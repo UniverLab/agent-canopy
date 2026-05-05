@@ -110,22 +110,20 @@ pub fn run_setup() -> Result<()> {
     ));
 
     wiz.render()?;
-    let rag_personal_root = pick_directory(
-        "Personal RAG root (your own notes/docs for global retrieval across sessions):",
-        &existing_config.rag_personal_root,
+    let prev_dirs = existing_config.rag_personal_dirs.clone();
+    let rag_personal_dirs = pick_multiple_directories(
+        "Personal RAG directories (your own notes/docs — indexed for global retrieval):",
+        if prev_dirs.is_empty() {
+            &existing_config.rag_personal_root
+        } else {
+            prev_dirs.first().map(String::as_str).unwrap_or("")
+        },
+        &prev_dirs,
     )?;
     wiz.add(format!(
-        "\x1b[32m✓\x1b[0m Personal RAG root: {}",
-        rag_personal_root
+        "\x1b[32m✓\x1b[0m Personal RAG dirs: {}",
+        rag_personal_dirs.join(", ")
     ));
-
-    wiz.render()?;
-    // Always start from the previously picked path so navigation is incremental.
-    let projects_root = pick_directory(
-        "Projects root (the parent folder that contains the repositories Canopy should discover/index):",
-        &rag_personal_root,
-    )?;
-    wiz.add(format!("\x1b[32m✓\x1b[0m Projects root: {}", projects_root));
 
     // ── Step 3: Install MCP servers + show matrix ───────────────
     if !selected.is_empty() {
@@ -145,8 +143,9 @@ pub fn run_setup() -> Result<()> {
     let cli_registry =
         crate::domain::cli_config::CliRegistry::detect_available(&platforms_with_cli);
     std::fs::create_dir_all(&canopy_dir)?;
-    std::fs::create_dir_all(&rag_personal_root)?;
-    std::fs::create_dir_all(&projects_root)?;
+    for dir in &rag_personal_dirs {
+        std::fs::create_dir_all(dir)?;
+    }
 
     // ── Step 5: Essential Skills ─────────────────────────────────
     wiz.render()?;
@@ -178,8 +177,7 @@ pub fn run_setup() -> Result<()> {
     config.clis = cli_registry.available_clis;
     config.temperature_unit = temperature_unit;
     config.embeddings_model = embeddings_model;
-    config.rag_personal_root = rag_personal_root;
-    config.projects_root = projects_root;
+    config.rag_personal_dirs = rag_personal_dirs;
     let config_step = match config.save(&canopy_dir) {
         Ok(_) => format!(
             "\x1b[32m✓\x1b[0m Config: {} CLI(s) saved to config.toml",
@@ -335,14 +333,11 @@ fn select_embeddings_model(current: &str) -> Result<String> {
         .iter()
         .position(|model| model.id == current)
         .unwrap_or(0);
-    let selected = Select::new(
-        "Embeddings model for the knowledge layer (date and size help you choose):",
-        options,
-    )
-    .with_starting_cursor(start)
-    .with_help_message("enter: confirm | ↑↓: navigate")
-    .prompt()
-    .map_err(|e| anyhow::anyhow!("Embeddings model selection cancelled: {}", e))?;
+    let selected = Select::new("Embeddings model for the knowledge layer:", options)
+        .with_starting_cursor(start)
+        .with_help_message("enter: confirm | ↑↓: navigate")
+        .prompt()
+        .map_err(|e| anyhow::anyhow!("Embeddings model selection cancelled: {}", e))?;
 
     if selected == "Custom…" {
         Text::new("Custom embeddings model:")
@@ -359,49 +354,59 @@ fn select_embeddings_model(current: &str) -> Result<String> {
     }
 }
 
-fn pick_directory(message: &str, current: &str) -> Result<String> {
+/// Interactively pick one or more directories for personal RAG indexing.
+fn pick_multiple_directories(
+    message: &str,
+    initial: &str,
+    existing: &[String],
+) -> Result<Vec<String>> {
     println!("  {message}");
-    println!("  \x1b[90mUse the directory picker and press Enter to confirm the folder.\x1b[0m");
-    let selected = browse_directory(current);
-    let trimmed = selected.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("{message} cannot be empty");
+    if !existing.is_empty() {
+        println!("  \x1b[90mCurrently configured:\x1b[0m");
+        for dir in existing {
+            println!("    \x1b[90m• {dir}\x1b[0m");
+        }
     }
-    Ok(trimmed.to_string())
-}
+    println!("  \x1b[90mUse the directory picker and press Enter to confirm each folder.\x1b[0m");
 
-/// Convert a parameter-count hint ("7B", "768M") to approximate file weight in MB
-/// assuming float16 quantization (2 bytes / param).  Qualitative labels are kept as-is.
-fn params_to_size_label(size_hint: &str) -> String {
-    let lower = size_hint.to_lowercase();
-    if let Some(rest) = lower.strip_suffix('b') {
-        if let Ok(n) = rest.parse::<f64>() {
-            // n billion params × 2 bytes × 10^9 / 10^6 = n × 2000 MB
-            let mb = n * 2_000.0;
-            return if mb >= 1_024.0 {
-                format!("~{:.1} GB", mb / 1_024.0)
-            } else {
-                format!("~{:.0} MB", mb)
-            };
+    let mut dirs: Vec<String> = Vec::new();
+    let mut last = initial.to_string();
+
+    loop {
+        let selected = browse_directory(&last);
+        let trimmed = selected.trim().to_string();
+        if trimmed.is_empty() {
+            if dirs.is_empty() {
+                anyhow::bail!("At least one RAG directory is required");
+            }
+            break;
+        }
+        if !dirs.contains(&trimmed) {
+            dirs.push(trimmed.clone());
+        }
+        last = trimmed;
+
+        println!("\n  \x1b[32m✓\x1b[0m Added: {}", dirs.last().unwrap());
+        for d in &dirs {
+            println!("    \x1b[90m• {d}\x1b[0m");
+        }
+        println!();
+
+        let add_more = Confirm::new("Add another directory?")
+            .with_default(false)
+            .with_help_message("enter: confirm")
+            .prompt()
+            .unwrap_or(false);
+        if !add_more {
+            break;
         }
     }
-    if let Some(rest) = lower.strip_suffix('m') {
-        if let Ok(n) = rest.parse::<f64>() {
-            // n million params × 2 bytes / 10^6 = n × 2 MB
-            let mb = n * 2.0;
-            return format!("~{:.0} MB", mb);
-        }
-    }
-    size_hint.to_string()
+
+    Ok(dirs)
 }
 
 fn format_embeddings_option(model: &crate::domain::models_db::ModelEntry) -> String {
     let release_date = model.release_date.as_deref().unwrap_or("unknown date");
-    let size = model
-        .size_hint
-        .as_deref()
-        .map(params_to_size_label)
-        .unwrap_or_else(|| "unknown size".to_string());
-    // Gray ANSI for metadata so the model id stands out
-    format!("{}  \x1b[90m[{} | {}]\x1b[0m", model.id, release_date, size)
+    // Show model id with date only — no size hints.
+    format!("{}  \x1b[90m[{}]\x1b[0m", model.id, release_date)
 }

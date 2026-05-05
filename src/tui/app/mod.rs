@@ -415,12 +415,8 @@ impl App {
     pub fn activate_playground(&mut self) {
         self.playground_active = true;
         self.reset_playground_state();
-
-        // If a project is selected in the projects sidebar, default to searching that project
-        self.playground_project_hash = self
-            .projects
-            .get(self.selected_project)
-            .map(|p| p.hash.clone());
+        // Personal RAG is global — no project_hash filter.
+        self.playground_project_hash = None;
     }
 
     pub fn deactivate_playground(&mut self) {

@@ -29,8 +29,14 @@ pub struct CanopyConfig {
     #[serde(default = "default_embeddings_model")]
     pub embeddings_model: String,
 
-    /// Root path for personal RAG documents/files.
-    #[serde(default = "default_rag_personal_root")]
+    /// Personal RAG directories — all are indexed recursively.
+    /// Replaces the old `rag_personal_root` single-path field.
+    #[serde(default)]
+    pub rag_personal_dirs: Vec<String>,
+
+    /// Legacy single-path field kept for backward-compat deserialization only.
+    /// Migrated to `rag_personal_dirs` on first load.
+    #[serde(default, skip_serializing)]
     pub rag_personal_root: String,
 
     /// Root path used to discover or group related projects.
@@ -57,12 +63,6 @@ fn default_embeddings_model() -> String {
     "text-embedding-3-small".to_string()
 }
 
-fn default_rag_personal_root() -> String {
-    dirs::home_dir()
-        .map(|h| h.join(".canopy").join("rag").to_string_lossy().to_string())
-        .unwrap_or_else(|| ".canopy/rag".to_string())
-}
-
 fn default_projects_root() -> String {
     if let Some(home) = dirs::home_dir() {
         let preferred = home.join("Documents").join("Projects");
@@ -78,10 +78,17 @@ impl CanopyConfig {
     /// Load config from `~/.canopy/config.toml`. Returns default if not found.
     pub fn load(canopy_dir: &Path) -> Self {
         let config_path = canopy_dir.join("config.toml");
-        std::fs::read_to_string(&config_path)
+        let mut config: CanopyConfig = std::fs::read_to_string(&config_path)
             .ok()
             .and_then(|content| toml::from_str::<CanopyConfig>(&content).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // Migrate legacy single-root field to the new multi-dir vec.
+        if config.rag_personal_dirs.is_empty() && !config.rag_personal_root.is_empty() {
+            config
+                .rag_personal_dirs
+                .push(config.rag_personal_root.clone());
+        }
+        config
     }
 
     /// Save config to `~/.canopy/config.toml`.
@@ -120,7 +127,8 @@ impl Default for CanopyConfig {
             clis: Vec::new(),
             temperature_unit: TemperatureUnit::default(),
             embeddings_model: default_embeddings_model(),
-            rag_personal_root: default_rag_personal_root(),
+            rag_personal_dirs: Vec::new(),
+            rag_personal_root: String::new(),
             projects_root: default_projects_root(),
         }
     }
@@ -150,7 +158,7 @@ mod tests {
         config.mcp_filesystem_root = "/custom/path".to_string();
         config.temperature_unit = TemperatureUnit::Fahrenheit;
         config.embeddings_model = "custom-embed".to_string();
-        config.rag_personal_root = "/rag/home".to_string();
+        config.rag_personal_dirs = vec!["/rag/home".to_string(), "/rag/docs".to_string()];
         config.projects_root = "/projects".to_string();
 
         config.save(&canopy_dir).unwrap();
@@ -160,8 +168,21 @@ mod tests {
         assert_eq!(loaded.mcp_filesystem_root, "/custom/path");
         assert_eq!(loaded.temperature_unit, TemperatureUnit::Fahrenheit);
         assert_eq!(loaded.embeddings_model, "custom-embed");
-        assert_eq!(loaded.rag_personal_root, "/rag/home");
+        assert_eq!(loaded.rag_personal_dirs, vec!["/rag/home", "/rag/docs"]);
         assert_eq!(loaded.projects_root, "/projects");
+    }
+
+    #[test]
+    fn test_legacy_rag_personal_root_migration() {
+        let dir = TempDir::new().unwrap();
+        let canopy_dir = dir.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        // Write a config with the old single-root field.
+        let toml = r#"rag_personal_root = "/old/rag""#;
+        std::fs::write(canopy_dir.join("config.toml"), toml).unwrap();
+
+        let loaded = CanopyConfig::load(&canopy_dir);
+        assert_eq!(loaded.rag_personal_dirs, vec!["/old/rag"]);
     }
 
     #[test]

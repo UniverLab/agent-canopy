@@ -109,18 +109,22 @@ impl IngestionManager {
             .collect())
     }
 
-    /// Start a recursive filesystem watcher on `personal_root`.
+    /// Start recursive filesystem watchers on all `personal_roots`.
     ///
     /// - Create/Modify events enqueue the file for (re)indexing (if supported).
     /// - Delete events remove the file's chunks from the database immediately.
     ///
-    /// The watcher is kept alive inside `self` for the lifetime of the manager.
-    pub fn start_personal_watcher(self: Arc<Self>, personal_root: &PathBuf) {
+    /// All watchers are kept alive inside `self` for the lifetime of the manager.
+    pub fn start_personal_watcher(self: Arc<Self>, personal_roots: &[PathBuf]) {
+        if personal_roots.is_empty() {
+            return;
+        }
+
         let rt = tokio::runtime::Handle::current();
         let db = Arc::clone(&self.db);
         let queue = Arc::clone(&self.queue);
         let notify_handle = Arc::clone(&self.notify);
-        let root = personal_root.clone();
+        let roots = personal_roots.to_vec();
         let data_dir = self.data_dir.clone();
 
         let patterns = crate::rag::ragignore::load_patterns(&data_dir);
@@ -129,7 +133,10 @@ impl IngestionManager {
             move |res: Result<Event, notify::Error>| {
                 let Ok(event) = res else { return };
                 for path in &event.paths {
-                    if crate::rag::ragignore::is_ignored(path, &root, &patterns) {
+                    // Find the matching root for this path to compute relative ignore check.
+                    let matching_root = roots.iter().find(|r| path.starts_with(r));
+                    let Some(root) = matching_root else { continue };
+                    if crate::rag::ragignore::is_ignored(path, root, &patterns) {
                         continue;
                     }
                     let path_str = path.to_string_lossy().to_string();
@@ -172,18 +179,20 @@ impl IngestionManager {
             }
         };
 
-        if let Err(e) = watcher.watch(personal_root, RecursiveMode::Recursive) {
-            tracing::warn!(
-                "Personal RAG watcher could not watch {:?}: {e}",
-                personal_root
-            );
-            return;
+        let mut watched = 0usize;
+        for root in personal_roots {
+            if let Err(e) = watcher.watch(root, RecursiveMode::Recursive) {
+                tracing::warn!("Personal RAG watcher could not watch {:?}: {e}", root);
+            } else {
+                tracing::info!("Personal RAG watcher active on {:?}", root);
+                watched += 1;
+            }
         }
 
-        tracing::info!("Personal RAG watcher active on {:?}", personal_root);
-
-        if let Ok(mut guard) = self._personal_watcher.lock() {
-            *guard = Some(watcher);
+        if watched > 0 {
+            if let Ok(mut guard) = self._personal_watcher.lock() {
+                *guard = Some(watcher);
+            }
         }
     }
 

@@ -103,6 +103,73 @@ pub(crate) async fn run_doctor() -> Result<()> {
         issues.push("Install at least one: opencode, kiro-cli, copilot, or qwen");
     }
 
+    // ── RAG Health ──────────────────────────────────────────────
+    println!("\n  \x1b[1;36m◆ Personal RAG\x1b[0m");
+
+    let config = crate::domain::canopy_config::CanopyConfig::load(&canopy_dir);
+
+    // Embeddings model
+    if config.embeddings_model.is_empty() {
+        println!("  \x1b[33m⚠\x1b[0m  Embeddings model not configured (run 'canopy setup')");
+        issues.push("Configure embeddings model via 'canopy setup'");
+    } else {
+        println!(
+            "  \x1b[32m✓\x1b[0m Embeddings model: {}",
+            config.embeddings_model
+        );
+    }
+
+    // Indexed directories
+    if config.rag_personal_dirs.is_empty() {
+        println!("  \x1b[33m⚠\x1b[0m  No personal RAG directories configured");
+        issues.push("Add personal RAG directories via 'canopy setup'");
+    } else {
+        for dir in &config.rag_personal_dirs {
+            let exists = std::path::Path::new(dir).exists();
+            if exists {
+                println!("  \x1b[32m✓\x1b[0m RAG dir: {dir}");
+            } else {
+                println!("  \x1b[31m✗\x1b[0m RAG dir missing: {dir}");
+                issues.push("Personal RAG directory not found on disk");
+            }
+        }
+    }
+
+    // ragignore file
+    let ragignore_path = canopy_dir.join("ragignore");
+    if ragignore_path.exists() {
+        println!("  \x1b[32m✓\x1b[0m ragignore: {}", ragignore_path.display());
+    } else {
+        println!("  \x1b[90m–\x1b[0m  ragignore not found (optional — create ~/.canopy/ragignore to exclude files)");
+    }
+
+    // Chunk count from DB
+    if db_path.exists() {
+        let chunk_info: Option<(i64, i64)> = (|| -> Option<(i64, i64)> {
+            let conn = rusqlite::Connection::open(&db_path).ok()?;
+            let total: i64 = conn
+                .query_row("SELECT COUNT(*) FROM rag_chunks", [], |r| r.get(0))
+                .ok()?;
+            let queued: i64 = conn
+                .query_row("SELECT COUNT(*) FROM rag_queue", [], |r| r.get(0))
+                .ok()?;
+            Some((total, queued))
+        })();
+        match chunk_info {
+            Some((total, queued)) => {
+                println!("  \x1b[32m✓\x1b[0m Indexed chunks: {total}");
+                if queued > 0 {
+                    println!(
+                        "  \x1b[33m⚠\x1b[0m  Pending queue: {queued} file(s) awaiting indexing"
+                    );
+                }
+            }
+            None => {
+                println!("  \x1b[90m–\x1b[0m  Could not read RAG chunk count");
+            }
+        }
+    }
+
     if !issues.is_empty() {
         println!("\n  \x1b[1;33m⚠ Suggestions:\x1b[0m");
         for issue in &issues {

@@ -175,14 +175,21 @@ pub(crate) async fn run_stdio_server() -> Result<()> {
 /// Scan the personal RAG root for existing files, enqueue them, and start the watcher.
 async fn startup_personal_rag(ingestion: Arc<IngestionManager>, data_dir: &std::path::Path) {
     let config = crate::domain::canopy_config::CanopyConfig::load(data_dir);
-    let personal_root = std::path::PathBuf::from(&config.rag_personal_root);
+    let personal_roots: Vec<std::path::PathBuf> = config
+        .rag_personal_dirs
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect();
 
-    if let Err(e) = std::fs::create_dir_all(&personal_root) {
-        tracing::warn!(
-            "Could not create personal RAG root {:?}: {e}",
-            personal_root
-        );
+    if personal_roots.is_empty() {
+        tracing::info!("startup_personal_rag: no directories configured, skipping");
         return;
+    }
+
+    for root in &personal_roots {
+        if let Err(e) = std::fs::create_dir_all(root) {
+            tracing::warn!("Could not create personal RAG dir {:?}: {e}", root);
+        }
     }
 
     // Reload any items already in the DB queue from a previous session.
@@ -198,25 +205,26 @@ async fn startup_personal_rag(ingestion: Arc<IngestionManager>, data_dir: &std::
         }
     }
 
-    // Scan existing files in the personal root.
+    // Scan existing files across all personal roots.
     let patterns = crate::rag::ragignore::load_patterns(data_dir);
-    let root = personal_root.clone();
-    let walker = walkdir::WalkDir::new(&personal_root)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file());
-
     let mut queued = 0usize;
-    for entry in walker {
-        let path = entry.path();
-        if crate::rag::ragignore::is_ignored(path, &root, &patterns) {
-            continue;
-        }
-        let path_str = path.to_string_lossy().to_string();
-        if crate::rag::chunker::detect_lang(&path_str).is_some() {
-            ingestion.enqueue(&path_str).await;
-            queued += 1;
+    for root in &personal_roots {
+        let walker = walkdir::WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file());
+
+        for entry in walker {
+            let path = entry.path();
+            if crate::rag::ragignore::is_ignored(path, root, &patterns) {
+                continue;
+            }
+            let path_str = path.to_string_lossy().to_string();
+            if crate::rag::chunker::detect_lang(&path_str).is_some() {
+                ingestion.enqueue(&path_str).await;
+                queued += 1;
+            }
         }
     }
     if queued > 0 {
@@ -224,7 +232,7 @@ async fn startup_personal_rag(ingestion: Arc<IngestionManager>, data_dir: &std::
     }
 
     // Start the filesystem watcher for live updates.
-    Arc::clone(&ingestion).start_personal_watcher(&personal_root);
+    Arc::clone(&ingestion).start_personal_watcher(&personal_roots);
 }
 
 async fn shutdown_signal() {

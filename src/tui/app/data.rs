@@ -24,7 +24,11 @@ impl App {
         let agents = self.db.list_agents()?;
 
         self.agents.clear();
-        // Interactive sessions first
+        // Background agents first (they are rendered at the top of the sidebar)
+        for a in agents {
+            self.agents.push(AgentEntry::Agent(a));
+        }
+        // Interactive sessions
         for i in 0..self.interactive_agents.len() {
             self.agents.push(AgentEntry::Interactive(i));
         }
@@ -35,10 +39,6 @@ impl App {
         // Then split groups
         for i in 0..self.split_groups.len() {
             self.agents.push(AgentEntry::Group(i));
-        }
-        // Agents last
-        for a in agents {
-            self.agents.push(AgentEntry::Agent(a));
         }
 
         let total = self.agents.len();

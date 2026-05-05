@@ -35,14 +35,9 @@ pub fn handle_home_key(app: &mut App, code: KeyCode, _modifiers: KeyModifiers) -
         KeyCode::Down | KeyCode::Char('j') if !app.agents.is_empty() || has_project_preview => {
             app.dismiss_brain();
             if app.sidebar_mode == SidebarMode::Agents {
-                // Arrow-down from Home in Agents mode: show RAG info if chunks exist,
-                // otherwise go to first agent.
-                if app.rag_info.total_chunks > 0 {
-                    app.agents_rag_focused = true;
-                } else {
-                    app.selected = 0;
-                    app.agents_rag_focused = false;
-                }
+                // Arrow-down from Home: go to the first agent (background, at top of sidebar).
+                app.selected = 0;
+                app.agents_rag_focused = false;
             } else {
                 // Projects mode: arrow-down goes to RagInfo if chunks exist, else first project.
                 if app.rag_info.total_chunks > 0 {
@@ -112,7 +107,7 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
             }
         } else {
             match code {
-                KeyCode::Esc => {
+                KeyCode::F(10) => {
                     app.deactivate_playground();
                 }
                 KeyCode::Up if app.playground_selected > 0 => {
@@ -124,18 +119,6 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
                 KeyCode::Enter | KeyCode::Char('l') if !app.playground_results.is_empty() => {
                     app.playground_detail_mode = true;
                     app.playground_scroll = 0;
-                }
-                KeyCode::Tab => {
-                    if app.playground_project_hash.is_some() {
-                        app.playground_project_hash = None;
-                    } else {
-                        app.playground_project_hash = app
-                            .projects
-                            .get(app.selected_project)
-                            .map(|p| p.hash.clone());
-                    }
-                    // Trigger immediate refresh
-                    app.playground_last_executed_query.clear();
                 }
                 KeyCode::Backspace => {
                     app.playground_query.pop();
@@ -197,8 +180,12 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
                     app.select_next();
                 }
             } else {
-                // Agents mode: Down navigates agents; if at end and RAG exists, go to RagInfo
-                if !app.agents_rag_focused {
+                // Agents mode: Down navigates agents; if at end and RAG exists, go to RagInfo.
+                // If already on RagInfo, wrap back to first agent.
+                if app.agents_rag_focused {
+                    app.agents_rag_focused = false;
+                    app.selected = 0;
+                } else {
                     let at_last = app.selected + 1 >= app.agents.len();
                     if at_last && app.rag_info.total_chunks > 0 {
                         app.agents_rag_focused = true;
@@ -206,7 +193,6 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
                         app.select_next();
                     }
                 }
-                // If already on RagInfo, do nothing (can't go further down)
             }
         }
         KeyCode::Up | KeyCode::Char('k') => {
