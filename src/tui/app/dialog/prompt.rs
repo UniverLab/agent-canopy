@@ -367,20 +367,25 @@ impl SimplePromptDialog {
         Ok(None)
     }
 
-    fn resolve_path_resource(db: &Database, raw: &str) -> Result<Option<String>> {
-        let path = Path::new(raw);
-        if !path.exists() {
-            return Ok(None);
+    fn resolve_resource_entry(db: &Database, raw: &str) -> String {
+        let trimmed = raw.trim();
+
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            return format!("path: {trimmed}\nkind: url");
         }
 
-        if path.is_dir() {
-            if let Some(project) = db.get_project_by_path(path)? {
-                return Ok(Some(Self::format_project_block(&project)));
+        let path = Path::new(trimmed);
+        if path.exists() {
+            if path.is_dir() {
+                if let Ok(Some(project)) = db.get_project_by_path(path) {
+                    return Self::format_project_block(&project);
+                }
+                return format!("path: {}\nkind: directory", path.display());
             }
-            return Ok(Some(format!("path: {}\nkind: directory", path.display())));
+            return Self::format_file_resource(path);
         }
 
-        Ok(Some(Self::format_file_resource(path)))
+        format!("content: {trimmed}\nkind: raw")
     }
 
     fn resolve_rag_scope<'a>(
@@ -419,12 +424,7 @@ impl SimplePromptDialog {
     fn resolve_resource_entries(&self, db: &Database) -> Vec<String> {
         self.section_lines("resources")
             .into_iter()
-            .map(|entry| {
-                Self::resolve_path_resource(db, &entry)
-                    .ok()
-                    .flatten()
-                    .unwrap_or(entry)
-            })
+            .map(|entry| Self::resolve_resource_entry(db, &entry))
             .collect()
     }
 
