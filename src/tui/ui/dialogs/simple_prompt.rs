@@ -217,6 +217,14 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) {
             format!("{} {}", label, suffix.trim_start_matches('_'))
         };
 
+        let is_locked = dialog.is_locked(section_name);
+
+        let display_label = if is_locked {
+            format!("{display_label} 🔒")
+        } else {
+            display_label
+        };
+
         let label_style = if is_focused {
             Style::default().fg(accent).add_modifier(Modifier::BOLD)
         } else {

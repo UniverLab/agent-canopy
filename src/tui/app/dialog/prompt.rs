@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
 use ratatui::style::Color;
+use std::collections::{HashMap, HashSet};
 
 use super::at_picker::AtPicker;
 use crate::db::Database;
 use crate::domain::project::Project;
 use crate::tui::app::types::Focus;
-use std::collections::HashMap;
 use std::path::Path;
 
 /// Picker state for adding/removing sections
@@ -73,6 +73,11 @@ pub struct SimplePromptDialog {
     /// Collapsed paste content: placeholder text is stored in `sections`,
     /// the real pasted content lives here and is used for building the prompt.
     pub collapsed_pastes: HashMap<String, String>,
+    /// Section IDs that are read-only (auto-filled, cannot be edited).
+    pub locked_sections: HashSet<String>,
+    /// Invisible system block appended at the bottom of the final prompt.
+    /// None = don't append. Set once per workdir session (idempotent).
+    pub system_content: Option<String>,
 }
 
 impl SimplePromptDialog {
@@ -100,6 +105,8 @@ impl SimplePromptDialog {
             section_scrolls: scrolls,
             at_picker: None,
             collapsed_pastes: HashMap::new(),
+            locked_sections: HashSet::new(),
+            system_content: None,
         }
     }
 
@@ -111,6 +118,16 @@ impl SimplePromptDialog {
     /// Get scroll offset for a section
     pub fn scroll(&self, section: &str) -> usize {
         self.section_scrolls.get(section).copied().unwrap_or(0)
+    }
+
+    /// Returns true if the section is locked (read-only).
+    pub fn is_locked(&self, section_id: &str) -> bool {
+        self.locked_sections.contains(section_id)
+    }
+
+    /// Mark a section as locked (read-only).
+    pub fn lock_section(&mut self, section_id: &str) {
+        self.locked_sections.insert(section_id.to_string());
     }
 
     /// Generate unique ID for a section instance (always uses `name_N` format, N starting at 1).
@@ -143,7 +160,7 @@ impl SimplePromptDialog {
             .count()
     }
 
-    fn insert_section(&mut self, section_name: &str, content: String) {
+    fn insert_section(&mut self, section_name: &str, content: String) -> String {
         let unique_id = self.generate_section_id(section_name);
         let cursor_pos = content.chars().count();
         self.enabled_sections.push(unique_id.clone());
@@ -152,6 +169,7 @@ impl SimplePromptDialog {
         self.section_scrolls.insert(unique_id.clone(), 0);
         self.collapsed_pastes.remove(&unique_id);
         self.focused_section = self.enabled_sections.len() - 1;
+        unique_id
     }
 
     /// Add a section instance (can be same type multiple times)
@@ -159,9 +177,10 @@ impl SimplePromptDialog {
         self.insert_section(section_name, String::new());
     }
 
-    /// Add a section with pre-existing content (used for context transfer and initial content)
-    pub fn add_section_with_content(&mut self, section_name: &str, content: String) {
-        self.insert_section(section_name, content);
+    /// Add a section with pre-existing content (used for context transfer and initial content).
+    /// Returns the generated section ID.
+    pub fn add_section_with_content(&mut self, section_name: &str, content: String) -> String {
+        self.insert_section(section_name, content)
     }
 
     /// Remove a specific section instance.
@@ -471,8 +490,8 @@ impl SimplePromptDialog {
     fn append_instruction_section(&self, result: &mut String) {
         result.push_str("# [INSTRUCTIONS]: Execution Logic\n");
         result.push_str("<instruction_set>\n");
-        for (idx, content) in self.section_entries("instruction").into_iter().enumerate() {
-            push_xml_item(result, "instruction", idx + 1, content);
+        for content in self.section_entries("instruction") {
+            push_xml_item(result, "instruction", content);
         }
         result.push_str("</instruction_set>\n\n");
     }
@@ -490,9 +509,9 @@ impl SimplePromptDialog {
                     result.push_str("<tools>\n");
                 }
                 tools_count += 1;
-                result.push_str(&format!(
-                    "  <skill_{tools_count}>\n    {trimmed}\n  </skill_{tools_count}>\n\n"
-                ));
+                result.push_str("  <skill>\n");
+                result.push_str(&format!("    {trimmed}\n"));
+                result.push_str("  </skill>\n\n");
             }
         }
         if tools_count > 0 {
@@ -567,6 +586,13 @@ impl SimplePromptDialog {
             "constraint",
         );
         self.append_tools_section(&mut result);
+
+        if let Some(system) = &self.system_content {
+            result.push_str("<system>\n");
+            result.push_str(system);
+            result.push_str("\n</system>\n");
+        }
+
         Ok(result)
     }
 
@@ -992,6 +1018,7 @@ pub struct PromptBuilderSession {
     pub section_cursors: HashMap<String, usize>,
     pub section_scrolls: HashMap<String, usize>,
     pub collapsed_pastes: HashMap<String, String>,
+    pub locked_sections: HashSet<String>,
 }
 
 impl PromptBuilderSession {
@@ -1004,6 +1031,7 @@ impl PromptBuilderSession {
             section_cursors: dialog.section_cursors.clone(),
             section_scrolls: dialog.section_scrolls.clone(),
             collapsed_pastes: dialog.collapsed_pastes.clone(),
+            locked_sections: dialog.locked_sections.clone(),
         }
     }
 
@@ -1015,9 +1043,11 @@ impl PromptBuilderSession {
         dialog.section_cursors = self.section_cursors.clone();
         dialog.section_scrolls = self.section_scrolls.clone();
         dialog.collapsed_pastes = self.collapsed_pastes.clone();
-        // Reset transient UI state
+        dialog.locked_sections = self.locked_sections.clone();
+        // Reset transient UI state (not persisted across openings)
         dialog.picker_mode = SectionPickerMode::None;
         dialog.at_picker = None;
+        dialog.system_content = None; // re-evaluated on each open
     }
 }
 
@@ -1053,12 +1083,12 @@ fn add_skills_from_dir(
 
 // XML formatting helpers
 
-fn push_xml_item(result: &mut String, tag: &str, count: usize, content: &str) {
-    result.push_str(&format!("  <{tag}_{count}>\n"));
+fn push_xml_item(result: &mut String, tag: &str, content: &str) {
+    result.push_str(&format!("  <{tag}>\n"));
     for line in content.lines() {
         result.push_str(&format!("    {line}\n"));
     }
-    result.push_str(&format!("  </{tag}_{count}>\n\n"));
+    result.push_str(&format!("  </{tag}>\n\n"));
 }
 
 fn format_indexed_xml_section(
@@ -1074,8 +1104,8 @@ fn format_indexed_xml_section(
     let mut result = String::new();
     result.push_str(header);
     result.push_str(&format!("<{outer_tag}>\n"));
-    for (idx, item) in items.iter().enumerate() {
-        push_xml_item(&mut result, item_tag, idx + 1, item);
+    for item in items.iter() {
+        push_xml_item(&mut result, item_tag, item);
     }
     result.push_str(&format!("</{outer_tag}>\n\n"));
     Some(result)
@@ -1108,7 +1138,7 @@ fn build_xml_block<'a>(
             result.push_str(&format!("<{outer_tag}>\n"));
         }
         count += 1;
-        push_xml_item(result, item_tag, count, trimmed);
+        push_xml_item(result, item_tag, trimmed);
     }
     if count > 0 {
         result.push_str(&format!("</{outer_tag}>\n\n"));

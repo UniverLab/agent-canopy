@@ -64,7 +64,7 @@ impl App {
 
     /// Open prompt template dialog with the specified template and optional initial content.
     /// Restores any persisted session for the current workdir.
-    /// When multiple agents share the workdir, auto-populates context_1 with sync state.
+    /// Injects an invisible system block on the first prompt per workdir (idempotent).
     pub fn open_simple_prompt_dialog(
         &mut self,
         initial_content: Option<std::collections::HashMap<String, String>>,
@@ -81,16 +81,16 @@ impl App {
             }
         }
 
-        // Auto-populate context_1 with sync state when multiple agents are active
-        // and there is no persisted session (fresh open only).
-        if !has_persisted && self.sync_available() {
-            if let Some(sync_ctx) = self.build_sync_context_text() {
-                dialog.set_section_content("context_1", sync_ctx.clone());
-                let char_len = sync_ctx.chars().count();
-                dialog
-                    .section_cursors
-                    .insert("context_1".to_string(), char_len);
-            }
+        // Determine system block idempotency: send on first prompt or on solo-mode transition
+        let is_solo = !self.sync_available();
+        let state = self
+            .workdir_system_state
+            .get(&workdir)
+            .cloned()
+            .unwrap_or_default();
+        let should_send_system = !state.sent || (!state.sent_as_solo && is_solo);
+        if should_send_system {
+            dialog.system_content = Some(self.build_system_content(is_solo));
         }
 
         if let Some(content) = initial_content {
@@ -105,8 +105,12 @@ impl App {
                     let char_len = section_content.chars().count();
                     dialog.sections.insert(instr_id.clone(), section_content);
                     dialog.section_cursors.insert(instr_id, char_len);
+                } else if section_name == "context" || section_name.starts_with("context_") {
+                    // Context sections from initial_content (e.g. context transfer) are locked
+                    let ctx_id = dialog.add_section_with_content(&section_name, section_content);
+                    dialog.lock_section(&ctx_id);
                 } else {
-                    dialog.add_section_with_content(&section_name.clone(), section_content);
+                    dialog.add_section_with_content(&section_name, section_content);
                 }
             }
             dialog.focused_section = 0;
@@ -116,7 +120,83 @@ impl App {
         self.focus = super::super::types::Focus::PromptTemplateDialog;
     }
 
+    /// Build system block content for the invisible system prompt section.
+    fn build_system_content(&self, is_solo: bool) -> String {
+        let mut lines: Vec<String> = Vec::new();
+
+        if let Some(state) = self.sync_panel_state() {
+            lines.push(format!(
+                "workspace: {} | agents: {} | vibe: {}",
+                state.workdir,
+                state.participant_count,
+                state.vibe.as_str()
+            ));
+            if !is_solo {
+                if !state.active_intents.is_empty() {
+                    lines.push("active missions:".to_string());
+                    for intent in &state.active_intents {
+                        lines.push(format!(
+                            "  - {} [{}] {}: {}",
+                            intent.agent_name,
+                            intent.impact.as_str(),
+                            intent.mission,
+                            intent.description
+                        ));
+                    }
+                }
+                let chatter: Vec<_> = state
+                    .recent_messages
+                    .iter()
+                    .filter(|m| m.kind.is_chatter())
+                    .take(5)
+                    .collect();
+                if !chatter.is_empty() {
+                    lines.push("recent messages:".to_string());
+                    for msg in chatter {
+                        lines.push(format!("  - {}: {}", msg.agent_name, msg.message));
+                    }
+                }
+            }
+        } else {
+            let workdir = self.current_workdir();
+            lines.push(format!("workspace: {}", workdir.display()));
+        }
+
+        if is_solo {
+            lines.push(String::new());
+            lines.push(
+                "You are in solo mode in Canopy Sync. \
+                No other agents are currently active in this workspace."
+                    .to_string(),
+            );
+        }
+
+        lines.push(String::new());
+        lines.push("You are operating within the Canopy multi-agent framework.".to_string());
+        lines.push(
+            "- Follow skill:mindset principles for all actions \
+            (verify before reporting, think critically, relentless resourcefulness, \
+            security guard, token efficiency)."
+                .to_string(),
+        );
+        lines.push(
+            "- When taking actions that affect shared workspace state, use \
+            canopy_sync_broadcast and canopy_sync_declare_intent tools to coordinate \
+            with peer agents."
+                .to_string(),
+        );
+        lines.push(
+            "- Report execution status with canopy_agent_report when working on \
+            scheduled tasks."
+                .to_string(),
+        );
+
+        lines.join("\n")
+    }
+
     /// Build a compact sync context string from active intents and recent chatter.
+    /// Kept for backwards compatibility; not used by the prompt builder any more.
+    #[allow(dead_code)]
     fn build_sync_context_text(&self) -> Option<String> {
         let state = self.sync_panel_state()?;
         let mut lines = Vec::new();

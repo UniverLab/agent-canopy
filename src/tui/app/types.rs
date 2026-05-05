@@ -205,4 +205,13 @@ pub struct App {
     pub(crate) playground_scroll: u16,
     /// Optional project hash to filter search results. None = Global.
     pub(crate) playground_project_hash: Option<String>,
+    /// Tracks whether the system block has been sent per workdir.
+    pub(crate) workdir_system_state: HashMap<PathBuf, WorkdirSystemState>,
+}
+
+/// Tracks system block delivery per workdir for idempotency.
+#[derive(Clone, Default)]
+pub(crate) struct WorkdirSystemState {
+    pub sent: bool,
+    pub sent_as_solo: bool,
 }

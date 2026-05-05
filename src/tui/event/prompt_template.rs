@@ -308,7 +308,9 @@ fn confirm_skills_picker_selection(dialog: &mut SimplePromptDialog) {
 
     match replace_id {
         Some(section_id) => dialog.set_tools_section_skill(&section_id, label),
-        None => dialog.add_section_with_content("tools", label.clone()),
+        None => {
+            dialog.add_section_with_content("tools", label.clone());
+        }
     }
 }
 
@@ -550,10 +552,16 @@ fn handle_dialog_key(
             Ok(PromptAction::None)
         }
         KeyCode::Char(c) => {
+            if dialog.is_locked(section_name) {
+                return Ok(PromptAction::None);
+            }
             handle_section_char_input(dialog, section_name, c, field_width, workdir);
             Ok(PromptAction::None)
         }
         KeyCode::Backspace => {
+            if dialog.is_locked(section_name) {
+                return Ok(PromptAction::None);
+            }
             handle_section_backspace(dialog, section_name, field_width);
             Ok(PromptAction::None)
         }
@@ -642,10 +650,25 @@ fn handle_section_backspace(
 }
 
 fn submit_prompt(app: &mut App, prompt: &str) {
-    write_prompt_to_selected_agent(app, prompt);
+    // Capture whether system content was included before discarding
+    let had_system = app
+        .simple_prompt_dialog
+        .as_ref()
+        .and_then(|d| d.system_content.as_ref())
+        .is_some();
+    let is_solo = !app.sync_available();
     let workdir = app.current_workdir();
+
+    write_prompt_to_selected_agent(app, prompt);
     app.prompt_builder_sessions.remove(&workdir);
     app.discard_simple_prompt_dialog();
+
+    // Record that system block was sent for this workdir
+    if had_system {
+        let state = app.workdir_system_state.entry(workdir).or_default();
+        state.sent = true;
+        state.sent_as_solo = is_solo;
+    }
 }
 
 fn write_prompt_to_selected_agent(app: &mut App, prompt: &str) {

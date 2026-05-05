@@ -141,6 +141,7 @@ impl App {
             agents_rag_focused: false,
             sync_scroll_offset: 0,
             last_sync_area: None,
+            workdir_system_state: HashMap::new(),
         };
         app.refresh()?;
         Ok(app)
