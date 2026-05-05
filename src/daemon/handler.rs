@@ -28,7 +28,6 @@ use crate::domain::models::{Agent, Cli, RunLog, RunStatus, Trigger, WatchEvent};
 use crate::domain::sync::{MessageKind, MissionImpact, WorkspaceStatus};
 use crate::domain::validation::{validate_id, validate_prompt, validate_watch_path};
 use crate::executor::Executor;
-use crate::rag::ingestion::IngestionManager;
 use crate::rag::rate_limiter::RateLimiter;
 use crate::sync_manager::SyncManager;
 use crate::watchers::WatcherEngine;
@@ -41,9 +40,7 @@ pub struct TaskTriggerHandler {
     pub scheduler_notify: Arc<Notify>,
     pub notification_service: Arc<dyn NotificationService>,
     pub sync_manager: Arc<SyncManager>,
-    /// Shared ingestion manager — used by register_and_enqueue and startup enqueue.
-    pub ingestion: Arc<IngestionManager>,
-    /// Rate limiters for rag_search (10 calls/min). Keyed by agent when available.
+    /// Rate limiters for rag_search (10 calls/min). Keyed by agent_id.
     pub rag_limiters: Arc<tokio::sync::Mutex<std::collections::HashMap<String, RateLimiter>>>,
     pub start_time: std::time::Instant,
     pub port: u16,
@@ -61,7 +58,6 @@ impl TaskTriggerHandler {
         scheduler_notify: Arc<Notify>,
         notification_service: Arc<dyn NotificationService>,
         sync_manager: Arc<SyncManager>,
-        ingestion: Arc<IngestionManager>,
         port: u16,
     ) -> Self {
         Self {
@@ -71,7 +67,6 @@ impl TaskTriggerHandler {
             scheduler_notify,
             notification_service,
             sync_manager,
-            ingestion,
             rag_limiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             start_time: std::time::Instant::now(),
             port,
@@ -123,9 +118,9 @@ impl TaskTriggerHandler {
 
         self.db.upsert_agent(&agent).map_err(internal_error)?;
         if let Some(workdir) = agent.working_dir.as_deref() {
-            self.ingestion
-                .register_and_enqueue(Path::new(workdir))
-                .await;
+            if let Err(e) = self.db.register_project_path(std::path::Path::new(workdir)) {
+                tracing::debug!("Could not register project at {workdir}: {e}");
+            }
         }
         self.scheduler_notify.notify_one();
 
@@ -844,10 +839,10 @@ impl TaskTriggerHandler {
         }
     }
 
-    /// Semantic search over indexed project chunks (FTS5). Rate-limited: 10/min per agent.
+    /// Full-text search over personal RAG chunks (FTS5). Rate-limited: 10/min per agent.
     #[tool(
         name = "rag_search",
-        description = "Search indexed project content. scope: 'global' | 'project'. \
+        description = "Search indexed personal content (markdown and PDF files). \
          Default limit: 5. Rate-limited to 10 calls/min per agent."
     )]
     async fn rag_search(
@@ -858,19 +853,9 @@ impl TaskTriggerHandler {
             return Ok(result);
         }
 
-        let scope = params.scope.as_deref().unwrap_or("global");
-        let project_hash = match resolve_rag_project_hash(scope, params.project_hash.as_deref()) {
-            Ok(project_hash) => project_hash,
-            Err(e) => return Ok(error_result(e)),
-        };
-
         let chunks = self
             .db
-            .search_chunks(
-                &params.query,
-                project_hash,
-                params.limit.unwrap_or(5).min(20),
-            )
+            .search_chunks(&params.query, None, params.limit.unwrap_or(5).min(20))
             .map_err(internal_error)?;
         if chunks.is_empty() {
             return Ok(success_result("No results found."));
@@ -880,7 +865,6 @@ impl TaskTriggerHandler {
             .iter()
             .map(|c| {
                 serde_json::json!({
-                    "project_hash": c.project_hash,
                     "source": c.source_path,
                     "lang": c.lang,
                     "chunk_index": c.chunk_index,
@@ -927,7 +911,6 @@ impl TaskTriggerHandler {
         let limiter_key = params
             .agent_id
             .clone()
-            .or_else(|| params.project_hash.clone())
             .unwrap_or_else(|| "global".to_owned());
         let mut limiters = self.rag_limiters.lock().await;
         let limiter = limiters
@@ -1359,23 +1342,6 @@ fn update_agent_last_run(db: &Database, run: &RunLog, status: RunStatus) {
     };
 
     let _ = db.update_agent_last_run(&run.background_agent_id, success);
-}
-
-fn resolve_rag_project_hash<'a>(
-    scope: &str,
-    project_hash: Option<&'a str>,
-) -> Result<Option<&'a str>, &'static str> {
-    if scope == "global" {
-        return Ok(None);
-    }
-    if scope != "project" {
-        return Err("Invalid scope. Must be: global or project.");
-    }
-
-    let Some(project_hash) = project_hash else {
-        return Err("project_hash is required when scope is 'project'.");
-    };
-    Ok(Some(project_hash))
 }
 
 fn make_log_path(id: &str) -> Result<String, McpError> {

@@ -1,0 +1,18 @@
+# ragignore — global patterns excluded from RAG indexing
+# Glob patterns, one per line. Lines starting with # are comments.
+
+.agents/
+.git/
+target/
+node_modules/
+dist/
+build/
+.cache/
+__pycache__/
+.venv/
+vendor/
+.idea/
+.vscode/
+*.lock
+*.min.js
+*.min.css

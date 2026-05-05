@@ -49,7 +49,7 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
         tracing::error!("Failed to reload watchers: {}", e);
     }
 
-    startup_enqueue_unindexed(Arc::clone(&ingestion), Arc::clone(&db)).await;
+    startup_personal_rag(Arc::clone(&ingestion), &data_dir).await;
 
     let cron_scheduler = Arc::new(CronScheduler::new(Arc::clone(&db), Arc::clone(&executor)));
     let scheduler_notify = cron_scheduler.notifier();
@@ -60,7 +60,6 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
     let handler_watcher_engine = Arc::clone(&watcher_engine);
     let handler_scheduler_notify = Arc::clone(&scheduler_notify);
     let handler_sync_manager = Arc::clone(&sync_manager);
-    let handler_ingestion = Arc::clone(&ingestion);
 
     let ct = tokio_util::sync::CancellationToken::new();
 
@@ -73,7 +72,6 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
                 Arc::clone(&handler_scheduler_notify),
                 Arc::clone(&notification_service),
                 Arc::clone(&handler_sync_manager),
-                Arc::clone(&handler_ingestion),
                 port,
             ))
         },
@@ -140,7 +138,7 @@ pub(crate) async fn run_stdio_server() -> Result<()> {
     let ingestion = Arc::new(IngestionManager::new(Arc::clone(&db), data_dir.clone()));
     let _ingestion_cancel = Arc::clone(&ingestion).start();
 
-    startup_enqueue_unindexed(Arc::clone(&ingestion), Arc::clone(&db)).await;
+    startup_personal_rag(Arc::clone(&ingestion), &data_dir).await;
 
     if let Err(e) = watcher_engine.reload_from_db().await {
         tracing::error!("Failed to reload watchers: {}", e);
@@ -157,7 +155,6 @@ pub(crate) async fn run_stdio_server() -> Result<()> {
         scheduler_notify,
         Arc::clone(&notification_service),
         sync_manager,
-        ingestion,
         0,
     );
 
@@ -175,44 +172,59 @@ pub(crate) async fn run_stdio_server() -> Result<()> {
     Ok(())
 }
 
-/// Enqueue all registered projects that have never been indexed,
-/// and reload any pending queue items left in the DB from a previous session.
-async fn startup_enqueue_unindexed(ingestion: Arc<IngestionManager>, db: Arc<Database>) {
-    // Reload any items already in the DB queue (e.g. queued via register_project_path
-    // in a previous session or via the sync path that writes directly to the DB).
-    // This is the primary fix for "indexed stays at 1" — items written to rag_queue
-    // by queue_project_files never reached the in-memory worker queue.
-    if let Ok(pending) = db.list_rag_queue(10_000) {
-        for item in &pending {
-            ingestion.enqueue(&item.source_path).await;
+/// Scan the personal RAG root for existing files, enqueue them, and start the watcher.
+async fn startup_personal_rag(ingestion: Arc<IngestionManager>, data_dir: &std::path::Path) {
+    let config = crate::domain::canopy_config::CanopyConfig::load(data_dir);
+    let personal_root = std::path::PathBuf::from(&config.rag_personal_root);
+
+    if let Err(e) = std::fs::create_dir_all(&personal_root) {
+        tracing::warn!(
+            "Could not create personal RAG root {:?}: {e}",
+            personal_root
+        );
+        return;
+    }
+
+    // Reload any items already in the DB queue from a previous session.
+    if let Ok(pending) = ingestion.db_pending_queue() {
+        for path in &pending {
+            ingestion.enqueue(path).await;
         }
         if !pending.is_empty() {
             tracing::info!(
-                "startup_enqueue: reloaded {} pending queue items",
+                "startup_personal_rag: reloaded {} pending queue items",
                 pending.len()
             );
         }
     }
 
-    let projects = match db.list_projects() {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!("startup_enqueue: failed to list projects: {}", e);
-            return;
+    // Scan existing files in the personal root.
+    let patterns = crate::rag::ragignore::load_patterns(data_dir);
+    let root = personal_root.clone();
+    let walker = walkdir::WalkDir::new(&personal_root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file());
+
+    let mut queued = 0usize;
+    for entry in walker {
+        let path = entry.path();
+        if crate::rag::ragignore::is_ignored(path, &root, &patterns) {
+            continue;
         }
-    };
-    for project in projects.into_iter().filter(|p| p.indexed_at.is_none()) {
-        if std::path::Path::new(&project.path).exists() {
-            let name = project.name.clone();
-            let hash = project.hash.clone();
-            ingestion.enqueue_project(&project).await;
-            tracing::info!(
-                "startup_enqueue: queued unindexed project '{}' ({})",
-                name,
-                hash,
-            );
+        let path_str = path.to_string_lossy().to_string();
+        if crate::rag::chunker::detect_lang(&path_str).is_some() {
+            ingestion.enqueue(&path_str).await;
+            queued += 1;
         }
     }
+    if queued > 0 {
+        tracing::info!("startup_personal_rag: queued {queued} existing file(s) for indexing");
+    }
+
+    // Start the filesystem watcher for live updates.
+    Arc::clone(&ingestion).start_personal_watcher(&personal_root);
 }
 
 async fn shutdown_signal() {

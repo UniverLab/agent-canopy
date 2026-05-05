@@ -181,10 +181,6 @@ pub struct RagSearchParams {
     pub query: String,
     /// Optional caller identity used for per-agent throttling.
     pub agent_id: Option<String>,
-    /// "global" (all projects) or "project" (single project).
-    pub scope: Option<String>,
-    /// Required when scope = "project".
-    pub project_hash: Option<String>,
     /// Max results (default: 5).
     pub limit: Option<usize>,
 }

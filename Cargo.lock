@@ -1123,6 +1123,7 @@ dependencies = [
  "portable-pty",
  "rand 0.10.1",
  "ratatui",
+ "regex",
  "reqwest",
  "rmcp",
  "rusqlite",

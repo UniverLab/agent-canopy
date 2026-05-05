@@ -84,43 +84,8 @@ impl Database {
             project.description = extract_readme_description(&readme);
         }
 
-        // Create .canopy/ragignore seeded from .gitignore if not present.
-        crate::rag::ragignore::ensure_ragignore(&canonical);
-
         self.upsert_project(&project)?;
-
-        // File scanning can be slow on large repos — run it off the calling thread
-        // so TUI / CLI callers are not blocked.
-        let db_clone = self.clone();
-        std::thread::spawn(move || {
-            let _ = db_clone.queue_project_files(&canonical);
-        });
-
         Ok(project)
-    }
-
-    /// Scan project directory and write all files to rag_queue.
-    /// Applies ragignore patterns, MAX_DEPTH, MAX_FILE_SIZE, and indexable-extension
-    /// filtering via `process_dir_entry` so the traversal is bounded.
-    fn queue_project_files(&self, root: &Path) -> Result<()> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs() as i64;
-
-        let patterns = crate::rag::ragignore::load_patterns(root);
-        let mut queue = vec![(root.to_path_buf(), 0usize)];
-
-        while let Some((current_path, depth)) = queue.pop() {
-            let Ok(entries) = std::fs::read_dir(&current_path) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                process_dir_entry(&entry, root, &patterns, depth, &mut queue, |path| {
-                    let _ = self.enqueue_rag_item(path, now);
-                });
-            }
-        }
-        Ok(())
     }
 
     pub fn delete_project(&self, hash: &str) -> Result<()> {
@@ -445,74 +410,4 @@ fn row_to_rag_queue_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<RagQueueIt
         status: row.get(1)?,
         queued_at: row.get(2)?,
     })
-}
-
-/// Process a single directory entry during project file scanning.
-/// Pushes subdirectories onto `queue` and calls `on_file` for indexable files.
-fn process_dir_entry(
-    entry: &std::fs::DirEntry,
-    root: &Path,
-    patterns: &[String],
-    depth: usize,
-    queue: &mut Vec<(std::path::PathBuf, usize)>,
-    mut on_file: impl FnMut(&str),
-) {
-    const MAX_DEPTH: usize = 10;
-    const MAX_FILE_SIZE: u64 = 5 * 1024 * 1024;
-
-    let entry_path = entry.path();
-
-    if crate::rag::ragignore::is_ignored(&entry_path, root, patterns) {
-        return;
-    }
-    let Ok(metadata) = entry.metadata() else {
-        return;
-    };
-
-    if metadata.is_dir() {
-        if depth < MAX_DEPTH {
-            queue.push((entry_path, depth + 1));
-        }
-        return;
-    }
-
-    if metadata.len() > MAX_FILE_SIZE {
-        return;
-    }
-    let Some(path_str) = entry_path.to_str() else {
-        return;
-    };
-    if is_indexable_path(path_str) {
-        on_file(path_str);
-    }
-}
-
-/// Returns true if the file at `path` has an extension the RAG indexer can process.
-/// Mirrors the extension list in `crate::rag::chunker::detect_lang` without
-/// creating a cross-module dependency cycle (db → rag → db).
-fn is_indexable_path(path: &str) -> bool {
-    let ext = std::path::Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
-    matches!(
-        ext,
-        "rs" | "py"
-            | "java"
-            | "kt"
-            | "js"
-            | "jsx"
-            | "ts"
-            | "tsx"
-            | "go"
-            | "c"
-            | "cpp"
-            | "h"
-            | "md"
-            | "mdx"
-            | "yaml"
-            | "yml"
-            | "toml"
-            | "txt"
-    )
 }

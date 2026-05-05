@@ -1,27 +1,16 @@
-//! `.canopy/ragignore` — global exclusion patterns for RAG indexing.
+//! `.canopy/ragignore` — global exclusion patterns for personal RAG indexing.
 //!
-//! Lives in the canopy data dir (`~/.canopy/ragignore`), not per-project.
-//! On first use it is created with default exclusions. When a project is
-//! registered its `.gitignore` patterns are merged in automatically.
+//! Lives in the canopy data dir (`~/.canopy/ragignore`).
+//! Each non-comment line is a regex pattern matched against the path of a file
+//! relative to the personal RAG root.  Lines starting with `#` are comments.
 
 use std::path::{Path, PathBuf};
 
 const DEFAULT_PATTERNS: &[&str] = &[
-    ".agents/",
-    ".git/",
-    "target/",
-    "node_modules/",
-    "dist/",
-    "build/",
-    ".cache/",
-    "__pycache__/",
-    ".venv/",
-    "vendor/",
-    ".idea/",
-    ".vscode/",
-    "*.lock",
-    "*.min.js",
-    "*.min.css",
+    r"^\.",    // hidden files / directories (e.g. .git, .DS_Store)
+    r"~$",     // editor backup files
+    r"\.tmp$", // temp files
+    r"\.swp$", // Vim swap files
 ];
 
 /// Path to the global ragignore file.
@@ -30,7 +19,7 @@ pub fn ragignore_path(data_dir: &Path) -> PathBuf {
 }
 
 /// Ensure the global ragignore exists in `data_dir`.
-/// Seeds it with default patterns if it doesn't exist yet.
+/// Seeds it with default patterns if it does not exist yet.
 pub fn ensure_ragignore(data_dir: &Path) {
     let path = ragignore_path(data_dir);
     if path.exists() {
@@ -40,47 +29,13 @@ pub fn ensure_ragignore(data_dir: &Path) {
         return;
     }
     let content = format!(
-        "# ragignore — global patterns excluded from RAG indexing\n# Glob patterns, one per line. Lines starting with # are comments.\n\n{}\n",
+        "# ragignore — regex patterns excluded from personal RAG indexing\n\
+         # One regex per line.  Lines starting with # are comments.\n\
+         # Patterns are matched against the path relative to the RAG root.\n\n\
+         {}\n",
         DEFAULT_PATTERNS.join("\n")
     );
     let _ = std::fs::write(&path, content);
-}
-
-/// Merge patterns from a project's `.gitignore` into the global ragignore.
-/// Only adds patterns not already present.
-pub fn merge_gitignore(data_dir: &Path, project_root: &Path) {
-    let gitignore = project_root.join(".gitignore");
-    let Ok(gitignore_content) = std::fs::read_to_string(&gitignore) else {
-        return;
-    };
-
-    let ragignore = ragignore_path(data_dir);
-    let existing = std::fs::read_to_string(&ragignore).unwrap_or_default();
-    let existing_patterns: std::collections::HashSet<&str> = existing
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .collect();
-
-    let new_patterns: Vec<&str> = gitignore_content
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#') && !existing_patterns.contains(l))
-        .collect();
-
-    if new_patterns.is_empty() {
-        return;
-    }
-
-    let addition = format!(
-        "\n# from {}\n{}\n",
-        project_root.display(),
-        new_patterns.join("\n")
-    );
-    let _ = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&ragignore)
-        .and_then(|mut f| std::io::Write::write_all(&mut f, addition.as_bytes()));
 }
 
 /// Load ignore patterns from the global ragignore in `data_dir`.
@@ -97,31 +52,19 @@ pub fn load_patterns(data_dir: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Returns true if `file_path` (absolute) should be excluded given `project_root`
-/// and the loaded `patterns`.
-pub fn is_ignored(file_path: &Path, project_root: &Path, patterns: &[String]) -> bool {
+/// Returns `true` if `file_path` should be excluded given `root` and the
+/// loaded regex `patterns`.  Invalid regex patterns are silently skipped.
+pub fn is_ignored(file_path: &Path, root: &Path, patterns: &[String]) -> bool {
     let rel = file_path
-        .strip_prefix(project_root)
+        .strip_prefix(root)
         .unwrap_or(file_path)
         .to_string_lossy();
 
     for pattern in patterns {
-        let pat = pattern.trim_end_matches('/');
-        if pattern.ends_with('/') {
-            if rel.starts_with(pat)
-                && (rel.len() == pat.len() || rel.as_bytes().get(pat.len()) == Some(&b'/'))
-            {
-                return true;
-            }
+        let Ok(re) = regex::Regex::new(pattern) else {
             continue;
-        }
-        if let Some(suffix) = pattern.strip_prefix('*') {
-            if rel.ends_with(suffix.trim_start_matches('/')) {
-                return true;
-            }
-            continue;
-        }
-        if rel.as_ref() == pattern.as_str() || rel.starts_with(&format!("{pattern}/")) {
+        };
+        if re.is_match(&rel) {
             return true;
         }
     }

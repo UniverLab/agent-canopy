@@ -70,6 +70,9 @@ sha2 = "0.10"
 # Directory traversal for RAG ingestion
 walkdir = "2"
 
+# Regex matching for ragignore patterns
+regex = "1"
+
 # Graceful shutdown coordination
 tokio-util = { version = "0.7", features = ["rt"] }
 

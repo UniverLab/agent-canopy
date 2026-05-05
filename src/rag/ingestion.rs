@@ -1,30 +1,28 @@
 #![allow(dead_code)]
-//! `IngestionManager` — async queue + background worker for RAG indexing.
+//! `IngestionManager` — async queue + background worker for personal RAG indexing.
 //!
-//! Uses SQLite FTS5 as the search index (bundled, zero extra deps).
-//! Embedding is deferred to a future spec iteration; for now chunks are
-//! stored as plain text and searched via FTS5 keyword matching.
+//! Indexes only `.md`, `.mdx`, and `.pdf` files from the personal RAG root
+//! (`~/.canopy/rag/` by default).  Uses SQLite FTS5 as the search backend.
 
 use std::collections::{HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::{Mutex, Notify};
 use uuid::Uuid;
 
 use crate::application::ports::StateRepository;
 use crate::db::project::Chunk;
 use crate::db::Database;
-use crate::domain::project::Project;
 use crate::rag::chunker::{chunk, detect_lang};
 
 const QUEUE_MAX: usize = 10_000;
 const FILE_MAX_BYTES: u64 = 5 * 1024 * 1024; // 5 MB
 
 struct Queue {
-    /// Ordered list of (project_hash, source_path) to process.
-    order: VecDeque<(String, String)>,
-    /// Set for dedup — if already queued, move to end.
-    set: HashSet<(String, String)>,
+    order: VecDeque<String>,
+    set: HashSet<String>,
 }
 
 impl Queue {
@@ -39,8 +37,10 @@ impl Queue {
         self.order.len()
     }
 
-    fn push(&mut self, project_hash: &str, path: &str) -> bool {
-        let key = (project_hash.to_owned(), path.to_owned());
+    /// Push a path to the back of the queue.  If already present, move to end.
+    /// Returns `false` when the queue is at capacity.
+    fn push(&mut self, path: &str) -> bool {
+        let key = path.to_owned();
         if self.set.contains(&key) {
             self.order.retain(|k| k != &key);
         }
@@ -52,7 +52,7 @@ impl Queue {
         true
     }
 
-    fn pop(&mut self) -> Option<(String, String)> {
+    fn pop(&mut self) -> Option<String> {
         let item = self.order.pop_front()?;
         self.set.remove(&item);
         Some(item)
@@ -61,40 +61,29 @@ impl Queue {
 
 pub struct IngestionManager {
     db: Arc<Database>,
-    data_dir: std::path::PathBuf,
+    data_dir: PathBuf,
     queue: Arc<Mutex<Queue>>,
     notify: Arc<Notify>,
+    /// Holds the personal-RAG notify watcher so it is not dropped.
+    _personal_watcher: std::sync::Mutex<Option<RecommendedWatcher>>,
 }
 
 impl IngestionManager {
-    pub fn new(db: Arc<Database>, data_dir: std::path::PathBuf) -> Self {
+    pub fn new(db: Arc<Database>, data_dir: PathBuf) -> Self {
         crate::rag::ragignore::ensure_ragignore(&data_dir);
         Self {
             db,
             data_dir,
             queue: Arc::new(Mutex::new(Queue::new())),
             notify: Arc::new(Notify::new()),
+            _personal_watcher: std::sync::Mutex::new(None),
         }
     }
 
-    /// Register a project path and enqueue all its files into the in-memory worker.
-    pub async fn register_and_enqueue(&self, path: &std::path::Path) {
-        let project = match self.db.register_project_path(path) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("RAG register_and_enqueue failed for {:?}: {e}", path);
-                return;
-            }
-        };
-        // Merge project's .gitignore into global ragignore
-        crate::rag::ragignore::merge_gitignore(&self.data_dir, path);
-        self.enqueue_project(&project).await;
-    }
-
-    /// Enqueue a file for (re)indexing. Returns false if queue is full.
+    /// Enqueue a file path for (re)indexing.  Returns `false` if the queue is full.
     pub async fn enqueue(&self, source_path: &str) -> bool {
         let mut q = self.queue.lock().await;
-        let ok = q.push("", source_path);
+        let ok = q.push(source_path);
         if ok {
             let now = chrono::Utc::now().timestamp();
             if let Err(e) = self.db.enqueue_rag_item(source_path, now) {
@@ -110,27 +99,95 @@ impl IngestionManager {
         self.queue.lock().await.len()
     }
 
-    /// Enqueue all supported files under `root` for a project.
-    pub async fn enqueue_project(&self, project: &Project) {
-        let root = std::path::Path::new(&project.path);
-        let patterns = crate::rag::ragignore::load_patterns(&self.data_dir);
-
-        let walker = walkdir::WalkDir::new(root)
-            .max_depth(10)
+    /// Return paths of items currently queued in the DB (from a previous session).
+    pub fn db_pending_queue(&self) -> anyhow::Result<Vec<String>> {
+        Ok(self
+            .db
+            .list_rag_queue(10_000)?
             .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-            .filter(|e| !crate::rag::ragignore::is_ignored(e.path(), root, &patterns));
+            .map(|i| i.source_path)
+            .collect())
+    }
 
-        for entry in walker {
-            let path = entry.path().to_string_lossy().to_string();
-            if detect_lang(&path).is_some() {
-                self.enqueue(&path).await;
+    /// Start a recursive filesystem watcher on `personal_root`.
+    ///
+    /// - Create/Modify events enqueue the file for (re)indexing (if supported).
+    /// - Delete events remove the file's chunks from the database immediately.
+    ///
+    /// The watcher is kept alive inside `self` for the lifetime of the manager.
+    pub fn start_personal_watcher(self: Arc<Self>, personal_root: &PathBuf) {
+        let rt = tokio::runtime::Handle::current();
+        let db = Arc::clone(&self.db);
+        let queue = Arc::clone(&self.queue);
+        let notify_handle = Arc::clone(&self.notify);
+        let root = personal_root.clone();
+        let data_dir = self.data_dir.clone();
+
+        let patterns = crate::rag::ragignore::load_patterns(&data_dir);
+
+        let mut watcher = match RecommendedWatcher::new(
+            move |res: Result<Event, notify::Error>| {
+                let Ok(event) = res else { return };
+                for path in &event.paths {
+                    if crate::rag::ragignore::is_ignored(path, &root, &patterns) {
+                        continue;
+                    }
+                    let path_str = path.to_string_lossy().to_string();
+                    match event.kind {
+                        EventKind::Create(_) | EventKind::Modify(_) => {
+                            if detect_lang(&path_str).is_some() {
+                                let q = Arc::clone(&queue);
+                                let n = Arc::clone(&notify_handle);
+                                let p = path_str.clone();
+                                let db2 = Arc::clone(&db);
+                                rt.spawn(async move {
+                                    let now = chrono::Utc::now().timestamp();
+                                    let ok = {
+                                        let mut lock = q.lock().await;
+                                        lock.push(&p)
+                                    };
+                                    if ok {
+                                        let _ = db2.enqueue_rag_item(&p, now);
+                                        n.notify_one();
+                                    }
+                                });
+                            }
+                        }
+                        EventKind::Remove(_) => {
+                            let db2 = Arc::clone(&db);
+                            rt.spawn(async move {
+                                let _ = db2.replace_chunks(&path_str, &[]);
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            },
+            Config::default(),
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!("Personal RAG watcher creation failed: {e}");
+                return;
             }
+        };
+
+        if let Err(e) = watcher.watch(personal_root, RecursiveMode::Recursive) {
+            tracing::warn!(
+                "Personal RAG watcher could not watch {:?}: {e}",
+                personal_root
+            );
+            return;
+        }
+
+        tracing::info!("Personal RAG watcher active on {:?}", personal_root);
+
+        if let Ok(mut guard) = self._personal_watcher.lock() {
+            *guard = Some(watcher);
         }
     }
 
-    /// Start the background worker. Returns a handle to cancel it.
+    /// Start the background indexing worker.  Returns a cancellation token.
     pub fn start(self: Arc<Self>) -> tokio_util::sync::CancellationToken {
         let ct = tokio_util::sync::CancellationToken::new();
         let ct_child = ct.child_token();
@@ -165,7 +222,7 @@ impl IngestionManager {
                 return;
             }
 
-            let Some((_ignored, source_path)) = self.queue.lock().await.pop() else {
+            let Some(source_path) = self.queue.lock().await.pop() else {
                 break;
             };
 
@@ -181,11 +238,11 @@ impl IngestionManager {
         }
 
         if processed > 0 {
-            tracing::info!("RAG: indexed {processed} file(s)");
+            tracing::info!("Personal RAG: indexed {processed} file(s)");
         }
     }
 
-    /// Spin-wait while RAG is paused. Returns `false` if cancelled.
+    /// Spin-wait while RAG is paused.  Returns `false` if cancelled.
     async fn wait_while_paused(&self, ct: &tokio_util::sync::CancellationToken) -> bool {
         while self.is_paused() {
             tokio::select! {
@@ -206,7 +263,7 @@ impl IngestionManager {
 
         let meta = std::fs::metadata(path)?;
         if meta.len() > FILE_MAX_BYTES {
-            tracing::debug!("RAG: skipping large file {source_path}");
+            tracing::debug!("Personal RAG: skipping large file {source_path}");
             return Ok(());
         }
 
