@@ -205,7 +205,7 @@ pub(crate) fn browse_directory(start_dir: &str) -> String {
     let mut cursor: usize = 0;
     let mut filter = String::new();
     let visible: usize = 10;
-    let total_rows = 3 + visible + 1; // +1 for filter line
+    let total_rows = 3 + visible + 1;
 
     let _ = enable_raw_mode();
     for _ in 0..total_rows {
@@ -213,80 +213,19 @@ pub(crate) fn browse_directory(start_dir: &str) -> String {
     }
 
     loop {
-        let all_subdirs = browse_list_subdirs(&current);
-        let subdirs: Vec<String> = if filter.is_empty() {
-            all_subdirs
-        } else {
-            let f = filter.to_lowercase();
-            all_subdirs
-                .into_iter()
-                .filter(|name| name.to_lowercase().contains(&f))
-                .collect()
-        };
-
-        if !subdirs.is_empty() && cursor >= subdirs.len() {
-            cursor = subdirs.len().saturating_sub(1);
-        }
-
-        let scroll = if cursor >= visible {
-            cursor - visible + 1
-        } else {
-            0
-        };
+        let subdirs = filter_subdirs_from(&current, &filter);
+        adjust_cursor_bounds(&mut cursor, subdirs.len());
+        let scroll = calculate_scroll(cursor, visible);
         let has_above = scroll > 0;
         let has_below = !subdirs.is_empty() && scroll + visible < subdirs.len();
 
-        print!("\x1b[{total_rows}A");
-        print!("\r\x1b[2K  \x1b[36m»\x1b[0m  {}\r\n", current.display());
-        print!(
-            "\r\x1b[2K  \x1b[90m↑↓ navigate  → enter  ← back  Enter confirm  Esc cancel  type to filter\x1b[0m\r\n"
+        render_browse_display(
+            total_rows, &current, &subdirs, cursor, scroll, visible, &filter, has_above, has_below,
         );
-        // Filter line
-        if filter.is_empty() {
-            print!("\r\x1b[2K  \x1b[90mfilter: _\x1b[0m\r\n");
-        } else {
-            print!("\r\x1b[2K  filter: \x1b[33m{filter}\x1b[0m \x1b[90m(Backspace to clear)\x1b[0m\r\n");
-        }
-
-        if subdirs.is_empty() {
-            if filter.is_empty() {
-                print!("\r\x1b[2K  \x1b[90m(empty — Enter to confirm, ← to go up)\x1b[0m\r\n");
-            } else {
-                print!("\r\x1b[2K  \x1b[90m(no matches for \"{filter}\")\x1b[0m\r\n");
-            }
-            for _ in 1..visible {
-                print!("\r\x1b[2K\r\n");
-            }
-        } else {
-            let mut drawn = 0usize;
-            for (i, name) in subdirs.iter().enumerate().skip(scroll).take(visible) {
-                if i == cursor {
-                    print!("\r\x1b[2K  \x1b[1;32m▶\x1b[0m \x1b[7m {name} \x1b[0m\r\n");
-                } else {
-                    print!("\r\x1b[2K    {name}\r\n");
-                }
-                drawn += 1;
-            }
-            for _ in drawn..visible {
-                print!("\r\x1b[2K\r\n");
-            }
-        }
-
-        if subdirs.is_empty() {
-            print!("\r\x1b[2K  \x1b[90m0 items\x1b[0m\r\n");
-        } else {
-            let up = if has_above { "↑ " } else { "  " };
-            let dn = if has_below { " ↓" } else { "  " };
-            print!(
-                "\r\x1b[2K  \x1b[90m{up}{}/{}{dn}\x1b[0m\r\n",
-                cursor + 1,
-                subdirs.len()
-            );
-        }
         let _ = io::stdout().flush();
 
-        match read() {
-            Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => {
+        if let Ok(Event::Key(k)) = read() {
+            if k.kind == KeyEventKind::Press {
                 match handle_browse_key(k.code, &subdirs, &mut cursor, &mut current, &mut filter) {
                     BrowseAction::Confirm => {
                         let _ = disable_raw_mode();
@@ -303,8 +242,109 @@ pub(crate) fn browse_directory(start_dir: &str) -> String {
                     BrowseAction::Continue => {}
                 }
             }
-            _ => {}
         }
+    }
+}
+
+fn filter_subdirs_from(current: &std::path::Path, filter: &str) -> Vec<String> {
+    let all = browse_list_subdirs(current);
+    if filter.is_empty() {
+        return all;
+    }
+    let f = filter.to_lowercase();
+    all.into_iter()
+        .filter(|name| name.to_lowercase().contains(&f))
+        .collect()
+}
+
+fn adjust_cursor_bounds(cursor: &mut usize, len: usize) {
+    if len > 0 && *cursor >= len {
+        *cursor = len - 1;
+    }
+}
+
+fn calculate_scroll(cursor: usize, visible: usize) -> usize {
+    if cursor >= visible {
+        cursor - visible + 1
+    } else {
+        0
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_browse_display(
+    total_rows: usize,
+    current: &std::path::Path,
+    subdirs: &[String],
+    cursor: usize,
+    scroll: usize,
+    visible: usize,
+    filter: &str,
+    has_above: bool,
+    has_below: bool,
+) {
+    print!("\x1b[{total_rows}A");
+    print!("\r\x1b[2K  \x1b[36m»\x1b[0m  {}\r\n", current.display());
+    print!(
+        "\r\x1b[2K  \x1b[90m↑↓ navigate  → enter  ← back  Enter confirm  Esc cancel  type to filter\x1b[0m\r\n"
+    );
+
+    if filter.is_empty() {
+        print!("\r\x1b[2K  \x1b[90mfilter: _\x1b[0m\r\n");
+    } else {
+        print!(
+            "\r\x1b[2K  filter: \x1b[33m{filter}\x1b[0m \x1b[90m(Backspace to clear)\x1b[0m\r\n"
+        );
+    }
+
+    render_subdirs_section(subdirs, cursor, scroll, visible, filter);
+    render_pagination_line(subdirs, cursor, has_above, has_below);
+}
+
+fn render_subdirs_section(
+    subdirs: &[String],
+    cursor: usize,
+    scroll: usize,
+    visible: usize,
+    filter: &str,
+) {
+    if subdirs.is_empty() {
+        let msg = if filter.is_empty() {
+            "(empty — Enter to confirm, ← to go up)"
+        } else {
+            "(no matches for \"{filter}\")"
+        };
+        print!("\r\x1b[2K  \x1b[90m{msg}\x1b[0m\r\n");
+        for _ in 1..visible {
+            print!("\r\x1b[2K\r\n");
+        }
+    } else {
+        let mut drawn = 0;
+        for (i, name) in subdirs.iter().enumerate().skip(scroll).take(visible) {
+            if i == cursor {
+                print!("\r\x1b[2K  \x1b[1;32m▶\x1b[0m \x1b[7m {name} \x1b[0m\r\n");
+            } else {
+                print!("\r\x1b[2K    {name}\r\n");
+            }
+            drawn += 1;
+        }
+        for _ in drawn..visible {
+            print!("\r\x1b[2K\r\n");
+        }
+    }
+}
+
+fn render_pagination_line(subdirs: &[String], cursor: usize, has_above: bool, has_below: bool) {
+    if subdirs.is_empty() {
+        print!("\r\x1b[2K  \x1b[90m0 items\x1b[0m\r\n");
+    } else {
+        let up = if has_above { "↑ " } else { "  " };
+        let dn = if has_below { " ↓" } else { "  " };
+        print!(
+            "\r\x1b[2K  \x1b[90m{up}{}/{}{dn}\x1b[0m\r\n",
+            cursor + 1,
+            subdirs.len()
+        );
     }
 }
 
