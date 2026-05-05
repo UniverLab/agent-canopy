@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use ratatui::style::Color;
 use std::collections::{HashMap, HashSet};
 
@@ -343,12 +343,8 @@ impl SimplePromptDialog {
         lines.join("\n")
     }
 
-    fn format_file_resource(path: &Path, content: &str) -> String {
-        format!(
-            "path: {}\nkind: file\ncontent:\n{}",
-            path.display(),
-            content
-        )
+    fn format_file_resource(path: &Path) -> String {
+        format!("path: {}\nkind: file", path.display())
     }
 
     fn format_rag_chunk(query: &str, chunk: &crate::db::project::Chunk) -> String {
@@ -384,9 +380,7 @@ impl SimplePromptDialog {
             return Ok(Some(format!("path: {}\nkind: directory", path.display())));
         }
 
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read resource file {}", path.display()))?;
-        Ok(Some(Self::format_file_resource(path, &content)))
+        Ok(Some(Self::format_file_resource(path)))
     }
 
     fn resolve_rag_scope<'a>(
@@ -979,7 +973,8 @@ mod tests {
 
         assert!(prompt.contains("# [PROJECT CONTEXT]: Registered Project Metadata"));
         assert!(prompt.contains(&project.hash));
-        assert!(prompt.contains("hello from resource"));
+        assert!(prompt.contains("kind: file"));
+        assert!(prompt.contains("guide.txt"));
         assert!(prompt.contains("kind: rag_chunk"));
         assert!(prompt.contains("semantic chunk body"));
     }
