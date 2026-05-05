@@ -148,6 +148,7 @@ pub struct App {
     pub(crate) copied_at: std::time::Instant,
     pub(crate) last_scroll_at: std::time::Instant,
     pub(crate) last_panel_inner: (u16, u16),
+    pub(crate) last_panel_y: u16,
     pub(crate) whimsg: crate::tui::whimsg::Whimsg,
     /// Hash of the last log chunk scanned for whimsg triggers — avoids re-firing
     /// on the same content every tick.

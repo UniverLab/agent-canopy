@@ -286,6 +286,7 @@ fn draw_focused_terminal_panel(frame: &mut Frame, area: Rect, app: &mut App, idx
         }
         draw_warp_input_box(frame, input_area, app, idx);
         app.last_panel_inner = (pty_area.width, pty_area.height);
+        app.last_panel_y = pty_area.y;
         return true;
     }
 
@@ -330,6 +331,7 @@ pub(super) fn draw_log_panel(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 
     app.last_panel_inner = (inner.width, inner.height);
+    app.last_panel_y = inner.y;
 
     if show_home_fallback(app) {
         draw_home_panel(frame, inner, app);
@@ -743,6 +745,7 @@ pub(super) fn draw_split_panel(
 
     if focused {
         app.last_panel_inner = (inner.width, inner.height);
+        app.last_panel_y = inner.y;
     }
 
     let Some(session) = found else {
@@ -790,6 +793,7 @@ fn draw_split_warp_panel(
 
     if focused {
         app.last_panel_inner = (pty_area.width, pty_area.height);
+        app.last_panel_y = pty_area.y;
     }
 }
 

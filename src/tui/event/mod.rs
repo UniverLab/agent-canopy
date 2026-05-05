@@ -185,11 +185,10 @@ fn handle_copy_click(app: &mut App, mouse: &MouseEvent) -> bool {
 
     if mouse.modifiers.contains(KeyModifiers::SHIFT) {
         handle_shift_click_copy(app);
-    } else {
-        handle_left_click_copy(app, mouse);
+        return true;
     }
 
-    true
+    false
 }
 
 fn handle_mouse_scroll(app: &mut App, mouse: &MouseEvent) {
@@ -254,21 +253,21 @@ fn try_forward_mouse_to_pty(app: &mut App, mouse: &MouseEvent) -> bool {
 
 fn mouse_pty_position(app: &App, mouse: &MouseEvent) -> Option<(u16, u16)> {
     let sidebar_width = sidebar_width(app);
-    let header_height = 1u16;
+    let panel_y = app.last_panel_y;
     let panel_width = app.last_panel_inner.0;
     let panel_height = app.last_panel_inner.1;
 
     if mouse.column < sidebar_width
-        || mouse.row < header_height
+        || mouse.row < panel_y
         || mouse.column >= sidebar_width.saturating_add(panel_width)
-        || mouse.row >= header_height.saturating_add(panel_height)
+        || mouse.row >= panel_y.saturating_add(panel_height)
     {
         return None;
     }
 
     Some((
         mouse.column.saturating_sub(sidebar_width),
-        mouse.row.saturating_sub(header_height),
+        mouse.row.saturating_sub(panel_y),
     ))
 }
 
@@ -278,22 +277,6 @@ fn sidebar_width(app: &App) -> u16 {
     } else {
         0
     }
-}
-
-fn handle_left_click_copy(app: &mut App, mouse: &MouseEvent) {
-    let Some((pty_col, pty_row)) = mouse_pty_position(app, mouse) else {
-        return;
-    };
-
-    let Some(text) = with_selected_terminal_like(app, |agent| {
-        agent.get_clean_pty_line_at_position(pty_col, pty_row)
-    })
-    .flatten() else {
-        return;
-    };
-
-    copy_to_clipboard_async(text);
-    mark_copied(app);
 }
 
 fn handle_shift_click_copy(app: &mut App) {
@@ -306,12 +289,6 @@ fn handle_shift_click_copy(app: &mut App) {
     };
 
     let _ = arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(&text));
-}
-
-fn copy_to_clipboard_async(text: String) {
-    std::thread::spawn(move || {
-        let _ = arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(&text));
-    });
 }
 
 fn mark_copied(app: &mut App) {

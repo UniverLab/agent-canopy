@@ -519,28 +519,28 @@ fn handle_dialog_key(
             dialog.focused_section -= 1;
             Ok(PromptAction::None)
         }
-        KeyCode::Left if is_shift => {
-            dialog.move_cursor_left(section_name, field_width);
-            Ok(PromptAction::None)
-        }
-        KeyCode::Right if is_shift => {
-            dialog.move_cursor_right(section_name, field_width);
-            Ok(PromptAction::None)
-        }
-        KeyCode::Up if is_shift => {
-            dialog.move_cursor_up(section_name, field_width);
-            Ok(PromptAction::None)
-        }
-        KeyCode::Down if is_shift => {
-            dialog.move_cursor_down(section_name, field_width);
-            Ok(PromptAction::None)
-        }
-        KeyCode::Up if dialog.focused_section > 0 => {
+        KeyCode::Up if is_shift && dialog.focused_section > 0 => {
             dialog.focused_section -= 1;
             Ok(PromptAction::None)
         }
-        KeyCode::Down if dialog.focused_section + 1 < dialog.enabled_sections.len() => {
+        KeyCode::Down if is_shift && dialog.focused_section + 1 < dialog.enabled_sections.len() => {
             dialog.focused_section += 1;
+            Ok(PromptAction::None)
+        }
+        KeyCode::Left => {
+            dialog.move_cursor_left(section_name, field_width);
+            Ok(PromptAction::None)
+        }
+        KeyCode::Right => {
+            dialog.move_cursor_right(section_name, field_width);
+            Ok(PromptAction::None)
+        }
+        KeyCode::Up => {
+            dialog.move_cursor_up(section_name, field_width);
+            Ok(PromptAction::None)
+        }
+        KeyCode::Down => {
+            dialog.move_cursor_down(section_name, field_width);
             Ok(PromptAction::None)
         }
         KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {

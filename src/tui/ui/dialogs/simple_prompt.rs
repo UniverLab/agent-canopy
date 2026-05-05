@@ -258,21 +258,18 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) {
             .map(|s| s.as_str())
             .unwrap_or(content_raw);
 
-        let (render_text, content_height, scroll_offset) = if is_tools {
+        let (render_text, cursor_idx_opt, content_height, scroll_offset) = if is_tools {
             // Tools section: read-only, always 1 line — shows skill label or placeholder
             let display = if content_raw.trim().is_empty() {
                 "  (empty — Ctrl+A to pick a skill)".to_string()
             } else {
                 content_raw.trim().to_string()
             };
-            (display, 1u16, 0u16)
+            (display, None, 1u16, 0u16)
         } else if is_focused {
             let cursor_idx = dialog
                 .cursor(section_name)
                 .min(content_real.chars().count());
-            let before: String = content_real.chars().take(cursor_idx).collect();
-            let after: String = content_real.chars().skip(cursor_idx).collect();
-            let text = format!("{}│{}", before, after);
             let max_h =
                 crate::tui::app::dialog::SimplePromptDialog::max_visible_lines(section_name);
             let vis = crate::tui::app::dialog::SimplePromptDialog::visual_line_count(
@@ -282,7 +279,8 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) {
             // Clamp content height to available space
             let max_avail = inner_bottom.saturating_sub(y_pos).saturating_sub(2);
             (
-                text,
+                content_real.to_string(),
+                Some(cursor_idx),
                 (vis as u16).clamp(1, max_h as u16).min(max_avail),
                 dialog.scroll(section_name) as u16,
             )
@@ -299,18 +297,60 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) {
             } else {
                 first_line.to_string()
             };
-            (text, 1u16, 0u16)
+            (text, None, 1u16, 0u16)
         };
 
         let styled_content = dialog.get_file_reference_with_styling(&render_text, accent);
         let mut spans = Vec::new();
-        for (text, color) in styled_content {
-            let span_style = if let Some(c) = color {
-                Style::default().fg(c).bg(section_bg)
-            } else {
-                Style::default().fg(Color::White).bg(section_bg)
-            };
-            spans.push(Span::styled(text, span_style));
+        if let Some(cursor_idx) = cursor_idx_opt {
+            // Block cursor: highlight the char under the cursor without shifting text
+            let mut char_count: usize = 0;
+            for (text, color) in styled_content {
+                let span_style = if let Some(c) = color {
+                    Style::default().fg(c).bg(section_bg)
+                } else {
+                    Style::default().fg(Color::White).bg(section_bg)
+                };
+                let text_chars = text.chars().count();
+                if cursor_idx >= char_count && cursor_idx < char_count + text_chars {
+                    let local_pos = cursor_idx - char_count;
+                    let before: String = text.chars().take(local_pos).collect();
+                    let cursor_ch: String = text
+                        .chars()
+                        .nth(local_pos)
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| " ".to_string());
+                    let after: String = text.chars().skip(local_pos + 1).collect();
+                    if !before.is_empty() {
+                        spans.push(Span::styled(before, span_style));
+                    }
+                    spans.push(Span::styled(
+                        cursor_ch,
+                        Style::default().fg(section_bg).bg(Color::White),
+                    ));
+                    if !after.is_empty() {
+                        spans.push(Span::styled(after, span_style));
+                    }
+                } else {
+                    spans.push(Span::styled(text, span_style));
+                }
+                char_count += text_chars;
+            }
+            if cursor_idx >= char_count {
+                spans.push(Span::styled(
+                    " ",
+                    Style::default().fg(section_bg).bg(Color::White),
+                ));
+            }
+        } else {
+            for (text, color) in styled_content {
+                let span_style = if let Some(c) = color {
+                    Style::default().fg(c).bg(section_bg)
+                } else {
+                    Style::default().fg(Color::White).bg(section_bg)
+                };
+                spans.push(Span::styled(text, span_style));
+            }
         }
 
         let content_paragraph = Paragraph::new(Line::from(spans))

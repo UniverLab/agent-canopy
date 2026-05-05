@@ -363,45 +363,6 @@ impl InteractiveAgent {
         }
     }
 
-    /// Get clean PTY line text at a specific screen position, excluding UI elements.
-    pub fn get_clean_pty_line_at_position(&self, col: u16, row: u16) -> Option<String> {
-        if row > 1000 || col > 1000 {
-            return None;
-        }
-
-        let vt = self.vt.try_lock().ok()?;
-        let screen = vt.screen();
-        let (screen_rows, screen_cols) = screen.size();
-
-        if screen_rows == 0 || screen_cols == 0 {
-            return None;
-        }
-
-        let actual_row = if self.in_alternate_screen() {
-            row.saturating_add(self.scroll_offset as u16)
-        } else {
-            row
-        };
-
-        if actual_row >= screen_rows || col >= screen_cols {
-            return None;
-        }
-
-        let line = read_screen_line(screen, actual_row, screen_cols)?;
-        let sanitized = sanitize_line(&line);
-
-        if sanitized.trim().is_empty() || is_ui_line(&sanitized) {
-            return None;
-        }
-
-        let clean = strip_borders(&sanitized);
-        if clean.trim().is_empty() {
-            None
-        } else {
-            Some(clean.to_string())
-        }
-    }
-
     /// Maximum scroll offset — try setting a large value and read back
     /// the clamped result from vt100's scrollback.
     pub fn max_scroll(&self) -> usize {

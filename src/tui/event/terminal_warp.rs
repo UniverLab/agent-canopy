@@ -511,7 +511,7 @@ pub fn open_terminal_suggestion_picker(app: &mut App, idx: usize) -> Result<()> 
         return Ok(());
     }
 
-    if is_cd_picker_request(&input) {
+    if is_cd_command(input.trim()) {
         let partial = if input.len() > 2 {
             input[3..].trim()
         } else {
