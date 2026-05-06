@@ -948,7 +948,9 @@ fn agent_is_waiting(agent: &AgentEntry, app: &App, selected: bool) -> bool {
 
     match agent {
         AgentEntry::Interactive(index) => app.interactive_agents[*index].is_waiting_for_input(),
-        AgentEntry::Terminal(index) => app.terminal_agents[*index].is_waiting_for_input(),
+        // Terminal sessions always have the cursor at the last row (shell prompt),
+        // so is_waiting_for_input would generate constant false positives.
+        AgentEntry::Terminal(_) => false,
         _ => false,
     }
 }
