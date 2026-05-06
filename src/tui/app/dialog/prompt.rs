@@ -86,17 +86,14 @@ impl SimplePromptDialog {
         counters.insert("instruction".to_string(), 2usize);
         counters.insert("context".to_string(), 2usize);
         let mut cursors = HashMap::new();
-        cursors.insert("context_1".to_string(), 0usize);
         cursors.insert("instruction_1".to_string(), 0usize);
         let mut scrolls = HashMap::new();
-        scrolls.insert("context_1".to_string(), 0usize);
         scrolls.insert("instruction_1".to_string(), 0usize);
         let mut sections = HashMap::new();
-        sections.insert("context_1".to_string(), String::new());
         sections.insert("instruction_1".to_string(), String::new());
         Self {
             sections,
-            enabled_sections: vec!["context_1".to_string(), "instruction_1".to_string()],
+            enabled_sections: vec!["instruction_1".to_string()],
             focused_section: 0,
             prev_focus: None,
             picker_mode: SectionPickerMode::None,
