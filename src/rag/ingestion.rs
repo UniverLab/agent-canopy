@@ -5,7 +5,7 @@
 //! (`~/.canopy/rag/` by default).  Uses SQLite FTS5 as the search backend.
 
 use std::collections::{HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -16,7 +16,8 @@ use crate::application::ports::StateRepository;
 use crate::db::project::Chunk;
 use crate::db::Database;
 use crate::rag::chunker::{chunk_semantic, detect_lang};
-use crate::rag::embedding_client::client_from_config;
+use crate::rag::embedding_client::{client_from_config, model_dimensions, EmbeddingClient};
+use crate::rag::vector_store::{VectorChunk, VectorStore};
 
 const QUEUE_MAX: usize = 10_000;
 const FILE_MAX_BYTES: u64 = 5 * 1024 * 1024; // 5 MB
@@ -163,8 +164,10 @@ impl IngestionManager {
                         }
                         EventKind::Remove(_) => {
                             let db2 = Arc::clone(&db);
+                            let data_dir2 = data_dir.clone();
                             rt.spawn(async move {
                                 let _ = db2.replace_chunks(&path_str, &[]);
+                                purge_vector_chunks(&data_dir2, &path_str).await;
                             });
                         }
                         _ => {}
@@ -268,6 +271,7 @@ impl IngestionManager {
 
         if !path.exists() {
             self.db.replace_chunks(source_path, &[])?;
+            purge_vector_chunks(&self.data_dir, source_path).await;
             return Ok(());
         }
 
@@ -285,8 +289,8 @@ impl IngestionManager {
         let now = chrono::Utc::now().timestamp();
         let config = crate::domain::canopy_config::CanopyConfig::load(&self.data_dir);
         let semantic_chunks = chunk_semantic(&content, lang, config.similarity_threshold);
-        let embedding_client = match client_from_config(&config) {
-            Ok(client) => Some(client),
+        let embedding_client: Option<Arc<dyn EmbeddingClient>> = match client_from_config(&config) {
+            Ok(client) => Some(Arc::from(client)),
             Err(error) => {
                 tracing::warn!("RAG embeddings unavailable for {source_path}: {error}");
                 None
@@ -294,13 +298,27 @@ impl IngestionManager {
         };
 
         let mut chunks = Vec::with_capacity(semantic_chunks.len());
+        let mut vector_chunks = Vec::new();
         for chunk in semantic_chunks {
+            let content = chunk.content;
+            let chunk_id = Uuid::new_v4().to_string();
             let embedding = if let Some(client) = embedding_client.as_ref() {
-                match client.embed(&chunk.content) {
-                    Ok(values) => Some(values),
-                    Err(error) => {
+                let client = Arc::clone(client);
+                let content_for_embedding = content.clone();
+                match tokio::task::spawn_blocking(move || client.embed(&content_for_embedding))
+                    .await
+                {
+                    Ok(Ok(values)) => Some(values),
+                    Ok(Err(error)) => {
                         tracing::warn!(
                             "RAG embedding error {source_path} chunk {}: {error}",
+                            chunk.index
+                        );
+                        None
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "RAG embedding task error {source_path} chunk {}: {error}",
                             chunk.index
                         );
                         None
@@ -310,12 +328,22 @@ impl IngestionManager {
                 None
             };
 
+            if let Some(vector_embedding) = embedding.as_ref() {
+                vector_chunks.push(VectorChunk {
+                    id: chunk_id.clone(),
+                    file_path: source_path.to_owned(),
+                    content: content.clone(),
+                    embedding: vector_embedding.clone(),
+                    created_at: now,
+                });
+            }
+
             chunks.push(Chunk {
-                id: Uuid::new_v4().to_string(),
+                id: chunk_id,
                 project_hash: None,
                 source_path: source_path.to_owned(),
                 chunk_index: chunk.index as i32,
-                content: chunk.content,
+                content,
                 lang: lang.to_owned(),
                 embedding,
                 updated_at: now,
@@ -323,6 +351,67 @@ impl IngestionManager {
         }
 
         self.db.replace_chunks(source_path, &chunks)?;
+        sync_vector_store(&config, source_path, &vector_chunks).await;
         Ok(())
+    }
+}
+
+async fn sync_vector_store(
+    config: &crate::domain::canopy_config::CanopyConfig,
+    source_path: &str,
+    chunks: &[VectorChunk],
+) {
+    let Some(store) = open_vector_store(config).await else {
+        return;
+    };
+
+    if let Err(error) = store.delete_by_path(source_path).await {
+        tracing::warn!("RAG vector cleanup error {source_path}: {error}");
+        return;
+    }
+
+    for chunk in chunks {
+        if let Err(error) = store.insert_chunk(chunk).await {
+            tracing::warn!(
+                "RAG vector store error {source_path} chunk {}: {error}",
+                chunk.id
+            );
+        }
+    }
+}
+
+async fn purge_vector_chunks(data_dir: &Path, source_path: &str) {
+    let config = crate::domain::canopy_config::CanopyConfig::load(data_dir);
+    let Some(store) = open_vector_store(&config).await else {
+        return;
+    };
+
+    if let Err(error) = store.delete_by_path(source_path).await {
+        tracing::warn!("RAG vector cleanup error {source_path}: {error}");
+    }
+}
+
+async fn open_vector_store(
+    config: &crate::domain::canopy_config::CanopyConfig,
+) -> Option<VectorStore> {
+    let model = config.embeddings_model.trim();
+    if model.is_empty() {
+        return None;
+    }
+
+    let dimensions = match model_dimensions(model) {
+        Ok(dimensions) => dimensions,
+        Err(error) => {
+            tracing::warn!("RAG vector store unavailable for model {model}: {error}");
+            return None;
+        }
+    };
+
+    match VectorStore::new(dimensions).await {
+        Ok(store) => Some(store),
+        Err(error) => {
+            tracing::warn!("RAG vector store open error: {error}");
+            None
+        }
     }
 }
