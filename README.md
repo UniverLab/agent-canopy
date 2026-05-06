@@ -28,7 +28,7 @@ harness-canopy is a modern, self-contained MCP (Multi-Agent Control Point) serve
 - **🚀 High-Performance Scheduler:** Event-driven cron scheduler using Tokio with zero polling overhead. Computes precise wake-up times and sleeps until needed, reducing CPU usage to near-zero when idle.
 - **📊 Real-time File Watcher:** Instantly reacts to file system events (create, modify, delete, move) using the notify crate with configurable debouncing and recursive directory monitoring.
 - **💾 Persistent State Management:** All tasks, watchers, execution logs, and agent state are stored in an embedded SQLite database with automatic migrations and transaction safety.
-- **🧠 Personal RAG Pipeline:** Markdown/PDF notes are semantically chunked, embedded with your configured model, and stored with vector metadata for higher quality retrieval.
+- **🧠 Personal RAG Pipeline:** Markdown/PDF notes are semantically chunked, embedded with your configured model, and stored in a LanceDB vector store for higher quality retrieval.
 
 ### 🤖 Agent Orchestration
 
