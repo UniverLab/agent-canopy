@@ -261,7 +261,7 @@ pub(crate) fn browse_directories_multiselect(start_dir: &str) -> Vec<String> {
     let mut filter = String::new();
     let mut selected: HashSet<String> = HashSet::new();
     let visible: usize = 10;
-    let total_rows = 4 + visible + 1;
+    let total_rows = 4 + visible;
 
     let _ = enable_raw_mode();
     for _ in 0..total_rows {
