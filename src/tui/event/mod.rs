@@ -239,20 +239,10 @@ fn rect_contains_point(rect: ratatui::layout::Rect, column: u16, row: u16) -> bo
 
 /// Try to forward the mouse event to the focused PTY agent.
 /// Returns `true` if the event was consumed.
-/// Note: Terminal sessions don't forward mouse to PTY (allows text selection for copy).
 fn try_forward_mouse_to_pty(app: &mut App, mouse: &MouseEvent) -> bool {
     let Some((pty_col, pty_row)) = mouse_pty_position(app, mouse) else {
         return false;
     };
-
-    // Only forward mouse to interactive agent PTYs, not terminal sessions
-    let Some((is_terminal, _)) = selected_terminal_like(app) else {
-        return false;
-    };
-
-    if is_terminal {
-        return false;
-    }
 
     with_selected_terminal_like_mut(app, |agent| {
         agent

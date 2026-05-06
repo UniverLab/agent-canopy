@@ -76,10 +76,6 @@ impl DialogFields {
         }
     }
 
-    fn is_active_dir_field(self, dialog: &NewAgentDialog) -> bool {
-        dialog.field == self.dir_field || self.is_watch_dir_field(dialog)
-    }
-
     fn is_watch_dir_field(self, dialog: &NewAgentDialog) -> bool {
         self.is_background
             && dialog.field == self.extra_field
@@ -180,12 +176,6 @@ fn handle_dialog_enter(app: &mut App) {
         let Some(dialog) = app.new_agent_dialog.as_mut() else {
             return;
         };
-
-        let fields = DialogFields::from(dialog);
-        if fields.is_active_dir_field(dialog) {
-            dialog.select_current();
-            return;
-        }
 
         if should_open_session_picker(dialog) {
             dialog.open_session_picker();

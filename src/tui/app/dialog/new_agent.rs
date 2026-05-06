@@ -495,42 +495,6 @@ impl NewAgentDialog {
         }
     }
 
-    /// Select the currently highlighted entry as the working dir (Enter key).
-    /// For directories: sets working_dir to that path without navigating into it.
-    /// For files (Watcher only): sets watch_path.
-    pub fn select_current(&mut self) {
-        let filtered = self.filtered_dir_entries();
-        if self.dir_selected >= filtered.len() {
-            // Nothing highlighted — select current_path itself
-            self.working_dir = self.current_path.clone();
-            if self.task_type == NewTaskType::Background
-                && self.background_trigger == BackgroundTrigger::Watch
-            {
-                self.watch_path = self.current_path.clone();
-            }
-            return;
-        }
-
-        let selected = filtered[self.dir_selected].clone();
-        let name = selected.trim_start_matches("📁 ").trim_start_matches("  ");
-        let full_path = format!("{}/{}", self.current_path.trim_end_matches('/'), name);
-        let is_dir = std::fs::metadata(&full_path)
-            .map(|m| m.is_dir())
-            .unwrap_or(false);
-
-        if is_dir {
-            self.working_dir = full_path.clone();
-            if self.task_type == NewTaskType::Background
-                && self.background_trigger == BackgroundTrigger::Watch
-            {
-                self.watch_path = full_path;
-            }
-        } else {
-            // File selected (Watcher only)
-            self.watch_path = full_path;
-        }
-    }
-
     /// Update working_dir preview based on currently selected item in picker
     /// This is called while navigating with ↑↓ to show real-time preview
     pub fn update_dir_preview(&mut self) {
