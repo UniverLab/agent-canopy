@@ -126,6 +126,7 @@ fn handle_global_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> b
     if code == KeyCode::Char('b')
         && modifiers.contains(KeyModifiers::CONTROL)
         && matches!(app.focus, Focus::Agent)
+        && !is_terminal_agent_selected(app)
     {
         app.open_simple_prompt_dialog(None);
         return true;
@@ -484,6 +485,11 @@ fn jump_terminal_search_match(search: &TerminalSearch, app: &mut App) {
     let _ = with_terminal_like_agent_mut(app, search.is_terminal, search.agent_idx, |agent| {
         search.jump_to_match(agent);
     });
+}
+
+/// Check if the currently selected agent is a Terminal agent.
+fn is_terminal_agent_selected(app: &App) -> bool {
+    matches!(app.selected_agent(), Some(AgentEntry::Terminal(_)))
 }
 
 #[cfg(test)]
