@@ -273,6 +273,8 @@ fn distance_at(batch: &RecordBatch, row: usize) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rag::chunker::chunk_semantic;
+    use crate::rag::embedding_client::{EmbeddingClient, MockEmbeddingClient};
     use tempfile::TempDir;
 
     fn chunk(id: &str, file_path: &str, content: &str, embedding: Vec<f32>) -> VectorChunk {
@@ -343,5 +345,34 @@ mod tests {
             .expect_err("dimension mismatch should fail");
 
         assert!(error.to_string().contains("Embedding dimensions mismatch"));
+    }
+
+    #[tokio::test]
+    async fn semantic_chunking_embedding_and_vector_search_roundtrip() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = VectorStore::open_at(&VectorStore::path_for_tests(temp_dir.path()), 4)
+            .await
+            .unwrap();
+        let embedder = MockEmbeddingClient::new(4);
+        let content = "# Alpha\n\nalpha beta gamma\n\n## Beta\n\ndelta epsilon zeta";
+
+        for semantic_chunk in chunk_semantic(content, "markdown", 0.4) {
+            let embedding = embedder.embed(&semantic_chunk.content).unwrap();
+            let chunk = VectorChunk {
+                id: format!("chunk-{}", semantic_chunk.index),
+                file_path: "/docs/guide.md".to_string(),
+                content: semantic_chunk.content,
+                embedding,
+                created_at: 1_715_000_000,
+            };
+            store.insert_chunk(&chunk).await.unwrap();
+        }
+
+        let query = embedder.embed("alpha beta gamma").unwrap();
+        let results = store.search_similar(&query, 1).await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].content.contains("Alpha"));
+        assert_eq!(results[0].file_path, "/docs/guide.md");
     }
 }
