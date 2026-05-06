@@ -47,27 +47,29 @@ impl InteractiveAgent {
 
     /// Detect if the agent appears to be waiting for user input / confirmation.
     ///
-    /// Strategy (cursor-position only — no text-pattern matching):
-    /// 1. Process is running AND idle for 1_000ms (1 second) with no output.
-    /// 2. Cursor is on the last non-empty row of the visible screen.
+    /// Conservative strategy (cursor-position only — no text-pattern matching):
+    /// 1. Process is running AND idle for 5+ seconds with new output.
+    /// 2. Cursor is on the very last row (not middle) of the visible screen.
     ///
-    /// Text patterns were removed because box-drawing characters appear in all
+    /// Thresholds are deliberately high to avoid false positives. Once activated,
+    /// will not reactivate unless there's new output (prevents flashing on idle).
     pub fn is_waiting_for_input(&self) -> bool {
         if self.status != AgentStatus::Running {
             return false;
         }
 
         let (is_idle, new_output) = self.check_idle_state();
+        // Only show waiting if idle AND we saw new output (prevents re-triggering on no change)
         if !is_idle || !new_output {
             return false;
         }
 
         let Some(screen) = self.screen_snapshot() else {
-            return true;
+            return false;
         };
         let rows = screen.cells.len();
         if rows == 0 {
-            return true;
+            return false;
         }
 
         let last_nonempty = (0..rows).rev().find(|&r| {
@@ -77,12 +79,18 @@ impl InteractiveAgent {
             })
         });
 
-        let Some(_) = last_nonempty else { return true };
-        is_idle && (screen.cursor_row as usize) > rows / 2
+        let Some(last_row) = last_nonempty else {
+            return false;
+        };
+        // Cursor must be on the actual last non-empty row (very last, not just lower half)
+        // and be near the right side to indicate prompt awaiting input
+        is_idle
+            && (screen.cursor_row as usize) == last_row
+            && screen.cursor_col as usize > last_row.saturating_sub(5)
     }
 
     fn check_idle_state(&self) -> (bool, bool) {
-        const IDLE_MS: i64 = 2000;
+        const IDLE_MS: i64 = 5000; // 5 seconds — much more conservative
         let Ok(out) = self.last_output_at.lock() else {
             return (false, false);
         };
