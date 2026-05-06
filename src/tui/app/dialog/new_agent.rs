@@ -531,6 +531,22 @@ impl NewAgentDialog {
         }
     }
 
+    /// Update working_dir preview based on currently selected item in picker
+    /// This is called while navigating with ↑↓ to show real-time preview
+    pub fn update_dir_preview(&mut self) {
+        let filtered = self.filtered_dir_entries();
+        if self.dir_selected >= filtered.len() {
+            // Nothing selected, use current_path
+            self.working_dir = self.current_path.clone();
+            return;
+        }
+
+        let selected = filtered[self.dir_selected].clone();
+        let name = selected.trim_start_matches("📁 ").trim_start_matches("  ");
+        let full_path = format!("{}/{}", self.current_path.trim_end_matches('/'), name);
+        self.working_dir = full_path;
+    }
+
     /// Navigate into the selected directory entry (→ key).
     pub fn navigate_to_selected(&mut self) {
         let filtered = self.filtered_dir_entries();

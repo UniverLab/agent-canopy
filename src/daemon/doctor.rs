@@ -52,9 +52,9 @@ pub(crate) async fn run_doctor() -> Result<()> {
     if config.is_configured() {
         println!("  \x1b[32m✓\x1b[0m Config: config.toml");
         if config.clis.is_empty() {
-            println!("    CLIs: (none configured)");
+            println!("    Harnesses: (none configured)");
         } else {
-            println!("    CLIs: {}", config.cli_names().join(", "));
+            println!("    Harnesses: {}", config.cli_names().join(", "));
         }
     } else {
         // Check for legacy files
@@ -91,7 +91,7 @@ pub(crate) async fn run_doctor() -> Result<()> {
     let available_clis = crate::domain::models::Cli::detect_available();
     if !available_clis.is_empty() {
         println!(
-            "  \x1b[32m✓\x1b[0m CLIs in PATH: {}",
+            "  \x1b[32m✓\x1b[0m Harnesses in PATH: {}",
             available_clis
                 .iter()
                 .map(|c| c.as_str())
@@ -99,7 +99,7 @@ pub(crate) async fn run_doctor() -> Result<()> {
                 .join(", ")
         );
     } else {
-        println!("  \x1b[31m✗\x1b[0m No supported CLIs found in PATH");
+        println!("  \x1b[31m✗\x1b[0m No supported harnesses found in PATH");
         issues.push("Install at least one: opencode, kiro-cli, copilot, or qwen");
     }
 

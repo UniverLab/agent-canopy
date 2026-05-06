@@ -179,13 +179,13 @@ fn background_trigger_label(trigger: BackgroundTrigger) -> &'static str {
 fn help_text(dialog: &NewAgentDialog) -> &'static str {
     match dialog.task_type {
         NewTaskType::Interactive => {
-            "  ↑↓: fields · ←→: mode  (in dirs: → enter  ← up) · Enter: launch · Esc: cancel"
+            "  ↑↓: fields · Shift+↑↓: navigate  (in dirs: → enter  ← up) · Enter: launch · Esc: cancel"
         }
         NewTaskType::Background => {
-            "  ↑↓: fields · ←→: trigger  (in dirs: → enter  ← up) · Enter: create · Esc: cancel"
+            "  ↑↓: fields · Shift+↑↓: navigate  (in dirs: → enter  ← up) · Enter: create · Esc: cancel"
         }
         NewTaskType::Terminal => {
-            "  ↑↓: fields  (in dirs: → enter  ← up) · Enter: launch · Esc: cancel"
+            "  ↑↓: fields · Shift+↑↓: navigate  (in dirs: → enter  ← up) · Enter: launch · Esc: cancel"
         }
     }
 }

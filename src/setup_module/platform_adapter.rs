@@ -246,6 +246,216 @@ pub(crate) fn browse_directory(start_dir: &str) -> String {
     }
 }
 
+/// Multi-select directory browser - allows selecting multiple directories with space bar
+pub(crate) fn browse_directories_multiselect(start_dir: &str) -> Vec<String> {
+    use ratatui::crossterm::event::{read, Event, KeyEventKind};
+    use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+    use std::collections::HashSet;
+
+    let mut current = std::path::PathBuf::from(start_dir);
+    if !current.is_dir() {
+        current = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+    }
+
+    let mut cursor: usize = 0;
+    let mut filter = String::new();
+    let mut selected: HashSet<String> = HashSet::new();
+    let visible: usize = 10;
+    let total_rows = 4 + visible + 1;
+
+    let _ = enable_raw_mode();
+    for _ in 0..total_rows {
+        print!("\r\n");
+    }
+
+    loop {
+        let subdirs = filter_subdirs_from(&current, &filter);
+        adjust_cursor_bounds(&mut cursor, subdirs.len());
+        let scroll = calculate_scroll(cursor, visible);
+        let has_above = scroll > 0;
+        let has_below = !subdirs.is_empty() && scroll + visible < subdirs.len();
+
+        render_multiselect_display(
+            total_rows, &current, &subdirs, cursor, scroll, visible, &filter, has_above, has_below,
+            &selected,
+        );
+        let _ = io::stdout().flush();
+
+        if let Ok(Event::Key(k)) = read() {
+            if k.kind == KeyEventKind::Press {
+                match handle_multiselect_key(
+                    k.code,
+                    &subdirs,
+                    &mut cursor,
+                    &mut current,
+                    &mut filter,
+                    &mut selected,
+                ) {
+                    MultiSelectAction::Confirm => {
+                        let _ = disable_raw_mode();
+                        print!("\r\n");
+                        let _ = io::stdout().flush();
+                        return selected.into_iter().collect();
+                    }
+                    MultiSelectAction::Cancel => {
+                        let _ = disable_raw_mode();
+                        print!("\r\n");
+                        let _ = io::stdout().flush();
+                        return Vec::new();
+                    }
+                    MultiSelectAction::Continue => {}
+                }
+            }
+        }
+    }
+}
+
+enum MultiSelectAction {
+    Confirm,
+    Cancel,
+    Continue,
+}
+
+fn handle_multiselect_key(
+    code: ratatui::crossterm::event::KeyCode,
+    subdirs: &[String],
+    cursor: &mut usize,
+    current: &mut std::path::PathBuf,
+    filter: &mut String,
+    selected: &mut std::collections::HashSet<String>,
+) -> MultiSelectAction {
+    use ratatui::crossterm::event::KeyCode;
+    match code {
+        KeyCode::Enter => MultiSelectAction::Confirm,
+        KeyCode::Esc => MultiSelectAction::Cancel,
+        KeyCode::Up => {
+            *cursor = cursor.saturating_sub(1);
+            MultiSelectAction::Continue
+        }
+        KeyCode::Down if !subdirs.is_empty() && *cursor + 1 < subdirs.len() => {
+            *cursor += 1;
+            MultiSelectAction::Continue
+        }
+        KeyCode::Char(' ') if filter.is_empty() => {
+            // Toggle selection of current item
+            if let Some(name) = subdirs.get(*cursor) {
+                let full_path = current.join(name).to_string_lossy().to_string();
+                if selected.contains(&full_path) {
+                    selected.remove(&full_path);
+                } else {
+                    selected.insert(full_path);
+                }
+            }
+            MultiSelectAction::Continue
+        }
+        KeyCode::Right | KeyCode::Char('l') if filter.is_empty() => {
+            if let Some(name) = subdirs.get(*cursor) {
+                *current = current.join(name);
+                *cursor = 0;
+            }
+            MultiSelectAction::Continue
+        }
+        KeyCode::Left | KeyCode::Char('h') if filter.is_empty() => {
+            if let Some(parent) = current.parent() {
+                *current = parent.to_path_buf();
+                *cursor = 0;
+            }
+            MultiSelectAction::Continue
+        }
+        KeyCode::Right if !filter.is_empty() => {
+            if let Some(name) = subdirs.get(*cursor) {
+                *current = current.join(name);
+                *cursor = 0;
+                filter.clear();
+            }
+            MultiSelectAction::Continue
+        }
+        KeyCode::Char(c) if !c.is_control() && filter.len() < 50 => {
+            filter.push(c);
+            *cursor = 0;
+            MultiSelectAction::Continue
+        }
+        KeyCode::Backspace => {
+            filter.pop();
+            *cursor = 0;
+            MultiSelectAction::Continue
+        }
+        _ => MultiSelectAction::Continue,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_multiselect_display(
+    total_rows: usize,
+    current: &std::path::Path,
+    subdirs: &[String],
+    cursor: usize,
+    scroll: usize,
+    visible: usize,
+    filter: &str,
+    has_above: bool,
+    has_below: bool,
+    selected: &std::collections::HashSet<String>,
+) {
+    print!("\x1b[{total_rows}A");
+    print!("\r\x1b[2K  \x1b[36m»\x1b[0m  {}\r\n", current.display());
+    let selected_count = selected.len();
+    print!(
+        "\r\x1b[2K  \x1b[90m↑↓ navigate  Space mark  → enter  ← back  Enter confirm  Esc cancel  ({} selected)\x1b[0m\r\n",
+        selected_count
+    );
+
+    if filter.is_empty() {
+        print!("\r\x1b[2K  \x1b[90mfilter: _\x1b[0m\r\n");
+    } else {
+        print!(
+            "\r\x1b[2K  filter: \x1b[33m{filter}\x1b[0m \x1b[90m(Backspace to clear)\x1b[0m\r\n"
+        );
+    }
+
+    render_multiselect_subdirs(subdirs, cursor, scroll, visible, filter, current, selected);
+    render_pagination_line(subdirs, cursor, has_above, has_below);
+}
+
+fn render_multiselect_subdirs(
+    subdirs: &[String],
+    cursor: usize,
+    scroll: usize,
+    visible: usize,
+    filter: &str,
+    current: &std::path::Path,
+    selected: &std::collections::HashSet<String>,
+) {
+    if subdirs.is_empty() {
+        let msg = if filter.is_empty() {
+            "(empty — Enter to confirm, ← to go up)"
+        } else {
+            "(no matches for \"{filter}\")"
+        };
+        print!("\r\x1b[2K  \x1b[90m{msg}\x1b[0m\r\n");
+        for _ in 1..visible {
+            print!("\r\x1b[2K\r\n");
+        }
+    } else {
+        let mut drawn = 0;
+        for (i, name) in subdirs.iter().enumerate().skip(scroll).take(visible) {
+            let full_path = current.join(name).to_string_lossy().to_string();
+            let is_selected = selected.contains(&full_path);
+            let marker = if is_selected { "☑" } else { "☐" };
+
+            if i == cursor {
+                print!("\r\x1b[2K  \x1b[1;32m▶\x1b[0m \x1b[7m {marker} {name} \x1b[0m\r\n");
+            } else {
+                print!("\r\x1b[2K    {marker} {name}\r\n");
+            }
+            drawn += 1;
+        }
+        for _ in drawn..visible {
+            print!("\r\x1b[2K\r\n");
+        }
+    }
+}
+
 fn filter_subdirs_from(current: &std::path::Path, filter: &str) -> Vec<String> {
     let all = browse_list_subdirs(current);
     if filter.is_empty() {

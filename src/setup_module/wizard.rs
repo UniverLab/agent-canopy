@@ -2,7 +2,7 @@ use crate::setup_module::daemon_service::{
     install_service_if_needed, start_daemon_if_needed, stop_daemon,
 };
 use crate::setup_module::models::{is_platform_available, Platform};
-use crate::setup_module::platform_adapter::{browse_directory, clear_wizard_screen};
+use crate::setup_module::platform_adapter::{browse_directories_multiselect, clear_wizard_screen};
 use crate::setup_module::registry_fetch::{fetch_registry, print_banner};
 use crate::setup_module::sync_and_skills::{run_essential_skills_step, run_sync_step};
 use crate::setup_module::PlatformWithCli;
@@ -367,40 +367,23 @@ fn pick_multiple_directories(
             println!("    \x1b[90m• {dir}\x1b[0m");
         }
     }
-    println!("  \x1b[90mUse the directory picker and press Enter to confirm each folder.\x1b[0m");
+    println!("  \x1b[90mUse Space to mark directories, navigate with ↑↓, → to enter folders, ← to go up, Enter to confirm.\x1b[0m");
 
-    let mut dirs: Vec<String> = Vec::new();
-    let mut last = initial.to_string();
+    let selected = browse_directories_multiselect(initial);
 
-    loop {
-        let selected = browse_directory(&last);
-        let trimmed = selected.trim().to_string();
-        if trimmed.is_empty() {
-            if dirs.is_empty() {
-                anyhow::bail!("At least one RAG directory is required");
-            }
-            break;
-        }
-        if !dirs.contains(&trimmed) {
-            dirs.push(trimmed.clone());
-        }
-        last = trimmed;
-
-        println!("\n  \x1b[32m✓\x1b[0m Added: {}", dirs.last().unwrap());
-        for d in &dirs {
-            println!("    \x1b[90m• {d}\x1b[0m");
-        }
-        println!();
-
-        let add_more = Confirm::new("Add another directory?")
-            .with_default(false)
-            .with_help_message("enter: confirm")
-            .prompt()
-            .unwrap_or(false);
-        if !add_more {
-            break;
-        }
+    if selected.is_empty() {
+        anyhow::bail!("At least one RAG directory is required");
     }
+
+    // Sort for consistency
+    let mut dirs = selected;
+    dirs.sort();
+
+    println!("\n  \x1b[32m✓\x1b[0m Selected directories:");
+    for dir in &dirs {
+        println!("    \x1b[90m• {dir}\x1b[0m");
+    }
+    println!();
 
     Ok(dirs)
 }

@@ -105,8 +105,8 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) {
     let instructions = Line::from(vec![
         Span::styled("↑↓ ", Style::default().fg(DIM)),
         Span::styled("fields  ", Style::default().fg(Color::White)),
-        Span::styled("⇧↑↓←→ ", Style::default().fg(DIM)),
-        Span::styled("cursor  ", Style::default().fg(Color::White)),
+        Span::styled("Shift+↑↓ ", Style::default().fg(DIM)),
+        Span::styled("navigate  ", Style::default().fg(Color::White)),
         Span::styled("@ ", Style::default().fg(DIM)),
         Span::styled("file  ", Style::default().fg(Color::White)),
         Span::styled("Ctrl+A ", Style::default().fg(DIM)),

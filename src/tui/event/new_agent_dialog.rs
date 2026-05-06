@@ -426,6 +426,7 @@ fn handle_directory_field(
 fn move_directory_up(dialog: &mut NewAgentDialog, fields: DialogFields, is_watch_dir: bool) {
     if dialog.dir_selected > 0 {
         dialog.dir_selected -= 1;
+        dialog.update_dir_preview();
         return;
     }
 
@@ -436,6 +437,7 @@ fn move_directory_down(dialog: &mut NewAgentDialog, fields: DialogFields) {
     let filtered_len = dialog.filtered_dir_entries().len();
     if filtered_len > 0 && dialog.dir_selected + 1 < filtered_len {
         dialog.dir_selected += 1;
+        dialog.update_dir_preview();
         return;
     }
 
