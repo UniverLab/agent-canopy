@@ -109,6 +109,10 @@ flate2 = "1.0"
 tar = "0.4"
 tempfile = "3.8"
 sysinfo = "0.38"
+lancedb = "0.27.2"
+arrow-array = "57"
+arrow-schema = "57"
+futures = "0.3"
 
 # Unix process management (kill, setsid)
 [target.'cfg(unix)'.dependencies]
