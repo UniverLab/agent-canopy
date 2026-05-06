@@ -26,8 +26,12 @@ pub struct CanopyConfig {
     pub temperature_unit: TemperatureUnit,
 
     /// Embeddings model identifier used by the knowledge layer.
-    #[serde(default = "default_embeddings_model")]
+    #[serde(default)]
     pub embeddings_model: String,
+
+    /// Similarity threshold for semantic chunk merging (0.0 - 1.0).
+    #[serde(default = "default_similarity_threshold")]
+    pub similarity_threshold: f32,
 
     /// Personal RAG directories — all are indexed recursively.
     /// Replaces the old `rag_personal_root` single-path field.
@@ -59,8 +63,8 @@ fn default_mcp_root() -> String {
         .unwrap_or_else(|| "/".to_string())
 }
 
-fn default_embeddings_model() -> String {
-    "text-embedding-3-small".to_string()
+fn default_similarity_threshold() -> f32 {
+    0.4
 }
 
 fn default_projects_root() -> String {
@@ -126,7 +130,8 @@ impl Default for CanopyConfig {
             mcp_filesystem_root: default_mcp_root(),
             clis: Vec::new(),
             temperature_unit: TemperatureUnit::default(),
-            embeddings_model: default_embeddings_model(),
+            embeddings_model: String::new(),
+            similarity_threshold: default_similarity_threshold(),
             rag_personal_dirs: Vec::new(),
             rag_personal_root: String::new(),
             projects_root: default_projects_root(),
@@ -145,7 +150,8 @@ mod tests {
         assert!(!config.is_configured());
         assert!(config.clis.is_empty());
         assert_eq!(config.temperature_unit, TemperatureUnit::Celsius);
-        assert_eq!(config.embeddings_model, "text-embedding-3-small");
+        assert_eq!(config.embeddings_model, "");
+        assert_eq!(config.similarity_threshold, 0.4);
     }
 
     #[test]
@@ -158,6 +164,7 @@ mod tests {
         config.mcp_filesystem_root = "/custom/path".to_string();
         config.temperature_unit = TemperatureUnit::Fahrenheit;
         config.embeddings_model = "custom-embed".to_string();
+        config.similarity_threshold = 0.35;
         config.rag_personal_dirs = vec!["/rag/home".to_string(), "/rag/docs".to_string()];
         config.projects_root = "/projects".to_string();
 

@@ -110,6 +110,28 @@ pub fn run_setup() -> Result<()> {
     ));
 
     wiz.render()?;
+    // Similarity threshold for semantic chunk merging (default range 0.3-0.5, default 0.4)
+    let similarity_threshold = {
+        let default = existing_config.similarity_threshold;
+        let input = Text::new("Similarity threshold for semantic chunk merging (0.3-0.5):")
+            .with_initial_value(&format!("{:.2}", default))
+            .with_help_message("Value between 0.3 and 0.5 (recommended 0.4)")
+            .prompt()
+            .map_err(|e| anyhow::anyhow!("Similarity threshold selection cancelled: {}", e))?;
+        let parsed = input
+            .trim()
+            .parse::<f32>()
+            .map_err(|e| anyhow::anyhow!("Invalid number: {}", e))?;
+        if !(0.3f32..=0.5f32).contains(&parsed) {
+            anyhow::bail!("Similarity threshold must be between 0.3 and 0.5");
+        }
+        parsed
+    };
+    wiz.add(format!(
+        "\x1b[32m✓\x1b[0m Similarity threshold: {:.2}",
+        similarity_threshold
+    ));
+
     let prev_dirs = existing_config.rag_personal_dirs.clone();
     let rag_personal_dirs = pick_multiple_directories(
         "Personal RAG directories (your own notes/docs — indexed for global retrieval):",
@@ -177,6 +199,7 @@ pub fn run_setup() -> Result<()> {
     config.clis = cli_registry.available_clis;
     config.temperature_unit = temperature_unit;
     config.embeddings_model = embeddings_model;
+    config.similarity_threshold = similarity_threshold;
     config.rag_personal_dirs = rag_personal_dirs;
     let config_step = match config.save(&canopy_dir) {
         Ok(_) => format!(
