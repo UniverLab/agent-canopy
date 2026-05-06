@@ -113,25 +113,8 @@ fn clean_context_output(raw: &str) -> String {
 fn is_status_noise(line: &str) -> bool {
     let trimmed = line.trim();
 
-    // Token/cost counters: "123 tokens", "45 used", "0.12 spent"
-    if (trimmed.ends_with("tokens") || trimmed.ends_with("used") || trimmed.ends_with("spent"))
-        && trimmed.chars().any(|c| c.is_ascii_digit())
-    {
-        return true;
-    }
-
-    const EXACT: &[&str] = &[
-        "Context",
-        "LSP",
-        "MCP",
-        "Build",
-        "Sessions",
-        "Environment",
-        "for shortcuts",
-        "Shift+Tab",
-        "MCP issues",
-        "MCP servers",
-    ];
+    // Only filter very specific UI navigation/help text, not content
+    const EXACT: &[&str] = &["for shortcuts", "Shift+Tab", "MCP issues", "MCP servers"];
     if EXACT.contains(&trimmed) {
         return true;
     }
@@ -140,24 +123,12 @@ fn is_status_noise(line: &str) -> bool {
         return true;
     }
 
-    if trimmed.contains("LSPs will activate") {
+    // Very conservative: only skip lines that look like TUI status bars with no content
+    if trimmed.contains("LSPs will activate") && trimmed.len() < 50 {
         return true;
     }
 
-    // File stat lines like "prompt.txt  +150 -58"
-    is_file_stat_line(trimmed)
-}
-
-fn is_file_stat_line(trimmed: &str) -> bool {
-    if !(trimmed.contains('+') && trimmed.contains('-')) {
-        return false;
-    }
-    let parts: Vec<&str> = trimmed.split_whitespace().collect();
-    parts.len() >= 2
-        && parts
-            .last()
-            .is_some_and(|p| p.starts_with('-') || p.starts_with('+'))
-        && trimmed.chars().filter(|c| *c == ' ').count() >= 2
+    false
 }
 
 fn collect_last_prompts(history: &VecDeque<PromptEntry>, n: usize) -> Vec<PromptEntry> {
