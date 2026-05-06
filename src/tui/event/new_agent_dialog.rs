@@ -405,10 +405,9 @@ fn handle_directory_field(
 ) {
     match code {
         KeyCode::Up => move_directory_up(dialog, fields, is_watch_dir),
-        KeyCode::Down => move_directory_down(dialog, fields),
+        KeyCode::Down => move_directory_down(dialog),
         KeyCode::BackTab => dialog.field = fields.previous_dir_field(is_watch_dir),
         KeyCode::Tab => dialog.field = fields.next_dir_field(dialog.field),
-        KeyCode::Enter => dialog.select_current(),
         KeyCode::Right => dialog.navigate_to_selected(),
         KeyCode::Left => dialog.go_up(),
         KeyCode::Backspace if !dialog.dir_filter.is_empty() => {
@@ -433,15 +432,12 @@ fn move_directory_up(dialog: &mut NewAgentDialog, fields: DialogFields, is_watch
     dialog.field = fields.previous_dir_field(is_watch_dir);
 }
 
-fn move_directory_down(dialog: &mut NewAgentDialog, fields: DialogFields) {
+fn move_directory_down(dialog: &mut NewAgentDialog) {
     let filtered_len = dialog.filtered_dir_entries().len();
     if filtered_len > 0 && dialog.dir_selected + 1 < filtered_len {
         dialog.dir_selected += 1;
         dialog.update_dir_preview();
-        return;
     }
-
-    dialog.field = fields.next_dir_field(dialog.field);
 }
 
 fn handle_shell_field(dialog: &mut NewAgentDialog, code: KeyCode, fields: DialogFields) {
