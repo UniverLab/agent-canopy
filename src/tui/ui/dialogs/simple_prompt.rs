@@ -11,6 +11,47 @@ use crate::tui::ui::dialogs::section_picker::draw_section_picker_modal;
 #[allow(unused_imports)]
 use super::{BG_SELECTED, ERROR_COLOR, INTERACTIVE_COLOR};
 
+/// Apply styling to collapsed paste blocks, making them stand out with accent color.
+fn style_collapsed_paste_blocks(
+    render_text: &str,
+    accent: Color,
+    _section_bg: Color,
+) -> Vec<(String, Option<Color>)> {
+    let mut result = Vec::new();
+    let mut current_pos = 0;
+
+    // Find all collapsed paste blocks: [Pasted ~N lines]
+    while let Some(start) = render_text[current_pos..].find("[Pasted ~") {
+        let start_abs = current_pos + start;
+
+        // Add text before the block (uncolored)
+        if start > 0 {
+            result.push((render_text[current_pos..start_abs].to_string(), None));
+        }
+
+        // Find the end of the block
+        if let Some(end_rel) = render_text[start_abs..].find(']') {
+            let end_abs = start_abs + end_rel + 1;
+            let block_text = &render_text[start_abs..end_abs];
+
+            // Add the collapsed block with accent color
+            result.push((block_text.to_string(), Some(accent)));
+            current_pos = end_abs;
+        } else {
+            // No closing bracket, treat rest as normal
+            result.push((render_text[start_abs..].to_string(), None));
+            break;
+        }
+    }
+
+    // Add remaining text
+    if current_pos < render_text.len() {
+        result.push((render_text[current_pos..].to_string(), None));
+    }
+
+    result
+}
+
 // Old function removed - using simple prompt dialog instead
 fn generate_top_border(title: &str, width: u16, style: Style) -> Line<'static> {
     let title_with_spaces = format!(" {} ", title);
@@ -300,7 +341,13 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) {
             (text, None, 1u16, 0u16)
         };
 
-        let styled_content = dialog.get_file_reference_with_styling(&render_text, accent);
+        let styled_content = if dialog.has_collapsed_paste(section_name) {
+            // Use special styling for collapsed pastes to highlight with accent color
+            style_collapsed_paste_blocks(&render_text, accent, section_bg)
+        } else {
+            // Use default file reference styling
+            dialog.get_file_reference_with_styling(&render_text, accent)
+        };
         let mut spans = Vec::new();
         if let Some(cursor_idx) = cursor_idx_opt {
             // Block cursor: highlight the char under the cursor without shifting text

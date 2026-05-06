@@ -911,6 +911,54 @@ impl SimplePromptDialog {
             self.set_section_content(section_id, real);
         }
     }
+
+    /// Check if section has a collapsed paste.
+    pub fn has_collapsed_paste(&self, section_id: &str) -> bool {
+        self.collapsed_pastes.contains_key(section_id)
+    }
+
+    /// Check if cursor is positioned inside a collapsed placeholder text.
+    /// Returns true if the section has a collapsed paste and cursor is within the placeholder.
+    pub fn cursor_in_collapsed_placeholder(&self, section_id: &str) -> bool {
+        if !self.has_collapsed_paste(section_id) {
+            return false;
+        }
+
+        let content = self.get_section_content(section_id);
+        let cursor_pos = self.cursor(section_id);
+
+        // Find the collapsed placeholder pattern: "[Pasted ~N lines]"
+        if let Some(start) = content.find("[Pasted ~") {
+            if let Some(end) = content[start..].find(']') {
+                let placeholder_end = start + end + 1;
+                return cursor_pos > start && cursor_pos <= placeholder_end;
+            }
+        }
+        false
+    }
+
+    /// Delete the entire collapsed paste block and restore cursor position.
+    /// Called when backspace is pressed while cursor is inside the placeholder.
+    pub fn backspace_collapsed_paste(&mut self, section_id: &str, field_width: usize) {
+        if !self.has_collapsed_paste(section_id) {
+            return;
+        }
+
+        let content = self.get_section_content(section_id);
+
+        // Find and remove the collapsed placeholder
+        if let Some(start) = content.find("[Pasted ~") {
+            if let Some(end) = content[start..].find(']') {
+                let placeholder_end = start + end + 1;
+                let mut new_content = String::with_capacity(content.len());
+                new_content.push_str(&content[..start]);
+                new_content.push_str(&content[placeholder_end..]);
+
+                self.collapsed_pastes.remove(section_id);
+                self.set_content_and_cursor(section_id, new_content, start, field_width);
+            }
+        }
+    }
 }
 
 fn strip_resources_section(prompt: &str) -> String {

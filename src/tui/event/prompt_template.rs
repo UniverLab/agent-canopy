@@ -35,7 +35,11 @@ pub fn handle_prompt_template_key(
         return Ok(());
     };
 
-    dialog.expand_collapsed_paste(&section_name);
+    // Only expand collapsed pastes when entering text or doing edit operations
+    // (not for navigation keys like arrows, tab, etc.)
+    if should_expand_on_key(code, modifiers) {
+        dialog.expand_collapsed_paste(&section_name);
+    }
 
     if handle_at_picker_key(dialog, code, modifiers, &section_name, field_width) {
         return Ok(());
@@ -88,6 +92,24 @@ fn focused_section_name(dialog: &mut SimplePromptDialog) -> Option<String> {
 
     dialog.focused_section = dialog.focused_section.min(last_index);
     dialog.enabled_sections.get(dialog.focused_section).cloned()
+}
+
+/// Determine if a key press should trigger expansion of a collapsed paste.
+/// Only text input and specific edit operations should expand; navigation keys should not.
+fn should_expand_on_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    match code {
+        // Text input characters should expand
+        KeyCode::Char(_) => true,
+        // Backspace and Delete should expand (to handle edit operations)
+        KeyCode::Backspace | KeyCode::Delete => true,
+        // Enter should expand for instruction sections
+        KeyCode::Enter => !modifiers.is_empty(),
+        // Navigation keys should NOT expand
+        KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => false,
+        KeyCode::Tab | KeyCode::BackTab => false,
+        // Everything else: don't expand
+        _ => false,
+    }
 }
 
 fn handle_section_picker_key(
@@ -646,7 +668,12 @@ fn handle_section_backspace(
         return;
     }
 
-    dialog.backspace_at_cursor(section_name, field_width);
+    // Check if cursor is inside a collapsed paste block
+    if dialog.cursor_in_collapsed_placeholder(section_name) {
+        dialog.backspace_collapsed_paste(section_name, field_width);
+    } else {
+        dialog.backspace_at_cursor(section_name, field_width);
+    }
 }
 
 fn submit_prompt(app: &mut App, prompt: &str) {
