@@ -139,6 +139,7 @@ impl Database {
                 chunk_index  INTEGER NOT NULL,
                 content      TEXT NOT NULL,
                 lang         TEXT NOT NULL,
+                embedding    BLOB,
                 updated_at   INTEGER NOT NULL,
                 PRIMARY KEY (source_path, chunk_index)
             );
@@ -176,6 +177,7 @@ impl Database {
         // Migration: rebuild rag_chunks and rag_queue if they still use the old
         // (project_hash, source_path, ...) composite primary key.
         Self::migrate_rag_tables(&conn)?;
+        Self::migrate_rag_embeddings(&conn)?;
 
         Ok(())
     }
@@ -212,6 +214,7 @@ impl Database {
                      chunk_index  INTEGER NOT NULL,
                      content      TEXT NOT NULL,
                      lang         TEXT NOT NULL,
+                     embedding    BLOB,
                      updated_at   INTEGER NOT NULL,
                      PRIMARY KEY (source_path, chunk_index)
                  );
@@ -243,6 +246,24 @@ impl Database {
                  UPDATE projects SET indexed_at = NULL;",
             )?;
             tracing::info!("RAG migration: rebuilt rag_chunks and rag_queue with global schema");
+        }
+
+        Ok(())
+    }
+
+    fn migrate_rag_embeddings(conn: &Connection) -> Result<()> {
+        let has_embedding_column: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('rag_chunks') WHERE name='embedding'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+
+        if !has_embedding_column {
+            conn.execute("ALTER TABLE rag_chunks ADD COLUMN embedding BLOB", [])?;
+            tracing::info!("RAG migration: added embedding column to rag_chunks");
         }
 
         Ok(())

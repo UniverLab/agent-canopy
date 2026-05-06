@@ -287,6 +287,7 @@ fn test_search_chunks_returns_recently_indexed_content() {
             chunk_index: 0,
             content: "needle indexed chunk".to_string(),
             lang: "rust".to_string(),
+            embedding: Some(vec![1.0, 0.0, 0.0]),
             updated_at: 1,
         }],
     )
@@ -296,6 +297,7 @@ fn test_search_chunks_returns_recently_indexed_content() {
 
     assert_eq!(results.len(), 1);
     assert!(results[0].content.contains("needle indexed chunk"));
+    assert_eq!(results[0].embedding.as_deref(), Some(&[1.0, 0.0, 0.0][..]));
 }
 
 #[test]
@@ -314,6 +316,49 @@ fn test_rag_queue_roundtrip() {
 
     db.remove_rag_item("/tmp/project/src/lib.rs").unwrap();
     assert!(db.list_rag_queue(10).unwrap().is_empty());
+}
+
+#[test]
+fn test_search_chunks_by_embedding_returns_best_match_first() {
+    let db = test_db();
+    db.replace_chunks(
+        "src/lib.rs",
+        &[
+            crate::db::project::Chunk {
+                id: "chunk-1".to_string(),
+                project_hash: None,
+                source_path: "src/lib.rs".to_string(),
+                chunk_index: 0,
+                content: "alpha".to_string(),
+                lang: "text".to_string(),
+                embedding: Some(vec![1.0, 0.0, 0.0]),
+                updated_at: 1,
+            },
+            crate::db::project::Chunk {
+                id: "chunk-2".to_string(),
+                project_hash: None,
+                source_path: "src/lib.rs".to_string(),
+                chunk_index: 1,
+                content: "beta".to_string(),
+                lang: "text".to_string(),
+                embedding: Some(vec![0.0, 1.0, 0.0]),
+                updated_at: 2,
+            },
+        ],
+    )
+    .unwrap();
+
+    let results = db
+        .search_chunks_by_embedding(&[0.9, 0.1, 0.0], None, 2)
+        .unwrap();
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].chunk.id, "chunk-1");
+    assert!(results[0].score > results[1].score);
+    assert_eq!(
+        results[0].chunk.embedding.as_deref(),
+        Some(&[1.0, 0.0, 0.0][..])
+    );
 }
 
 #[test]
@@ -337,6 +382,7 @@ fn test_rag_info_summary_counts_chunks_and_queue_states() {
             chunk_index: 0,
             content: "needle".to_string(),
             lang: "rust".to_string(),
+            embedding: None,
             updated_at: 114,
         }],
     )

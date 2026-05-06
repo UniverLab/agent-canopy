@@ -2,6 +2,7 @@
 //! SQLite repositories for projects and RAG chunks (FTS5).
 
 use anyhow::Result;
+use rusqlite::types::Type;
 use std::path::Path;
 
 use crate::db::Database;
@@ -17,7 +18,14 @@ pub struct Chunk {
     pub chunk_index: i32,
     pub content: String,
     pub lang: String,
+    pub embedding: Option<Vec<f32>>,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScoredChunk {
+    pub chunk: Chunk,
+    pub score: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -314,8 +322,8 @@ impl Database {
 
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO rag_chunks(id,project_hash,source_path,chunk_index,content,lang,updated_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                "INSERT INTO rag_chunks(id,project_hash,source_path,chunk_index,content,lang,embedding,updated_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
             )?;
 
             for c in chunks {
@@ -326,6 +334,7 @@ impl Database {
                     c.chunk_index,
                     c.content,
                     c.lang,
+                    serialize_embedding(c.embedding.as_deref()),
                     c.updated_at
                 ])?;
             }
@@ -352,7 +361,7 @@ impl Database {
 
         if let Some(ph) = project_hash {
             let mut stmt = conn.prepare(
-                "SELECT c.id,c.project_hash,c.source_path,c.chunk_index,c.content,c.lang,c.updated_at
+                "SELECT c.id,c.project_hash,c.source_path,c.chunk_index,c.content,c.lang,c.embedding,c.updated_at
                  FROM rag_chunks_fts f
                  JOIN rag_chunks c ON c.rowid = f.rowid
                  WHERE rag_chunks_fts MATCH ?1 AND c.project_hash=?2
@@ -360,12 +369,12 @@ impl Database {
             )?;
             let rows: Vec<Chunk> = stmt
                 .query_map(rusqlite::params![fts_query, ph, limit as i64], row_to_chunk)?
-                .filter_map(|r| r.ok())
+                .filter_map(|row| row.ok())
                 .collect();
             Ok(rows)
         } else {
             let mut stmt = conn.prepare(
-                "SELECT c.id,c.project_hash,c.source_path,c.chunk_index,c.content,c.lang,c.updated_at
+                "SELECT c.id,c.project_hash,c.source_path,c.chunk_index,c.content,c.lang,c.embedding,c.updated_at
                  FROM rag_chunks_fts f
                  JOIN rag_chunks c ON c.rowid = f.rowid
                  WHERE rag_chunks_fts MATCH ?1
@@ -373,10 +382,60 @@ impl Database {
             )?;
             let rows: Vec<Chunk> = stmt
                 .query_map(rusqlite::params![fts_query, limit as i64], row_to_chunk)?
-                .filter_map(|r| r.ok())
+                .filter_map(|row| row.ok())
                 .collect();
             Ok(rows)
         }
+    }
+
+    pub fn search_chunks_by_embedding(
+        &self,
+        embedding: &[f32],
+        project_hash: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ScoredChunk>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
+        let rows = if let Some(ph) = project_hash {
+            let mut stmt = conn.prepare(
+                "SELECT id,project_hash,source_path,chunk_index,content,lang,embedding,updated_at
+                 FROM rag_chunks
+                 WHERE embedding IS NOT NULL AND project_hash=?1",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![ph], row_to_chunk)?
+                .filter_map(|row| row.ok())
+                .collect::<Vec<_>>();
+            rows
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT id,project_hash,source_path,chunk_index,content,lang,embedding,updated_at
+                 FROM rag_chunks
+                 WHERE embedding IS NOT NULL",
+            )?;
+            let rows = stmt
+                .query_map([], row_to_chunk)?
+                .filter_map(|row| row.ok())
+                .collect::<Vec<_>>();
+            rows
+        };
+
+        let mut matches: Vec<ScoredChunk> = rows
+            .into_iter()
+            .filter_map(|chunk| {
+                let score = {
+                    let candidate = chunk.embedding.as_deref()?;
+                    cosine_similarity(embedding, candidate)?
+                };
+                Some(ScoredChunk { chunk, score })
+            })
+            .collect();
+        matches.sort_by(|left, right| right.score.total_cmp(&left.score));
+        matches.truncate(limit);
+        Ok(matches)
     }
 }
 
@@ -393,6 +452,14 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
 }
 
 fn row_to_chunk(row: &rusqlite::Row<'_>) -> rusqlite::Result<Chunk> {
+    let embedding = row
+        .get::<_, Option<Vec<u8>>>(6)?
+        .map(|bytes| deserialize_embedding(&bytes))
+        .transpose()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(6, Type::Blob, Box::new(error))
+        })?;
+
     Ok(Chunk {
         id: row.get(0)?,
         project_hash: row.get(1)?,
@@ -400,8 +467,56 @@ fn row_to_chunk(row: &rusqlite::Row<'_>) -> rusqlite::Result<Chunk> {
         chunk_index: row.get(3)?,
         content: row.get(4)?,
         lang: row.get(5)?,
-        updated_at: row.get(6)?,
+        embedding,
+        updated_at: row.get(7)?,
     })
+}
+
+fn serialize_embedding(embedding: Option<&[f32]>) -> Option<Vec<u8>> {
+    embedding.map(|values| {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    })
+}
+
+fn deserialize_embedding(bytes: &[u8]) -> std::io::Result<Vec<f32>> {
+    let chunks = bytes.chunks_exact(std::mem::size_of::<f32>());
+    if !chunks.remainder().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "embedding blob length must be divisible by {}",
+                std::mem::size_of::<f32>()
+            ),
+        ));
+    }
+
+    Ok(bytes
+        .chunks_exact(std::mem::size_of::<f32>())
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
+}
+
+fn cosine_similarity(left: &[f32], right: &[f32]) -> Option<f32> {
+    if left.len() != right.len() || left.is_empty() {
+        return None;
+    }
+
+    let dot = left
+        .iter()
+        .zip(right)
+        .map(|(lhs, rhs)| lhs * rhs)
+        .sum::<f32>();
+    let left_norm = left.iter().map(|value| value * value).sum::<f32>().sqrt();
+    let right_norm = right.iter().map(|value| value * value).sum::<f32>().sqrt();
+
+    if left_norm == 0.0 || right_norm == 0.0 {
+        None
+    } else {
+        Some((dot / (left_norm * right_norm)).clamp(-1.0, 1.0))
+    }
 }
 
 fn row_to_rag_queue_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<RagQueueItem> {

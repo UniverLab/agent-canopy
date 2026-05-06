@@ -1001,6 +1001,7 @@ mod tests {
                 chunk_index: 0,
                 content: "needle semantic chunk body".to_string(),
                 lang: "rust".to_string(),
+                embedding: None,
                 updated_at: 1,
             }],
         )

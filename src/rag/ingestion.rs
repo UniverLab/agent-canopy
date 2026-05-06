@@ -292,6 +292,7 @@ impl IngestionManager {
                 chunk_index: i as i32,
                 content: text,
                 lang: lang.to_owned(),
+                embedding: None,
                 updated_at: now,
             })
             .collect();
