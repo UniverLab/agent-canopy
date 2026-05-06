@@ -28,6 +28,7 @@ harness-canopy is a modern, self-contained MCP (Multi-Agent Control Point) serve
 - **🚀 High-Performance Scheduler:** Event-driven cron scheduler using Tokio with zero polling overhead. Computes precise wake-up times and sleeps until needed, reducing CPU usage to near-zero when idle.
 - **📊 Real-time File Watcher:** Instantly reacts to file system events (create, modify, delete, move) using the notify crate with configurable debouncing and recursive directory monitoring.
 - **💾 Persistent State Management:** All tasks, watchers, execution logs, and agent state are stored in an embedded SQLite database with automatic migrations and transaction safety.
+- **🧠 Personal RAG Pipeline:** Markdown/PDF notes are semantically chunked, embedded with your configured model, and stored with vector metadata for higher quality retrieval.
 
 ### 🤖 Agent Orchestration
 
@@ -86,11 +87,13 @@ harness-canopy is a modern, self-contained MCP (Multi-Agent Control Point) serve
    ```bash
    canopy daemon start
    ```
-2. **Add tasks and watchers:**
+2. **Configure Personal RAG (optional but recommended):**
+   Run `canopy setup` and choose an `embeddings_model` plus `similarity_threshold` for semantic chunking. Canopy will embed indexed notes during daemon ingestion and persist the vectors for similarity search.
+3. **Add tasks and watchers:**
    Use the CLI or API to register scheduled tasks and file event watchers. Each task can specify:
    - `id`, `prompt`, `schedule_expr`, `cli`, `model`, `working_dir`, `timeout_minutes`, etc.
    - Watchers specify `path`, `events`, and trigger logic.
-3. **Monitor and manage:**
+4. **Monitor and manage:**
    - View logs, status, and manage agents interactively via the TUI.
    - All state is persisted in `~/.canopy/tasks.db`.
 

@@ -362,6 +362,43 @@ fn test_search_chunks_by_embedding_returns_best_match_first() {
 }
 
 #[test]
+fn test_semantic_chunk_embeddings_roundtrip_through_vector_search() {
+    use crate::rag::chunker::chunk_semantic;
+    use crate::rag::embedding_client::{EmbeddingClient, MockEmbeddingClient};
+
+    let db = test_db();
+    let embedder = MockEmbeddingClient::new(8);
+    let semantic_chunks = chunk_semantic(
+        "# Alpha\n\nalpha beta gamma\n\n## Beta\n\nomega sigma tau",
+        "markdown",
+        0.0,
+    );
+
+    let chunks = semantic_chunks
+        .into_iter()
+        .map(|chunk| crate::db::project::Chunk {
+            id: format!("chunk-{}", chunk.index),
+            project_hash: None,
+            source_path: "notes.md".to_string(),
+            chunk_index: chunk.index as i32,
+            embedding: Some(embedder.embed(&chunk.content).unwrap()),
+            content: chunk.content,
+            lang: "markdown".to_string(),
+            updated_at: 1,
+        })
+        .collect::<Vec<_>>();
+
+    db.replace_chunks("notes.md", &chunks).unwrap();
+
+    let query = embedder.embed("alpha beta").unwrap();
+    let results = db.search_chunks_by_embedding(&query, None, 1).unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].chunk.content.contains("# Alpha"));
+    assert!(results[0].score > 0.5);
+}
+
+#[test]
 fn test_rag_info_summary_counts_chunks_and_queue_states() {
     let db = test_db();
     let project = crate::domain::project::Project::new("/tmp/project");

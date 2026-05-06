@@ -379,6 +379,14 @@ mod tests {
     }
 
     #[test]
+    fn client_from_config_rejects_missing_model() {
+        let error = client_from_config(&CanopyConfig::default())
+            .err()
+            .expect("missing model should fail");
+        assert!(error.to_string().contains("not configured"));
+    }
+
+    #[test]
     fn mock_embedding_client_returns_normalized_embedding() {
         let client = MockEmbeddingClient::new(4);
         let embedding = client.embed("alpha beta alpha").unwrap();
@@ -407,6 +415,19 @@ mod tests {
         assert!(request.contains("authorization: Bearer test-key"));
         assert!(request.contains("\"model\":\"custom-4d\""));
         assert!(request.contains("\"input\":\"hello world\""));
+    }
+
+    #[test]
+    fn openai_embedding_client_rejects_dimension_mismatches() {
+        let response = r#"{"data":[{"embedding":[0.1,0.2,0.3]}]}"#;
+        let (base_url, server) = serve_once(response);
+        let client =
+            OpenAIEmbeddingClient::with_base_url("custom-4d", "test-key", &base_url).unwrap();
+
+        let error = client.embed("hello world").unwrap_err();
+        let _ = server.join().unwrap();
+
+        assert!(error.to_string().contains("expected 4, got 3"));
     }
 
     #[test]
