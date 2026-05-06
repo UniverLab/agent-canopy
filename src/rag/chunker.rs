@@ -5,10 +5,19 @@
 //! `.md .mdx`  → markdown (by heading)
 //! `.pdf`      → paragraph / default
 
+use std::collections::HashMap;
+
 const MAX_CHUNK_TOKENS: usize = 512;
 const OVERLAP_TOKENS: usize = 64;
 // Rough approximation: 1 token ≈ 4 chars
 const CHARS_PER_TOKEN: usize = 4;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SemanticChunk {
+    pub index: usize,
+    pub content: String,
+    pub similarity_to_prev: Option<f32>,
+}
 
 /// Detect language tag from file extension.
 /// Returns `None` for unsupported types (personal RAG: md, mdx, pdf only).
@@ -28,72 +37,255 @@ pub fn detect_lang(path: &str) -> Option<&'static str> {
 /// Returns `(chunk_index, text)` pairs.
 pub fn chunk(content: &str, lang: &str) -> Vec<(usize, String)> {
     match lang {
-        "markdown" => chunk_markdown(content),
-        _ => chunk_paragraphs(content),
+        "markdown" => to_indexed_chunks(chunk_markdown_texts(content)),
+        _ => to_indexed_chunks(chunk_paragraph_texts(content)),
     }
 }
 
+/// Chunk `content` using structural chunking followed by similarity-aware merges.
+pub fn chunk_semantic(content: &str, lang: &str, threshold: f32) -> Vec<SemanticChunk> {
+    let chunks = match lang {
+        "markdown" => annotate_similarity(chunk_markdown_texts(content)),
+        _ => chunk_paragraphs(content),
+    };
+    merge_low_similarity_chunks(chunks, threshold)
+}
+
+/// Compute cosine similarity using normalized term frequencies.
+pub fn cosine_similarity(text1: &str, text2: &str) -> f32 {
+    let left = term_frequencies(text1);
+    let right = term_frequencies(text2);
+
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
+    }
+
+    let dot = left
+        .iter()
+        .filter_map(|(token, left_freq)| right.get(token).map(|right_freq| left_freq * right_freq))
+        .sum::<f32>();
+    let left_norm = left
+        .values()
+        .map(|weight| weight * weight)
+        .sum::<f32>()
+        .sqrt();
+    let right_norm = right
+        .values()
+        .map(|weight| weight * weight)
+        .sum::<f32>()
+        .sqrt();
+
+    if left_norm == 0.0 || right_norm == 0.0 {
+        0.0
+    } else {
+        (dot / (left_norm * right_norm)).clamp(0.0, 1.0)
+    }
+}
+
+/// Merge adjacent chunks whose similarity metadata falls below `threshold`.
+pub fn merge_low_similarity_chunks(
+    chunks: Vec<SemanticChunk>,
+    threshold: f32,
+) -> Vec<SemanticChunk> {
+    let mut iter = chunks.into_iter();
+    let Some(first) = iter.next() else {
+        return Vec::new();
+    };
+
+    let threshold = threshold.clamp(0.0, 1.0);
+    let mut merged_texts = vec![first.content];
+
+    for chunk in iter {
+        let should_merge = chunk.similarity_to_prev.unwrap_or(1.0) < threshold;
+        if should_merge {
+            if let Some(current) = merged_texts.last_mut() {
+                current.push_str("\n\n");
+                current.push_str(&chunk.content);
+            }
+        } else {
+            merged_texts.push(chunk.content);
+        }
+    }
+
+    annotate_similarity(merged_texts)
+}
+
 /// Markdown: split on headings (`#`, `##`, `###`).
-fn chunk_markdown(content: &str) -> Vec<(usize, String)> {
-    let mut chunks: Vec<(usize, String)> = Vec::new();
+fn chunk_markdown_texts(content: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
     let mut current: Vec<&str> = Vec::new();
-    let mut idx = 0usize;
 
     for line in content.lines() {
         if line.starts_with('#') && !current.is_empty() {
-            let text = current.join("\n").trim().to_owned();
-            if !text.is_empty() {
-                chunks.push((idx, text));
-                idx += 1;
-            }
+            let text = current.join("\n");
+            push_chunk(&mut chunks, &text);
             current.clear();
         }
         current.push(line);
     }
+
     if !current.is_empty() {
-        let text = current.join("\n").trim().to_owned();
-        if !text.is_empty() {
-            chunks.push((idx, text));
-        }
+        let text = current.join("\n");
+        push_chunk(&mut chunks, &text);
     }
+
     if chunks.is_empty() {
-        chunk_paragraphs(content)
+        chunk_paragraph_texts(content)
     } else {
         chunks
     }
 }
 
-/// Default: paragraph chunking with 512-token window and 64-token overlap.
-fn chunk_paragraphs(content: &str) -> Vec<(usize, String)> {
+/// Default semantic paragraph chunking.
+///
+/// Each paragraph becomes its own chunk so similarity can be evaluated across
+/// natural boundaries. Oversized paragraphs are still split with the same
+/// window/overlap constraints used by structural chunking.
+fn chunk_paragraphs(content: &str) -> Vec<SemanticChunk> {
+    let chunks = content
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|paragraph| !paragraph.is_empty())
+        .flat_map(split_paragraph)
+        .collect();
+
+    annotate_similarity(chunks)
+}
+
+fn chunk_paragraph_texts(content: &str) -> Vec<String> {
     let window = MAX_CHUNK_TOKENS * CHARS_PER_TOKEN;
     let overlap = OVERLAP_TOKENS * CHARS_PER_TOKEN;
 
     let paragraphs: Vec<&str> = content
         .split("\n\n")
         .map(str::trim)
-        .filter(|p| !p.is_empty())
+        .filter(|paragraph| !paragraph.is_empty())
         .collect();
 
-    let mut chunks: Vec<(usize, String)> = Vec::new();
+    let mut chunks = Vec::new();
     let mut buf = String::new();
-    let mut idx = 0usize;
 
-    for para in &paragraphs {
-        if buf.len() + para.len() > window && !buf.is_empty() {
-            chunks.push((idx, buf.trim().to_owned()));
-            idx += 1;
-            let overlap_start = buf.len().saturating_sub(overlap);
-            buf = buf[overlap_start..].to_owned();
+    for paragraph in paragraphs {
+        if paragraph.len() > window {
+            if !buf.is_empty() {
+                let flushed = std::mem::take(&mut buf);
+                push_chunk(&mut chunks, &flushed);
+            }
+            chunks.extend(split_paragraph(paragraph));
+            continue;
+        }
+
+        let separator_len = usize::from(!buf.is_empty()) * 2;
+        if buf.len() + separator_len + paragraph.len() > window && !buf.is_empty() {
+            let flushed = std::mem::take(&mut buf);
+            push_chunk(&mut chunks, &flushed);
+            let overlap_start = chunks
+                .last()
+                .map(|chunk: &String| chunk.len().saturating_sub(overlap))
+                .unwrap_or(0);
+            buf = chunks
+                .last()
+                .map(|chunk| chunk[overlap_start..].to_owned())
+                .unwrap_or_default();
         }
         if !buf.is_empty() {
             buf.push_str("\n\n");
         }
-        buf.push_str(para);
+        buf.push_str(paragraph);
     }
+
     if !buf.trim().is_empty() {
-        chunks.push((idx, buf.trim().to_owned()));
+        push_chunk(&mut chunks, &buf);
     }
+
     chunks
+}
+
+fn split_paragraph(paragraph: &str) -> Vec<String> {
+    let window = MAX_CHUNK_TOKENS * CHARS_PER_TOKEN;
+    let overlap = OVERLAP_TOKENS * CHARS_PER_TOKEN;
+
+    if paragraph.len() <= window {
+        return vec![paragraph.to_owned()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    let chars: Vec<(usize, char)> = paragraph.char_indices().collect();
+    let total_len = paragraph.len();
+
+    while start < total_len {
+        let mut end = start;
+        for (idx, _) in chars.iter().copied().skip_while(|(idx, _)| *idx < start) {
+            if idx.saturating_sub(start) > window {
+                break;
+            }
+            end = idx;
+        }
+
+        let end = if end <= start {
+            total_len.min(start + window)
+        } else {
+            paragraph[end..]
+                .chars()
+                .next()
+                .map(|ch| end + ch.len_utf8())
+                .unwrap_or(total_len)
+        };
+
+        push_chunk(&mut chunks, &paragraph[start..end]);
+        if end >= total_len {
+            break;
+        }
+        start = end.saturating_sub(overlap);
+    }
+
+    chunks
+}
+
+fn push_chunk(chunks: &mut Vec<String>, text: &str) {
+    let trimmed = text.trim();
+    if !trimmed.is_empty() {
+        chunks.push(trimmed.to_owned());
+    }
+}
+
+fn annotate_similarity(chunks: Vec<String>) -> Vec<SemanticChunk> {
+    let mut previous: Option<String> = None;
+
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(index, content)| {
+            let similarity_to_prev = previous
+                .as_deref()
+                .map(|prev| cosine_similarity(prev, &content));
+            previous = Some(content.clone());
+            SemanticChunk {
+                index,
+                content,
+                similarity_to_prev,
+            }
+        })
+        .collect()
+}
+
+fn to_indexed_chunks(chunks: Vec<String>) -> Vec<(usize, String)> {
+    chunks.into_iter().enumerate().collect()
+}
+
+fn term_frequencies(text: &str) -> HashMap<String, f32> {
+    let mut frequencies = HashMap::new();
+
+    for token in text
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+    {
+        *frequencies.entry(token).or_insert(0.0) += 1.0;
+    }
+
+    frequencies
 }
 
 #[cfg(test)]
@@ -133,15 +325,59 @@ mod tests {
     fn chunk_markdown_indices_are_sequential() {
         let md = "# A\n\ntext\n\n## B\n\nmore";
         let chunks = chunk(md, "markdown");
-        let indices: Vec<usize> = chunks.iter().map(|(i, _)| *i).collect();
+        let indices: Vec<usize> = chunks.iter().map(|(index, _)| *index).collect();
         assert_eq!(indices, (0..chunks.len()).collect::<Vec<_>>());
     }
 
     #[test]
     fn chunk_paragraphs_respects_window() {
-        let para = "word ".repeat(150);
-        let big = [para.as_str(); 6].join("\n\n");
-        let chunks = chunk_paragraphs(&big);
+        let paragraph = "word ".repeat(600);
+        let chunks = chunk_paragraphs(&paragraph);
         assert!(chunks.len() >= 2, "should split into multiple chunks");
+    }
+
+    #[test]
+    fn chunk_paragraphs_tracks_similarity_between_adjacent_paragraphs() {
+        let content = "alpha beta gamma\n\nalpha beta delta\n\nomega sigma tau";
+        let chunks = chunk_paragraphs(content);
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].similarity_to_prev, None);
+        assert!(chunks[1].similarity_to_prev.unwrap_or_default() > 0.0);
+        assert_eq!(chunks[2].similarity_to_prev.unwrap_or_default(), 0.0);
+    }
+
+    #[test]
+    fn cosine_similarity_returns_one_for_identical_text() {
+        let similarity = cosine_similarity("alpha beta gamma", "alpha beta gamma");
+        assert!((similarity - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn cosine_similarity_returns_zero_for_disjoint_text() {
+        let similarity = cosine_similarity("alpha beta gamma", "delta epsilon zeta");
+        assert_eq!(similarity, 0.0);
+    }
+
+    #[test]
+    fn chunk_semantic_merges_chunks_below_threshold() {
+        let content = "# One\n\nalpha beta gamma\n\n## Two\n\nalpha beta delta\n\n## Three\n\nomega sigma tau";
+        let chunks = chunk_semantic(content, "markdown", 0.2);
+
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].content.contains("# One"));
+        assert!(chunks[1].content.contains("## Two"));
+        assert!(chunks[1].content.contains("## Three"));
+        assert!(chunks[1].similarity_to_prev.is_some());
+    }
+
+    #[test]
+    fn chunk_semantic_preserves_similarity_metadata_after_merging() {
+        let content = "alpha beta gamma\n\ndelta epsilon zeta";
+        let chunks = chunk_semantic(content, "text", 0.5);
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].similarity_to_prev, None);
+        assert!(chunks[0].content.contains("delta epsilon zeta"));
     }
 }
