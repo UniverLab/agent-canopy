@@ -15,7 +15,8 @@ use uuid::Uuid;
 use crate::application::ports::StateRepository;
 use crate::db::project::Chunk;
 use crate::db::Database;
-use crate::rag::chunker::{chunk, detect_lang};
+use crate::rag::chunker::{chunk_semantic, detect_lang};
+use crate::rag::embedding_client::client_from_config;
 
 const QUEUE_MAX: usize = 10_000;
 const FILE_MAX_BYTES: u64 = 5 * 1024 * 1024; // 5 MB
@@ -282,20 +283,44 @@ impl IngestionManager {
 
         let content = std::fs::read_to_string(path)?;
         let now = chrono::Utc::now().timestamp();
+        let config = crate::domain::canopy_config::CanopyConfig::load(&self.data_dir);
+        let semantic_chunks = chunk_semantic(&content, lang, config.similarity_threshold);
+        let embedding_client = match client_from_config(&config) {
+            Ok(client) => Some(client),
+            Err(error) => {
+                tracing::warn!("RAG embeddings unavailable for {source_path}: {error}");
+                None
+            }
+        };
 
-        let chunks: Vec<Chunk> = chunk(&content, lang)
-            .into_iter()
-            .map(|(i, text)| Chunk {
+        let mut chunks = Vec::with_capacity(semantic_chunks.len());
+        for chunk in semantic_chunks {
+            let embedding = if let Some(client) = embedding_client.as_ref() {
+                match client.embed(&chunk.content) {
+                    Ok(values) => Some(values),
+                    Err(error) => {
+                        tracing::warn!(
+                            "RAG embedding error {source_path} chunk {}: {error}",
+                            chunk.index
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            chunks.push(Chunk {
                 id: Uuid::new_v4().to_string(),
                 project_hash: None,
                 source_path: source_path.to_owned(),
-                chunk_index: i as i32,
-                content: text,
+                chunk_index: chunk.index as i32,
+                content: chunk.content,
                 lang: lang.to_owned(),
-                embedding: None,
+                embedding,
                 updated_at: now,
-            })
-            .collect();
+            });
+        }
 
         self.db.replace_chunks(source_path, &chunks)?;
         Ok(())
