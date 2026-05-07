@@ -2,9 +2,10 @@
 //! `IngestionManager` — async queue + background worker for personal RAG indexing.
 //!
 //! Indexes only `.md`, `.mdx`, and `.pdf` files from the personal RAG root
-//! (`~/.canopy/rag/` by default).  Uses SQLite FTS5 as the search backend.
+//! (`~/.canopy/rag/` by default). Uses LanceDB as the vector search backend.
 
 use std::collections::{HashSet, VecDeque};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -13,7 +14,6 @@ use tokio::sync::{Mutex, Notify};
 use uuid::Uuid;
 
 use crate::application::ports::StateRepository;
-use crate::db::project::Chunk;
 use crate::db::Database;
 use crate::rag::chunker::{chunk_semantic, detect_lang};
 use crate::rag::embedding_client::{client_from_config, model_dimensions, EmbeddingClient};
@@ -39,8 +39,6 @@ impl Queue {
         self.order.len()
     }
 
-    /// Push a path to the back of the queue.  If already present, move to end.
-    /// Returns `false` when the queue is at capacity.
     fn push(&mut self, path: &str) -> bool {
         let key = path.to_owned();
         if self.set.contains(&key) {
@@ -66,7 +64,6 @@ pub struct IngestionManager {
     data_dir: PathBuf,
     queue: Arc<Mutex<Queue>>,
     notify: Arc<Notify>,
-    /// Holds the personal-RAG notify watcher so it is not dropped.
     _personal_watcher: std::sync::Mutex<Option<RecommendedWatcher>>,
 }
 
@@ -82,7 +79,6 @@ impl IngestionManager {
         }
     }
 
-    /// Enqueue a file path for (re)indexing.  Returns `false` if the queue is full.
     pub async fn enqueue(&self, source_path: &str) -> bool {
         let mut q = self.queue.lock().await;
         let ok = q.push(source_path);
@@ -96,12 +92,10 @@ impl IngestionManager {
         ok
     }
 
-    /// Queue size snapshot.
     pub async fn queue_len(&self) -> usize {
         self.queue.lock().await.len()
     }
 
-    /// Return paths of items currently queued in the DB (from a previous session).
     pub fn db_pending_queue(&self) -> anyhow::Result<Vec<String>> {
         Ok(self
             .db
@@ -111,12 +105,6 @@ impl IngestionManager {
             .collect())
     }
 
-    /// Start recursive filesystem watchers on all `personal_roots`.
-    ///
-    /// - Create/Modify events enqueue the file for (re)indexing (if supported).
-    /// - Delete events remove the file's chunks from the database immediately.
-    ///
-    /// All watchers are kept alive inside `self` for the lifetime of the manager.
     pub fn start_personal_watcher(self: Arc<Self>, personal_roots: &[PathBuf]) {
         if personal_roots.is_empty() {
             return;
@@ -135,7 +123,6 @@ impl IngestionManager {
             move |res: Result<Event, notify::Error>| {
                 let Ok(event) = res else { return };
                 for path in &event.paths {
-                    // Find the matching root for this path to compute relative ignore check.
                     let matching_root = roots.iter().find(|r| path.starts_with(r));
                     let Some(root) = matching_root else { continue };
                     if crate::rag::ragignore::is_ignored(path, root, &patterns) {
@@ -163,11 +150,10 @@ impl IngestionManager {
                             }
                         }
                         EventKind::Remove(_) => {
-                            let db2 = Arc::clone(&db);
                             let data_dir2 = data_dir.clone();
+                            let p = path_str;
                             rt.spawn(async move {
-                                let _ = db2.replace_chunks(&path_str, &[]);
-                                purge_vector_chunks(&data_dir2, &path_str).await;
+                                purge_vector_chunks(&data_dir2, &p).await;
                             });
                         }
                         _ => {}
@@ -200,7 +186,6 @@ impl IngestionManager {
         }
     }
 
-    /// Start the background indexing worker.  Returns a cancellation token.
     pub fn start(self: Arc<Self>) -> tokio_util::sync::CancellationToken {
         let ct = tokio_util::sync::CancellationToken::new();
         let ct_child = ct.child_token();
@@ -215,7 +200,6 @@ impl IngestionManager {
             tokio::select! {
                 _ = ct.cancelled() => break,
                 _ = self.notify.notified() => {
-                    // Debounce: wait 3 s for burst to settle
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     self.drain_queue(&ct).await;
                 }
@@ -242,11 +226,11 @@ impl IngestionManager {
             let now = chrono::Utc::now().timestamp();
             let _ = self.db.mark_rag_item_processing(&source_path, now);
 
-            if let Err(e) = self.index_file(&source_path).await {
-                tracing::warn!("RAG index error {source_path}: {e}");
-            } else {
-                processed += 1;
-            }
+        if let Err(e) = self.index_file(&source_path).await {
+            tracing::warn!("RAG index error {source_path}: {e}");
+        } else {
+            processed += 1;
+        }
             let _ = self.db.remove_rag_item(&source_path);
         }
 
@@ -255,7 +239,6 @@ impl IngestionManager {
         }
     }
 
-    /// Spin-wait while RAG is paused.  Returns `false` if cancelled.
     async fn wait_while_paused(&self, ct: &tokio_util::sync::CancellationToken) -> bool {
         while self.is_paused() {
             tokio::select! {
@@ -270,7 +253,6 @@ impl IngestionManager {
         let path = std::path::Path::new(source_path);
 
         if !path.exists() {
-            self.db.replace_chunks(source_path, &[])?;
             purge_vector_chunks(&self.data_dir, source_path).await;
             return Ok(());
         }
@@ -288,8 +270,30 @@ impl IngestionManager {
         let content = extract_file_content(path, lang)?;
         let now = chrono::Utc::now().timestamp();
         let config = crate::domain::canopy_config::CanopyConfig::load(&self.data_dir);
-        let semantic_chunks = chunk_semantic(&content, lang, config.similarity_threshold);
-        let embedding_client: Option<Arc<dyn EmbeddingClient>> = match client_from_config(&config) {
+
+        let content_owned = content.clone();
+        let lang_owned = lang.to_owned();
+        let threshold = config.similarity_threshold;
+        let chunk_result = tokio::task::spawn_blocking(move || {
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                chunk_semantic(&content_owned, &lang_owned, threshold)
+            }))
+        })
+        .await;
+
+        let semantic_chunks = match chunk_result {
+            Ok(Ok(chunks)) => chunks,
+            Ok(Err(panic)) => {
+                tracing::error!("RAG chunker panic for {source_path}: {panic:?}");
+                return Ok(());
+            }
+            Err(join_err) => {
+                tracing::error!("RAG chunker task failed for {source_path}: {join_err}");
+                return Ok(());
+            }
+        };
+        let embedding_client: Option<Arc<dyn EmbeddingClient>> = match client_from_config(&config)
+        {
             Ok(client) => Some(Arc::from(client)),
             Err(error) => {
                 tracing::warn!("RAG embeddings unavailable for {source_path}: {error}");
@@ -297,8 +301,7 @@ impl IngestionManager {
             }
         };
 
-        let mut chunks = Vec::with_capacity(semantic_chunks.len());
-        let mut vector_chunks = Vec::new();
+        let mut vector_chunks = Vec::with_capacity(semantic_chunks.len());
         for chunk in semantic_chunks {
             let content = chunk.content;
             let chunk_id = Uuid::new_v4().to_string();
@@ -328,29 +331,17 @@ impl IngestionManager {
                 None
             };
 
-            if let Some(vector_embedding) = embedding.as_ref() {
+            if let Some(vec_emb) = embedding {
                 vector_chunks.push(VectorChunk {
-                    id: chunk_id.clone(),
+                    id: chunk_id,
                     file_path: source_path.to_owned(),
-                    content: content.clone(),
-                    embedding: vector_embedding.clone(),
+                    content,
+                    embedding: vec_emb,
                     created_at: now,
                 });
             }
-
-            chunks.push(Chunk {
-                id: chunk_id,
-                project_hash: None,
-                source_path: source_path.to_owned(),
-                chunk_index: chunk.index as i32,
-                content,
-                lang: lang.to_owned(),
-                embedding,
-                updated_at: now,
-            });
         }
 
-        self.db.replace_chunks(source_path, &chunks)?;
         sync_vector_store(&config, source_path, &vector_chunks).await;
         Ok(())
     }
@@ -391,7 +382,6 @@ async fn purge_vector_chunks(data_dir: &Path, source_path: &str) {
     }
 }
 
-/// Extract text content from a file based on its type
 fn extract_file_content(path: &Path, lang: &str) -> anyhow::Result<String> {
     if lang == "text" && path.extension().and_then(|e| e.to_str()) == Some("pdf") {
         extract_pdf_text(path)
@@ -400,7 +390,6 @@ fn extract_file_content(path: &Path, lang: &str) -> anyhow::Result<String> {
     }
 }
 
-/// Extract text from a PDF file
 fn extract_pdf_text(path: &Path) -> anyhow::Result<String> {
     use std::io::Read;
 

@@ -10,7 +10,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
-use lancedb::query::{ExecutableQuery, QueryBase};
+use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use lancedb::{connect, Connection, Table};
 
 const DEFAULT_DB_DIR: &str = ".canopy/rag/vectors.lancedb";
@@ -45,6 +45,11 @@ impl VectorStore {
     pub async fn new(embedding_dimensions: usize) -> Result<Self> {
         let home = dirs::home_dir().context("Could not determine home directory")?;
         Self::open_at(&home.join(DEFAULT_DB_DIR), embedding_dimensions).await
+    }
+
+    pub fn default_lancedb_path() -> Result<PathBuf> {
+        let home = dirs::home_dir().context("Could not determine home directory")?;
+        Ok(home.join(DEFAULT_DB_DIR))
     }
 
     pub async fn open_at(path: &Path, embedding_dimensions: usize) -> Result<Self> {
@@ -135,6 +140,40 @@ impl VectorStore {
         Ok(())
     }
 
+    pub async fn count_chunks(&self) -> Result<i64> {
+        let count = self
+            .table
+            .count_rows(None)
+            .await
+            .context("Failed to count LanceDB rows")?;
+        Ok(count as i64)
+    }
+
+    pub async fn count_unique_paths(&self) -> Result<i64> {
+        let batches: Vec<RecordBatch> = self
+            .table
+            .query()
+            .select(Select::columns(&["file_path"]))
+            .execute()
+            .await
+            .context("Failed to query LanceDB for unique paths")?
+            .try_collect()
+            .await
+            .context("Failed to collect LanceDB path query results")?;
+
+        let mut paths = std::collections::HashSet::new();
+        for batch in &batches {
+            if let Some(col) = batch.column_by_name("file_path") {
+                if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                    for i in 0..arr.len() {
+                        paths.insert(arr.value(i).to_string());
+                    }
+                }
+            }
+        }
+        Ok(paths.len() as i64)
+    }
+
     pub fn path_for_tests(base_dir: &Path) -> PathBuf {
         base_dir.join("vectors.lancedb")
     }
@@ -185,7 +224,8 @@ fn chunk_batch(
     let ids = StringArray::from_iter_values(chunks.iter().map(|chunk| chunk.id.as_str()));
     let file_paths =
         StringArray::from_iter_values(chunks.iter().map(|chunk| chunk.file_path.as_str()));
-    let contents = StringArray::from_iter_values(chunks.iter().map(|chunk| chunk.content.as_str()));
+    let contents =
+        StringArray::from_iter_values(chunks.iter().map(|chunk| chunk.content.as_str()));
     let created_at = Int64Array::from_iter_values(chunks.iter().map(|chunk| chunk.created_at));
     let embeddings = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
         chunks.iter().map(|chunk| {
@@ -374,5 +414,28 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(results[0].content.contains("Alpha"));
         assert_eq!(results[0].file_path, "/docs/guide.md");
+    }
+
+    #[tokio::test]
+    async fn count_chunks_returns_total_and_unique_paths() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = VectorStore::open_at(&VectorStore::path_for_tests(temp_dir.path()), 4)
+            .await
+            .unwrap();
+        store
+            .insert_chunk(&chunk("a", "/docs/a.md", "alpha", vec![1.0, 0.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        store
+            .insert_chunk(&chunk("b", "/docs/a.md", "beta", vec![0.0, 1.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        store
+            .insert_chunk(&chunk("c", "/docs/b.md", "gamma", vec![0.0, 0.0, 1.0, 0.0]))
+            .await
+            .unwrap();
+
+        assert_eq!(store.count_chunks().await.unwrap(), 3);
+        assert_eq!(store.count_unique_paths().await.unwrap(), 2);
     }
 }
