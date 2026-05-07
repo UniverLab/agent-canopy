@@ -285,7 +285,7 @@ impl IngestionManager {
             return Ok(());
         };
 
-        let content = std::fs::read_to_string(path)?;
+        let content = extract_file_content(path, lang)?;
         let now = chrono::Utc::now().timestamp();
         let config = crate::domain::canopy_config::CanopyConfig::load(&self.data_dir);
         let semantic_chunks = chunk_semantic(&content, lang, config.similarity_threshold);
@@ -388,6 +388,32 @@ async fn purge_vector_chunks(data_dir: &Path, source_path: &str) {
 
     if let Err(error) = store.delete_by_path(source_path).await {
         tracing::warn!("RAG vector cleanup error {source_path}: {error}");
+    }
+}
+
+/// Extract text content from a file based on its type
+fn extract_file_content(path: &Path, lang: &str) -> anyhow::Result<String> {
+    if lang == "text" && path.extension().and_then(|e| e.to_str()) == Some("pdf") {
+        extract_pdf_text(path)
+    } else {
+        Ok(std::fs::read_to_string(path)?)
+    }
+}
+
+/// Extract text from a PDF file
+fn extract_pdf_text(path: &Path) -> anyhow::Result<String> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer)?;
+
+    match pdf_extract::extract_text_from_mem(&buffer) {
+        Ok(text) => Ok(text),
+        Err(e) => {
+            tracing::warn!("Failed to extract text from PDF {}: {}", path.display(), e);
+            Ok(String::new())
+        }
     }
 }
 
