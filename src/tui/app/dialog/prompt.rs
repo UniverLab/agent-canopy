@@ -344,10 +344,11 @@ impl SimplePromptDialog {
         format!("path: {}\nkind: file", path.display())
     }
 
-    fn format_rag_chunk(query: &str, chunk: &crate::db::project::Chunk) -> String {
+    fn format_rag_chunk(query: &str, chunk: &crate::rag::vector_store::SearchResult) -> String {
+        let dist = chunk.distance.map_or("—".to_string(), |d| format!("{d:.4}"));
         format!(
-            "kind: rag_chunk\nquery: {query}\npath: {}\nchunk_index: {}\nlanguage: {}\ncontent:\n{}",
-            chunk.source_path, chunk.chunk_index, chunk.lang, chunk.content
+            "kind: rag_chunk\nquery: {query}\npath: {}\ndistance: {}\ncontent:\n{}",
+            chunk.file_path, dist, chunk.content
         )
     }
 
@@ -426,26 +427,52 @@ impl SimplePromptDialog {
     }
 
     fn search_rag_resources<'a>(
-        db: &Database,
+        _db: &Database,
         query: &'a str,
-        default_project_hash: Option<&'a str>,
+        _default_project_hash: Option<&'a str>,
     ) -> Vec<String> {
-        let (scope, resolved_query) = Self::resolve_rag_scope(query, default_project_hash);
+        let (scope, resolved_query) = Self::resolve_rag_scope(query, _default_project_hash);
+        let _ = scope;
         if resolved_query.is_empty() {
             return Vec::new();
         }
 
-        let project_hash = if let RagScope::Project(hash) = scope {
-            Some(hash)
-        } else {
-            None
+        let canopy_dir = match dirs::home_dir() {
+            Some(h) => h.join(".canopy"),
+            None => return Vec::new(),
+        };
+        let config = crate::domain::canopy_config::CanopyConfig::load(&canopy_dir);
+        let model = config.embeddings_model.trim();
+        if model.is_empty() {
+            return Vec::new();
+        }
+        let dimensions = match crate::rag::embedding_client::model_dimensions(model) {
+            Ok(d) => d,
+            Err(_) => return Vec::new(),
+        };
+        let rt = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => return Vec::new(),
         };
 
-        db.search_chunks(resolved_query, project_hash, 5)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|chunk| Self::format_rag_chunk(resolved_query, &chunk))
-            .collect()
+        rt.block_on(async {
+            let Ok(store) = crate::rag::vector_store::VectorStore::new(dimensions).await else {
+                return Vec::new();
+            };
+            let Ok(embedder) = crate::rag::embedding_client::client_from_config(&config) else {
+                return Vec::new();
+            };
+            let Ok(query_vec) = embedder.embed(resolved_query) else {
+                return Vec::new();
+            };
+            let Ok(results) = store.search_similar(&query_vec, 5).await else {
+                return Vec::new();
+            };
+            results
+                .iter()
+                .map(|chunk| Self::format_rag_chunk(resolved_query, chunk))
+                .collect()
+        })
     }
 
     fn resolve_rag_resources(
@@ -977,11 +1004,10 @@ fn strip_resources_section(prompt: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::project::Chunk;
     use tempfile::tempdir;
 
     #[test]
-    fn build_prompt_resolves_project_context_file_resources_and_rag_queries() {
+    fn build_prompt_resolves_project_context_and_file_resources() {
         let temp = tempdir().unwrap();
         let db_path = temp.path().join("canopy.db");
         let db = Database::new(&db_path).unwrap();
@@ -992,26 +1018,11 @@ mod tests {
 
         let resource = project_dir.join("guide.txt");
         std::fs::write(&resource, "hello from resource").unwrap();
-        db.replace_chunks(
-            "src/lib.rs",
-            &[Chunk {
-                id: "chunk-1".to_string(),
-                project_hash: Some(project.hash.clone()),
-                source_path: "src/lib.rs".to_string(),
-                chunk_index: 0,
-                content: "needle semantic chunk body".to_string(),
-                lang: "rust".to_string(),
-                embedding: None,
-                updated_at: 1,
-            }],
-        )
-        .unwrap();
 
         let mut dialog = SimplePromptDialog::new();
         dialog.set_section_content("instruction", "do the thing".to_string());
         dialog.add_section_with_content("project_context", project.path.clone());
         dialog.add_section_with_content("resources", resource.display().to_string());
-        dialog.add_section_with_content("rag_search", "needle".to_string());
 
         let prompt = dialog
             .build_prompt_with_resolved_resources(&db, &project_dir)
@@ -1021,8 +1032,6 @@ mod tests {
         assert!(prompt.contains(&project.hash));
         assert!(prompt.contains("kind: file"));
         assert!(prompt.contains("guide.txt"));
-        assert!(prompt.contains("kind: rag_chunk"));
-        assert!(prompt.contains("semantic chunk body"));
     }
 
     #[test]

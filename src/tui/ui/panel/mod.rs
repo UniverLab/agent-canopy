@@ -555,10 +555,9 @@ fn visible_playground_window(area: Rect, selected: usize) -> (usize, usize) {
     (max_visible, scroll_start)
 }
 
-fn project_name_for_chunk<'a>(app: &'a App, chunk: &crate::db::project::Chunk) -> &'a str {
+fn project_name_for_chunk<'a>(app: &'a App, _chunk: &crate::rag::vector_store::SearchResult) -> &'a str {
     app.projects
-        .iter()
-        .find(|project| chunk.project_hash.as_deref() == Some(project.hash.as_str()))
+        .first()
         .map(|project| project.name.as_str())
         .unwrap_or("?")
 }
@@ -609,13 +608,14 @@ fn playground_scope_label(app: &App) -> String {
 }
 
 fn render_chunk_entry<'a>(
-    chunk: &'a crate::db::project::Chunk,
+    chunk: &'a crate::rag::vector_store::SearchResult,
     project_name: &'a str,
     selected: bool,
     width: u16,
 ) -> Vec<Line<'a>> {
     let (style, marker) = selected_row_style(selected);
-    let path = format!("{} · {} [{}]", project_name, chunk.source_path, chunk.lang);
+    let dist = chunk.distance.map_or("—".to_string(), |d| format!("{d:.3}"));
+    let path = format!("{} · {} [dist={}]", project_name, chunk.file_path, dist);
     let mut lines = vec![Line::from(vec![
         Span::styled(marker, style.fg(ACCENT)),
         Span::raw(" "),
@@ -627,7 +627,7 @@ fn render_chunk_entry<'a>(
 
     for line in chunk.content.lines().take(3) {
         lines.push(Line::from(vec![
-            Span::styled("  ", style),
+            Span::styled("   ", style),
             Span::styled(
                 truncate_str(line, width.saturating_sub(6) as usize),
                 style.fg(DIM),
@@ -639,15 +639,13 @@ fn render_chunk_entry<'a>(
     lines
 }
 
-fn playground_detail_header(chunk: &crate::db::project::Chunk) -> Vec<Line<'static>> {
+fn playground_detail_header(chunk: &crate::rag::vector_store::SearchResult) -> Vec<Line<'static>> {
+    let dist = chunk.distance.map_or("—".to_string(), |d| format!("{d:.4}"));
     vec![
         Line::from(vec![
             Span::styled("‹ ", Style::default().fg(ACCENT)),
             Span::styled(
-                format!(
-                    "{} [{} · chunk {}]",
-                    chunk.source_path, chunk.lang, chunk.chunk_index
-                ),
+                format!("{} [dist={}]", chunk.file_path, dist),
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),

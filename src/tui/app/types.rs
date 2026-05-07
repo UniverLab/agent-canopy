@@ -3,11 +3,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::application::notification_service::NotificationService;
-use crate::db::project::{Chunk, RagInfoSummary, RagQueueItem};
+use crate::db::project::{RagInfoSummary, RagQueueItem};
 use crate::db::Database;
 use crate::domain::models::{Agent, RunLog};
 use crate::domain::project::Project;
 use crate::domain::sync::{ActiveIntent, SyncMessage, WorkspaceStatus};
+use crate::rag::vector_store::SearchResult;
 use crate::tui::agent::InteractiveAgent;
 use crate::tui::app::dialog::{NewAgentDialog, SimplePromptDialog};
 use crate::tui::app::terminal_search::TerminalSearch;
@@ -196,7 +197,7 @@ pub struct App {
     // RAG Playground state
     pub(crate) playground_active: bool,
     pub(crate) playground_query: String,
-    pub(crate) playground_results: Vec<Chunk>,
+    pub(crate) playground_results: Vec<SearchResult>,
     pub(crate) playground_selected: usize,
     pub(crate) playground_last_search: std::time::Instant,
     pub(crate) playground_last_executed_query: String,

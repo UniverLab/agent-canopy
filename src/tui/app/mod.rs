@@ -182,7 +182,6 @@ impl App {
             return Ok(());
         }
 
-        // Only search if query changed and debounce time has passed (300ms)
         let since_last = self.playground_last_search.elapsed().as_millis();
         if since_last < 300 {
             return Ok(());
@@ -200,10 +199,7 @@ impl App {
             return Ok(());
         }
 
-        if let Ok(results) =
-            self.db
-                .search_chunks(&query, self.playground_project_hash.as_deref(), 50)
-        {
+        if let Ok(results) = self.rag_vector_search(&query, 50) {
             self.playground_results = results;
             self.playground_selected = 0;
         }
@@ -345,12 +341,20 @@ impl App {
 
     fn refresh_rag_state(&mut self) -> Result<()> {
         self.global_rag_queue = self.db.list_rag_queue(50)?;
-        self.rag_info = self.db.rag_info_summary()?;
         self.rag_paused = self
             .db
             .get_state("rag_paused")?
             .map(|v| v == "1")
             .unwrap_or(false);
+
+        let (queued, processing) = self.db.rag_queue_counts().unwrap_or((0, 0));
+        let (total_chunks, indexed_files) = self.rag_lancedb_counts();
+        self.rag_info = crate::db::project::RagInfoSummary {
+            total_chunks,
+            indexed_projects: indexed_files,
+            queued_items: queued,
+            processing_items: processing,
+        };
 
         if self.global_rag_queue.is_empty() {
             self.selected_rag_queue = 0;
@@ -360,7 +364,6 @@ impl App {
                 .min(self.global_rag_queue.len().saturating_sub(1));
         }
 
-        // If RagInfo becomes unavailable (no chunks), reset focus away from it.
         if !self.rag_info.has_rag_activity() {
             if self.projects_panel_focus == ProjectsPanelFocus::RagInfo {
                 self.projects_panel_focus = ProjectsPanelFocus::Projects;
@@ -369,6 +372,54 @@ impl App {
         }
 
         Ok(())
+    }
+
+    fn rag_lancedb_counts(&self) -> (i64, i64) {
+        let canopy_dir = match dirs::home_dir() {
+            Some(h) => h.join(".canopy"),
+            None => return (0, 0),
+        };
+        let config = crate::domain::canopy_config::CanopyConfig::load(&canopy_dir);
+        let model = config.embeddings_model.trim();
+        if model.is_empty() {
+            return (0, 0);
+        }
+        let dimensions = match crate::rag::embedding_client::model_dimensions(model) {
+            Ok(d) => d,
+            Err(_) => return (0, 0),
+        };
+        let rt = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => return (0, 0),
+        };
+        rt.block_on(async {
+            let Ok(store) = crate::rag::vector_store::VectorStore::new(dimensions).await else {
+                return (0, 0);
+            };
+            let total = store.count_chunks().await.unwrap_or(0);
+            let unique = store.count_unique_paths().await.unwrap_or(0);
+            (total, unique)
+        })
+    }
+
+    fn rag_vector_search(&self, query: &str, top_k: usize) -> anyhow::Result<Vec<crate::rag::vector_store::SearchResult>> {
+        let canopy_dir = dirs::home_dir()
+            .map(|h| h.join(".canopy"))
+            .ok_or_else(|| anyhow::anyhow!("No home directory"))?;
+        let config = crate::domain::canopy_config::CanopyConfig::load(&canopy_dir);
+        let model = config.embeddings_model.trim();
+        if model.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dimensions = crate::rag::embedding_client::model_dimensions(model)?;
+        let rt = tokio::runtime::Handle::try_current()
+            .map_err(|_| anyhow::anyhow!("No tokio runtime"))?;
+        rt.block_on(async {
+            let store = crate::rag::vector_store::VectorStore::new(dimensions).await?;
+            let embedder = crate::rag::embedding_client::client_from_config(&config)?;
+            let query_vec = embedder.embed(query)?;
+            store.search_similar(&query_vec, top_k).await
+        })
     }
 
     pub fn selected_agent(&self) -> Option<&AgentEntry> {
@@ -452,7 +503,7 @@ impl App {
         self.reset_log_scroll();
     }
 
-    pub fn selected_playground_chunk(&self) -> Option<&crate::db::project::Chunk> {
+    pub fn selected_playground_chunk(&self) -> Option<&crate::rag::vector_store::SearchResult> {
         self.playground_results.get(self.playground_selected)
     }
 
@@ -987,8 +1038,11 @@ impl App {
 
         let query = self.playground_query.trim().to_string();
         let context_payload = format!(
-            "kind: rag_chunk\nquery: {}\npath: {}\nchunk_index: {}\nlanguage: {}\ncontent:\n{}",
-            query, chunk.source_path, chunk.chunk_index, chunk.lang, chunk.content
+            "kind: rag_chunk\nquery: {}\npath: {}\ndistance: {}\ncontent:\n{}",
+            query,
+            chunk.file_path,
+            chunk.distance.map_or("—".to_string(), |d| format!("{d:.4}")),
+            chunk.content
         );
 
         self.rag_transfer_modal = Some(RagTransferModal {
