@@ -114,6 +114,9 @@ arrow-array = "57"
 arrow-schema = "57"
 futures = "0.3"
 
+# PDF text extraction
+pdf-extract = "0.7"
+
 # Unix process management (kill, setsid)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
