@@ -101,7 +101,7 @@ pub(crate) async fn run_doctor() -> Result<()> {
     }
 
     // ── RAG Health ──────────────────────────────────────────────
-    println!("\n \x1b[1;36m◆ Personal RAG\x1b[0m");
+    println!(" \x1b[1;36m◆ Personal RAG\x1b[0m");
 
     let config = crate::domain::canopy_config::CanopyConfig::load(&canopy_dir);
 
@@ -115,23 +115,24 @@ pub(crate) async fn run_doctor() -> Result<()> {
         );
 
         // Check that the required API key is present.
-        let api_key_info =
-            match crate::rag::embedding_client::provider_for_model(&config.embeddings_model) {
-                Some(crate::rag::embedding_client::EmbeddingProvider::OpenAi) => {
-                    Some(("OPENAI_API_KEY", std::env::var("OPENAI_API_KEY").is_ok()))
-                }
-                Some(crate::rag::embedding_client::EmbeddingProvider::Gemini) => {
-                    Some(("GEMINI_API_KEY", std::env::var("GEMINI_API_KEY").is_ok()))
-                }
-                None => {
-                    println!(
-                        " \x1b[31m✗\x1b[0m Unrecognised model '{}' — embeddings will fail",
+        let api_key_info = match crate::rag::embedding_client::provider_for_model(
+            &config.embeddings_model,
+        ) {
+            Some(crate::rag::embedding_client::EmbeddingProvider::OpenAi) => {
+                Some(("OPENAI_API_KEY", std::env::var("OPENAI_API_KEY").is_ok()))
+            }
+            Some(crate::rag::embedding_client::EmbeddingProvider::Gemini) => {
+                Some(("GEMINI_API_KEY", std::env::var("GEMINI_API_KEY").is_ok()))
+            }
+            None => {
+                println!(
+                        " \x1b[31m✗\x1b[0m Model '{}' is not supported — only OpenAI and Google models are supported. Run 'canopy setup' to pick a compatible model.",
                         config.embeddings_model
                     );
-                    issues.push("Set a supported embeddings model via 'canopy setup'");
-                    None
-                }
-            };
+                issues.push("Run 'canopy setup' and select an OpenAI or Google embedding model");
+                None
+            }
+        };
 
         if let Some((key_var, present)) = api_key_info {
             if present {

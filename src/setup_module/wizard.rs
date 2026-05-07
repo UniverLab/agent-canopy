@@ -294,7 +294,11 @@ fn select_embeddings_model(current: &str) -> Result<String> {
                 .filter(|model| {
                     let id = model.id.to_lowercase();
                     let name = model.name.to_lowercase();
-                    id.contains("embed") || name.contains("embed")
+                    let provider = model.provider.to_lowercase();
+                    (id.contains("embed") || name.contains("embed"))
+                        && (provider == "openai"
+                            || provider == "google"
+                            || provider == "google-vertex")
                 })
                 .collect::<Vec<_>>()
         })
