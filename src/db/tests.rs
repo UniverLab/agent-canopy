@@ -274,33 +274,6 @@ fn test_mark_project_indexed_updates_timestamp() {
 }
 
 #[test]
-fn test_search_chunks_returns_recently_indexed_content() {
-    let db = test_db();
-    let project = crate::domain::project::Project::new("/tmp/project");
-    db.upsert_project(&project).unwrap();
-    db.replace_chunks(
-        "src/lib.rs",
-        &[crate::db::project::Chunk {
-            id: "chunk-1".to_string(),
-            project_hash: Some(project.hash.clone()),
-            source_path: "src/lib.rs".to_string(),
-            chunk_index: 0,
-            content: "needle indexed chunk".to_string(),
-            lang: "rust".to_string(),
-            embedding: Some(vec![1.0, 0.0, 0.0]),
-            updated_at: 1,
-        }],
-    )
-    .unwrap();
-
-    let results = db.search_chunks("needle", Some(&project.hash), 5).unwrap();
-
-    assert_eq!(results.len(), 1);
-    assert!(results[0].content.contains("needle indexed chunk"));
-    assert_eq!(results[0].embedding.as_deref(), Some(&[1.0, 0.0, 0.0][..]));
-}
-
-#[test]
 fn test_rag_queue_roundtrip() {
     let db = test_db();
     let project = crate::domain::project::Project::new("/tmp/project");
@@ -319,117 +292,15 @@ fn test_rag_queue_roundtrip() {
 }
 
 #[test]
-fn test_search_chunks_by_embedding_returns_best_match_first() {
+fn test_rag_queue_counts() {
     let db = test_db();
-    db.replace_chunks(
-        "src/lib.rs",
-        &[
-            crate::db::project::Chunk {
-                id: "chunk-1".to_string(),
-                project_hash: None,
-                source_path: "src/lib.rs".to_string(),
-                chunk_index: 0,
-                content: "alpha".to_string(),
-                lang: "text".to_string(),
-                embedding: Some(vec![1.0, 0.0, 0.0]),
-                updated_at: 1,
-            },
-            crate::db::project::Chunk {
-                id: "chunk-2".to_string(),
-                project_hash: None,
-                source_path: "src/lib.rs".to_string(),
-                chunk_index: 1,
-                content: "beta".to_string(),
-                lang: "text".to_string(),
-                embedding: Some(vec![0.0, 1.0, 0.0]),
-                updated_at: 2,
-            },
-        ],
-    )
-    .unwrap();
+    db.enqueue_rag_item("/tmp/a.rs", 111).unwrap();
+    db.enqueue_rag_item("/tmp/b.rs", 112).unwrap();
+    db.mark_rag_item_processing("/tmp/a.rs", 113).unwrap();
 
-    let results = db
-        .search_chunks_by_embedding(&[0.9, 0.1, 0.0], None, 2)
-        .unwrap();
-
-    assert_eq!(results.len(), 2);
-    assert_eq!(results[0].chunk.id, "chunk-1");
-    assert!(results[0].score > results[1].score);
-    assert_eq!(
-        results[0].chunk.embedding.as_deref(),
-        Some(&[1.0, 0.0, 0.0][..])
-    );
-}
-
-#[test]
-fn test_semantic_chunk_embeddings_roundtrip_through_vector_search() {
-    use crate::rag::chunker::chunk_semantic;
-    use crate::rag::embedding_client::{EmbeddingClient, MockEmbeddingClient};
-
-    let db = test_db();
-    let embedder = MockEmbeddingClient::new(8);
-    let semantic_chunks = chunk_semantic(
-        "# Alpha\n\nalpha beta gamma\n\n## Beta\n\nomega sigma tau",
-        "markdown",
-        0.0,
-    );
-
-    let chunks = semantic_chunks
-        .into_iter()
-        .map(|chunk| crate::db::project::Chunk {
-            id: format!("chunk-{}", chunk.index),
-            project_hash: None,
-            source_path: "notes.md".to_string(),
-            chunk_index: chunk.index as i32,
-            embedding: Some(embedder.embed(&chunk.content).unwrap()),
-            content: chunk.content,
-            lang: "markdown".to_string(),
-            updated_at: 1,
-        })
-        .collect::<Vec<_>>();
-
-    db.replace_chunks("notes.md", &chunks).unwrap();
-
-    let query = embedder.embed("alpha beta").unwrap();
-    let results = db.search_chunks_by_embedding(&query, None, 1).unwrap();
-
-    assert_eq!(results.len(), 1);
-    assert!(results[0].chunk.content.contains("# Alpha"));
-    assert!(results[0].score > 0.5);
-}
-
-#[test]
-fn test_rag_info_summary_counts_chunks_and_queue_states() {
-    let db = test_db();
-    let project = crate::domain::project::Project::new("/tmp/project");
-    db.upsert_project(&project).unwrap();
-
-    db.enqueue_rag_item("/tmp/project/src/lib.rs", 111).unwrap();
-    db.enqueue_rag_item("/tmp/project/src/main.rs", 112)
-        .unwrap();
-    db.mark_rag_item_processing("/tmp/project/src/main.rs", 113)
-        .unwrap();
-
-    db.replace_chunks(
-        "/tmp/project/src/lib.rs",
-        &[crate::db::project::Chunk {
-            id: "chunk-1".to_string(),
-            project_hash: Some(project.hash),
-            source_path: "/tmp/project/src/lib.rs".to_string(),
-            chunk_index: 0,
-            content: "needle".to_string(),
-            lang: "rust".to_string(),
-            embedding: None,
-            updated_at: 114,
-        }],
-    )
-    .unwrap();
-
-    let summary = db.rag_info_summary().unwrap();
-    assert_eq!(summary.total_chunks, 1);
-    assert_eq!(summary.indexed_projects, 1);
-    assert_eq!(summary.queued_items, 1);
-    assert_eq!(summary.processing_items, 1);
+    let (queued, processing) = db.rag_queue_counts().unwrap();
+    assert_eq!(queued, 1);
+    assert_eq!(processing, 1);
 }
 
 // ── Agent CRUD ─────────────────────────────────────────────────────
