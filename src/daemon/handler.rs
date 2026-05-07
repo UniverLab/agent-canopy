@@ -831,11 +831,11 @@ impl TaskTriggerHandler {
         }
     }
 
-    /// Full-text search over personal RAG chunks (FTS5). Rate-limited: 10/min per agent.
+    /// Full-text search over personal RAG chunks (LanceDB vector search). Rate-limited: 10/min per agent.
     #[tool(
         name = "rag_search",
         description = "Search indexed personal content (markdown and PDF files). \
-         Default limit: 5. Rate-limited to 10 calls/min per agent."
+        Default limit: 5. Rate-limited to 10 calls/min per agent."
     )]
     async fn rag_search(
         &self,
@@ -845,22 +845,51 @@ impl TaskTriggerHandler {
             return Ok(result);
         }
 
-        let chunks = self
-            .db
-            .search_chunks(&params.query, None, params.limit.unwrap_or(5).min(20))
-            .map_err(internal_error)?;
-        if chunks.is_empty() {
+        let limit = params.limit.unwrap_or(5).min(20);
+        let data_dir_path = data_dir().map_err(internal_error)?;
+        let config = crate::domain::canopy_config::CanopyConfig::load(&data_dir_path);
+
+        let model = config.embeddings_model.trim();
+        if model.is_empty() {
+            return Ok(success_result("No embeddings model configured."));
+        }
+
+        let dimensions = match crate::rag::embedding_client::model_dimensions(model) {
+            Ok(d) => d,
+            Err(e) => return Ok(error_result(&format!("Unknown model dimensions: {e}"))),
+        };
+
+        let embedding_client = match crate::rag::embedding_client::client_from_config(&config) {
+            Ok(client) => client,
+            Err(e) => return Ok(error_result(&format!("Embedding client error: {e}"))),
+        };
+
+        let query = params.query.clone();
+        let query_vec = tokio::task::spawn_blocking(move || embedding_client.embed(&query))
+            .await
+            .map_err(|e| internal_error(e.to_string()))?
+            .map_err(|e| internal_error(e.to_string()))?;
+
+        let store = crate::rag::vector_store::VectorStore::new(dimensions)
+            .await
+            .map_err(|e| internal_error(e.to_string()))?;
+
+        let results = store
+            .search_similar(&query_vec, limit)
+            .await
+            .map_err(|e| internal_error(e.to_string()))?;
+
+        if results.is_empty() {
             return Ok(success_result("No results found."));
         }
 
-        let out: Vec<serde_json::Value> = chunks
+        let out: Vec<serde_json::Value> = results
             .iter()
-            .map(|c| {
+            .map(|r| {
                 serde_json::json!({
-                    "source": c.source_path,
-                    "lang": c.lang,
-                    "chunk_index": c.chunk_index,
-                    "content": c.content,
+                    "source": r.file_path,
+                    "content": r.content,
+                    "distance": r.distance,
                 })
             })
             .collect();
