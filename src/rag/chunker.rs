@@ -179,14 +179,21 @@ fn chunk_paragraph_texts(content: &str) -> Vec<String> {
         if buf.len() + separator_len + paragraph.len() > window && !buf.is_empty() {
             let flushed = std::mem::take(&mut buf);
             push_chunk(&mut chunks, &flushed);
-            let overlap_start = chunks
-                .last()
-                .map(|chunk: &String| chunk.len().saturating_sub(overlap))
-                .unwrap_or(0);
-            buf = chunks
-                .last()
-                .map(|chunk| chunk[overlap_start..].to_owned())
-                .unwrap_or_default();
+        let overlap_start = chunks
+            .last()
+            .map(|chunk: &String| {
+                let byte_target = chunk.len().saturating_sub(overlap);
+                chunk
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .find(|&b| b >= byte_target)
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        buf = chunks
+            .last()
+            .map(|chunk| chunk[overlap_start..].to_owned())
+            .unwrap_or_default();
         }
         if !buf.is_empty() {
             buf.push_str("\n\n");
@@ -210,34 +217,29 @@ fn split_paragraph(paragraph: &str) -> Vec<String> {
     }
 
     let mut chunks = Vec::new();
-    let mut start = 0usize;
-    let chars: Vec<(usize, char)> = paragraph.char_indices().collect();
+    let char_boundaries: Vec<usize> = paragraph.char_indices().map(|(i, _)| i).collect();
     let total_len = paragraph.len();
+    let mut start = 0usize;
 
     while start < total_len {
-        let mut end = start;
-        for (idx, _) in chars.iter().copied().skip_while(|(idx, _)| *idx < start) {
-            if idx.saturating_sub(start) > window {
-                break;
-            }
-            end = idx;
-        }
-
-        let end = if end <= start {
-            total_len.min(start + window)
-        } else {
-            paragraph[end..]
-                .chars()
-                .next()
-                .map(|ch| end + ch.len_utf8())
-                .unwrap_or(total_len)
-        };
+        let target = start.saturating_add(window).min(total_len);
+        let end = char_boundaries
+            .iter()
+            .copied()
+            .find(|&b| b >= target)
+            .unwrap_or(total_len);
 
         push_chunk(&mut chunks, &paragraph[start..end]);
         if end >= total_len {
             break;
         }
-        start = end.saturating_sub(overlap);
+
+        let overlap_target = end.saturating_sub(overlap);
+        start = char_boundaries
+            .iter()
+            .copied()
+            .find(|&b| b >= overlap_target)
+            .unwrap_or(end);
     }
 
     chunks
@@ -379,5 +381,24 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].similarity_to_prev, None);
         assert!(chunks[0].content.contains("delta epsilon zeta"));
+    }
+
+    #[test]
+    fn split_paragraph_handles_multibyte_utf8_without_panic() {
+        let ligature = "ﬁ".repeat(600);
+        let paragraph = format!("In this work we investigate {ligature}");
+        let chunks = split_paragraph(&paragraph);
+        assert!(!chunks.is_empty());
+        for chunk in &chunks {
+            assert!(chunk.is_char_boundary(chunk.len()));
+        }
+    }
+
+    #[test]
+    fn chunk_paragraph_texts_handles_multibyte_utf8_without_panic() {
+        let ligature = "ﬁ".repeat(600);
+        let content = format!("alpha beta gamma\n\n{ligature}\n\ndelta epsilon");
+        let chunks = chunk_paragraph_texts(&content);
+        assert!(!chunks.is_empty());
     }
 }
