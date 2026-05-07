@@ -1,5 +1,6 @@
 pub mod config_manip;
 pub mod daemon_service;
+pub mod dir_browser;
 pub mod models;
 pub mod platform_adapter;
 pub mod public_api;

@@ -1,8 +1,9 @@
 use crate::setup_module::daemon_service::{
     install_service_if_needed, start_daemon_if_needed, stop_daemon,
 };
+use crate::setup_module::dir_browser::browse_directories_multiselect;
 use crate::setup_module::models::{is_platform_available, Platform};
-use crate::setup_module::platform_adapter::{browse_directories_multiselect, clear_wizard_screen};
+use crate::setup_module::platform_adapter::clear_wizard_screen;
 use crate::setup_module::registry_fetch::{fetch_registry, print_banner};
 use crate::setup_module::sync_and_skills::{run_essential_skills_step, run_sync_step};
 use crate::setup_module::PlatformWithCli;

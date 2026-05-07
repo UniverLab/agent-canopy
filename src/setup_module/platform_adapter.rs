@@ -1,6 +1,7 @@
 use crate::setup_module::config_manip::{
     remove_json_key, upsert_json_key, upsert_toml_array, upsert_toml_key,
 };
+use crate::setup_module::dir_browser::browse_directory;
 use crate::setup_module::models::{
     load_mcp_fs_root, resolve_config_path, save_mcp_fs_root, CanonicalServers, Platform,
 };
@@ -12,7 +13,6 @@ type JsonMap = serde_json::Map<String, serde_json::Value>;
 
 // ── Parsing & normalization ──────────────────────────────────────────────────
 
-/// Replace `{filesystem_dir}` and `{home}` placeholders in a JSON value tree.
 fn substitute_placeholders(value: &mut serde_json::Value, home: &str, fs_dir: &str) {
     match value {
         serde_json::Value::String(s) if s.contains("{filesystem_dir}") || s.contains("{home}") => {
@@ -48,7 +48,6 @@ fn clone_object_entries_except(obj: &JsonMap, excluded: &[&str]) -> JsonMap {
         .collect()
 }
 
-/// Build the initial field map applying the platform's command_format rule.
 fn apply_command_format(obj: &JsonMap, command_format: &str) -> JsonMap {
     if command_format != "merged" {
         return clone_object_entries(obj);
@@ -85,8 +84,6 @@ fn rename_mapped_fields(
 
 // ── Validation & resolution ─────────────────────────────────────────────────
 
-/// Infer server type index from canonical fields.
-/// Returns `0` for url-based (http/remote) or `1` for command-based (stdio/local).
 fn infer_server_type_index(config: &JsonMap) -> Option<usize> {
     if config.contains_key("url") {
         return Some(0);
@@ -188,462 +185,8 @@ pub fn adapt_config(
     serde_json::Value::Object(adapted)
 }
 
-/// Interactive directory browser using `inquire::Select`.
-/// Lets the user navigate the filesystem and select a directory.
-/// Interactive directory picker using arrow-key navigation.
-///
-/// Keys: ↑↓ navigate  →  enter directory  ←  go up  Enter  confirm  Esc  cancel
-pub(crate) fn browse_directory(start_dir: &str) -> String {
-    use ratatui::crossterm::event::{read, Event, KeyEventKind};
-    use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+// ── MCP config extraction & display ──────────────────────────────────────────
 
-    let mut current = std::path::PathBuf::from(start_dir);
-    if !current.is_dir() {
-        current = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
-    }
-
-    let mut cursor: usize = 0;
-    let mut filter = String::new();
-    let visible: usize = 10;
-    let total_rows = 3 + visible + 1;
-
-    let _ = enable_raw_mode();
-    for _ in 0..total_rows {
-        print!("\r\n");
-    }
-
-    loop {
-        let subdirs = filter_subdirs_from(&current, &filter);
-        adjust_cursor_bounds(&mut cursor, subdirs.len());
-        let scroll = calculate_scroll(cursor, visible);
-        let has_above = scroll > 0;
-        let has_below = !subdirs.is_empty() && scroll + visible < subdirs.len();
-
-        render_browse_display(
-            total_rows, &current, &subdirs, cursor, scroll, visible, &filter, has_above, has_below,
-        );
-        let _ = io::stdout().flush();
-
-        if let Ok(Event::Key(k)) = read() {
-            if k.kind == KeyEventKind::Press {
-                match handle_browse_key(k.code, &subdirs, &mut cursor, &mut current, &mut filter) {
-                    BrowseAction::Confirm => {
-                        let _ = disable_raw_mode();
-                        print!("\r\n");
-                        let _ = io::stdout().flush();
-                        return current.to_string_lossy().to_string();
-                    }
-                    BrowseAction::Cancel => {
-                        let _ = disable_raw_mode();
-                        print!("\r\n");
-                        let _ = io::stdout().flush();
-                        return start_dir.to_string();
-                    }
-                    BrowseAction::Continue => {}
-                }
-            }
-        }
-    }
-}
-
-/// Multi-select directory browser - allows selecting multiple directories with space bar
-pub(crate) fn browse_directories_multiselect(start_dir: &str) -> Vec<String> {
-    use ratatui::crossterm::event::{read, Event, KeyEventKind};
-    use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-    use std::collections::HashSet;
-
-    let mut current = std::path::PathBuf::from(start_dir);
-    if !current.is_dir() {
-        current = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
-    }
-
-    let mut cursor: usize = 0;
-    let mut filter = String::new();
-    let mut selected: HashSet<String> = HashSet::new();
-    let visible: usize = 10;
-    let total_rows = 4 + visible;
-
-    let _ = enable_raw_mode();
-    for _ in 0..total_rows {
-        print!("\r\n");
-    }
-
-    loop {
-        let subdirs = filter_subdirs_from(&current, &filter);
-        adjust_cursor_bounds(&mut cursor, subdirs.len());
-        let scroll = calculate_scroll(cursor, visible);
-        let has_above = scroll > 0;
-        let has_below = !subdirs.is_empty() && scroll + visible < subdirs.len();
-
-        render_multiselect_display(
-            total_rows, &current, &subdirs, cursor, scroll, visible, &filter, has_above, has_below,
-            &selected,
-        );
-        let _ = io::stdout().flush();
-
-        if let Ok(Event::Key(k)) = read() {
-            if k.kind == KeyEventKind::Press {
-                match handle_multiselect_key(
-                    k.code,
-                    &subdirs,
-                    &mut cursor,
-                    &mut current,
-                    &mut filter,
-                    &mut selected,
-                ) {
-                    MultiSelectAction::Confirm => {
-                        let _ = disable_raw_mode();
-                        print!("\r\n");
-                        let _ = io::stdout().flush();
-                        return selected.into_iter().collect();
-                    }
-                    MultiSelectAction::Cancel => {
-                        let _ = disable_raw_mode();
-                        print!("\r\n");
-                        let _ = io::stdout().flush();
-                        return Vec::new();
-                    }
-                    MultiSelectAction::Continue => {}
-                }
-            }
-        }
-    }
-}
-
-enum MultiSelectAction {
-    Confirm,
-    Cancel,
-    Continue,
-}
-
-fn handle_multiselect_key(
-    code: ratatui::crossterm::event::KeyCode,
-    subdirs: &[String],
-    cursor: &mut usize,
-    current: &mut std::path::PathBuf,
-    filter: &mut String,
-    selected: &mut std::collections::HashSet<String>,
-) -> MultiSelectAction {
-    use ratatui::crossterm::event::KeyCode;
-    match code {
-        KeyCode::Enter => MultiSelectAction::Confirm,
-        KeyCode::Esc => MultiSelectAction::Cancel,
-        KeyCode::Up => {
-            *cursor = cursor.saturating_sub(1);
-            MultiSelectAction::Continue
-        }
-        KeyCode::Down if !subdirs.is_empty() && *cursor + 1 < subdirs.len() => {
-            *cursor += 1;
-            MultiSelectAction::Continue
-        }
-        KeyCode::Char(' ') if filter.is_empty() => {
-            // Toggle selection of current item
-            if let Some(name) = subdirs.get(*cursor) {
-                let full_path = current.join(name).to_string_lossy().to_string();
-                if selected.contains(&full_path) {
-                    selected.remove(&full_path);
-                } else {
-                    selected.insert(full_path);
-                }
-            }
-            MultiSelectAction::Continue
-        }
-        KeyCode::Right | KeyCode::Char('l') if filter.is_empty() => {
-            if let Some(name) = subdirs.get(*cursor) {
-                *current = current.join(name);
-                *cursor = 0;
-            }
-            MultiSelectAction::Continue
-        }
-        KeyCode::Left | KeyCode::Char('h') if filter.is_empty() => {
-            if let Some(parent) = current.parent() {
-                *current = parent.to_path_buf();
-                *cursor = 0;
-            }
-            MultiSelectAction::Continue
-        }
-        KeyCode::Right if !filter.is_empty() => {
-            if let Some(name) = subdirs.get(*cursor) {
-                *current = current.join(name);
-                *cursor = 0;
-                filter.clear();
-            }
-            MultiSelectAction::Continue
-        }
-        KeyCode::Char(c) if !c.is_control() && filter.len() < 50 => {
-            filter.push(c);
-            *cursor = 0;
-            MultiSelectAction::Continue
-        }
-        KeyCode::Backspace => {
-            filter.pop();
-            *cursor = 0;
-            MultiSelectAction::Continue
-        }
-        _ => MultiSelectAction::Continue,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn render_multiselect_display(
-    total_rows: usize,
-    current: &std::path::Path,
-    subdirs: &[String],
-    cursor: usize,
-    scroll: usize,
-    visible: usize,
-    filter: &str,
-    has_above: bool,
-    has_below: bool,
-    selected: &std::collections::HashSet<String>,
-) {
-    print!("\x1b[{total_rows}A");
-    print!("\r\x1b[2K  \x1b[36m»\x1b[0m  {}\r\n", current.display());
-    let selected_count = selected.len();
-    print!(
-        "\r\x1b[2K  \x1b[90m↑↓ navigate  Space mark  → enter  ← back  Enter confirm  Esc cancel  ({} selected)\x1b[0m\r\n",
-        selected_count
-    );
-
-    if filter.is_empty() {
-        print!("\r\x1b[2K  \x1b[90mfilter: _\x1b[0m\r\n");
-    } else {
-        print!(
-            "\r\x1b[2K  filter: \x1b[33m{filter}\x1b[0m \x1b[90m(Backspace to clear)\x1b[0m\r\n"
-        );
-    }
-
-    render_multiselect_subdirs(subdirs, cursor, scroll, visible, filter, current, selected);
-    render_pagination_line(subdirs, cursor, has_above, has_below);
-}
-
-fn render_multiselect_subdirs(
-    subdirs: &[String],
-    cursor: usize,
-    scroll: usize,
-    visible: usize,
-    filter: &str,
-    current: &std::path::Path,
-    selected: &std::collections::HashSet<String>,
-) {
-    if subdirs.is_empty() {
-        let msg = if filter.is_empty() {
-            "(empty — Enter to confirm, ← to go up)"
-        } else {
-            "(no matches for \"{filter}\")"
-        };
-        print!("\r\x1b[2K  \x1b[90m{msg}\x1b[0m\r\n");
-        for _ in 1..visible {
-            print!("\r\x1b[2K\r\n");
-        }
-    } else {
-        let mut drawn = 0;
-        for (i, name) in subdirs.iter().enumerate().skip(scroll).take(visible) {
-            let full_path = current.join(name).to_string_lossy().to_string();
-            let is_selected = selected.contains(&full_path);
-            let marker = if is_selected { "☑" } else { "☐" };
-
-            if i == cursor {
-                print!("\r\x1b[2K  \x1b[1;32m▶\x1b[0m \x1b[7m {marker} {name} \x1b[0m\r\n");
-            } else {
-                print!("\r\x1b[2K    {marker} {name}\r\n");
-            }
-            drawn += 1;
-        }
-        for _ in drawn..visible {
-            print!("\r\x1b[2K\r\n");
-        }
-    }
-}
-
-fn filter_subdirs_from(current: &std::path::Path, filter: &str) -> Vec<String> {
-    let all = browse_list_subdirs(current);
-    if filter.is_empty() {
-        return all;
-    }
-    let f = filter.to_lowercase();
-    all.into_iter()
-        .filter(|name| name.to_lowercase().contains(&f))
-        .collect()
-}
-
-fn adjust_cursor_bounds(cursor: &mut usize, len: usize) {
-    if len > 0 && *cursor >= len {
-        *cursor = len - 1;
-    }
-}
-
-fn calculate_scroll(cursor: usize, visible: usize) -> usize {
-    if cursor >= visible {
-        cursor - visible + 1
-    } else {
-        0
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn render_browse_display(
-    total_rows: usize,
-    current: &std::path::Path,
-    subdirs: &[String],
-    cursor: usize,
-    scroll: usize,
-    visible: usize,
-    filter: &str,
-    has_above: bool,
-    has_below: bool,
-) {
-    print!("\x1b[{total_rows}A");
-    print!("\r\x1b[2K  \x1b[36m»\x1b[0m  {}\r\n", current.display());
-    print!(
-        "\r\x1b[2K  \x1b[90m↑↓ navigate  → enter  ← back  Enter confirm  Esc cancel  type to filter\x1b[0m\r\n"
-    );
-
-    if filter.is_empty() {
-        print!("\r\x1b[2K  \x1b[90mfilter: _\x1b[0m\r\n");
-    } else {
-        print!(
-            "\r\x1b[2K  filter: \x1b[33m{filter}\x1b[0m \x1b[90m(Backspace to clear)\x1b[0m\r\n"
-        );
-    }
-
-    render_subdirs_section(subdirs, cursor, scroll, visible, filter);
-    render_pagination_line(subdirs, cursor, has_above, has_below);
-}
-
-fn render_subdirs_section(
-    subdirs: &[String],
-    cursor: usize,
-    scroll: usize,
-    visible: usize,
-    filter: &str,
-) {
-    if subdirs.is_empty() {
-        let msg = if filter.is_empty() {
-            "(empty — Enter to confirm, ← to go up)"
-        } else {
-            "(no matches for \"{filter}\")"
-        };
-        print!("\r\x1b[2K  \x1b[90m{msg}\x1b[0m\r\n");
-        for _ in 1..visible {
-            print!("\r\x1b[2K\r\n");
-        }
-    } else {
-        let mut drawn = 0;
-        for (i, name) in subdirs.iter().enumerate().skip(scroll).take(visible) {
-            if i == cursor {
-                print!("\r\x1b[2K  \x1b[1;32m▶\x1b[0m \x1b[7m {name} \x1b[0m\r\n");
-            } else {
-                print!("\r\x1b[2K    {name}\r\n");
-            }
-            drawn += 1;
-        }
-        for _ in drawn..visible {
-            print!("\r\x1b[2K\r\n");
-        }
-    }
-}
-
-fn render_pagination_line(subdirs: &[String], cursor: usize, has_above: bool, has_below: bool) {
-    if subdirs.is_empty() {
-        print!("\r\x1b[2K  \x1b[90m0 items\x1b[0m\r\n");
-    } else {
-        let up = if has_above { "↑ " } else { "  " };
-        let dn = if has_below { " ↓" } else { "  " };
-        print!(
-            "\r\x1b[2K  \x1b[90m{up}{}/{}{dn}\x1b[0m\r\n",
-            cursor + 1,
-            subdirs.len()
-        );
-    }
-}
-
-enum BrowseAction {
-    Confirm,
-    Cancel,
-    Continue,
-}
-
-fn handle_browse_key(
-    code: ratatui::crossterm::event::KeyCode,
-    subdirs: &[String],
-    cursor: &mut usize,
-    current: &mut std::path::PathBuf,
-    filter: &mut String,
-) -> BrowseAction {
-    use ratatui::crossterm::event::KeyCode;
-    match code {
-        KeyCode::Enter => BrowseAction::Confirm,
-        KeyCode::Esc => BrowseAction::Cancel,
-        KeyCode::Up => {
-            *cursor = cursor.saturating_sub(1);
-            BrowseAction::Continue
-        }
-        KeyCode::Down if !subdirs.is_empty() && *cursor + 1 < subdirs.len() => {
-            *cursor += 1;
-            BrowseAction::Continue
-        }
-        KeyCode::Right | KeyCode::Char('l') if filter.is_empty() => {
-            if let Some(name) = subdirs.get(*cursor) {
-                *current = current.join(name);
-                *cursor = 0;
-            }
-            BrowseAction::Continue
-        }
-        KeyCode::Left | KeyCode::Char('h') if filter.is_empty() => {
-            if let Some(parent) = current.parent() {
-                *current = parent.to_path_buf();
-                *cursor = 0;
-            }
-            BrowseAction::Continue
-        }
-        // → with filter: enter the highlighted match then clear filter
-        KeyCode::Right if !filter.is_empty() => {
-            if let Some(name) = subdirs.get(*cursor) {
-                *current = current.join(name);
-                *cursor = 0;
-                filter.clear();
-            }
-            BrowseAction::Continue
-        }
-        KeyCode::Backspace => {
-            filter.pop();
-            *cursor = 0;
-            BrowseAction::Continue
-        }
-        KeyCode::Char(c) => {
-            filter.push(c);
-            *cursor = 0;
-            BrowseAction::Continue
-        }
-        _ => BrowseAction::Continue,
-    }
-}
-
-fn browse_list_subdirs(path: &std::path::Path) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return Vec::new();
-    };
-    let mut dirs: Vec<String> = entries
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_type().map(|t| t.is_dir()).unwrap_or(false)
-                || (e.file_type().map(|t| t.is_symlink()).unwrap_or(false) && e.path().is_dir())
-        })
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') {
-                None
-            } else {
-                Some(name)
-            }
-        })
-        .collect();
-    dirs.sort();
-    dirs
-}
-
-/// Extract all MCP server configs from the selected platforms.
 pub(crate) fn extract_all_mcp_configs(
     home: &Path,
     selected: &[&Platform],
@@ -686,7 +229,6 @@ pub(crate) fn print_mcp_matrix(all_configs: &[crate::config::PlatformMcpConfig])
         .iter()
         .flat_map(|c| c.servers.iter().map(|s| s.name.clone()))
         .collect();
-    // Always show our 4 core servers in the matrix
     for s in &["canopy", "fetch", "filesystem"] {
         all_servers.insert(s.to_string());
     }
@@ -695,9 +237,9 @@ pub(crate) fn print_mcp_matrix(all_configs: &[crate::config::PlatformMcpConfig])
     let cell_col = 3usize;
     let total_width = 2 + server_col + 1 + (all_configs.len() * (cell_col + 1));
 
-    println!("  MCP overview:");
+    println!(" MCP overview:");
     println!(
-        "  {:<server_col$} {}",
+        " {:<server_col$} {}",
         "Server",
         (1..=all_configs.len())
             .map(|i| format!("{:>cell_col$}", i, cell_col = cell_col))
@@ -705,9 +247,9 @@ pub(crate) fn print_mcp_matrix(all_configs: &[crate::config::PlatformMcpConfig])
             .join(" "),
         server_col = server_col
     );
-    println!("  {:─<width$}", "", width = total_width.max(34));
+    println!(" {:─<width$}", "", width = total_width.max(34));
     for server_name in &all_servers {
-        let mut row = format!("  {:<server_col$}", server_name, server_col = server_col);
+        let mut row = format!(" {:<server_col$}", server_name, server_col = server_col);
         for config in all_configs {
             let has = config.servers.iter().any(|s| s.name == *server_name);
             let icon = if has {
@@ -715,15 +257,14 @@ pub(crate) fn print_mcp_matrix(all_configs: &[crate::config::PlatformMcpConfig])
             } else {
                 "\x1b[31m✗\x1b[0m"
             };
-            // Manual padding: ANSI codes break format width, so pad explicitly
             row.push_str(&format!(" {}{}", " ".repeat(cell_col - 1), icon));
         }
         println!("{}", row);
     }
     println!();
-    println!("  Platforms:");
+    println!(" Platforms:");
     for (idx, cfg) in all_configs.iter().enumerate() {
-        println!("    {:>2}: {}", idx + 1, cfg.platform);
+        println!(" {:>2}: {}", idx + 1, cfg.platform);
     }
 }
 
@@ -812,7 +353,7 @@ fn write_server_config(
     let adapted = adapt_config(&config, platform, server_name);
     if let Err(error) = apply_upsert_to_platform(platform, config_path, server_name, &adapted) {
         eprintln!(
-            "  \x1b[33m⚠\x1b[0m  Failed to write {server_name} for {}: {error}",
+            " \x1b[33m⚠\x1b[0m Failed to write {server_name} for {}: {error}",
             platform.name
         );
     }
@@ -837,10 +378,10 @@ fn resolve_filesystem_root(home: &Path, canonical: &CanonicalServers) -> String 
 
     let current_fs = load_mcp_fs_root(home);
     println!();
-    println!("  \x1b[36mFilesystem MCP root directory\x1b[0m");
-    println!("  Agents will have read/write access to everything inside this directory.");
-    println!("  Choose a project folder or workspace root.");
-    println!("  Current: \x1b[33m{}\x1b[0m", current_fs);
+    println!(" \x1b[36mFilesystem MCP root directory\x1b[0m");
+    println!(" Agents will have read/write access to everything inside this directory.");
+    println!(" Choose a project folder or workspace root.");
+    println!(" Current: \x1b[33m{}\x1b[0m", current_fs);
     println!();
 
     let chosen = browse_directory(&current_fs);
