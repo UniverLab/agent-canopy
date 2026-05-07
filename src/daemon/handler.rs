@@ -3,10 +3,8 @@
 //! Uses the `rmcp` SDK's `#[tool_router]` and `#[tool_handler]` macros
 //! with `Parameters<T>` for proper MCP protocol compliance.
 
-use std::path::Path;
 use std::sync::Arc;
 
-use chrono::Utc;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
@@ -19,14 +17,22 @@ use tokio::sync::Notify;
 
 use crate::application::notification_service::NotificationService;
 use crate::application::ports::{AgentRepository, RunRepository};
-use crate::daemon::helpers::{
-    data_dir, error_result, filter_log_line, notify_run_result, success_result,
+use crate::daemon::handler_formatting::{
+    format_agent_info, format_log_output, format_temporal_agents, format_uptime, internal_error,
+    make_log_path, recent_runs_output, resolve_log_path,
 };
+use crate::daemon::handler_helpers::{
+    apply_scalar_updates, apply_trigger_updates, handle_timed_out_run, map_action_result,
+    new_agent_base, parse_report_status, prepare_cron_task, prepare_watch_task,
+    update_agent_last_run, validate_report_summary, validate_run_transition,
+    watcher_restart_needed,
+};
+use crate::daemon::helpers::{data_dir, error_result, notify_run_result, success_result};
 use crate::daemon::params::*;
 use crate::db::Database;
-use crate::domain::models::{Agent, Cli, RunLog, RunStatus, Trigger, WatchEvent};
+use crate::domain::models::{Agent, Trigger};
 use crate::domain::sync::{MessageKind, MissionImpact, WorkspaceStatus};
-use crate::domain::validation::{validate_id, validate_prompt, validate_watch_path};
+use crate::domain::validation::validate_id;
 use crate::executor::Executor;
 use crate::rag::rate_limiter::RateLimiter;
 use crate::sync_manager::SyncManager;
@@ -373,10 +379,7 @@ impl TaskTriggerHandler {
             .filter(|a| a.enabled && !a.is_expired())
             .count();
         let active_watchers = self.watcher_engine.active_count().await;
-
-        let uptime = self.start_time.elapsed();
-        let uptime_str = format_uptime(uptime.as_secs());
-
+        let uptime_str = format_uptime(self.start_time.elapsed().as_secs());
         let log_dir = data_dir()
             .map(|d| d.join("logs").to_string_lossy().to_string())
             .unwrap_or_else(|_| "unknown".to_string());
@@ -385,23 +388,15 @@ impl TaskTriggerHandler {
         let watch_count = agents.iter().filter(|a| a.is_watch()).count();
         let manual_count = agents.len() - cron_count - watch_count;
 
-        let temporal: Vec<String> = agents
-            .iter()
-            .filter(|a| a.expires_at.is_some() && a.enabled)
-            .map(|a| {
-                let remaining = a.expires_at.unwrap().signed_duration_since(Utc::now());
-                if remaining.num_seconds() > 0 {
-                    format!("  - {}: {}m remaining", a.id, remaining.num_minutes())
-                } else {
-                    format!("  - {}: EXPIRED", a.id)
-                }
-            })
-            .collect();
-
         let transport = if self.port > 0 {
             "Streamable HTTP"
         } else {
             "stdio"
+        };
+        let port_str = if self.port > 0 {
+            self.port.to_string()
+        } else {
+            "N/A".into()
         };
 
         let mut status = format!(
@@ -416,11 +411,7 @@ impl TaskTriggerHandler {
             env!("CARGO_PKG_VERSION"),
             uptime_str,
             transport,
-            if self.port > 0 {
-                self.port.to_string()
-            } else {
-                "N/A".to_string()
-            },
+            port_str,
             active_agents,
             agents.len(),
             cron_count,
@@ -430,9 +421,10 @@ impl TaskTriggerHandler {
             log_dir,
         );
 
+        let temporal = format_temporal_agents(&agents);
         if !temporal.is_empty() {
             status.push_str("\n\nTemporal agents:\n");
-            status.push_str(&temporal.join("\n"));
+            status.push_str(&temporal);
         }
 
         Ok(CallToolResult::success(vec![Content::text(status)]))
@@ -492,7 +484,7 @@ impl TaskTriggerHandler {
         Parameters(params): Parameters<TaskLogsParams>,
     ) -> Result<CallToolResult, McpError> {
         let log_path = resolve_log_path(&self.db, &params.id)?;
-        let path = Path::new(&log_path);
+        let path = std::path::Path::new(&log_path);
         if !path.exists() {
             return Ok(success_result(&format!(
                 "No logs found for '{}'. The agent has not been executed yet.",
@@ -921,464 +913,6 @@ impl TaskTriggerHandler {
             .check()
             .err()
             .map(|retry_after| error_result(&format!("rate_limited: retry_after={retry_after}s")))
-    }
-}
-
-// ── Formatting helpers ────────────────────────────────────────────────────
-
-fn format_uptime(secs: u64) -> String {
-    if secs > 3600 {
-        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
-    } else if secs > 60 {
-        format!("{}m {}s", secs / 60, secs % 60)
-    } else {
-        format!("{secs}s")
-    }
-}
-
-fn format_agent_info(a: &Agent) -> String {
-    let prompt_preview = if a.prompt.len() > 80 {
-        format!("{}...", &a.prompt[..80])
-    } else {
-        a.prompt.clone()
-    };
-
-    let status = if !a.enabled {
-        "disabled"
-    } else if a.is_expired() {
-        "expired"
-    } else {
-        "active"
-    };
-
-    let trigger_label = a.trigger_type_label();
-    let trigger_detail = match &a.trigger {
-        Some(Trigger::Cron { schedule_expr }) => schedule_expr.clone(),
-        Some(Trigger::Watch { path, .. }) => path.clone(),
-        None => "manual".to_string(),
-    };
-
-    let mut info = format!(
-        "- **{}** [{}] ({})\n  Trigger: {} `{}`\n  CLI: {}\n  Prompt: {}\n",
-        a.id, status, trigger_label, trigger_label, trigger_detail, a.cli, prompt_preview
-    );
-
-    if let Some(last) = a.last_run_at {
-        let ok_str = a
-            .last_run_ok
-            .map(|ok| if ok { "success" } else { "failed" })
-            .unwrap_or("unknown");
-        info.push_str(&format!("  Last run: {} ({})\n", last.to_rfc3339(), ok_str));
-    }
-
-    if let Some(last) = a.last_triggered_at {
-        info.push_str(&format!(
-            "  Last triggered: {} (count: {})\n",
-            last.to_rfc3339(),
-            a.trigger_count
-        ));
-    }
-
-    if let Some(exp) = a.expires_at {
-        let remaining = exp.signed_duration_since(Utc::now());
-        if remaining.num_seconds() > 0 {
-            info.push_str(&format!("  Expires in: {}m\n", remaining.num_minutes()));
-        } else {
-            info.push_str("  Status: EXPIRED\n");
-        }
-    }
-
-    info
-}
-
-// ── Handler helpers ───────────────────────────────────────────────
-
-struct PreparedCronTask {
-    cli: Cli,
-    schedule_expr: String,
-    expires_at: Option<chrono::DateTime<Utc>>,
-}
-
-struct PreparedWatchTask {
-    cli: Cli,
-    events: Vec<WatchEvent>,
-    debounce_seconds: u64,
-    recursive: bool,
-}
-
-fn internal_error(error: impl std::fmt::Display) -> McpError {
-    McpError::internal_error(error.to_string(), None)
-}
-
-fn map_action_result<T>(
-    result: Result<T, impl std::fmt::Display>,
-    success_message: &str,
-) -> CallToolResult {
-    match result {
-        Ok(_) => success_result(success_message),
-        Err(e) => error_result(&e.to_string()),
-    }
-}
-
-fn prepare_cron_task(
-    params: &TaskAddParams,
-    validate_cron: &impl Fn(&str) -> bool,
-) -> Result<PreparedCronTask, String> {
-    validate_id(&params.id)?;
-    validate_prompt(&params.prompt)?;
-
-    Ok(PreparedCronTask {
-        cli: Cli::resolve(params.cli.as_deref())?,
-        schedule_expr: validate_cron_schedule(&params.schedule, validate_cron, |schedule| {
-            format!(
-                "Invalid cron expression '{}'. Must be a 5-field cron expression. \
-                 Examples: '*/5 * * * *' (every 5 min), '0 9 * * *' (daily 9am).",
-                schedule
-            )
-        })?,
-        expires_at: params
-            .duration_minutes
-            .map(|minutes| Utc::now() + chrono::Duration::minutes(minutes)),
-    })
-}
-
-fn prepare_watch_task(params: &TaskWatchParams) -> Result<PreparedWatchTask, String> {
-    validate_id(&params.id)?;
-    validate_prompt(&params.prompt)?;
-    validate_watch_path(&params.path)?;
-
-    Ok(PreparedWatchTask {
-        cli: Cli::resolve(params.cli.as_deref())?,
-        events: WatchEvent::parse_list(&params.events)?,
-        debounce_seconds: params.debounce_seconds.unwrap_or(2),
-        recursive: params.recursive.unwrap_or(false),
-    })
-}
-
-fn apply_scalar_updates(agent: &mut Agent, params: &TaskUpdateParams) -> Result<(), String> {
-    if let Some(prompt) = params.prompt.as_deref() {
-        validate_prompt(prompt)?;
-        agent.prompt = prompt.to_string();
-    }
-    if let Some(cli) = params.cli.as_deref() {
-        agent.cli = Cli::from_str(cli);
-    }
-    if let Some(model) = params.model.as_ref() {
-        agent.model = model.clone();
-    }
-    if let Some(working_dir) = params.working_dir.as_ref() {
-        agent.working_dir = working_dir.clone();
-    }
-    if let Some(enabled) = params.enabled {
-        agent.enabled = enabled;
-    }
-    Ok(())
-}
-
-fn apply_trigger_updates(
-    agent: &mut Agent,
-    params: &TaskUpdateParams,
-    validate_cron: &impl Fn(&str) -> bool,
-) -> Result<(), String> {
-    match &mut agent.trigger {
-        Some(Trigger::Cron { schedule_expr }) => {
-            update_cron_trigger(schedule_expr, &mut agent.expires_at, params, validate_cron)
-        }
-        Some(Trigger::Watch {
-            path,
-            events,
-            debounce_seconds,
-            recursive,
-        }) => update_watch_trigger(path, events, debounce_seconds, recursive, params),
-        None => {
-            create_trigger_from_update(params, validate_cron).map(|trigger| agent.trigger = trigger)
-        }
-    }
-}
-
-fn update_cron_trigger(
-    schedule_expr: &mut String,
-    expires_at: &mut Option<chrono::DateTime<Utc>>,
-    params: &TaskUpdateParams,
-    validate_cron: &impl Fn(&str) -> bool,
-) -> Result<(), String> {
-    if let Some(schedule) = params.schedule.as_deref() {
-        *schedule_expr = validate_cron_schedule(schedule, validate_cron, |schedule| {
-            format!("Invalid cron expression '{schedule}'.")
-        })?;
-    }
-    if let Some(duration) = params.duration_minutes {
-        *expires_at = update_expiration(duration)?;
-    }
-    Ok(())
-}
-
-fn update_watch_trigger(
-    path: &mut String,
-    events: &mut Vec<WatchEvent>,
-    debounce_seconds: &mut u64,
-    recursive: &mut bool,
-    params: &TaskUpdateParams,
-) -> Result<(), String> {
-    if let Some(new_path) = params.path.as_deref() {
-        validate_watch_path(new_path)?;
-        *path = new_path.to_string();
-    }
-    if let Some(event_strs) = params.events.as_ref() {
-        *events = WatchEvent::parse_list(event_strs)?;
-    }
-    if let Some(value) = params.debounce_seconds {
-        *debounce_seconds = value;
-    }
-    if let Some(value) = params.recursive {
-        *recursive = value;
-    }
-    Ok(())
-}
-
-fn create_trigger_from_update(
-    params: &TaskUpdateParams,
-    validate_cron: &impl Fn(&str) -> bool,
-) -> Result<Option<Trigger>, String> {
-    if let Some(schedule) = params.schedule.as_deref() {
-        return validate_cron_schedule(schedule, validate_cron, |schedule| {
-            format!("Invalid cron expression '{schedule}'.")
-        })
-        .map(|schedule_expr| Some(Trigger::Cron { schedule_expr }));
-    }
-
-    let Some(path) = params.path.as_deref() else {
-        return Ok(None);
-    };
-    validate_watch_path(path)?;
-
-    let events = match params.events.as_ref() {
-        Some(event_strs) => WatchEvent::parse_list(event_strs)?,
-        None => vec![WatchEvent::Create, WatchEvent::Modify],
-    };
-
-    Ok(Some(Trigger::Watch {
-        path: path.to_string(),
-        events,
-        debounce_seconds: params.debounce_seconds.unwrap_or(2),
-        recursive: params.recursive.unwrap_or(false),
-    }))
-}
-
-fn watcher_restart_needed(params: &TaskUpdateParams) -> bool {
-    params.path.is_some()
-        || params.events.is_some()
-        || params.debounce_seconds.is_some()
-        || params.recursive.is_some()
-        || params.cli.is_some()
-        || params.prompt.is_some()
-        || params.model.is_some()
-}
-
-fn validate_cron_schedule(
-    schedule: &str,
-    validate_cron: &impl Fn(&str) -> bool,
-    invalid_message: impl FnOnce(&str) -> String,
-) -> Result<String, String> {
-    let trimmed = schedule.trim();
-    if validate_cron(trimmed) {
-        return Ok(trimmed.to_string());
-    }
-    Err(invalid_message(schedule))
-}
-
-fn update_expiration(duration: Option<i64>) -> Result<Option<chrono::DateTime<Utc>>, String> {
-    match duration {
-        Some(minutes) if minutes > 0 => Ok(Some(Utc::now() + chrono::Duration::minutes(minutes))),
-        Some(_) => Err("duration_minutes must be positive".to_string()),
-        None => Ok(None),
-    }
-}
-
-fn resolve_log_path(db: &Database, id: &str) -> Result<String, McpError> {
-    let Some(agent) = db.get_agent(id).map_err(internal_error)? else {
-        return default_log_path(id);
-    };
-    Ok(agent.log_path)
-}
-
-fn default_log_path(id: &str) -> Result<String, McpError> {
-    Ok(data_dir()
-        .map_err(internal_error)?
-        .join("logs")
-        .join(id)
-        .with_extension("log")
-        .to_string_lossy()
-        .to_string())
-}
-
-fn format_log_output(
-    path: &Path,
-    id: &str,
-    since: Option<&str>,
-    max_lines: usize,
-) -> Result<String, McpError> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| internal_error(format!("Failed to read log: {e}")))?;
-    let mut lines: Vec<&str> = content.lines().collect();
-
-    if let Some(since) = since {
-        if let Ok(since_dt) = chrono::DateTime::parse_from_rfc3339(since) {
-            lines.retain(|line| filter_log_line(line, &since_dt));
-        }
-    }
-
-    let total = lines.len();
-    if lines.len() > max_lines {
-        lines = lines[lines.len() - max_lines..].to_vec();
-    }
-
-    if lines.is_empty() {
-        return Ok(format!("No log entries for '{}' matching the filter.", id));
-    }
-
-    Ok(format!(
-        "Logs for '{}' (showing {} of {} lines):\n\n{}",
-        id,
-        lines.len(),
-        total,
-        lines.join("\n")
-    ))
-}
-
-fn recent_runs_output(db: &Database, id: &str) -> Option<String> {
-    let Ok(runs) = db.list_runs(id, 5) else {
-        return None;
-    };
-    if runs.is_empty() {
-        return None;
-    }
-
-    let mut output = String::from("\n\nRecent executions:\n");
-    for run in &runs {
-        output.push_str(&format_run_line(run));
-    }
-    Some(output)
-}
-
-fn format_run_line(run: &RunLog) -> String {
-    let duration = run
-        .finished_at
-        .map(|finished_at| {
-            format!(
-                "{}s",
-                finished_at
-                    .signed_duration_since(run.started_at)
-                    .num_seconds()
-            )
-        })
-        .unwrap_or_else(|| "in progress".to_string());
-    let summary = run
-        .summary
-        .as_deref()
-        .map(|summary| format!(" — {summary}"))
-        .unwrap_or_default();
-
-    format!(
-        "  - {} | {} | {} | {}{}\n",
-        run.started_at.to_rfc3339(),
-        run.trigger_type,
-        run.status.as_str(),
-        duration,
-        summary,
-    )
-}
-
-fn parse_report_status(status: &str) -> Result<RunStatus, &'static str> {
-    match status {
-        "in_progress" => Ok(RunStatus::InProgress),
-        "success" => Ok(RunStatus::Success),
-        "error" => Ok(RunStatus::Error),
-        _ => Err("Invalid status. Must be 'in_progress', 'success', or 'error'."),
-    }
-}
-
-fn validate_report_summary(status: RunStatus, summary: Option<&str>) -> Result<(), &'static str> {
-    if matches!(status, RunStatus::Success | RunStatus::Error) && summary.is_none() {
-        return Err("A summary is required when reporting 'success' or 'error'.");
-    }
-    Ok(())
-}
-
-fn handle_timed_out_run(db: &Database, run_id: &str, run: &RunLog) -> Option<CallToolResult> {
-    let timeout_at = run.timeout_at?;
-    if !run.status.is_active() || Utc::now() <= timeout_at {
-        return None;
-    }
-
-    let _ = db.update_run_status(run_id, RunStatus::Timeout, Some("Execution timed out"));
-    Some(error_result(&format!(
-        "Run '{}' has timed out and can no longer be updated.",
-        run_id
-    )))
-}
-
-fn validate_run_transition(current: RunStatus, next: RunStatus) -> Result<(), String> {
-    let valid = matches!(
-        (current, next),
-        (RunStatus::Pending, RunStatus::InProgress)
-            | (RunStatus::InProgress, RunStatus::Success | RunStatus::Error)
-            | (RunStatus::Pending, RunStatus::Success | RunStatus::Error)
-    );
-    if valid {
-        return Ok(());
-    }
-    Err(format!("Invalid transition: {} -> {}", current, next))
-}
-
-fn update_agent_last_run(db: &Database, run: &RunLog, status: RunStatus) {
-    let success = match status {
-        RunStatus::Success => Some(true),
-        RunStatus::Error => Some(false),
-        _ => None,
-    };
-    let Some(success) = success else {
-        return;
-    };
-
-    let _ = db.update_agent_last_run(&run.background_agent_id, success);
-}
-
-fn make_log_path(id: &str) -> Result<String, McpError> {
-    let log_dir = data_dir().map_err(internal_error)?.join("logs");
-    std::fs::create_dir_all(&log_dir).map_err(internal_error)?;
-    Ok(log_dir
-        .join(id)
-        .with_extension("log")
-        .to_string_lossy()
-        .to_string())
-}
-
-fn new_agent_base(
-    id: String,
-    prompt: String,
-    cli: Cli,
-    model: Option<String>,
-    working_dir: Option<String>,
-    timeout_minutes: Option<u32>,
-    log_path: String,
-) -> Agent {
-    Agent {
-        id,
-        prompt,
-        cli,
-        model,
-        working_dir,
-        enabled: true,
-        created_at: Utc::now(),
-        log_path,
-        timeout_minutes: timeout_minutes.unwrap_or(15),
-        expires_at: None,
-        trigger: None,
-        last_run_at: None,
-        last_run_ok: None,
-        last_triggered_at: None,
-        trigger_count: 0,
     }
 }
 

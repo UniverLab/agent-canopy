@@ -5,6 +5,8 @@
 
 pub(crate) mod cli;
 pub(crate) mod doctor;
+pub(crate) mod handler_formatting;
+pub(crate) mod handler_helpers;
 pub(crate) mod helpers;
 pub(crate) mod params;
 pub(crate) mod process;
