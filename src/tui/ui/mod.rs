@@ -8,7 +8,7 @@ mod sidebar;
 mod system_dashboard;
 
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Color;
+use ratatui::style::{Color, Style};
 use ratatui::Frame;
 
 use super::app::types::App;
@@ -30,6 +30,12 @@ pub(crate) const STATUS_WAIT_OFF: Color = Color::Rgb(30, 30, 30);
 // ── Main draw entry point ───────────────────────────────────────
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    let full = frame.area();
+    frame.render_widget(
+        ratatui::widgets::Paragraph::new("").style(Style::default().bg(Color::Rgb(18, 18, 18))),
+        full,
+    );
+
     let [header_area, body, footer_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
