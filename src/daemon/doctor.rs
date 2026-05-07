@@ -101,8 +101,6 @@ pub(crate) async fn run_doctor() -> Result<()> {
     }
 
     // ── RAG Health ──────────────────────────────────────────────
-    println!(" \x1b[1;36m◆ Personal RAG\x1b[0m");
-
     let config = crate::domain::canopy_config::CanopyConfig::load(&canopy_dir);
 
     if config.embeddings_model.is_empty() {
@@ -114,7 +112,7 @@ pub(crate) async fn run_doctor() -> Result<()> {
             config.embeddings_model
         );
 
-        // Check that the required API key is present.
+        // Check that the required API key is present (local models need none).
         let api_key_info = match crate::rag::embedding_client::provider_for_model(
             &config.embeddings_model,
         ) {
@@ -124,12 +122,16 @@ pub(crate) async fn run_doctor() -> Result<()> {
             Some(crate::rag::embedding_client::EmbeddingProvider::Gemini) => {
                 Some(("GEMINI_API_KEY", std::env::var("GEMINI_API_KEY").is_ok()))
             }
+            Some(crate::rag::embedding_client::EmbeddingProvider::Local) => {
+                println!(" \x1b[32m✓\x1b[0m Local model — no API key required");
+                None
+            }
             None => {
                 println!(
-                        " \x1b[31m✗\x1b[0m Model '{}' is not supported — only OpenAI and Google models are supported. Run 'canopy setup' to pick a compatible model.",
-                        config.embeddings_model
-                    );
-                issues.push("Run 'canopy setup' and select an OpenAI or Google embedding model");
+                    " \x1b[31m✗\x1b[0m Model '{}' is not supported. Run 'canopy setup' to pick a compatible model.",
+                    config.embeddings_model
+                );
+                issues.push("Run 'canopy setup' and select a supported embedding model");
                 None
             }
         };

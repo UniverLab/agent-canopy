@@ -22,6 +22,13 @@ pub fn client_from_config(config: &CanopyConfig) -> Result<Box<dyn EmbeddingClie
     match provider_for_model(model) {
         Some(EmbeddingProvider::OpenAi) => Ok(Box::new(OpenAIEmbeddingClient::from_env(model)?)),
         Some(EmbeddingProvider::Gemini) => Ok(Box::new(GeminiEmbeddingClient::from_env(model)?)),
+        Some(EmbeddingProvider::Local) => {
+            let cache_dir = dirs::home_dir()
+                .ok_or_else(|| anyhow!("No home directory found"))?
+                .join(".canopy")
+                .join("models");
+            Ok(Box::new(LocalEmbeddingClient::new(model, &cache_dir)?))
+        }
         None => bail!("Unsupported embeddings model: {model}"),
     }
 }
@@ -36,6 +43,13 @@ pub fn model_dimensions(model: &str) -> Result<usize> {
         "text-embedding-3-large" => Ok(3072),
         "text-embedding-ada-002" => Ok(1536),
         "gemini-embedding-001" | "gemini-embedding-2" => Ok(DEFAULT_GEMINI_DIMENSIONS),
+        // Local models via fastembed
+        "baai/bge-small-en-v1.5" => Ok(384),
+        "baai/bge-base-en-v1.5" => Ok(768),
+        "baai/bge-large-en-v1.5" => Ok(1024),
+        "intfloat/multilingual-e5-small" => Ok(384),
+        "intfloat/multilingual-e5-base" => Ok(768),
+        "intfloat/multilingual-e5-large" => Ok(1024),
         _ => bail!("Unsupported embeddings model: {model}"),
     }
 }
@@ -44,6 +58,7 @@ pub fn model_dimensions(model: &str) -> Result<usize> {
 pub enum EmbeddingProvider {
     OpenAi,
     Gemini,
+    Local,
 }
 
 pub fn provider_for_model(model: &str) -> Option<EmbeddingProvider> {
@@ -56,10 +71,22 @@ pub fn provider_for_model(model: &str) -> Option<EmbeddingProvider> {
         Some(EmbeddingProvider::Gemini)
     } else if normalized.starts_with("text-embedding") || normalized.contains("openai") {
         Some(EmbeddingProvider::OpenAi)
+    } else if LOCAL_MODEL_IDS.contains(&normalized.as_str()) {
+        Some(EmbeddingProvider::Local)
     } else {
         None
     }
 }
+
+/// Canonical IDs of supported local (fastembed/ONNX) embedding models.
+pub const LOCAL_MODEL_IDS: &[&str] = &[
+    "baai/bge-small-en-v1.5",
+    "baai/bge-base-en-v1.5",
+    "baai/bge-large-en-v1.5",
+    "intfloat/multilingual-e5-small",
+    "intfloat/multilingual-e5-base",
+    "intfloat/multilingual-e5-large",
+];
 
 pub struct OpenAIEmbeddingClient {
     client: reqwest::blocking::Client,
@@ -221,6 +248,86 @@ impl EmbeddingClient for GeminiEmbeddingClient {
 
         validate_embedding_dimensions(&self.model, self.dimensions, &embedding)?;
         Ok(embedding)
+    }
+}
+
+/// Embedding client backed by a local ONNX model via fastembed.
+///
+/// The model file is downloaded from HuggingFace on first use and cached in
+/// `~/.canopy/models/`. No API key is required.
+pub struct LocalEmbeddingClient {
+    // fastembed::TextEmbedding is Send but not Sync; wrapping in Mutex makes
+    // the struct Sync so it satisfies the EmbeddingClient bound.
+    model: std::sync::Mutex<fastembed::TextEmbedding>,
+    dimensions: usize,
+}
+
+impl LocalEmbeddingClient {
+    pub fn new(model_id: &str, cache_dir: &std::path::Path) -> Result<Self> {
+        std::fs::create_dir_all(cache_dir)
+            .with_context(|| format!("Cannot create model cache dir: {}", cache_dir.display()))?;
+
+        let fastembed_model = model_id_to_fastembed(model_id)?;
+        let dimensions = model_dimensions(model_id)?;
+
+        tracing::info!(
+            "Loading local embedding model '{model_id}' (cache: {})",
+            cache_dir.display()
+        );
+        let text_embedding = fastembed::TextEmbedding::try_new(
+            fastembed::InitOptions::new(fastembed_model)
+                .with_cache_dir(cache_dir.to_path_buf())
+                .with_show_download_progress(false),
+        )
+        .with_context(|| format!("Failed to load local embedding model '{model_id}'"))?;
+
+        Ok(Self {
+            model: std::sync::Mutex::new(text_embedding),
+            dimensions,
+        })
+    }
+}
+
+impl EmbeddingClient for LocalEmbeddingClient {
+    fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        let mut model = self
+            .model
+            .lock()
+            .map_err(|_| anyhow!("LocalEmbeddingClient mutex poisoned"))?;
+        let mut embeddings = model
+            .embed(vec![text], None)
+            .context("Local embedding inference failed")?;
+        let embedding = embeddings
+            .pop()
+            .filter(|e| !e.is_empty())
+            .ok_or_else(|| anyhow!("Local embedding model returned no output"))?;
+        validate_embedding_dimensions(
+            model_id_for_dimensions(self.dimensions),
+            self.dimensions,
+            &embedding,
+        )?;
+        Ok(embedding)
+    }
+}
+
+fn model_id_to_fastembed(model_id: &str) -> Result<fastembed::EmbeddingModel> {
+    match model_id.trim().to_ascii_lowercase().as_str() {
+        "baai/bge-small-en-v1.5" => Ok(fastembed::EmbeddingModel::BGESmallENV15),
+        "baai/bge-base-en-v1.5" => Ok(fastembed::EmbeddingModel::BGEBaseENV15),
+        "baai/bge-large-en-v1.5" => Ok(fastembed::EmbeddingModel::BGELargeENV15),
+        "intfloat/multilingual-e5-small" => Ok(fastembed::EmbeddingModel::MultilingualE5Small),
+        "intfloat/multilingual-e5-base" => Ok(fastembed::EmbeddingModel::MultilingualE5Base),
+        "intfloat/multilingual-e5-large" => Ok(fastembed::EmbeddingModel::MultilingualE5Large),
+        _ => bail!("No fastembed mapping for local model '{model_id}'"),
+    }
+}
+
+fn model_id_for_dimensions(dimensions: usize) -> &'static str {
+    match dimensions {
+        384 => "local-384d",
+        768 => "local-768d",
+        1024 => "local-1024d",
+        _ => "local",
     }
 }
 

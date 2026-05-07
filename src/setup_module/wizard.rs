@@ -304,6 +304,44 @@ fn select_embeddings_model(current: &str) -> Result<String> {
         })
         .unwrap_or_default();
 
+    // Prepend supported local models (no API key needed) at the top of the list.
+    let local_models: Vec<crate::domain::models_db::ModelEntry> = [
+        (
+            "baai/bge-small-en-v1.5",
+            "BGE Small EN v1.5  (local, 384d, ~130 MB)",
+            "local",
+        ),
+        (
+            "baai/bge-base-en-v1.5",
+            "BGE Base EN v1.5  (local, 768d, ~430 MB)",
+            "local",
+        ),
+        (
+            "intfloat/multilingual-e5-small",
+            "Multilingual E5 Small  (local, 384d, ~480 MB)",
+            "local",
+        ),
+        (
+            "intfloat/multilingual-e5-large",
+            "Multilingual E5 Large  (local, 1024d, ~2.2 GB)",
+            "local",
+        ),
+    ]
+    .iter()
+    .map(
+        |(id, name, provider)| crate::domain::models_db::ModelEntry {
+            id: id.to_string(),
+            name: name.to_string(),
+            provider: provider.to_string(),
+            release_date: None,
+            size_hint: None,
+        },
+    )
+    .collect();
+
+    // Local models first, then API-based.
+    models = local_models.into_iter().chain(models).collect();
+
     if models.is_empty() {
         models = vec![
             crate::domain::models_db::ModelEntry {

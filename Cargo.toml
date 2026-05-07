@@ -117,6 +117,9 @@ futures = "0.3"
 # PDF text extraction
 pdf-extract = "0.7"
 
+# Local embedding models via ONNX Runtime (no API key required)
+fastembed = "5"
+
 # Unix process management (kill, setsid)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
