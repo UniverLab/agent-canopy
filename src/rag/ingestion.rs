@@ -226,11 +226,11 @@ impl IngestionManager {
             let now = chrono::Utc::now().timestamp();
             let _ = self.db.mark_rag_item_processing(&source_path, now);
 
-        if let Err(e) = self.index_file(&source_path).await {
-            tracing::warn!("RAG index error {source_path}: {e}");
-        } else {
-            processed += 1;
-        }
+            if let Err(e) = self.index_file(&source_path).await {
+                tracing::warn!("RAG index error {source_path}: {e}");
+            } else {
+                processed += 1;
+            }
             let _ = self.db.remove_rag_item(&source_path);
         }
 
@@ -268,6 +268,10 @@ impl IngestionManager {
         };
 
         let content = extract_file_content(path, lang)?;
+        if content.trim().is_empty() {
+            tracing::warn!("RAG: skipping {source_path} — content is empty after extraction");
+            return Ok(());
+        }
         let now = chrono::Utc::now().timestamp();
         let config = crate::domain::canopy_config::CanopyConfig::load(&self.data_dir);
 
@@ -292,12 +296,14 @@ impl IngestionManager {
                 return Ok(());
             }
         };
-        let embedding_client: Option<Arc<dyn EmbeddingClient>> = match client_from_config(&config)
-        {
-            Ok(client) => Some(Arc::from(client)),
+        let embedding_client: Arc<dyn EmbeddingClient> = match client_from_config(&config) {
+            Ok(client) => Arc::from(client),
             Err(error) => {
-                tracing::warn!("RAG embeddings unavailable for {source_path}: {error}");
-                None
+                tracing::error!(
+                    "RAG: cannot index {source_path} — embedding client unavailable: {error}. \
+                     Check that embeddings_model is configured and the API key env var is set."
+                );
+                return Ok(());
             }
         };
 
@@ -305,41 +311,43 @@ impl IngestionManager {
         for chunk in semantic_chunks {
             let content = chunk.content;
             let chunk_id = Uuid::new_v4().to_string();
-            let embedding = if let Some(client) = embedding_client.as_ref() {
-                let client = Arc::clone(client);
-                let content_for_embedding = content.clone();
+            let client = Arc::clone(&embedding_client);
+            let content_for_embedding = content.clone();
+            let embedding =
                 match tokio::task::spawn_blocking(move || client.embed(&content_for_embedding))
                     .await
                 {
-                    Ok(Ok(values)) => Some(values),
+                    Ok(Ok(values)) => values,
                     Ok(Err(error)) => {
-                        tracing::warn!(
-                            "RAG embedding error {source_path} chunk {}: {error}",
+                        tracing::error!(
+                            "RAG embedding failed for {source_path} chunk {}: {error}",
                             chunk.index
                         );
-                        None
+                        continue;
                     }
                     Err(error) => {
-                        tracing::warn!(
-                            "RAG embedding task error {source_path} chunk {}: {error}",
+                        tracing::error!(
+                            "RAG embedding task panicked for {source_path} chunk {}: {error}",
                             chunk.index
                         );
-                        None
+                        continue;
                     }
-                }
-            } else {
-                None
-            };
+                };
 
-            if let Some(vec_emb) = embedding {
-                vector_chunks.push(VectorChunk {
-                    id: chunk_id,
-                    file_path: source_path.to_owned(),
-                    content,
-                    embedding: vec_emb,
-                    created_at: now,
-                });
-            }
+            vector_chunks.push(VectorChunk {
+                id: chunk_id,
+                file_path: source_path.to_owned(),
+                content,
+                embedding,
+                created_at: now,
+            });
+        }
+
+        if vector_chunks.is_empty() {
+            tracing::error!(
+                "RAG: no chunks were embedded for {source_path} — file will not be indexed"
+            );
+            return Ok(());
         }
 
         sync_vector_store(&config, source_path, &vector_chunks).await;
@@ -397,13 +405,8 @@ fn extract_pdf_text(path: &Path) -> anyhow::Result<String> {
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer)?;
 
-    match pdf_extract::extract_text_from_mem(&buffer) {
-        Ok(text) => Ok(text),
-        Err(e) => {
-            tracing::warn!("Failed to extract text from PDF {}: {}", path.display(), e);
-            Ok(String::new())
-        }
-    }
+    pdf_extract::extract_text_from_mem(&buffer)
+        .map_err(|e| anyhow::anyhow!("PDF text extraction failed for {}: {e}", path.display()))
 }
 
 async fn open_vector_store(
