@@ -10,6 +10,7 @@ pub(crate) mod handler_helpers;
 pub(crate) mod helpers;
 pub(crate) mod params;
 pub(crate) mod process;
+pub(crate) mod rag_cli;
 pub(crate) mod server;
 pub(crate) mod service_install;
 

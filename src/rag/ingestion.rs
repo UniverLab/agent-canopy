@@ -160,9 +160,10 @@ impl IngestionManager {
                         EventKind::Remove(_) => {
                             tracing::info!("RAG watcher: '{}' removed — purging chunks", path_str);
                             let data_dir2 = data_dir.clone();
+                            let db3 = Arc::clone(&db);
                             let p = path_str;
                             rt.spawn(async move {
-                                purge_vector_chunks(&data_dir2, &p).await;
+                                purge_vector_chunks(&data_dir2, &p, Some(&db3)).await;
                             });
                         }
                         _ => {}
@@ -237,6 +238,12 @@ impl IngestionManager {
                     tracing::warn!("RAG reconcile: failed to purge '{}': {e:#}", path);
                 } else {
                     purged += 1;
+                    let _ = self.db.log_rag_event(
+                        path,
+                        "deleted",
+                        Some("file no longer on disk — orphan chunks purged at startup"),
+                        chrono::Utc::now().timestamp(),
+                    );
                 }
             }
         }
@@ -293,11 +300,24 @@ impl IngestionManager {
                     processed += 1;
                     indexed_paths.push(source_path.clone());
                     let _ = self.db.remove_rag_item(&source_path);
+                    let _ = self.db.log_rag_event(
+                        &source_path,
+                        "indexed",
+                        None,
+                        chrono::Utc::now().timestamp(),
+                    );
                 }
                 Err(e) => {
                     tracing::error!("RAG index error {source_path}: {e:#}");
                     skipped += 1;
                     let _ = self.db.remove_rag_item(&source_path);
+                    let error_detail = format!("{e:#}");
+                    let _ = self.db.log_rag_event(
+                        &source_path,
+                        "error",
+                        Some(&error_detail),
+                        chrono::Utc::now().timestamp(),
+                    );
                     // Immediate per-file error notification so the user knows right away.
                     let filename = std::path::Path::new(&source_path)
                         .file_name()
@@ -305,7 +325,7 @@ impl IngestionManager {
                         .unwrap_or_else(|| source_path.clone());
                     crate::domain::notification::send_notification(
                         "Canopy — RAG indexing error",
-                        &format!("{filename} could not be indexed\nCause: {e:#}"),
+                        &format!("{filename} could not be indexed\nCause: {error_detail}"),
                     );
                 }
             }
@@ -366,7 +386,7 @@ impl IngestionManager {
         let path = std::path::Path::new(source_path);
 
         if !path.exists() {
-            purge_vector_chunks(&self.data_dir, source_path).await;
+            purge_vector_chunks(&self.data_dir, source_path, Some(&self.db)).await;
             return Ok(());
         }
 
@@ -533,7 +553,7 @@ async fn sync_vector_store(
     Ok(())
 }
 
-async fn purge_vector_chunks(data_dir: &Path, source_path: &str) {
+async fn purge_vector_chunks(data_dir: &Path, source_path: &str, db: Option<&crate::db::Database>) {
     let config = crate::domain::canopy_config::CanopyConfig::load(data_dir);
     let Some(store) = open_vector_store(&config).await else {
         tracing::warn!(
@@ -546,6 +566,14 @@ async fn purge_vector_chunks(data_dir: &Path, source_path: &str) {
     match store.delete_by_path(source_path).await {
         Ok(()) => {
             tracing::info!("RAG purge: removed chunks for '{}'", source_path);
+            if let Some(db) = db {
+                let _ = db.log_rag_event(
+                    source_path,
+                    "deleted",
+                    Some("file removed — watcher triggered chunk purge"),
+                    chrono::Utc::now().timestamp(),
+                );
+            }
         }
         Err(error) => {
             tracing::warn!(

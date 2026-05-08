@@ -30,6 +30,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use daemon::cli::{handle_daemon_action, DaemonAction};
 use daemon::doctor::run_doctor;
+use daemon::rag_cli::{handle_rag_action, RagAction};
 use daemon::server::{run_http_server, run_stdio_server};
 use std::path::PathBuf;
 
@@ -58,6 +59,11 @@ enum Commands {
         local_registry: Option<PathBuf>,
     },
     Mcp,
+    /// RAG indexing management.
+    Rag {
+        #[command(subcommand)]
+        action: RagAction,
+    },
     #[command(hide = true)]
     Serve,
 }
@@ -82,6 +88,7 @@ async fn main() -> Result<()> {
             tokio::task::block_in_place(mcp_wizard_module::run_mcp_wizard)?;
             Ok(())
         }
+        Some(Commands::Rag { action }) => handle_rag_action(action).await,
         None => {
             tokio::task::block_in_place(|| {
                 if setup_module::needs_setup() {

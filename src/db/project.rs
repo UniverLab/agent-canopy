@@ -284,3 +284,104 @@ fn row_to_rag_queue_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<RagQueueIt
         queued_at: row.get(2)?,
     })
 }
+
+// ── rag_file_events ────────────────────────────────────────────────────────
+
+/// A recorded lifecycle event for an indexed file.
+#[derive(Debug, Clone)]
+pub struct RagFileEvent {
+    pub id: i64,
+    pub file_path: String,
+    /// `"indexed"` | `"deleted"` | `"error"`
+    pub event_type: String,
+    pub detail: Option<String>,
+    pub occurred_at: i64,
+}
+
+impl Database {
+    /// Append a lifecycle event for a RAG file.
+    pub fn log_rag_event(
+        &self,
+        file_path: &str,
+        event_type: &str,
+        detail: Option<&str>,
+        occurred_at: i64,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        conn.execute(
+            "INSERT INTO rag_file_events (file_path, event_type, detail, occurred_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![file_path, event_type, detail, occurred_at],
+        )?;
+        Ok(())
+    }
+
+    /// Return all events for a specific file, newest-first.
+    pub fn rag_events_for_file(&self, file_path: &str) -> Result<Vec<RagFileEvent>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, file_path, event_type, detail, occurred_at
+               FROM rag_file_events
+              WHERE file_path = ?1
+              ORDER BY occurred_at DESC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![file_path], row_to_rag_file_event)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Return all events, newest-first, optionally limited.
+    pub fn list_rag_events(&self, limit: usize) -> Result<Vec<RagFileEvent>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, file_path, event_type, detail, occurred_at
+               FROM rag_file_events
+              ORDER BY occurred_at DESC
+              LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![limit as i64], row_to_rag_file_event)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Return the most-recent error event per file path.
+    pub fn rag_last_error_per_file(&self) -> Result<Vec<RagFileEvent>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, file_path, event_type, detail, occurred_at
+               FROM rag_file_events
+              WHERE event_type = 'error'
+                AND occurred_at = (
+                    SELECT MAX(occurred_at) FROM rag_file_events e2
+                     WHERE e2.file_path = rag_file_events.file_path
+                       AND e2.event_type = 'error'
+                )
+              ORDER BY file_path",
+        )?;
+        let rows = stmt.query_map([], row_to_rag_file_event)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+}
+
+fn row_to_rag_file_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<RagFileEvent> {
+    Ok(RagFileEvent {
+        id: row.get(0)?,
+        file_path: row.get(1)?,
+        event_type: row.get(2)?,
+        detail: row.get(3)?,
+        occurred_at: row.get(4)?,
+    })
+}

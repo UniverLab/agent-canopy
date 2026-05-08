@@ -418,7 +418,7 @@ fn rag_queue_text(app: &App) -> String {
     } else if app.rag_info.queued_items > 0 {
         format!("{} queued", app.rag_info.queued_items)
     } else {
-        "empty".to_string()
+        String::new()
     }
 }
 
@@ -428,7 +428,7 @@ fn rag_summary_lines(
     status_color: Color,
     queue_text: String,
 ) -> Vec<Line<'static>> {
-    vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled("Chunks: ", Style::default().fg(DIM)),
             Span::styled(
@@ -445,19 +445,22 @@ fn rag_summary_lines(
             ),
         ]),
         labeled_value_line(
-            "Queue: ",
-            Span::styled(queue_text, Style::default().fg(Color::White)),
-        ),
-        labeled_value_line(
             "Status: ",
             Span::styled(status_text, Style::default().fg(status_color)),
         ),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Press Enter to open the global RAG playground.",
-            Style::default().fg(ACCENT),
-        )),
-    ]
+    ];
+    if !queue_text.is_empty() {
+        lines.push(labeled_value_line(
+            "Queue:  ",
+            Span::styled(queue_text, Style::default().fg(Color::White)),
+        ));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Press Enter to open the global RAG playground.",
+        Style::default().fg(ACCENT),
+    )));
+    lines
 }
 
 fn draw_rag_info_overview(frame: &mut Frame, area: Rect, app: &App) {

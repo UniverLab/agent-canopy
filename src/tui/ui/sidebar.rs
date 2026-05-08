@@ -245,17 +245,18 @@ fn render_dashboard_if_present(frame: &mut Frame, area: Option<Rect>, app: &App)
 fn draw_projects_sidebar(frame: &mut Frame, areas: SidebarContentAreas, app: &App) {
     let rag_items = &app.global_rag_queue;
     let show_rag_info = app.rag_info.has_rag_activity() && areas.content.height >= 6;
-    let (content_top, rag_info_area) = if show_rag_info {
+    // ragInfo sits at the TOP of the projects sidebar so it's always visible.
+    let (rag_info_area, content_below) = if show_rag_info {
         let [top, bottom] =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(6)]).areas(areas.content);
-        (top, Some(bottom))
+            Layout::vertical([Constraint::Length(6), Constraint::Min(0)]).areas(areas.content);
+        (Some(top), bottom)
     } else {
-        (areas.content, None)
+        (None, areas.content)
     };
 
     let has_projects = !app.projects.is_empty();
     let projects_needed = if has_projects {
-        (app.projects.len() as u16 * 3 + 2).min(content_top.height)
+        (app.projects.len() as u16 * 3 + 2).min(content_below.height)
     } else {
         0
     };
@@ -264,7 +265,18 @@ fn draw_projects_sidebar(frame: &mut Frame, areas: SidebarContentAreas, app: &Ap
     } else {
         0
     };
-    let layout = layout_projects_sections(content_top, has_projects, projects_needed, rag_needed);
+    let layout = layout_projects_sections(content_below, has_projects, projects_needed, rag_needed);
+
+    if let Some(rag_info_area) = rag_info_area.filter(|area| area.height >= 3) {
+        render_titled_panel(
+            frame,
+            rag_info_area,
+            " ragInfo ",
+            Style::default().fg(DIM),
+            projects_panel_border_style(app, ProjectsPanelFocus::RagInfo),
+            |frame, inner| draw_rag_info(frame, inner, app),
+        );
+    }
 
     if let Some(projects_area) = layout.projects {
         render_titled_panel(
@@ -294,17 +306,6 @@ fn draw_projects_sidebar(frame: &mut Frame, areas: SidebarContentAreas, app: &Ap
     }
 
     render_brain_if_visible(frame, layout.brain, app);
-
-    if let Some(rag_info_area) = rag_info_area.filter(|area| area.height >= 3) {
-        render_titled_panel(
-            frame,
-            rag_info_area,
-            " ragInfo ",
-            Style::default().fg(DIM),
-            projects_panel_border_style(app, ProjectsPanelFocus::RagInfo),
-            |frame, inner| draw_rag_info(frame, inner, app),
-        );
-    }
 
     render_dashboard_if_present(frame, areas.dashboard, app);
 }
@@ -652,36 +653,35 @@ fn draw_rag_queue(
 }
 
 fn draw_rag_info(frame: &mut Frame, area: Rect, app: &App) {
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(" chunks ", Style::default().fg(DIM)),
-            Span::styled(
-                app.rag_info.total_chunks.to_string(),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(" files ", Style::default().fg(DIM)),
-            Span::styled(
-                app.rag_info.indexed_files.to_string(),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(" queue ", Style::default().fg(DIM)),
-            Span::styled(rag_queue_text(app), Style::default().fg(Color::White)),
-        ]),
-        rag_status_line(app),
-        Line::from(Span::styled(
-            " Enter opens playground ",
-            Style::default().fg(ACCENT),
-        )),
+    let mut lines = vec![
+        labeled_kv_line(" chunks: ", &app.rag_info.total_chunks.to_string()),
+        labeled_kv_line(" files:  ", &app.rag_info.indexed_files.to_string()),
     ];
+
+    let queue_text = rag_queue_text(app);
+    if !queue_text.is_empty() {
+        lines.push(labeled_kv_line(" queue:  ", &queue_text));
+    }
+
+    lines.push(rag_status_line(app));
+    lines.push(Line::from(Span::styled(
+        " Enter → playground ",
+        Style::default().fg(ACCENT),
+    )));
+
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn labeled_kv_line(label: &'static str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(label, Style::default().fg(DIM)),
+        Span::styled(
+            value.to_string(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
 }
 
 fn rag_status_line(app: &App) -> Line<'static> {
@@ -716,7 +716,7 @@ fn rag_queue_text(app: &App) -> String {
     if app.rag_info.queued_items > 0 {
         return format!("{} queued", app.rag_info.queued_items);
     }
-    "empty".to_string()
+    String::new()
 }
 
 fn is_agents_rag_info_focused(app: &App) -> bool {

@@ -229,6 +229,32 @@ impl VectorStore {
         Ok(paths.into_iter().collect())
     }
 
+    /// Return a map of `file_path → chunk_count` for every indexed file.
+    pub async fn count_chunks_per_file(&self) -> Result<std::collections::HashMap<String, usize>> {
+        let batches: Vec<RecordBatch> = self
+            .table
+            .query()
+            .select(Select::columns(&["file_path"]))
+            .execute()
+            .await
+            .context("Failed to query LanceDB for chunk counts")?
+            .try_collect()
+            .await
+            .context("Failed to collect LanceDB chunk-count results")?;
+
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for batch in &batches {
+            if let Some(col) = batch.column_by_name("file_path") {
+                if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                    for i in 0..arr.len() {
+                        *counts.entry(arr.value(i).to_string()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        Ok(counts)
+    }
+
     pub fn path_for_tests(base_dir: &Path) -> PathBuf {
         base_dir.join("vectors.lancedb")
     }

@@ -134,7 +134,17 @@ impl Database {
                 status TEXT NOT NULL,
                 queued_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
-            );",
+            );
+
+            CREATE TABLE IF NOT EXISTS rag_file_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_path TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                detail TEXT,
+                occurred_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_rag_file_events_path
+                ON rag_file_events(file_path);",
         )?;
 
         Ok(())

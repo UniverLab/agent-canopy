@@ -198,18 +198,31 @@ impl SimplePromptDialog {
         }
     }
 
-    /// Get available section types (these can always be added again)
+    /// Get available section types (these can always be added again).
+    /// RAG Search is only included when an embeddings model is configured.
     pub fn get_available_sections() -> Vec<(&'static str, &'static str)> {
-        vec![
+        let rag_enabled = dirs::home_dir()
+            .map(|h| {
+                let config = crate::domain::canopy_config::CanopyConfig::load(&h.join(".canopy"));
+                !config.embeddings_model.trim().is_empty()
+            })
+            .unwrap_or(false);
+
+        let mut sections = vec![
             ("instruction", "Instruction"),
             ("context", "Context"),
             ("project_context", "Project Context"),
             ("resources", "Resources"),
-            ("rag_search", "RAG Search"),
+        ];
+        if rag_enabled {
+            sections.push(("rag_search", "RAG Search"));
+        }
+        sections.extend([
             ("examples", "Examples"),
             ("constraints", "Constraints"),
             ("tools", "Tools"),
-        ]
+        ]);
+        sections
     }
 
     /// Return true if this section ID represents the read-only "tools" section.
