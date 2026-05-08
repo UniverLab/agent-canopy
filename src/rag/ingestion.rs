@@ -264,8 +264,17 @@ impl IngestionManager {
     }
 
     async fn drain_queue(&self, ct: &tokio_util::sync::CancellationToken) {
+        let initial_count = self.queue.lock().await.len();
+        if initial_count > 0 {
+            crate::domain::notification::send_notification(
+                "Canopy — RAG indexing",
+                &format!("Indexing queue active: {initial_count} file(s) pending"),
+            );
+        }
+
         let mut processed = 0usize;
         let mut skipped = 0usize;
+        let mut indexed_paths: Vec<String> = Vec::with_capacity(initial_count);
 
         loop {
             if !self.wait_while_paused(ct).await {
@@ -282,20 +291,33 @@ impl IngestionManager {
             match self.index_file(&source_path).await {
                 Ok(()) => {
                     processed += 1;
+                    indexed_paths.push(source_path.clone());
                     let _ = self.db.remove_rag_item(&source_path);
                 }
                 Err(e) => {
                     tracing::error!("RAG index error {source_path}: {e:#}");
                     skipped += 1;
-                    // Re-queue on transient errors (embedding client unavailable) so
-                    // we retry after the daemon restarts rather than silently dropping.
                     let _ = self.db.remove_rag_item(&source_path);
+                    // Immediate per-file error notification so the user knows right away.
+                    let filename = std::path::Path::new(&source_path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| source_path.clone());
+                    crate::domain::notification::send_notification(
+                        "Canopy — RAG indexing error",
+                        &format!("{filename} could not be indexed\nCause: {e:#}"),
+                    );
                 }
             }
         }
 
         if processed > 0 {
-            tracing::info!("Personal RAG: indexed {processed} file(s)");
+            let dir_note = indexing_dir_summary(&indexed_paths);
+            tracing::info!("Personal RAG: indexed {processed} file(s){dir_note}");
+            crate::domain::notification::send_notification(
+                "Canopy — RAG indexing",
+                &format!("{processed} file(s) indexed{dir_note}"),
+            );
         }
         if skipped > 0 {
             tracing::warn!("Personal RAG: {skipped} file(s) failed — check logs above");
@@ -539,6 +561,33 @@ fn extract_file_content(path: &Path, lang: &str) -> anyhow::Result<String> {
         extract_pdf_text(path)
     } else {
         Ok(std::fs::read_to_string(path)?)
+    }
+}
+
+/// Build a short directory annotation for the indexing summary notification.
+/// If all indexed files share the same parent directory, returns " in <dir>".
+/// If they span multiple directories, returns " across <n> dirs".
+/// Returns an empty string when the list is empty.
+fn indexing_dir_summary(paths: &[String]) -> String {
+    if paths.is_empty() {
+        return String::new();
+    }
+    let dirs: std::collections::HashSet<String> = paths
+        .iter()
+        .filter_map(|p| {
+            std::path::Path::new(p)
+                .parent()
+                .map(|d| d.to_string_lossy().to_string())
+        })
+        .collect();
+    match dirs.len() {
+        0 => String::new(),
+        1 => {
+            let dir = dirs.into_iter().next().unwrap_or_default();
+            let leaf = dir.rsplit('/').next().unwrap_or("?");
+            format!(" in {leaf}")
+        }
+        n => format!(" across {n} dirs"),
     }
 }
 
