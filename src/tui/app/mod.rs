@@ -351,7 +351,7 @@ impl App {
         let (total_chunks, indexed_files) = self.rag_lancedb_counts();
         self.rag_info = crate::db::project::RagInfoSummary {
             total_chunks,
-            indexed_projects: indexed_files,
+            indexed_files,
             queued_items: queued,
             processing_items: processing,
         };

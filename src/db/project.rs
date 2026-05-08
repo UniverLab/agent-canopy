@@ -20,7 +20,7 @@ pub struct RagQueueItem {
 #[derive(Debug, Clone, Default)]
 pub struct RagInfoSummary {
     pub total_chunks: i64,
-    pub indexed_projects: i64,
+    pub indexed_files: i64,
     pub queued_items: i64,
     pub processing_items: i64,
 }

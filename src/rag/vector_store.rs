@@ -198,6 +198,13 @@ impl VectorStore {
     }
 
     pub async fn count_unique_paths(&self) -> Result<i64> {
+        let paths = self.list_unique_paths().await?;
+        Ok(paths.len() as i64)
+    }
+
+    /// Return every distinct `file_path` stored in the vector table.
+    /// Used for orphan-chunk reconciliation at startup.
+    pub async fn list_unique_paths(&self) -> Result<Vec<String>> {
         let batches: Vec<RecordBatch> = self
             .table
             .query()
@@ -219,7 +226,7 @@ impl VectorStore {
                 }
             }
         }
-        Ok(paths.len() as i64)
+        Ok(paths.into_iter().collect())
     }
 
     pub fn path_for_tests(base_dir: &Path) -> PathBuf {

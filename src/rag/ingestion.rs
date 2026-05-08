@@ -135,6 +135,11 @@ impl IngestionManager {
                     match event.kind {
                         EventKind::Create(_) | EventKind::Modify(_) => {
                             if detect_lang(&path_str).is_some() {
+                                tracing::info!(
+                                    "RAG watcher: queuing '{}' for indexing ({:?})",
+                                    path_str,
+                                    event.kind
+                                );
                                 let q = Arc::clone(&queue);
                                 let n = Arc::clone(&notify_handle);
                                 let p = path_str.clone();
@@ -153,6 +158,7 @@ impl IngestionManager {
                             }
                         }
                         EventKind::Remove(_) => {
+                            tracing::info!("RAG watcher: '{}' removed — purging chunks", path_str);
                             let data_dir2 = data_dir.clone();
                             let p = path_str;
                             rt.spawn(async move {
@@ -196,6 +202,49 @@ impl IngestionManager {
             self.run(ct_child).await;
         });
         ct
+    }
+
+    /// Scan the vector store for chunks whose source file no longer exists on disk
+    /// and delete them. Run once at startup to clean up any orphans left from a
+    /// previous session where the daemon was offline during file deletions.
+    pub async fn reconcile_orphan_chunks(&self) {
+        let config = crate::domain::canopy_config::CanopyConfig::load(&self.data_dir);
+        let Some(store) = open_vector_store(&config).await else {
+            return;
+        };
+        let paths = match store.list_unique_paths().await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("RAG reconcile: failed to list indexed paths: {e:#}");
+                return;
+            }
+        };
+        if paths.is_empty() {
+            return;
+        }
+        tracing::info!(
+            "RAG reconcile: checking {} indexed path(s) for orphan chunks",
+            paths.len()
+        );
+        let mut purged = 0usize;
+        for path in &paths {
+            if !std::path::Path::new(path).exists() {
+                tracing::info!(
+                    "RAG reconcile: '{}' no longer exists — purging chunks",
+                    path
+                );
+                if let Err(e) = store.delete_by_path(path).await {
+                    tracing::warn!("RAG reconcile: failed to purge '{}': {e:#}", path);
+                } else {
+                    purged += 1;
+                }
+            }
+        }
+        if purged > 0 {
+            tracing::info!("RAG reconcile: removed chunks for {purged} deleted file(s)");
+        } else {
+            tracing::debug!("RAG reconcile: no orphan chunks found");
+        }
     }
 
     async fn run(&self, ct: tokio_util::sync::CancellationToken) {
@@ -465,11 +514,23 @@ async fn sync_vector_store(
 async fn purge_vector_chunks(data_dir: &Path, source_path: &str) {
     let config = crate::domain::canopy_config::CanopyConfig::load(data_dir);
     let Some(store) = open_vector_store(&config).await else {
+        tracing::warn!(
+            "RAG purge: vector store unavailable — chunks for '{}' may be orphaned",
+            source_path
+        );
         return;
     };
 
-    if let Err(error) = store.delete_by_path(source_path).await {
-        tracing::warn!("RAG vector cleanup error {source_path}: {error}");
+    match store.delete_by_path(source_path).await {
+        Ok(()) => {
+            tracing::info!("RAG purge: removed chunks for '{}'", source_path);
+        }
+        Err(error) => {
+            tracing::warn!(
+                "RAG purge: failed to remove chunks for '{}': {error:#}",
+                source_path
+            );
+        }
     }
 }
 

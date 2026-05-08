@@ -834,8 +834,10 @@ impl TaskTriggerHandler {
     /// Full-text search over personal RAG chunks (LanceDB vector search). Rate-limited: 10/min per agent.
     #[tool(
         name = "rag_search",
-        description = "Search indexed personal content (markdown and PDF files). \
-        Default limit: 5. Rate-limited to 10 calls/min per agent."
+        description = "Search indexed personal content (markdown and PDF files) using semantic \
+        vector search. Default limit: 5. Rate-limited to 10 calls/min per agent. \
+        Usage examples: 'search RAG for X', 'find documents about Y', \
+        'consult RAG about Z', 'what does the RAG say about W'."
     )]
     async fn rag_search(
         &self,

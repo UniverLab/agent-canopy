@@ -11,6 +11,9 @@ const MAX_CHUNK_TOKENS: usize = 512;
 const OVERLAP_TOKENS: usize = 64;
 // Rough approximation: 1 token ≈ 4 chars
 const CHARS_PER_TOKEN: usize = 4;
+/// Minimum characters a chunk must have to be indexed.
+/// Filters PDF artifacts like isolated numbers, axis labels, figure captions.
+const MIN_CHUNK_CHARS: usize = 20;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SemanticChunk {
@@ -247,9 +250,17 @@ fn split_paragraph(paragraph: &str) -> Vec<String> {
 
 fn push_chunk(chunks: &mut Vec<String>, text: &str) {
     let trimmed = text.trim();
-    if !trimmed.is_empty() {
+    if trimmed.len() >= MIN_CHUNK_CHARS && has_meaningful_content(trimmed) {
         chunks.push(trimmed.to_owned());
     }
+}
+
+/// Returns `true` if `text` contains at least one word with 3+ alphabetic characters.
+/// Rejects chunks that are purely numeric, symbolic, or axis/table labels
+/// (e.g. "123", "0 20 40 60", "σ = 19.4").
+fn has_meaningful_content(text: &str) -> bool {
+    text.split_whitespace()
+        .any(|word| word.chars().filter(|c| c.is_alphabetic()).count() >= 3)
 }
 
 fn annotate_similarity(chunks: Vec<String>) -> Vec<SemanticChunk> {
@@ -325,7 +336,7 @@ mod tests {
 
     #[test]
     fn chunk_markdown_indices_are_sequential() {
-        let md = "# A\n\ntext\n\n## B\n\nmore";
+        let md = "# Alpha Section\n\nsome text here\n\n## Beta Section\n\nmore content here";
         let chunks = chunk(md, "markdown");
         let indices: Vec<usize> = chunks.iter().map(|(index, _)| *index).collect();
         assert_eq!(indices, (0..chunks.len()).collect::<Vec<_>>());
@@ -340,7 +351,8 @@ mod tests {
 
     #[test]
     fn chunk_paragraphs_tracks_similarity_between_adjacent_paragraphs() {
-        let content = "alpha beta gamma\n\nalpha beta delta\n\nomega sigma tau";
+        let content =
+            "alpha beta gamma delta\n\nalpha beta delta epsilon\n\nomega sigma tau upsilon";
         let chunks = chunk_paragraphs(content);
 
         assert_eq!(chunks.len(), 3);
@@ -375,7 +387,7 @@ mod tests {
 
     #[test]
     fn chunk_semantic_preserves_similarity_metadata_after_merging() {
-        let content = "alpha beta gamma\n\ndelta epsilon zeta";
+        let content = "alpha beta gamma delta epsilon\n\ndelta epsilon zeta theta iota";
         let chunks = chunk_semantic(content, "text", 0.5);
 
         assert_eq!(chunks.len(), 1);
@@ -397,8 +409,42 @@ mod tests {
     #[test]
     fn chunk_paragraph_texts_handles_multibyte_utf8_without_panic() {
         let ligature = "ﬁ".repeat(600);
-        let content = format!("alpha beta gamma\n\n{ligature}\n\ndelta epsilon");
+        let content = format!("alpha beta gamma delta epsilon\n\n{ligature}\n\ndelta epsilon iota");
         let chunks = chunk_paragraph_texts(&content);
         assert!(!chunks.is_empty());
+    }
+
+    #[test]
+    fn push_chunk_filters_short_text() {
+        let mut chunks = Vec::new();
+        push_chunk(&mut chunks, "hi");
+        push_chunk(&mut chunks, "123");
+        push_chunk(&mut chunks, "0 20 40 60");
+        assert!(
+            chunks.is_empty(),
+            "all short/numeric chunks should be filtered"
+        );
+    }
+
+    #[test]
+    fn push_chunk_accepts_meaningful_text() {
+        let mut chunks = Vec::new();
+        push_chunk(&mut chunks, "noise reduction in weak lensing images");
+        assert_eq!(chunks.len(), 1);
+    }
+
+    #[test]
+    fn has_meaningful_content_rejects_pure_numbers() {
+        assert!(!has_meaningful_content("123"));
+        assert!(!has_meaningful_content("0.5"));
+        assert!(!has_meaningful_content("0 20 40 60"));
+        assert!(!has_meaningful_content("1.00"));
+    }
+
+    #[test]
+    fn has_meaningful_content_accepts_text_with_words() {
+        assert!(has_meaningful_content("noise reduction weak lensing"));
+        assert!(has_meaningful_content("Introduction to signal processing"));
+        assert!(has_meaningful_content("Ground Truth evaluation"));
     }
 }

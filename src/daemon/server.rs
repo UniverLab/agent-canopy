@@ -231,6 +231,9 @@ async fn startup_personal_rag(ingestion: Arc<IngestionManager>, data_dir: &std::
         tracing::info!("startup_personal_rag: queued {queued} existing file(s) for indexing");
     }
 
+    // Reconcile orphan chunks from files deleted while the daemon was offline.
+    ingestion.reconcile_orphan_chunks().await;
+
     // Start the filesystem watcher for live updates.
     Arc::clone(&ingestion).start_personal_watcher(&personal_roots);
 }

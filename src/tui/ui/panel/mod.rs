@@ -436,9 +436,9 @@ fn rag_summary_lines(
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled("Projects: ", Style::default().fg(DIM)),
+            Span::styled("Files: ", Style::default().fg(DIM)),
             Span::styled(
-                app.rag_info.indexed_projects.to_string(),
+                app.rag_info.indexed_files.to_string(),
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),

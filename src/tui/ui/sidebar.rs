@@ -663,9 +663,9 @@ fn draw_rag_info(frame: &mut Frame, area: Rect, app: &App) {
             ),
         ]),
         Line::from(vec![
-            Span::styled(" projects ", Style::default().fg(DIM)),
+            Span::styled(" files ", Style::default().fg(DIM)),
             Span::styled(
-                app.rag_info.indexed_projects.to_string(),
+                app.rag_info.indexed_files.to_string(),
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
