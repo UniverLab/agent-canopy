@@ -65,6 +65,8 @@ pub struct IngestionManager {
     queue: Arc<Mutex<Queue>>,
     notify: Arc<Notify>,
     _personal_watcher: std::sync::Mutex<Option<RecommendedWatcher>>,
+    /// Cached embedding client keyed by model id so we load the ONNX model once.
+    cached_client: Mutex<Option<(String, Arc<dyn EmbeddingClient>)>>,
 }
 
 impl IngestionManager {
@@ -76,6 +78,7 @@ impl IngestionManager {
             queue: Arc::new(Mutex::new(Queue::new())),
             notify: Arc::new(Notify::new()),
             _personal_watcher: std::sync::Mutex::new(None),
+            cached_client: Mutex::new(None),
         }
     }
 
@@ -213,6 +216,7 @@ impl IngestionManager {
 
     async fn drain_queue(&self, ct: &tokio_util::sync::CancellationToken) {
         let mut processed = 0usize;
+        let mut skipped = 0usize;
 
         loop {
             if !self.wait_while_paused(ct).await {
@@ -226,16 +230,26 @@ impl IngestionManager {
             let now = chrono::Utc::now().timestamp();
             let _ = self.db.mark_rag_item_processing(&source_path, now);
 
-            if let Err(e) = self.index_file(&source_path).await {
-                tracing::warn!("RAG index error {source_path}: {e}");
-            } else {
-                processed += 1;
+            match self.index_file(&source_path).await {
+                Ok(()) => {
+                    processed += 1;
+                    let _ = self.db.remove_rag_item(&source_path);
+                }
+                Err(e) => {
+                    tracing::error!("RAG index error {source_path}: {e:#}");
+                    skipped += 1;
+                    // Re-queue on transient errors (embedding client unavailable) so
+                    // we retry after the daemon restarts rather than silently dropping.
+                    let _ = self.db.remove_rag_item(&source_path);
+                }
             }
-            let _ = self.db.remove_rag_item(&source_path);
         }
 
         if processed > 0 {
             tracing::info!("Personal RAG: indexed {processed} file(s)");
+        }
+        if skipped > 0 {
+            tracing::warn!("Personal RAG: {skipped} file(s) failed — check logs above");
         }
     }
 
@@ -247,6 +261,34 @@ impl IngestionManager {
             }
         }
         !ct.is_cancelled()
+    }
+
+    /// Return a cached embedding client, creating it (in a blocking task) if needed.
+    /// If the configured model changed since last call, the client is recreated.
+    async fn get_embedding_client(
+        &self,
+        config: &crate::domain::canopy_config::CanopyConfig,
+    ) -> anyhow::Result<Arc<dyn EmbeddingClient>> {
+        let model_id = config.embeddings_model.trim().to_string();
+        let mut guard = self.cached_client.lock().await;
+
+        if let Some((cached_model, client)) = guard.as_ref() {
+            if *cached_model == model_id {
+                return Ok(Arc::clone(client));
+            }
+        }
+
+        // Load the model (potentially heavy for local ONNX models) off the async executor.
+        tracing::info!("RAG: loading embedding client for model '{model_id}'");
+        let config_clone = config.clone();
+        let client: Arc<dyn EmbeddingClient> =
+            tokio::task::spawn_blocking(move || client_from_config(&config_clone).map(Arc::from))
+                .await
+                .map_err(|e| anyhow::anyhow!("Embedding client task panicked: {e}"))??;
+
+        *guard = Some((model_id.clone(), Arc::clone(&client)));
+        tracing::info!("RAG: embedding client loaded and cached for model '{model_id}'");
+        Ok(client)
     }
 
     async fn index_file(&self, source_path: &str) -> anyhow::Result<()> {
@@ -272,6 +314,10 @@ impl IngestionManager {
             tracing::warn!("RAG: skipping {source_path} — content is empty after extraction");
             return Ok(());
         }
+        tracing::debug!(
+            "RAG index_file: {source_path} — extracted {} bytes (lang={lang})",
+            content.len()
+        );
         let now = chrono::Utc::now().timestamp();
         let config = crate::domain::canopy_config::CanopyConfig::load(&self.data_dir);
 
@@ -296,14 +342,20 @@ impl IngestionManager {
                 return Ok(());
             }
         };
-        let embedding_client: Arc<dyn EmbeddingClient> = match client_from_config(&config) {
-            Ok(client) => Arc::from(client),
+        tracing::debug!(
+            "RAG index_file: {source_path} — {} semantic chunk(s) produced",
+            semantic_chunks.len()
+        );
+        let embedding_client = match self.get_embedding_client(&config).await {
+            Ok(client) => {
+                tracing::debug!("RAG index_file: embedding client ready for {source_path}");
+                client
+            }
             Err(error) => {
                 tracing::error!(
-                    "RAG: cannot index {source_path} — embedding client unavailable: {error}. \
-                     Check that embeddings_model is configured and the API key env var is set."
+                    "RAG: cannot index {source_path} — embedding client unavailable: {error:#}"
                 );
-                return Ok(());
+                return Err(error);
             }
         };
 
@@ -317,7 +369,14 @@ impl IngestionManager {
                 match tokio::task::spawn_blocking(move || client.embed(&content_for_embedding))
                     .await
                 {
-                    Ok(Ok(values)) => values,
+                    Ok(Ok(values)) => {
+                        tracing::debug!(
+                            "RAG: embedded chunk {} of {source_path} → {} dims",
+                            chunk.index,
+                            values.len()
+                        );
+                        values
+                    }
                     Ok(Err(error)) => {
                         tracing::error!(
                             "RAG embedding failed for {source_path} chunk {}: {error}",
@@ -350,7 +409,11 @@ impl IngestionManager {
             return Ok(());
         }
 
-        sync_vector_store(&config, source_path, &vector_chunks).await;
+        tracing::info!(
+            "RAG index_file: {source_path} — {} chunk(s) embedded, pushing to vector store",
+            vector_chunks.len()
+        );
+        sync_vector_store(&config, source_path, &vector_chunks).await?;
         Ok(())
     }
 }
@@ -359,24 +422,44 @@ async fn sync_vector_store(
     config: &crate::domain::canopy_config::CanopyConfig,
     source_path: &str,
     chunks: &[VectorChunk],
-) {
+) -> anyhow::Result<()> {
+    let model = config.embeddings_model.trim();
+    tracing::info!(
+        "RAG sync_vector_store: {} chunk(s) for {source_path} (model={})",
+        chunks.len(),
+        model
+    );
+
     let Some(store) = open_vector_store(config).await else {
-        return;
+        anyhow::bail!("RAG vector store unavailable — check model config");
     };
 
     if let Err(error) = store.delete_by_path(source_path).await {
-        tracing::warn!("RAG vector cleanup error {source_path}: {error}");
-        return;
+        tracing::warn!("RAG vector cleanup error {source_path}: {error:#}");
+        // Non-fatal — continue inserting fresh chunks even if delete failed.
     }
 
+    let mut ok = 0usize;
+    let mut fail = 0usize;
     for chunk in chunks {
-        if let Err(error) = store.insert_chunk(chunk).await {
-            tracing::warn!(
-                "RAG vector store error {source_path} chunk {}: {error}",
-                chunk.id
-            );
+        match store.insert_chunk(chunk).await {
+            Ok(()) => ok += 1,
+            Err(error) => {
+                tracing::error!(
+                    "RAG insert failed for {source_path} chunk {}: {error:#}",
+                    chunk.id
+                );
+                fail += 1;
+            }
         }
     }
+
+    tracing::info!("RAG sync_vector_store: {source_path} — {ok} inserted, {fail} failed");
+
+    if fail > 0 && ok == 0 {
+        anyhow::bail!("All {fail} chunk(s) failed to insert for {source_path} — see errors above");
+    }
+    Ok(())
 }
 
 async fn purge_vector_chunks(data_dir: &Path, source_path: &str) {
@@ -418,17 +501,23 @@ async fn open_vector_store(
     }
 
     let dimensions = match model_dimensions(model) {
-        Ok(dimensions) => dimensions,
+        Ok(dimensions) => {
+            tracing::info!("RAG open_vector_store: model='{model}' dimensions={dimensions}");
+            dimensions
+        }
         Err(error) => {
-            tracing::warn!("RAG vector store unavailable for model {model}: {error}");
+            tracing::warn!("RAG vector store unavailable for model {model}: {error:#}");
             return None;
         }
     };
 
     match VectorStore::new(dimensions).await {
-        Ok(store) => Some(store),
+        Ok(store) => {
+            tracing::info!("RAG open_vector_store: store opened OK");
+            Some(store)
+        }
         Err(error) => {
-            tracing::warn!("RAG vector store open error: {error}");
+            tracing::warn!("RAG vector store open error: {error:#}");
             None
         }
     }

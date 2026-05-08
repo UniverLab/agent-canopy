@@ -345,7 +345,9 @@ impl SimplePromptDialog {
     }
 
     fn format_rag_chunk(query: &str, chunk: &crate::rag::vector_store::SearchResult) -> String {
-        let dist = chunk.distance.map_or("—".to_string(), |d| format!("{d:.4}"));
+        let dist = chunk
+            .distance
+            .map_or("—".to_string(), |d| format!("{d:.4}"));
         format!(
             "kind: rag_chunk\nquery: {query}\npath: {}\ndistance: {}\ncontent:\n{}",
             chunk.file_path, dist, chunk.content
@@ -446,13 +448,11 @@ impl SimplePromptDialog {
         if model.is_empty() {
             return Vec::new();
         }
-        let dimensions = match crate::rag::embedding_client::model_dimensions(model) {
-            Ok(d) => d,
-            Err(_) => return Vec::new(),
+        let Ok(dimensions) = crate::rag::embedding_client::model_dimensions(model) else {
+            return Vec::new();
         };
-        let rt = match tokio::runtime::Handle::try_current() {
-            Ok(h) => h,
-            Err(_) => return Vec::new(),
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return Vec::new();
         };
 
         rt.block_on(async {

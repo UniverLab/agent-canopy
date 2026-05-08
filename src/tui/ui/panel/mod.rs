@@ -555,7 +555,10 @@ fn visible_playground_window(area: Rect, selected: usize) -> (usize, usize) {
     (max_visible, scroll_start)
 }
 
-fn project_name_for_chunk<'a>(app: &'a App, _chunk: &crate::rag::vector_store::SearchResult) -> &'a str {
+fn project_name_for_chunk<'a>(
+    app: &'a App,
+    _chunk: &crate::rag::vector_store::SearchResult,
+) -> &'a str {
     app.projects
         .first()
         .map(|project| project.name.as_str())
@@ -614,7 +617,9 @@ fn render_chunk_entry<'a>(
     width: u16,
 ) -> Vec<Line<'a>> {
     let (style, marker) = selected_row_style(selected);
-    let dist = chunk.distance.map_or("—".to_string(), |d| format!("{d:.3}"));
+    let dist = chunk
+        .distance
+        .map_or("—".to_string(), |d| format!("{d:.3}"));
     let path = format!("{} · {} [dist={}]", project_name, chunk.file_path, dist);
     let mut lines = vec![Line::from(vec![
         Span::styled(marker, style.fg(ACCENT)),
@@ -640,7 +645,9 @@ fn render_chunk_entry<'a>(
 }
 
 fn playground_detail_header(chunk: &crate::rag::vector_store::SearchResult) -> Vec<Line<'static>> {
-    let dist = chunk.distance.map_or("—".to_string(), |d| format!("{d:.4}"));
+    let dist = chunk
+        .distance
+        .map_or("—".to_string(), |d| format!("{d:.4}"));
     vec![
         Line::from(vec![
             Span::styled("‹ ", Style::default().fg(ACCENT)),

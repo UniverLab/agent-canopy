@@ -59,6 +59,12 @@ impl VectorStore {
             bail!("Embedding dimensions must be greater than zero");
         }
 
+        tracing::debug!(
+            "RAG VectorStore: opening at {} with {} dimensions",
+            path.display(),
+            embedding_dimensions
+        );
+
         std::fs::create_dir_all(path)
             .with_context(|| format!("Failed to create LanceDB directory at {}", path.display()))?;
 
@@ -67,17 +73,56 @@ impl VectorStore {
             .await
             .with_context(|| format!("Failed to open LanceDB at {}", path.display()))?;
         let schema = chunk_schema(embedding_dimensions);
+
         let table = match connection.open_table(TABLE_NAME).execute().await {
-            Ok(table) => table,
-            Err(open_error) => connection
-                .create_empty_table(TABLE_NAME, schema.clone())
-                .execute()
-                .await
-                .with_context(|| {
-                    format!(
-                        "Failed to create LanceDB table {TABLE_NAME} after open error: {open_error}"
-                    )
-                })?,
+            Ok(existing_table) => {
+                // Check whether the stored schema matches the requested dimensions.
+                // If they differ (e.g. model was changed), drop and recreate the table.
+                let stored_dims = embedding_dims_from_table(&existing_table).await;
+                tracing::info!(
+                    "RAG VectorStore: existing table found — stored_dims={:?}, requested={}",
+                    stored_dims,
+                    embedding_dimensions
+                );
+                if stored_dims != Some(embedding_dimensions) {
+                    tracing::warn!(
+                        "RAG VectorStore: schema mismatch (stored={:?} vs requested={}) — dropping and recreating table",
+                        stored_dims,
+                        embedding_dimensions
+                    );
+                    connection
+                        .drop_table(TABLE_NAME, &[])
+                        .await
+                        .context("Failed to drop outdated LanceDB table")?;
+                    let new_table = connection
+                        .create_empty_table(TABLE_NAME, schema.clone())
+                        .execute()
+                        .await
+                        .context("Failed to recreate LanceDB table after schema change")?;
+                    tracing::info!(
+                        "RAG VectorStore: recreated table with {} dimensions",
+                        embedding_dimensions
+                    );
+                    new_table
+                } else {
+                    tracing::info!("RAG VectorStore: schema OK, reusing existing table");
+                    existing_table
+                }
+            }
+            Err(open_error) => {
+                tracing::info!(
+                    "RAG VectorStore: table not found ({}), creating fresh with {} dims",
+                    open_error,
+                    embedding_dimensions
+                );
+                connection
+                    .create_empty_table(TABLE_NAME, schema.clone())
+                    .execute()
+                    .await
+                    .with_context(|| {
+                        format!("Failed to create LanceDB table {TABLE_NAME} after open error: {open_error}")
+                    })?
+            }
         };
 
         Ok(Self {
@@ -95,11 +140,14 @@ impl VectorStore {
             std::slice::from_ref(chunk),
             self.embedding_dimensions,
         )?;
-        self.table
-            .add(batch)
-            .execute()
-            .await
-            .context("Failed to insert chunk into LanceDB")?;
+        self.table.add(batch).execute().await.with_context(|| {
+            format!(
+                "LanceDB add() failed for chunk {} (file: {}, embedding_dims={})",
+                chunk.id,
+                chunk.file_path,
+                chunk.embedding.len()
+            )
+        })?;
         Ok(())
     }
 
@@ -224,8 +272,7 @@ fn chunk_batch(
     let ids = StringArray::from_iter_values(chunks.iter().map(|chunk| chunk.id.as_str()));
     let file_paths =
         StringArray::from_iter_values(chunks.iter().map(|chunk| chunk.file_path.as_str()));
-    let contents =
-        StringArray::from_iter_values(chunks.iter().map(|chunk| chunk.content.as_str()));
+    let contents = StringArray::from_iter_values(chunks.iter().map(|chunk| chunk.content.as_str()));
     let created_at = Int64Array::from_iter_values(chunks.iter().map(|chunk| chunk.created_at));
     let embeddings = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
         chunks.iter().map(|chunk| {
@@ -308,6 +355,16 @@ fn distance_at(batch: &RecordBatch, row: usize) -> Option<f32> {
                     .map(|distances| distances.value(row) as f32)
             })
     })
+}
+
+/// Extract the embedding vector dimensions from an existing LanceDB table schema.
+async fn embedding_dims_from_table(table: &Table) -> Option<i32> {
+    let schema = table.schema().await.ok()?;
+    let field = schema.field_with_name("embedding").ok()?;
+    match field.data_type() {
+        DataType::FixedSizeList(_, size) => Some(*size),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

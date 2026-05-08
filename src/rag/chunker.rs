@@ -179,21 +179,21 @@ fn chunk_paragraph_texts(content: &str) -> Vec<String> {
         if buf.len() + separator_len + paragraph.len() > window && !buf.is_empty() {
             let flushed = std::mem::take(&mut buf);
             push_chunk(&mut chunks, &flushed);
-        let overlap_start = chunks
-            .last()
-            .map(|chunk: &String| {
-                let byte_target = chunk.len().saturating_sub(overlap);
-                chunk
-                    .char_indices()
-                    .map(|(i, _)| i)
-                    .find(|&b| b >= byte_target)
-                    .unwrap_or(0)
-            })
-            .unwrap_or(0);
-        buf = chunks
-            .last()
-            .map(|chunk| chunk[overlap_start..].to_owned())
-            .unwrap_or_default();
+            let overlap_start = chunks
+                .last()
+                .map(|chunk: &String| {
+                    let byte_target = chunk.len().saturating_sub(overlap);
+                    chunk
+                        .char_indices()
+                        .map(|(i, _)| i)
+                        .find(|&b| b >= byte_target)
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+            buf = chunks
+                .last()
+                .map(|chunk| chunk[overlap_start..].to_owned())
+                .unwrap_or_default();
         }
         if !buf.is_empty() {
             buf.push_str("\n\n");

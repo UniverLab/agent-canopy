@@ -252,10 +252,19 @@ pub(crate) async fn run_doctor() -> Result<()> {
                         } else {
                             println!(" \x1b[31m✗\x1b[0m No chunks indexed yet");
                             if !config.rag_personal_dirs.is_empty() {
-                                issues.push(
-                                    "RAG directories are configured but nothing is indexed — \
-                                     ensure the daemon is running and the API key env var is set",
+                                let is_local = matches!(
+                                    crate::rag::embedding_client::provider_for_model(
+                                        &config.embeddings_model
+                                    ),
+                                    Some(crate::rag::embedding_client::EmbeddingProvider::Local)
                                 );
+                                issues.push(if is_local {
+                                    "RAG directories are configured but nothing is indexed — \
+                                     ensure the daemon is running"
+                                } else {
+                                    "RAG directories are configured but nothing is indexed — \
+                                     ensure the daemon is running and the API key env var is set"
+                                });
                             }
                         }
                     }

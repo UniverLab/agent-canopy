@@ -251,18 +251,16 @@ impl Database {
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-        let queued: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM rag_queue WHERE status='queued'",
-                [],
-                |row| row.get(0),
-            )?;
-        let processing: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM rag_queue WHERE status='processing'",
-                [],
-                |row| row.get(0),
-            )?;
+        let queued: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM rag_queue WHERE status='queued'",
+            [],
+            |row| row.get(0),
+        )?;
+        let processing: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM rag_queue WHERE status='processing'",
+            [],
+            |row| row.get(0),
+        )?;
         Ok((queued, processing))
     }
 }

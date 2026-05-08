@@ -384,13 +384,11 @@ impl App {
         if model.is_empty() {
             return (0, 0);
         }
-        let dimensions = match crate::rag::embedding_client::model_dimensions(model) {
-            Ok(d) => d,
-            Err(_) => return (0, 0),
+        let Ok(dimensions) = crate::rag::embedding_client::model_dimensions(model) else {
+            return (0, 0);
         };
-        let rt = match tokio::runtime::Handle::try_current() {
-            Ok(h) => h,
-            Err(_) => return (0, 0),
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return (0, 0);
         };
         rt.block_on(async {
             let Ok(store) = crate::rag::vector_store::VectorStore::new(dimensions).await else {
@@ -402,7 +400,11 @@ impl App {
         })
     }
 
-    fn rag_vector_search(&self, query: &str, top_k: usize) -> anyhow::Result<Vec<crate::rag::vector_store::SearchResult>> {
+    fn rag_vector_search(
+        &self,
+        query: &str,
+        top_k: usize,
+    ) -> anyhow::Result<Vec<crate::rag::vector_store::SearchResult>> {
         let canopy_dir = dirs::home_dir()
             .map(|h| h.join(".canopy"))
             .ok_or_else(|| anyhow::anyhow!("No home directory"))?;
@@ -1041,7 +1043,9 @@ impl App {
             "kind: rag_chunk\nquery: {}\npath: {}\ndistance: {}\ncontent:\n{}",
             query,
             chunk.file_path,
-            chunk.distance.map_or("—".to_string(), |d| format!("{d:.4}")),
+            chunk
+                .distance
+                .map_or("—".to_string(), |d| format!("{d:.4}")),
             chunk.content
         );
 

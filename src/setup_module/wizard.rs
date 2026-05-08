@@ -82,71 +82,106 @@ pub fn run_setup() -> Result<()> {
         }
     ));
 
-    // ── Step 2.3: Knowledge layer preferences ───────────────────
+    // ── Step 2.3: RAG opt-in ─────────────────────────────────────
     wiz.render()?;
-    let embeddings_model = select_embeddings_model(&existing_config.embeddings_model)?;
+    let rag_previously_configured = !existing_config.embeddings_model.is_empty()
+        || !existing_config.rag_personal_dirs.is_empty();
+    let use_rag = Confirm::new("Enable personal knowledge indexing (RAG)?")
+        .with_default(rag_previously_configured)
+        .with_help_message(
+            "Indexes your notes/docs so AI tools can search them — runs fully locally",
+        )
+        .prompt()
+        .map_err(|e| anyhow::anyhow!("RAG selection cancelled: {}", e))?;
 
-    // Warn if model changed — re-indexing all documents will be required.
-    if !existing_config.embeddings_model.is_empty()
-        && embeddings_model != existing_config.embeddings_model
-    {
-        println!();
-        println!("  \x1b[33m⚠  Embeddings model changed.\x1b[0m");
-        println!("  \x1b[90mAll previously indexed documents will need to be re-indexed.\x1b[0m");
-        println!("  \x1b[90mThis is a heavy operation and may take a while.\x1b[0m");
-        println!();
-        let confirmed = Confirm::new("Continue with the new model?")
-            .with_default(false)
-            .with_help_message("enter: confirm")
-            .prompt()
-            .unwrap_or(false);
-        if !confirmed {
-            anyhow::bail!("Embeddings model change cancelled by user");
+    let (embeddings_model, similarity_threshold, rag_personal_dirs) = if use_rag {
+        // ── Select local embedding model ──────────────────────────
+        wiz.render()?;
+        let embeddings_model = select_local_embeddings_model(&existing_config.embeddings_model)?;
+
+        // Warn if model changed — re-indexing all documents will be required.
+        if !existing_config.embeddings_model.is_empty()
+            && embeddings_model != existing_config.embeddings_model
+        {
+            println!();
+            println!("  \x1b[33m⚠  Embeddings model changed.\x1b[0m");
+            println!(
+                "  \x1b[90mAll previously indexed documents will need to be re-indexed.\x1b[0m"
+            );
+            println!("  \x1b[90mThis is a heavy operation and may take a while.\x1b[0m");
+            println!();
+            let confirmed = Confirm::new("Continue with the new model?")
+                .with_default(false)
+                .with_help_message("enter: confirm")
+                .prompt()
+                .unwrap_or(false);
+            if !confirmed {
+                anyhow::bail!("Embeddings model change cancelled by user");
+            }
         }
-    }
 
-    wiz.add(format!(
-        "\x1b[32m✓\x1b[0m Embeddings model: {}",
-        embeddings_model
-    ));
+        wiz.add(format!(
+            "\x1b[32m✓\x1b[0m Embeddings model: {}",
+            embeddings_model
+        ));
 
-    wiz.render()?;
-    // Similarity threshold for semantic chunk merging (default range 0.3-0.5, default 0.4)
-    let similarity_threshold = {
-        let default = existing_config.similarity_threshold;
-        let input = Text::new("Similarity threshold for semantic chunk merging (0.3-0.5):")
-            .with_initial_value(&format!("{:.2}", default))
-            .with_help_message("Value between 0.3 and 0.5 (recommended 0.4)")
-            .prompt()
-            .map_err(|e| anyhow::anyhow!("Similarity threshold selection cancelled: {}", e))?;
-        let parsed = input
-            .trim()
-            .parse::<f32>()
-            .map_err(|e| anyhow::anyhow!("Invalid number: {}", e))?;
-        if !(0.3f32..=0.5f32).contains(&parsed) {
-            anyhow::bail!("Similarity threshold must be between 0.3 and 0.5");
-        }
-        parsed
+        // ── Download / warm-up the model ──────────────────────────
+        wiz.render()?;
+        let model_cache_dir = canopy_dir.join("models");
+        download_local_model_for_setup(&embeddings_model, &model_cache_dir)?;
+        wiz.add(format!(
+            "\x1b[32m✓\x1b[0m Model ready: {}",
+            embeddings_model
+        ));
+
+        // ── Similarity threshold ───────────────────────────────────
+        wiz.render()?;
+        let similarity_threshold = {
+            let default = existing_config.similarity_threshold;
+            let input = Text::new("Similarity threshold for semantic chunk merging (0.3-0.5):")
+                .with_initial_value(&format!("{:.2}", default))
+                .with_help_message("Value between 0.3 and 0.5 (recommended 0.4)")
+                .prompt()
+                .map_err(|e| anyhow::anyhow!("Similarity threshold selection cancelled: {}", e))?;
+            let parsed = input
+                .trim()
+                .parse::<f32>()
+                .map_err(|e| anyhow::anyhow!("Invalid number: {}", e))?;
+            if !(0.3f32..=0.5f32).contains(&parsed) {
+                anyhow::bail!("Similarity threshold must be between 0.3 and 0.5");
+            }
+            parsed
+        };
+        wiz.add(format!(
+            "\x1b[32m✓\x1b[0m Similarity threshold: {:.2}",
+            similarity_threshold
+        ));
+
+        // ── RAG directories ─────────────────────────────────────────
+        let prev_dirs = existing_config.rag_personal_dirs.clone();
+        let rag_personal_dirs = pick_multiple_directories(
+            "Personal RAG directories (your own notes/docs — indexed for global retrieval):",
+            if prev_dirs.is_empty() {
+                &existing_config.rag_personal_root
+            } else {
+                prev_dirs.first().map(String::as_str).unwrap_or("")
+            },
+            &prev_dirs,
+        )?;
+        wiz.add(format!(
+            "\x1b[32m✓\x1b[0m Personal RAG dirs: {}",
+            rag_personal_dirs.join(", ")
+        ));
+
+        (embeddings_model, similarity_threshold, rag_personal_dirs)
+    } else {
+        wiz.add("\x1b[90m–\x1b[0m RAG: disabled".to_string());
+        (
+            String::new(),
+            existing_config.similarity_threshold,
+            Vec::new(),
+        )
     };
-    wiz.add(format!(
-        "\x1b[32m✓\x1b[0m Similarity threshold: {:.2}",
-        similarity_threshold
-    ));
-
-    let prev_dirs = existing_config.rag_personal_dirs.clone();
-    let rag_personal_dirs = pick_multiple_directories(
-        "Personal RAG directories (your own notes/docs — indexed for global retrieval):",
-        if prev_dirs.is_empty() {
-            &existing_config.rag_personal_root
-        } else {
-            prev_dirs.first().map(String::as_str).unwrap_or("")
-        },
-        &prev_dirs,
-    )?;
-    wiz.add(format!(
-        "\x1b[32m✓\x1b[0m Personal RAG dirs: {}",
-        rag_personal_dirs.join(", ")
-    ));
 
     // ── Step 3: Install MCP servers + show matrix ───────────────
     if !selected.is_empty() {
@@ -285,139 +320,62 @@ fn select_temperature_unit() -> Result<crate::domain::canopy_config::Temperature
     })
 }
 
-fn select_embeddings_model(current: &str) -> Result<String> {
-    let mut models = crate::domain::models_db::load_catalog()
-        .map(|catalog| {
-            catalog
-                .models
-                .into_iter()
-                .filter(|model| {
-                    let id = model.id.to_lowercase();
-                    let name = model.name.to_lowercase();
-                    let provider = model.provider.to_lowercase();
-                    (id.contains("embed") || name.contains("embed"))
-                        && (provider == "openai"
-                            || provider == "google"
-                            || provider == "google-vertex")
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    // Prepend supported local models (no API key needed) at the top of the list.
-    let local_models: Vec<crate::domain::models_db::ModelEntry> = [
+fn select_local_embeddings_model(current: &str) -> Result<String> {
+    const LOCAL_MODELS: &[(&str, &str)] = &[
         (
             "baai/bge-small-en-v1.5",
-            "BGE Small EN v1.5  (local, 384d, ~130 MB)",
-            "local",
+            "BGE Small EN v1.5     (local · 384d · ~130 MB)  — fast, great for English",
         ),
         (
             "baai/bge-base-en-v1.5",
-            "BGE Base EN v1.5  (local, 768d, ~430 MB)",
-            "local",
+            "BGE Base EN v1.5      (local · 768d · ~430 MB)  — balanced, English",
+        ),
+        (
+            "baai/bge-large-en-v1.5",
+            "BGE Large EN v1.5     (local · 1024d · ~1.3 GB) — best quality, English",
         ),
         (
             "intfloat/multilingual-e5-small",
-            "Multilingual E5 Small  (local, 384d, ~480 MB)",
-            "local",
+            "Multilingual E5 Small (local · 384d · ~480 MB)  — fast, multilingual",
+        ),
+        (
+            "intfloat/multilingual-e5-base",
+            "Multilingual E5 Base  (local · 768d · ~1.1 GB)  — balanced, multilingual",
         ),
         (
             "intfloat/multilingual-e5-large",
-            "Multilingual E5 Large  (local, 1024d, ~2.2 GB)",
-            "local",
+            "Multilingual E5 Large (local · 1024d · ~2.2 GB) — best quality, multilingual",
         ),
-    ]
-    .iter()
-    .map(
-        |(id, name, provider)| crate::domain::models_db::ModelEntry {
-            id: id.to_string(),
-            name: name.to_string(),
-            provider: provider.to_string(),
-            release_date: None,
-            size_hint: None,
-        },
-    )
-    .collect();
+    ];
 
-    // Local models first, then API-based.
-    models = local_models.into_iter().chain(models).collect();
+    let options: Vec<&str> = LOCAL_MODELS.iter().map(|(_, label)| *label).collect();
 
-    if models.is_empty() {
-        models = vec![
-            crate::domain::models_db::ModelEntry {
-                id: "text-embedding-3-small".to_string(),
-                name: "text-embedding-3-small".to_string(),
-                provider: "openai".to_string(),
-                release_date: Some("2024-01-25".to_string()),
-                size_hint: Some("small".to_string()),
-            },
-            crate::domain::models_db::ModelEntry {
-                id: "text-embedding-3-large".to_string(),
-                name: "text-embedding-3-large".to_string(),
-                provider: "openai".to_string(),
-                release_date: Some("2024-01-25".to_string()),
-                size_hint: Some("large".to_string()),
-            },
-            crate::domain::models_db::ModelEntry {
-                id: "gemini-embedding-001".to_string(),
-                name: "Gemini Embedding 001".to_string(),
-                provider: "google".to_string(),
-                release_date: Some("2025-05-20".to_string()),
-                size_hint: None,
-            },
-        ];
-    }
-
-    if !current.is_empty() && !models.iter().any(|model| model.id == current) {
-        models.insert(
-            0,
-            crate::domain::models_db::ModelEntry {
-                id: current.to_string(),
-                name: current.to_string(),
-                provider: "custom".to_string(),
-                release_date: None,
-                size_hint: None,
-            },
-        );
-    }
-
-    models.dedup_by(|a, b| a.id == b.id);
-    // Sort newest-first (lexicographic descending on date, None last).
-    models.sort_by(|a, b| {
-        let da = a.release_date.as_deref().unwrap_or("");
-        let db = b.release_date.as_deref().unwrap_or("");
-        db.cmp(da)
-    });
-
-    let mut options = models
+    let start = LOCAL_MODELS
         .iter()
-        .map(format_embeddings_option)
-        .collect::<Vec<_>>();
-    options.push("Custom…".to_string());
-
-    let start = models
-        .iter()
-        .position(|model| model.id == current)
+        .position(|(id, _)| *id == current)
         .unwrap_or(0);
-    let selected = Select::new("Embeddings model for the knowledge layer:", options)
+
+    let selected = Select::new("Embeddings model (local, no API key required):", options)
         .with_starting_cursor(start)
-        .with_help_message("enter: confirm | ↑↓: navigate")
+        .with_help_message(
+            "Downloaded once to ~/.canopy/models/ — no internet needed after that | ↑↓: navigate | enter: confirm",
+        )
         .prompt()
         .map_err(|e| anyhow::anyhow!("Embeddings model selection cancelled: {}", e))?;
 
-    if selected == "Custom…" {
-        Text::new("Custom embeddings model:")
-            .with_initial_value(current)
-            .with_help_message("enter: confirm")
-            .prompt()
-            .map_err(|e| anyhow::anyhow!("Custom embeddings model cancelled: {}", e))
-    } else {
-        models
-            .into_iter()
-            .find(|model| format_embeddings_option(model) == selected)
-            .map(|model| model.id)
-            .ok_or_else(|| anyhow::anyhow!("Unknown embeddings model selection"))
-    }
+    LOCAL_MODELS
+        .iter()
+        .find(|(_, label)| *label == selected)
+        .map(|(id, _)| id.to_string())
+        .ok_or_else(|| anyhow::anyhow!("Unknown embeddings model selection"))
+}
+
+fn download_local_model_for_setup(model_id: &str, cache_dir: &std::path::Path) -> Result<()> {
+    println!("  \x1b[90mDownloading model to ~/.canopy/models/ (only needed once)…\x1b[0m");
+    println!();
+    crate::rag::embedding_client::download_local_model(model_id, cache_dir)?;
+    println!();
+    Ok(())
 }
 
 /// Interactively pick one or more directories for personal RAG indexing.
@@ -452,10 +410,4 @@ fn pick_multiple_directories(
     println!();
 
     Ok(dirs)
-}
-
-fn format_embeddings_option(model: &crate::domain::models_db::ModelEntry) -> String {
-    let release_date = model.release_date.as_deref().unwrap_or("unknown date");
-    // Show model id with date only — no size hints.
-    format!("{}  \x1b[90m[{}]\x1b[0m", model.id, release_date)
 }

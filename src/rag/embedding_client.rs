@@ -310,6 +310,21 @@ impl EmbeddingClient for LocalEmbeddingClient {
     }
 }
 
+/// Download (or verify) a local embedding model, showing download progress.
+/// Called during interactive setup so the model is ready before indexing begins.
+pub fn download_local_model(model_id: &str, cache_dir: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(cache_dir)
+        .with_context(|| format!("Cannot create model cache dir: {}", cache_dir.display()))?;
+    let fastembed_model = model_id_to_fastembed(model_id)?;
+    fastembed::TextEmbedding::try_new(
+        fastembed::InitOptions::new(fastembed_model)
+            .with_cache_dir(cache_dir.to_path_buf())
+            .with_show_download_progress(true),
+    )
+    .with_context(|| format!("Failed to download/load local embedding model '{model_id}'"))?;
+    Ok(())
+}
+
 fn model_id_to_fastembed(model_id: &str) -> Result<fastembed::EmbeddingModel> {
     match model_id.trim().to_ascii_lowercase().as_str() {
         "baai/bge-small-en-v1.5" => Ok(fastembed::EmbeddingModel::BGESmallENV15),
