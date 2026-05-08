@@ -141,6 +141,10 @@ pub struct App {
     pub(crate) global_rag_queue: Vec<RagQueueItem>,
     pub(crate) selected_rag_queue: usize,
     pub(crate) rag_info: RagInfoSummary,
+    /// Per-file RAG status loaded from `rag_file_events` table.
+    pub(crate) rag_file_status: Vec<crate::db::project::RagPerFileStatus>,
+    /// Scroll offset for the per-file list in the ragInfo preview panel.
+    pub(crate) rag_report_scroll: usize,
     pub(crate) sidebar_visible: bool,
     pub(crate) sync_panel_visible: bool,
     pub(crate) term_width: u16,

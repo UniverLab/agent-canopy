@@ -192,6 +192,37 @@ async fn startup_personal_rag(ingestion: Arc<IngestionManager>, data_dir: &std::
         }
     }
 
+    // ── Model-change detection ──────────────────────────────────────────────
+    // If the configured embeddings model differs from the last run, wipe the
+    // vector store and clear the queue so everything is re-indexed with the
+    // new model.  This covers both dimension changes (already handled inside
+    // `open_at`) *and* same-dimension model swaps where old vectors would give
+    // wrong results.
+    let current_model = config.embeddings_model.trim().to_string();
+    if !current_model.is_empty() {
+        let last_model = ingestion
+            .db()
+            .get_state("rag_last_model")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+
+        if !last_model.is_empty() && last_model != current_model {
+            tracing::warn!(
+                "startup_personal_rag: embeddings model changed '{}' → '{}' \
+                 — wiping vector store and clearing queue for full re-index",
+                last_model,
+                current_model
+            );
+            if let Err(e) = crate::rag::ingestion::wipe_lancedb(ingestion.db()).await {
+                tracing::error!("startup_personal_rag: LanceDB wipe failed: {e:#}");
+            }
+            ingestion.clear_queue().await;
+        }
+
+        let _ = ingestion.db().set_state("rag_last_model", &current_model);
+    }
+
     // Reload any items already in the DB queue from a previous session.
     if let Ok(pending) = ingestion.db_pending_queue() {
         for path in &pending {
@@ -206,6 +237,11 @@ async fn startup_personal_rag(ingestion: Arc<IngestionManager>, data_dir: &std::
     }
 
     // Scan existing files across all personal roots.
+    // Skip files that are already indexed and haven't been modified since.
+    let already_indexed = ingestion
+        .db()
+        .indexed_files_timestamps()
+        .unwrap_or_default();
     let patterns = crate::rag::ragignore::load_patterns(data_dir);
     let mut queued = 0usize;
     for root in &personal_roots {
@@ -221,10 +257,24 @@ async fn startup_personal_rag(ingestion: Arc<IngestionManager>, data_dir: &std::
                 continue;
             }
             let path_str = path.to_string_lossy().to_string();
-            if crate::rag::chunker::detect_lang(&path_str).is_some() {
-                ingestion.enqueue(&path_str).await;
-                queued += 1;
+            if crate::rag::chunker::detect_lang(&path_str).is_none() {
+                continue;
             }
+            // Skip if indexed and file hasn't changed since.
+            if let Some(&indexed_at) = already_indexed.get(&path_str) {
+                let mtime = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(i64::MAX);
+                if mtime <= indexed_at {
+                    continue;
+                }
+            }
+            ingestion.enqueue(&path_str).await;
+            queued += 1;
         }
     }
     if queued > 0 {

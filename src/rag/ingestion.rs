@@ -99,6 +99,21 @@ impl IngestionManager {
         self.queue.lock().await.len()
     }
 
+    /// Clear both the in-memory queue and the DB queue (used on model change).
+    pub async fn clear_queue(&self) {
+        let mut q = self.queue.lock().await;
+        q.order.clear();
+        q.set.clear();
+        if let Err(e) = self.db.clear_rag_queue() {
+            tracing::warn!("RAG: failed to clear DB queue: {e}");
+        }
+    }
+
+    /// Expose the underlying database for state queries (e.g. model change checks).
+    pub(crate) fn db(&self) -> &Arc<Database> {
+        &self.db
+    }
+
     pub fn db_pending_queue(&self) -> anyhow::Result<Vec<String>> {
         Ok(self
             .db
@@ -659,4 +674,25 @@ async fn open_vector_store(
             None
         }
     }
+}
+
+/// Delete the entire LanceDB directory so the next `open_vector_store` starts fresh.
+/// Used when the embeddings model is changed so stale vectors don't pollute results.
+pub async fn wipe_lancedb(db: &Database) -> anyhow::Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home dir"))?;
+    let lancedb_path = home.join(".canopy/rag/vectors.lancedb");
+    if lancedb_path.exists() {
+        tokio::fs::remove_dir_all(&lancedb_path)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to wipe LanceDB at {}: {e}", lancedb_path.display())
+            })?;
+        tracing::info!(
+            "RAG: wiped LanceDB at {} (model change)",
+            lancedb_path.display()
+        );
+    }
+    // Clear rag_file_events so the report starts clean for the new model.
+    let _ = db.clear_rag_file_events();
+    Ok(())
 }

@@ -129,30 +129,14 @@ fn send_macos(title: &str, body: &str) {
 }
 
 fn send_wsl(title: &str, body: &str) {
-    // Clear stale Canopy notifications from Action Center before showing a new one.
-    let clear_script = format!(
-        "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, \
-         ContentType = WindowsRuntime] > $null; \
-         try {{ [Windows.UI.Notifications.ToastNotificationManager]::\
-         CreateToastNotifier('{}').Clear() }} catch {{}}",
-        ps_escape(APP_ID),
-    );
-    let _ = Command::new("powershell.exe")
-        .arg("-NoProfile")
-        .arg("-NonInteractive")
-        .arg("-Command")
-        .arg(&clear_script)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-
-    // Show toast via WinRT API with an expiration window.
-    // ExpirationTime controls when the toast is auto-removed from the queue;
-    // Action Center retains it until explicitly cleared or the user interacts.
+    // Clear stale notifications and show the new toast in a single PowerShell process
+    // to avoid a race condition where two spawned processes interfere with each other.
     let ps_script = format!(
         concat!(
             "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ",
             "ContentType = WindowsRuntime] > $null; ",
+            "try {{ [Windows.UI.Notifications.ToastNotificationManager]::",
+            "CreateToastNotifier('{}').Clear() }} catch {{}}; ",
             "$template = [Windows.UI.Notifications.ToastNotificationManager]::",
             "GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02); ",
             "$nodes = $template.GetElementsByTagName('text'); ",
@@ -163,6 +147,7 @@ fn send_wsl(title: &str, body: &str) {
             "[Windows.UI.Notifications.ToastNotificationManager]::",
             "CreateToastNotifier('{}').Show($toast)"
         ),
+        ps_escape(APP_ID),
         ps_escape(title),
         ps_escape(body),
         ps_escape(APP_ID),

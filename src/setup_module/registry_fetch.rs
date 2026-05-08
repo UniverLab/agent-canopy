@@ -325,10 +325,40 @@ fn refresh_registry_inner(home: &Path) -> Result<()> {
     let cli_registry =
         crate::domain::cli_config::CliRegistry::detect_available(&platforms_with_cli);
 
-    if !cli_registry.available_clis.is_empty() {
-        let canopy_dir = home.join(".canopy");
-        let mut config = crate::domain::canopy_config::CanopyConfig::load(&canopy_dir);
-        config.clis = cli_registry.available_clis;
+    let canopy_dir = home.join(".canopy");
+    let mut config = crate::domain::canopy_config::CanopyConfig::load(&canopy_dir);
+
+    // Merge: add newly detected CLIs that aren't already configured, and remove
+    // CLIs that the registry no longer knows about AND whose binary is gone.
+    // We deliberately preserve manually-configured CLIs even if `which` can't
+    // find them right now (e.g. NVM binaries, custom installs) to avoid
+    // silently deleting entries the user set up intentionally.
+    let known_names: std::collections::HashSet<String> = platforms_with_cli
+        .iter()
+        .filter_map(|p| p.cli.as_ref().map(|c| c.name.clone()))
+        .collect();
+
+    // Remove CLIs only when the registry explicitly knows the platform AND
+    // the binary is confirmed missing.
+    config.clis.retain(|c| {
+        // Not in registry at all → keep (manually added)
+        if !known_names.contains(&c.name) {
+            return true;
+        }
+        // In registry → keep only if binary is present
+        c.is_available()
+    });
+
+    // Add newly detected CLIs that aren't already in config.
+    let existing_names: std::collections::HashSet<String> =
+        config.clis.iter().map(|c| c.name.clone()).collect();
+    for cli in cli_registry.available_clis {
+        if !existing_names.contains(&cli.name) {
+            config.clis.push(cli);
+        }
+    }
+
+    if !config.clis.is_empty() {
         let _ = config.save(&canopy_dir);
     }
 

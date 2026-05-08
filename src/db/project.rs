@@ -97,6 +97,15 @@ impl Database {
         Ok(())
     }
 
+    pub fn clear_rag_file_events(&self) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        conn.execute("DELETE FROM rag_file_events", [])?;
+        Ok(())
+    }
+
     pub fn get_project(&self, hash: &str) -> Result<Option<Project>> {
         let conn = self
             .conn
@@ -374,6 +383,36 @@ impl Database {
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
+
+    /// Return a map of file_path → last_indexed_at (unix seconds) for all files
+    /// whose most-recent event is `"indexed"`.  Used at startup to skip re-indexing
+    /// files that haven't changed since they were last indexed.
+    pub fn indexed_files_timestamps(&self) -> Result<std::collections::HashMap<String, i64>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        // Get the most-recent event per file; keep only those whose latest event is "indexed".
+        let mut stmt = conn.prepare(
+            "SELECT e.file_path, e.occurred_at
+               FROM rag_file_events e
+              INNER JOIN (
+                  SELECT file_path, MAX(occurred_at) AS max_at
+                    FROM rag_file_events
+                   GROUP BY file_path
+              ) latest ON e.file_path = latest.file_path
+                      AND e.occurred_at = latest.max_at
+              WHERE e.event_type = 'indexed'",
+        )?;
+        let mut map = std::collections::HashMap::new();
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            let ts: i64 = row.get(1)?;
+            map.insert(path, ts);
+        }
+        Ok(map)
+    }
 }
 
 fn row_to_rag_file_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<RagFileEvent> {
@@ -384,4 +423,64 @@ fn row_to_rag_file_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<RagFileEve
         detail: row.get(3)?,
         occurred_at: row.get(4)?,
     })
+}
+
+// ── RagPerFileStatus ────────────────────────────────────────────────────────
+
+/// Aggregated per-file RAG status for the TUI preview panel.
+#[derive(Debug, Clone)]
+pub struct RagPerFileStatus {
+    pub file_path: String,
+    /// Last recorded event type: `"indexed"` | `"deleted"` | `"error"`
+    pub last_event_type: String,
+    /// Detail from the last event (error message, etc.)
+    pub last_detail: Option<String>,
+    /// How many times this file has been successfully indexed.
+    pub times_indexed: i64,
+    /// Timestamp of the most recent event.
+    pub last_at: i64,
+}
+
+impl Database {
+    /// Return one summary row per file: last event, last detail, index count.
+    /// Results are ordered by last activity time, newest first.
+    pub fn rag_per_file_status(&self) -> Result<Vec<RagPerFileStatus>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT
+                 e.file_path,
+                 e.event_type,
+                 e.detail,
+                 COALESCE(ic.cnt, 0),
+                 e.occurred_at
+             FROM rag_file_events e
+             INNER JOIN (
+                 SELECT file_path, MAX(occurred_at) AS max_at
+                   FROM rag_file_events
+                  GROUP BY file_path
+             ) latest ON e.file_path = latest.file_path
+                     AND e.occurred_at = latest.max_at
+             LEFT JOIN (
+                 SELECT file_path, COUNT(*) AS cnt
+                   FROM rag_file_events
+                  WHERE event_type = 'indexed'
+                  GROUP BY file_path
+             ) ic ON e.file_path = ic.file_path
+             ORDER BY e.occurred_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RagPerFileStatus {
+                file_path: row.get(0)?,
+                last_event_type: row.get(1)?,
+                last_detail: row.get(2)?,
+                times_indexed: row.get(3)?,
+                last_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
 }

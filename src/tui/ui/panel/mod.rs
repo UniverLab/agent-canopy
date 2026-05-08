@@ -410,12 +410,7 @@ fn rag_status(app: &App) -> (&'static str, Color) {
 }
 
 fn rag_queue_text(app: &App) -> String {
-    if app.rag_info.processing_items > 0 {
-        format!(
-            "{} queued · {} indexing",
-            app.rag_info.queued_items, app.rag_info.processing_items
-        )
-    } else if app.rag_info.queued_items > 0 {
+    if app.rag_info.queued_items > 0 {
         format!("{} queued", app.rag_info.queued_items)
     } else {
         String::new()
@@ -467,7 +462,22 @@ fn draw_rag_info_overview(frame: &mut Frame, area: Rect, app: &App) {
     let (status_text, status_color) = rag_status(app);
     let mut lines = rag_summary_lines(app, status_text, status_color, rag_queue_text(app));
 
-    if !app.global_rag_queue.is_empty() {
+    if !app.rag_file_status.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("Files  ", Style::default().fg(DIM)),
+            Span::styled(
+                format!("({}) ", app.rag_file_status.len()),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("↑↓ scroll", Style::default().fg(DIM)),
+        ]));
+        lines.extend(rag_file_status_lines(
+            &app.rag_file_status,
+            app.rag_report_scroll,
+            area,
+        ));
+    } else if !app.global_rag_queue.is_empty() {
         lines.extend(rag_queue_lines(
             &app.global_rag_queue,
             app.selected_rag_queue,
@@ -475,6 +485,60 @@ fn draw_rag_info_overview(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     render_wrapped_paragraph(frame, area, lines);
+}
+
+fn rag_file_status_lines(
+    files: &[crate::db::project::RagPerFileStatus],
+    scroll: usize,
+    area: Rect,
+) -> Vec<Line<'static>> {
+    // Reserve 6 lines for summary header; remainder is available for file rows.
+    let max_rows = (area.height as usize).saturating_sub(7).max(2);
+    let start = scroll.min(files.len().saturating_sub(1));
+    let visible = &files[start..];
+
+    let mut lines = Vec::new();
+    for file in visible.iter().take(max_rows) {
+        let (icon, icon_color) = match file.last_event_type.as_str() {
+            "indexed" => ("✓", Color::Green),
+            "deleted" => ("○", DIM),
+            _ => ("✗", Color::Red),
+        };
+        let filename = std::path::Path::new(&file.file_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| file.file_path.clone());
+        let name_trunc = truncate_str(&filename, 28);
+
+        let suffix = if file.last_event_type == "error" {
+            file.last_detail
+                .as_deref()
+                .map(|d| format!("  {}", truncate_str(d, 22)))
+                .unwrap_or_default()
+        } else {
+            format!("  ×{} indexed", file.times_indexed)
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(format!("{icon} "), Style::default().fg(icon_color)),
+            Span::styled(
+                name_trunc,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(suffix, Style::default().fg(DIM)),
+        ]));
+    }
+
+    if start + max_rows < files.len() {
+        let remaining = files.len() - start - max_rows;
+        lines.push(Line::from(Span::styled(
+            format!("  … {} more (↓)", remaining),
+            Style::default().fg(DIM),
+        )));
+    }
+    lines
 }
 
 fn rag_queue_lines(

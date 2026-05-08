@@ -89,6 +89,8 @@ impl App {
             global_rag_queue: Vec::new(),
             selected_rag_queue: 0,
             rag_info: crate::db::project::RagInfoSummary::default(),
+            rag_file_status: Vec::new(),
+            rag_report_scroll: 0,
             sidebar_visible: true,
             sync_panel_visible: true,
             term_width: 0,
@@ -370,6 +372,8 @@ impl App {
             }
             self.agents_rag_focused = false;
         }
+
+        self.rag_file_status = self.db.rag_per_file_status().unwrap_or_default();
 
         Ok(())
     }

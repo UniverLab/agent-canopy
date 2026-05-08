@@ -382,12 +382,13 @@ fn draw_agents_sidebar(
     app: &mut App,
 ) {
     let show_rag_info = app.rag_info.has_rag_activity() && areas.content.height >= 10;
-    let (content_area, rag_info_area) = if show_rag_info {
+    // ragInfo sits at the TOP so it's always visible, same as the projects sidebar.
+    let (rag_info_area, content_area) = if show_rag_info {
         let [top, bottom] =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(6)]).areas(areas.content);
-        (top, Some(bottom))
+            Layout::vertical([Constraint::Length(6), Constraint::Min(0)]).areas(areas.content);
+        (Some(top), bottom)
     } else {
-        (areas.content, None)
+        (None, areas.content)
     };
 
     let heights = AgentSectionHeights {
@@ -707,16 +708,11 @@ fn rag_status_line(app: &App) -> Line<'static> {
 }
 
 fn rag_queue_text(app: &App) -> String {
-    if app.rag_info.processing_items > 0 {
-        return format!(
-            "{} queued · {} indexing",
-            app.rag_info.queued_items, app.rag_info.processing_items
-        );
-    }
     if app.rag_info.queued_items > 0 {
-        return format!("{} queued", app.rag_info.queued_items);
+        format!("{} queued", app.rag_info.queued_items)
+    } else {
+        String::new()
     }
-    String::new()
 }
 
 fn is_agents_rag_info_focused(app: &App) -> bool {

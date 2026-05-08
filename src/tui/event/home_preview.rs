@@ -181,10 +181,16 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
                 }
             } else {
                 // Agents mode: Down navigates agents; if at end and RAG exists, go to RagInfo.
-                // If already on RagInfo, wrap back to first agent.
+                // If already on RagInfo, scroll the per-file list; at end, wrap back to first agent.
                 if app.agents_rag_focused {
-                    app.agents_rag_focused = false;
-                    app.selected = 0;
+                    let max_scroll = app.rag_file_status.len().saturating_sub(1);
+                    if app.rag_report_scroll < max_scroll {
+                        app.rag_report_scroll += 1;
+                    } else {
+                        app.agents_rag_focused = false;
+                        app.rag_report_scroll = 0;
+                        app.selected = 0;
+                    }
                 } else {
                     let at_last = app.selected + 1 >= app.agents.len();
                     if at_last && app.rag_info.total_chunks > 0 {
@@ -204,9 +210,13 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
                     app.select_prev();
                 }
             } else {
-                // Agents mode: Up from RagInfo goes back to last agent
+                // Agents mode: Up scrolls in ragInfo; at top, exits back to last agent
                 if app.agents_rag_focused {
-                    app.agents_rag_focused = false;
+                    if app.rag_report_scroll > 0 {
+                        app.rag_report_scroll -= 1;
+                    } else {
+                        app.agents_rag_focused = false;
+                    }
                 } else {
                     app.select_prev();
                 }
