@@ -528,26 +528,31 @@ impl SimplePromptDialog {
     }
 
     fn append_tools_section(&self, result: &mut String) {
-        let mut tools_count = 0;
-        for content in self.section_entries("tools") {
-            for trimmed in content
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-            {
-                if tools_count == 0 {
-                    result.push_str("# [TOOLS]: Skills & Capabilities\n");
-                    result.push_str("<tools>\n");
-                }
-                tools_count += 1;
-                result.push_str("  <skill>\n");
-                result.push_str(&format!("    {trimmed}\n"));
-                result.push_str("  </skill>\n\n");
-            }
+        let tool_lines = self.collect_tool_lines();
+        if tool_lines.is_empty() {
+            return;
         }
-        if tools_count > 0 {
-            result.push_str("</tools>\n\n");
+
+        result.push_str("# [TOOLS]: Skills & Capabilities\n");
+        result.push_str("<tools>\n");
+        for tool_line in tool_lines {
+            append_tool_skill(result, &tool_line);
         }
+        result.push_str("</tools>\n\n");
+    }
+
+    fn collect_tool_lines(&self) -> Vec<String> {
+        self.section_entries("tools")
+            .into_iter()
+            .flat_map(|content| {
+                content
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     pub fn build_prompt_with_resolved_resources(
@@ -996,6 +1001,12 @@ impl SimplePromptDialog {
             }
         }
     }
+}
+
+fn append_tool_skill(result: &mut String, tool_line: &str) {
+    result.push_str("  <skill>\n");
+    result.push_str(&format!("    {tool_line}\n"));
+    result.push_str("  </skill>\n\n");
 }
 
 fn strip_resources_section(prompt: &str) -> String {

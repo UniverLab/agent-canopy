@@ -1,5 +1,9 @@
 use super::types::{AgentEntry, App, Focus};
 use crate::tui::agent::{AgentStatus, InteractiveAgent};
+use std::time::Duration;
+
+const SHADOW_SUMMARY_LINGER_SECS: u64 = 7;
+const SHADOW_SUMMARY_INSTRUCTION: &str = "Session terminated by user. Before exit, call intelligence_upsert with kind='session' and persist a concise summary including: mission outcome, key decisions, pending follow-ups, and any reusable facts/patterns.";
 
 /// Strip ANSI escape sequences from a string for plain-text display.
 fn strip_ansi_codes(s: &str) -> String {
@@ -700,10 +704,13 @@ impl App {
         };
 
         let _ = self.db.finish_interactive_session(&agent_id, exit_code);
-        let Some(agent) = self.interactive_agents.get_mut(idx) else {
+        let Some(agent) = self.interactive_agents.get(idx) else {
             return false;
         };
-        agent.kill();
+        agent.schedule_shadow_shutdown(
+            SHADOW_SUMMARY_INSTRUCTION,
+            Duration::from_secs(SHADOW_SUMMARY_LINGER_SECS),
+        );
         self.remove_session_target(SessionTarget::Interactive(idx))
     }
 

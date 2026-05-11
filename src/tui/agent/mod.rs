@@ -11,6 +11,7 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ratatui::style::Color;
 
@@ -372,6 +373,25 @@ impl InteractiveAgent {
             let _ = child.kill();
         }
         self.status = AgentStatus::Exited(-9);
+    }
+
+    /// Ask the agent to persist a final summary, then terminate it after a short delay.
+    ///
+    /// This enables "shadow summary" behavior: the UI can close immediately while
+    /// the process briefly remains alive to run finalization instructions.
+    pub fn schedule_shadow_shutdown(&self, final_instruction: &str, linger: Duration) {
+        let _ = self.write_to_pty(final_instruction.as_bytes());
+        let _ = self.write_to_pty(b"\n");
+
+        let child = Arc::clone(&self.child);
+        std::thread::spawn(move || {
+            std::thread::sleep(linger);
+            if let Ok(mut child) = child.lock() {
+                #[cfg(unix)]
+                send_sighup_to_group(child.as_mut());
+                let _ = child.kill();
+            }
+        });
     }
 
     /// Resize the PTY and virtual terminal (e.g. on terminal window resize).

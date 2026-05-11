@@ -1,5 +1,4 @@
 use anyhow::Result;
-use std::cmp::min;
 
 use crate::db::Database;
 
@@ -174,12 +173,5 @@ impl LaunchpadDialog {
             .find(|(idx, _)| *idx > self.cursor)
             .map(|(idx, _)| idx)
             .unwrap_or(self.new_mission.len());
-    }
-
-    pub fn cursor_display_col(&self) -> usize {
-        min(
-            self.new_mission[..self.cursor].chars().count(),
-            self.new_mission.chars().count(),
-        )
     }
 }
