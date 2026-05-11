@@ -70,7 +70,11 @@ fn draw_sync_section(frame: &mut Frame, area: Rect, state: &SyncPanelState, scro
                         .fg(Color::White)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!(" ({})", intent.agent_id), Style::default().fg(DIM)),
+                if is_redundant_id(&intent.agent_name, &intent.agent_id) {
+                    Span::raw("")
+                } else {
+                    Span::styled(format!(" ({})", intent.agent_id), Style::default().fg(DIM))
+                },
                 Span::styled(
                     format!(" [{}]", intent.impact.as_str()),
                     Style::default().fg(intent_color(intent.impact)),
@@ -121,7 +125,11 @@ fn draw_sync_section(frame: &mut Frame, area: Rect, state: &SyncPanelState, scro
                 &message.agent_name,
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!(" ({})", message.agent_id), Style::default().fg(DIM)),
+            if is_redundant_id(&message.agent_name, &message.agent_id) {
+                Span::raw("")
+            } else {
+                Span::styled(format!(" ({})", message.agent_id), Style::default().fg(DIM))
+            },
         ]));
         // Message body — wrap
         for chunk in wrap_text(&message.message, w.saturating_sub(2)) {
@@ -191,5 +199,54 @@ fn kind_color(kind: MessageKind) -> Color {
         MessageKind::Query => Color::Cyan,
         MessageKind::Answer => STATUS_OK,
         MessageKind::Info => DIM,
+    }
+}
+
+/// Returns `true` when `id` is just a slugified form of `name` — e.g.
+/// "Copilot CLI" → "copilot-cli" or "copilot_cli". In that case showing
+/// `(id)` next to the name adds no information.
+fn is_redundant_id(name: &str, id: &str) -> bool {
+    let slug: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let norm_id: String = id
+        .chars()
+        .map(|c| {
+            if c == '_' {
+                '-'
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
+        .collect();
+    slug == norm_id || slug.replace('-', "") == norm_id.replace('-', "")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_redundant_id_detects_slug() {
+        assert!(is_redundant_id("Copilot CLI", "copilot-cli"));
+        assert!(is_redundant_id("Copilot CLI", "copilot_cli"));
+        assert!(is_redundant_id("My Agent", "my-agent"));
+    }
+
+    #[test]
+    fn is_redundant_id_keeps_distinct_ids() {
+        assert!(!is_redundant_id("Copilot CLI", "agent-42"));
+        assert!(!is_redundant_id("Alice", "bob"));
     }
 }

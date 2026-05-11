@@ -31,11 +31,13 @@ impl App {
             .db
             .list_sync_messages(workdir, RECENT_MESSAGE_LIMIT)
             .ok()?;
-        let active_agent_ids = self
-            .interactive_agents
+        // Derive active agent IDs directly from the messages — the agent_id in sync
+        // messages is set by the external CLI (e.g. "copilot-cli") and cannot be
+        // reliably mapped to Canopy's internal InteractiveAgent IDs or display names.
+        // Showing all agents that have posted in the recent window is the right UX.
+        let active_agent_ids = recent_messages
             .iter()
-            .filter(|agent| agent.status == AgentStatus::Running && agent.working_dir == workdir)
-            .map(|agent| agent.name.clone())
+            .map(|m| m.agent_id.clone())
             .collect::<std::collections::HashSet<_>>();
         let summary = summarize_sync_context(&recent_messages, &active_agent_ids, CHATTER_LIMIT);
 
