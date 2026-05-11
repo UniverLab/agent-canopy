@@ -14,25 +14,33 @@ type JsonMap = serde_json::Map<String, serde_json::Value>;
 // ── Parsing & normalization ──────────────────────────────────────────────────
 
 fn substitute_placeholders(value: &mut serde_json::Value, home: &str, fs_dir: &str) {
-    match value {
-        serde_json::Value::String(s) if s.contains("{filesystem_dir}") || s.contains("{home}") => {
-            *s = s
-                .replace("{filesystem_dir}", fs_dir)
-                .replace("{home}", home);
+    if let serde_json::Value::String(content) = value {
+        if !content.contains("{filesystem_dir}") && !content.contains("{home}") {
+            return;
         }
-        serde_json::Value::String(_) => {}
+        *content = substitute_string_placeholders(content, home, fs_dir);
+        return;
+    }
+
+    match value {
         serde_json::Value::Array(arr) => {
             for item in arr {
                 substitute_placeholders(item, home, fs_dir);
             }
         }
         serde_json::Value::Object(map) => {
-            for val in map.values_mut() {
-                substitute_placeholders(val, home, fs_dir);
+            for nested_value in map.values_mut() {
+                substitute_placeholders(nested_value, home, fs_dir);
             }
         }
         _ => {}
     }
+}
+
+fn substitute_string_placeholders(content: &str, home: &str, fs_dir: &str) -> String {
+    content
+        .replace("{filesystem_dir}", fs_dir)
+        .replace("{home}", home)
 }
 
 fn clone_object_entries(obj: &JsonMap) -> JsonMap {
