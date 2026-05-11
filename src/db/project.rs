@@ -385,24 +385,29 @@ impl Database {
     }
 
     /// Return a map of file_path → last_indexed_at (unix seconds) for all files
-    /// whose most-recent event is `"indexed"`.  Used at startup to skip re-indexing
-    /// files that haven't changed since they were last indexed.
+    /// that have at least one successful `"indexed"` event and were not later
+    /// deleted. Error events do not invalidate the last successful timestamp.
+    /// Used at startup to skip re-indexing files that haven't changed since
+    /// they were last indexed successfully.
     pub fn indexed_files_timestamps(&self) -> Result<std::collections::HashMap<String, i64>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-        // Get the most-recent event per file; keep only those whose latest event is "indexed".
+        // Keep the last successful index timestamp per file unless a later delete
+        // exists. This avoids full startup re-index loops after transient errors.
         let mut stmt = conn.prepare(
-            "SELECT e.file_path, e.occurred_at
-               FROM rag_file_events e
-              INNER JOIN (
-                  SELECT file_path, MAX(occurred_at) AS max_at
-                    FROM rag_file_events
+            "SELECT s.file_path, s.last_indexed_at
+               FROM (
+                   SELECT
+                       file_path,
+                       MAX(CASE WHEN event_type = 'indexed' THEN occurred_at END) AS last_indexed_at,
+                       MAX(CASE WHEN event_type = 'deleted' THEN occurred_at END) AS last_deleted_at
+                   FROM rag_file_events
                    GROUP BY file_path
-              ) latest ON e.file_path = latest.file_path
-                      AND e.occurred_at = latest.max_at
-              WHERE e.event_type = 'indexed'",
+               ) s
+              WHERE s.last_indexed_at IS NOT NULL
+                AND (s.last_deleted_at IS NULL OR s.last_indexed_at > s.last_deleted_at)",
         )?;
         let mut map = std::collections::HashMap::new();
         let mut rows = stmt.query([])?;

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::application::notification_service::NotificationService;
@@ -130,6 +131,8 @@ pub struct App {
     // System monitoring (updated asynchronously to avoid UI freezes)
     pub(crate) system_info: crate::system::SystemInfo,
     pub(crate) system_info_rx: std::sync::mpsc::Receiver<crate::system::SystemInfo>,
+    /// Controls system monitor cadence: true = fast polling, false = lazy polling.
+    pub(crate) system_monitor_active: Arc<AtomicBool>,
     pub(crate) last_system_update: std::time::Instant,
     pub(crate) process_start_time: std::time::Instant,
 

@@ -577,7 +577,9 @@ fn handle_dialog_key(
             if dialog.is_locked(section_name) {
                 return Ok(PromptAction::None);
             }
-            handle_section_char_input(dialog, section_name, c, field_width, workdir);
+            if let Some(ch) = normalize_prompt_char_input(c, modifiers) {
+                handle_section_char_input(dialog, section_name, ch, field_width, workdir);
+            }
             Ok(PromptAction::None)
         }
         KeyCode::Backspace => {
@@ -589,6 +591,23 @@ fn handle_dialog_key(
         }
         _ => Ok(PromptAction::None),
     }
+}
+
+fn normalize_prompt_char_input(c: char, modifiers: KeyModifiers) -> Option<char> {
+    if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT {
+        return Some(c);
+    }
+
+    // AltGr is typically reported as Ctrl+Alt; on some layouts crossterm surfaces
+    // the base key (for example 'q'/'2') instead of the produced character.
+    if modifiers.contains(KeyModifiers::CONTROL) && modifiers.contains(KeyModifiers::ALT) {
+        return Some(match c {
+            'q' | 'Q' | '2' => '@',
+            _ => c,
+        });
+    }
+
+    None
 }
 
 fn handle_enter_key(
@@ -713,4 +732,38 @@ fn write_prompt_to_selected_agent(app: &mut App, prompt: &str) {
     let pasted = format!("\x1b[200~{prompt}\x1b[201~");
     let _ = agent.write_to_pty(pasted.as_bytes());
     let _ = agent.write_to_pty(b"\r");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_prompt_char_input;
+    use ratatui::crossterm::event::KeyModifiers;
+
+    #[test]
+    fn normalize_prompt_char_input_accepts_plain_and_shift_chars() {
+        assert_eq!(
+            normalize_prompt_char_input('@', KeyModifiers::NONE),
+            Some('@')
+        );
+        assert_eq!(
+            normalize_prompt_char_input('A', KeyModifiers::SHIFT),
+            Some('A')
+        );
+    }
+
+    #[test]
+    fn normalize_prompt_char_input_maps_common_altgr_at_variants() {
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        assert_eq!(normalize_prompt_char_input('q', altgr), Some('@'));
+        assert_eq!(normalize_prompt_char_input('2', altgr), Some('@'));
+        assert_eq!(normalize_prompt_char_input('@', altgr), Some('@'));
+    }
+
+    #[test]
+    fn normalize_prompt_char_input_rejects_control_shortcuts() {
+        assert_eq!(
+            normalize_prompt_char_input('a', KeyModifiers::CONTROL),
+            None
+        );
+    }
 }

@@ -265,8 +265,9 @@ fn draw_focused_interactive_panel(frame: &mut Frame, area: Rect, app: &App, idx:
         &snap,
         app,
         agent.is_sensitive_input_active(),
-        true,
+        false,
     );
+    set_focused_interactive_cursor(frame, area, &snap, agent);
     true
 }
 
@@ -309,6 +310,30 @@ fn draw_new_agent_dialog_background(frame: &mut Frame, area: Rect, app: &App) ->
     }
 
     false
+}
+
+fn set_focused_interactive_cursor(
+    frame: &mut Frame,
+    area: Rect,
+    snap: &crate::tui::agent::ScreenSnapshot,
+    agent: &crate::tui::agent::InteractiveAgent,
+) {
+    if snap.scrolled || area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let cursor_col = adjusted_interactive_cursor_col(agent.cli.as_str(), snap.cursor_col);
+    let cx = area.x + cursor_col.min(area.width.saturating_sub(1));
+    let cy = area.y + snap.cursor_row.min(area.height.saturating_sub(1));
+    frame.set_cursor_position((cx, cy));
+}
+
+fn adjusted_interactive_cursor_col(cli_name: &str, cursor_col: u16) -> u16 {
+    if cli_name == "copilot" {
+        cursor_col.saturating_sub(1)
+    } else {
+        cursor_col
+    }
 }
 
 pub(super) fn draw_log_panel(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -920,4 +945,20 @@ fn find_session_by_name(app: &App, name: &str) -> Option<SessionRef> {
         return Some(SessionRef::Terminal(idx));
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::adjusted_interactive_cursor_col;
+
+    #[test]
+    fn copilot_cursor_is_shifted_left_by_one() {
+        assert_eq!(adjusted_interactive_cursor_col("copilot", 5), 4);
+        assert_eq!(adjusted_interactive_cursor_col("copilot", 0), 0);
+    }
+
+    #[test]
+    fn other_clients_keep_their_cursor_position() {
+        assert_eq!(adjusted_interactive_cursor_col("opencode", 5), 5);
+    }
 }

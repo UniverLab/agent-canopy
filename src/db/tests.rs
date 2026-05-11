@@ -303,6 +303,31 @@ fn test_rag_queue_counts() {
     assert_eq!(processing, 1);
 }
 
+#[test]
+fn test_indexed_files_timestamps_uses_last_success_unless_deleted() {
+    let db = test_db();
+
+    db.log_rag_event("/tmp/a.md", "indexed", None, 100).unwrap();
+    db.log_rag_event("/tmp/a.md", "error", Some("transient"), 110)
+        .unwrap();
+
+    db.log_rag_event("/tmp/b.md", "indexed", None, 120).unwrap();
+    db.log_rag_event("/tmp/b.md", "deleted", None, 130).unwrap();
+
+    db.log_rag_event("/tmp/c.md", "indexed", None, 90).unwrap();
+    db.log_rag_event("/tmp/c.md", "indexed", None, 140).unwrap();
+
+    db.log_rag_event("/tmp/d.md", "error", Some("never indexed"), 150)
+        .unwrap();
+
+    let timestamps = db.indexed_files_timestamps().unwrap();
+
+    assert_eq!(timestamps.get("/tmp/a.md"), Some(&100));
+    assert_eq!(timestamps.get("/tmp/c.md"), Some(&140));
+    assert!(!timestamps.contains_key("/tmp/b.md"));
+    assert!(!timestamps.contains_key("/tmp/d.md"));
+}
+
 // ── Agent CRUD ─────────────────────────────────────────────────────
 
 #[test]

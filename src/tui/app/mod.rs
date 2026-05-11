@@ -7,6 +7,7 @@ use anyhow::Result;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::application::notification_service::DefaultNotificationService;
@@ -42,12 +43,22 @@ impl App {
         let canopy_dir = home.join(".canopy");
         let canopy_config = crate::domain::canopy_config::CanopyConfig::load(&canopy_dir);
 
+        let system_monitor_active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let system_monitor_active_bg = Arc::clone(&system_monitor_active);
         let (system_info_tx, system_info_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let initial = crate::system::SystemInfo::new();
             let _ = system_info_tx.send(initial);
             loop {
-                std::thread::sleep(std::time::Duration::from_secs(2));
+                // Lazy cadence:
+                // - fast when sidebar/dashboard is visible
+                // - slow when hidden
+                let sleep_for = if system_monitor_active_bg.load(Ordering::Relaxed) {
+                    std::time::Duration::from_secs(8)
+                } else {
+                    std::time::Duration::from_secs(40)
+                };
+                std::thread::sleep(sleep_for);
                 let mut info = crate::system::SystemInfo::default();
                 info.update();
                 let _ = system_info_tx.send(info);
@@ -119,6 +130,7 @@ impl App {
             terminal_search: None,
             system_info: crate::system::SystemInfo::default(),
             system_info_rx,
+            system_monitor_active,
             last_system_update: std::time::Instant::now() - std::time::Duration::from_secs(10),
             process_start_time: std::time::Instant::now(),
             cli_usage: {
@@ -164,6 +176,8 @@ impl App {
         self.ensure_sidebar_brain();
         self.refresh_log();
         self.auto_hide_sidebar();
+        self.system_monitor_active
+            .store(self.sidebar_visible, Ordering::Relaxed);
         self.dismiss_copied();
         self.update_whimsg_context();
         self.resize_interactive_agents();

@@ -11,8 +11,8 @@ const MAX_CHUNK_TOKENS: usize = 512;
 const OVERLAP_TOKENS: usize = 64;
 // Rough approximation: 1 token ≈ 4 chars
 const CHARS_PER_TOKEN: usize = 4;
-/// Minimum characters a chunk must have to be indexed.
-/// Filters PDF artifacts like isolated numbers, axis labels, figure captions.
+/// Minimum characters before a fragment is considered too small and should be
+/// merged into a neighboring chunk.
 const MIN_CHUNK_CHARS: usize = 20;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -48,10 +48,11 @@ pub fn chunk(content: &str, lang: &str) -> Vec<(usize, String)> {
 /// Chunk `content` using structural chunking followed by similarity-aware merges.
 pub fn chunk_semantic(content: &str, lang: &str, threshold: f32) -> Vec<SemanticChunk> {
     let chunks = match lang {
-        "markdown" => annotate_similarity(chunk_markdown_texts(content)),
-        _ => chunk_paragraphs(content),
+        "markdown" => chunk_markdown_texts(content),
+        _ => chunk_paragraph_texts(content),
     };
-    merge_low_similarity_chunks(chunks, threshold)
+    let chunks = coalesce_small_chunks(chunks);
+    merge_low_similarity_chunks(annotate_similarity(chunks), threshold)
 }
 
 /// Compute cosine similarity using normalized term frequencies.
@@ -135,7 +136,7 @@ fn chunk_markdown_texts(content: &str) -> Vec<String> {
     if chunks.is_empty() {
         chunk_paragraph_texts(content)
     } else {
-        chunks
+        coalesce_small_chunks(chunks)
     }
 }
 
@@ -208,7 +209,7 @@ fn chunk_paragraph_texts(content: &str) -> Vec<String> {
         push_chunk(&mut chunks, &buf);
     }
 
-    chunks
+    coalesce_small_chunks(chunks)
 }
 
 fn split_paragraph(paragraph: &str) -> Vec<String> {
@@ -250,17 +251,9 @@ fn split_paragraph(paragraph: &str) -> Vec<String> {
 
 fn push_chunk(chunks: &mut Vec<String>, text: &str) {
     let trimmed = text.trim();
-    if trimmed.len() >= MIN_CHUNK_CHARS && has_meaningful_content(trimmed) {
+    if !trimmed.is_empty() {
         chunks.push(trimmed.to_owned());
     }
-}
-
-/// Returns `true` if `text` contains at least one word with 3+ alphabetic characters.
-/// Rejects chunks that are purely numeric, symbolic, or axis/table labels
-/// (e.g. "123", "0 20 40 60", "σ = 19.4").
-fn has_meaningful_content(text: &str) -> bool {
-    text.split_whitespace()
-        .any(|word| word.chars().filter(|c| c.is_alphabetic()).count() >= 3)
 }
 
 fn annotate_similarity(chunks: Vec<String>) -> Vec<SemanticChunk> {
@@ -285,6 +278,52 @@ fn annotate_similarity(chunks: Vec<String>) -> Vec<SemanticChunk> {
 
 fn to_indexed_chunks(chunks: Vec<String>) -> Vec<(usize, String)> {
     chunks.into_iter().enumerate().collect()
+}
+
+fn coalesce_small_chunks(chunks: Vec<String>) -> Vec<String> {
+    let mut merged: Vec<String> = Vec::new();
+    let mut pending: Option<String> = None;
+
+    for chunk in chunks.into_iter().map(|chunk| chunk.trim().to_string()) {
+        if chunk.is_empty() {
+            continue;
+        }
+
+        if chunk.len() < MIN_CHUNK_CHARS {
+            if let Some(last) = merged.last_mut() {
+                last.push_str("\n\n");
+                last.push_str(&chunk);
+            } else {
+                pending = Some(match pending.take() {
+                    Some(mut acc) => {
+                        acc.push_str("\n\n");
+                        acc.push_str(&chunk);
+                        acc
+                    }
+                    None => chunk,
+                });
+            }
+            continue;
+        }
+
+        if let Some(pending_chunk) = pending.take() {
+            merged.push(format!("{pending_chunk}\n\n{chunk}"));
+            continue;
+        }
+
+        merged.push(chunk);
+    }
+
+    if let Some(pending_chunk) = pending {
+        if let Some(last) = merged.last_mut() {
+            last.push_str("\n\n");
+            last.push_str(&pending_chunk);
+        } else {
+            merged.push(pending_chunk);
+        }
+    }
+
+    merged
 }
 
 fn term_frequencies(text: &str) -> HashMap<String, f32> {
@@ -415,15 +454,12 @@ mod tests {
     }
 
     #[test]
-    fn push_chunk_filters_short_text() {
+    fn push_chunk_keeps_short_text_for_later_merge() {
         let mut chunks = Vec::new();
         push_chunk(&mut chunks, "hi");
         push_chunk(&mut chunks, "123");
         push_chunk(&mut chunks, "0 20 40 60");
-        assert!(
-            chunks.is_empty(),
-            "all short/numeric chunks should be filtered"
-        );
+        assert_eq!(chunks.len(), 3);
     }
 
     #[test]
@@ -434,17 +470,27 @@ mod tests {
     }
 
     #[test]
-    fn has_meaningful_content_rejects_pure_numbers() {
-        assert!(!has_meaningful_content("123"));
-        assert!(!has_meaningful_content("0.5"));
-        assert!(!has_meaningful_content("0 20 40 60"));
-        assert!(!has_meaningful_content("1.00"));
+    fn coalesce_small_chunks_prefers_previous_chunk() {
+        let chunks = coalesce_small_chunks(vec![
+            "first substantial chunk with enough words".to_string(),
+            "2".to_string(),
+            "third substantial chunk with enough words".to_string(),
+        ]);
+
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].contains("2"));
     }
 
     #[test]
-    fn has_meaningful_content_accepts_text_with_words() {
-        assert!(has_meaningful_content("noise reduction weak lensing"));
-        assert!(has_meaningful_content("Introduction to signal processing"));
-        assert!(has_meaningful_content("Ground Truth evaluation"));
+    fn coalesce_small_chunks_attaches_leading_fragments_to_next_chunk() {
+        let chunks = coalesce_small_chunks(vec![
+            "1".to_string(),
+            "2".to_string(),
+            "first substantial chunk with enough words".to_string(),
+        ]);
+
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].starts_with("1"));
+        assert!(chunks[0].contains("first substantial chunk"));
     }
 }
