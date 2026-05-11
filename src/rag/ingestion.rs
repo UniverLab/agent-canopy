@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::application::ports::StateRepository;
 use crate::db::Database;
-use crate::rag::chunker::{chunk_semantic, detect_lang};
+use crate::rag::chunker::{chunk_semantic, detect_lang, SemanticChunk};
 use crate::rag::embedding_client::{client_from_config, model_dimensions, EmbeddingClient};
 use crate::rag::vector_store::{VectorChunk, VectorStore};
 
@@ -427,26 +427,11 @@ impl IngestionManager {
         let now = chrono::Utc::now().timestamp();
         let config = crate::domain::canopy_config::CanopyConfig::load(&self.data_dir);
 
-        let content_owned = content.clone();
-        let lang_owned = lang.to_owned();
         let threshold = config.similarity_threshold;
-        let chunk_result = tokio::task::spawn_blocking(move || {
-            std::panic::catch_unwind(AssertUnwindSafe(|| {
-                chunk_semantic(&content_owned, &lang_owned, threshold)
-            }))
-        })
-        .await;
-
-        let semantic_chunks = match chunk_result {
-            Ok(Ok(chunks)) => chunks,
-            Ok(Err(panic)) => {
-                tracing::error!("RAG chunker panic for {source_path}: {panic:?}");
-                return Ok(());
-            }
-            Err(join_err) => {
-                tracing::error!("RAG chunker task failed for {source_path}: {join_err}");
-                return Ok(());
-            }
+        let Some(semantic_chunks) =
+            build_semantic_chunks(content.clone(), lang.to_owned(), threshold, source_path).await
+        else {
+            return Ok(());
         };
         tracing::debug!(
             "RAG index_file: {source_path} — {} semantic chunk(s) produced",
@@ -465,48 +450,8 @@ impl IngestionManager {
             }
         };
 
-        let mut vector_chunks = Vec::with_capacity(semantic_chunks.len());
-        for chunk in semantic_chunks {
-            let content = chunk.content;
-            let chunk_id = Uuid::new_v4().to_string();
-            let client = Arc::clone(&embedding_client);
-            let content_for_embedding = content.clone();
-            let embedding =
-                match tokio::task::spawn_blocking(move || client.embed(&content_for_embedding))
-                    .await
-                {
-                    Ok(Ok(values)) => {
-                        tracing::debug!(
-                            "RAG: embedded chunk {} of {source_path} → {} dims",
-                            chunk.index,
-                            values.len()
-                        );
-                        values
-                    }
-                    Ok(Err(error)) => {
-                        tracing::error!(
-                            "RAG embedding failed for {source_path} chunk {}: {error}",
-                            chunk.index
-                        );
-                        continue;
-                    }
-                    Err(error) => {
-                        tracing::error!(
-                            "RAG embedding task panicked for {source_path} chunk {}: {error}",
-                            chunk.index
-                        );
-                        continue;
-                    }
-                };
-
-            vector_chunks.push(VectorChunk {
-                id: chunk_id,
-                file_path: source_path.to_owned(),
-                content,
-                embedding,
-                created_at: now,
-            });
-        }
+        let vector_chunks =
+            embed_semantic_chunks(embedding_client, semantic_chunks, source_path, now).await;
 
         if vector_chunks.is_empty() {
             tracing::error!(
@@ -522,6 +467,85 @@ impl IngestionManager {
         sync_vector_store(&config, source_path, &vector_chunks).await?;
         Ok(())
     }
+}
+
+async fn build_semantic_chunks(
+    content: String,
+    lang: String,
+    threshold: f32,
+    source_path: &str,
+) -> Option<Vec<SemanticChunk>> {
+    let chunk_result = tokio::task::spawn_blocking(move || {
+        std::panic::catch_unwind(AssertUnwindSafe(|| {
+            chunk_semantic(&content, &lang, threshold)
+        }))
+    })
+    .await;
+
+    match chunk_result {
+        Ok(Ok(chunks)) => Some(chunks),
+        Ok(Err(panic)) => {
+            tracing::error!("RAG chunker panic for {source_path}: {panic:?}");
+            None
+        }
+        Err(join_err) => {
+            tracing::error!("RAG chunker task failed for {source_path}: {join_err}");
+            None
+        }
+    }
+}
+
+async fn embed_semantic_chunks(
+    embedding_client: Arc<dyn EmbeddingClient>,
+    semantic_chunks: Vec<SemanticChunk>,
+    source_path: &str,
+    created_at: i64,
+) -> Vec<VectorChunk> {
+    let mut vector_chunks = Vec::with_capacity(semantic_chunks.len());
+
+    for chunk in semantic_chunks {
+        let content = chunk.content;
+        let chunk_id = Uuid::new_v4().to_string();
+        let client = Arc::clone(&embedding_client);
+        let content_for_embedding = content.clone();
+        let embedding_result =
+            tokio::task::spawn_blocking(move || client.embed(&content_for_embedding)).await;
+
+        let embedding = match embedding_result {
+            Ok(Ok(values)) => {
+                tracing::debug!(
+                    "RAG: embedded chunk {} of {source_path} → {} dims",
+                    chunk.index,
+                    values.len()
+                );
+                values
+            }
+            Ok(Err(error)) => {
+                tracing::error!(
+                    "RAG embedding failed for {source_path} chunk {}: {error}",
+                    chunk.index
+                );
+                continue;
+            }
+            Err(error) => {
+                tracing::error!(
+                    "RAG embedding task panicked for {source_path} chunk {}: {error}",
+                    chunk.index
+                );
+                continue;
+            }
+        };
+
+        vector_chunks.push(VectorChunk {
+            id: chunk_id,
+            file_path: source_path.to_owned(),
+            content,
+            embedding,
+            created_at,
+        });
+    }
+
+    vector_chunks
 }
 
 async fn sync_vector_store(

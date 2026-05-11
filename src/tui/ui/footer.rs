@@ -28,6 +28,8 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                     vec![
                         ("type", "search"),
                         ("↑↓", "results"),
+                        ("Enter", "search/open"),
+                        ("Shift+↑↓", "agents"),
                         ("Ctrl+T", "transfer"),
                         ("Esc", "close"),
                         ("F2", "agents"),
@@ -77,6 +79,10 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("Esc", "cancel"),
         ],
         Focus::Agent => {
+            if app.playground_active {
+                return draw_footer_playground(frame, area, app, sync_available);
+            }
+
             let is_pty = matches!(
                 app.selected_agent(),
                 Some(AgentEntry::Interactive(_))
@@ -88,7 +94,7 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                 let mut h = vec![
                     ("F10", "preview"),
                     ("Esc", "home"),
-                    ("Shift+↑↓", "agents"),
+                    ("Shift+↑↓", "agents/rag"),
                     ("Ctrl+T", "context"),
                 ];
                 if in_split {
@@ -209,5 +215,58 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         }
         let right_p = Paragraph::new(Line::from(right_spans));
         frame.render_widget(right_p, right_area);
+    }
+}
+
+fn draw_footer_playground(frame: &mut Frame, area: Rect, app: &App, sync_available: bool) {
+    let mut hints = vec![
+        ("type", "search"),
+        ("↑↓", "results"),
+        ("Enter", "search/open"),
+        ("Shift+↑↓", "agents"),
+        ("Ctrl+T", "transfer"),
+        ("F10", "preview"),
+        ("Esc", "close"),
+        ("F2", "projects"),
+    ];
+    if sync_available {
+        hints.push(("F3", "sync"));
+    }
+
+    let mut spans = Vec::new();
+    spans.push(Span::raw("  "));
+    for (i, (key, desc)) in hints.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(
+            *key,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(*desc, Style::default().fg(DIM)));
+    }
+
+    let version = if app.daemon_version.is_empty() {
+        String::new()
+    } else {
+        format!(" v{} ", app.daemon_version)
+    };
+
+    let hints_line = Line::from(spans);
+    frame.render_widget(Paragraph::new(hints_line), area);
+
+    if !version.is_empty() && area.width > version.len() as u16 {
+        let right_w = version.len() as u16;
+        let right_area = Rect::new(area.x + area.width - right_w, area.y, right_w, 1);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                version,
+                Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+            ))),
+            right_area,
+        );
     }
 }

@@ -246,25 +246,9 @@ fn draw_projects_sidebar(frame: &mut Frame, areas: SidebarContentAreas, app: &Ap
     let rag_items = &app.global_rag_queue;
     let show_rag_info = app.rag_info.has_rag_activity() && areas.content.height >= 6;
     // ragInfo sits at the TOP of the projects sidebar so it's always visible.
-    let (rag_info_area, content_below) = if show_rag_info {
-        let [top, bottom] =
-            Layout::vertical([Constraint::Length(6), Constraint::Min(0)]).areas(areas.content);
-        (Some(top), bottom)
-    } else {
-        (None, areas.content)
-    };
-
-    let has_projects = !app.projects.is_empty();
-    let projects_needed = if has_projects {
-        (app.projects.len() as u16 * 3 + 2).min(content_below.height)
-    } else {
-        0
-    };
-    let rag_needed = if app.playground_active && !rag_items.is_empty() {
-        (rag_items.len() as u16 * 2 + 3).min(14)
-    } else {
-        0
-    };
+    let (rag_info_area, content_below) = split_top_panel(areas.content, show_rag_info, 6);
+    let (has_projects, projects_needed, rag_needed) =
+        projects_layout_requirements(app, rag_items, content_below.height);
     let layout = layout_projects_sections(content_below, has_projects, projects_needed, rag_needed);
 
     if let Some(rag_info_area) = rag_info_area.filter(|area| area.height >= 3) {
@@ -290,15 +274,10 @@ fn draw_projects_sidebar(frame: &mut Frame, areas: SidebarContentAreas, app: &Ap
     }
 
     if let Some(rag_area) = layout.rag_queue.filter(|area| area.height >= 3) {
-        let queue_title = if app.rag_paused {
-            " ragQueue ⏸ "
-        } else {
-            " ragQueue "
-        };
         render_titled_panel(
             frame,
             rag_area,
-            queue_title,
+            rag_queue_title(app.rag_paused),
             Style::default().fg(DIM),
             Style::default().fg(DIM),
             |frame, inner| draw_rag_queue(frame, inner, rag_items, app.selected_rag_queue),
@@ -308,6 +287,44 @@ fn draw_projects_sidebar(frame: &mut Frame, areas: SidebarContentAreas, app: &Ap
     render_brain_if_visible(frame, layout.brain, app);
 
     render_dashboard_if_present(frame, areas.dashboard, app);
+}
+
+fn split_top_panel(content: Rect, enabled: bool, top_height: u16) -> (Option<Rect>, Rect) {
+    if !enabled {
+        return (None, content);
+    }
+
+    let [top, bottom] =
+        Layout::vertical([Constraint::Length(top_height), Constraint::Min(0)]).areas(content);
+    (Some(top), bottom)
+}
+
+fn projects_layout_requirements(
+    app: &App,
+    rag_items: &[crate::db::project::RagQueueItem],
+    content_height: u16,
+) -> (bool, u16, u16) {
+    let has_projects = !app.projects.is_empty();
+    let projects_needed = if has_projects {
+        (app.projects.len() as u16 * 3 + 2).min(content_height)
+    } else {
+        0
+    };
+    let rag_needed = if app.playground_active && !rag_items.is_empty() {
+        (rag_items.len() as u16 * 2 + 3).min(14)
+    } else {
+        0
+    };
+
+    (has_projects, projects_needed, rag_needed)
+}
+
+fn rag_queue_title(rag_paused: bool) -> &'static str {
+    if rag_paused {
+        " ragQueue ⏸ "
+    } else {
+        " ragQueue "
+    }
 }
 
 fn layout_projects_sections(

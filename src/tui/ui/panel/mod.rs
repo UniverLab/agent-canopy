@@ -200,21 +200,15 @@ fn draw_preview_panel(frame: &mut Frame, area: Rect, app: &App) -> bool {
         return false;
     };
 
-    match selected {
-        AgentEntry::Agent(agent) => {
-            draw_agent_details(frame, area, agent, app);
-            true
-        }
-        AgentEntry::Interactive(idx) => draw_interactive_preview(frame, area, app, *idx),
-        AgentEntry::Terminal(idx) => draw_terminal_preview(frame, area, app, *idx),
-        AgentEntry::Group(idx) => {
-            draw_group_details(frame, area, app, *idx);
-            true
-        }
-    }
+    draw_selected_preview(frame, area, app, selected)
 }
 
 fn draw_agent_panel(frame: &mut Frame, area: Rect, app: &mut App) -> bool {
+    if app.playground_active {
+        draw_playground_panel(frame, area, app);
+        return true;
+    }
+
     let Some(selected) = app.selected_agent() else {
         return false;
     };
@@ -284,23 +278,48 @@ fn draw_focused_terminal_panel(frame: &mut Frame, area: Rect, app: &mut App, idx
     let warp_mode = agent.warp_mode;
     let snap = agent.screen_snapshot();
 
-    if warp_mode {
-        let (pty_area, input_area) = split_warp_areas(area);
-        if let Some(snap) = snap.as_ref() {
-            render_snapshot(frame, pty_area, snap, app, sensitive, false);
-        }
-        draw_warp_input_box(frame, input_area, app, idx);
-        app.last_panel_inner = (pty_area.width, pty_area.height);
-        app.last_panel_y = pty_area.y;
+    if !warp_mode {
+        let Some(snap) = snap else {
+            return false;
+        };
+        render_snapshot(frame, area, &snap, app, sensitive, true);
         return true;
     }
 
-    let Some(snap) = snap else {
-        return false;
-    };
-
-    render_snapshot(frame, area, &snap, app, sensitive, true);
+    draw_terminal_warp_mode(frame, area, app, idx, snap.as_ref(), sensitive);
     true
+}
+
+fn draw_selected_preview(frame: &mut Frame, area: Rect, app: &App, selected: &AgentEntry) -> bool {
+    match selected {
+        AgentEntry::Agent(agent) => {
+            draw_agent_details(frame, area, agent, app);
+            true
+        }
+        AgentEntry::Interactive(idx) => draw_interactive_preview(frame, area, app, *idx),
+        AgentEntry::Terminal(idx) => draw_terminal_preview(frame, area, app, *idx),
+        AgentEntry::Group(idx) => {
+            draw_group_details(frame, area, app, *idx);
+            true
+        }
+    }
+}
+
+fn draw_terminal_warp_mode(
+    frame: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    idx: usize,
+    snap: Option<&crate::tui::agent::ScreenSnapshot>,
+    sensitive: bool,
+) {
+    let (pty_area, input_area) = split_warp_areas(area);
+    if let Some(snap) = snap {
+        render_snapshot(frame, pty_area, snap, app, sensitive, false);
+    }
+    draw_warp_input_box(frame, input_area, app, idx);
+    app.last_panel_inner = (pty_area.width, pty_area.height);
+    app.last_panel_y = pty_area.y;
 }
 
 fn draw_new_agent_dialog_background(frame: &mut Frame, area: Rect, app: &App) -> bool {
@@ -494,18 +513,13 @@ fn draw_rag_info_overview(frame: &mut Frame, area: Rect, app: &App) {
     if !app.rag_file_status.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled("Files  ", Style::default().fg(DIM)),
+            Span::styled("Recent files  ", Style::default().fg(DIM)),
             Span::styled(
                 format!("({}) ", app.rag_file_status.len()),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
-            Span::styled("↑↓ scroll", Style::default().fg(DIM)),
         ]));
-        lines.extend(rag_file_status_lines(
-            &app.rag_file_status,
-            app.rag_report_scroll,
-            area,
-        ));
+        lines.extend(rag_file_status_lines(&app.rag_file_status, area));
     } else if !app.global_rag_queue.is_empty() {
         lines.extend(rag_queue_lines(
             &app.global_rag_queue,
@@ -518,16 +532,15 @@ fn draw_rag_info_overview(frame: &mut Frame, area: Rect, app: &App) {
 
 fn rag_file_status_lines(
     files: &[crate::db::project::RagPerFileStatus],
-    scroll: usize,
     area: Rect,
 ) -> Vec<Line<'static>> {
-    // Reserve 6 lines for summary header; remainder is available for file rows.
-    let max_rows = (area.height as usize).saturating_sub(7).max(2);
-    let start = scroll.min(files.len().saturating_sub(1));
-    let visible = &files[start..];
+    // Reserve summary/header space and render a fixed non-interactive preview window.
+    let max_rows = (area.height as usize).saturating_sub(8).max(2);
+    let name_width = area.width.saturating_sub(4) as usize;
+    let detail_width = area.width.saturating_sub(6) as usize;
 
     let mut lines = Vec::new();
-    for file in visible.iter().take(max_rows) {
+    for file in files.iter().take(max_rows) {
         let (icon, icon_color) = match file.last_event_type.as_str() {
             "indexed" => ("✓", Color::Green),
             "deleted" => ("○", DIM),
@@ -537,15 +550,16 @@ fn rag_file_status_lines(
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| file.file_path.clone());
-        let name_trunc = truncate_str(&filename, 28);
-
-        let suffix = if file.last_event_type == "error" {
+        let name_trunc = truncate_str(&filename, name_width);
+        let detail = if file.last_event_type == "error" {
             file.last_detail
                 .as_deref()
-                .map(|d| format!("  {}", truncate_str(d, 22)))
-                .unwrap_or_default()
+                .map(|d| format!("error: {}", truncate_str(d, detail_width)))
+                .unwrap_or_else(|| "error".to_string())
+        } else if file.last_event_type == "deleted" {
+            "deleted".to_string()
         } else {
-            format!("  ×{} indexed", file.times_indexed)
+            format!("indexed ×{}", file.times_indexed)
         };
 
         lines.push(Line::from(vec![
@@ -556,14 +570,17 @@ fn rag_file_status_lines(
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(suffix, Style::default().fg(DIM)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("   ", Style::default().fg(DIM)),
+            Span::styled(detail, Style::default().fg(DIM)),
         ]));
     }
 
-    if start + max_rows < files.len() {
-        let remaining = files.len() - start - max_rows;
+    if max_rows < files.len() {
+        let remaining = files.len() - max_rows;
         lines.push(Line::from(Span::styled(
-            format!("  … {} more (↓)", remaining),
+            format!("  … {} more (open playground for full details)", remaining),
             Style::default().fg(DIM),
         )));
     }
