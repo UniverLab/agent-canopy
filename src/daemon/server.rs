@@ -226,6 +226,16 @@ async fn startup_personal_rag(ingestion: Arc<IngestionManager>, data_dir: &std::
     }
 
     // Reload any items already in the DB queue from a previous session.
+    let recovered = ingestion
+        .db()
+        .requeue_processing_rag_items(chrono::Utc::now().timestamp())
+        .unwrap_or(0);
+    if recovered > 0 {
+        tracing::warn!(
+            "startup_personal_rag: recovered {recovered} stale processing queue item(s) after previous crash"
+        );
+    }
+
     if let Ok(pending) = ingestion.db_pending_queue() {
         for path in &pending {
             ingestion.enqueue(path).await;

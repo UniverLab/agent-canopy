@@ -228,6 +228,22 @@ impl Database {
         Ok(n > 0)
     }
 
+    /// Recover queue items that were left in `processing` after an unexpected
+    /// daemon exit. Moves them back to `queued` so indexing can resume.
+    pub fn requeue_processing_rag_items(&self, now: i64) -> Result<usize> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let n = conn.execute(
+            "UPDATE rag_queue
+             SET status='queued', queued_at=?1, updated_at=?1
+             WHERE status='processing'",
+            rusqlite::params![now],
+        )?;
+        Ok(n)
+    }
+
     pub fn remove_rag_item(&self, source_path: &str) -> Result<bool> {
         let conn = self
             .conn

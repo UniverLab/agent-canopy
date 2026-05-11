@@ -436,6 +436,29 @@ fn test_rag_queue_counts() {
 }
 
 #[test]
+fn test_requeue_processing_rag_items() {
+    let db = test_db();
+    db.enqueue_rag_item("/tmp/a.rs", 111).unwrap();
+    db.enqueue_rag_item("/tmp/b.rs", 112).unwrap();
+    db.mark_rag_item_processing("/tmp/a.rs", 113).unwrap();
+
+    let recovered = db.requeue_processing_rag_items(999).unwrap();
+    assert_eq!(recovered, 1);
+
+    let items = db.list_rag_queue(10).unwrap();
+    let a = items
+        .iter()
+        .find(|item| item.source_path == "/tmp/a.rs")
+        .expect("requeued item exists");
+    assert_eq!(a.status, "queued");
+    assert_eq!(a.queued_at, 999);
+
+    let (queued, processing) = db.rag_queue_counts().unwrap();
+    assert_eq!(queued, 2);
+    assert_eq!(processing, 0);
+}
+
+#[test]
 fn test_indexed_files_timestamps_uses_last_success_unless_deleted() {
     let db = test_db();
 

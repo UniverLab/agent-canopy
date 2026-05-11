@@ -213,6 +213,21 @@ pub(crate) fn truncate_str(s: &str, max: usize) -> String {
     }
 }
 
+pub(crate) fn truncate_str_keep_tail(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    if max <= 1 {
+        return String::new();
+    }
+
+    let tail_len = max.saturating_sub(1);
+    let chars: Vec<char> = s.chars().collect();
+    let tail_start = chars.len().saturating_sub(tail_len);
+    let tail: String = chars[tail_start..].iter().collect();
+    format!("…{tail}")
+}
+
 /// Extract the last two path segments, e.g. `/a/b/c/d` → `c/d`.
 pub(crate) fn last_two_segments(path: &str) -> String {
     let trimmed = path.trim_end_matches('/');

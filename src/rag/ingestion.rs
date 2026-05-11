@@ -314,6 +314,7 @@ impl IngestionManager {
 
             let now = chrono::Utc::now().timestamp();
             let _ = self.db.mark_rag_item_processing(&source_path, now);
+            tracing::info!("RAG drain_queue: indexing '{}'", source_path);
 
             match self.index_file(&source_path).await {
                 Ok(()) => {
@@ -469,7 +470,14 @@ impl IngestionManager {
             "RAG index_file: {source_path} — {} chunk(s) embedded, pushing to vector store",
             vector_chunks.len()
         );
-        sync_vector_store(&self.db, &self.data_dir, &config, source_path, &vector_chunks).await?;
+        sync_vector_store(
+            &self.db,
+            &self.data_dir,
+            &config,
+            source_path,
+            &vector_chunks,
+        )
+        .await?;
         Ok(())
     }
 }
@@ -683,15 +691,234 @@ fn indexing_dir_summary(paths: &[String]) -> String {
     }
 }
 
+/// Internal helper command used to isolate PDF parsing in a subprocess.
+/// This prevents parser-level stack overflows from taking down the daemon.
+pub fn run_internal_pdf_extract(path: &Path) -> anyhow::Result<()> {
+    let text = extract_pdf_text_in_process(path)?;
+    print!("{text}");
+    Ok(())
+}
+
 fn extract_pdf_text(path: &Path) -> anyhow::Result<String> {
+    let exe = std::env::current_exe()?;
+    let output = std::process::Command::new(exe)
+        .arg("internal-pdf-extract")
+        .arg(path)
+        .output()
+        .map_err(|e| anyhow::anyhow!("Failed to launch PDF extraction subprocess: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            format!("subprocess exited with status {}", output.status)
+        } else {
+            stderr
+        };
+        anyhow::bail!(
+            "PDF extraction subprocess failed for {}: {detail}",
+            path.display()
+        );
+    }
+
+    String::from_utf8(output.stdout).map_err(|e| {
+        anyhow::anyhow!(
+            "PDF extraction subprocess returned non-UTF8 output for {}: {e}",
+            path.display()
+        )
+    })
+}
+
+fn extract_pdf_text_in_process(path: &Path) -> anyhow::Result<String> {
     use std::io::Read;
 
     let mut file = std::fs::File::open(path)?;
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer)?;
 
+    // Detect actual file type by magic bytes — .pdf files are sometimes HTML
+    // error pages or other content saved with the wrong extension.
+    if is_html_bytes(&buffer) {
+        let html = String::from_utf8_lossy(&buffer);
+        let text = strip_html_to_text(&html);
+        if text.trim().is_empty() {
+            anyhow::bail!(
+                "File '{}' appears to be HTML but contains no extractable text",
+                path.display()
+            );
+        }
+        tracing::info!(
+            "RAG: '{}' detected as HTML (not PDF) — extracted {} bytes via HTML stripper",
+            path.display(),
+            text.len()
+        );
+        return Ok(text);
+    }
+
+    if !buffer.starts_with(b"%PDF") {
+        // Unknown binary — attempt pdf-extract anyway, fall back to raw salvage.
+        tracing::warn!(
+            "RAG: '{}' missing PDF magic bytes — attempting pdf-extract with raw-text fallback",
+            path.display()
+        );
+        return pdf_extract::extract_text_from_mem(&buffer)
+            .map_err(|_| ())
+            .or_else(|_| {
+                let text = salvage_printable_text(&buffer);
+                if text.split_whitespace().count() >= 20 {
+                    Ok(text)
+                } else {
+                    Err(())
+                }
+            })
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Could not extract text from '{}': not a valid PDF or recognisable text file",
+                    path.display()
+                )
+            });
+    }
+
     pdf_extract::extract_text_from_mem(&buffer)
         .map_err(|e| anyhow::anyhow!("PDF text extraction failed for {}: {e}", path.display()))
+}
+
+/// Returns `true` when the byte slice looks like an HTML document.
+fn is_html_bytes(bytes: &[u8]) -> bool {
+    // Skip a leading UTF-8 BOM if present.
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    let prefix = &bytes[..bytes.len().min(64)];
+    let lower: Vec<u8> = prefix.iter().map(|b| b.to_ascii_lowercase()).collect();
+    lower.starts_with(b"<!doctype")
+        || lower.starts_with(b"<html")
+        || lower.windows(6).any(|w| w == b"<html ")
+}
+
+/// Very simple HTML-to-text: strips tags, decodes common entities, collapses whitespace.
+fn strip_html_to_text(html: &str) -> String {
+    let mut out = String::with_capacity(html.len() / 2);
+    let mut in_tag = false;
+    let mut in_script = false;
+    let mut tag_buf = String::new();
+    let mut pending_space = false;
+
+    let mut chars = html.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if in_tag {
+            tag_buf.push(ch);
+            if ch == '>' {
+                let tag_lower = tag_buf.to_ascii_lowercase();
+                let tag_name = tag_lower
+                    .trim_start_matches('<')
+                    .trim_start_matches('/')
+                    .split(|c: char| c.is_whitespace() || c == '>')
+                    .next()
+                    .unwrap_or("");
+                in_script = matches!(tag_name, "script" | "style");
+                // Block-level tags produce a line break in the output.
+                if matches!(
+                    tag_name,
+                    "p" | "div"
+                        | "br"
+                        | "li"
+                        | "h1"
+                        | "h2"
+                        | "h3"
+                        | "h4"
+                        | "h5"
+                        | "h6"
+                        | "tr"
+                        | "td"
+                        | "th"
+                        | "blockquote"
+                        | "section"
+                        | "article"
+                ) {
+                    out.push('\n');
+                    pending_space = false;
+                }
+                tag_buf.clear();
+                in_tag = false;
+            }
+        } else if ch == '<' {
+            in_tag = true;
+            tag_buf.clear();
+            tag_buf.push(ch);
+        } else if in_script {
+            // skip script/style content
+        } else if ch == '&' {
+            // Decode HTML entity.
+            let mut entity = String::new();
+            for ec in chars.by_ref() {
+                if ec == ';' {
+                    break;
+                }
+                entity.push(ec);
+                if entity.len() > 8 {
+                    break;
+                }
+            }
+            let decoded = match entity.as_str() {
+                "amp" => "&",
+                "lt" => "<",
+                "gt" => ">",
+                "nbsp" | "#160" => " ",
+                "quot" => "\"",
+                "apos" | "#39" => "'",
+                _ => " ",
+            };
+            out.push_str(decoded);
+            pending_space = false;
+        } else if ch.is_whitespace() {
+            pending_space = true;
+        } else {
+            if pending_space && !out.ends_with('\n') {
+                out.push(' ');
+            }
+            pending_space = false;
+            out.push(ch);
+        }
+    }
+
+    // Collapse runs of blank lines down to a single blank line.
+    let mut result = String::with_capacity(out.len());
+    let mut blank_run = 0usize;
+    for line in out.lines() {
+        if line.trim().is_empty() {
+            blank_run += 1;
+            if blank_run <= 1 {
+                result.push('\n');
+            }
+        } else {
+            blank_run = 0;
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+    result
+}
+
+/// Last-resort text salvage: collect printable ASCII / Unicode runs from raw bytes.
+/// Only accepts runs of at least 4 consecutive printable chars to filter binary noise.
+fn salvage_printable_text(bytes: &[u8]) -> String {
+    const MIN_RUN: usize = 4;
+    let mut runs: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    for &b in bytes {
+        if (0x20..0x7f).contains(&b) || b == b'\n' || b == b'\r' || b == b'\t' {
+            current.push(b as char);
+        } else {
+            if current.trim().len() >= MIN_RUN {
+                runs.push(current.trim().to_owned());
+            }
+            current.clear();
+        }
+    }
+    if current.trim().len() >= MIN_RUN {
+        runs.push(current.trim().to_owned());
+    }
+
+    runs.join(" ")
 }
 
 async fn open_vector_store(

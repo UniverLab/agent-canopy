@@ -8,8 +8,8 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::{
-    truncate_str, ACCENT, DIM, INTERACTIVE_COLOR, STATUS_DISABLED, STATUS_FAIL, STATUS_OK,
-    STATUS_RUNNING,
+    truncate_str, truncate_str_keep_tail, ACCENT, DIM, INTERACTIVE_COLOR, STATUS_DISABLED,
+    STATUS_FAIL, STATUS_OK, STATUS_RUNNING,
 };
 use crate::tui::agent::ScreenSnapshot;
 use crate::tui::app::types::{AgentEntry, App, Focus, ProjectsPanelFocus};
@@ -554,7 +554,7 @@ fn rag_file_status_lines(
         let detail = if file.last_event_type == "error" {
             file.last_detail
                 .as_deref()
-                .map(|d| format!("error: {}", truncate_str(d, detail_width)))
+                .map(|d| format!("error: {}", truncate_str_keep_tail(d, detail_width)))
                 .unwrap_or_else(|| "error".to_string())
         } else if file.last_event_type == "deleted" {
             "deleted".to_string()

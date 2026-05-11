@@ -363,17 +363,20 @@ impl App {
             .map(|v| v == "1")
             .unwrap_or(false);
 
-        let (queued, processing) = self.db.rag_queue_counts().unwrap_or((0, 0));
+        let (queued, processing) = self
+            .db
+            .rag_queue_counts()
+            .unwrap_or((self.rag_info.queued_items, self.rag_info.processing_items));
         let total_chunks = self
             .db
             .get_state("rag_total_chunks")?
             .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(0);
+            .unwrap_or(self.rag_info.total_chunks);
         let indexed_files = self
             .db
             .get_state("rag_indexed_files")?
             .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(0);
+            .unwrap_or(self.rag_info.indexed_files);
         self.rag_info = crate::db::project::RagInfoSummary {
             total_chunks,
             indexed_files,

@@ -65,6 +65,10 @@ enum Commands {
         action: RagAction,
     },
     #[command(hide = true)]
+    InternalPdfExtract {
+        path: PathBuf,
+    },
+    #[command(hide = true)]
     Serve,
 }
 
@@ -89,6 +93,9 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(Commands::Rag { action }) => handle_rag_action(action).await,
+        Some(Commands::InternalPdfExtract { path }) => {
+            rag::ingestion::run_internal_pdf_extract(&path)
+        }
         None => {
             tokio::task::block_in_place(|| {
                 if setup_module::needs_setup() {

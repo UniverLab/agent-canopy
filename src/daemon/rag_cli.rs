@@ -184,7 +184,7 @@ async fn handle_rag_report(data_dir: &std::path::Path, db: &Database) -> Result<
             println!(
                 "     \x1b[31merror\x1b[0m:   {} — {}",
                 format_ts(err.occurred_at),
-                truncate(detail, 120)
+                crate::tui::truncate_str_keep_tail(detail, 120)
             );
         }
     }
@@ -208,12 +208,4 @@ fn format_ts(ts: i64) -> String {
     let d = UNIX_EPOCH + Duration::from_secs(ts as u64);
     let dt: chrono::DateTime<chrono::Local> = d.into();
     dt.format("%Y-%m-%d %H:%M").to_string()
-}
-
-fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        s
-    } else {
-        &s[..max]
-    }
 }

@@ -14,6 +14,8 @@ pub(crate) mod terminal_history;
 mod ui;
 mod whimsg;
 
+pub(crate) use ui::truncate_str_keep_tail;
+
 use anyhow::{Context, Result};
 use ratatui::crossterm::{
     event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},

@@ -3,7 +3,7 @@ use anyhow::Result;
 use crate::application::ports::{AgentRepository, RunRepository, StateRepository};
 
 use super::types::{AgentEntry, App};
-use super::utils::{is_process_running, relative_time, tail_lines};
+use super::utils::{is_local_port_open, is_process_running, relative_time, tail_lines};
 
 impl App {
     pub(super) fn refresh_daemon_status(&mut self) {
@@ -11,13 +11,22 @@ impl App {
         self.daemon_pid = std::fs::read_to_string(&pid_path)
             .ok()
             .and_then(|s| s.trim().parse().ok());
-        self.daemon_running = self.daemon_pid.map(is_process_running).unwrap_or(false);
+        let daemon_running_by_pid = self.daemon_pid.map(is_process_running).unwrap_or(false);
         self.daemon_version = self
             .db
             .get_state("version")
             .ok()
             .flatten()
             .unwrap_or_default();
+        let daemon_port = self
+            .db
+            .get_state("port")
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(7755);
+        let daemon_running_by_port = is_local_port_open(daemon_port);
+        self.daemon_running = daemon_running_by_pid || daemon_running_by_port;
     }
 
     pub(super) fn refresh_agents(&mut self) -> Result<()> {
