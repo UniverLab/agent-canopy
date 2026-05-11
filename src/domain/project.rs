@@ -8,7 +8,11 @@ use sha2::{Digest, Sha256};
 pub fn workdir_hash(canonical_path: &str) -> String {
     let mut h = Sha256::new();
     h.update(canonical_path.as_bytes());
-    format!("{:.8x}", h.finalize())
+    h.finalize()
+        .iter()
+        .take(4)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Extract a description from README.md content per spec rules:

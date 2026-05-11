@@ -18,7 +18,7 @@ use platform::{
 use windows::get_windows_host_metrics;
 
 /// System information and metrics.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SystemInfo {
     pub cpu_usage: f32,
     pub cpu_cores: usize,
@@ -37,7 +37,7 @@ pub struct SystemInfo {
 }
 
 /// GPU information.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 #[allow(dead_code)]
 pub struct GpuInfo {
     pub name: String,

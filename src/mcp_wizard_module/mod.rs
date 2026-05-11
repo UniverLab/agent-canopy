@@ -699,6 +699,15 @@ fn print_mcp_table(detected: &[&Platform], all_configs: &PlatformConfigs) {
         .unwrap_or(4)
         .max(4);
 
+    print_mcp_table_header(detected, name_col, plat_col);
+
+    for server in &all_servers {
+        print_mcp_table_row(server, detected, all_configs, name_col, plat_col);
+    }
+    println!();
+}
+
+fn print_mcp_table_header(detected: &[&Platform], name_col: usize, plat_col: usize) {
     print!("  {:<name_col$}", "Server");
     for platform in detected {
         print!("  {:>plat_col$}", platform.name);
@@ -707,22 +716,30 @@ fn print_mcp_table(detected: &[&Platform], all_configs: &PlatformConfigs) {
 
     let total_w = name_col + detected.len() * (plat_col + 2);
     println!("  {:─<total_w$}", "");
+}
 
-    for server in &all_servers {
-        print!("  {:<name_col$}", server);
-        for platform in detected {
-            let has_server = all_configs
-                .get(&platform.name)
-                .is_some_and(|servers| servers.contains_key(server));
-            let icon = if has_server {
-                "\x1b[32m ✓\x1b[0m"
-            } else {
-                "\x1b[31m ✗\x1b[0m"
-            };
-            let pad = plat_col.saturating_sub(1);
-            print!("  {}{}", " ".repeat(pad), icon);
-        }
-        println!();
+fn print_mcp_table_row(
+    server: &str,
+    detected: &[&Platform],
+    all_configs: &PlatformConfigs,
+    name_col: usize,
+    plat_col: usize,
+) {
+    print!("  {:<name_col$}", server);
+    for platform in detected {
+        let has_server = all_configs
+            .get(&platform.name)
+            .is_some_and(|servers| servers.contains_key(server));
+        let pad = plat_col.saturating_sub(1);
+        print!("  {}{}", " ".repeat(pad), server_presence_icon(has_server));
     }
     println!();
+}
+
+fn server_presence_icon(has_server: bool) -> &'static str {
+    if has_server {
+        "\x1b[32m ✓\x1b[0m"
+    } else {
+        "\x1b[31m ✗\x1b[0m"
+    }
 }
