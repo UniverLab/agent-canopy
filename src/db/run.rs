@@ -204,6 +204,7 @@ impl RunRepository for Database {
 impl Database {
     fn upsert_run_intelligence_node(&self, run: &RunLog) -> Result<()> {
         let agent = self.get_agent(&run.background_agent_id)?;
+        let working_dir = agent.as_ref().and_then(|item| item.working_dir.clone());
         let title = agent
             .as_ref()
             .map(|agent| {
@@ -237,6 +238,7 @@ impl Database {
                 "source": "run",
                 "run_id": run.id,
                 "background_agent_id": run.background_agent_id,
+                "workdir": working_dir,
                 "status": run.status.as_str(),
                 "trigger_type": run.trigger_type.as_str(),
                 "exit_code": run.exit_code,

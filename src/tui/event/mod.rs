@@ -22,6 +22,7 @@ use crate::tui::ui;
 use agent_focus::handle_agent_key;
 use context_transfer::handle_context_transfer_key;
 use home_preview::{handle_home_key, handle_preview_key};
+use launchpad::handle_launchpad_key;
 use new_agent_dialog::handle_dialog_key;
 use paste::handle_paste;
 use prompt_template::handle_prompt_template_key;
@@ -49,6 +50,7 @@ fn tick_duration(app: &App) -> Duration {
     match app.focus {
         Focus::Agent
         | Focus::NewAgentDialog
+        | Focus::LaunchpadDialog
         | Focus::ContextTransfer
         | Focus::RagTransfer
         | Focus::PromptTemplateDialog => Duration::from_millis(50),
@@ -89,6 +91,7 @@ fn dispatch_event(app: &mut App, event: Event) -> Result<()> {
 mod agent_focus;
 mod context_transfer;
 mod home_preview;
+mod launchpad;
 mod new_agent_dialog;
 mod paste;
 mod prompt_template;
@@ -161,6 +164,7 @@ fn dispatch_focus_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> 
         Focus::Home => handle_home_key(app, code, modifiers),
         Focus::Preview => handle_preview_key(app, code, modifiers),
         Focus::NewAgentDialog => handle_dialog_key(app, code),
+        Focus::LaunchpadDialog => handle_launchpad_key(app, code),
         Focus::Agent => handle_agent_key(app, code, modifiers),
         Focus::ContextTransfer => handle_context_transfer_key(app, code),
         Focus::RagTransfer => handle_rag_transfer_key(app, code),
@@ -343,7 +347,10 @@ fn handle_scroll(app: &mut App, dir: i32) {
                 }
             }
         }
-        Focus::ContextTransfer | Focus::RagTransfer | Focus::PromptTemplateDialog => {}
+        Focus::LaunchpadDialog
+        | Focus::ContextTransfer
+        | Focus::RagTransfer
+        | Focus::PromptTemplateDialog => {}
     }
 }
 

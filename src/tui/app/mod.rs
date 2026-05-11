@@ -90,6 +90,8 @@ impl App {
             log_scroll: 0,
             running: true,
             new_agent_dialog: None,
+            launchpad_dialog: None,
+            pending_launch_dialog: None,
             quit_confirm: false,
             sidebar_brain: None,
             home_brain: None,

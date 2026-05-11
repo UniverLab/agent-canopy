@@ -146,6 +146,7 @@ fn show_home_fallback(app: &App) -> bool {
         && !matches!(
             app.focus,
             Focus::NewAgentDialog
+                | Focus::LaunchpadDialog
                 | Focus::ContextTransfer
                 | Focus::RagTransfer
                 | Focus::PromptTemplateDialog
@@ -172,7 +173,10 @@ fn draw_log_panel_focus(frame: &mut Frame, area: Rect, app: &mut App) -> bool {
         Focus::Preview => draw_preview_panel(frame, area, app),
         Focus::Agent => draw_agent_panel(frame, area, app),
         Focus::NewAgentDialog => draw_new_agent_dialog_background(frame, area, app),
-        Focus::ContextTransfer | Focus::RagTransfer | Focus::PromptTemplateDialog => false,
+        Focus::LaunchpadDialog
+        | Focus::ContextTransfer
+        | Focus::RagTransfer
+        | Focus::PromptTemplateDialog => false,
     }
 }
 

@@ -109,6 +109,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         dialogs::draw_new_agent_dialog(frame, app);
     }
 
+    if app.launchpad_dialog.is_some() {
+        dialogs::draw_launchpad_dialog(frame, app);
+    }
+
     if app.quit_confirm {
         dialogs::draw_quit_confirm(frame);
     }

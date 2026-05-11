@@ -701,6 +701,11 @@ fn test_update_run_status() {
         .unwrap();
     assert_eq!(snapshot.kind, "session");
     assert!(snapshot.body.contains("Done"));
+    assert!(snapshot
+        .metadata
+        .as_deref()
+        .unwrap_or_default()
+        .contains("/tmp/project"));
 }
 
 #[test]

@@ -11,7 +11,7 @@ use crate::domain::project::Project;
 use crate::domain::sync::{ActiveIntent, SyncMessage, WorkspaceStatus};
 use crate::rag::vector_store::SearchResult;
 use crate::tui::agent::InteractiveAgent;
-use crate::tui::app::dialog::{NewAgentDialog, SimplePromptDialog};
+use crate::tui::app::dialog::{LaunchpadDialog, NewAgentDialog, SimplePromptDialog};
 use crate::tui::app::terminal_search::TerminalSearch;
 
 /// Unified entry in the sidebar.
@@ -40,6 +40,7 @@ pub enum Focus {
     Home,
     Preview,
     NewAgentDialog,
+    LaunchpadDialog,
     Agent,
     ContextTransfer,
     RagTransfer,
@@ -121,6 +122,8 @@ pub struct App {
     pub(crate) log_scroll: u16,
     pub(crate) running: bool,
     pub(crate) new_agent_dialog: Option<NewAgentDialog>,
+    pub(crate) launchpad_dialog: Option<LaunchpadDialog>,
+    pub(crate) pending_launch_dialog: Option<NewAgentDialog>,
     pub(crate) quit_confirm: bool,
 
     // Brian's Brain automaton (sidebar decoration)

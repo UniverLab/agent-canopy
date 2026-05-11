@@ -1,5 +1,6 @@
 use super::super::types::AgentEntry;
 use super::super::types::App;
+use super::launchpad::{LaunchpadChoice, LaunchpadDialog};
 use super::new_agent::{BackgroundTrigger, NewAgentDialog, NewTaskType};
 use super::prompt::SimplePromptDialog;
 use crate::application::ports::AgentRepository;
@@ -60,6 +61,17 @@ impl App {
             self.focus = super::super::types::Focus::Home;
         }
         self.new_agent_dialog = None;
+    }
+
+    pub fn close_launchpad_dialog(&mut self) {
+        let prev_focus = self
+            .pending_launch_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.prev_focus)
+            .unwrap_or(super::super::types::Focus::Preview);
+        self.launchpad_dialog = None;
+        self.pending_launch_dialog = None;
+        self.focus = prev_focus;
     }
 
     /// Open prompt template dialog with the specified template and optional initial content.
@@ -303,14 +315,14 @@ impl App {
         }
 
         // ── Create mode ───────────────────────────────────────────────────
+        if matches!(dialog.task_type, NewTaskType::Interactive) {
+            self.open_launchpad_dialog(dialog)?;
+            return Ok(());
+        }
+
         // Track the name of the newly created agent to select it after refresh
         let new_agent_name = match dialog.task_type {
-            NewTaskType::Interactive => {
-                self.launch_interactive(&dialog)?;
-                self.interactive_agents
-                    .last()
-                    .map(|agent| agent.name.clone())
-            }
+            NewTaskType::Interactive => None,
             NewTaskType::Background => {
                 match dialog.background_trigger {
                     BackgroundTrigger::Cron => {
@@ -345,6 +357,119 @@ impl App {
 
         // All new sessions start in focus mode
         self.focus = super::super::types::Focus::Agent;
+        Ok(())
+    }
+
+    fn open_launchpad_dialog(&mut self, dialog: NewAgentDialog) -> Result<()> {
+        let launchpad = LaunchpadDialog::for_workdir(&self.db, &dialog.working_dir)?;
+        self.pending_launch_dialog = Some(dialog);
+        self.launchpad_dialog = Some(launchpad);
+        self.focus = super::super::types::Focus::LaunchpadDialog;
+        Ok(())
+    }
+
+    pub fn confirm_launchpad_dialog(&mut self) -> Result<()> {
+        let Some(dialog) = self.pending_launch_dialog.take() else {
+            self.launchpad_dialog = None;
+            self.focus = super::super::types::Focus::Preview;
+            return Ok(());
+        };
+        let Some(launchpad) = self.launchpad_dialog.take() else {
+            self.focus = super::super::types::Focus::Preview;
+            return Ok(());
+        };
+
+        let (mission_title, mission_context, previous_node_id, mode) = match launchpad.selected {
+            LaunchpadChoice::ContinuePrevious => {
+                if let Some(previous) = &launchpad.previous {
+                    (
+                        previous.mission.clone(),
+                        previous.summary.clone(),
+                        Some(previous.node_id.clone()),
+                        "continue",
+                    )
+                } else {
+                    let mission = launchpad.new_mission.trim();
+                    (
+                        if mission.is_empty() {
+                            "New mission".to_string()
+                        } else {
+                            mission.to_string()
+                        },
+                        None,
+                        None,
+                        "new",
+                    )
+                }
+            }
+            LaunchpadChoice::NewMission => {
+                let mission = launchpad.new_mission.trim();
+                (
+                    if mission.is_empty() {
+                        "New mission".to_string()
+                    } else {
+                        mission.to_string()
+                    },
+                    None,
+                    None,
+                    "new",
+                )
+            }
+        };
+
+        let launchpad_node_id = format!("launchpad:{}", uuid::Uuid::new_v4());
+        let dialog_workdir = dialog.working_dir.clone();
+        self.db
+            .upsert_intelligence_node(crate::db::intelligence::IntelligenceNodeInput {
+                id: Some(launchpad_node_id.clone()),
+                kind: "session".to_string(),
+                title: mission_title.clone(),
+                body: mission_context
+                    .clone()
+                    .unwrap_or_else(|| "Launchpad session started.".to_string()),
+                metadata: Some(serde_json::json!({
+                    "source": "launchpad",
+                    "workdir": dialog_workdir,
+                    "mode": mode,
+                    "summary": mission_context,
+                })),
+                project_hash: None,
+                session_id: Some(launchpad_node_id),
+                relations: previous_node_id.map(|node_id| {
+                    vec![crate::db::intelligence::IntelligenceRelationInput {
+                        to_node_id: node_id,
+                        relation: "continues".to_string(),
+                        weight: Some(1.0),
+                    }]
+                }),
+            })?;
+
+        self.launch_interactive(&dialog)?;
+        let new_agent_name = self
+            .interactive_agents
+            .last()
+            .map(|agent| agent.name.clone())
+            .unwrap_or_default();
+        self.refresh_agents()?;
+        if !new_agent_name.is_empty() {
+            if let Some(position) = self
+                .agents
+                .iter()
+                .position(|entry| entry.id(self) == new_agent_name)
+            {
+                self.selected = position;
+            }
+        }
+
+        let mut initial_content = std::collections::HashMap::new();
+        initial_content.insert("instruction".to_string(), mission_title);
+        if let Some(context) = mission_context {
+            if !context.trim().is_empty() {
+                initial_content.insert("context".to_string(), context);
+            }
+        }
+        self.focus = super::super::types::Focus::Agent;
+        self.open_simple_prompt_dialog(Some(initial_content));
         Ok(())
     }
 

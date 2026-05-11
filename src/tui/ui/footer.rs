@@ -70,6 +70,12 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("Enter", "confirm"),
             ("Esc", "cancel"),
         ],
+        Focus::LaunchpadDialog => vec![
+            ("Tab/←→", "toggle"),
+            ("type", "mission"),
+            ("Enter", "confirm"),
+            ("Esc", "cancel"),
+        ],
         Focus::Agent => {
             let is_pty = matches!(
                 app.selected_agent(),
