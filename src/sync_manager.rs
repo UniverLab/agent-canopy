@@ -51,15 +51,34 @@ impl SyncManager {
             description: description.to_owned(),
         })?;
 
-        self.publish(
-            workdir,
-            agent_id,
-            agent_name,
-            MessageKind::Intent,
-            &format!("{agent_name}: {mission}"),
-            Some(&payload),
-        )
-        .await
+        let message = self
+            .publish(
+                workdir,
+                agent_id,
+                agent_name,
+                MessageKind::Intent,
+                &format!("{agent_name}: {mission}"),
+                Some(&payload),
+            )
+            .await?;
+        self.upsert_sync_intelligence_node(crate::db::intelligence::IntelligenceNodeInput {
+            id: Some(format!("sync:{workdir}:{agent_id}")),
+            kind: "session".to_owned(),
+            title: mission.to_owned(),
+            body: description.to_owned(),
+            metadata: Some(serde_json::json!({
+                "source": "sync",
+                "workdir": workdir,
+                "agent_id": agent_id,
+                "agent_name": agent_name,
+                "kind": "intent",
+                "payload": payload,
+            })),
+            project_hash: None,
+            session_id: Some(format!("sync:{workdir}:{agent_id}")),
+            relations: None,
+        })?;
+        Ok(message)
     }
 
     pub async fn report_status(
@@ -75,15 +94,34 @@ impl SyncManager {
             message: message.to_owned(),
         })?;
 
-        self.publish(
-            workdir,
-            agent_id,
-            agent_name,
-            MessageKind::Status,
-            message,
-            Some(&payload),
-        )
-        .await
+        let sync_message = self
+            .publish(
+                workdir,
+                agent_id,
+                agent_name,
+                MessageKind::Status,
+                message,
+                Some(&payload),
+            )
+            .await?;
+        self.upsert_sync_intelligence_node(crate::db::intelligence::IntelligenceNodeInput {
+            id: Some(format!("sync:{workdir}:{agent_id}")),
+            kind: "session".to_owned(),
+            title: message.to_owned(),
+            body: message.to_owned(),
+            metadata: Some(serde_json::json!({
+                "source": "sync",
+                "workdir": workdir,
+                "agent_id": agent_id,
+                "agent_name": agent_name,
+                "kind": "status",
+                "payload": payload,
+            })),
+            project_hash: None,
+            session_id: Some(format!("sync:{workdir}:{agent_id}")),
+            relations: None,
+        })?;
+        Ok(sync_message)
     }
 
     pub async fn broadcast(
@@ -133,6 +171,14 @@ impl SyncManager {
         let sender = self.ensure_sender(workdir).await;
         let _ = sender.send(sync_message.clone());
         Ok(sync_message)
+    }
+
+    fn upsert_sync_intelligence_node(
+        &self,
+        node: crate::db::intelligence::IntelligenceNodeInput,
+    ) -> anyhow::Result<()> {
+        self.db.upsert_intelligence_node(node)?;
+        Ok(())
     }
 
     async fn ensure_sender(&self, workdir: &str) -> broadcast::Sender<SyncMessage> {

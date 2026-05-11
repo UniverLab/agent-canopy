@@ -2,6 +2,7 @@ use anyhow::Result;
 use chrono::Utc;
 use rusqlite::{params, OptionalExtension};
 
+use crate::application::ports::AgentRepository;
 use crate::application::ports::RunRepository;
 use crate::db::Database;
 use crate::domain::models::{RunLog, RunStatus, TriggerType};
@@ -27,6 +28,8 @@ impl RunRepository for Database {
                 run.timeout_at.map(|t| t.to_rfc3339()),
             ],
         )?;
+        drop(conn);
+        self.upsert_run_intelligence_node(run)?;
         Ok(())
     }
 
@@ -144,6 +147,12 @@ impl RunRepository for Database {
              WHERE id = ?4",
             params![status.as_str(), summary, finished_at, run_id],
         )?;
+        if rows > 0 {
+            drop(conn);
+            if let Some(run) = self.get_run(run_id)? {
+                self.upsert_run_intelligence_node(&run)?;
+            }
+        }
         Ok(rows > 0)
     }
 
@@ -189,6 +198,57 @@ impl RunRepository for Database {
             Some(row) => Ok(Some(row.into_run_log()?)),
             None => Ok(None),
         }
+    }
+}
+
+impl Database {
+    fn upsert_run_intelligence_node(&self, run: &RunLog) -> Result<()> {
+        let agent = self.get_agent(&run.background_agent_id)?;
+        let title = agent
+            .as_ref()
+            .map(|agent| {
+                let first_line = agent.prompt.lines().next().unwrap_or(&agent.id);
+                if first_line.is_empty() {
+                    agent.id.as_str()
+                } else {
+                    first_line
+                }
+            })
+            .unwrap_or(run.background_agent_id.as_str())
+            .to_string();
+        let body = match run.summary.as_deref() {
+            Some(summary) => format!(
+                "Run status: {}\nSummary: {}\nExit code: {}",
+                run.status.as_str(),
+                summary,
+                run.exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "n/a".to_string())
+            ),
+            None => format!("Run status: {}", run.status.as_str()),
+        };
+
+        self.upsert_intelligence_node(crate::db::intelligence::IntelligenceNodeInput {
+            id: Some(format!("run:{}", run.id)),
+            kind: "session".to_string(),
+            title,
+            body,
+            metadata: Some(serde_json::json!({
+                "source": "run",
+                "run_id": run.id,
+                "background_agent_id": run.background_agent_id,
+                "status": run.status.as_str(),
+                "trigger_type": run.trigger_type.as_str(),
+                "exit_code": run.exit_code,
+                "started_at": run.started_at.to_rfc3339(),
+                "finished_at": run.finished_at.map(|t| t.to_rfc3339()),
+            })),
+            project_hash: None,
+            session_id: Some(run.id.clone()),
+            relations: None,
+        })?;
+
+        Ok(())
     }
 }
 
