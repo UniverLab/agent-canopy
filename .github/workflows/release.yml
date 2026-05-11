@@ -16,4 +16,6 @@ jobs:
     uses: UniverLab/workflows/.github/workflows/rust-release.yml@main
     with:
       binary-name: canopy
+      system-packages: protobuf-compiler
+      include-windows: false
     secrets: inherit
