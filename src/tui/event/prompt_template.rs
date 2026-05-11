@@ -197,6 +197,12 @@ fn select_addable_section(
     match name {
         "tools" => open_skills_picker(dialog, workdir),
         "project_context" => open_project_picker(dialog, db)?,
+        "memory_context" => {
+            let memory = SimplePromptDialog::build_memory_context_block(db, workdir);
+            let section_id = dialog.add_section_with_content("memory_context", memory);
+            dialog.lock_section(&section_id);
+            dialog.picker_mode = SectionPickerMode::None;
+        }
         _ => {
             dialog.add_section(name);
             dialog.picker_mode = SectionPickerMode::None;

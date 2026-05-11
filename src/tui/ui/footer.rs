@@ -138,7 +138,7 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("↑↓", "fields"),
             ("⇧↑↓←→", "cursor"),
             ("Ctrl+S", "send"),
-            ("Ctrl+A/X", "add/remove"),
+            ("Ctrl+A/X", "add/memory/remove"),
             ("Esc", "cancel"),
         ],
     };

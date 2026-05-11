@@ -210,6 +210,7 @@ impl SimplePromptDialog {
 
         let mut sections = vec![
             ("instruction", "Instruction"),
+            ("memory_context", "Memory Context"),
             ("context", "Context"),
             ("project_context", "Project Context"),
             ("resources", "Resources"),
@@ -594,6 +595,13 @@ impl SimplePromptDialog {
         let mut result = String::new();
         self.append_prompt_section(
             &mut result,
+            "memory_context",
+            "# [MEMORY CONTEXT]: PIL Snapshot\n",
+            "memory_context",
+            "memory",
+        );
+        self.append_prompt_section(
+            &mut result,
             "context",
             "# [CONTEXT]: Project Background\n",
             "context",
@@ -630,6 +638,95 @@ impl SimplePromptDialog {
         }
 
         Ok(result)
+    }
+
+    /// Build a compact memory block from PIL/session data for a workdir.
+    pub fn build_memory_context_block(db: &Database, workdir: &Path) -> String {
+        let workdir_str = workdir.display().to_string();
+        let workdir_ref = workdir_str.as_str();
+        let mut lines: Vec<String> = vec![
+            format!("workspace: {workdir_str}"),
+            "source: PIL".to_string(),
+        ];
+
+        if let Ok(messages) = db.list_sync_messages(&workdir_str, 20) {
+            let active_agent_ids = messages
+                .iter()
+                .map(|m| m.agent_id.clone())
+                .collect::<std::collections::HashSet<_>>();
+            let snapshot =
+                crate::domain::sync::summarize_sync_context(&messages, &active_agent_ids, 5);
+            lines.push(format!("sync_vibe: {}", snapshot.vibe.as_str()));
+            if !snapshot.active_intents.is_empty() {
+                lines.push("active_missions:".to_string());
+                for intent in snapshot.active_intents.iter().take(3) {
+                    lines.push(format!(
+                        "- {} [{}]: {}",
+                        intent.agent_name,
+                        intent.impact.as_str(),
+                        intent.mission
+                    ));
+                }
+            }
+        }
+
+        if let Ok(session_nodes) = db.list_intelligence_nodes(Some("session"), 50) {
+            let recent_for_workdir = session_nodes
+                .into_iter()
+                .filter(|node| {
+                    node.metadata
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                        .and_then(|meta| {
+                            meta.get("workdir")
+                                .and_then(|value| value.as_str())
+                                .map(|value| value == workdir_ref)
+                        })
+                        .unwrap_or(false)
+                })
+                .take(3)
+                .collect::<Vec<_>>();
+
+            if !recent_for_workdir.is_empty() {
+                lines.push("recent_sessions:".to_string());
+                for node in recent_for_workdir {
+                    lines.push(format!("- {}", node.title));
+                    let summary = node
+                        .metadata
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                        .and_then(|meta| {
+                            meta.get("summary")
+                                .and_then(|value| value.as_str())
+                                .map(str::to_owned)
+                        })
+                        .unwrap_or_default();
+                    if !summary.trim().is_empty() {
+                        lines.push(format!("  summary: {}", summary.trim()));
+                    }
+                }
+            }
+        }
+
+        if let Ok(patterns) = db.list_intelligence_nodes(Some("pattern"), 5) {
+            if !patterns.is_empty() {
+                lines.push("patterns:".to_string());
+                for pattern in patterns {
+                    lines.push(format!("- {}", pattern.title));
+                }
+            }
+        }
+
+        if let Ok(facts) = db.list_intelligence_nodes(Some("fact"), 5) {
+            if !facts.is_empty() {
+                lines.push("facts:".to_string());
+                for fact in facts {
+                    lines.push(format!("- {}", fact.title));
+                }
+            }
+        }
+
+        lines.join("\n")
     }
 
     fn set_content_and_cursor(
