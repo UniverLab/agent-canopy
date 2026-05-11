@@ -183,6 +183,8 @@ async fn startup_personal_rag(ingestion: Arc<IngestionManager>, data_dir: &std::
 
     if personal_roots.is_empty() {
         tracing::info!("startup_personal_rag: no directories configured, skipping");
+        // Still initialize snapshot even if no RAG dirs configured
+        ingestion.refresh_snapshot().await;
         return;
     }
 
@@ -283,6 +285,8 @@ async fn startup_personal_rag(ingestion: Arc<IngestionManager>, data_dir: &std::
 
     // Reconcile orphan chunks from files deleted while the daemon was offline.
     ingestion.reconcile_orphan_chunks().await;
+    // Keep a persisted snapshot so TUI reads counters without querying LanceDB.
+    ingestion.refresh_snapshot().await;
 
     // Start the filesystem watcher for live updates.
     Arc::clone(&ingestion).start_personal_watcher(&personal_roots);

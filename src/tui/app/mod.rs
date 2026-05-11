@@ -364,7 +364,16 @@ impl App {
             .unwrap_or(false);
 
         let (queued, processing) = self.db.rag_queue_counts().unwrap_or((0, 0));
-        let (total_chunks, indexed_files) = self.rag_lancedb_counts();
+        let total_chunks = self
+            .db
+            .get_state("rag_total_chunks")?
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+        let indexed_files = self
+            .db
+            .get_state("rag_indexed_files")?
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
         self.rag_info = crate::db::project::RagInfoSummary {
             total_chunks,
             indexed_files,
@@ -390,32 +399,6 @@ impl App {
         self.rag_file_status = self.db.rag_per_file_status().unwrap_or_default();
 
         Ok(())
-    }
-
-    fn rag_lancedb_counts(&self) -> (i64, i64) {
-        let canopy_dir = match dirs::home_dir() {
-            Some(h) => h.join(".canopy"),
-            None => return (0, 0),
-        };
-        let config = crate::domain::canopy_config::CanopyConfig::load(&canopy_dir);
-        let model = config.embeddings_model.trim();
-        if model.is_empty() {
-            return (0, 0);
-        }
-        let Ok(dimensions) = crate::rag::embedding_client::model_dimensions(model) else {
-            return (0, 0);
-        };
-        let Ok(rt) = tokio::runtime::Handle::try_current() else {
-            return (0, 0);
-        };
-        rt.block_on(async {
-            let Ok(store) = crate::rag::vector_store::VectorStore::new(dimensions).await else {
-                return (0, 0);
-            };
-            let total = store.count_chunks().await.unwrap_or(0);
-            let unique = store.count_unique_paths().await.unwrap_or(0);
-            (total, unique)
-        })
     }
 
     fn rag_vector_search(

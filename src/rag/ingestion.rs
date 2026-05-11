@@ -123,6 +123,10 @@ impl IngestionManager {
             .collect())
     }
 
+    pub async fn refresh_snapshot(&self) {
+        refresh_rag_snapshot(&self.db, &self.data_dir).await;
+    }
+
     pub fn start_personal_watcher(self: Arc<Self>, personal_roots: &[PathBuf]) {
         if personal_roots.is_empty() {
             return;
@@ -264,6 +268,7 @@ impl IngestionManager {
         }
         if purged > 0 {
             tracing::info!("RAG reconcile: removed chunks for {purged} deleted file(s)");
+            refresh_rag_snapshot(&self.db, &self.data_dir).await;
         } else {
             tracing::debug!("RAG reconcile: no orphan chunks found");
         }
@@ -464,7 +469,7 @@ impl IngestionManager {
             "RAG index_file: {source_path} — {} chunk(s) embedded, pushing to vector store",
             vector_chunks.len()
         );
-        sync_vector_store(&config, source_path, &vector_chunks).await?;
+        sync_vector_store(&self.db, &self.data_dir, &config, source_path, &vector_chunks).await?;
         Ok(())
     }
 }
@@ -549,6 +554,8 @@ async fn embed_semantic_chunks(
 }
 
 async fn sync_vector_store(
+    db: &Database,
+    data_dir: &Path,
     config: &crate::domain::canopy_config::CanopyConfig,
     source_path: &str,
     chunks: &[VectorChunk],
@@ -589,6 +596,9 @@ async fn sync_vector_store(
     if fail > 0 && ok == 0 {
         anyhow::bail!("All {fail} chunk(s) failed to insert for {source_path} — see errors above");
     }
+    if ok > 0 {
+        refresh_rag_snapshot(db, data_dir).await;
+    }
     Ok(())
 }
 
@@ -612,6 +622,7 @@ async fn purge_vector_chunks(data_dir: &Path, source_path: &str, db: Option<&cra
                     Some("file removed — watcher triggered chunk purge"),
                     chrono::Utc::now().timestamp(),
                 );
+                refresh_rag_snapshot(db, data_dir).await;
             }
         }
         Err(error) => {
@@ -621,6 +632,20 @@ async fn purge_vector_chunks(data_dir: &Path, source_path: &str, db: Option<&cra
             );
         }
     }
+}
+
+async fn refresh_rag_snapshot(db: &Database, data_dir: &Path) {
+    let config = crate::domain::canopy_config::CanopyConfig::load(data_dir);
+    let Some(store) = open_vector_store(&config).await else {
+        let _ = db.set_state("rag_total_chunks", "0");
+        let _ = db.set_state("rag_indexed_files", "0");
+        return;
+    };
+
+    let total_chunks = store.count_chunks().await.unwrap_or(0);
+    let indexed_files = store.count_unique_paths().await.unwrap_or(0);
+    let _ = db.set_state("rag_total_chunks", &total_chunks.to_string());
+    let _ = db.set_state("rag_indexed_files", &indexed_files.to_string());
 }
 
 fn extract_file_content(path: &Path, lang: &str) -> anyhow::Result<String> {
@@ -718,5 +743,7 @@ pub async fn wipe_lancedb(db: &Database) -> anyhow::Result<()> {
     }
     // Clear rag_file_events so the report starts clean for the new model.
     let _ = db.clear_rag_file_events();
+    let _ = db.set_state("rag_total_chunks", "0");
+    let _ = db.set_state("rag_indexed_files", "0");
     Ok(())
 }
