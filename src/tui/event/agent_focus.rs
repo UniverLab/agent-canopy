@@ -2,6 +2,7 @@ use anyhow::Result;
 use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
 use super::context_transfer::resolve_session;
+use super::home_preview::handle_playground_key;
 use super::search_picker::handle_suggestion_picker_key;
 use super::terminal_warp::{
     handle_terminal_direct_pty_key, handle_terminal_warp_key, record_terminal_command,
@@ -18,6 +19,9 @@ enum FocusedAgent {
 pub fn handle_agent_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
     if app.suggestion_picker.is_some() {
         return handle_suggestion_picker_key(app, code);
+    }
+    if handle_playground_key(app, code, modifiers) {
+        return Ok(());
     }
 
     if handle_split_picker_key(app, code)
@@ -124,7 +128,10 @@ fn handle_context_transfer_shortcut(app: &mut App, code: KeyCode, modifiers: Key
 
     if app.active_split_id.is_some() {
         app.open_context_transfer_for_split();
-    } else if matches!(
+        return true;
+    }
+
+    if matches!(
         app.selected_agent(),
         Some(AgentEntry::Interactive(_)) | Some(AgentEntry::Terminal(_))
     ) {
@@ -177,17 +184,24 @@ fn handle_termination_shortcut(app: &mut App, code: KeyCode, modifiers: KeyModif
     }
 
     if modifiers.contains(KeyModifiers::SHIFT) {
-        if app.active_split_id.is_some() {
-            app.terminate_focused_session();
-        }
-        return true;
+        return terminate_split_session_if_present(app);
     }
 
     if app.active_split_id.is_some() {
         app.dissolve_split();
-    } else {
-        app.terminate_focused_session();
+        return true;
     }
+
+    app.terminate_focused_session();
+    true
+}
+
+fn terminate_split_session_if_present(app: &mut App) -> bool {
+    if app.active_split_id.is_none() {
+        return true;
+    }
+
+    app.terminate_focused_session();
     true
 }
 
@@ -205,10 +219,66 @@ fn handle_agent_cycle_shortcut(app: &mut App, code: KeyCode, modifiers: KeyModif
         return false;
     }
 
-    match code {
-        KeyCode::Down => app.next_interactive(),
-        KeyCode::Up => app.prev_interactive(),
+    let forward = match code {
+        KeyCode::Down => true,
+        KeyCode::Up => false,
         _ => return false,
+    };
+
+    if app.rag_info.has_rag_activity() {
+        if app.playground_active {
+            app.deactivate_playground();
+            if forward {
+                app.next_interactive();
+            } else {
+                app.prev_interactive();
+            }
+            app.sidebar_mode = crate::tui::app::SidebarMode::Agents;
+            return true;
+        }
+
+        let focusable: Vec<usize> = app
+            .agents
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                matches!(
+                    entry,
+                    AgentEntry::Interactive(_) | AgentEntry::Terminal(_) | AgentEntry::Group(_)
+                )
+            })
+            .map(|(idx, _)| idx)
+            .collect();
+
+        if focusable.is_empty() {
+            app.activate_playground();
+            app.focus = Focus::Agent;
+            app.sidebar_mode = crate::tui::app::SidebarMode::Agents;
+            return true;
+        }
+
+        let current_pos = focusable
+            .iter()
+            .position(|&idx| idx == app.selected)
+            .unwrap_or(0);
+        let at_edge = if forward {
+            current_pos + 1 >= focusable.len()
+        } else {
+            current_pos == 0
+        };
+
+        if at_edge {
+            app.activate_playground();
+            app.focus = Focus::Agent;
+            app.sidebar_mode = crate::tui::app::SidebarMode::Agents;
+            return true;
+        }
+    }
+
+    if forward {
+        app.next_interactive();
+    } else {
+        app.prev_interactive();
     }
 
     app.sidebar_mode = crate::tui::app::SidebarMode::Agents;

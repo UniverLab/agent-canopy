@@ -601,13 +601,17 @@ fn normalize_prompt_char_input(c: char, modifiers: KeyModifiers) -> Option<char>
     // AltGr is typically reported as Ctrl+Alt; on some layouts crossterm surfaces
     // the base key (for example 'q'/'2') instead of the produced character.
     if modifiers.contains(KeyModifiers::CONTROL) && modifiers.contains(KeyModifiers::ALT) {
-        return Some(match c {
-            'q' | 'Q' | '2' => '@',
-            _ => c,
-        });
+        return Some(normalize_altgr_char(c));
     }
 
     None
+}
+
+fn normalize_altgr_char(c: char) -> char {
+    match c {
+        'q' | 'Q' | '2' => '@',
+        _ => c,
+    }
 }
 
 fn handle_enter_key(
@@ -718,11 +722,7 @@ fn submit_prompt(app: &mut App, prompt: &str) {
 }
 
 fn write_prompt_to_selected_agent(app: &mut App, prompt: &str) {
-    let selected_idx = match app.selected_agent() {
-        Some(AgentEntry::Interactive(idx)) => Some(*idx),
-        _ => None,
-    };
-    let Some(idx) = selected_idx else {
+    let Some(idx) = selected_interactive_index(app) else {
         return;
     };
     let Some(agent) = app.interactive_agents.get_mut(idx) else {
@@ -732,6 +732,13 @@ fn write_prompt_to_selected_agent(app: &mut App, prompt: &str) {
     let pasted = format!("\x1b[200~{prompt}\x1b[201~");
     let _ = agent.write_to_pty(pasted.as_bytes());
     let _ = agent.write_to_pty(b"\r");
+}
+
+fn selected_interactive_index(app: &App) -> Option<usize> {
+    match app.selected_agent() {
+        Some(AgentEntry::Interactive(idx)) => Some(*idx),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

@@ -74,66 +74,7 @@ pub fn handle_home_key(app: &mut App, code: KeyCode, _modifiers: KeyModifiers) -
 // ── Preview: navigate agents, Enter → Focus ─────────────────────────
 
 pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
-    // If playground is active, handle playground-specific inputs
-    if app.playground_active {
-        if app.playground_detail_mode {
-            match code {
-                KeyCode::Esc => {
-                    app.playground_detail_mode = false;
-                    app.playground_scroll = 0;
-                }
-                KeyCode::F(10) => {
-                    app.playground_detail_mode = false;
-                    app.playground_scroll = 0;
-                }
-                KeyCode::Up if modifiers.contains(KeyModifiers::SHIFT) => {
-                    app.deactivate_playground();
-                    app.select_prev();
-                }
-                KeyCode::Down if modifiers.contains(KeyModifiers::SHIFT) => {
-                    app.deactivate_playground();
-                    app.select_next();
-                }
-                KeyCode::Up => {
-                    app.playground_scroll = app.playground_scroll.saturating_sub(3);
-                }
-                KeyCode::Down => {
-                    app.playground_scroll = app.playground_scroll.saturating_add(3);
-                }
-                KeyCode::Char('t') if modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.open_rag_transfer_modal();
-                }
-                _ => {}
-            }
-        } else {
-            match code {
-                KeyCode::F(10) => {
-                    app.deactivate_playground();
-                }
-                KeyCode::Up if app.playground_selected > 0 => {
-                    app.playground_selected -= 1;
-                }
-                KeyCode::Down if app.playground_selected + 1 < app.playground_results.len() => {
-                    app.playground_selected += 1;
-                }
-                KeyCode::Enter | KeyCode::Char('l') if !app.playground_results.is_empty() => {
-                    app.playground_detail_mode = true;
-                    app.playground_scroll = 0;
-                }
-                KeyCode::Backspace => {
-                    app.playground_query.pop();
-                    app.playground_last_search = std::time::Instant::now();
-                }
-                KeyCode::Char('t') if modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.open_rag_transfer_modal();
-                }
-                KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.playground_query.push(c);
-                    app.playground_last_search = std::time::Instant::now();
-                }
-                _ => {}
-            }
-        }
+    if handle_playground_key(app, code, modifiers) {
         return Ok(());
     }
 
@@ -181,14 +122,9 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
                 }
             } else {
                 // Agents mode: Down navigates agents; if at end and RAG exists, go to RagInfo.
-                // If already on RagInfo, scroll the per-file list; at end, wrap back to first agent.
                 if app.agents_rag_focused {
-                    let max_scroll = app.rag_file_status.len().saturating_sub(1);
-                    if app.rag_report_scroll < max_scroll {
-                        app.rag_report_scroll += 1;
-                    } else {
-                        app.agents_rag_focused = false;
-                        app.rag_report_scroll = 0;
+                    app.agents_rag_focused = false;
+                    if !app.agents.is_empty() {
                         app.selected = 0;
                     }
                 } else {
@@ -210,12 +146,10 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
                     app.select_prev();
                 }
             } else {
-                // Agents mode: Up scrolls in ragInfo; at top, exits back to last agent
                 if app.agents_rag_focused {
-                    if app.rag_report_scroll > 0 {
-                        app.rag_report_scroll -= 1;
-                    } else {
-                        app.agents_rag_focused = false;
+                    app.agents_rag_focused = false;
+                    if !app.agents.is_empty() {
+                        app.selected = app.agents.len() - 1;
                     }
                 } else {
                     app.select_prev();
@@ -256,6 +190,111 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
         _ => {}
     }
     Ok(())
+}
+
+pub(super) fn handle_playground_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> bool {
+    if !app.playground_active {
+        return false;
+    }
+
+    if app.playground_detail_mode {
+        match code {
+            KeyCode::Esc | KeyCode::F(10) => {
+                app.playground_detail_mode = false;
+                app.playground_scroll = 0;
+            }
+            KeyCode::Up if modifiers.contains(KeyModifiers::SHIFT) => {
+                app.deactivate_playground();
+                if app.focus == Focus::Agent {
+                    app.prev_interactive();
+                } else {
+                    app.select_prev();
+                }
+            }
+            KeyCode::Down if modifiers.contains(KeyModifiers::SHIFT) => {
+                app.deactivate_playground();
+                if app.focus == Focus::Agent {
+                    app.next_interactive();
+                } else {
+                    app.select_next();
+                }
+            }
+            KeyCode::Up => {
+                app.playground_scroll = app.playground_scroll.saturating_sub(3);
+            }
+            KeyCode::Down => {
+                app.playground_scroll = app.playground_scroll.saturating_add(3);
+            }
+            KeyCode::Char('t') if modifiers.contains(KeyModifiers::CONTROL) => {
+                app.open_rag_transfer_modal();
+            }
+            _ => {}
+        }
+        return true;
+    }
+
+    match code {
+        KeyCode::F(10) => {
+            app.deactivate_playground();
+            if app.focus != Focus::Agent {
+                app.focus = Focus::Preview;
+            }
+        }
+        KeyCode::Up if modifiers.contains(KeyModifiers::SHIFT) => {
+            app.deactivate_playground();
+            if app.focus == Focus::Agent {
+                app.prev_interactive();
+            } else {
+                app.select_prev();
+            }
+        }
+        KeyCode::Down if modifiers.contains(KeyModifiers::SHIFT) => {
+            app.deactivate_playground();
+            if app.focus == Focus::Agent {
+                app.next_interactive();
+            } else {
+                app.select_next();
+            }
+        }
+        KeyCode::Up if app.playground_selected > 0 => {
+            app.playground_selected -= 1;
+        }
+        KeyCode::Down if app.playground_selected + 1 < app.playground_results.len() => {
+            app.playground_selected += 1;
+        }
+        KeyCode::Enter | KeyCode::Char('l') => {
+            if app.playground_last_executed_query != app.playground_query.trim() {
+                app.playground_search_pending = true;
+                app.playground_last_search =
+                    std::time::Instant::now() - std::time::Duration::from_secs(1);
+            } else if !app.playground_results.is_empty() {
+                app.playground_detail_mode = true;
+                app.playground_scroll = 0;
+            }
+        }
+        KeyCode::Backspace => {
+            app.playground_query.pop();
+            if app.playground_query.is_empty() {
+                app.playground_results.clear();
+                app.playground_selected = 0;
+                app.playground_last_executed_query.clear();
+            }
+            // Deleting does not trigger auto-search.
+            app.playground_search_pending = false;
+            app.playground_last_search = std::time::Instant::now();
+        }
+        KeyCode::Char('t') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.open_rag_transfer_modal();
+        }
+        KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
+            app.playground_query.push(c);
+            app.playground_last_search = std::time::Instant::now();
+            app.playground_search_pending = true;
+        }
+        _ => {}
+    }
+
+    true
 }
 
 // ── Focus: PTY interaction or log scroll ────────────────────────────
