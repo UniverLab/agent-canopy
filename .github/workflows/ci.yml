@@ -6,4 +6,9 @@ on:
 
 jobs:
   rust-ci:
+    name: Format, Lint & Test
     uses: UniverLab/workflows/.github/workflows/rust-ci.yml@main
+    with:
+      system-packages: protobuf-compiler
+
+
