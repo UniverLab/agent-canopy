@@ -144,7 +144,42 @@ impl Database {
                 occurred_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_rag_file_events_path
-                ON rag_file_events(file_path);",
+                ON rag_file_events(file_path);
+
+            CREATE TABLE IF NOT EXISTS intelligence_nodes (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                metadata TEXT,
+                project_hash TEXT,
+                session_id TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_intelligence_nodes_kind_updated
+                ON intelligence_nodes(kind, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_intelligence_nodes_project_hash
+                ON intelligence_nodes(project_hash);
+            CREATE INDEX IF NOT EXISTS idx_intelligence_nodes_session_id
+                ON intelligence_nodes(session_id);
+
+            CREATE TABLE IF NOT EXISTS intelligence_edges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_node_id TEXT NOT NULL,
+                to_node_id TEXT NOT NULL,
+                relation TEXT NOT NULL,
+                weight REAL NOT NULL DEFAULT 1.0,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY(from_node_id) REFERENCES intelligence_nodes(id) ON DELETE CASCADE,
+                FOREIGN KEY(to_node_id) REFERENCES intelligence_nodes(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_intelligence_edges_from
+                ON intelligence_edges(from_node_id);
+            CREATE INDEX IF NOT EXISTS idx_intelligence_edges_to
+                ON intelligence_edges(to_node_id);",
         )?;
 
         Ok(())
@@ -153,6 +188,7 @@ impl Database {
 
 pub mod agent;
 pub mod group;
+pub mod intelligence;
 pub mod project;
 pub mod run;
 pub mod session;

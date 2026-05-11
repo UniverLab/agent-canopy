@@ -1,4 +1,5 @@
 use super::*;
+use crate::db::intelligence::{IntelligenceNodeInput, IntelligenceRelationInput};
 use crate::domain::models::{Agent, Cli, RunLog, RunStatus, Trigger, TriggerType, WatchEvent};
 use crate::domain::sync::{
     IntentPayload, MessageKind, MissionImpact, StatusPayload, WorkspaceStatus,
@@ -218,6 +219,83 @@ fn test_sync_message_payload_roundtrip() {
         .as_deref()
         .unwrap_or_default()
         .contains("testing"));
+}
+
+#[test]
+fn test_recent_sync_messages_returns_global_order() {
+    let db = test_db();
+    db.insert_sync_message(
+        "/tmp/project-a",
+        "agent-a",
+        "copilot",
+        MessageKind::Info,
+        "one",
+        None,
+    )
+    .unwrap();
+    db.insert_sync_message(
+        "/tmp/project-b",
+        "agent-b",
+        "claude",
+        MessageKind::Info,
+        "two",
+        None,
+    )
+    .unwrap();
+
+    let messages = db.list_recent_sync_messages(10).unwrap();
+
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].message, "one");
+    assert_eq!(messages[1].message, "two");
+}
+
+// ── Project intelligence layer ────────────────────────────────────
+
+#[test]
+fn test_intelligence_upsert_search_and_graph_walk() {
+    let db = test_db();
+    db.upsert_intelligence_node(IntelligenceNodeInput {
+        id: Some("node-b".to_string()),
+        kind: "pattern".to_string(),
+        title: "Connection caching".to_string(),
+        body: "Cache expensive clients".to_string(),
+        metadata: None,
+        project_hash: Some("project-1".to_string()),
+        session_id: None,
+        relations: None,
+    })
+    .unwrap();
+    let base = db
+        .upsert_intelligence_node(IntelligenceNodeInput {
+            id: Some("node-a".to_string()),
+            kind: "fact".to_string(),
+            title: "Database rule".to_string(),
+            body: "Use a single connection".to_string(),
+            metadata: Some(serde_json::json!({"topic": "db"})),
+            project_hash: Some("project-1".to_string()),
+            session_id: Some("session-1".to_string()),
+            relations: Some(vec![IntelligenceRelationInput {
+                to_node_id: "node-b".to_string(),
+                relation: "related_to".to_string(),
+                weight: Some(0.8),
+            }]),
+        })
+        .unwrap();
+
+    let search = db
+        .search_intelligence_nodes("connection", Some("pattern"), 10)
+        .unwrap();
+    assert_eq!(search.len(), 1);
+    assert_eq!(search[0].id, "node-b");
+
+    let walk = db
+        .walk_intelligence_graph(&base.id, 2)
+        .unwrap()
+        .expect("graph walk should find node");
+    assert_eq!(walk.root.id, "node-a");
+    assert!(walk.nodes.iter().any(|node| node.id == "node-b"));
+    assert!(walk.edges.iter().any(|edge| edge.from_node_id == "node-a"));
 }
 
 // ── Project registry / RAG metadata ──────────────────────────────

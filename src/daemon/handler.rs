@@ -764,6 +764,158 @@ impl TaskTriggerHandler {
         )]))
     }
 
+    #[tool(
+        name = "intelligence_get_context",
+        description = "Return PIL context at the requested scope: light or full."
+    )]
+    async fn intelligence_get_context(
+        &self,
+        Parameters(params): Parameters<IntelligenceGetContextParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let scope = params.scope.trim().to_lowercase();
+        let (session_limit, knowledge_limit, sync_limit) = match scope.as_str() {
+            "light" => (2, 5, 8),
+            "full" => (10, 20, 25),
+            _ => return Ok(error_result("Invalid scope. Must be: light or full.")),
+        };
+
+        let sessions = self
+            .db
+            .list_intelligence_nodes(Some("session"), session_limit)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let knowledge = self
+            .db
+            .list_intelligence_nodes(None, knowledge_limit)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let sync_messages = self
+            .db
+            .list_recent_sync_messages(sync_limit)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let summary_prefix = if scope == "light" {
+            "Light context"
+        } else {
+            "Full context"
+        };
+
+        let out = serde_json::json!({
+            "scope": scope,
+            "summary": format!(
+                "{}: {} session node(s), {} knowledge node(s), {} sync message(s).",
+                summary_prefix,
+                sessions.len(),
+                knowledge.len(),
+                sync_messages.len()
+            ),
+            "sessions": sessions.iter().map(intelligence_node_json).collect::<Vec<_>>(),
+            "knowledge": knowledge.iter().map(intelligence_node_json).collect::<Vec<_>>(),
+            "sync_messages": sync_messages.iter().map(sync_message_json).collect::<Vec<_>>(),
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&out).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        name = "intelligence_upsert",
+        description = "Create or update an intelligence node and optional relations."
+    )]
+    async fn intelligence_upsert(
+        &self,
+        Parameters(params): Parameters<IntelligenceUpsertParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let node = crate::db::intelligence::IntelligenceNodeInput {
+            id: params.node_data.id,
+            kind: params.node_data.kind,
+            title: params.node_data.title,
+            body: params.node_data.body,
+            metadata: params.node_data.metadata,
+            project_hash: params.node_data.project_hash,
+            session_id: params.node_data.session_id,
+            relations: params.node_data.relations.map(|relations| {
+                relations
+                    .into_iter()
+                    .map(
+                        |relation| crate::db::intelligence::IntelligenceRelationInput {
+                            to_node_id: relation.to_node_id,
+                            relation: relation.relation,
+                            weight: relation.weight,
+                        },
+                    )
+                    .collect()
+            }),
+        };
+
+        let record = self
+            .db
+            .upsert_intelligence_node(node)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&serde_json::json!({
+                "node": intelligence_node_json(&record),
+            }))
+            .unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        name = "intelligence_search",
+        description = "Search intelligence nodes by free text and optional kind."
+    )]
+    async fn intelligence_search(
+        &self,
+        Parameters(params): Parameters<IntelligenceSearchParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let limit = params.limit.unwrap_or(10).min(50);
+        let results = self
+            .db
+            .search_intelligence_nodes(&params.query, params.kind.as_deref(), limit)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let out = serde_json::json!({
+            "query": params.query,
+            "kind": params.kind,
+            "count": results.len(),
+            "results": results.iter().map(intelligence_node_json).collect::<Vec<_>>(),
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&out).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        name = "intelligence_graph_walk",
+        description = "Walk the PIL graph from a node up to the requested depth."
+    )]
+    async fn intelligence_graph_walk(
+        &self,
+        Parameters(params): Parameters<IntelligenceGraphWalkParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let depth = params.depth.unwrap_or(2).min(8);
+        let Some(graph) = self
+            .db
+            .walk_intelligence_graph(&params.node_id, depth)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        else {
+            return Ok(error_result(&format!(
+                "Intelligence node '{}' not found.",
+                params.node_id
+            )));
+        };
+
+        let out = serde_json::json!({
+            "root": intelligence_node_json(&graph.root),
+            "nodes": graph.nodes.iter().map(intelligence_node_json).collect::<Vec<_>>(),
+            "edges": graph.edges.iter().map(intelligence_edge_json).collect::<Vec<_>>(),
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&out).unwrap_or_default(),
+        )]))
+    }
+
     /// Search registered projects by name or description.
     #[tool(
         name = "project_search",
@@ -945,6 +1097,48 @@ impl TaskTriggerHandler {
             .err()
             .map(|retry_after| error_result(&format!("rate_limited: retry_after={retry_after}s")))
     }
+}
+
+fn intelligence_node_json(
+    node: &crate::db::intelligence::IntelligenceNodeRecord,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": node.id,
+        "kind": node.kind,
+        "title": node.title,
+        "body": node.body,
+        "metadata": node.metadata,
+        "project_hash": node.project_hash,
+        "session_id": node.session_id,
+        "created_at": node.created_at,
+        "updated_at": node.updated_at,
+    })
+}
+
+fn intelligence_edge_json(
+    edge: &crate::db::intelligence::IntelligenceEdgeRecord,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": edge.id,
+        "from_node_id": edge.from_node_id,
+        "to_node_id": edge.to_node_id,
+        "relation": edge.relation,
+        "weight": edge.weight,
+        "created_at": edge.created_at,
+    })
+}
+
+fn sync_message_json(message: &crate::domain::sync::SyncMessage) -> serde_json::Value {
+    serde_json::json!({
+        "id": message.id,
+        "workdir": message.workdir,
+        "agent_id": message.agent_id,
+        "agent_name": message.agent_name,
+        "kind": message.kind.as_str(),
+        "message": message.message,
+        "payload": message.payload,
+        "created_at": message.created_at,
+    })
 }
 
 #[tool_handler]

@@ -157,6 +157,68 @@ pub struct SyncGetContextParams {
     pub limit: Option<usize>,
 }
 
+// ── Intelligence tool parameter types ─────────────────────────────
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct IntelligenceGetContextParams {
+    /// Context depth: light or full.
+    pub scope: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct IntelligenceRelationParams {
+    /// Target node ID for the relation.
+    pub to_node_id: String,
+    /// Relation label, e.g. "depends_on" or "summarizes".
+    pub relation: String,
+    /// Optional edge weight.
+    pub weight: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct IntelligenceNodeParams {
+    /// Optional stable node ID. If omitted, a new UUID is generated.
+    pub id: Option<String>,
+    /// Node kind: project, session, fact, or pattern.
+    pub kind: String,
+    /// Human-readable title for the node.
+    pub title: String,
+    /// Main body/content of the node.
+    pub body: String,
+    /// Optional structured metadata.
+    pub metadata: Option<serde_json::Value>,
+    /// Optional project hash this node belongs to.
+    pub project_hash: Option<String>,
+    /// Optional session ID this node belongs to.
+    pub session_id: Option<String>,
+    /// Optional outgoing relations to other nodes.
+    pub relations: Option<Vec<IntelligenceRelationParams>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct IntelligenceUpsertParams {
+    /// Node payload to create or update.
+    pub node_data: IntelligenceNodeParams,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct IntelligenceSearchParams {
+    /// Free-text search query.
+    pub query: String,
+    /// Optional kind filter.
+    pub kind: Option<String>,
+    /// Maximum number of results to return.
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct IntelligenceGraphWalkParams {
+    /// Starting node ID.
+    pub node_id: String,
+    /// Maximum traversal depth.
+    pub depth: Option<usize>,
+}
+
 // ── RAG tool parameter types ───────────────────────────────────────────
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

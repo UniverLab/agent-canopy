@@ -69,6 +69,36 @@ impl Database {
         Ok(messages)
     }
 
+    pub fn list_recent_sync_messages(&self, limit: usize) -> Result<Vec<SyncMessage>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, workdir, agent_id, agent_name, kind, message, payload, created_at
+             FROM sync_messages
+             ORDER BY id DESC LIMIT ?1",
+        )?;
+
+        let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
+            let kind_str: String = row.get(4)?;
+            Ok(SyncMessage {
+                id: row.get(0)?,
+                workdir: row.get(1)?,
+                agent_id: row.get(2)?,
+                agent_name: row.get(3)?,
+                kind: MessageKind::from_str(&kind_str).unwrap_or(MessageKind::Info),
+                message: row.get(5)?,
+                payload: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        })?;
+
+        let mut messages: Vec<SyncMessage> = rows.filter_map(|row| row.ok()).collect();
+        messages.reverse();
+        Ok(messages)
+    }
+
     pub fn list_active_sync_agent_ids(&self, workdir: &str) -> Result<Vec<String>> {
         let conn = self
             .conn
