@@ -1,1 +1,1 @@
-
+// Library crate intentionally minimal.

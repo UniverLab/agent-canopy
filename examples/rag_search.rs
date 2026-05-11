@@ -1,3 +1,17 @@
+mod setup_module {
+    #[derive(Clone)]
+    pub struct PlatformWithCli {
+        pub cli: Option<crate::domain::cli_config::CliConfig>,
+    }
+}
+
+#[path = "../src/domain/mod.rs"]
+mod domain;
+#[path = "../src/rag/embedding_client.rs"]
+mod embedding_client;
+#[path = "../src/rag/vector_store.rs"]
+mod vector_store;
+
 /// Example: Search the personal RAG for content about denoising metrics
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -5,26 +19,25 @@ async fn main() -> anyhow::Result<()> {
     let data_dir = home.join(".canopy");
 
     // Load config to get model
-    let config = harness_canopy::domain::canopy_config::CanopyConfig::load(&data_dir);
+    let config = domain::canopy_config::CanopyConfig::load(&data_dir);
     let model = config.embeddings_model.trim();
 
     println!("🔍 RAG Search Example");
     println!("  Model: {}", model);
 
     // Get embedding dimensions
-    let dimensions = harness_canopy::rag::embedding_client::model_dimensions(model)
+    let dimensions = embedding_client::model_dimensions(model)
         .map_err(|e| anyhow::anyhow!("Invalid model: {}", e))?;
     println!("  Dimensions: {}", dimensions);
 
     // Create embedding client
-    let client = harness_canopy::rag::embedding_client::client_from_config(&config)?;
+    let client = embedding_client::client_from_config(&config)?;
 
     // Embed the query (run in blocking task to avoid blocking async executor)
     let query = "métricas validar denoising resultados conclusiones metrics";
     println!("\n🔎 Query: \"{}\"", query);
 
     let query_vec: Vec<f32> = tokio::task::spawn_blocking({
-        let client = client.clone();
         let q = query.to_string();
         move || client.embed(&q)
     })
@@ -33,10 +46,8 @@ async fn main() -> anyhow::Result<()> {
     println!("✅ Query embedded: {} dims\n", query_vec.len());
 
     // Open vector store and search
-    let store: harness_canopy::rag::vector_store::VectorStore =
-        harness_canopy::rag::vector_store::VectorStore::new(dimensions).await?;
-    let results: Vec<harness_canopy::rag::vector_store::SearchResult> =
-        store.search_similar(&query_vec, 5).await?;
+    let store: vector_store::VectorStore = vector_store::VectorStore::new(dimensions).await?;
+    let results: Vec<vector_store::SearchResult> = store.search_similar(&query_vec, 5).await?;
 
     println!("📊 Top 5 results:\n");
     if results.is_empty() {
