@@ -345,18 +345,35 @@ fn set_focused_interactive_cursor(
         return;
     }
 
-    let cursor_col = adjusted_interactive_cursor_col(agent.cli.as_str(), snap.cursor_col);
+    let cursor_col = adjusted_interactive_cursor_col(agent.cli.as_str(), snap);
     let cx = area.x + cursor_col.min(area.width.saturating_sub(1));
     let cy = area.y + snap.cursor_row.min(area.height.saturating_sub(1));
     frame.set_cursor_position((cx, cy));
 }
 
-fn adjusted_interactive_cursor_col(cli_name: &str, cursor_col: u16) -> u16 {
-    if cli_name == "copilot" {
-        cursor_col.saturating_sub(1)
-    } else {
-        cursor_col
+fn adjusted_interactive_cursor_col(
+    cli_name: &str,
+    snap: &crate::tui::agent::ScreenSnapshot,
+) -> u16 {
+    let cursor_col = snap.cursor_col;
+    if !cli_name.to_ascii_lowercase().contains("copilot") {
+        return cursor_col;
     }
+
+    // Copilot can render its own in-band cursor decoration; when present, trust
+    // the inverse-highlighted cell rather than vt cursor coordinates.
+    if let Some(row) = snap.cells.get(snap.cursor_row as usize) {
+        if let Some((idx, _)) = row
+            .iter()
+            .enumerate()
+            .find(|(_, cell)| cell.as_ref().is_some_and(|c| c.inverse))
+        {
+            return idx as u16;
+        }
+    }
+
+    // Legacy offset fallback for Copilot prompts that report one cell ahead.
+    cursor_col.saturating_sub(1)
 }
 
 pub(super) fn draw_log_panel(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -971,15 +988,54 @@ fn find_session_by_name(app: &App, name: &str) -> Option<SessionRef> {
 #[cfg(test)]
 mod tests {
     use super::adjusted_interactive_cursor_col;
+    use crate::tui::agent::screen::VtCell;
+    use crate::tui::agent::ScreenSnapshot;
+    use ratatui::style::Color;
 
     #[test]
     fn copilot_cursor_is_shifted_left_by_one() {
-        assert_eq!(adjusted_interactive_cursor_col("copilot", 5), 4);
-        assert_eq!(adjusted_interactive_cursor_col("copilot", 0), 0);
+        let snap = ScreenSnapshot {
+            cells: vec![(0..8).map(|_| None).collect()],
+            cursor_row: 0,
+            cursor_col: 5,
+            scrolled: false,
+        };
+        assert_eq!(adjusted_interactive_cursor_col("copilot", &snap), 4);
+        let snap_zero = ScreenSnapshot {
+            cursor_col: 0,
+            ..snap
+        };
+        assert_eq!(adjusted_interactive_cursor_col("copilot", &snap_zero), 0);
+    }
+
+    #[test]
+    fn copilot_cursor_prefers_inverse_cell_when_present() {
+        let mut row: Vec<Option<VtCell>> = (0..8).map(|_| None).collect();
+        row[3] = Some(VtCell {
+            ch: "x".to_string(),
+            fg: Color::White,
+            bg: Color::Black,
+            bold: false,
+            underline: false,
+            inverse: true,
+        });
+        let snap = ScreenSnapshot {
+            cells: vec![row],
+            cursor_row: 0,
+            cursor_col: 7,
+            scrolled: false,
+        };
+        assert_eq!(adjusted_interactive_cursor_col("copilot-cli", &snap), 3);
     }
 
     #[test]
     fn other_clients_keep_their_cursor_position() {
-        assert_eq!(adjusted_interactive_cursor_col("opencode", 5), 5);
+        let snap = ScreenSnapshot {
+            cells: vec![(0..8).map(|_| None).collect()],
+            cursor_row: 0,
+            cursor_col: 5,
+            scrolled: false,
+        };
+        assert_eq!(adjusted_interactive_cursor_col("opencode", &snap), 5);
     }
 }

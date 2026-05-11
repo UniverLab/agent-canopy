@@ -875,15 +875,38 @@ impl SimplePromptDialog {
         if field_width == 0 {
             return 1;
         }
-        let mut count = 0;
-        for line in text.lines() {
-            if line.is_empty() {
-                count += 1;
-            } else {
-                count += line.chars().count().div_ceil(field_width);
+
+        // Keep wrapping math aligned with the rendered paragraph, including tabs
+        // and hard line breaks, so box height grows when visible text does.
+        let mut lines = 1usize;
+        let mut col = 0usize;
+        for ch in text.chars() {
+            match ch {
+                '\n' => {
+                    lines += 1;
+                    col = 0;
+                }
+                '\t' => {
+                    let tab = 4 - (col % 4);
+                    if col + tab > field_width {
+                        lines += 1;
+                        col = tab;
+                    } else {
+                        col += tab;
+                    }
+                }
+                _ => {
+                    if col + 1 > field_width {
+                        lines += 1;
+                        col = 1;
+                    } else {
+                        col += 1;
+                    }
+                }
             }
         }
-        count.max(1)
+
+        lines.max(1)
     }
 
     /// Visual lines occupied by the first `char_idx` chars of text.
@@ -904,11 +927,7 @@ impl SimplePromptDialog {
     /// Update scroll for a section so the cursor stays visible.
     pub fn update_section_scroll(&mut self, section_id: &str, field_width: usize) {
         let max_vis = Self::max_visible_lines(section_id);
-        let text = self
-            .sections
-            .get(section_id)
-            .map(|s| s.as_str())
-            .unwrap_or("");
+        let text = self.section_content_for_build(section_id).unwrap_or("");
         let cur = self.cursor(section_id);
         let cursor_visual_line =
             Self::visual_lines_to_cursor(text, cur, field_width).saturating_sub(1);

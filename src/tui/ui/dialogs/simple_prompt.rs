@@ -103,11 +103,7 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) {
         .map(|(i, section_name)| {
             let is_focused = dialog.focused_section == i;
             let content_h = if is_focused {
-                let content = dialog
-                    .sections
-                    .get(section_name)
-                    .map(|s| s.as_str())
-                    .unwrap_or("");
+                let content = dialog.section_content_for_build(section_name).unwrap_or("");
                 let vis = crate::tui::app::dialog::SimplePromptDialog::visual_line_count(
                     content,
                     field_width,
