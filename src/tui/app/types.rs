@@ -133,10 +133,12 @@ pub struct App {
 
     // System monitoring (updated asynchronously to avoid UI freezes)
     pub(crate) system_info: crate::system::SystemInfo,
+    pub(crate) system_info_target: crate::system::SystemInfo,
     pub(crate) system_info_rx: std::sync::mpsc::Receiver<crate::system::SystemInfo>,
-    /// Controls system monitor cadence: true = fast polling, false = lazy polling.
+    /// Controls system monitor activity: true = poll, false = pause polling.
     pub(crate) system_monitor_active: Arc<AtomicBool>,
     pub(crate) last_system_update: std::time::Instant,
+    pub(crate) last_system_frame_at: std::time::Instant,
     pub(crate) process_start_time: std::time::Instant,
 
     // Layout state
@@ -149,8 +151,6 @@ pub struct App {
     pub(crate) rag_info: RagInfoSummary,
     /// Per-file RAG status loaded from `rag_file_events` table.
     pub(crate) rag_file_status: Vec<crate::db::project::RagPerFileStatus>,
-    /// Scroll offset for the per-file list in the ragInfo preview panel.
-    pub(crate) rag_report_scroll: usize,
     pub(crate) sidebar_visible: bool,
     pub(crate) sync_panel_visible: bool,
     pub(crate) term_width: u16,
@@ -210,6 +210,7 @@ pub struct App {
     pub(crate) playground_results: Vec<SearchResult>,
     pub(crate) playground_selected: usize,
     pub(crate) playground_last_search: std::time::Instant,
+    pub(crate) playground_search_pending: bool,
     pub(crate) playground_last_executed_query: String,
     /// Whether the playground is showing a single chunk in detail mode.
     pub(crate) playground_detail_mode: bool,
