@@ -388,16 +388,7 @@ impl TaskTriggerHandler {
         let watch_count = agents.iter().filter(|a| a.is_watch()).count();
         let manual_count = agents.len() - cron_count - watch_count;
 
-        let transport = if self.port > 0 {
-            "Streamable HTTP"
-        } else {
-            "stdio"
-        };
-        let port_str = if self.port > 0 {
-            self.port.to_string()
-        } else {
-            "N/A".into()
-        };
+        let (transport, port_str) = transport_details(self.port);
 
         let mut status = format!(
             "canopy v{}\n\
@@ -421,11 +412,7 @@ impl TaskTriggerHandler {
             log_dir,
         );
 
-        let temporal = format_temporal_agents(&agents);
-        if !temporal.is_empty() {
-            status.push_str("\n\nTemporal agents:\n");
-            status.push_str(&temporal);
-        }
+        append_temporal_agents_section(&mut status, &agents);
 
         Ok(CallToolResult::success(vec![Content::text(status)]))
     }
@@ -773,9 +760,9 @@ impl TaskTriggerHandler {
         Parameters(params): Parameters<IntelligenceGetContextParams>,
     ) -> Result<CallToolResult, McpError> {
         let scope = params.scope.trim().to_lowercase();
-        let (session_limit, knowledge_limit, sync_limit) = match scope.as_str() {
-            "light" => (2, 5, 8),
-            "full" => (10, 20, 25),
+        let (session_limit, knowledge_limit, sync_limit, dependency_limit) = match scope.as_str() {
+            "light" => (2, 5, 8, 0),
+            "full" => (10, 20, 25, 30),
             _ => return Ok(error_result("Invalid scope. Must be: light or full.")),
         };
 
@@ -791,6 +778,13 @@ impl TaskTriggerHandler {
             .db
             .list_recent_sync_messages(sync_limit)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let cross_project_dependencies = if scope == "full" {
+            self.db
+                .list_cross_project_dependencies(dependency_limit)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        } else {
+            Vec::new()
+        };
         let summary_prefix = if scope == "light" {
             "Light context"
         } else {
@@ -809,6 +803,7 @@ impl TaskTriggerHandler {
             "sessions": sessions.iter().map(intelligence_node_json).collect::<Vec<_>>(),
             "knowledge": knowledge.iter().map(intelligence_node_json).collect::<Vec<_>>(),
             "sync_messages": sync_messages.iter().map(sync_message_json).collect::<Vec<_>>(),
+            "cross_project_dependencies": cross_project_dependencies,
         });
 
         Ok(CallToolResult::success(vec![Content::text(
@@ -1139,6 +1134,24 @@ fn sync_message_json(message: &crate::domain::sync::SyncMessage) -> serde_json::
         "payload": message.payload,
         "created_at": message.created_at,
     })
+}
+
+fn transport_details(port: u16) -> (&'static str, String) {
+    if port > 0 {
+        ("Streamable HTTP", port.to_string())
+    } else {
+        ("stdio", "N/A".to_owned())
+    }
+}
+
+fn append_temporal_agents_section(status: &mut String, agents: &[Agent]) {
+    let temporal = format_temporal_agents(agents);
+    if temporal.is_empty() {
+        return;
+    }
+
+    status.push_str("\n\nTemporal agents:\n");
+    status.push_str(&temporal);
 }
 
 #[tool_handler]
