@@ -57,6 +57,19 @@ pub struct IntelligenceGraphWalk {
     pub edges: Vec<IntelligenceEdgeRecord>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntelligenceProjectDependencyRecord {
+    pub from_node_id: String,
+    pub from_title: String,
+    pub from_project_hash: Option<String>,
+    pub to_node_id: String,
+    pub to_title: String,
+    pub to_project_hash: Option<String>,
+    pub relation: String,
+    pub weight: f64,
+    pub created_at: i64,
+}
+
 impl Database {
     pub fn upsert_intelligence_node(
         &self,
@@ -284,6 +297,57 @@ impl Database {
             nodes: collected_nodes.into_values().collect(),
             edges: collected_edges,
         }))
+    }
+
+    pub fn list_cross_project_dependencies(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<IntelligenceProjectDependencyRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT
+                e.from_node_id,
+                from_node.title,
+                from_node.project_hash,
+                e.to_node_id,
+                to_node.title,
+                to_node.project_hash,
+                e.relation,
+                e.weight,
+                e.created_at
+             FROM intelligence_edges e
+             JOIN intelligence_nodes from_node ON from_node.id = e.from_node_id
+             JOIN intelligence_nodes to_node ON to_node.id = e.to_node_id
+             WHERE from_node.kind = 'project'
+               AND to_node.kind = 'project'
+               AND (
+                   instr(lower(e.relation), 'depend') > 0 OR
+                   instr(lower(e.relation), 'require') > 0 OR
+                   instr(lower(e.relation), 'block') > 0
+               )
+             ORDER BY e.created_at DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![limit as i64],
+            |row| -> rusqlite::Result<IntelligenceProjectDependencyRecord> {
+                Ok(IntelligenceProjectDependencyRecord {
+                    from_node_id: row.get(0)?,
+                    from_title: row.get(1)?,
+                    from_project_hash: row.get(2)?,
+                    to_node_id: row.get(3)?,
+                    to_title: row.get(4)?,
+                    to_project_hash: row.get(5)?,
+                    relation: row.get(6)?,
+                    weight: row.get(7)?,
+                    created_at: row.get(8)?,
+                })
+            },
+        )?;
+        Ok(rows.filter_map(|row| row.ok()).collect())
     }
 
     fn read_intelligence_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<IntelligenceNodeRecord> {

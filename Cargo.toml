@@ -38,7 +38,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Schema generation for MCP tools
-schemars = { version = "0.9", features = ["derive"] }
+schemars = { version = "1.2.1", features = ["derive"] }
 
 # SQLite persistence
 rusqlite = { version = "0.39", features = ["bundled"] }
@@ -65,7 +65,7 @@ dirs = "6.0"
 uuid = { version = "1", features = ["v4"] }
 
 # SHA-256 for workdir_hash
-sha2 = "0.10"
+sha2 = "0.11.0"
 
 # Directory traversal for RAG ingestion
 walkdir = "2"
@@ -110,12 +110,12 @@ tar = "0.4"
 tempfile = "3.8"
 sysinfo = "0.38"
 lancedb = "0.27.2"
-arrow-array = "57"
-arrow-schema = "57"
+arrow-array = "57.3.0"
+arrow-schema = "57.3.0"
 futures = "0.3"
 
 # PDF text extraction
-pdf-extract = "0.7"
+pdf-extract = "0.10.0"
 
 # Local embedding models via ONNX Runtime (no API key required)
 fastembed = "5"

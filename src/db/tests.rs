@@ -298,6 +298,60 @@ fn test_intelligence_upsert_search_and_graph_walk() {
     assert!(walk.edges.iter().any(|edge| edge.from_node_id == "node-a"));
 }
 
+#[test]
+fn test_list_cross_project_dependencies_returns_only_project_links() {
+    let db = test_db();
+
+    db.upsert_intelligence_node(IntelligenceNodeInput {
+        id: Some("project-b".to_string()),
+        kind: "project".to_string(),
+        title: "Project B".to_string(),
+        body: "B".to_string(),
+        metadata: None,
+        project_hash: Some("hash-b".to_string()),
+        session_id: None,
+        relations: None,
+    })
+    .unwrap();
+    db.upsert_intelligence_node(IntelligenceNodeInput {
+        id: Some("project-a".to_string()),
+        kind: "project".to_string(),
+        title: "Project A".to_string(),
+        body: "A".to_string(),
+        metadata: None,
+        project_hash: Some("hash-a".to_string()),
+        session_id: None,
+        relations: Some(vec![IntelligenceRelationInput {
+            to_node_id: "project-b".to_string(),
+            relation: "depends_on".to_string(),
+            weight: Some(1.0),
+        }]),
+    })
+    .unwrap();
+    db.upsert_intelligence_node(IntelligenceNodeInput {
+        id: Some("fact-1".to_string()),
+        kind: "fact".to_string(),
+        title: "Fact".to_string(),
+        body: "Fact body".to_string(),
+        metadata: None,
+        project_hash: None,
+        session_id: None,
+        relations: Some(vec![IntelligenceRelationInput {
+            to_node_id: "project-a".to_string(),
+            relation: "depends_on".to_string(),
+            weight: Some(1.0),
+        }]),
+    })
+    .unwrap();
+
+    let deps = db.list_cross_project_dependencies(10).unwrap();
+
+    assert_eq!(deps.len(), 1);
+    assert_eq!(deps[0].from_node_id, "project-a");
+    assert_eq!(deps[0].to_node_id, "project-b");
+    assert_eq!(deps[0].relation, "depends_on");
+}
+
 // ── Project registry / RAG metadata ──────────────────────────────
 
 #[test]

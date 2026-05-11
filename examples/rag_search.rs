@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+#![allow(clippy::doc_markdown)]
+
 mod setup_module {
     #[derive(Clone)]
     pub struct PlatformWithCli {
