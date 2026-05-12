@@ -767,7 +767,7 @@ fn brain_needs_reinit(
 ) -> bool {
     brain
         .as_ref()
-        .map_or(true, |b| b.rows != rows || b.cols != cols)
+        .is_none_or(|b| b.rows != rows || b.cols != cols)
 }
 
 /// Resolve effective brain dimensions from panel size, falling back to terminal size.

@@ -39,7 +39,7 @@ fn read_abs_range(
     // We need max_sb - S <= from_abs  =>  S >= max_sb - from_abs.
     // Round up to the nearest multiple of `rows`, capped at max_sb.
     let s_for_from = max_sb.saturating_sub(from_abs);
-    let s_start = if s_for_from % rows == 0 {
+    let s_start = if s_for_from.is_multiple_of(rows) {
         s_for_from
     } else {
         ((s_for_from / rows) + 1) * rows

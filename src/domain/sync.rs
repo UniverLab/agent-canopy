@@ -204,7 +204,7 @@ pub fn summarize_sync_context(
     intents_by_agent.retain(|agent_id, intent| {
         closed_at_by_agent
             .get(agent_id)
-            .map_or(true, |&closed_at| closed_at < intent.since)
+            .is_none_or(|&closed_at| closed_at < intent.since)
     });
 
     let mut active_intents: Vec<ActiveIntent> = intents_by_agent

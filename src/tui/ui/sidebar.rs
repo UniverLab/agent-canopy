@@ -947,7 +947,7 @@ fn effective_status_color(base: Color, agent: &AgentEntry, app: &App, selected: 
         return base;
     }
 
-    if (app.animation_tick / 10) % 2 == 0 {
+    if (app.animation_tick / 10).is_multiple_of(2) {
         super::STATUS_WAIT_ON
     } else {
         super::STATUS_WAIT_OFF
