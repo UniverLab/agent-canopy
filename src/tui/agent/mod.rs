@@ -46,6 +46,7 @@ pub struct PromptEntry {
 
 /// Maximum number of prompt entries to keep in the ring buffer.
 const MAX_PROMPT_HISTORY: usize = 20;
+const VT_SCROLLBACK_LINES: usize = 5_000;
 
 /// An interactive agent with a virtual terminal screen.
 pub struct InteractiveAgent {
@@ -176,7 +177,11 @@ impl InteractiveAgent {
         let mut reader = pair.master.try_clone_reader()?;
         let master = pair.master;
 
-        let vt = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10_000)));
+        let vt = Arc::new(Mutex::new(vt100::Parser::new(
+            rows,
+            cols,
+            VT_SCROLLBACK_LINES,
+        )));
         let vt_clone = Arc::clone(&vt);
 
         let last_output_at = Arc::new(Mutex::new(Utc::now()));
@@ -276,7 +281,11 @@ impl InteractiveAgent {
         let mut reader = pair.master.try_clone_reader()?;
         let master = pair.master;
 
-        let vt = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10_000)));
+        let vt = Arc::new(Mutex::new(vt100::Parser::new(
+            rows,
+            cols,
+            VT_SCROLLBACK_LINES,
+        )));
         let vt_clone = Arc::clone(&vt);
 
         let last_output_at = Arc::new(Mutex::new(Utc::now()));

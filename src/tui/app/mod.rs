@@ -642,7 +642,7 @@ impl App {
 
     fn selected_log_excerpt(&self) -> String {
         self.selected_live_agent()
-            .map(|agent| agent.last_lines(50))
+            .map(|agent| agent.visible_text())
             .unwrap_or_else(|| self.log_content.clone())
     }
 
@@ -995,13 +995,16 @@ impl App {
                 let agent = self.context_transfer_agent(source)?;
                 let capture_kind = interactive_capture_kind(agent);
                 let max_units = Self::interactive_capture_units(agent, capture_kind);
-                let initial_units = initial_capture_units(max_units, &self.context_transfer_config);
+                let initial_units = if capture_kind == ContextCaptureKind::LinePages {
+                    1
+                } else {
+                    initial_capture_units(max_units, &self.context_transfer_config)
+                };
                 Some(ContextTransferModal::new(idx, capture_kind, initial_units))
             }
             ContextTransferSource::Terminal(idx) => {
                 self.context_transfer_agent(source)?;
-                let initial_units = initial_capture_units(20, &self.context_transfer_config);
-                Some(ContextTransferModal::new_terminal(idx, initial_units))
+                Some(ContextTransferModal::new_terminal(idx, 1))
             }
         }
     }

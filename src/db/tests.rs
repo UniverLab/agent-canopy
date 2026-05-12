@@ -296,6 +296,39 @@ fn test_recent_sync_messages_returns_global_order() {
     assert_eq!(messages[1].message, "two");
 }
 
+#[test]
+fn test_resolve_sync_actor_name_prefers_interactive_session_name() {
+    let db = test_db();
+    db.insert_interactive_session("ix-1", "violet-river", "copilot", "/tmp/project", None)
+        .unwrap();
+    db.insert_sync_message(
+        "/tmp/project",
+        "ix-1",
+        "Copilot CLI",
+        MessageKind::Info,
+        "hello",
+        None,
+    )
+    .unwrap();
+
+    let resolved = db.resolve_sync_actor_name("/tmp/project", "ix-1").unwrap();
+
+    assert_eq!(resolved.as_deref(), Some("violet-river"));
+}
+
+#[test]
+fn test_resolve_sync_actor_name_prefers_terminal_session_name() {
+    let db = test_db();
+    db.insert_terminal_session("term-1", "shell-sage", "bash", "/tmp/project")
+        .unwrap();
+
+    let resolved = db
+        .resolve_sync_actor_name("/tmp/project", "term-1")
+        .unwrap();
+
+    assert_eq!(resolved.as_deref(), Some("shell-sage"));
+}
+
 // ── Project context layer ─────────────────────────────────────────
 
 #[test]

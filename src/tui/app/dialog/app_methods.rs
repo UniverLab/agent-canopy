@@ -92,6 +92,13 @@ impl App {
                 session.restore_into(&mut dialog);
             }
         }
+        let current_project_path = self
+            .db
+            .get_project_by_path_or_ancestor(&workdir)
+            .ok()
+            .flatten()
+            .map(|project| project.path);
+        dialog.migrate_legacy_sections(current_project_path.as_deref());
 
         // Determine system block idempotency: send on first prompt or on solo-mode transition
         let is_solo = !self.sync_available();
@@ -117,12 +124,8 @@ impl App {
                     let char_len = section_content.chars().count();
                     dialog.sections.insert(instr_id.clone(), section_content);
                     dialog.section_cursors.insert(instr_id, char_len);
-                } else if section_name == "context"
-                    || section_name.starts_with("context_")
-                    || section_name == "memory_context"
-                    || section_name.starts_with("memory_context_")
-                {
-                    // Context/memory sections from initial_content are locked.
+                } else if section_name == "context" || section_name.starts_with("context_") {
+                    // Context sections from initial_content are locked.
                     let ctx_id = dialog.add_section_with_content(&section_name, section_content);
                     dialog.lock_section(&ctx_id);
                 } else {
@@ -131,6 +134,7 @@ impl App {
             }
             dialog.focused_section = 0;
         }
+        dialog.migrate_legacy_sections(current_project_path.as_deref());
         dialog.prev_focus = Some(prev_focus);
         self.simple_prompt_dialog = Some(dialog);
         self.focus = super::super::types::Focus::PromptTemplateDialog;
@@ -526,12 +530,11 @@ impl App {
             }
         }
         initial_content.insert("context".to_string(), launchpad_context);
-        let memory = SimplePromptDialog::build_memory_context_block(
-            &self.db,
-            Path::new(&dialog.working_dir),
-        );
-        if !memory.trim().is_empty() {
-            initial_content.insert("memory_context".to_string(), memory);
+        if let Ok(Some(project)) = self
+            .db
+            .get_project_by_path_or_ancestor(Path::new(&dialog.working_dir))
+        {
+            initial_content.insert("project_context".to_string(), project.path);
         }
         self.focus = super::super::types::Focus::Agent;
         self.open_simple_prompt_dialog(Some(initial_content));

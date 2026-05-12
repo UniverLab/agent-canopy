@@ -147,7 +147,7 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) {
         Span::styled("@ ", Style::default().fg(DIM)),
         Span::styled("file  ", Style::default().fg(Color::White)),
         Span::styled("Ctrl+A ", Style::default().fg(DIM)),
-        Span::styled("add/memory  ", Style::default().fg(Color::White)),
+        Span::styled("add section  ", Style::default().fg(Color::White)),
         Span::styled("Ctrl+X ", Style::default().fg(DIM)),
         Span::styled("remove  ", Style::default().fg(Color::White)),
         Span::styled("Ctrl+S ", Style::default().fg(DIM)),
@@ -222,12 +222,10 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) {
             let known = [
                 "tools",
                 "instruction",
-                "memory_context",
                 "context",
                 "project_context",
                 "resources",
                 "rag_search",
-                "examples",
                 "constraints",
             ];
             known

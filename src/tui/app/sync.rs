@@ -46,14 +46,20 @@ impl App {
         }
 
         let workdir = self.selected_sync_workdir()?;
-        let recent_messages = self
+        let mut recent_messages = self
             .db
             .list_sync_messages(workdir, RECENT_MESSAGE_LIMIT)
             .ok()?;
-        // Derive active agent IDs directly from the messages — the agent_id in sync
-        // messages is set by the external CLI (e.g. "copilot-cli") and cannot be
-        // reliably mapped to Canopy's internal InteractiveAgent IDs or display names.
-        // Showing all agents that have posted in the recent window is the right UX.
+        for message in &mut recent_messages {
+            if let Ok(Some(session_name)) =
+                self.db.resolve_sync_actor_name(workdir, &message.agent_id)
+            {
+                message.agent_name = session_name;
+            }
+        }
+        // Derive active agent IDs directly from the messages. We resolve display
+        // names for known interactive/terminal sessions above, but the ID itself
+        // remains the stable source for deciding who has participated recently.
         let active_agent_ids = recent_messages
             .iter()
             .map(|m| m.agent_id.clone())

@@ -134,6 +134,22 @@ impl Database {
         Ok(rows.next().transpose()?)
     }
 
+    pub fn get_project_by_path_or_ancestor(&self, path: &Path) -> Result<Option<Project>> {
+        let canonical = std::fs::canonicalize(path)?;
+        let projects = self.list_projects()?;
+
+        Ok(projects
+            .into_iter()
+            .filter_map(|project| {
+                let project_path = std::path::PathBuf::from(&project.path);
+                canonical
+                    .starts_with(&project_path)
+                    .then_some((project_path.components().count(), project))
+            })
+            .max_by_key(|(depth, _)| *depth)
+            .map(|(_, project)| project))
+    }
+
     pub fn list_projects(&self) -> Result<Vec<Project>> {
         let conn = self
             .conn

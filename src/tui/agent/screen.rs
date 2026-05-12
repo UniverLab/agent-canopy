@@ -242,6 +242,10 @@ impl InteractiveAgent {
         Some(sanitize_line(&line).trim_end().to_string())
     }
 
+    pub fn visible_text(&self) -> String {
+        self.get_plain_text_from_screen().unwrap_or_default()
+    }
+
     /// Get plain text from the current visible screen area.
     /// This is used for copying clean text without ANSI formatting.
     pub fn get_plain_text_from_screen(&self) -> Option<String> {

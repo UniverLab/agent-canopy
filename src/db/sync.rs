@@ -1,6 +1,7 @@
 //! SQLite repositories for collaborative sync messages and participant lookup.
 
 use anyhow::Result;
+use rusqlite::OptionalExtension;
 
 use crate::db::Database;
 use crate::domain::sync::{MessageKind, SyncMessage};
@@ -46,8 +47,14 @@ impl Database {
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
             "SELECT id, workdir, agent_id, agent_name, kind, message, payload, created_at
-             FROM sync_messages WHERE workdir = ?1
-             ORDER BY id DESC LIMIT ?2",
+             FROM (
+                SELECT id, workdir, agent_id, agent_name, kind, message, payload, created_at
+                FROM sync_messages
+                WHERE workdir = ?1
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?2
+             )
+             ORDER BY created_at ASC, id ASC",
         )?;
 
         let rows = stmt.query_map(rusqlite::params![workdir, limit as i64], |row| {
@@ -64,9 +71,7 @@ impl Database {
             })
         })?;
 
-        let mut messages: Vec<SyncMessage> = rows.filter_map(|row| row.ok()).collect();
-        messages.reverse();
-        Ok(messages)
+        Ok(rows.filter_map(|row| row.ok()).collect())
     }
 
     pub fn list_recent_sync_messages(&self, limit: usize) -> Result<Vec<SyncMessage>> {
@@ -76,8 +81,13 @@ impl Database {
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
             "SELECT id, workdir, agent_id, agent_name, kind, message, payload, created_at
-             FROM sync_messages
-             ORDER BY id DESC LIMIT ?1",
+             FROM (
+                SELECT id, workdir, agent_id, agent_name, kind, message, payload, created_at
+                FROM sync_messages
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?1
+             )
+             ORDER BY created_at ASC, id ASC",
         )?;
 
         let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
@@ -94,9 +104,43 @@ impl Database {
             })
         })?;
 
-        let mut messages: Vec<SyncMessage> = rows.filter_map(|row| row.ok()).collect();
-        messages.reverse();
-        Ok(messages)
+        Ok(rows.filter_map(|row| row.ok()).collect())
+    }
+
+    pub fn resolve_sync_actor_name(&self, workdir: &str, agent_id: &str) -> Result<Option<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
+        let interactive_name = conn
+            .query_row(
+                "SELECT name
+                 FROM interactive_sessions
+                 WHERE id = ?1 AND working_dir = ?2
+                 ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, started_at DESC
+                 LIMIT 1",
+                rusqlite::params![agent_id, workdir],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if interactive_name.is_some() {
+            return Ok(interactive_name);
+        }
+
+        let terminal_name = conn
+            .query_row(
+                "SELECT name
+                 FROM terminal_sessions
+                 WHERE id = ?1 AND working_dir = ?2
+                 ORDER BY CASE status WHEN 'idle' THEN 0 ELSE 1 END, created_at DESC
+                 LIMIT 1",
+                rusqlite::params![agent_id, workdir],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+
+        Ok(terminal_name)
     }
 
     /// Insert a closing marker into the sync channel when an agent exits.

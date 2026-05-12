@@ -210,7 +210,6 @@ impl SimplePromptDialog {
 
         let mut sections = vec![
             ("instruction", "Instruction"),
-            ("memory_context", "Memory Context"),
             ("context", "Context"),
             ("project_context", "Project Context"),
             ("resources", "Resources"),
@@ -218,11 +217,7 @@ impl SimplePromptDialog {
         if rag_enabled {
             sections.push(("rag_search", "RAG Search"));
         }
-        sections.extend([
-            ("examples", "Examples"),
-            ("constraints", "Constraints"),
-            ("tools", "Tools"),
-        ]);
+        sections.extend([("constraints", "Constraints"), ("tools", "Tools")]);
         sections
     }
 
@@ -375,7 +370,7 @@ impl SimplePromptDialog {
 
         let path = Path::new(entry);
         if path.exists() {
-            return db.get_project_by_path(path);
+            return db.get_project_by_path_or_ancestor(path);
         }
 
         Ok(None)
@@ -421,17 +416,42 @@ impl SimplePromptDialog {
     }
 
     fn default_project_hash(&self, db: &Database, current_workdir: &Path) -> Option<String> {
-        db.get_project_by_path(current_workdir)
+        db.get_project_by_path_or_ancestor(current_workdir)
             .ok()
             .flatten()
             .map(|project| project.hash)
     }
 
     fn resolve_project_contexts(&self, db: &Database) -> Vec<String> {
-        self.section_lines("project_context")
+        let mut seen_hashes = HashSet::new();
+        let mut projects = self
+            .section_lines("project_context")
             .into_iter()
             .filter_map(|entry| Self::lookup_project_reference(db, &entry).ok().flatten())
+            .filter(|project| seen_hashes.insert(project.hash.clone()))
+            .collect::<Vec<_>>();
+
+        for project in self.derived_project_contexts_from_resources(db) {
+            if seen_hashes.insert(project.hash.clone()) {
+                projects.push(project);
+            }
+        }
+
+        projects
+            .into_iter()
             .map(|project| Self::format_project_block(&project))
+            .collect()
+    }
+
+    fn derived_project_contexts_from_resources(&self, db: &Database) -> Vec<Project> {
+        self.section_lines("resources")
+            .into_iter()
+            .filter_map(|entry| {
+                let path = Path::new(&entry);
+                path.exists()
+                    .then(|| db.get_project_by_path_or_ancestor(path).ok().flatten())
+                    .flatten()
+            })
             .collect()
     }
 
@@ -595,13 +615,6 @@ impl SimplePromptDialog {
         let mut result = String::new();
         self.append_prompt_section(
             &mut result,
-            "memory_context",
-            "# [MEMORY CONTEXT]: Workspace Brief\n",
-            "memory_context",
-            "memory",
-        );
-        self.append_prompt_section(
-            &mut result,
             "context",
             "# [CONTEXT]: Project Background\n",
             "context",
@@ -614,13 +627,6 @@ impl SimplePromptDialog {
             "# [RESOURCES]: Knowledge Base & Data\n",
             "resources",
             "resource",
-        );
-        self.append_prompt_section(
-            &mut result,
-            "examples",
-            "# [EXAMPLES]: Multi-Shot Learning\n",
-            "examples",
-            "example",
         );
         self.append_prompt_section(
             &mut result,
@@ -640,107 +646,37 @@ impl SimplePromptDialog {
         Ok(result)
     }
 
-    /// Build a compact workspace brief from project-context/session data and project registry for a workdir.
-    pub fn build_memory_context_block(db: &Database, workdir: &Path) -> String {
-        let workdir_str = workdir.display().to_string();
-        let workdir_ref = workdir_str.as_str();
-        let mut lines: Vec<String> = vec![
-            format!("workspace: {workdir_str}"),
-            "source: project context".to_string(),
-        ];
+    pub fn migrate_legacy_sections(&mut self, current_project_path: Option<&str>) {
+        let had_memory_context = self
+            .enabled_sections
+            .iter()
+            .any(|section_id| Self::section_matches_prefix(section_id, "memory_context"));
+        let obsolete_sections = self
+            .enabled_sections
+            .iter()
+            .filter(|section_id| {
+                Self::section_matches_prefix(section_id, "memory_context")
+                    || Self::section_matches_prefix(section_id, "examples")
+            })
+            .cloned()
+            .collect::<Vec<_>>();
 
-        if let Ok(Some(project)) = db.get_project_by_path(workdir) {
-            lines.push(format!("project: {}", project.name));
-            if let Some(desc) = &project.description {
-                if !desc.trim().is_empty() {
-                    lines.push(format!("description: {}", desc.trim()));
-                }
-            }
-            if let Some(tags) = &project.tags {
-                if !tags.trim().is_empty() {
-                    lines.push(format!("tags: {}", tags.trim()));
-                }
-            }
+        for section_id in obsolete_sections {
+            self.remove_section(&section_id);
         }
 
-        if let Ok(messages) = db.list_sync_messages(&workdir_str, 20) {
-            let active_agent_ids = messages
-                .iter()
-                .map(|m| m.agent_id.clone())
-                .collect::<std::collections::HashSet<_>>();
-            let snapshot =
-                crate::domain::sync::summarize_sync_context(&messages, &active_agent_ids, 5);
-            lines.push(format!("sync_vibe: {}", snapshot.vibe.as_str()));
-            if !snapshot.active_intents.is_empty() {
-                lines.push("active_missions:".to_string());
-                for intent in snapshot.active_intents.iter().take(3) {
-                    lines.push(format!(
-                        "- {} [{}]: {}",
-                        intent.agent_name,
-                        intent.impact.as_str(),
-                        intent.mission
-                    ));
-                }
+        let has_project_context = self
+            .enabled_sections
+            .iter()
+            .any(|section_id| Self::section_matches_prefix(section_id, "project_context"));
+        if had_memory_context && !has_project_context {
+            if let Some(project_path) = current_project_path {
+                self.add_section_with_content("project_context", project_path.to_string());
             }
         }
-
-        if let Ok(session_nodes) = db.list_intelligence_nodes(Some("session"), 50) {
-            let recent_for_workdir = session_nodes
-                .into_iter()
-                .filter(|node| {
-                    node.metadata
-                        .as_deref()
-                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-                        .and_then(|meta| {
-                            meta.get("workdir")
-                                .and_then(|value| value.as_str())
-                                .map(|value| value == workdir_ref)
-                        })
-                        .unwrap_or(false)
-                })
-                .take(3)
-                .collect::<Vec<_>>();
-
-            if !recent_for_workdir.is_empty() {
-                lines.push("recent_sessions:".to_string());
-                for node in recent_for_workdir {
-                    lines.push(format!("- {}", node.title));
-                    let summary = node
-                        .metadata
-                        .as_deref()
-                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-                        .and_then(|meta| {
-                            meta.get("summary")
-                                .and_then(|value| value.as_str())
-                                .map(str::to_owned)
-                        })
-                        .unwrap_or_default();
-                    if !summary.trim().is_empty() {
-                        lines.push(format!("  summary: {}", summary.trim()));
-                    }
-                }
-            }
-        }
-
-        if let Ok(patterns) = db.list_intelligence_nodes(Some("pattern"), 5) {
-            if !patterns.is_empty() {
-                lines.push("patterns:".to_string());
-                for pattern in patterns {
-                    lines.push(format!("- {}", pattern.title));
-                }
-            }
-        }
-
-        if let Ok(facts) = db.list_intelligence_nodes(Some("fact"), 5) {
-            if !facts.is_empty() {
-                lines.push("facts:".to_string());
-                for fact in facts {
-                    lines.push(format!("- {}", fact.title));
-                }
-            }
-        }
-
-        lines.join("\n")
+        self.focused_section = self
+            .focused_section
+            .min(self.enabled_sections.len().saturating_sub(1));
     }
 
     fn set_content_and_cursor(
@@ -1208,6 +1144,54 @@ mod tests {
 
         assert!(prompt.contains("workdir_hash:"));
         assert!(prompt.contains(&project.hash));
+    }
+
+    #[test]
+    fn build_prompt_auto_injects_project_context_for_resource_descendant() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("canopy.db");
+        let db = Database::new(&db_path).unwrap();
+
+        let project_dir = temp.path().join("linked-project");
+        std::fs::create_dir(&project_dir).unwrap();
+        let project = db.register_project_path(&project_dir).unwrap();
+
+        let nested_dir = project_dir.join("src").join("module");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        let file_path = nested_dir.join("lib.rs");
+        std::fs::write(&file_path, "pub fn demo() {}").unwrap();
+
+        let mut dialog = SimplePromptDialog::new();
+        dialog.set_section_content("instruction_1", "summarize".to_string());
+        dialog.add_section_with_content("resources", file_path.display().to_string());
+
+        let prompt = dialog
+            .build_prompt_with_resolved_resources(&db, temp.path())
+            .unwrap();
+
+        assert!(prompt.contains("# [PROJECT CONTEXT]: Registered Project Metadata"));
+        assert!(prompt.contains(&project.hash));
+        assert!(prompt.contains("kind: file"));
+        assert!(prompt.contains("lib.rs"));
+    }
+
+    #[test]
+    fn migrate_legacy_sections_replaces_memory_with_project_context() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.add_section_with_content("memory_context", "legacy".to_string());
+        dialog.add_section_with_content("examples", "old".to_string());
+
+        dialog.migrate_legacy_sections(Some("/tmp/project"));
+
+        assert!(dialog
+            .enabled_sections
+            .iter()
+            .all(|section_id| !section_id.starts_with("memory_context_")
+                && !section_id.starts_with("examples_")));
+        assert!(dialog
+            .enabled_sections
+            .iter()
+            .any(|section_id| section_id.starts_with("project_context_")));
     }
 }
 

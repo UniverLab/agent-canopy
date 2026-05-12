@@ -61,12 +61,6 @@ impl PromptTemplates {
                         placeholder: "Available tools or resources".to_string(),
                         required: false,
                     },
-                    TemplateSection {
-                        name: "examples".to_string(),
-                        label: "Examples".to_string(),
-                        placeholder: "Example inputs/outputs".to_string(),
-                        required: false,
-                    },
                 ],
                 format: "{{instruction}}".to_string(),
             }],

@@ -166,6 +166,10 @@ pub fn interactive_prompt_count(agent: &InteractiveAgent) -> usize {
 }
 
 pub fn interactive_line_page_count(agent: &InteractiveAgent) -> usize {
+    if !agent.visible_text().trim().is_empty() {
+        return 1;
+    }
+
     let total_depth = agent.total_depth();
     if total_depth == 0 {
         return 0;
@@ -212,13 +216,25 @@ fn append_interactive_prompt_context(out: &mut String, agent: &InteractiveAgent,
 }
 
 fn append_line_context(out: &mut String, agent: &InteractiveAgent, n_units: usize) {
-    let scrollback = agent.last_lines((n_units.max(1)) * 50);
-    if scrollback.is_empty() {
+    let visible = agent.visible_text();
+    if n_units <= 1 {
+        if visible.is_empty() {
+            return;
+        }
+        out.push_str(&visible);
+        if !visible.ends_with('\n') {
+            out.push('\n');
+        }
         return;
     }
 
-    out.push_str(&scrollback);
-    if !scrollback.ends_with('\n') {
+    let history = agent.last_lines((n_units.max(1)) * 50);
+    if history.is_empty() {
+        return;
+    }
+
+    out.push_str(&history);
+    if !history.ends_with('\n') {
         out.push('\n');
     }
 }

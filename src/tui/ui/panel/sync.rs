@@ -1,3 +1,4 @@
+use chrono::{Local, TimeZone};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -70,11 +71,7 @@ fn draw_sync_section(frame: &mut Frame, area: Rect, state: &SyncPanelState, scro
                         .fg(Color::White)
                         .add_modifier(Modifier::BOLD),
                 ),
-                if is_redundant_id(&intent.agent_name, &intent.agent_id) {
-                    Span::raw("")
-                } else {
-                    Span::styled(format!(" ({})", intent.agent_id), Style::default().fg(DIM))
-                },
+                Span::styled(format!(" ({})", intent.agent_id), Style::default().fg(DIM)),
                 Span::styled(
                     format!(" [{}]", intent.impact.as_str()),
                     Style::default().fg(intent_color(intent.impact)),
@@ -118,18 +115,21 @@ fn draw_sync_section(frame: &mut Frame, area: Rect, state: &SyncPanelState, scro
             MessageKind::Info => "·",
         };
         let color = kind_color(message.kind);
-        // Card header: icon agent_name (agent_id)
+        // Card header: icon session_name (agent_id)
         lines.push(Line::from(vec![
             Span::styled(format!("┌{icon} "), Style::default().fg(color)),
             Span::styled(
                 &message.agent_name,
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
-            if is_redundant_id(&message.agent_name, &message.agent_id) {
-                Span::raw("")
-            } else {
-                Span::styled(format!(" ({})", message.agent_id), Style::default().fg(DIM))
-            },
+            Span::styled(format!(" ({})", message.agent_id), Style::default().fg(DIM)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("│ ", Style::default().fg(color)),
+            Span::styled(
+                format_timestamp(message.created_at),
+                Style::default().fg(DIM),
+            ),
         ]));
         // Message body — wrap
         for chunk in wrap_text(&message.message, w.saturating_sub(2)) {
@@ -202,35 +202,11 @@ fn kind_color(kind: MessageKind) -> Color {
     }
 }
 
-/// Returns `true` when `id` is just a slugified form of `name` — e.g.
-/// "Copilot CLI" → "copilot-cli" or "copilot_cli". In that case showing
-/// `(id)` next to the name adds no information.
-fn is_redundant_id(name: &str, id: &str) -> bool {
-    let slug: String = name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .split('-')
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("-");
-    let norm_id: String = id
-        .chars()
-        .map(|c| {
-            if c == '_' {
-                '-'
-            } else {
-                c.to_ascii_lowercase()
-            }
-        })
-        .collect();
-    slug == norm_id || slug.replace('-', "") == norm_id.replace('-', "")
+fn format_timestamp(timestamp: i64) -> String {
+    match Local.timestamp_opt(timestamp, 0).single() {
+        Some(datetime) => datetime.format("%Y-%m-%d %H:%M").to_string(),
+        None => timestamp.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -238,15 +214,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn is_redundant_id_detects_slug() {
-        assert!(is_redundant_id("Copilot CLI", "copilot-cli"));
-        assert!(is_redundant_id("Copilot CLI", "copilot_cli"));
-        assert!(is_redundant_id("My Agent", "my-agent"));
-    }
-
-    #[test]
-    fn is_redundant_id_keeps_distinct_ids() {
-        assert!(!is_redundant_id("Copilot CLI", "agent-42"));
-        assert!(!is_redundant_id("Alice", "bob"));
+    fn format_timestamp_returns_non_empty_text() {
+        assert!(!format_timestamp(0).is_empty());
     }
 }
