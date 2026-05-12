@@ -250,7 +250,7 @@ fn test_recent_sync_messages_returns_global_order() {
     assert_eq!(messages[1].message, "two");
 }
 
-// ── Project intelligence layer ────────────────────────────────────
+// ── Project context layer ─────────────────────────────────────────
 
 #[test]
 fn test_intelligence_upsert_search_and_graph_walk() {

@@ -753,7 +753,7 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "intelligence_get_context",
-        description = "Return PIL context at the requested scope: light or full."
+        description = "Return project context at the requested scope: light or full."
     )]
     async fn intelligence_get_context(
         &self,
@@ -882,7 +882,7 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "intelligence_graph_walk",
-        description = "Walk the PIL graph from a node up to the requested depth."
+        description = "Walk the project-context graph from a node up to the requested depth."
     )]
     async fn intelligence_graph_walk(
         &self,
@@ -979,13 +979,13 @@ impl TaskTriggerHandler {
                 "risk": "low",
                 "protocol": [
                     "1. Call intelligence_upsert(kind=\"session\", title=\"<mission>\", body=\"<what was done>\", \
-                       metadata={workdir, summary, ...}) — store session summary in PIL.",
+                       metadata={workdir, summary, ...}) — store session summary in project context.",
                     "2. Call sync_report_status(status=\"stable\", message=\"Mission complete: <summary>\") \
                        — the daemon closes your mission automatically on exit.",
                     "3. Do NOT manually call any close/shutdown tool — daemon handles it."
                 ],
                 "tools": [
-                    "intelligence_upsert — persist session summary as a 'session' node in PIL",
+                    "intelligence_upsert — persist session summary as a 'session' node in project context",
                     "sync_report_status — leave a clean 'stable' marker for the next agent"
                 ]
             }),
@@ -1002,9 +1002,9 @@ impl TaskTriggerHandler {
                     "sync_declare_intent — announce mission (impact: low/medium/high/breaking)",
                     "sync_broadcast — send info/query/answer messages to peers",
                     "sync_report_status — report stable/unstable/testing after actions",
-                    "intelligence_get_context(scope=\"full\") — deep PIL pull for architecture work",
+                    "intelligence_get_context(scope=\"full\") — deep project-context pull for architecture work",
                     "intelligence_upsert — persist facts, patterns, session summaries",
-                    "intelligence_search — find prior art or decisions in PIL"
+                    "intelligence_search — find prior art or decisions in project context"
                 ]
             }),
             _ => {

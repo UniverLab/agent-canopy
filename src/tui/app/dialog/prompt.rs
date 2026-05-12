@@ -640,13 +640,13 @@ impl SimplePromptDialog {
         Ok(result)
     }
 
-    /// Build a compact workspace brief from PIL/session data and project registry for a workdir.
+    /// Build a compact workspace brief from project-context/session data and project registry for a workdir.
     pub fn build_memory_context_block(db: &Database, workdir: &Path) -> String {
         let workdir_str = workdir.display().to_string();
         let workdir_ref = workdir_str.as_str();
         let mut lines: Vec<String> = vec![
             format!("workspace: {workdir_str}"),
-            "source: PIL".to_string(),
+            "source: project context".to_string(),
         ];
 
         if let Ok(Some(project)) = db.get_project_by_path(workdir) {
