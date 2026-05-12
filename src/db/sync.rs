@@ -99,6 +99,27 @@ impl Database {
         Ok(messages)
     }
 
+    /// Insert a closing marker into the sync channel when an agent exits.
+    ///
+    /// This allows `summarize_sync_context` to filter out stale missions from
+    /// agents that have since left, without relying on the agent to self-report.
+    pub fn close_agent_missions(
+        &self,
+        agent_id: &str,
+        agent_name: &str,
+        workdir: &str,
+    ) -> Result<()> {
+        self.insert_sync_message(
+            workdir,
+            agent_id,
+            agent_name,
+            MessageKind::Info,
+            &format!("{agent_name} session ended — missions closed"),
+            Some(r#"{"mission_closed":true}"#),
+        )?;
+        Ok(())
+    }
+
     pub fn list_active_sync_agent_ids(&self, workdir: &str) -> Result<Vec<String>> {
         let conn = self
             .conn

@@ -137,55 +137,63 @@ impl App {
     }
 
     /// Build system block content for the invisible system prompt section.
-    fn build_system_content(&self, is_solo: bool) -> String {
+    fn build_system_content(&self, _is_solo: bool) -> String {
         let mut lines: Vec<String> = Vec::new();
 
-        if let Some(state) = self.sync_panel_state() {
+        let workdir = if let Some(state) = self.sync_panel_state() {
             lines.push(format!(
                 "workspace: {} | agents: {} | vibe: {}",
                 state.workdir,
                 state.participant_count,
                 state.vibe.as_str()
             ));
-            if !is_solo {
-                if !state.active_intents.is_empty() {
-                    lines.push("active missions:".to_string());
-                    for intent in &state.active_intents {
-                        lines.push(format!(
-                            "  - {} [{}] {}: {}",
-                            intent.agent_name,
-                            intent.impact.as_str(),
-                            intent.mission,
-                            intent.description
-                        ));
-                    }
-                }
-                let chatter: Vec<_> = state
-                    .recent_messages
-                    .iter()
-                    .filter(|m| m.kind.is_chatter())
-                    .take(5)
-                    .collect();
-                if !chatter.is_empty() {
-                    lines.push("recent messages:".to_string());
-                    for msg in chatter {
-                        lines.push(format!("  - {}: {}", msg.agent_name, msg.message));
-                    }
+            // Show active missions from panel state (already has full context).
+            let active_intents = &state.active_intents;
+            if !active_intents.is_empty() {
+                lines.push("active missions:".to_string());
+                for intent in active_intents {
+                    lines.push(format!(
+                        "  - {} [{}] {}: {}",
+                        intent.agent_name,
+                        intent.impact.as_str(),
+                        intent.mission,
+                        intent.description
+                    ));
                 }
             }
+            let chatter: Vec<_> = state
+                .recent_messages
+                .iter()
+                .filter(|m| m.kind.is_chatter())
+                .take(5)
+                .collect();
+            if !chatter.is_empty() {
+                lines.push("recent messages:".to_string());
+                for msg in chatter {
+                    lines.push(format!("  - {}: {}", msg.agent_name, msg.message));
+                }
+            }
+            state.workdir.clone()
         } else {
-            let workdir = self.current_workdir();
-            lines.push(format!("workspace: {}", workdir.display()));
-        }
-
-        if is_solo {
-            lines.push(String::new());
-            lines.push(
-                "You are in solo mode in Canopy Sync. \
-                No other agents are currently active in this workspace."
-                    .to_string(),
-            );
-        }
+            let workdir = self.current_workdir().to_string_lossy().to_string();
+            lines.push(format!("workspace: {workdir}"));
+            // Fetch missions without the ≥2 session gate so solo agents see them too.
+            let active_intents = self.active_missions_for_workdir(&workdir);
+            if !active_intents.is_empty() {
+                lines.push("active missions:".to_string());
+                for intent in &active_intents {
+                    lines.push(format!(
+                        "  - {} [{}] {}: {}",
+                        intent.agent_name,
+                        intent.impact.as_str(),
+                        intent.mission,
+                        intent.description
+                    ));
+                }
+            }
+            workdir
+        };
+        let _ = workdir;
 
         lines.push(String::new());
         lines.push("You are operating within the Canopy multi-agent framework.".to_string());
@@ -195,10 +203,26 @@ impl App {
             security guard, token efficiency)."
                 .to_string(),
         );
+        lines.push(String::new());
+        lines.push("[AGENT PROTOCOL]".to_string());
         lines.push(
-            "- When taking actions that affect shared workspace state, use \
-            canopy_sync_broadcast and canopy_sync_declare_intent tools to coordinate \
-            with peer agents."
+            "1. Session start: call get_tools(scope=\"session_start\") \
+            — read workspace context before responding to the user."
+                .to_string(),
+        );
+        lines.push(
+            "2. Before modifying files: call get_tools(scope=\"file_write\", path=\"...\") \
+            — check for mission conflicts, then declare_intent."
+                .to_string(),
+        );
+        lines.push(
+            "3. Before running tests/builds: call get_tools(scope=\"test_run\") \
+            — broadcast before running, broadcast result (pass/fail)."
+                .to_string(),
+        );
+        lines.push(
+            "4. Session end: call get_tools(scope=\"close_session\") \
+            — upsert session summary, report workspace status."
                 .to_string(),
         );
         lines.push(

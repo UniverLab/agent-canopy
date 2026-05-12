@@ -160,6 +160,8 @@ pub fn summarize_sync_context(
 ) -> SyncContextSnapshot {
     let mut intents_by_agent: HashMap<&str, IntentState> = HashMap::new();
     let mut statuses_by_agent: HashMap<&str, WorkspaceStatus> = HashMap::new();
+    // Track the timestamp of the last explicit mission-closed marker per agent.
+    let mut closed_at_by_agent: HashMap<&str, i64> = HashMap::new();
 
     for message in messages {
         if !active_agent_ids.contains(&message.agent_id) {
@@ -189,9 +191,21 @@ pub fn summarize_sync_context(
                 };
                 statuses_by_agent.insert(&message.agent_id, payload.status);
             }
-            MessageKind::Query | MessageKind::Answer | MessageKind::Info => {}
+            MessageKind::Info => {
+                if is_mission_closed(message) {
+                    closed_at_by_agent.insert(&message.agent_id, message.created_at);
+                }
+            }
+            MessageKind::Query | MessageKind::Answer => {}
         }
     }
+
+    // Remove intents for agents whose close marker arrived after their last intent.
+    intents_by_agent.retain(|agent_id, intent| {
+        closed_at_by_agent
+            .get(agent_id)
+            .map_or(true, |&closed_at| closed_at < intent.since)
+    });
 
     let mut active_intents: Vec<ActiveIntent> = intents_by_agent
         .into_values()
@@ -249,6 +263,17 @@ pub fn parse_intent_payload(message: &SyncMessage) -> Option<IntentPayload> {
 
 pub fn parse_status_payload(message: &SyncMessage) -> Option<StatusPayload> {
     serde_json::from_str(message.payload.as_deref()?).ok()
+}
+
+/// Returns true if the message is an explicit mission-closed marker inserted by
+/// the daemon when an agent exits (payload contains `"mission_closed": true`).
+fn is_mission_closed(message: &SyncMessage) -> bool {
+    message
+        .payload
+        .as_deref()
+        .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+        .and_then(|v| v.get("mission_closed").and_then(|b| b.as_bool()))
+        .unwrap_or(false)
 }
 
 fn default_status_for_impact(impact: MissionImpact) -> WorkspaceStatus {

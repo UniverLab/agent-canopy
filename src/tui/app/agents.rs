@@ -394,10 +394,15 @@ impl App {
         };
 
         let agent_id = agent.id.clone();
+        let agent_name = agent.name.clone();
+        let working_dir = agent.working_dir.clone();
         let cli = agent.cli.as_str().to_string();
         let output_snippet = recent_output_snippet(agent, 5);
 
         let _ = self.db.finish_interactive_session(&agent_id, code);
+        let _ = self
+            .db
+            .close_agent_missions(&agent_id, &agent_name, &working_dir);
         if code != 0 {
             self.notify_failed_interactive_exit(&agent_id, &cli, code, &output_snippet);
         }

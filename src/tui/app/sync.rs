@@ -18,6 +18,25 @@ impl App {
         self.live_session_count_for_workdir(workdir) >= 2
     }
 
+    /// Returns active missions for a workdir without the ≥2 session gate.
+    ///
+    /// Used by the system prompt so missions are always visible, even in solo
+    /// mode. This is intentional: solo agents benefit from seeing prior mission
+    /// history and stale missions that need cleanup.
+    pub(crate) fn active_missions_for_workdir(
+        &self,
+        workdir: &str,
+    ) -> Vec<crate::domain::sync::ActiveIntent> {
+        let Ok(messages) = self.db.list_sync_messages(workdir, RECENT_MESSAGE_LIMIT) else {
+            return Vec::new();
+        };
+        let active_agent_ids = messages
+            .iter()
+            .map(|m| m.agent_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        summarize_sync_context(&messages, &active_agent_ids, 0).active_intents
+    }
+
     pub(crate) fn sync_panel_state(&self) -> Option<SyncPanelState> {
         if !self.sync_panel_visible {
             return None;
