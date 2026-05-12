@@ -34,8 +34,9 @@ use crate::domain::models::{Agent, Trigger};
 use crate::domain::sync::{MessageKind, MissionImpact, WorkspaceStatus};
 use crate::domain::validation::validate_id;
 use crate::domain::workflow::{
-    Workflow, WorkflowDetails, WorkflowEdge, WorkflowEdgeCondition, WorkflowNode, WorkflowNodeKind,
-    WorkflowSpec, WorkflowSpecStatus, WorkflowStatus,
+    validate_spec_description_template, Workflow, WorkflowDetails, WorkflowEdge,
+    WorkflowEdgeCondition, WorkflowNode, WorkflowNodeKind, WorkflowSpec, WorkflowSpecStatus,
+    WorkflowStatus,
 };
 use crate::executor::Executor;
 use crate::rag::rate_limiter::RateLimiter;
@@ -1003,12 +1004,20 @@ impl TaskTriggerHandler {
                 params.workflow_id, params.position
             )));
         }
+        let Some(description) = params.description.as_deref().map(str::trim) else {
+            return Ok(error_result(
+                "Workflow spec description is required and must follow the minimum template.",
+            ));
+        };
+        if let Err(error) = validate_spec_description_template(description) {
+            return Ok(error_result(&error));
+        }
 
         let spec = WorkflowSpec {
             id: uuid::Uuid::new_v4().to_string(),
             workflow_id: workflow_id.to_string(),
             name: name.to_string(),
-            description: params.description.filter(|value| !value.trim().is_empty()),
+            description: Some(description.to_string()),
             position: params.position,
             parallelizable: params.parallelizable,
             status: WorkflowSpecStatus::Pending,
