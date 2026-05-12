@@ -179,7 +179,79 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_intelligence_edges_from
                 ON intelligence_edges(from_node_id);
             CREATE INDEX IF NOT EXISTS idx_intelligence_edges_to
-                ON intelligence_edges(to_node_id);",
+                ON intelligence_edges(to_node_id);
+
+            CREATE TABLE IF NOT EXISTS workflows (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                workdir TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_workflows_workdir_created
+                ON workflows(workdir, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS workflow_specs (
+                id TEXT PRIMARY KEY,
+                workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                description TEXT,
+                position INTEGER NOT NULL,
+                parallelizable INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_specs_position
+                ON workflow_specs(workflow_id, position);
+
+            CREATE TABLE IF NOT EXISTS workflow_nodes (
+                id TEXT PRIMARY KEY,
+                spec_id TEXT NOT NULL REFERENCES workflow_specs(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                config TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_nodes_position
+                ON workflow_nodes(spec_id, position);
+
+            CREATE TABLE IF NOT EXISTS workflow_edges (
+                id TEXT PRIMARY KEY,
+                spec_id TEXT NOT NULL REFERENCES workflow_specs(id) ON DELETE CASCADE,
+                from_node TEXT NOT NULL REFERENCES workflow_nodes(id) ON DELETE CASCADE,
+                to_node TEXT NOT NULL REFERENCES workflow_nodes(id) ON DELETE CASCADE,
+                condition TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_workflow_edges_spec_from
+                ON workflow_edges(spec_id, from_node);
+
+            CREATE TABLE IF NOT EXISTS workflow_runs (
+                id TEXT PRIMARY KEY,
+                workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+                spec_id TEXT NOT NULL REFERENCES workflow_specs(id) ON DELETE CASCADE,
+                node_id TEXT NOT NULL REFERENCES workflow_nodes(id) ON DELETE CASCADE,
+                status TEXT NOT NULL,
+                input TEXT,
+                output TEXT,
+                started_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                iteration INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_workflow_runs_spec_started
+                ON workflow_runs(spec_id, started_at ASC);
+
+            CREATE INDEX IF NOT EXISTS idx_workflow_runs_node_iteration
+                ON workflow_runs(node_id, iteration DESC);",
         )?;
 
         Ok(())
@@ -194,6 +266,7 @@ pub mod run;
 pub mod session;
 pub mod state;
 pub mod sync;
+pub mod workflow;
 
 #[cfg(test)]
 pub use crate::application::ports::{AgentRepository, RunRepository, StateRepository};

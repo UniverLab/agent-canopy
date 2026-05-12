@@ -4,6 +4,10 @@ use crate::domain::models::{Agent, Cli, RunLog, RunStatus, Trigger, TriggerType,
 use crate::domain::sync::{
     IntentPayload, MessageKind, MissionImpact, StatusPayload, WorkspaceStatus,
 };
+use crate::domain::workflow::{
+    Workflow, WorkflowEdge, WorkflowEdgeCondition, WorkflowNode, WorkflowNodeKind, WorkflowNodeRun,
+    WorkflowRunStatus, WorkflowSpec, WorkflowSpecStatus, WorkflowStatus,
+};
 use chrono::{Duration, Utc};
 use tempfile::{tempdir, NamedTempFile};
 
@@ -79,6 +83,48 @@ fn sample_manual_agent(id: &str) -> Agent {
         last_run_ok: None,
         last_triggered_at: None,
         trigger_count: 0,
+    }
+}
+
+fn sample_workflow(id: &str) -> Workflow {
+    Workflow {
+        id: id.to_string(),
+        name: "Auth workflow".to_string(),
+        description: Some("Implements auth in ordered specs".to_string()),
+        workdir: "/tmp/project".to_string(),
+        status: WorkflowStatus::Draft,
+        created_at: Utc::now(),
+        started_at: None,
+        completed_at: None,
+    }
+}
+
+fn sample_workflow_spec(workflow_id: &str, id: &str, position: i64) -> WorkflowSpec {
+    WorkflowSpec {
+        id: id.to_string(),
+        workflow_id: workflow_id.to_string(),
+        name: format!("Spec {position}"),
+        description: Some("Do a slice of the feature".to_string()),
+        position,
+        parallelizable: false,
+        status: WorkflowSpecStatus::Pending,
+        started_at: None,
+        completed_at: None,
+    }
+}
+
+fn sample_workflow_node(spec_id: &str, id: &str, position: i64) -> WorkflowNode {
+    WorkflowNode {
+        id: id.to_string(),
+        spec_id: spec_id.to_string(),
+        name: format!("Node {position}"),
+        kind: WorkflowNodeKind::Check,
+        config: serde_json::json!({
+            "command": "cargo test",
+            "success_condition": "exit_code_0"
+        }),
+        position,
+        created_at: Utc::now(),
     }
 }
 
@@ -296,6 +342,87 @@ fn test_intelligence_upsert_search_and_graph_walk() {
     assert_eq!(walk.root.id, "node-a");
     assert!(walk.nodes.iter().any(|node| node.id == "node-b"));
     assert!(walk.edges.iter().any(|edge| edge.from_node_id == "node-a"));
+}
+
+// ── Workflow persistence ──────────────────────────────────────────
+
+#[test]
+fn workflow_details_roundtrip_preserves_order_and_graph() {
+    let db = test_db();
+    let workflow = sample_workflow("wf-1");
+    let spec_one = sample_workflow_spec(&workflow.id, "spec-1", 1);
+    let spec_two = sample_workflow_spec(&workflow.id, "spec-2", 2);
+    let node_one = sample_workflow_node(&spec_one.id, "node-1", 1);
+    let node_two = sample_workflow_node(&spec_one.id, "node-2", 2);
+    let edge = WorkflowEdge {
+        id: "edge-1".to_string(),
+        spec_id: spec_one.id.clone(),
+        from_node: node_one.id.clone(),
+        to_node: node_two.id.clone(),
+        condition: WorkflowEdgeCondition::Pass,
+    };
+
+    db.insert_workflow(&workflow).unwrap();
+    db.insert_workflow_spec(&spec_two).unwrap();
+    db.insert_workflow_spec(&spec_one).unwrap();
+    db.insert_workflow_node(&node_two).unwrap();
+    db.insert_workflow_node(&node_one).unwrap();
+    db.insert_workflow_edge(&edge).unwrap();
+
+    let details = db.get_workflow_details(&workflow.id).unwrap().unwrap();
+
+    assert_eq!(details.workflow.id, workflow.id);
+    assert_eq!(details.specs.len(), 2);
+    assert_eq!(details.specs[0].spec.id, spec_one.id);
+    assert_eq!(details.specs[0].nodes[0].id, node_one.id);
+    assert_eq!(details.specs[0].nodes[1].id, node_two.id);
+    assert_eq!(details.specs[0].edges[0].id, edge.id);
+    assert_eq!(details.specs[1].spec.id, spec_two.id);
+}
+
+#[test]
+fn workflow_run_roundtrip_preserves_json_payloads() {
+    let db = test_db();
+    let workflow = sample_workflow("wf-2");
+    let spec = sample_workflow_spec(&workflow.id, "spec-run", 1);
+    let node = sample_workflow_node(&spec.id, "node-run", 1);
+    let run = WorkflowNodeRun {
+        id: "run-1".to_string(),
+        workflow_id: workflow.id.clone(),
+        spec_id: spec.id.clone(),
+        node_id: node.id.clone(),
+        status: WorkflowRunStatus::Pass,
+        input: Some(serde_json::json!({"feedback": "previous"})),
+        output: Some(serde_json::json!({"summary": "ok"})),
+        started_at: Utc::now(),
+        completed_at: Some(Utc::now()),
+        iteration: 2,
+    };
+
+    db.insert_workflow(&workflow).unwrap();
+    db.insert_workflow_spec(&spec).unwrap();
+    db.insert_workflow_node(&node).unwrap();
+    db.insert_workflow_run(&run).unwrap();
+
+    let runs = db.list_workflow_runs_for_spec(&spec.id).unwrap();
+
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].iteration, 2);
+    assert_eq!(runs[0].status, WorkflowRunStatus::Pass);
+    assert_eq!(
+        runs[0]
+            .input
+            .as_ref()
+            .and_then(|value| value.get("feedback")),
+        Some(&serde_json::json!("previous"))
+    );
+    assert_eq!(
+        runs[0]
+            .output
+            .as_ref()
+            .and_then(|value| value.get("summary")),
+        Some(&serde_json::json!("ok"))
+    );
 }
 
 #[test]

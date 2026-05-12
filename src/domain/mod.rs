@@ -13,6 +13,7 @@ pub mod project;
 pub mod sync;
 pub mod usage_stats;
 pub mod validation;
+pub mod workflow;
 
 #[cfg(test)]
 mod domain_tests;
