@@ -1193,10 +1193,11 @@ impl TaskTriggerHandler {
 
         let mut out = Vec::with_capacity(workflows.len());
         for workflow in workflows {
-            let current_spec = self
+            let specs = self
                 .db
                 .list_workflow_specs(&workflow.id)
-                .map_err(internal_error)?
+                .map_err(internal_error)?;
+            let current_spec = specs
                 .into_iter()
                 .find(|spec| {
                     matches!(
@@ -1204,12 +1205,29 @@ impl TaskTriggerHandler {
                         WorkflowSpecStatus::Running | WorkflowSpecStatus::Pending
                     )
                 })
-                .map(|spec| spec.name);
+                .map(|spec| {
+                    let runs = self
+                        .db
+                        .list_workflow_runs_for_spec(&spec.id)
+                        .map_err(internal_error)?;
+                    let current_node = runs
+                        .iter()
+                        .rev()
+                        .find(|run| run.status == WorkflowRunStatus::Running)
+                        .or_else(|| runs.last())
+                        .map(|run| run.node_id.clone());
+                    let blocker = runs.last().and_then(workflow_run_blocker);
+                    Ok::<_, McpError>((spec.name, current_node, blocker))
+                })
+                .transpose()?;
             out.push(serde_json::json!({
                 "id": workflow.id,
                 "name": workflow.name,
                 "status": workflow.status.as_str(),
-                "current_spec": current_spec,
+                "current_spec": current_spec.as_ref().map(|value| &value.0),
+                "current_node": current_spec.as_ref().and_then(|value| value.1.as_ref()),
+                "blocked": current_spec.as_ref().and_then(|value| value.2.as_ref()).is_some(),
+                "blocker": current_spec.and_then(|value| value.2),
                 "created_at": workflow.created_at.to_rfc3339(),
                 "workdir": workflow.workdir,
             }));
@@ -1776,7 +1794,7 @@ fn workflow_details_json(
     let specs = workflow
         .specs
         .iter()
-        .map(|spec| workflow_spec_details_json(db, spec))
+        .map(|spec| workflow_spec_details_json(db, spec, workflow.workflow.status))
         .collect::<anyhow::Result<Vec<_>>>()?;
 
     Ok(serde_json::json!({
@@ -1795,12 +1813,23 @@ fn workflow_details_json(
 fn workflow_spec_details_json(
     db: &Database,
     spec: &crate::domain::workflow::WorkflowSpecDetails,
+    workflow_status: WorkflowStatus,
 ) -> anyhow::Result<serde_json::Value> {
-    let runs = db
-        .list_workflow_runs_for_spec(&spec.spec.id)?
+    let runs = db.list_workflow_runs_for_spec(&spec.spec.id)?;
+    let current_run = runs
         .iter()
-        .map(workflow_run_json)
-        .collect::<Vec<_>>();
+        .rev()
+        .find(|run| run.status == WorkflowRunStatus::Running)
+        .or_else(|| runs.last());
+    let blocker = runs.last().and_then(workflow_run_blocker);
+    let resume_actions = if workflow_status == WorkflowStatus::Paused
+        && spec.spec.status == WorkflowSpecStatus::Running
+    {
+        vec!["retry_current_node", "skip_next_spec"]
+    } else {
+        Vec::new()
+    };
+    let runs = runs.iter().map(workflow_run_json).collect::<Vec<_>>();
 
     Ok(serde_json::json!({
         "id": spec.spec.id,
@@ -1810,6 +1839,10 @@ fn workflow_spec_details_json(
         "position": spec.spec.position,
         "parallelizable": spec.spec.parallelizable,
         "status": spec.spec.status.as_str(),
+        "current_node": current_run.map(|run| run.node_id.clone()),
+        "blocked": blocker.is_some(),
+        "blocker": blocker,
+        "resume_actions": resume_actions,
         "started_at": spec.spec.started_at.map(|value| value.to_rfc3339()),
         "completed_at": spec.spec.completed_at.map(|value| value.to_rfc3339()),
         "nodes": spec.nodes.iter().map(workflow_node_json).collect::<Vec<_>>(),
@@ -1853,6 +1886,14 @@ fn workflow_run_json(run: &crate::domain::workflow::WorkflowNodeRun) -> serde_js
         "completed_at": run.completed_at.map(|value| value.to_rfc3339()),
         "iteration": run.iteration,
     })
+}
+
+fn workflow_run_blocker(run: &crate::domain::workflow::WorkflowNodeRun) -> Option<String> {
+    run.output
+        .as_ref()
+        .and_then(|output| output.get("blocker"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 fn transport_details(port: u16) -> (&'static str, String) {
