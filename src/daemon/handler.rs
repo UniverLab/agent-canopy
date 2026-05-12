@@ -33,6 +33,10 @@ use crate::db::Database;
 use crate::domain::models::{Agent, Trigger};
 use crate::domain::sync::{MessageKind, MissionImpact, WorkspaceStatus};
 use crate::domain::validation::validate_id;
+use crate::domain::workflow::{
+    Workflow, WorkflowDetails, WorkflowEdge, WorkflowEdgeCondition, WorkflowNode, WorkflowNodeKind,
+    WorkflowSpec, WorkflowSpecStatus, WorkflowStatus,
+};
 use crate::executor::Executor;
 use crate::rag::rate_limiter::RateLimiter;
 use crate::sync_manager::SyncManager;
@@ -911,6 +915,295 @@ impl TaskTriggerHandler {
         )]))
     }
 
+    #[tool(
+        name = "workflow_create",
+        description = "Create a workflow container for a background graph of specs and nodes."
+    )]
+    async fn workflow_create(
+        &self,
+        Parameters(params): Parameters<WorkflowCreateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let name = params.name.trim();
+        if name.is_empty() {
+            return Ok(error_result("Workflow name must not be empty."));
+        }
+        let workdir = params.workdir.trim();
+        if workdir.is_empty() {
+            return Ok(error_result("Workflow workdir must not be empty."));
+        }
+        let workdir_path = std::path::Path::new(workdir);
+        if !workdir_path.is_absolute() {
+            return Ok(error_result("Workflow workdir must be an absolute path."));
+        }
+        if !workdir_path.is_dir() {
+            return Ok(error_result(
+                "Workflow workdir must point to an existing directory.",
+            ));
+        }
+
+        let workflow = Workflow {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            description: params.description.filter(|value| !value.trim().is_empty()),
+            workdir: workdir.to_string(),
+            status: WorkflowStatus::Draft,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+        };
+
+        self.db.insert_workflow(&workflow).map_err(internal_error)?;
+        if let Err(error) = self.db.register_project_path(workdir_path) {
+            tracing::debug!("Could not register workflow project at {workdir}: {error}");
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&serde_json::json!({
+                "workflow_id": workflow.id,
+            }))
+            .unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        name = "workflow_add_spec",
+        description = "Add an ordered spec to an existing workflow."
+    )]
+    async fn workflow_add_spec(
+        &self,
+        Parameters(params): Parameters<WorkflowAddSpecParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let name = params.name.trim();
+        if name.is_empty() {
+            return Ok(error_result("Workflow spec name must not be empty."));
+        }
+        let workflow_id = params.workflow_id.trim();
+        if self
+            .db
+            .get_workflow(workflow_id)
+            .map_err(internal_error)?
+            .is_none()
+        {
+            return Ok(error_result(&format!(
+                "Workflow '{}' not found.",
+                params.workflow_id
+            )));
+        }
+
+        let existing_specs = self
+            .db
+            .list_workflow_specs(workflow_id)
+            .map_err(internal_error)?;
+        if existing_specs
+            .iter()
+            .any(|spec| spec.position == params.position)
+        {
+            return Ok(error_result(&format!(
+                "Workflow '{}' already has a spec at position {}.",
+                params.workflow_id, params.position
+            )));
+        }
+
+        let spec = WorkflowSpec {
+            id: uuid::Uuid::new_v4().to_string(),
+            workflow_id: workflow_id.to_string(),
+            name: name.to_string(),
+            description: params.description.filter(|value| !value.trim().is_empty()),
+            position: params.position,
+            parallelizable: params.parallelizable,
+            status: WorkflowSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+        };
+        self.db
+            .insert_workflow_spec(&spec)
+            .map_err(internal_error)?;
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&serde_json::json!({
+                "spec_id": spec.id,
+            }))
+            .unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        name = "workflow_add_node",
+        description = "Add a graph node to an existing workflow spec."
+    )]
+    async fn workflow_add_node(
+        &self,
+        Parameters(params): Parameters<WorkflowAddNodeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let name = params.name.trim();
+        if name.is_empty() {
+            return Ok(error_result("Workflow node name must not be empty."));
+        }
+        let spec_id = params.spec_id.trim();
+        let spec_exists = self
+            .db
+            .get_workflow_spec(spec_id)
+            .map_err(internal_error)?
+            .is_some();
+        if !spec_exists {
+            return Ok(error_result(&format!(
+                "Spec '{}' not found.",
+                params.spec_id
+            )));
+        }
+
+        let Some(kind) = WorkflowNodeKind::from_str(params.kind.trim()) else {
+            return Ok(error_result(
+                "Workflow node kind must be one of: agent, check, gate.",
+            ));
+        };
+
+        let next_position = self
+            .db
+            .list_workflow_nodes(spec_id)
+            .map_err(internal_error)?
+            .last()
+            .map(|node| node.position + 1)
+            .unwrap_or(1);
+
+        let node = WorkflowNode {
+            id: uuid::Uuid::new_v4().to_string(),
+            spec_id: spec_id.to_string(),
+            name: name.to_string(),
+            kind,
+            config: params.config,
+            position: next_position,
+            created_at: chrono::Utc::now(),
+        };
+        self.db
+            .insert_workflow_node(&node)
+            .map_err(internal_error)?;
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&serde_json::json!({
+                "node_id": node.id,
+            }))
+            .unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        name = "workflow_add_edge",
+        description = "Connect two nodes inside a workflow spec with a routing condition."
+    )]
+    async fn workflow_add_edge(
+        &self,
+        Parameters(params): Parameters<WorkflowAddEdgeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let Some(condition) = WorkflowEdgeCondition::from_str(params.condition.trim()) else {
+            return Ok(error_result(
+                "Workflow edge condition must be one of: pass, fail, always.",
+            ));
+        };
+
+        let nodes = self
+            .db
+            .list_workflow_nodes(&params.spec_id)
+            .map_err(internal_error)?;
+        if nodes.is_empty() {
+            return Ok(error_result(&format!(
+                "Spec '{}' not found.",
+                params.spec_id
+            )));
+        }
+        let has_from = nodes.iter().any(|node| node.id == params.from_node);
+        let has_to = nodes.iter().any(|node| node.id == params.to_node);
+        if !has_from || !has_to {
+            return Ok(error_result(
+                "Both workflow edge endpoints must belong to the provided spec.",
+            ));
+        }
+
+        let edge = WorkflowEdge {
+            id: uuid::Uuid::new_v4().to_string(),
+            spec_id: params.spec_id,
+            from_node: params.from_node,
+            to_node: params.to_node,
+            condition,
+        };
+        self.db
+            .insert_workflow_edge(&edge)
+            .map_err(internal_error)?;
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+            }))
+            .unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        name = "workflow_get",
+        description = "Return a workflow with its ordered specs, nodes, and edges."
+    )]
+    async fn workflow_get(
+        &self,
+        Parameters(params): Parameters<WorkflowGetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let Some(workflow) = self
+            .db
+            .get_workflow_details(&params.workflow_id)
+            .map_err(internal_error)?
+        else {
+            return Ok(error_result(&format!(
+                "Workflow '{}' not found.",
+                params.workflow_id
+            )));
+        };
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&workflow_details_json(&workflow)).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        name = "workflow_list",
+        description = "List workflows, optionally filtered by workdir."
+    )]
+    async fn workflow_list(
+        &self,
+        Parameters(params): Parameters<WorkflowListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let workflows = self
+            .db
+            .list_workflows(params.workdir.as_deref())
+            .map_err(internal_error)?;
+
+        let mut out = Vec::with_capacity(workflows.len());
+        for workflow in workflows {
+            let current_spec = self
+                .db
+                .list_workflow_specs(&workflow.id)
+                .map_err(internal_error)?
+                .into_iter()
+                .find(|spec| {
+                    matches!(
+                        spec.status,
+                        WorkflowSpecStatus::Running | WorkflowSpecStatus::Pending
+                    )
+                })
+                .map(|spec| spec.name);
+            out.push(serde_json::json!({
+                "id": workflow.id,
+                "name": workflow.name,
+                "status": workflow.status.as_str(),
+                "current_spec": current_spec,
+                "created_at": workflow.created_at.to_rfc3339(),
+                "workdir": workflow.workdir,
+            }));
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&out).unwrap_or_default(),
+        )]))
+    }
+
     /// Returns the recommended tools and step-by-step protocol for a given action scope.
     /// Use this at session start, before file writes, before test runs, and on session close.
     #[tool(
@@ -1241,6 +1534,60 @@ fn sync_message_json(message: &crate::domain::sync::SyncMessage) -> serde_json::
         "message": message.message,
         "payload": message.payload,
         "created_at": message.created_at,
+    })
+}
+
+fn workflow_details_json(workflow: &WorkflowDetails) -> serde_json::Value {
+    serde_json::json!({
+        "id": workflow.workflow.id,
+        "name": workflow.workflow.name,
+        "description": workflow.workflow.description,
+        "workdir": workflow.workflow.workdir,
+        "status": workflow.workflow.status.as_str(),
+        "created_at": workflow.workflow.created_at.to_rfc3339(),
+        "started_at": workflow.workflow.started_at.map(|value| value.to_rfc3339()),
+        "completed_at": workflow.workflow.completed_at.map(|value| value.to_rfc3339()),
+        "specs": workflow.specs.iter().map(workflow_spec_details_json).collect::<Vec<_>>(),
+    })
+}
+
+fn workflow_spec_details_json(
+    spec: &crate::domain::workflow::WorkflowSpecDetails,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": spec.spec.id,
+        "workflow_id": spec.spec.workflow_id,
+        "name": spec.spec.name,
+        "description": spec.spec.description,
+        "position": spec.spec.position,
+        "parallelizable": spec.spec.parallelizable,
+        "status": spec.spec.status.as_str(),
+        "started_at": spec.spec.started_at.map(|value| value.to_rfc3339()),
+        "completed_at": spec.spec.completed_at.map(|value| value.to_rfc3339()),
+        "nodes": spec.nodes.iter().map(workflow_node_json).collect::<Vec<_>>(),
+        "edges": spec.edges.iter().map(workflow_edge_json).collect::<Vec<_>>(),
+    })
+}
+
+fn workflow_node_json(node: &WorkflowNode) -> serde_json::Value {
+    serde_json::json!({
+        "id": node.id,
+        "spec_id": node.spec_id,
+        "name": node.name,
+        "kind": node.kind.as_str(),
+        "config": node.config,
+        "position": node.position,
+        "created_at": node.created_at.to_rfc3339(),
+    })
+}
+
+fn workflow_edge_json(edge: &WorkflowEdge) -> serde_json::Value {
+    serde_json::json!({
+        "id": edge.id,
+        "spec_id": edge.spec_id,
+        "from_node": edge.from_node,
+        "to_node": edge.to_node,
+        "condition": edge.condition.as_str(),
     })
 }
 

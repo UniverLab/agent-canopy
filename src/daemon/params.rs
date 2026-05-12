@@ -254,3 +254,65 @@ pub struct RagSearchParams {
     /// Max results (default: 5).
     pub limit: Option<usize>,
 }
+
+// ── Workflow tool parameter types ────────────────────────────────────────
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowCreateParams {
+    /// Human-readable workflow name.
+    pub name: String,
+    /// Optional workflow description.
+    pub description: Option<String>,
+    /// Absolute working directory for the workflow.
+    pub workdir: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowAddSpecParams {
+    /// Existing workflow ID.
+    pub workflow_id: String,
+    /// Human-readable spec name.
+    pub name: String,
+    /// Optional spec description.
+    pub description: Option<String>,
+    /// Execution order within the workflow.
+    pub position: i64,
+    /// Whether the spec is allowed to run in parallel in future engine phases.
+    pub parallelizable: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowAddNodeParams {
+    /// Existing spec ID.
+    pub spec_id: String,
+    /// Human-readable node name.
+    pub name: String,
+    /// Node kind: agent, check, or gate.
+    pub kind: String,
+    /// Kind-specific configuration object.
+    pub config: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowAddEdgeParams {
+    /// Existing spec ID.
+    pub spec_id: String,
+    /// Source node ID.
+    pub from_node: String,
+    /// Destination node ID.
+    pub to_node: String,
+    /// Routing condition: pass, fail, or always.
+    pub condition: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowGetParams {
+    /// Workflow ID.
+    pub workflow_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowListParams {
+    /// Optional absolute workdir filter.
+    pub workdir: Option<String>,
+}

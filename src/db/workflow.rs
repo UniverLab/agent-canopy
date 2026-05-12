@@ -142,6 +142,21 @@ impl Database {
             .map_err(Into::into)
     }
 
+    pub fn get_workflow_spec(&self, spec_id: &str) -> Result<Option<WorkflowSpec>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, workflow_id, name, description, position, parallelizable, status, started_at, completed_at
+             FROM workflow_specs WHERE id = ?1",
+        )?;
+
+        stmt.query_row(params![spec_id], map_workflow_spec_row)
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn update_workflow_spec_status(
         &self,
         spec_id: &str,
