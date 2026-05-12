@@ -805,11 +805,10 @@ fn detail_progress_line(
         return None;
     }
 
-    let percent = if total_lines == 0 {
-        100
-    } else {
-        ((start + visible_lines).min(total_lines) * 100 / total_lines).min(100)
-    };
+    let percent = ((start.saturating_add(visible_lines)).min(total_lines) * 100)
+        .checked_div(total_lines)
+        .unwrap_or(100)
+        .min(100);
     Some(Line::from(Span::styled(
         format!("  ── {percent}% ──"),
         Style::default().fg(DIM),

@@ -152,29 +152,29 @@ impl IngestionManager {
                     }
                     let path_str = path.to_string_lossy().to_string();
                     match event.kind {
-                        EventKind::Create(_) | EventKind::Modify(_) => {
-                            if detect_lang(&path_str).is_some() {
-                                tracing::info!(
-                                    "RAG watcher: queuing '{}' for indexing ({:?})",
-                                    path_str,
-                                    event.kind
-                                );
-                                let q = Arc::clone(&queue);
-                                let n = Arc::clone(&notify_handle);
-                                let p = path_str.clone();
-                                let db2 = Arc::clone(&db);
-                                rt.spawn(async move {
-                                    let now = chrono::Utc::now().timestamp();
-                                    let ok = {
-                                        let mut lock = q.lock().await;
-                                        lock.push(&p)
-                                    };
-                                    if ok {
-                                        let _ = db2.enqueue_rag_item(&p, now);
-                                        n.notify_one();
-                                    }
-                                });
-                            }
+                        EventKind::Create(_) | EventKind::Modify(_)
+                            if detect_lang(&path_str).is_some() =>
+                        {
+                            tracing::info!(
+                                "RAG watcher: queuing '{}' for indexing ({:?})",
+                                path_str,
+                                event.kind
+                            );
+                            let q = Arc::clone(&queue);
+                            let n = Arc::clone(&notify_handle);
+                            let p = path_str.clone();
+                            let db2 = Arc::clone(&db);
+                            rt.spawn(async move {
+                                let now = chrono::Utc::now().timestamp();
+                                let ok = {
+                                    let mut lock = q.lock().await;
+                                    lock.push(&p)
+                                };
+                                if ok {
+                                    let _ = db2.enqueue_rag_item(&p, now);
+                                    n.notify_one();
+                                }
+                            });
                         }
                         EventKind::Remove(_) => {
                             tracing::info!("RAG watcher: '{}' removed — purging chunks", path_str);
