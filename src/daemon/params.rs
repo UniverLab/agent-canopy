@@ -328,3 +328,11 @@ pub struct WorkflowPauseParams {
     /// Workflow ID.
     pub workflow_id: String,
 }
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowContinueParams {
+    /// Workflow ID.
+    pub workflow_id: String,
+    /// Continue mode: retry_current_node or skip_next_spec.
+    pub action: String,
+}

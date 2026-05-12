@@ -128,9 +128,9 @@ impl WorkflowEngine {
             .iter()
             .map(|node| (node.id.as_str(), node))
             .collect::<HashMap<_, _>>();
-        let mut current_node_id = find_entry_node(&spec_details)?;
-        let mut previous_output = None;
-        let mut iterations = HashMap::<String, usize>::new();
+        let existing_runs = self.db.list_workflow_runs_for_spec(&spec.id)?;
+        let (mut current_node_id, mut previous_output, mut iterations) =
+            resolve_spec_start(&spec_details, spec, &existing_runs)?;
 
         self.db.update_workflow_spec_status(
             &spec.id,
@@ -454,6 +454,25 @@ fn should_advance_to_next_spec(node: &WorkflowNode, status: WorkflowRunStatus) -
             .is_some_and(|route| route == "next_spec")
 }
 
+fn resolve_spec_start(
+    spec_details: &crate::domain::workflow::WorkflowSpecDetails,
+    spec: &WorkflowSpec,
+    existing_runs: &[WorkflowNodeRun],
+) -> Result<(String, Option<Value>, HashMap<String, usize>)> {
+    let mut iterations = HashMap::<String, usize>::new();
+    for run in existing_runs {
+        *iterations.entry(run.node_id.clone()).or_insert(0) += 1;
+    }
+
+    if spec.status == WorkflowSpecStatus::Running {
+        if let Some(last_run) = existing_runs.last() {
+            return Ok((last_run.node_id.clone(), last_run.input.clone(), iterations));
+        }
+    }
+
+    Ok((find_entry_node(spec_details)?, None, iterations))
+}
+
 #[cfg(unix)]
 fn shell_command(command: &str) -> Command {
     let mut process = Command::new("sh");
@@ -588,5 +607,55 @@ mod tests {
 
         assert_eq!(workflow.status, WorkflowStatus::Failed);
         assert_eq!(spec.status, WorkflowSpecStatus::Failed);
+    }
+
+    #[test]
+    fn resolve_spec_start_retries_last_running_node() {
+        let spec = WorkflowSpec {
+            id: "spec".to_string(),
+            workflow_id: "wf".to_string(),
+            name: "Spec".to_string(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: WorkflowSpecStatus::Running,
+            started_at: None,
+            completed_at: None,
+        };
+        let details = crate::domain::workflow::WorkflowSpecDetails {
+            spec: spec.clone(),
+            nodes: vec![WorkflowNode {
+                id: "node-1".to_string(),
+                spec_id: spec.id.clone(),
+                name: "Node".to_string(),
+                kind: WorkflowNodeKind::Check,
+                config: serde_json::json!({"command": "true"}),
+                position: 1,
+                created_at: chrono::Utc::now(),
+            }],
+            edges: vec![],
+        };
+        let runs = vec![WorkflowNodeRun {
+            id: "run".to_string(),
+            workflow_id: "wf".to_string(),
+            spec_id: spec.id.clone(),
+            node_id: "node-1".to_string(),
+            status: WorkflowRunStatus::Fail,
+            input: Some(serde_json::json!({"previous": "context"})),
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: Some(chrono::Utc::now()),
+            iteration: 1,
+        }];
+
+        let (node_id, previous_output, iterations) =
+            resolve_spec_start(&details, &spec, &runs).unwrap();
+
+        assert_eq!(node_id, "node-1");
+        assert_eq!(iterations.get("node-1"), Some(&1));
+        assert_eq!(
+            previous_output.and_then(|value| value.get("previous").cloned()),
+            Some(serde_json::json!("context"))
+        );
     }
 }

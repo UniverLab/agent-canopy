@@ -1286,6 +1286,72 @@ impl TaskTriggerHandler {
         }
     }
 
+    #[tool(
+        name = "workflow_continue",
+        description = "Continue a paused workflow by retrying the current node or skipping to the next spec."
+    )]
+    async fn workflow_continue(
+        &self,
+        Parameters(params): Parameters<WorkflowContinueParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let Some(workflow) = self
+            .db
+            .get_workflow(&params.workflow_id)
+            .map_err(internal_error)?
+        else {
+            return Ok(error_result(&format!(
+                "Workflow '{}' not found.",
+                params.workflow_id
+            )));
+        };
+        if workflow.status != WorkflowStatus::Paused {
+            return Ok(error_result(&format!(
+                "Workflow '{}' is not paused.",
+                params.workflow_id
+            )));
+        }
+
+        match params.action.trim() {
+            "retry_current_node" => {}
+            "skip_next_spec" => {
+                let current_spec = self
+                    .db
+                    .list_workflow_specs(&params.workflow_id)
+                    .map_err(internal_error)?
+                    .into_iter()
+                    .find(|spec| spec.status == WorkflowSpecStatus::Running);
+                let Some(current_spec) = current_spec else {
+                    return Ok(error_result(
+                        "No running spec found to skip from this paused workflow.",
+                    ));
+                };
+                self.db
+                    .update_workflow_spec_status(
+                        &current_spec.id,
+                        WorkflowSpecStatus::Skipped,
+                        None,
+                        Some(chrono::Utc::now()),
+                    )
+                    .map_err(internal_error)?;
+            }
+            _ => {
+                return Ok(error_result(
+                    "workflow_continue action must be retry_current_node or skip_next_spec.",
+                ));
+            }
+        }
+
+        self.db
+            .update_workflow_status(&params.workflow_id, WorkflowStatus::Running, None, None)
+            .map_err(internal_error)?;
+        Arc::clone(&self.workflow_engine).start_background(params.workflow_id.clone());
+
+        Ok(success_result(&format!(
+            "Workflow '{}' resumed with action '{}'.",
+            params.workflow_id, params.action
+        )))
+    }
+
     /// Returns the recommended tools and step-by-step protocol for a given action scope.
     /// Use this at session start, before file writes, before test runs, and on session close.
     #[tool(
