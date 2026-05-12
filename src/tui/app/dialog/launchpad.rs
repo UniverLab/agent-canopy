@@ -1,6 +1,7 @@
 use anyhow::Result;
 
 use crate::db::Database;
+use crate::domain::sync::summarize_sync_context;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum LaunchpadChoice {
@@ -15,6 +16,14 @@ pub struct LaunchpadContext {
     pub summary: Option<String>,
 }
 
+/// A brief summary of an active mission from another agent.
+#[derive(Clone)]
+pub struct ActiveMissionSummary {
+    pub agent_name: String,
+    pub impact: String,
+    pub mission: String,
+}
+
 #[derive(Clone)]
 pub struct LaunchpadDialog {
     pub workdir: String,
@@ -22,6 +31,8 @@ pub struct LaunchpadDialog {
     pub selected: LaunchpadChoice,
     pub new_mission: String,
     pub cursor: usize,
+    /// Active missions from peer agents in this workdir (mission handoff context).
+    pub active_missions: Vec<ActiveMissionSummary>,
 }
 
 impl LaunchpadDialog {
@@ -92,12 +103,34 @@ impl LaunchpadDialog {
             LaunchpadChoice::NewMission
         };
 
+        let active_missions = db
+            .list_sync_messages(workdir, 30)
+            .ok()
+            .map(|messages| {
+                let agent_ids = messages
+                    .iter()
+                    .map(|m| m.agent_id.clone())
+                    .collect::<std::collections::HashSet<_>>();
+                let snapshot = summarize_sync_context(&messages, &agent_ids, 5);
+                snapshot
+                    .active_intents
+                    .into_iter()
+                    .map(|intent| ActiveMissionSummary {
+                        agent_name: intent.agent_name,
+                        impact: intent.impact.as_str().to_owned(),
+                        mission: intent.mission,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
         Ok(Self {
             workdir: workdir.to_owned(),
             previous,
             selected,
             new_mission: String::new(),
             cursor: 0,
+            active_missions,
         })
     }
 

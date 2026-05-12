@@ -219,6 +219,14 @@ pub struct IntelligenceGraphWalkParams {
     pub depth: Option<usize>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetToolsParams {
+    /// Scope of the action. One of: session_start, file_write, test_run, close_session, multi_agent.
+    pub scope: String,
+    /// Optional file path hint (used with file_write scope to check conflicts).
+    pub path: Option<String>,
+}
+
 // ── RAG tool parameter types ───────────────────────────────────────────
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

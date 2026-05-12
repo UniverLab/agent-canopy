@@ -911,6 +911,114 @@ impl TaskTriggerHandler {
         )]))
     }
 
+    /// Returns the recommended tools and step-by-step protocol for a given action scope.
+    /// Use this at session start, before file writes, before test runs, and on session close.
+    #[tool(
+        name = "get_tools",
+        description = "Return the right tools and action protocol for the requested scope. \
+        Scopes: session_start (what to do first), file_write (conflict check before modifying), \
+        test_run (broadcast before/after running), close_session (wrap up + summary), \
+        multi_agent (full sync toolkit). Call this before acting — it tells you exactly what to use."
+    )]
+    async fn get_tools(
+        &self,
+        Parameters(params): Parameters<GetToolsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let scope = params.scope.trim().to_lowercase();
+        let out = match scope.as_str() {
+            "session_start" => serde_json::json!({
+                "scope": "session_start",
+                "risk": "low",
+                "protocol": [
+                    "1. Call intelligence_get_context(scope=\"light\") to load workspace brief.",
+                    "2. Check active_missions in sync context — align your work with open missions.",
+                    "3. If starting a new thread of work, call sync_declare_intent to register your mission.",
+                    "4. Respond to the user with context in hand."
+                ],
+                "tools": [
+                    "intelligence_get_context — pull session history, facts, patterns",
+                    "sync_get_context — check active missions and workspace vibe",
+                    "sync_declare_intent — announce your mission (impact: low/medium/high/breaking)"
+                ]
+            }),
+            "file_write" => {
+                let path_hint = params.path.as_deref().unwrap_or("(not specified)");
+                serde_json::json!({
+                    "scope": "file_write",
+                    "risk": "high",
+                    "path": path_hint,
+                    "protocol": [
+                        "1. Call sync_get_context(workdir=...) — check for conflicting missions on this path.",
+                        "2. If no conflict, call sync_declare_intent(impact=\"high\", mission=\"...\").",
+                        "3. Modify the file.",
+                        "4. Call sync_report_status(status=\"stable\", message=\"Changes complete: ...\")."
+                    ],
+                    "tools": [
+                        "sync_get_context — check active missions, detect conflicts",
+                        "sync_declare_intent — announce what you're changing and why",
+                        "sync_report_status — report stable/unstable/testing after the change"
+                    ]
+                })
+            }
+            "test_run" => serde_json::json!({
+                "scope": "test_run",
+                "risk": "medium",
+                "protocol": [
+                    "1. Call sync_broadcast(kind=\"info\", message=\"Running tests: <suite/command>\").",
+                    "2. Run the tests.",
+                    "3. Call sync_broadcast(kind=\"info\", message=\"Tests complete: PASSED/FAILED — <summary>\").",
+                    "4. If failed, call sync_report_status(status=\"unstable\", message=\"Test failure: ...\")."
+                ],
+                "tools": [
+                    "sync_broadcast — announce test start and result to peer agents",
+                    "sync_report_status — mark workspace unstable if tests fail"
+                ]
+            }),
+            "close_session" => serde_json::json!({
+                "scope": "close_session",
+                "risk": "low",
+                "protocol": [
+                    "1. Call intelligence_upsert(kind=\"session\", title=\"<mission>\", body=\"<what was done>\", \
+                       metadata={workdir, summary, ...}) — store session summary in PIL.",
+                    "2. Call sync_report_status(status=\"stable\", message=\"Mission complete: <summary>\") \
+                       — the daemon closes your mission automatically on exit.",
+                    "3. Do NOT manually call any close/shutdown tool — daemon handles it."
+                ],
+                "tools": [
+                    "intelligence_upsert — persist session summary as a 'session' node in PIL",
+                    "sync_report_status — leave a clean 'stable' marker for the next agent"
+                ]
+            }),
+            "multi_agent" => serde_json::json!({
+                "scope": "multi_agent",
+                "risk": "varies",
+                "protocol": [
+                    "Follow the action-risk table: low=execute, medium=broadcast, high=declare+execute+report, breaking=same as high with impact=breaking.",
+                    "Always non-blocking — act on last-known state, never wait for responses.",
+                    "Communicate intent not implementation — missions explain what and why, not how."
+                ],
+                "tools": [
+                    "sync_get_context — check active missions and workspace vibe (call first)",
+                    "sync_declare_intent — announce mission (impact: low/medium/high/breaking)",
+                    "sync_broadcast — send info/query/answer messages to peers",
+                    "sync_report_status — report stable/unstable/testing after actions",
+                    "intelligence_get_context(scope=\"full\") — deep PIL pull for architecture work",
+                    "intelligence_upsert — persist facts, patterns, session summaries",
+                    "intelligence_search — find prior art or decisions in PIL"
+                ]
+            }),
+            _ => {
+                return Ok(error_result(
+                    "Invalid scope. Must be one of: session_start, file_write, test_run, close_session, multi_agent.",
+                ))
+            }
+        };
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&out).unwrap_or_default(),
+        )]))
+    }
+
     /// Search registered projects by name or description.
     #[tool(
         name = "project_search",

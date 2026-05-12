@@ -596,7 +596,7 @@ impl SimplePromptDialog {
         self.append_prompt_section(
             &mut result,
             "memory_context",
-            "# [MEMORY CONTEXT]: PIL Snapshot\n",
+            "# [MEMORY CONTEXT]: Workspace Brief\n",
             "memory_context",
             "memory",
         );
@@ -640,7 +640,7 @@ impl SimplePromptDialog {
         Ok(result)
     }
 
-    /// Build a compact memory block from PIL/session data for a workdir.
+    /// Build a compact workspace brief from PIL/session data and project registry for a workdir.
     pub fn build_memory_context_block(db: &Database, workdir: &Path) -> String {
         let workdir_str = workdir.display().to_string();
         let workdir_ref = workdir_str.as_str();
@@ -648,6 +648,20 @@ impl SimplePromptDialog {
             format!("workspace: {workdir_str}"),
             "source: PIL".to_string(),
         ];
+
+        if let Ok(Some(project)) = db.get_project_by_path(workdir) {
+            lines.push(format!("project: {}", project.name));
+            if let Some(desc) = &project.description {
+                if !desc.trim().is_empty() {
+                    lines.push(format!("description: {}", desc.trim()));
+                }
+            }
+            if let Some(tags) = &project.tags {
+                if !tags.trim().is_empty() {
+                    lines.push(format!("tags: {}", tags.trim()));
+                }
+            }
+        }
 
         if let Ok(messages) = db.list_sync_messages(&workdir_str, 20) {
             let active_agent_ids = messages
