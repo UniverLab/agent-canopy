@@ -294,6 +294,69 @@ impl Database {
             .map_err(Into::into)
     }
 
+    pub fn get_workflow_run(&self, run_id: &str) -> Result<Option<WorkflowNodeRun>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, workflow_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration
+             FROM workflow_runs WHERE id = ?1",
+        )?;
+
+        stmt.query_row(params![run_id], map_workflow_run_row)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn get_active_workflow_run_for_node(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<WorkflowNodeRun>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, workflow_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration
+             FROM workflow_runs
+             WHERE node_id = ?1 AND status = 'running'
+             ORDER BY started_at DESC
+             LIMIT 1",
+        )?;
+
+        stmt.query_row(params![node_id], map_workflow_run_row)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn update_workflow_run_result(
+        &self,
+        run_id: &str,
+        status: WorkflowRunStatus,
+        output: Option<&Value>,
+        completed_at: Option<DateTime<Utc>>,
+    ) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE workflow_runs
+             SET status = ?1,
+                 output = COALESCE(?2, output),
+                 completed_at = COALESCE(?3, completed_at)
+             WHERE id = ?4",
+            params![
+                status.as_str(),
+                output.map(serde_json::to_string).transpose()?,
+                completed_at.map(|value| value.timestamp()),
+                run_id,
+            ],
+        )?;
+        Ok(rows > 0)
+    }
+
     pub fn get_workflow_details(&self, workflow_id: &str) -> Result<Option<WorkflowDetails>> {
         let Some(workflow) = self.get_workflow(workflow_id)? else {
             return Ok(None);

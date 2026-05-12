@@ -336,3 +336,23 @@ pub struct WorkflowContinueParams {
     /// Continue mode: retry_current_node or skip_next_spec.
     pub action: String,
 }
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowCompleteNodeParams {
+    /// Workflow node ID.
+    pub node_id: String,
+    /// pass or fail.
+    pub status: String,
+    /// Node output payload.
+    pub output: String,
+    /// Human-readable summary.
+    pub summary: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowReportBlockerParams {
+    /// Workflow node ID.
+    pub node_id: String,
+    /// Human-readable blocker description.
+    pub description: String,
+}

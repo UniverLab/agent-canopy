@@ -35,8 +35,8 @@ use crate::domain::sync::{MessageKind, MissionImpact, WorkspaceStatus};
 use crate::domain::validation::validate_id;
 use crate::domain::workflow::{
     validate_spec_description_template, Workflow, WorkflowDetails, WorkflowEdge,
-    WorkflowEdgeCondition, WorkflowNode, WorkflowNodeKind, WorkflowSpec, WorkflowSpecStatus,
-    WorkflowStatus,
+    WorkflowEdgeCondition, WorkflowNode, WorkflowNodeKind, WorkflowRunStatus, WorkflowSpec,
+    WorkflowSpecStatus, WorkflowStatus,
 };
 use crate::executor::Executor;
 use crate::rag::rate_limiter::RateLimiter;
@@ -1350,6 +1350,90 @@ impl TaskTriggerHandler {
             "Workflow '{}' resumed with action '{}'.",
             params.workflow_id, params.action
         )))
+    }
+
+    #[tool(
+        name = "workflow_complete_node",
+        description = "Mark the active run for a workflow node as pass or fail and attach its output."
+    )]
+    async fn workflow_complete_node(
+        &self,
+        Parameters(params): Parameters<WorkflowCompleteNodeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let status = match params.status.trim() {
+            "pass" => Some(WorkflowRunStatus::Pass),
+            "fail" => Some(WorkflowRunStatus::Fail),
+            _ => None,
+        };
+        let Some(status) = status else {
+            return Ok(error_result(
+                "workflow_complete_node status must be pass or fail.",
+            ));
+        };
+        let Some(run) = self
+            .db
+            .get_active_workflow_run_for_node(&params.node_id)
+            .map_err(internal_error)?
+        else {
+            return Ok(error_result(&format!(
+                "No active workflow run found for node '{}'.",
+                params.node_id
+            )));
+        };
+
+        self.db
+            .update_workflow_run_result(
+                &run.id,
+                status,
+                Some(&serde_json::json!({
+                    "reported_output": params.output,
+                    "summary": params.summary,
+                })),
+                Some(chrono::Utc::now()),
+            )
+            .map_err(internal_error)?;
+
+        Ok(success_result("Workflow node result recorded."))
+    }
+
+    #[tool(
+        name = "workflow_report_blocker",
+        description = "Pause a workflow because the active node is blocked and needs human intervention."
+    )]
+    async fn workflow_report_blocker(
+        &self,
+        Parameters(params): Parameters<WorkflowReportBlockerParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let Some(run) = self
+            .db
+            .get_active_workflow_run_for_node(&params.node_id)
+            .map_err(internal_error)?
+        else {
+            return Ok(error_result(&format!(
+                "No active workflow run found for node '{}'.",
+                params.node_id
+            )));
+        };
+
+        self.db
+            .update_workflow_run_result(
+                &run.id,
+                WorkflowRunStatus::Fail,
+                Some(&serde_json::json!({
+                    "blocker": params.description,
+                })),
+                Some(chrono::Utc::now()),
+            )
+            .map_err(internal_error)?;
+        self.db
+            .update_workflow_status(&run.workflow_id, WorkflowStatus::Paused, None, None)
+            .map_err(internal_error)?;
+        self.notification_service
+            .notify_task_failed(&run.workflow_id, 1, &params.description);
+
+        Ok(success_result(
+            "Workflow blocker recorded and workflow paused.",
+        ))
     }
 
     /// Returns the recommended tools and step-by-step protocol for a given action scope.

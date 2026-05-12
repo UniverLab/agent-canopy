@@ -7,6 +7,7 @@ use tokio::process::Command;
 
 use crate::application::notification_service::NotificationService;
 use crate::db::Database;
+use crate::domain::models::Cli;
 use crate::domain::workflow::{
     WorkflowEdge, WorkflowNode, WorkflowNodeKind, WorkflowNodeRun, WorkflowRunStatus, WorkflowSpec,
     WorkflowSpecStatus, WorkflowStatus,
@@ -163,23 +164,47 @@ impl WorkflowEngine {
             let node = nodes_by_id
                 .get(current_node_id.as_str())
                 .ok_or_else(|| anyhow!("Workflow node '{}' not found.", current_node_id))?;
-            let execution = self
-                .execute_node(workflow, spec, node, previous_output.as_ref())
-                .await?;
+            let run_id = uuid::Uuid::new_v4().to_string();
             self.db.insert_workflow_run(&WorkflowNodeRun {
-                id: uuid::Uuid::new_v4().to_string(),
+                id: run_id.clone(),
                 workflow_id: workflow.id.clone(),
                 spec_id: spec.id.clone(),
                 node_id: node.id.clone(),
-                status: execution.status,
+                status: WorkflowRunStatus::Running,
                 input: previous_output.clone(),
-                output: Some(execution.output.clone()),
+                output: None,
                 started_at: chrono::Utc::now(),
-                completed_at: Some(chrono::Utc::now()),
+                completed_at: None,
                 iteration: *iteration as i64,
             })?;
+            let execution = self
+                .execute_node(workflow, spec, node, previous_output.as_ref(), &run_id)
+                .await?;
+            let run = self
+                .db
+                .get_workflow_run(&run_id)?
+                .ok_or_else(|| anyhow!("Workflow run '{}' not found after execution.", run_id))?;
+            let final_execution = if run.status == WorkflowRunStatus::Running {
+                self.db.update_workflow_run_result(
+                    &run_id,
+                    execution.status,
+                    Some(&execution.output),
+                    Some(chrono::Utc::now()),
+                )?;
+                execution
+            } else {
+                NodeExecution {
+                    status: run.status,
+                    output: run.output.unwrap_or_else(|| serde_json::json!({})),
+                    summary: execution.summary,
+                }
+            };
 
-            if should_advance_to_next_spec(node, execution.status) {
+            if self.is_paused(&workflow.id)? {
+                return Ok(SpecExecutionOutcome::Paused);
+            }
+
+            if should_advance_to_next_spec(node, final_execution.status) {
                 self.db.update_workflow_spec_status(
                     &spec.id,
                     WorkflowSpecStatus::Completed,
@@ -189,15 +214,16 @@ impl WorkflowEngine {
                 return Ok(SpecExecutionOutcome::Completed);
             }
 
-            let next_node_id = select_next_node(&spec_details.edges, &node.id, execution.status)?
-                .map(str::to_owned);
+            let next_node_id =
+                select_next_node(&spec_details.edges, &node.id, final_execution.status)?
+                    .map(str::to_owned);
 
             match next_node_id {
                 Some(next_node_id) => {
-                    previous_output = Some(execution.output);
+                    previous_output = Some(final_execution.output);
                     current_node_id = next_node_id;
                 }
-                None if execution.status == WorkflowRunStatus::Pass => {
+                None if final_execution.status == WorkflowRunStatus::Pass => {
                     self.db.update_workflow_spec_status(
                         &spec.id,
                         WorkflowSpecStatus::Completed,
@@ -213,7 +239,7 @@ impl WorkflowEngine {
                         None,
                         Some(chrono::Utc::now()),
                     )?;
-                    return Ok(SpecExecutionOutcome::Failed(execution.summary));
+                    return Ok(SpecExecutionOutcome::Failed(final_execution.summary));
                 }
             }
         }
@@ -225,20 +251,14 @@ impl WorkflowEngine {
         spec: &WorkflowSpec,
         node: &WorkflowNode,
         previous_output: Option<&Value>,
+        run_id: &str,
     ) -> Result<NodeExecution> {
         match node.kind {
             WorkflowNodeKind::Check => execute_check_node(workflow, spec, node).await,
             WorkflowNodeKind::Gate => execute_gate_node(node, previous_output),
-            WorkflowNodeKind::Agent => Ok(NodeExecution {
-                status: WorkflowRunStatus::Fail,
-                output: serde_json::json!({
-                    "summary": "Agent nodes are not wired yet."
-                }),
-                summary: format!(
-                    "Workflow node '{}' is an agent node and is not wired in this checkpoint.",
-                    node.name
-                ),
-            }),
+            WorkflowNodeKind::Agent => {
+                execute_agent_node(&self.db, workflow, spec, node, previous_output, run_id).await
+            }
         }
     }
 
@@ -329,6 +349,78 @@ async fn execute_check_node(
             node.name,
             if passed { "passed" } else { "failed" }
         ),
+    })
+}
+
+async fn execute_agent_node(
+    db: &Arc<Database>,
+    workflow: &crate::domain::workflow::Workflow,
+    spec: &WorkflowSpec,
+    node: &WorkflowNode,
+    previous_output: Option<&Value>,
+    run_id: &str,
+) -> Result<NodeExecution> {
+    let cli_name = node
+        .config
+        .get("platform")
+        .or_else(|| node.config.get("cli"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("Agent node '{}' is missing a platform/cli.", node.name))?;
+    let cli = Cli::resolve(Some(cli_name)).map_err(anyhow::Error::msg)?;
+    let prompt_template = node
+        .config
+        .get("prompt_template")
+        .and_then(Value::as_str)
+        .unwrap_or("{{spec_content}}\n\n{{previous_feedback}}");
+    let prompt = render_agent_prompt(workflow, spec, node, prompt_template, previous_output);
+    let model = node.config.get("model").and_then(Value::as_str);
+    let timeout_minutes = node
+        .config
+        .get("timeout_minutes")
+        .and_then(Value::as_u64)
+        .unwrap_or(30);
+
+    let mut command = cli
+        .strategy()
+        .build_command(&prompt, model, Some(&workflow.workdir));
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_minutes * 60),
+        command.output(),
+    )
+    .await
+    .with_context(|| format!("Agent node '{}' timed out.", node.name))??;
+
+    if let Some(run) = db.get_workflow_run(run_id)? {
+        if run.status != WorkflowRunStatus::Running {
+            return Ok(NodeExecution {
+                status: run.status,
+                output: run.output.unwrap_or_else(|| serde_json::json!({})),
+                summary: format!("Agent node '{}' reported its own result.", node.name),
+            });
+        }
+    }
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Ok(NodeExecution {
+        status: if output.status.success() {
+            WorkflowRunStatus::Pass
+        } else {
+            WorkflowRunStatus::Fail
+        },
+        output: serde_json::json!({
+            "kind": "agent",
+            "node_id": node.id,
+            "cli": cli.as_str(),
+            "model": model,
+            "exit_code": exit_code,
+            "stdout": stdout,
+            "stderr": stderr,
+        }),
+        summary: format!("Agent node '{}' exited with code {}.", node.name, exit_code),
     })
 }
 
@@ -452,6 +544,39 @@ fn should_advance_to_next_spec(node: &WorkflowNode, status: WorkflowRunStatus) -
             .get(route_key)
             .and_then(Value::as_str)
             .is_some_and(|route| route == "next_spec")
+}
+
+fn render_agent_prompt(
+    workflow: &crate::domain::workflow::Workflow,
+    spec: &WorkflowSpec,
+    node: &WorkflowNode,
+    prompt_template: &str,
+    previous_output: Option<&Value>,
+) -> String {
+    let previous_feedback = previous_output
+        .map(|value| serde_json::to_string_pretty(value).unwrap_or_default())
+        .unwrap_or_else(|| "(none)".to_string());
+    let spec_content = spec.description.as_deref().unwrap_or(&spec.name);
+    let prompt = prompt_template
+        .replace("{{workflow_name}}", &workflow.name)
+        .replace("{{workdir}}", &workflow.workdir)
+        .replace("{{spec_id}}", &spec.id)
+        .replace("{{spec_name}}", &spec.name)
+        .replace("{{spec_content}}", spec_content)
+        .replace("{{node_id}}", &node.id)
+        .replace("{{previous_feedback}}", &previous_feedback);
+
+    format!(
+        "# [WORKFLOW CONTEXT]\n<workflow>\n  <name>{}</name>\n  <spec>{}</spec>\n  <node>{}</node>\n  <workdir>{}</workdir>\n</workflow>\n\n# [SPEC]\n{}\n\n# [PREVIOUS FEEDBACK]\n{}\n\n# [REPORTING]\nWhen you finish this node, call workflow_complete_node with node_id=\"{}\", status=\"pass\"|\"fail\", a concise summary, and your output.\nIf you are blocked and need human intervention, call workflow_report_blocker with node_id=\"{}\" and the blocker description.\n",
+        workflow.name,
+        spec.name,
+        node.name,
+        workflow.workdir,
+        prompt,
+        previous_feedback,
+        node.id,
+        node.id
+    )
 }
 
 fn resolve_spec_start(
@@ -657,5 +782,52 @@ mod tests {
             previous_output.and_then(|value| value.get("previous").cloned()),
             Some(serde_json::json!("context"))
         );
+    }
+
+    #[test]
+    fn render_agent_prompt_includes_reporting_contract() {
+        let workflow = crate::domain::workflow::Workflow {
+            id: "wf".to_string(),
+            name: "Workflow".to_string(),
+            description: None,
+            workdir: "/tmp/project".to_string(),
+            status: WorkflowStatus::Draft,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+        };
+        let spec = WorkflowSpec {
+            id: "spec".to_string(),
+            workflow_id: "wf".to_string(),
+            name: "Spec".to_string(),
+            description: Some("Do the thing".to_string()),
+            position: 1,
+            parallelizable: false,
+            status: WorkflowSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+        };
+        let node = WorkflowNode {
+            id: "node-1".to_string(),
+            spec_id: "spec".to_string(),
+            name: "Agent".to_string(),
+            kind: WorkflowNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+
+        let prompt = render_agent_prompt(
+            &workflow,
+            &spec,
+            &node,
+            "{{spec_content}}",
+            Some(&serde_json::json!({"feedback":"ok"})),
+        );
+
+        assert!(prompt.contains("workflow_complete_node"));
+        assert!(prompt.contains("workflow_report_blocker"));
+        assert!(prompt.contains("Do the thing"));
+        assert!(prompt.contains("\"feedback\": \"ok\""));
     }
 }
