@@ -42,6 +42,7 @@ use crate::executor::Executor;
 use crate::rag::rate_limiter::RateLimiter;
 use crate::sync_manager::SyncManager;
 use crate::watchers::WatcherEngine;
+use crate::workflow_engine::WorkflowEngine;
 
 #[derive(Clone)]
 pub struct TaskTriggerHandler {
@@ -49,6 +50,7 @@ pub struct TaskTriggerHandler {
     pub executor: Arc<Executor>,
     pub watcher_engine: Arc<WatcherEngine>,
     pub scheduler_notify: Arc<Notify>,
+    pub workflow_engine: Arc<WorkflowEngine>,
     pub notification_service: Arc<dyn NotificationService>,
     pub sync_manager: Arc<SyncManager>,
     /// Rate limiters for rag_search (10 calls/min). Keyed by agent_id.
@@ -67,6 +69,7 @@ impl TaskTriggerHandler {
         executor: Arc<Executor>,
         watcher_engine: Arc<WatcherEngine>,
         scheduler_notify: Arc<Notify>,
+        workflow_engine: Arc<WorkflowEngine>,
         notification_service: Arc<dyn NotificationService>,
         sync_manager: Arc<SyncManager>,
         port: u16,
@@ -76,6 +79,7 @@ impl TaskTriggerHandler {
             executor,
             watcher_engine,
             scheduler_notify,
+            workflow_engine,
             notification_service,
             sync_manager,
             rag_limiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -1167,7 +1171,10 @@ impl TaskTriggerHandler {
         };
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&workflow_details_json(&workflow)).unwrap_or_default(),
+            serde_json::to_string_pretty(
+                &workflow_details_json(&self.db, &workflow).map_err(internal_error)?,
+            )
+            .unwrap_or_default(),
         )]))
     }
 
@@ -1211,6 +1218,72 @@ impl TaskTriggerHandler {
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&out).unwrap_or_default(),
         )]))
+    }
+
+    #[tool(
+        name = "workflow_run",
+        description = "Run a workflow in the background, spec by spec."
+    )]
+    async fn workflow_run(
+        &self,
+        Parameters(params): Parameters<WorkflowRunParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let Some(workflow) = self
+            .db
+            .get_workflow(&params.workflow_id)
+            .map_err(internal_error)?
+        else {
+            return Ok(error_result(&format!(
+                "Workflow '{}' not found.",
+                params.workflow_id
+            )));
+        };
+
+        if workflow.status == WorkflowStatus::Running {
+            return Ok(error_result(&format!(
+                "Workflow '{}' is already running.",
+                params.workflow_id
+            )));
+        }
+        if matches!(
+            workflow.status,
+            WorkflowStatus::Completed | WorkflowStatus::Failed
+        ) {
+            return Ok(error_result(
+                "Completed or failed workflows cannot be resumed yet.",
+            ));
+        }
+
+        Arc::clone(&self.workflow_engine).start_background(params.workflow_id.clone());
+        Ok(success_result(&format!(
+            "Workflow '{}' launched in background.",
+            params.workflow_id
+        )))
+    }
+
+    #[tool(
+        name = "workflow_pause",
+        description = "Pause a running workflow after the current node finishes."
+    )]
+    async fn workflow_pause(
+        &self,
+        Parameters(params): Parameters<WorkflowPauseParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let paused = self
+            .workflow_engine
+            .request_pause(&params.workflow_id)
+            .map_err(internal_error)?;
+        if paused {
+            Ok(success_result(&format!(
+                "Workflow '{}' marked to pause.",
+                params.workflow_id
+            )))
+        } else {
+            Ok(error_result(&format!(
+                "Workflow '{}' is not running or does not exist.",
+                params.workflow_id
+            )))
+        }
     }
 
     /// Returns the recommended tools and step-by-step protocol for a given action scope.
@@ -1546,8 +1619,17 @@ fn sync_message_json(message: &crate::domain::sync::SyncMessage) -> serde_json::
     })
 }
 
-fn workflow_details_json(workflow: &WorkflowDetails) -> serde_json::Value {
-    serde_json::json!({
+fn workflow_details_json(
+    db: &Database,
+    workflow: &WorkflowDetails,
+) -> anyhow::Result<serde_json::Value> {
+    let specs = workflow
+        .specs
+        .iter()
+        .map(|spec| workflow_spec_details_json(db, spec))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    Ok(serde_json::json!({
         "id": workflow.workflow.id,
         "name": workflow.workflow.name,
         "description": workflow.workflow.description,
@@ -1556,14 +1638,21 @@ fn workflow_details_json(workflow: &WorkflowDetails) -> serde_json::Value {
         "created_at": workflow.workflow.created_at.to_rfc3339(),
         "started_at": workflow.workflow.started_at.map(|value| value.to_rfc3339()),
         "completed_at": workflow.workflow.completed_at.map(|value| value.to_rfc3339()),
-        "specs": workflow.specs.iter().map(workflow_spec_details_json).collect::<Vec<_>>(),
-    })
+        "specs": specs,
+    }))
 }
 
 fn workflow_spec_details_json(
+    db: &Database,
     spec: &crate::domain::workflow::WorkflowSpecDetails,
-) -> serde_json::Value {
-    serde_json::json!({
+) -> anyhow::Result<serde_json::Value> {
+    let runs = db
+        .list_workflow_runs_for_spec(&spec.spec.id)?
+        .iter()
+        .map(workflow_run_json)
+        .collect::<Vec<_>>();
+
+    Ok(serde_json::json!({
         "id": spec.spec.id,
         "workflow_id": spec.spec.workflow_id,
         "name": spec.spec.name,
@@ -1575,7 +1664,8 @@ fn workflow_spec_details_json(
         "completed_at": spec.spec.completed_at.map(|value| value.to_rfc3339()),
         "nodes": spec.nodes.iter().map(workflow_node_json).collect::<Vec<_>>(),
         "edges": spec.edges.iter().map(workflow_edge_json).collect::<Vec<_>>(),
-    })
+        "runs": runs,
+    }))
 }
 
 fn workflow_node_json(node: &WorkflowNode) -> serde_json::Value {
@@ -1597,6 +1687,21 @@ fn workflow_edge_json(edge: &WorkflowEdge) -> serde_json::Value {
         "from_node": edge.from_node,
         "to_node": edge.to_node,
         "condition": edge.condition.as_str(),
+    })
+}
+
+fn workflow_run_json(run: &crate::domain::workflow::WorkflowNodeRun) -> serde_json::Value {
+    serde_json::json!({
+        "id": run.id,
+        "workflow_id": run.workflow_id,
+        "spec_id": run.spec_id,
+        "node_id": run.node_id,
+        "status": run.status.as_str(),
+        "input": run.input,
+        "output": run.output,
+        "started_at": run.started_at.to_rfc3339(),
+        "completed_at": run.completed_at.map(|value| value.to_rfc3339()),
+        "iteration": run.iteration,
     })
 }
 

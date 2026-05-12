@@ -13,6 +13,7 @@ use crate::rag::ingestion::IngestionManager;
 use crate::scheduler::cron_scheduler::CronScheduler;
 use crate::sync_manager::SyncManager;
 use crate::watchers::WatcherEngine;
+use crate::workflow_engine::WorkflowEngine;
 
 pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
     crate::domain::notification::register_aumid();
@@ -29,6 +30,10 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
     ));
     let watcher_engine = Arc::new(WatcherEngine::new(Arc::clone(&db), Arc::clone(&executor)));
     let sync_manager = Arc::new(SyncManager::new(Arc::clone(&db)));
+    let workflow_engine = Arc::new(WorkflowEngine::new(
+        Arc::clone(&db),
+        Arc::clone(&notification_service),
+    ));
 
     let ingestion = Arc::new(IngestionManager::new(Arc::clone(&db), data_dir.clone()));
     let _ingestion_cancel = Arc::clone(&ingestion).start();
@@ -60,6 +65,7 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
     let handler_watcher_engine = Arc::clone(&watcher_engine);
     let handler_scheduler_notify = Arc::clone(&scheduler_notify);
     let handler_sync_manager = Arc::clone(&sync_manager);
+    let handler_workflow_engine = Arc::clone(&workflow_engine);
 
     let ct = tokio_util::sync::CancellationToken::new();
 
@@ -70,6 +76,7 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
                 Arc::clone(&handler_executor),
                 Arc::clone(&handler_watcher_engine),
                 Arc::clone(&handler_scheduler_notify),
+                Arc::clone(&handler_workflow_engine),
                 Arc::clone(&notification_service),
                 Arc::clone(&handler_sync_manager),
                 port,
@@ -134,6 +141,10 @@ pub(crate) async fn run_stdio_server() -> Result<()> {
     ));
     let watcher_engine = Arc::new(WatcherEngine::new(Arc::clone(&db), Arc::clone(&executor)));
     let sync_manager = Arc::new(SyncManager::new(Arc::clone(&db)));
+    let workflow_engine = Arc::new(WorkflowEngine::new(
+        Arc::clone(&db),
+        Arc::clone(&notification_service),
+    ));
 
     let ingestion = Arc::new(IngestionManager::new(Arc::clone(&db), data_dir.clone()));
     let _ingestion_cancel = Arc::clone(&ingestion).start();
@@ -153,6 +164,7 @@ pub(crate) async fn run_stdio_server() -> Result<()> {
         Arc::clone(&executor),
         Arc::clone(&watcher_engine),
         scheduler_notify,
+        workflow_engine,
         Arc::clone(&notification_service),
         sync_manager,
         0,

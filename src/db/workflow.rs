@@ -1,8 +1,3 @@
-#![expect(
-    dead_code,
-    reason = "Workflow persistence lands before handler and engine checkpoints start using every API."
-)]
-
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, OptionalExtension};

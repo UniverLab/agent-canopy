@@ -316,3 +316,15 @@ pub struct WorkflowListParams {
     /// Optional absolute workdir filter.
     pub workdir: Option<String>,
 }
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowRunParams {
+    /// Workflow ID.
+    pub workflow_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowPauseParams {
+    /// Workflow ID.
+    pub workflow_id: String,
+}
