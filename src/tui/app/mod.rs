@@ -421,9 +421,6 @@ impl App {
             self.workflow_runs.clear();
             self.workflow_selected_spec = 0;
             self.workflow_selected_node = 0;
-            if self.projects_panel_focus == ProjectsPanelFocus::Workflows {
-                self.projects_panel_focus = ProjectsPanelFocus::Projects;
-            }
             return;
         }
 
@@ -533,20 +530,7 @@ impl App {
     }
 
     pub fn visible_workflows(&self) -> Vec<&crate::domain::workflow::Workflow> {
-        let Some(project) = self.selected_project() else {
-            return self.workflows.iter().collect();
-        };
-        let project_path = project.path.trim_end_matches('/');
-        self.workflows
-            .iter()
-            .filter(|workflow| {
-                workflow.workdir == project_path
-                    || workflow
-                        .workdir
-                        .strip_prefix(project_path)
-                        .is_some_and(|suffix| suffix.starts_with('/'))
-            })
-            .collect()
+        self.workflows.iter().collect()
     }
 
     pub fn selected_workflow(&self) -> Option<&crate::domain::workflow::Workflow> {
@@ -584,10 +568,7 @@ impl App {
 
     #[allow(dead_code)]
     pub fn visible_projects_panels(&self) -> Vec<ProjectsPanelFocus> {
-        let mut panels = vec![ProjectsPanelFocus::Projects];
-        if !self.visible_workflows().is_empty() {
-            panels.push(ProjectsPanelFocus::Workflows);
-        }
+        let mut panels = vec![ProjectsPanelFocus::Projects, ProjectsPanelFocus::Workflows];
         if self.rag_info.has_rag_activity() {
             panels.push(ProjectsPanelFocus::RagInfo);
         }

@@ -326,16 +326,16 @@ fn projects_layout_requirements(
     content_height: u16,
 ) -> (bool, bool, u16, u16, u16) {
     let has_projects = !app.projects.is_empty();
-    let has_workflows = workflow_count > 0;
+    let has_workflows = true;
     let projects_needed = if has_projects {
         (app.projects.len() as u16 * 3 + 2).min(content_height)
     } else {
         0
     };
-    let workflows_needed = if has_workflows {
+    let workflows_needed = if workflow_count > 0 {
         (workflow_count as u16 * 3 + 2).min(content_height)
     } else {
-        0
+        4.min(content_height)
     };
     let rag_needed = if app.playground_active && !rag_items.is_empty() {
         (rag_items.len() as u16 * 2 + 3).min(14)
@@ -645,7 +645,7 @@ fn draw_workflows_list(frame: &mut Frame, area: Rect, app: &App) {
     if workflows.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "No workflows for this project",
+                "No workflows yet",
                 Style::default().fg(Color::DarkGray),
             ))),
             area,

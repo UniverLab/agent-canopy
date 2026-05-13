@@ -468,7 +468,7 @@ fn draw_rag_queue_overview(frame: &mut Frame, area: Rect, app: &App) {
 fn draw_workflow_overview(frame: &mut Frame, area: Rect, app: &App) {
     let Some(workflow) = app.selected_workflow() else {
         frame.render_widget(
-            Paragraph::new("No workflows for the selected project").style(Style::default().fg(DIM)),
+            Paragraph::new("No workflows yet").style(Style::default().fg(DIM)),
             area,
         );
         return;
