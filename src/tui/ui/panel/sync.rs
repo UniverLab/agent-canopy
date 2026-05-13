@@ -9,7 +9,7 @@ use crate::domain::sync::{MessageKind, MissionImpact, SyncMessage, WorkspaceStat
 use crate::tui::app::types::SyncPanelState;
 use crate::tui::ui::{last_two_segments, ACCENT, DIM, ERROR_COLOR, STATUS_OK};
 
-pub(crate) fn draw_sync_panel(
+pub(crate) fn draw_activity_panel(
     frame: &mut Frame,
     area: Rect,
     state: &SyncPanelState,
@@ -17,7 +17,7 @@ pub(crate) fn draw_sync_panel(
 ) {
     let block = Block::default()
         .title(
-            Line::from(Span::styled(" sync ", Style::default().fg(DIM)))
+            Line::from(Span::styled(" activity ", Style::default().fg(DIM)))
                 .alignment(ratatui::layout::Alignment::Right),
         )
         .borders(Borders::ALL)
@@ -38,7 +38,7 @@ fn draw_sync_section(frame: &mut Frame, area: Rect, state: &SyncPanelState, scro
                 Style::default().fg(vibe_fg).add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled("sessions ", Style::default().fg(DIM)),
+            Span::styled("participants ", Style::default().fg(DIM)),
             Span::styled(
                 state.participant_count.to_string(),
                 Style::default().fg(Color::White),

@@ -17,6 +17,7 @@ pub fn handle_home_key(app: &mut App, code: KeyCode, _modifiers: KeyModifiers) -
 
     let has_project_preview = app.sidebar_mode == SidebarMode::Projects
         && (!app.projects.is_empty()
+            || !app.visible_workflows().is_empty()
             || !app.global_rag_queue.is_empty()
             || app.rag_info.total_chunks > 0);
 
@@ -39,12 +40,11 @@ pub fn handle_home_key(app: &mut App, code: KeyCode, _modifiers: KeyModifiers) -
                 app.selected = 0;
                 app.agents_rag_focused = false;
             } else {
-                // Projects mode: arrow-down goes to RagInfo if chunks exist, else first project.
-                if app.rag_info.total_chunks > 0 {
-                    app.projects_panel_focus = ProjectsPanelFocus::RagInfo;
-                } else {
-                    app.select_next();
-                }
+                app.projects_panel_focus = app
+                    .visible_projects_panels()
+                    .first()
+                    .copied()
+                    .unwrap_or(ProjectsPanelFocus::Projects);
             }
             app.log_scroll = 0;
             app.focus = Focus::Preview;
@@ -55,7 +55,11 @@ pub fn handle_home_key(app: &mut App, code: KeyCode, _modifiers: KeyModifiers) -
                 app.selected = app.agents.len().saturating_sub(1);
                 app.agents_rag_focused = false;
             } else {
-                app.select_prev();
+                app.projects_panel_focus = app
+                    .visible_projects_panels()
+                    .last()
+                    .copied()
+                    .unwrap_or(ProjectsPanelFocus::Projects);
             }
             app.log_scroll = 0;
             app.focus = Focus::Preview;
@@ -87,6 +91,9 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
                 match app.projects_panel_focus {
                     ProjectsPanelFocus::RagInfo => app.activate_playground(),
                     ProjectsPanelFocus::Projects => {}
+                    ProjectsPanelFocus::Workflows => {
+                        let _ = app.open_workflow_editor_dialog();
+                    }
                 }
                 return Ok(());
             }
@@ -109,17 +116,15 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
             app.log_scroll = 0;
             app.focus = Focus::Agent;
         }
+        KeyCode::Tab if app.sidebar_mode == SidebarMode::Projects => {
+            app.cycle_projects_panel_focus(true);
+        }
+        KeyCode::BackTab if app.sidebar_mode == SidebarMode::Projects => {
+            app.cycle_projects_panel_focus(false);
+        }
         KeyCode::Down | KeyCode::Char('j') => {
             if app.sidebar_mode == SidebarMode::Projects {
-                // In Projects mode: Down cycles Projects → RagInfo
-                if app.projects_panel_focus == ProjectsPanelFocus::Projects
-                    && app.rag_info.total_chunks > 0
-                {
-                    app.projects_panel_focus = ProjectsPanelFocus::RagInfo;
-                } else {
-                    app.projects_panel_focus = ProjectsPanelFocus::Projects;
-                    app.select_next();
-                }
+                app.select_next();
             } else {
                 // Agents mode: Down navigates agents; if at end and RAG exists, go to RagInfo.
                 if app.agents_rag_focused {
@@ -139,12 +144,7 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if app.sidebar_mode == SidebarMode::Projects {
-                // In Projects mode: Up cycles RagInfo → Projects
-                if app.projects_panel_focus == ProjectsPanelFocus::RagInfo {
-                    app.projects_panel_focus = ProjectsPanelFocus::Projects;
-                } else {
-                    app.select_prev();
-                }
+                app.select_prev();
             } else {
                 if app.agents_rag_focused {
                     app.agents_rag_focused = false;
@@ -156,8 +156,38 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
                 }
             }
         }
+        KeyCode::Left
+            if app.sidebar_mode == SidebarMode::Projects
+                && app.projects_panel_focus == ProjectsPanelFocus::Workflows =>
+        {
+            app.cycle_workflow_node(false);
+        }
+        KeyCode::Right
+            if app.sidebar_mode == SidebarMode::Projects
+                && app.projects_panel_focus == ProjectsPanelFocus::Workflows =>
+        {
+            app.cycle_workflow_node(true);
+        }
+        KeyCode::Char('[')
+            if app.sidebar_mode == SidebarMode::Projects
+                && app.projects_panel_focus == ProjectsPanelFocus::Workflows =>
+        {
+            app.cycle_workflow_spec(false);
+        }
+        KeyCode::Char(']')
+            if app.sidebar_mode == SidebarMode::Projects
+                && app.projects_panel_focus == ProjectsPanelFocus::Workflows =>
+        {
+            app.cycle_workflow_spec(true);
+        }
         KeyCode::Char('e') if !app.agents_rag_focused => {
-            app.open_edit_dialog();
+            if app.sidebar_mode == SidebarMode::Projects
+                && app.projects_panel_focus == ProjectsPanelFocus::Workflows
+            {
+                let _ = app.open_workflow_editor_dialog();
+            } else {
+                app.open_edit_dialog();
+            }
         }
         KeyCode::Char('d') if !app.agents_rag_focused => {
             let _ = app.toggle_enable();
@@ -177,7 +207,7 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
                 && app.projects_panel_focus == ProjectsPanelFocus::Projects
             {
                 let _ = app.delete_selected_project();
-            } else if !app.agents_rag_focused {
+            } else if app.sidebar_mode != SidebarMode::Projects && !app.agents_rag_focused {
                 let _ = app.delete_selected();
             }
         }

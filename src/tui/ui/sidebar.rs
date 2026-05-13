@@ -51,6 +51,7 @@ struct SidebarContentAreas {
 #[derive(Default)]
 struct ProjectsLayout {
     projects: Option<Rect>,
+    workflows: Option<Rect>,
     rag_queue: Option<Rect>,
     brain: Option<Rect>,
 }
@@ -244,12 +245,20 @@ fn render_dashboard_if_present(frame: &mut Frame, area: Option<Rect>, app: &App)
 
 fn draw_projects_sidebar(frame: &mut Frame, areas: SidebarContentAreas, app: &App) {
     let rag_items = &app.global_rag_queue;
+    let workflows = app.visible_workflows();
     let show_rag_info = app.rag_info.has_rag_activity() && areas.content.height >= 6;
     // ragInfo sits at the TOP of the projects sidebar so it's always visible.
     let (rag_info_area, content_below) = split_top_panel(areas.content, show_rag_info, 6);
-    let (has_projects, projects_needed, rag_needed) =
-        projects_layout_requirements(app, rag_items, content_below.height);
-    let layout = layout_projects_sections(content_below, has_projects, projects_needed, rag_needed);
+    let (has_projects, has_workflows, projects_needed, workflows_needed, rag_needed) =
+        projects_layout_requirements(app, workflows.len(), rag_items, content_below.height);
+    let layout = layout_projects_sections(
+        content_below,
+        has_projects,
+        has_workflows,
+        projects_needed,
+        workflows_needed,
+        rag_needed,
+    );
 
     if let Some(rag_info_area) = rag_info_area.filter(|area| area.height >= 3) {
         render_titled_panel(
@@ -270,6 +279,17 @@ fn draw_projects_sidebar(frame: &mut Frame, areas: SidebarContentAreas, app: &Ap
             Style::default().fg(DIM),
             projects_panel_border_style(app, ProjectsPanelFocus::Projects),
             |frame, inner| draw_projects_list(frame, inner, app),
+        );
+    }
+
+    if let Some(workflows_area) = layout.workflows {
+        render_titled_panel(
+            frame,
+            workflows_area,
+            " workflows ",
+            Style::default().fg(DIM),
+            projects_panel_border_style(app, ProjectsPanelFocus::Workflows),
+            |frame, inner| draw_workflows_list(frame, inner, app),
         );
     }
 
@@ -301,12 +321,19 @@ fn split_top_panel(content: Rect, enabled: bool, top_height: u16) -> (Option<Rec
 
 fn projects_layout_requirements(
     app: &App,
+    workflow_count: usize,
     rag_items: &[crate::db::project::RagQueueItem],
     content_height: u16,
-) -> (bool, u16, u16) {
+) -> (bool, bool, u16, u16, u16) {
     let has_projects = !app.projects.is_empty();
+    let has_workflows = workflow_count > 0;
     let projects_needed = if has_projects {
         (app.projects.len() as u16 * 3 + 2).min(content_height)
+    } else {
+        0
+    };
+    let workflows_needed = if has_workflows {
+        (workflow_count as u16 * 3 + 2).min(content_height)
     } else {
         0
     };
@@ -316,7 +343,13 @@ fn projects_layout_requirements(
         0
     };
 
-    (has_projects, projects_needed, rag_needed)
+    (
+        has_projects,
+        has_workflows,
+        projects_needed,
+        workflows_needed,
+        rag_needed,
+    )
 }
 
 fn rag_queue_title(rag_paused: bool) -> &'static str {
@@ -330,32 +363,42 @@ fn rag_queue_title(rag_paused: bool) -> &'static str {
 fn layout_projects_sections(
     content_top: Rect,
     has_projects: bool,
+    has_workflows: bool,
     projects_needed: u16,
+    workflows_needed: u16,
     rag_needed: u16,
 ) -> ProjectsLayout {
-    if has_projects && rag_needed > 0 && projects_needed + rag_needed < content_top.height {
+    if (has_projects || has_workflows)
+        && rag_needed > 0
+        && projects_needed + workflows_needed + rag_needed < content_top.height
+    {
         let mut remaining = content_top;
         let projects = take_top(&mut remaining, projects_needed);
+        let workflows = take_top(&mut remaining, workflows_needed);
         let rag_queue = take_top(&mut remaining, rag_needed);
         return ProjectsLayout {
             projects,
+            workflows,
             rag_queue,
             brain: Some(remaining),
         };
     }
 
-    if has_projects && projects_needed < content_top.height {
+    if (has_projects || has_workflows) && projects_needed + workflows_needed < content_top.height {
         let mut remaining = content_top;
         return ProjectsLayout {
             projects: take_top(&mut remaining, projects_needed),
+            workflows: take_top(&mut remaining, workflows_needed),
             rag_queue: (rag_needed > 0 && remaining.height >= 3).then_some(remaining),
             brain: None,
         };
     }
 
-    if has_projects {
+    if has_projects || has_workflows {
+        let mut remaining = content_top;
         return ProjectsLayout {
-            projects: Some(content_top),
+            projects: take_top(&mut remaining, projects_needed),
+            workflows: take_top(&mut remaining, workflows_needed).or(Some(remaining)),
             ..ProjectsLayout::default()
         };
     }
@@ -591,6 +634,86 @@ fn draw_project_row(
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             format!("{}  {}", project.hash, last_two_segments(&project.path)),
+            meta_style,
+        ))),
+        Rect::new(area.x, y + 1, area.width, 1),
+    );
+}
+
+fn draw_workflows_list(frame: &mut Frame, area: Rect, app: &App) {
+    let workflows = app.visible_workflows();
+    if workflows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "No workflows for this project",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            area,
+        );
+        return;
+    }
+
+    let selected_index = app.selected_workflow().and_then(|workflow| {
+        workflows
+            .iter()
+            .position(|candidate| candidate.id == workflow.id)
+    });
+    let scroll = scroll_state(
+        workflows.len(),
+        selected_index,
+        (area.height / 3).max(1) as usize,
+    );
+    let panel_focused = app.projects_panel_focus == ProjectsPanelFocus::Workflows;
+    let mut y = area.y;
+
+    for (idx, workflow) in workflows
+        .iter()
+        .enumerate()
+        .skip(scroll.start)
+        .take(scroll.max_visible)
+    {
+        if y + 2 > area.y + area.height {
+            break;
+        }
+        draw_workflow_row(
+            frame,
+            area,
+            y,
+            workflow,
+            app.selected_workflow_id.as_deref() == Some(workflow.id.as_str()),
+            panel_focused,
+        );
+        let _ = idx;
+        y += 3;
+    }
+
+    draw_scroll_indicators(frame, area, scroll.has_up, scroll.has_down);
+}
+
+fn draw_workflow_row(
+    frame: &mut Frame,
+    area: Rect,
+    y: u16,
+    workflow: &crate::domain::workflow::Workflow,
+    selected: bool,
+    panel_focused: bool,
+) {
+    let title_style = project_title_style(selected, panel_focused);
+    let meta_style = project_meta_style(selected);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            truncate_str(&workflow.name, area.width as usize),
+            title_style,
+        ))),
+        Rect::new(area.x, y, area.width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(
+                "{}  {}",
+                workflow.status.as_str().to_uppercase(),
+                last_two_segments(&workflow.workdir)
+            ),
             meta_style,
         ))),
         Rect::new(area.x, y + 1, area.width, 1),

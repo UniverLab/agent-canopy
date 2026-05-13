@@ -459,6 +459,72 @@ fn workflow_run_roundtrip_preserves_json_payloads() {
 }
 
 #[test]
+fn workflow_updates_persist_metadata_and_positions() {
+    let db = test_db();
+    let workflow = sample_workflow("wf-update");
+    let spec = sample_workflow_spec(&workflow.id, "spec-update", 1);
+    let node = sample_workflow_node(&spec.id, "node-update", 1);
+    let edge = WorkflowEdge {
+        id: "edge-update".to_string(),
+        spec_id: spec.id.clone(),
+        from_node: node.id.clone(),
+        to_node: node.id.clone(),
+        condition: WorkflowEdgeCondition::Always,
+    };
+
+    db.insert_workflow(&workflow).unwrap();
+    db.insert_workflow_spec(&spec).unwrap();
+    db.insert_workflow_node(&node).unwrap();
+    db.insert_workflow_edge(&edge).unwrap();
+
+    db.update_workflow_details(
+        &workflow.id,
+        Some("Auth refresh workflow"),
+        Some(Some("Updated description")),
+        Some("/tmp/other-project"),
+    )
+    .unwrap();
+    db.update_workflow_spec_details(
+        &spec.id,
+        Some("Spec updated"),
+        Some("Functional Requirements:\n- A\n\nNon-Functional Requirements:\n- B\n\nObjective:\n- C\n\nConstraints:\n- D\n\nGuidelines:\n- E\n\nIn Scope:\n- F\n\nOut of Scope:\n- G"),
+        Some(3),
+        Some(true),
+    )
+    .unwrap();
+    db.update_workflow_node_details(
+        &node.id,
+        Some("Verification node"),
+        Some(WorkflowNodeKind::Gate),
+        Some(&serde_json::json!({"evaluate": "output_contains", "value": "APPROVED"})),
+        Some(4),
+    )
+    .unwrap();
+    db.update_workflow_edge_condition(&edge.id, WorkflowEdgeCondition::Fail)
+        .unwrap();
+
+    let workflow = db.get_workflow(&workflow.id).unwrap().unwrap();
+    let spec = db.get_workflow_spec(&spec.id).unwrap().unwrap();
+    let node = db.get_workflow_node(&node.id).unwrap().unwrap();
+    let edge = db.get_workflow_edge(&edge.id).unwrap().unwrap();
+
+    assert_eq!(workflow.name, "Auth refresh workflow");
+    assert_eq!(workflow.description.as_deref(), Some("Updated description"));
+    assert_eq!(workflow.workdir, "/tmp/other-project");
+    assert_eq!(spec.name, "Spec updated");
+    assert_eq!(spec.position, 3);
+    assert!(spec.parallelizable);
+    assert_eq!(node.name, "Verification node");
+    assert_eq!(node.kind, WorkflowNodeKind::Gate);
+    assert_eq!(node.position, 4);
+    assert_eq!(
+        node.config.get("evaluate"),
+        Some(&serde_json::json!("output_contains"))
+    );
+    assert_eq!(edge.condition, WorkflowEdgeCondition::Fail);
+}
+
+#[test]
 fn test_list_cross_project_dependencies_returns_only_project_links() {
     let db = test_db();
 

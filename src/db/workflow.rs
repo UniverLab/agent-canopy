@@ -34,6 +34,37 @@ impl Database {
         Ok(())
     }
 
+    pub fn update_workflow_details(
+        &self,
+        workflow_id: &str,
+        name: Option<&str>,
+        description: Option<Option<&str>>,
+        workdir: Option<&str>,
+    ) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE workflows
+             SET name = COALESCE(?1, name),
+                 description = CASE
+                     WHEN ?2 IS NULL THEN description
+                     ELSE ?3
+                 END,
+                 workdir = COALESCE(?4, workdir)
+             WHERE id = ?5",
+            params![
+                name,
+                description.map(|_| 1),
+                description.flatten(),
+                workdir,
+                workflow_id
+            ],
+        )?;
+        Ok(rows > 0)
+    }
+
     pub fn get_workflow(&self, workflow_id: &str) -> Result<Option<Workflow>> {
         let conn = self
             .conn
@@ -152,6 +183,30 @@ impl Database {
             .map_err(Into::into)
     }
 
+    pub fn update_workflow_spec_details(
+        &self,
+        spec_id: &str,
+        name: Option<&str>,
+        description: Option<&str>,
+        position: Option<i64>,
+        parallelizable: Option<bool>,
+    ) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE workflow_specs
+             SET name = COALESCE(?1, name),
+                 description = COALESCE(?2, description),
+                 position = COALESCE(?3, position),
+                 parallelizable = COALESCE(?4, parallelizable)
+             WHERE id = ?5",
+            params![name, description, position, parallelizable, spec_id],
+        )?;
+        Ok(rows > 0)
+    }
+
     pub fn update_workflow_spec_status(
         &self,
         spec_id: &str,
@@ -215,6 +270,50 @@ impl Database {
             .map_err(Into::into)
     }
 
+    pub fn get_workflow_node(&self, node_id: &str) -> Result<Option<WorkflowNode>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, spec_id, name, kind, config, position, created_at
+             FROM workflow_nodes WHERE id = ?1",
+        )?;
+        stmt.query_row(params![node_id], map_workflow_node_row)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn update_workflow_node_details(
+        &self,
+        node_id: &str,
+        name: Option<&str>,
+        kind: Option<WorkflowNodeKind>,
+        config: Option<&Value>,
+        position: Option<i64>,
+    ) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE workflow_nodes
+             SET name = COALESCE(?1, name),
+                 kind = COALESCE(?2, kind),
+                 config = COALESCE(?3, config),
+                 position = COALESCE(?4, position)
+             WHERE id = ?5",
+            params![
+                name,
+                kind.map(|value| value.as_str()),
+                config.map(serde_json::to_string).transpose()?,
+                position,
+                node_id,
+            ],
+        )?;
+        Ok(rows > 0)
+    }
+
     pub fn insert_workflow_edge(&self, edge: &WorkflowEdge) -> Result<()> {
         let conn = self
             .conn
@@ -247,6 +346,38 @@ impl Database {
 
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    pub fn get_workflow_edge(&self, edge_id: &str) -> Result<Option<WorkflowEdge>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, spec_id, from_node, to_node, condition
+             FROM workflow_edges WHERE id = ?1",
+        )?;
+        stmt.query_row(params![edge_id], map_workflow_edge_row)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn update_workflow_edge_condition(
+        &self,
+        edge_id: &str,
+        condition: WorkflowEdgeCondition,
+    ) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE workflow_edges
+             SET condition = ?1
+             WHERE id = ?2",
+            params![condition.as_str(), edge_id],
+        )?;
+        Ok(rows > 0)
     }
 
     pub fn insert_workflow_run(&self, run: &WorkflowNodeRun) -> Result<()> {

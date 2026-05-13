@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -9,11 +9,11 @@ use crate::db::Database;
 use crate::domain::models::{Agent, RunLog};
 use crate::domain::project::Project;
 use crate::domain::sync::{ActiveIntent, SyncMessage, WorkspaceStatus};
+use crate::domain::workflow::{Workflow, WorkflowDetails, WorkflowNodeRun};
 use crate::rag::vector_store::SearchResult;
 use crate::tui::agent::InteractiveAgent;
 use crate::tui::app::dialog::{LaunchpadDialog, NewAgentDialog, SimplePromptDialog};
 use crate::tui::app::terminal_search::TerminalSearch;
-
 /// Unified entry in the sidebar.
 #[allow(clippy::large_enum_variant)]
 pub enum AgentEntry {
@@ -45,12 +45,100 @@ pub enum Focus {
     ContextTransfer,
     RagTransfer,
     PromptTemplateDialog,
+    WorkflowEditorDialog,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ProjectsPanelFocus {
     Projects,
+    Workflows,
     RagInfo,
+}
+
+#[derive(Clone)]
+pub(crate) enum WorkflowEditorMode {
+    AgentPrompt,
+    NodeConfig,
+}
+
+#[derive(Clone)]
+pub(crate) struct WorkflowEditorDialog {
+    pub node_id: String,
+    pub node_name: String,
+    pub title: String,
+    pub help: String,
+    pub buffer: String,
+    pub cursor: usize,
+    pub mode: WorkflowEditorMode,
+}
+
+impl WorkflowEditorDialog {
+    pub fn new(
+        node_id: String,
+        node_name: String,
+        title: String,
+        help: String,
+        buffer: String,
+        mode: WorkflowEditorMode,
+    ) -> Self {
+        let cursor = buffer.chars().count();
+        Self {
+            node_id,
+            node_name,
+            title,
+            help,
+            buffer,
+            cursor,
+            mode,
+        }
+    }
+
+    pub fn char_len(&self) -> usize {
+        self.buffer.chars().count()
+    }
+
+    pub fn insert_char(&mut self, value: char) {
+        self.insert_str(&value.to_string());
+    }
+
+    pub fn insert_str(&mut self, value: &str) {
+        let byte_index = char_to_byte_index(&self.buffer, self.cursor);
+        self.buffer.insert_str(byte_index, value);
+        self.cursor += value.chars().count();
+    }
+
+    pub fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let start = char_to_byte_index(&self.buffer, self.cursor - 1);
+        let end = char_to_byte_index(&self.buffer, self.cursor);
+        self.buffer.replace_range(start..end, "");
+        self.cursor -= 1;
+    }
+
+    pub fn move_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn move_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.char_len());
+    }
+
+    pub fn move_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn move_end(&mut self) {
+        self.cursor = self.char_len();
+    }
+}
+
+fn char_to_byte_index(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .map(|(index, _)| index)
+        .nth(char_index)
+        .unwrap_or(text.len())
 }
 
 #[derive(Clone, Copy)]
@@ -146,13 +234,20 @@ pub struct App {
     pub(crate) projects: Vec<Project>,
     pub(crate) selected_project: usize,
     pub(crate) projects_panel_focus: ProjectsPanelFocus,
+    pub(crate) workflows: Vec<Workflow>,
+    pub(crate) selected_workflow_id: Option<String>,
+    pub(crate) workflow_details: Option<WorkflowDetails>,
+    pub(crate) workflow_runs: Vec<WorkflowNodeRun>,
+    pub(crate) workflow_selected_spec: usize,
+    pub(crate) workflow_selected_node: usize,
+    pub(crate) workflow_editor_dialog: Option<WorkflowEditorDialog>,
     pub(crate) global_rag_queue: Vec<RagQueueItem>,
     pub(crate) selected_rag_queue: usize,
     pub(crate) rag_info: RagInfoSummary,
     /// Per-file RAG status loaded from `rag_file_events` table.
     pub(crate) rag_file_status: Vec<crate::db::project::RagPerFileStatus>,
     pub(crate) sidebar_visible: bool,
-    pub(crate) sync_panel_visible: bool,
+    pub(crate) hidden_activity_workdirs: HashSet<String>,
     pub(crate) term_width: u16,
     pub(crate) show_legend: bool,
     pub(crate) show_copied: bool,
@@ -194,9 +289,9 @@ pub struct App {
     /// CLI launch usage counters (persisted to disk).
     pub(crate) cli_usage: crate::domain::usage_stats::CliUsage,
 
-    // Sync panel scroll
+    // Activity panel scroll
     pub(crate) sync_scroll_offset: u16,
-    /// Last rendered area of the sync panel (used for mouse hit-testing).
+    /// Last rendered area of the activity panel (used for mouse hit-testing).
     pub(crate) last_sync_area: Option<ratatui::layout::Rect>,
 
     // RAG pause state (synced from daemon_state table)

@@ -971,6 +971,74 @@ impl TaskTriggerHandler {
     }
 
     #[tool(
+        name = "workflow_update",
+        description = "Update workflow metadata such as name, description, or workdir."
+    )]
+    async fn workflow_update(
+        &self,
+        Parameters(params): Parameters<WorkflowUpdateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let workflow_id = params.workflow_id.trim();
+        if workflow_id.is_empty() {
+            return Ok(error_result("Workflow ID must not be empty."));
+        }
+        if self
+            .db
+            .get_workflow(workflow_id)
+            .map_err(internal_error)?
+            .is_none()
+        {
+            return Ok(error_result(&format!(
+                "Workflow '{}' not found.",
+                params.workflow_id
+            )));
+        }
+
+        let name = match params.name.as_deref().map(str::trim) {
+            Some("") => return Ok(error_result("Workflow name must not be empty.")),
+            Some(value) => Some(value),
+            None => None,
+        };
+        let description = params.description.as_ref().map(|value| {
+            value
+                .as_deref()
+                .map(str::trim)
+                .filter(|description| !description.is_empty())
+        });
+        let workdir = match params.workdir.as_deref().map(str::trim) {
+            Some("") => return Ok(error_result("Workflow workdir must not be empty.")),
+            Some(value) => {
+                let path = std::path::Path::new(value);
+                if !path.is_absolute() {
+                    return Ok(error_result("Workflow workdir must be an absolute path."));
+                }
+                if !path.is_dir() {
+                    return Ok(error_result(
+                        "Workflow workdir must point to an existing directory.",
+                    ));
+                }
+                Some(value)
+            }
+            None => None,
+        };
+
+        if name.is_none() && description.is_none() && workdir.is_none() {
+            return Ok(error_result(
+                "workflow_update requires at least one field to update.",
+            ));
+        }
+
+        self.db
+            .update_workflow_details(workflow_id, name, description, workdir)
+            .map_err(internal_error)?;
+
+        Ok(success_result(&format!(
+            "Workflow '{}' updated.",
+            params.workflow_id
+        )))
+    }
+
+    #[tool(
         name = "workflow_add_spec",
         description = "Add an ordered spec to an existing workflow."
     )]
@@ -1041,6 +1109,83 @@ impl TaskTriggerHandler {
     }
 
     #[tool(
+        name = "workflow_update_spec",
+        description = "Update an existing workflow spec."
+    )]
+    async fn workflow_update_spec(
+        &self,
+        Parameters(params): Parameters<WorkflowUpdateSpecParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let spec_id = params.spec_id.trim();
+        let Some(spec) = self.db.get_workflow_spec(spec_id).map_err(internal_error)? else {
+            return Ok(error_result(&format!(
+                "Spec '{}' not found.",
+                params.spec_id
+            )));
+        };
+
+        let name = match params.name.as_deref().map(str::trim) {
+            Some("") => return Ok(error_result("Workflow spec name must not be empty.")),
+            Some(value) => Some(value),
+            None => None,
+        };
+        let description = match params.description.as_deref().map(str::trim) {
+            Some("") => {
+                return Ok(error_result(
+                    "Workflow spec description must not be empty and must follow the template.",
+                ))
+            }
+            Some(value) => {
+                if let Err(error) = validate_spec_description_template(value) {
+                    return Ok(error_result(&error));
+                }
+                Some(value)
+            }
+            None => None,
+        };
+
+        if let Some(position) = params.position {
+            let conflict = self
+                .db
+                .list_workflow_specs(&spec.workflow_id)
+                .map_err(internal_error)?
+                .into_iter()
+                .any(|candidate| candidate.id != spec.id && candidate.position == position);
+            if conflict {
+                return Ok(error_result(&format!(
+                    "Workflow '{}' already has a spec at position {}.",
+                    spec.workflow_id, position
+                )));
+            }
+        }
+
+        if name.is_none()
+            && description.is_none()
+            && params.position.is_none()
+            && params.parallelizable.is_none()
+        {
+            return Ok(error_result(
+                "workflow_update_spec requires at least one field to update.",
+            ));
+        }
+
+        self.db
+            .update_workflow_spec_details(
+                spec_id,
+                name,
+                description,
+                params.position,
+                params.parallelizable,
+            )
+            .map_err(internal_error)?;
+
+        Ok(success_result(&format!(
+            "Workflow spec '{}' updated.",
+            spec_id
+        )))
+    }
+
+    #[tool(
         name = "workflow_add_node",
         description = "Add a graph node to an existing workflow spec."
     )]
@@ -1101,6 +1246,78 @@ impl TaskTriggerHandler {
     }
 
     #[tool(
+        name = "workflow_update_node",
+        description = "Update an existing workflow node."
+    )]
+    async fn workflow_update_node(
+        &self,
+        Parameters(params): Parameters<WorkflowUpdateNodeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let node_id = params.node_id.trim();
+        let Some(node) = self.db.get_workflow_node(node_id).map_err(internal_error)? else {
+            return Ok(error_result(&format!(
+                "Workflow node '{}' not found.",
+                params.node_id
+            )));
+        };
+
+        let name = match params.name.as_deref().map(str::trim) {
+            Some("") => return Ok(error_result("Workflow node name must not be empty.")),
+            Some(value) => Some(value),
+            None => None,
+        };
+        let kind = match params.kind.as_deref().map(str::trim) {
+            Some("") => return Ok(error_result("Workflow node kind must not be empty.")),
+            Some(value) => match WorkflowNodeKind::from_str(value) {
+                Some(kind) => Some(kind),
+                None => {
+                    return Ok(error_result(
+                        "Workflow node kind must be one of: agent, check, gate.",
+                    ))
+                }
+            },
+            None => None,
+        };
+
+        if let Some(position) = params.position {
+            let conflict = self
+                .db
+                .list_workflow_nodes(&node.spec_id)
+                .map_err(internal_error)?
+                .into_iter()
+                .any(|candidate| candidate.id != node.id && candidate.position == position);
+            if conflict {
+                return Ok(error_result(&format!(
+                    "Spec '{}' already has a node at position {}.",
+                    node.spec_id, position
+                )));
+            }
+        }
+
+        if name.is_none() && kind.is_none() && params.config.is_none() && params.position.is_none()
+        {
+            return Ok(error_result(
+                "workflow_update_node requires at least one field to update.",
+            ));
+        }
+
+        self.db
+            .update_workflow_node_details(
+                node_id,
+                name,
+                kind,
+                params.config.as_ref(),
+                params.position,
+            )
+            .map_err(internal_error)?;
+
+        Ok(success_result(&format!(
+            "Workflow node '{}' updated.",
+            node_id
+        )))
+    }
+
+    #[tool(
         name = "workflow_add_edge",
         description = "Connect two nodes inside a workflow spec with a routing condition."
     )]
@@ -1149,6 +1366,48 @@ impl TaskTriggerHandler {
             }))
             .unwrap_or_default(),
         )]))
+    }
+
+    #[tool(
+        name = "workflow_update_edge",
+        description = "Update the routing condition of an existing workflow edge."
+    )]
+    async fn workflow_update_edge(
+        &self,
+        Parameters(params): Parameters<WorkflowUpdateEdgeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let Some(edge) = self
+            .db
+            .get_workflow_edge(params.edge_id.trim())
+            .map_err(internal_error)?
+        else {
+            return Ok(error_result(&format!(
+                "Workflow edge '{}' not found.",
+                params.edge_id
+            )));
+        };
+        let Some(condition) = WorkflowEdgeCondition::from_str(params.condition.trim()) else {
+            return Ok(error_result(
+                "Workflow edge condition must be one of: pass, fail, always.",
+            ));
+        };
+
+        if edge.condition == condition {
+            return Ok(success_result(&format!(
+                "Workflow edge '{}' already uses condition '{}'.",
+                edge.id,
+                condition.as_str()
+            )));
+        }
+
+        self.db
+            .update_workflow_edge_condition(&edge.id, condition)
+            .map_err(internal_error)?;
+
+        Ok(success_result(&format!(
+            "Workflow edge '{}' updated.",
+            edge.id
+        )))
     }
 
     #[tool(

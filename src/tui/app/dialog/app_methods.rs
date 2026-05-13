@@ -144,7 +144,7 @@ impl App {
     fn build_system_content(&self, _is_solo: bool) -> String {
         let mut lines: Vec<String> = Vec::new();
 
-        let workdir = if let Some(state) = self.sync_panel_state() {
+        let workdir = if let Some(state) = self.selected_activity_state() {
             lines.push(format!(
                 "workspace: {} | agents: {} | vibe: {}",
                 state.workdir,
@@ -261,7 +261,7 @@ impl App {
     /// Kept for backwards compatibility; not used by the prompt builder any more.
     #[allow(dead_code)]
     fn build_sync_context_text(&self) -> Option<String> {
-        let state = self.sync_panel_state()?;
+        let state = self.selected_activity_state()?;
         let mut lines = Vec::new();
 
         lines.push(format!(

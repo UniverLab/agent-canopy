@@ -27,6 +27,7 @@ use new_agent_dialog::handle_dialog_key;
 use paste::handle_paste;
 use prompt_template::handle_prompt_template_key;
 use rag_transfer::handle_rag_transfer_key;
+use workflow_editor::handle_workflow_editor_key;
 
 type Terminal = ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
 
@@ -53,7 +54,8 @@ fn tick_duration(app: &App) -> Duration {
         | Focus::LaunchpadDialog
         | Focus::ContextTransfer
         | Focus::RagTransfer
-        | Focus::PromptTemplateDialog => Duration::from_millis(50),
+        | Focus::PromptTemplateDialog
+        | Focus::WorkflowEditorDialog => Duration::from_millis(50),
         Focus::Preview => Duration::from_millis(100),
         Focus::Home if app.home_brain.is_some() => Duration::from_millis(50),
         Focus::Home => Duration::from_millis(200),
@@ -98,6 +100,7 @@ mod prompt_template;
 mod rag_transfer;
 mod search_picker;
 mod terminal_warp;
+mod workflow_editor;
 
 pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
     if dismiss_legend(app) || handle_global_key(app, code, modifiers) {
@@ -144,7 +147,7 @@ fn handle_global_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> b
     }
 
     if code == KeyCode::F(3) {
-        app.toggle_sync_panel();
+        app.toggle_activity_panel();
         return true;
     }
 
@@ -169,6 +172,7 @@ fn dispatch_focus_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> 
         Focus::ContextTransfer => handle_context_transfer_key(app, code),
         Focus::RagTransfer => handle_rag_transfer_key(app, code),
         Focus::PromptTemplateDialog => handle_prompt_template_key(app, code, modifiers),
+        Focus::WorkflowEditorDialog => handle_workflow_editor_key(app, code, modifiers),
     }
 }
 
@@ -350,7 +354,8 @@ fn handle_scroll(app: &mut App, dir: i32) {
         Focus::LaunchpadDialog
         | Focus::ContextTransfer
         | Focus::RagTransfer
-        | Focus::PromptTemplateDialog => {}
+        | Focus::PromptTemplateDialog
+        | Focus::WorkflowEditorDialog => {}
     }
 }
 

@@ -268,6 +268,18 @@ pub struct WorkflowCreateParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowUpdateParams {
+    /// Workflow ID.
+    pub workflow_id: String,
+    /// New human-readable workflow name.
+    pub name: Option<String>,
+    /// New workflow description, or null to clear.
+    pub description: Option<Option<String>>,
+    /// New absolute workdir for the workflow.
+    pub workdir: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct WorkflowAddSpecParams {
     /// Existing workflow ID.
     pub workflow_id: String,
@@ -279,6 +291,20 @@ pub struct WorkflowAddSpecParams {
     pub position: i64,
     /// Whether the spec is allowed to run in parallel in future engine phases.
     pub parallelizable: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowUpdateSpecParams {
+    /// Existing spec ID.
+    pub spec_id: String,
+    /// New human-readable spec name.
+    pub name: Option<String>,
+    /// New spec description following the required template.
+    pub description: Option<String>,
+    /// New execution order within the workflow.
+    pub position: Option<i64>,
+    /// Whether the spec is allowed to run in parallel.
+    pub parallelizable: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -294,6 +320,20 @@ pub struct WorkflowAddNodeParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowUpdateNodeParams {
+    /// Existing node ID.
+    pub node_id: String,
+    /// New human-readable node name.
+    pub name: Option<String>,
+    /// New node kind: agent, check, or gate.
+    pub kind: Option<String>,
+    /// Replacement node config payload.
+    pub config: Option<serde_json::Value>,
+    /// New visual position within the spec.
+    pub position: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct WorkflowAddEdgeParams {
     /// Existing spec ID.
     pub spec_id: String,
@@ -302,6 +342,14 @@ pub struct WorkflowAddEdgeParams {
     /// Destination node ID.
     pub to_node: String,
     /// Routing condition: pass, fail, or always.
+    pub condition: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowUpdateEdgeParams {
+    /// Existing edge ID.
+    pub edge_id: String,
+    /// New routing condition: pass, fail, or always.
     pub condition: String,
 }
 

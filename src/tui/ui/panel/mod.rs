@@ -25,7 +25,7 @@ pub mod warp;
 pub use details::{draw_agent_details, draw_group_details};
 pub(crate) use home::draw_brians_brain;
 pub use log_fallback::draw_log_text;
-pub(crate) use sync::draw_sync_panel;
+pub(crate) use sync::draw_activity_panel;
 use vt100::render_vt_screen;
 #[allow(unused_imports)]
 pub use warp::compact_cwd;
@@ -150,6 +150,7 @@ fn show_home_fallback(app: &App) -> bool {
                 | Focus::ContextTransfer
                 | Focus::RagTransfer
                 | Focus::PromptTemplateDialog
+                | Focus::WorkflowEditorDialog
         )
 }
 
@@ -176,7 +177,8 @@ fn draw_log_panel_focus(frame: &mut Frame, area: Rect, app: &mut App) -> bool {
         Focus::LaunchpadDialog
         | Focus::ContextTransfer
         | Focus::RagTransfer
-        | Focus::PromptTemplateDialog => false,
+        | Focus::PromptTemplateDialog
+        | Focus::WorkflowEditorDialog => false,
     }
 }
 
@@ -454,12 +456,153 @@ fn draw_projects_mode_panel(frame: &mut Frame, area: Rect, app: &App) {
 
     match app.projects_panel_focus {
         ProjectsPanelFocus::Projects => draw_project_overview(frame, area, app),
+        ProjectsPanelFocus::Workflows => draw_workflow_overview(frame, area, app),
         ProjectsPanelFocus::RagInfo => draw_rag_queue_overview(frame, area, app),
     }
 }
 
 fn draw_rag_queue_overview(frame: &mut Frame, area: Rect, app: &App) {
     draw_rag_info_overview(frame, area, app);
+}
+
+fn draw_workflow_overview(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(workflow) = app.selected_workflow() else {
+        frame.render_widget(
+            Paragraph::new("No workflows for the selected project").style(Style::default().fg(DIM)),
+            area,
+        );
+        return;
+    };
+    let Some(details) = app.selected_workflow_details() else {
+        frame.render_widget(
+            Paragraph::new("Workflow details are unavailable").style(Style::default().fg(DIM)),
+            area,
+        );
+        return;
+    };
+    let Some(spec) = app.selected_workflow_spec() else {
+        frame.render_widget(
+            Paragraph::new("Workflow has no specs yet").style(Style::default().fg(DIM)),
+            area,
+        );
+        return;
+    };
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Workflow ", Style::default().fg(DIM)),
+            Span::styled(
+                workflow.name.as_str(),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                workflow.status.as_str().to_uppercase(),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        Line::from(format!("Workdir: {}", workflow.workdir)),
+        Line::from(format!(
+            "Spec {}/{}: {} [{}]",
+            app.workflow_selected_spec + 1,
+            details.specs.len(),
+            spec.spec.name,
+            spec.spec.status.as_str()
+        )),
+        Line::from(Span::styled(
+            "Tab section  ·  [ ] spec  ·  ←→ node  ·  Enter/e edit",
+            Style::default().fg(DIM),
+        )),
+        Line::from(""),
+        Line::from(Span::styled("Graph", Style::default().fg(DIM))),
+    ];
+
+    if spec.edges.is_empty() {
+        lines.push(Line::from("  (no edges)"));
+    } else {
+        lines.extend(spec.edges.iter().map(|edge| {
+            Line::from(format!(
+                "  {} --{}--> {}",
+                edge.from_node,
+                edge.condition.as_str(),
+                edge.to_node
+            ))
+        }));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("Nodes", Style::default().fg(DIM))));
+    for (idx, node) in spec.nodes.iter().enumerate() {
+        let selected = idx == app.workflow_selected_node;
+        let (style, marker) = selected_row_style(selected);
+        lines.push(Line::from(vec![
+            Span::styled(marker, style),
+            Span::raw(" "),
+            Span::styled(node.name.as_str(), style.add_modifier(Modifier::BOLD)),
+            Span::raw(" "),
+            Span::styled(
+                format!("[{}]", node.kind.as_str()),
+                Style::default().fg(DIM),
+            ),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!("    {}", workflow_node_summary(node)),
+            if selected {
+                style.fg(Color::White)
+            } else {
+                Style::default().fg(DIM)
+            },
+        )));
+    }
+
+    if !app.workflow_runs.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Recent runs",
+            Style::default().fg(DIM),
+        )));
+        lines.extend(app.workflow_runs.iter().rev().take(4).map(|run| {
+            Line::from(format!(
+                "  iter {}  {}  {}",
+                run.iteration,
+                run.node_id,
+                run.status.as_str()
+            ))
+        }));
+    }
+
+    render_wrapped_paragraph(frame, area, lines);
+}
+
+fn workflow_node_summary(node: &crate::domain::workflow::WorkflowNode) -> String {
+    match node.kind {
+        crate::domain::workflow::WorkflowNodeKind::Agent => node
+            .config
+            .get("prompt_template")
+            .and_then(serde_json::Value::as_str)
+            .map(|prompt| truncate_str(prompt, 72))
+            .filter(|prompt| !prompt.is_empty())
+            .unwrap_or_else(|| "prompt_template not set".to_string()),
+        crate::domain::workflow::WorkflowNodeKind::Check => node
+            .config
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .map(|command| format!("check: {}", truncate_str(command, 72)))
+            .unwrap_or_else(|| "check config".to_string()),
+        crate::domain::workflow::WorkflowNodeKind::Gate => {
+            let evaluate = node
+                .config
+                .get("evaluate")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("gate");
+            let value = node
+                .config
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            format!("{evaluate}: {}", truncate_str(value, 48))
+        }
+    }
 }
 
 fn rag_status(app: &App) -> (&'static str, Color) {

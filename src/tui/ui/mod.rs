@@ -54,16 +54,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         body
     };
 
-    let sync_state = app.sync_panel_state();
-    let sync_width = app.sync_panel_layout_width(body_area.width, sync_state.is_some());
-    let (panel_area, sync_area) = if let Some(sync_state) = sync_state.as_ref() {
-        if sync_width > 0 {
+    let activity_state = app.activity_panel_state();
+    let activity_width = app.activity_panel_layout_width(body_area.width, activity_state.is_some());
+    let (panel_area, sync_area) = if let Some(activity_state) = activity_state.as_ref() {
+        if activity_width > 0 {
             let [panel, sync] = Layout::horizontal([
-                Constraint::Min(body_area.width.saturating_sub(sync_width)),
-                Constraint::Length(sync_width),
+                Constraint::Min(body_area.width.saturating_sub(activity_width)),
+                Constraint::Length(activity_width),
             ])
             .areas(body_area);
-            panel::draw_sync_panel(frame, sync, sync_state, app.sync_scroll_offset);
+            panel::draw_activity_panel(frame, sync, activity_state, app.sync_scroll_offset);
             app.last_sync_area = Some(sync);
             (panel, Some(sync))
         } else {
@@ -131,6 +131,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     if app.simple_prompt_dialog.is_some() {
         dialogs::draw_simple_prompt_dialog(frame, app);
+    }
+
+    if app.workflow_editor_dialog.is_some() {
+        dialogs::draw_workflow_editor_dialog(frame, app);
     }
 
     if app.split_picker_open {

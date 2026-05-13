@@ -10,12 +10,12 @@ use super::DIM;
 use crate::tui::app::types::{AgentEntry, App, Focus};
 
 pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let sync_available = app.sync_available();
+    let activity_available = app.activity_panel_available();
     let hints = match app.focus {
         Focus::Home => {
             let mut h = vec![("↑↓", "select"), ("n", "new"), ("F2", "projects")];
-            if sync_available {
-                h.push(("F3", "sync"));
+            if activity_available {
+                h.push(("F3", "activity"));
             }
             h.push(("Shift+←→", "panels"));
             h.push(("F10", "preview"));
@@ -36,13 +36,18 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                     ]
                 } else {
                     let mut h = vec![
+                        ("Tab", "section"),
                         ("↑↓", "nav"),
-                        ("Shift+←→", "panels"),
-                        ("Enter", "open"),
+                        ("←→", "node"),
+                        ("[ ]", "spec"),
+                        ("Enter/e", "edit"),
                         ("F2", "agents"),
                     ];
-                    if sync_available {
-                        h.push(("F3", "sync"));
+                    if app.projects_panel_focus == crate::tui::app::ProjectsPanelFocus::RagInfo {
+                        h.push(("p", "pause rag"));
+                    }
+                    if activity_available {
+                        h.push(("F3", "activity"));
                     }
                     h.push(("Esc", "home"));
                     h
@@ -58,8 +63,8 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                 }
                 h.push(("n", "new"));
                 h.push(("F2", "projects"));
-                if sync_available {
-                    h.push(("F3", "sync"));
+                if activity_available {
+                    h.push(("F3", "activity"));
                 }
                 h.push(("Esc", "home"));
                 h
@@ -80,7 +85,7 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         ],
         Focus::Agent => {
             if app.playground_active {
-                return draw_footer_playground(frame, area, app, sync_available);
+                return draw_footer_playground(frame, area, app, activity_available);
             }
 
             let is_pty = matches!(
@@ -112,16 +117,16 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                     h.push(("Ctrl+B", "prompt"));
                 }
                 h.push(("F2", "projects"));
-                if sync_available {
-                    h.push(("F3", "sync"));
+                if activity_available {
+                    h.push(("F3", "activity"));
                 }
                 h.push(("Ctrl+N", "new"));
                 h.push(("F1", "legend"));
                 h
             } else {
                 let mut h = vec![("F10", "preview"), ("Esc", "home"), ("F2", "projects")];
-                if sync_available {
-                    h.push(("F3", "sync"));
+                if activity_available {
+                    h.push(("F3", "activity"));
                 }
                 h.push(("Ctrl+N", "new"));
                 h.push(("F1", "legend"));
@@ -139,6 +144,13 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("⇧↑↓←→", "cursor"),
             ("Ctrl+S", "send"),
             ("Ctrl+A/X", "add/memory/remove"),
+            ("Esc", "cancel"),
+        ],
+        Focus::WorkflowEditorDialog => vec![
+            ("type", "edit"),
+            ("←→", "cursor"),
+            ("Enter", "newline"),
+            ("Ctrl+S", "save"),
             ("Esc", "cancel"),
         ],
     };
@@ -218,7 +230,7 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn draw_footer_playground(frame: &mut Frame, area: Rect, app: &App, sync_available: bool) {
+fn draw_footer_playground(frame: &mut Frame, area: Rect, app: &App, activity_available: bool) {
     let mut hints = vec![
         ("type", "search"),
         ("↑↓", "results"),
@@ -229,8 +241,8 @@ fn draw_footer_playground(frame: &mut Frame, area: Rect, app: &App, sync_availab
         ("Esc", "close"),
         ("F2", "projects"),
     ];
-    if sync_available {
-        hints.push(("F3", "sync"));
+    if activity_available {
+        hints.push(("F3", "activity"));
     }
 
     let mut spans = Vec::new();
