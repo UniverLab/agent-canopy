@@ -16,6 +16,9 @@ use std::time::Duration;
 use ratatui::style::Color;
 
 use crate::domain::models::Cli;
+use crate::shared::sync_identity::{
+    CANOPY_AGENT_ID_ENV, CANOPY_SESSION_NAME_ENV, CANOPY_WORKDIR_ENV,
+};
 
 #[cfg(unix)]
 use crate::tui::agent::pty::{ignore_signals, send_sighup_to_group};
@@ -47,6 +50,17 @@ pub struct PromptEntry {
 /// Maximum number of prompt entries to keep in the ring buffer.
 const MAX_PROMPT_HISTORY: usize = 20;
 const VT_SCROLLBACK_LINES: usize = 5_000;
+
+fn apply_canopy_session_env(
+    cmd: &mut CommandBuilder,
+    agent_id: &str,
+    session_name: &str,
+    working_dir: &str,
+) {
+    cmd.env(CANOPY_AGENT_ID_ENV, agent_id);
+    cmd.env(CANOPY_SESSION_NAME_ENV, session_name);
+    cmd.env(CANOPY_WORKDIR_ENV, working_dir);
+}
 
 /// An interactive agent with a virtual terminal screen.
 pub struct InteractiveAgent {
@@ -128,6 +142,11 @@ impl InteractiveAgent {
         #[cfg(unix)]
         ignore_signals();
 
+        let id = uuid::Uuid::new_v4().to_string();
+        let name = name
+            .map(str::to_owned)
+            .unwrap_or_else(|| naming::pick_random_name(existing_ids));
+
         let pty_system = native_pty_system();
 
         let pair = pty_system.openpty(PtySize {
@@ -153,6 +172,7 @@ impl InteractiveAgent {
             }
         }
         cmd.cwd(working_dir);
+        apply_canopy_session_env(&mut cmd, &id, &name, working_dir);
 
         // Advertise truecolor capability so child CLIs (Kiro, etc.) use
         // 24-bit RGB color sequences for their accent colors instead of
@@ -206,13 +226,6 @@ impl InteractiveAgent {
             }
         });
 
-        let id = uuid::Uuid::new_v4().to_string();
-        let name = if let Some(n) = name {
-            n.to_string()
-        } else {
-            naming::pick_random_name(existing_ids)
-        };
-
         Ok(Self {
             id,
             name,
@@ -258,6 +271,11 @@ impl InteractiveAgent {
         #[cfg(unix)]
         ignore_signals();
 
+        let id = uuid::Uuid::new_v4().to_string();
+        let session_name = name
+            .map(str::to_owned)
+            .unwrap_or_else(|| naming::pick_terminal_name(existing_ids));
+
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
             rows,
@@ -268,6 +286,7 @@ impl InteractiveAgent {
 
         let mut cmd = CommandBuilder::new(shell);
         cmd.cwd(working_dir);
+        apply_canopy_session_env(&mut cmd, &id, &session_name, working_dir);
         // Compact prompt since warp mode shows its own prompt line
         cmd.env("PS1", "$ ");
         cmd.env("PROMPT_COMMAND", "");
@@ -308,12 +327,6 @@ impl InteractiveAgent {
             }
         });
 
-        let id = uuid::Uuid::new_v4().to_string();
-        let session_name = if let Some(n) = name {
-            n.to_string()
-        } else {
-            naming::pick_terminal_name(existing_ids)
-        };
         let cli = Cli::new(shell);
 
         Ok(Self {

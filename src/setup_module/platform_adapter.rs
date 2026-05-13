@@ -5,6 +5,11 @@ use crate::setup_module::dir_browser::browse_directory;
 use crate::setup_module::models::{
     load_mcp_fs_root, resolve_config_path, save_mcp_fs_root, CanonicalServers, Platform,
 };
+use crate::shared::sync_identity::{
+    CANOPY_AGENT_ID_ENV, CANOPY_AGENT_ID_HEADER, CANOPY_CLIENT_NAME_HEADER,
+    CANOPY_SESSION_NAME_ENV,
+    CANOPY_SESSION_NAME_HEADER, CANOPY_WORKDIR_ENV, CANOPY_WORKDIR_HEADER,
+};
 use anyhow::Result;
 use std::io::{self, Write};
 use std::path::Path;
@@ -167,6 +172,44 @@ fn strip_unsupported_keys(adapted: &mut JsonMap, unsupported_keys: &[String]) {
     }
 }
 
+fn canopy_identity_headers(platform_name: &str) -> Option<JsonMap> {
+    let headers = match platform_name {
+        "copilot" => serde_json::json!({
+            CANOPY_AGENT_ID_HEADER: format!("${CANOPY_AGENT_ID_ENV}"),
+            CANOPY_SESSION_NAME_HEADER: format!("${CANOPY_SESSION_NAME_ENV}"),
+            CANOPY_WORKDIR_HEADER: format!("${CANOPY_WORKDIR_ENV}"),
+            CANOPY_CLIENT_NAME_HEADER: platform_name,
+        }),
+        "opencode" => serde_json::json!({
+            CANOPY_AGENT_ID_HEADER: format!("{{env:{CANOPY_AGENT_ID_ENV}}}"),
+            CANOPY_SESSION_NAME_HEADER: format!("{{env:{CANOPY_SESSION_NAME_ENV}}}"),
+            CANOPY_WORKDIR_HEADER: format!("{{env:{CANOPY_WORKDIR_ENV}}}"),
+            CANOPY_CLIENT_NAME_HEADER: platform_name,
+        }),
+        _ => return None,
+    };
+
+    headers.as_object().map(clone_object_entries)
+}
+
+fn apply_canopy_identity_headers(adapted: &mut JsonMap, platform: &Platform, server_name: &str) {
+    if server_name != "canopy" || !adapted.contains_key("url") {
+        return;
+    }
+
+    let Some(identity_headers) = canopy_identity_headers(&platform.name) else {
+        return;
+    };
+
+    let mut headers = adapted
+        .get("headers")
+        .and_then(serde_json::Value::as_object)
+        .map(clone_object_entries)
+        .unwrap_or_default();
+    merge_json_object(&mut headers, &identity_headers);
+    adapted.insert("headers".to_string(), serde_json::Value::Object(headers));
+}
+
 /// Translate a canonical server config to a target platform's format.
 ///
 /// Applies in order:
@@ -189,6 +232,7 @@ pub fn adapt_config(
     apply_required_fields(&mut adapted, &platform.required_fields);
     merge_server_extras(&mut adapted, platform, server_name);
     strip_unsupported_keys(&mut adapted, &platform.unsupported_keys);
+    apply_canopy_identity_headers(&mut adapted, platform, server_name);
 
     serde_json::Value::Object(adapted)
 }
@@ -518,6 +562,63 @@ mod tests {
                 "name": "existing",
                 "type": "custom"
             })
+        );
+    }
+
+    #[test]
+    fn adapt_config_adds_canopy_identity_headers_for_copilot() {
+        let mut platform = test_platform();
+        platform.name = "copilot".to_string();
+        platform
+            .required_fields
+            .insert("type".to_string(), vec!["http".to_string()]);
+
+        let adapted = adapt_config(
+            &serde_json::json!({
+                "url": "http://localhost:7755/mcp",
+                "tools": ["*"]
+            }),
+            &platform,
+            "canopy",
+        );
+
+        assert_eq!(
+            adapted.get("headers"),
+            Some(&serde_json::json!({
+                "x-canopy-agent-id": "$CANOPY_AGENT_ID",
+                "x-canopy-session-name": "$CANOPY_SESSION_NAME",
+                "x-canopy-workdir": "$CANOPY_WORKDIR",
+                "x-canopy-client-name": "copilot"
+            }))
+        );
+    }
+
+    #[test]
+    fn adapt_config_keeps_canopy_headers_for_opencode() {
+        let mut platform = test_platform();
+        platform.name = "opencode".to_string();
+        platform.unsupported_keys.push("headers".to_string());
+        platform
+            .required_fields
+            .insert("type".to_string(), vec!["remote".to_string()]);
+
+        let adapted = adapt_config(
+            &serde_json::json!({
+                "url": "http://localhost:7755/mcp",
+                "enabled": true
+            }),
+            &platform,
+            "canopy",
+        );
+
+        assert_eq!(
+            adapted.get("headers"),
+            Some(&serde_json::json!({
+                "x-canopy-agent-id": "{env:CANOPY_AGENT_ID}",
+                "x-canopy-session-name": "{env:CANOPY_SESSION_NAME}",
+                "x-canopy-workdir": "{env:CANOPY_WORKDIR}",
+                "x-canopy-client-name": "opencode"
+            }))
         );
     }
 }

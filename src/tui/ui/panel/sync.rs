@@ -71,7 +71,6 @@ fn draw_sync_section(frame: &mut Frame, area: Rect, state: &SyncPanelState, scro
                         .fg(Color::White)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!(" ({})", intent.agent_id), Style::default().fg(DIM)),
                 Span::styled(
                     format!(" [{}]", intent.impact.as_str()),
                     Style::default().fg(intent_color(intent.impact)),
@@ -115,14 +114,13 @@ fn draw_sync_section(frame: &mut Frame, area: Rect, state: &SyncPanelState, scro
             MessageKind::Info => "·",
         };
         let color = kind_color(message.kind);
-        // Card header: icon session_name (agent_id)
+        // Card header: icon · session_name · client
         lines.push(Line::from(vec![
             Span::styled(format!("┌{icon} "), Style::default().fg(color)),
             Span::styled(
                 &message.agent_name,
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!(" ({})", message.agent_id), Style::default().fg(DIM)),
         ]));
         lines.push(Line::from(vec![
             Span::styled("│ ", Style::default().fg(color)),

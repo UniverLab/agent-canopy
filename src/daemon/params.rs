@@ -107,10 +107,6 @@ pub struct TaskReportParams {
 pub struct SyncDeclareIntentParams {
     /// Workdir this mission belongs to.
     pub workdir: String,
-    /// Agent ID announcing the mission.
-    pub agent_id: String,
-    /// Human-readable agent name.
-    pub agent_name: String,
     /// High-level mission being started.
     pub mission: String,
     /// Impact on the workspace: low | high | breaking.
@@ -123,10 +119,6 @@ pub struct SyncDeclareIntentParams {
 pub struct SyncReportStatusParams {
     /// Workdir this status applies to.
     pub workdir: String,
-    /// Agent ID reporting workspace state.
-    pub agent_id: String,
-    /// Human-readable agent name.
-    pub agent_name: String,
     /// Workspace state: stable | unstable | testing.
     pub status: String,
     /// Optional status details shown to peers.
@@ -137,10 +129,6 @@ pub struct SyncReportStatusParams {
 pub struct SyncBroadcastParams {
     /// Workdir channel to broadcast to.
     pub workdir: String,
-    /// Agent ID sending the message.
-    pub agent_id: String,
-    /// Human-readable agent name.
-    pub agent_name: String,
     /// Message kind: info | query | answer.
     pub kind: String,
     /// Human-readable message.

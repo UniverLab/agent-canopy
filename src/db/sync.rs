@@ -143,6 +143,12 @@ impl Database {
         Ok(terminal_name)
     }
 
+    pub fn resolve_sync_actor_display_name(&self, workdir: &str, agent_id: &str) -> Result<String> {
+        Ok(self
+            .resolve_sync_actor_name(workdir, agent_id)?
+            .unwrap_or_else(|| agent_id.to_owned()))
+    }
+
     /// Insert a closing marker into the sync channel when an agent exits.
     ///
     /// This allows `summarize_sync_context` to filter out stale missions from

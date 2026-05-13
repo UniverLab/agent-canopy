@@ -40,11 +40,12 @@ impl SyncManager {
         &self,
         workdir: &str,
         agent_id: &str,
-        agent_name: &str,
+        client_name: Option<&str>,
         mission: &str,
         impact: MissionImpact,
         description: &str,
     ) -> anyhow::Result<SyncMessage> {
+        let agent_name = self.build_display_name(workdir, agent_id, client_name)?;
         let payload = serde_json::to_string(&IntentPayload {
             mission: mission.to_owned(),
             impact,
@@ -55,7 +56,7 @@ impl SyncManager {
             .publish(
                 workdir,
                 agent_id,
-                agent_name,
+                &agent_name,
                 MessageKind::Intent,
                 &format!("{agent_name}: {mission}"),
                 Some(&payload),
@@ -85,10 +86,11 @@ impl SyncManager {
         &self,
         workdir: &str,
         agent_id: &str,
-        agent_name: &str,
+        client_name: Option<&str>,
         status: WorkspaceStatus,
         message: &str,
     ) -> anyhow::Result<SyncMessage> {
+        let agent_name = self.build_display_name(workdir, agent_id, client_name)?;
         let payload = serde_json::to_string(&StatusPayload {
             status,
             message: message.to_owned(),
@@ -98,7 +100,7 @@ impl SyncManager {
             .publish(
                 workdir,
                 agent_id,
-                agent_name,
+                &agent_name,
                 MessageKind::Status,
                 message,
                 Some(&payload),
@@ -128,12 +130,13 @@ impl SyncManager {
         &self,
         workdir: &str,
         agent_id: &str,
-        agent_name: &str,
+        client_name: Option<&str>,
         kind: MessageKind,
         message: &str,
         payload: Option<&str>,
     ) -> anyhow::Result<SyncMessage> {
-        self.publish(workdir, agent_id, agent_name, kind, message, payload)
+        let agent_name = self.build_display_name(workdir, agent_id, client_name)?;
+        self.publish(workdir, agent_id, &agent_name, kind, message, payload)
             .await
     }
 
@@ -171,6 +174,21 @@ impl SyncManager {
         let sender = self.ensure_sender(workdir).await;
         let _ = sender.send(sync_message.clone());
         Ok(sync_message)
+    }
+
+    /// Resolves the TUI session name from the DB and appends the client harness name when known.
+    /// Result: "laetiporus · copilot" or just "laetiporus" if client_name is unavailable.
+    fn build_display_name(
+        &self,
+        workdir: &str,
+        agent_id: &str,
+        client_name: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let session_name = self.db.resolve_sync_actor_display_name(workdir, agent_id)?;
+        Ok(match client_name {
+            Some(c) if !c.is_empty() => format!("{session_name} · {c}"),
+            _ => session_name,
+        })
     }
 
     fn upsert_sync_intelligence_node(

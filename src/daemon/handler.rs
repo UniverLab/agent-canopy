@@ -5,7 +5,9 @@
 
 use std::sync::Arc;
 
+use axum::http::request::Parts;
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
 use rmcp::tool;
@@ -40,9 +42,17 @@ use crate::domain::workflow::{
 };
 use crate::executor::Executor;
 use crate::rag::rate_limiter::RateLimiter;
+use crate::shared::sync_identity::{CANOPY_AGENT_ID_HEADER, CANOPY_CLIENT_NAME_HEADER};
 use crate::sync_manager::SyncManager;
 use crate::watchers::WatcherEngine;
 use crate::workflow_engine::WorkflowEngine;
+
+const MISSING_SYNC_IDENTITY_MESSAGE: &str =
+    "Missing Canopy session identity. Launch the agent from Canopy so the MCP client sends the Canopy identity headers automatically.";
+
+fn missing_sync_identity_error() -> McpError {
+    McpError::invalid_params(MISSING_SYNC_IDENTITY_MESSAGE.to_string(), None)
+}
 
 #[derive(Clone)]
 pub struct TaskTriggerHandler {
@@ -64,6 +74,17 @@ pub struct TaskTriggerHandler {
 #[tool_router]
 #[allow(clippy::too_many_arguments)]
 impl TaskTriggerHandler {
+    fn resolve_sync_agent_id<'a>(&self, parts: &'a Parts) -> Result<&'a str, McpError> {
+        let Some(agent_id) = header_str(parts, CANOPY_AGENT_ID_HEADER) else {
+            return Err(missing_sync_identity_error());
+        };
+        Ok(agent_id)
+    }
+
+    fn resolve_sync_client_name<'a>(&self, parts: &'a Parts) -> Option<&'a str> {
+        header_str(parts, CANOPY_CLIENT_NAME_HEADER)
+    }
+
     pub fn new(
         db: Arc<Database>,
         executor: Arc<Executor>,
@@ -598,24 +619,28 @@ impl TaskTriggerHandler {
     #[tool(
         name = "sync_declare_intent",
         description = "Declare a high-level mission for the current workdir. Non-blocking. \
-         Use this to announce major work before you start changing things."
+         Use this to announce major work before you start changing things. \
+         The actor identity is resolved automatically from the current Canopy session."
     )]
     async fn sync_declare_intent(
         &self,
         Parameters(params): Parameters<SyncDeclareIntentParams>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         let Some(impact) = MissionImpact::from_str(&params.impact) else {
             return Ok(error_result(
                 "Invalid impact. Must be: low, high, breaking.",
             ));
         };
+        let agent_id = self.resolve_sync_agent_id(&parts)?;
+        let client_name = self.resolve_sync_client_name(&parts);
 
         Ok(map_action_result(
             self.sync_manager
                 .declare_intent(
                     &params.workdir,
-                    &params.agent_id,
-                    &params.agent_name,
+                    agent_id,
+                    client_name,
                     &params.mission,
                     impact,
                     &params.description,
@@ -628,27 +653,25 @@ impl TaskTriggerHandler {
     #[tool(
         name = "sync_report_status",
         description = "Report the current workspace status for your mission. Non-blocking. \
-         status: stable | unstable | testing."
+         status: stable | unstable | testing. The actor identity is resolved \
+         automatically from the current Canopy session."
     )]
     async fn sync_report_status(
         &self,
         Parameters(params): Parameters<SyncReportStatusParams>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         let Some(status) = WorkspaceStatus::from_str(&params.status) else {
             return Ok(error_result(
                 "Invalid status. Must be: stable, unstable, testing.",
             ));
         };
+        let agent_id = self.resolve_sync_agent_id(&parts)?;
+        let client_name = self.resolve_sync_client_name(&parts);
 
         Ok(map_action_result(
             self.sync_manager
-                .report_status(
-                    &params.workdir,
-                    &params.agent_id,
-                    &params.agent_name,
-                    status,
-                    &params.message,
-                )
+                .report_status(&params.workdir, agent_id, client_name, status, &params.message)
                 .await,
             "Status reported.",
         ))
@@ -658,11 +681,13 @@ impl TaskTriggerHandler {
     #[tool(
         name = "sync_broadcast",
         description = "Broadcast a message to the workdir sync channel. Non-blocking. \
-         kind: info | query | answer."
+         kind: info | query | answer. The actor identity is resolved \
+         automatically from the current Canopy session."
     )]
     async fn sync_broadcast(
         &self,
         Parameters(params): Parameters<SyncBroadcastParams>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         let Some(kind) = MessageKind::from_str(&params.kind) else {
             return Ok(error_result("Invalid kind. Must be: info, query, answer."));
@@ -677,12 +702,14 @@ impl TaskTriggerHandler {
             .metadata
             .as_ref()
             .map(|metadata| metadata.to_string());
+        let agent_id = self.resolve_sync_agent_id(&parts)?;
+        let client_name = self.resolve_sync_client_name(&parts);
         Ok(map_action_result(
             self.sync_manager
                 .broadcast(
                     &params.workdir,
-                    &params.agent_id,
-                    &params.agent_name,
+                    agent_id,
+                    client_name,
                     kind,
                     &params.message,
                     payload.as_deref(),
@@ -2173,6 +2200,16 @@ fn append_temporal_agents_section(status: &mut String, agents: &[Agent]) {
     status.push_str(&temporal);
 }
 
+fn header_str<'a>(parts: &'a Parts, name: &str) -> Option<&'a str> {
+    parts
+        .headers
+        .get(name)?
+        .to_str()
+        .ok()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+}
+
 #[tool_handler]
 impl ServerHandler for TaskTriggerHandler {
     fn get_info(&self) -> ServerInfo {
@@ -2187,5 +2224,42 @@ impl ServerHandler for TaskTriggerHandler {
                  agent_run to test immediately, and agent_status for daemon health."
                     .to_string(),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{header_str, missing_sync_identity_error, MISSING_SYNC_IDENTITY_MESSAGE};
+    use crate::shared::sync_identity::{
+        CANOPY_AGENT_ID_HEADER, CANOPY_SESSION_NAME_HEADER, CANOPY_WORKDIR_HEADER,
+    };
+
+    #[test]
+    fn resolve_sync_agent_id_reads_canopy_header() {
+        let request = axum::http::Request::builder()
+            .header(CANOPY_AGENT_ID_HEADER, "agent-123")
+            .body(())
+            .unwrap();
+        let (parts, _) = request.into_parts();
+
+        assert_eq!(
+            header_str(&parts, CANOPY_AGENT_ID_HEADER),
+            Some("agent-123")
+        );
+    }
+
+    #[test]
+    fn resolve_sync_agent_id_requires_canopy_header() {
+        let request = axum::http::Request::builder()
+            .header(CANOPY_SESSION_NAME_HEADER, "cedro")
+            .header(CANOPY_WORKDIR_HEADER, "/tmp/workdir")
+            .body(())
+            .unwrap();
+        let (parts, _) = request.into_parts();
+
+        assert_eq!(header_str(&parts, CANOPY_AGENT_ID_HEADER), None);
+
+        let error = missing_sync_identity_error();
+        assert_eq!(error.message, MISSING_SYNC_IDENTITY_MESSAGE);
     }
 }

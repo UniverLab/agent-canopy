@@ -329,6 +329,17 @@ fn test_resolve_sync_actor_name_prefers_terminal_session_name() {
     assert_eq!(resolved.as_deref(), Some("shell-sage"));
 }
 
+#[test]
+fn test_resolve_sync_actor_display_name_falls_back_to_agent_id() {
+    let db = test_db();
+
+    let resolved = db
+        .resolve_sync_actor_display_name("/tmp/project", "bg-1")
+        .unwrap();
+
+    assert_eq!(resolved, "bg-1");
+}
+
 // ── Project context layer ─────────────────────────────────────────
 
 #[test]
