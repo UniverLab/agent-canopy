@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use crate::domain::sync::{MessageKind, MissionImpact, WorkspaceStatus};
+use crate::domain::sync::{MessageKind, MissionImpact, SyncMessage, WorkspaceStatus};
 use crate::tui::app::types::SyncPanelState;
 use crate::tui::ui::{last_two_segments, ACCENT, DIM, ERROR_COLOR, STATUS_OK};
 
@@ -106,7 +106,7 @@ fn draw_sync_section(frame: &mut Frame, area: Rect, state: &SyncPanelState, scro
         Style::default().fg(DIM).add_modifier(Modifier::BOLD),
     )));
 
-    for message in &state.recent_messages {
+    for message in recent_messages_for_display(&state.recent_messages) {
         let icon = match message.kind {
             MessageKind::Intent => "◉",
             MessageKind::Status => "≈",
@@ -176,6 +176,10 @@ fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
     result
 }
 
+fn recent_messages_for_display(messages: &[SyncMessage]) -> Vec<&SyncMessage> {
+    messages.iter().rev().collect()
+}
+
 fn vibe_color(status: WorkspaceStatus) -> Color {
     match status {
         WorkspaceStatus::Stable => STATUS_OK,
@@ -216,5 +220,41 @@ mod tests {
     #[test]
     fn format_timestamp_returns_non_empty_text() {
         assert!(!format_timestamp(0).is_empty());
+    }
+
+    #[test]
+    fn recent_messages_for_display_prioritizes_newest_entries() {
+        let messages = vec![
+            SyncMessage {
+                id: 1,
+                workdir: "/tmp/project".into(),
+                agent_id: "agent-a".into(),
+                agent_name: "oak-fern".into(),
+                kind: MessageKind::Info,
+                message: "older".into(),
+                payload: None,
+                created_at: 1,
+            },
+            SyncMessage {
+                id: 2,
+                workdir: "/tmp/project".into(),
+                agent_id: "agent-b".into(),
+                agent_name: "moss-hawk".into(),
+                kind: MessageKind::Info,
+                message: "newer".into(),
+                payload: None,
+                created_at: 2,
+            },
+        ];
+
+        let ordered = recent_messages_for_display(&messages);
+
+        assert_eq!(
+            ordered
+                .into_iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
     }
 }
