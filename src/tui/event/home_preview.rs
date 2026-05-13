@@ -40,11 +40,7 @@ pub fn handle_home_key(app: &mut App, code: KeyCode, _modifiers: KeyModifiers) -
                 app.selected = 0;
                 app.agents_rag_focused = false;
             } else {
-                app.projects_panel_focus = app
-                    .visible_projects_panels()
-                    .first()
-                    .copied()
-                    .unwrap_or(ProjectsPanelFocus::Projects);
+                app.focus_projects_panel_from_edge(true);
             }
             app.log_scroll = 0;
             app.focus = Focus::Preview;
@@ -55,11 +51,7 @@ pub fn handle_home_key(app: &mut App, code: KeyCode, _modifiers: KeyModifiers) -
                 app.selected = app.agents.len().saturating_sub(1);
                 app.agents_rag_focused = false;
             } else {
-                app.projects_panel_focus = app
-                    .visible_projects_panels()
-                    .last()
-                    .copied()
-                    .unwrap_or(ProjectsPanelFocus::Projects);
+                app.focus_projects_panel_from_edge(false);
             }
             app.log_scroll = 0;
             app.focus = Focus::Preview;

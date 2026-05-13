@@ -671,7 +671,13 @@ impl TaskTriggerHandler {
 
         Ok(map_action_result(
             self.sync_manager
-                .report_status(&params.workdir, agent_id, client_name, status, &params.message)
+                .report_status(
+                    &params.workdir,
+                    agent_id,
+                    client_name,
+                    status,
+                    &params.message,
+                )
                 .await,
             "Status reported.",
         ))

@@ -244,6 +244,7 @@ impl App {
     }
 
     fn select_next_project_panel(&mut self) {
+        self.normalize_projects_panel_focus();
         match self.projects_panel_focus {
             ProjectsPanelFocus::Projects => {
                 if self.projects.is_empty() {
@@ -316,6 +317,7 @@ impl App {
     }
 
     fn select_prev_project_panel(&mut self) {
+        self.normalize_projects_panel_focus();
         match self.projects_panel_focus {
             ProjectsPanelFocus::Projects => {
                 if self.projects.is_empty() {
@@ -575,6 +577,45 @@ impl App {
         panels
     }
 
+    fn project_panel_has_navigable_items(&self, panel: ProjectsPanelFocus) -> bool {
+        match panel {
+            ProjectsPanelFocus::Projects => !self.projects.is_empty(),
+            ProjectsPanelFocus::Workflows => !self.visible_workflows().is_empty(),
+            ProjectsPanelFocus::RagInfo => self.rag_info.has_rag_activity(),
+        }
+    }
+
+    fn normalize_projects_panel_focus(&mut self) {
+        if self.project_panel_has_navigable_items(self.projects_panel_focus) {
+            return;
+        }
+
+        let fallback = self
+            .visible_projects_panels()
+            .into_iter()
+            .find(|panel| self.project_panel_has_navigable_items(*panel));
+        if let Some(panel) = fallback {
+            self.projects_panel_focus = panel;
+        }
+    }
+
+    pub(crate) fn focus_projects_panel_from_edge(&mut self, from_top: bool) {
+        let panels = self.visible_projects_panels();
+        let ordered = if from_top {
+            panels
+        } else {
+            panels.into_iter().rev().collect::<Vec<_>>()
+        };
+
+        let selected = ordered
+            .iter()
+            .copied()
+            .find(|panel| self.project_panel_has_navigable_items(*panel))
+            .or_else(|| ordered.first().copied())
+            .unwrap_or(ProjectsPanelFocus::Projects);
+        self.projects_panel_focus = selected;
+    }
+
     #[allow(dead_code)]
     pub fn cycle_projects_panel_focus(&mut self, forward: bool) {
         let panels = self.visible_projects_panels();
@@ -626,6 +667,9 @@ impl App {
             SidebarMode::Agents => SidebarMode::Projects,
             SidebarMode::Projects => SidebarMode::Agents,
         };
+        if self.sidebar_mode == SidebarMode::Projects {
+            self.normalize_projects_panel_focus();
+        }
         self.agents_rag_focused = false;
         self.reset_log_scroll();
     }

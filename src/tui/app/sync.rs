@@ -5,6 +5,9 @@ use super::types::{AgentEntry, App, SyncPanelState};
 pub(crate) const ACTIVITY_PANEL_WIDTH: u16 = 34;
 const MIN_PANEL_WIDTH: u16 = 90;
 const RECENT_MESSAGE_LIMIT: usize = 18;
+const MAX_RECENT_MESSAGE_LIMIT: usize = 200;
+const MESSAGE_WINDOW_LINES_PER_STEP: u16 = 6;
+const MESSAGE_WINDOW_ITEMS_PER_STEP: usize = 8;
 const CHATTER_LIMIT: usize = 8;
 
 impl App {
@@ -75,10 +78,8 @@ impl App {
     }
 
     fn activity_panel_state_for_workdir(&self, workdir: &str) -> Option<SyncPanelState> {
-        let mut recent_messages = self
-            .db
-            .list_sync_messages(workdir, RECENT_MESSAGE_LIMIT)
-            .ok()?;
+        let recent_limit = self.message_window_limit_for_scroll();
+        let mut recent_messages = self.db.list_sync_messages(workdir, recent_limit).ok()?;
         if recent_messages.is_empty() {
             return None;
         }
@@ -91,15 +92,14 @@ impl App {
             }
         }
 
-        let active_agent_ids = recent_messages
-            .iter()
-            .map(|message| message.agent_id.clone())
+        let active_agent_ids = self
+            .db
+            .list_active_sync_agent_ids(workdir)
+            .unwrap_or_default()
+            .into_iter()
             .collect::<std::collections::HashSet<_>>();
         let summary = summarize_sync_context(&recent_messages, &active_agent_ids, CHATTER_LIMIT);
-        let participant_count = active_agent_ids
-            .len()
-            .max(self.live_session_count_for_sync(workdir))
-            .max(1);
+        let participant_count = active_agent_ids.len().max(1);
 
         Some(SyncPanelState {
             workdir: workdir.to_owned(),
@@ -115,6 +115,12 @@ impl App {
             .list_active_sync_agent_ids(workdir)
             .map(|agent_ids| agent_ids.len())
             .unwrap_or(0)
+    }
+
+    fn message_window_limit_for_scroll(&self) -> usize {
+        let steps = (self.sync_scroll_offset / MESSAGE_WINDOW_LINES_PER_STEP) as usize;
+        (RECENT_MESSAGE_LIMIT + steps.saturating_mul(MESSAGE_WINDOW_ITEMS_PER_STEP))
+            .min(MAX_RECENT_MESSAGE_LIMIT)
     }
 }
 
@@ -206,5 +212,68 @@ mod tests {
 
         app.toggle_activity_panel();
         assert!(app.activity_panel_state().is_some());
+    }
+
+    #[test]
+    fn activity_panel_hides_intents_for_inactive_agents() {
+        let db = test_db();
+        let intent_payload = serde_json::to_string(&crate::domain::sync::IntentPayload {
+            mission: "Old mission".to_string(),
+            impact: crate::domain::sync::MissionImpact::High,
+            description: "should not show when inactive".to_string(),
+        })
+        .expect("serialize intent payload");
+        db.insert_sync_message(
+            "/tmp/project",
+            "agent-a",
+            "copilot",
+            crate::domain::sync::MessageKind::Intent,
+            "intent",
+            Some(intent_payload.as_str()),
+        )
+        .expect("insert intent");
+
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.agents = vec![AgentEntry::Agent(sample_agent("bg-1", "/tmp/project"))];
+        app.selected = 0;
+
+        let state = app
+            .activity_panel_state()
+            .expect("activity panel should render");
+
+        assert!(state.active_intents.is_empty());
+    }
+
+    #[test]
+    fn activity_panel_expands_message_window_with_scroll() {
+        let db = test_db();
+        for index in 0..(RECENT_MESSAGE_LIMIT + 4) {
+            db.insert_sync_message(
+                "/tmp/project",
+                &format!("agent-{index}"),
+                "copilot",
+                crate::domain::sync::MessageKind::Info,
+                &format!("message-{index}"),
+                None,
+            )
+            .expect("insert sync message");
+        }
+
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.agents = vec![AgentEntry::Agent(sample_agent("bg-1", "/tmp/project"))];
+        app.selected = 0;
+
+        let compact = app
+            .activity_panel_state()
+            .expect("activity panel should render");
+        assert_eq!(compact.recent_messages.len(), RECENT_MESSAGE_LIMIT);
+
+        app.sync_scroll_offset = MESSAGE_WINDOW_LINES_PER_STEP;
+        let expanded = app
+            .activity_panel_state()
+            .expect("activity panel should render");
+        assert!(expanded.recent_messages.len() > RECENT_MESSAGE_LIMIT);
     }
 }
