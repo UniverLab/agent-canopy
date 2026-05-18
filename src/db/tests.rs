@@ -313,7 +313,7 @@ fn test_resolve_sync_actor_name_prefers_interactive_session_name() {
 
     let resolved = db.resolve_sync_actor_name("/tmp/project", "ix-1").unwrap();
 
-    assert_eq!(resolved.as_deref(), Some("violet-river"));
+    assert_eq!(resolved.as_deref(), Some("violet-river · copilot"));
 }
 
 #[test]

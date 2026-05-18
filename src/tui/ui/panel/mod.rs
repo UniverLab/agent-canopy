@@ -1,5 +1,6 @@
 //! Right panel rendering — PTY output, brain automaton, banner, background_agent/watcher details, log.
 
+use chrono::{Local, TimeZone};
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 use ratatui::style::{Modifier, Style};
@@ -59,6 +60,56 @@ fn render_wrapped_paragraph<'a>(frame: &mut Frame, area: Rect, lines: Vec<Line<'
     }
 
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn format_unix_timestamp(timestamp: i64) -> String {
+    match Local.timestamp_opt(timestamp, 0).single() {
+        Some(datetime) => datetime.format("%Y-%m-%d %H:%M").to_string(),
+        None => timestamp.to_string(),
+    }
+}
+
+fn project_metadata_matches(
+    metadata: Option<&str>,
+    project: &crate::domain::project::Project,
+) -> bool {
+    let Some(metadata) = metadata else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(metadata) else {
+        return false;
+    };
+    value.get("workdir").and_then(serde_json::Value::as_str) == Some(project.path.as_str())
+}
+
+fn recent_project_session_summaries(
+    app: &App,
+    project: &crate::domain::project::Project,
+    limit: usize,
+) -> Vec<(String, String)> {
+    let Ok(nodes) =
+        app.db
+            .search_intelligence_nodes(&project.path, Some("session"), limit.saturating_mul(4))
+    else {
+        return Vec::new();
+    };
+
+    nodes
+        .into_iter()
+        .filter(|node| {
+            node.project_hash.as_deref() == Some(project.hash.as_str())
+                || project_metadata_matches(node.metadata.as_deref(), project)
+        })
+        .take(limit)
+        .map(|node| {
+            let summary = if node.body.trim().is_empty() {
+                "No summary captured yet.".to_string()
+            } else {
+                truncate_str(node.body.trim(), 96)
+            };
+            (node.title, summary)
+        })
+        .collect()
 }
 
 fn set_cursor_from_snapshot(frame: &mut Frame, area: Rect, snap: &ScreenSnapshot) {
@@ -424,13 +475,16 @@ fn draw_project_overview(frame: &mut Frame, area: Rect, app: &App) {
     let tags = project.tags.as_deref().unwrap_or("none");
     let indexed = project
         .indexed_at
-        .map(|timestamp| timestamp.to_string())
+        .map(format_unix_timestamp)
         .unwrap_or_else(|| "pending".to_string());
+    let created = format_unix_timestamp(project.created_at);
     let description = project
         .description
         .as_deref()
         .unwrap_or("No description extracted yet.");
-    let lines = vec![
+    let project_activity = app.activity_panel_state_for_workdir(&project.path);
+    let recent_sessions = recent_project_session_summaries(app, project, 3);
+    let mut lines = vec![
         Line::from(vec![
             Span::styled("Project ", Style::default().fg(DIM)),
             Span::styled(
@@ -438,13 +492,85 @@ fn draw_project_overview(frame: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
         ]),
-        Line::from(format!("Hash: {}", project.hash)),
-        Line::from(format!("Path: {}", project.path)),
-        Line::from(format!("Indexed: {}", indexed)),
-        Line::from(format!("Tags: {}", tags)),
+        Line::from(format!("workdir_hash: {}", project.hash)),
+        Line::from(format!("path: {}", project.path)),
+        Line::from(format!("indexed_at: {}", indexed)),
+        Line::from(format!("created_at: {}", created)),
+        Line::from(format!("tags: {}", tags)),
         Line::from(""),
+        Line::from(Span::styled("description", Style::default().fg(DIM))),
         Line::from(description),
+        Line::from(""),
+        Line::from(Span::styled("workspace context", Style::default().fg(DIM))),
     ];
+
+    if let Some(state) = project_activity {
+        lines.push(Line::from(format!(
+            "participants: {}  vibe: {}",
+            state.participant_count,
+            state.vibe.as_str()
+        )));
+        if state.active_intents.is_empty() {
+            lines.push(Line::from("active missions: none"));
+        } else {
+            lines.push(Line::from("active missions:"));
+            for intent in state.active_intents.iter().take(3) {
+                lines.push(Line::from(format!(
+                    "  - {} [{}]: {}",
+                    intent.agent_name,
+                    intent.impact.as_str(),
+                    intent.mission
+                )));
+                if !intent.description.trim().is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        format!("    {}", truncate_str(intent.description.trim(), 92)),
+                        Style::default().fg(DIM),
+                    )));
+                }
+            }
+        }
+
+        let recent_messages = state
+            .recent_messages
+            .iter()
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>();
+        if recent_messages.is_empty() {
+            lines.push(Line::from("recent activity: none"));
+        } else {
+            lines.push(Line::from("recent activity:"));
+            for message in recent_messages {
+                lines.push(Line::from(format!(
+                    "  - {}: {}",
+                    message.agent_name,
+                    truncate_str(message.message.trim(), 92)
+                )));
+            }
+        }
+    } else {
+        lines.push(Line::from("participants: 0  vibe: stable"));
+        lines.push(Line::from("active missions: none"));
+        lines.push(Line::from("recent activity: none"));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "recent sessions",
+        Style::default().fg(DIM),
+    )));
+    if recent_sessions.is_empty() {
+        lines.push(Line::from("  none"));
+    } else {
+        for (title, summary) in recent_sessions {
+            lines.push(Line::from(format!("  - {}", truncate_str(&title, 92))));
+            lines.push(Line::from(Span::styled(
+                format!("    {}", summary),
+                Style::default().fg(DIM),
+            )));
+        }
+    }
+
     render_wrapped_paragraph(frame, area, lines);
 }
 
@@ -517,42 +643,20 @@ fn draw_workflow_overview(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(Span::styled("Graph", Style::default().fg(DIM))),
     ];
 
-    if spec.edges.is_empty() {
-        lines.push(Line::from("  (no edges)"));
-    } else {
-        lines.extend(spec.edges.iter().map(|edge| {
-            Line::from(format!(
-                "  {} --{}--> {}",
-                edge.from_node,
-                edge.condition.as_str(),
-                edge.to_node
-            ))
-        }));
-    }
-
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("Nodes", Style::default().fg(DIM))));
-    for (idx, node) in spec.nodes.iter().enumerate() {
-        let selected = idx == app.workflow_selected_node;
-        let (style, marker) = selected_row_style(selected);
-        lines.push(Line::from(vec![
-            Span::styled(marker, style),
-            Span::raw(" "),
-            Span::styled(node.name.as_str(), style.add_modifier(Modifier::BOLD)),
-            Span::raw(" "),
-            Span::styled(
-                format!("[{}]", node.kind.as_str()),
-                Style::default().fg(DIM),
-            ),
-        ]));
+    lines.push(Line::from(Span::styled("Graph", Style::default().fg(DIM))));
+
+    if spec.nodes.is_empty() {
         lines.push(Line::from(Span::styled(
-            format!("    {}", workflow_node_summary(node)),
-            if selected {
-                style.fg(Color::White)
-            } else {
-                Style::default().fg(DIM)
-            },
+            "  (no nodes yet)",
+            Style::default().fg(DIM),
         )));
+    } else {
+        lines.extend(workflow_graph_lines(
+            spec,
+            app.workflow_selected_node,
+            area.width,
+        ));
     }
 
     if !app.workflow_runs.is_empty() {
@@ -603,6 +707,102 @@ fn workflow_node_summary(node: &crate::domain::workflow::WorkflowNode) -> String
             format!("{evaluate}: {}", truncate_str(value, 48))
         }
     }
+}
+
+fn workflow_graph_lines(
+    spec: &crate::domain::workflow::WorkflowSpecDetails,
+    selected_node_idx: usize,
+    area_width: u16,
+) -> Vec<Line<'static>> {
+    use std::collections::HashMap;
+
+    // Build outgoing map: from_node_id → Vec<(to_node_idx, condition)>
+    let mut outgoing: HashMap<&str, Vec<(usize, crate::domain::workflow::WorkflowEdgeCondition)>> =
+        HashMap::new();
+    for edge in &spec.edges {
+        if let Some(target_idx) = spec.nodes.iter().position(|n| n.id == edge.to_node) {
+            outgoing
+                .entry(edge.from_node.as_str())
+                .or_default()
+                .push((target_idx, edge.condition));
+        }
+    }
+
+    let box_width = (area_width as usize).saturating_sub(4).clamp(22, 48);
+    let inner = box_width.saturating_sub(2);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    for (idx, node) in spec.nodes.iter().enumerate() {
+        let selected = idx == selected_node_idx;
+        let border_style = if selected {
+            Style::default().fg(ACCENT)
+        } else {
+            Style::default().fg(DIM)
+        };
+        let text_style = if selected {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+
+        let kind_tag = format!("[{}]", node.kind.as_str());
+        // inner = marker(1) + space(1) + name + spaces + kind_tag
+        let max_name = inner.saturating_sub(2 + kind_tag.len());
+        let name_display = truncate_str(&node.name, max_name);
+        let spaces = inner.saturating_sub(2 + name_display.len() + kind_tag.len());
+        let marker = if selected { "›" } else { " " };
+
+        let top = format!("  ┌{}┐", "─".repeat(inner));
+        let content = format!(
+            "  │{} {}{}{}│",
+            marker,
+            name_display,
+            " ".repeat(spaces),
+            kind_tag
+        );
+        let bot = format!("  └{}┘", "─".repeat(inner));
+
+        lines.push(Line::from(Span::styled(top, border_style)));
+        lines.push(Line::from(Span::styled(content, text_style)));
+
+        let summary = workflow_node_summary(node);
+        if !summary.is_empty() {
+            let summary_trunc = truncate_str(&summary, inner.saturating_sub(3));
+            let summary_pad = inner.saturating_sub(3 + summary_trunc.len());
+            let summary_line = format!("  │   {}{}│", summary_trunc, " ".repeat(summary_pad));
+            lines.push(Line::from(Span::styled(
+                summary_line,
+                if selected {
+                    Style::default().fg(Color::White)
+                } else {
+                    Style::default().fg(DIM)
+                },
+            )));
+        }
+
+        lines.push(Line::from(Span::styled(bot, border_style)));
+
+        if let Some(edges) = outgoing.get(node.id.as_str()) {
+            for (i, (target_idx, condition)) in edges.iter().enumerate() {
+                let branch = if i == edges.len() - 1 { "└" } else { "├" };
+                let target_name = spec
+                    .nodes
+                    .get(*target_idx)
+                    .map(|n| n.name.clone())
+                    .unwrap_or_else(|| "?".to_string());
+                lines.push(Line::from(Span::styled(
+                    format!("   {}─ {} → {}", branch, condition.as_str(), target_name),
+                    Style::default().fg(DIM),
+                )));
+            }
+            lines.push(Line::from(""));
+        } else if idx < spec.nodes.len() - 1 {
+            lines.push(Line::from(""));
+        }
+    }
+
+    lines
 }
 
 fn rag_status(app: &App) -> (&'static str, Color) {

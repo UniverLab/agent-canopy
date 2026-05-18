@@ -46,9 +46,6 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                     if app.projects_panel_focus == crate::tui::app::ProjectsPanelFocus::RagInfo {
                         h.push(("p", "pause rag"));
                     }
-                    if activity_available {
-                        h.push(("F3", "activity"));
-                    }
                     h.push(("Esc", "home"));
                     h
                 }

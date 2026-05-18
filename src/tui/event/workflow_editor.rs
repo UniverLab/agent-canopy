@@ -35,21 +35,25 @@ pub fn handle_workflow_editor_key(
         }
         KeyCode::Backspace => {
             if let Some(dialog) = app.workflow_editor_dialog.as_mut() {
+                dialog.parse_error = None;
                 dialog.backspace();
             }
         }
         KeyCode::Enter => {
             if let Some(dialog) = app.workflow_editor_dialog.as_mut() {
+                dialog.parse_error = None;
                 dialog.insert_char('\n');
             }
         }
         KeyCode::Tab => {
             if let Some(dialog) = app.workflow_editor_dialog.as_mut() {
+                dialog.parse_error = None;
                 dialog.insert_str("    ");
             }
         }
         KeyCode::Char(value) if !modifiers.contains(KeyModifiers::CONTROL) => {
             if let Some(dialog) = app.workflow_editor_dialog.as_mut() {
+                dialog.parse_error = None;
                 dialog.insert_char(value);
             }
         }

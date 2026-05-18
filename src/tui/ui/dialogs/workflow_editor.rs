@@ -12,14 +12,17 @@ pub fn draw_workflow_editor_dialog(frame: &mut Frame, app: &App) {
         return;
     };
 
+    let has_error = dialog.parse_error.is_some();
     let height = frame.area().height.saturating_sub(4).clamp(10, 24);
     let area = centered_rect(70, height, frame.area());
     frame.render_widget(Clear, area);
 
+    let border_color = if has_error { Color::Red } else { ACCENT };
+
     let block = Block::default()
         .title(dialog.title.as_str())
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(Style::default().fg(border_color))
         .style(Style::default().bg(Color::Rgb(15, 25, 15)));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -36,11 +39,12 @@ pub fn draw_workflow_editor_dialog(frame: &mut Frame, app: &App) {
         Rect::new(inner.x, inner.y, inner.width, 2),
     );
 
+    let error_rows: u16 = if has_error { 2 } else { 0 };
     let editor_area = Rect::new(
         inner.x,
         inner.y + 2,
         inner.width,
-        inner.height.saturating_sub(2),
+        inner.height.saturating_sub(2 + error_rows),
     );
     let body_height = editor_area.height.max(1) as usize;
 
@@ -58,6 +62,21 @@ pub fn draw_workflow_editor_dialog(frame: &mut Frame, app: &App) {
             .collect::<Vec<_>>()
     };
     frame.render_widget(Paragraph::new(rendered_lines), editor_area);
+
+    if let Some(err) = &dialog.parse_error {
+        let error_y = inner.y + 2 + editor_area.height;
+        let err_text = vec![
+            Line::from(Span::styled(
+                "─".repeat(inner.width as usize),
+                Style::default().fg(Color::Red),
+            )),
+            Line::from(Span::styled(err.as_str(), Style::default().fg(Color::Red))),
+        ];
+        frame.render_widget(
+            Paragraph::new(err_text),
+            Rect::new(inner.x, error_y, inner.width, 2),
+        );
+    }
 
     let cursor_y = editor_area
         .y

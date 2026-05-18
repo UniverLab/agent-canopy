@@ -178,6 +178,8 @@ impl SyncManager {
 
     /// Resolves the TUI session name from the DB and appends the client harness name when known.
     /// Result: "laetiporus · copilot" or just "laetiporus" if client_name is unavailable.
+    /// The DB name already includes "· cli" for interactive sessions; the header is only appended
+    /// when its value differs (avoids duplicating "cortinarius · copilot · copilot").
     fn build_display_name(
         &self,
         workdir: &str,
@@ -186,7 +188,9 @@ impl SyncManager {
     ) -> anyhow::Result<String> {
         let session_name = self.db.resolve_sync_actor_display_name(workdir, agent_id)?;
         Ok(match client_name {
-            Some(c) if !c.is_empty() => format!("{session_name} · {c}"),
+            Some(c) if !c.is_empty() && !session_name.contains(c) => {
+                format!("{session_name} · {c}")
+            }
             _ => session_name,
         })
     }

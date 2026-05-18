@@ -420,6 +420,14 @@ impl App {
     }
 
     pub fn confirm_launchpad_dialog(&mut self) -> Result<()> {
+        let can_confirm = self
+            .launchpad_dialog
+            .as_ref()
+            .is_some_and(LaunchpadDialog::can_confirm_selection);
+        if !can_confirm {
+            return Ok(());
+        }
+
         let Some(dialog) = self.pending_launch_dialog.take() else {
             self.launchpad_dialog = None;
             self.focus = super::super::types::Focus::Preview;
@@ -432,39 +440,21 @@ impl App {
 
         let (mission_title, mission_context, previous_node_id, mode) = match launchpad.selected {
             LaunchpadChoice::ContinuePrevious => {
-                if let Some(previous) = &launchpad.previous {
-                    (
-                        previous.mission.clone(),
-                        previous.summary.clone(),
-                        Some(previous.node_id.clone()),
-                        "continue",
-                    )
-                } else {
-                    let mission = launchpad.new_mission.trim();
-                    (
-                        if mission.is_empty() {
-                            "New mission".to_string()
-                        } else {
-                            mission.to_string()
-                        },
-                        None,
-                        None,
-                        "new",
-                    )
-                }
+                let Some(previous) = &launchpad.previous else {
+                    return Ok(());
+                };
+                (
+                    previous.mission.clone(),
+                    previous.summary.clone(),
+                    Some(previous.node_id.clone()),
+                    "continue",
+                )
             }
             LaunchpadChoice::NewMission => {
-                let mission = launchpad.new_mission.trim();
-                (
-                    if mission.is_empty() {
-                        "New mission".to_string()
-                    } else {
-                        mission.to_string()
-                    },
-                    None,
-                    None,
-                    "new",
-                )
+                let Some(mission) = launchpad.new_mission_title() else {
+                    return Ok(());
+                };
+                (mission.to_string(), None, None, "new")
             }
         };
 

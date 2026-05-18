@@ -1,9 +1,10 @@
 use crate::domain::sync::summarize_sync_context;
 
-use super::types::{AgentEntry, App, SyncPanelState};
+use super::types::{AgentEntry, App, SidebarMode, SyncPanelState};
 
 pub(crate) const ACTIVITY_PANEL_WIDTH: u16 = 34;
 const MIN_PANEL_WIDTH: u16 = 90;
+const MIN_EXPLICIT_ACTIVITY_WIDTH: u16 = 24;
 const RECENT_MESSAGE_LIMIT: usize = 18;
 const MAX_RECENT_MESSAGE_LIMIT: usize = 200;
 const MESSAGE_WINDOW_LINES_PER_STEP: u16 = 6;
@@ -51,18 +52,41 @@ impl App {
 
     pub(crate) fn activity_panel_state(&self) -> Option<SyncPanelState> {
         let state = self.selected_activity_state()?;
-        (!self.hidden_activity_workdirs.contains(&state.workdir)).then_some(state)
+        if self.sidebar_mode == SidebarMode::Projects {
+            Some(state)
+        } else {
+            (!self.hidden_activity_workdirs.contains(&state.workdir)).then_some(state)
+        }
     }
 
     pub(crate) fn activity_panel_layout_width(&self, total_width: u16, enabled: bool) -> u16 {
-        if !enabled || total_width < MIN_PANEL_WIDTH {
+        if !enabled {
             return 0;
+        }
+
+        let force_shown = self
+            .selected_activity_workdir()
+            .is_some_and(|workdir| self.forced_activity_workdirs.contains(workdir));
+        if !force_shown && total_width < MIN_PANEL_WIDTH {
+            return 0;
+        }
+        if force_shown {
+            if total_width <= MIN_EXPLICIT_ACTIVITY_WIDTH {
+                return total_width;
+            }
+
+            return ACTIVITY_PANEL_WIDTH
+                .min(total_width.saturating_sub(MIN_EXPLICIT_ACTIVITY_WIDTH))
+                .max(MIN_EXPLICIT_ACTIVITY_WIDTH.min(total_width));
         }
 
         ACTIVITY_PANEL_WIDTH.min(total_width.saturating_sub(48))
     }
 
     pub(crate) fn selected_activity_workdir(&self) -> Option<&str> {
+        if self.sidebar_mode == SidebarMode::Projects {
+            return self.selected_project().map(|project| project.path.as_str());
+        }
         match self.selected_agent()? {
             AgentEntry::Interactive(idx) => self
                 .interactive_agents
@@ -77,12 +101,9 @@ impl App {
         }
     }
 
-    fn activity_panel_state_for_workdir(&self, workdir: &str) -> Option<SyncPanelState> {
+    pub(crate) fn activity_panel_state_for_workdir(&self, workdir: &str) -> Option<SyncPanelState> {
         let recent_limit = self.message_window_limit_for_scroll();
         let mut recent_messages = self.db.list_sync_messages(workdir, recent_limit).ok()?;
-        if recent_messages.is_empty() {
-            return None;
-        }
 
         for message in &mut recent_messages {
             if let Ok(Some(session_name)) =
@@ -98,6 +119,18 @@ impl App {
             .unwrap_or_default()
             .into_iter()
             .collect::<std::collections::HashSet<_>>();
+        if recent_messages.is_empty() {
+            if self.sidebar_mode != SidebarMode::Projects {
+                return None;
+            }
+            return Some(SyncPanelState {
+                workdir: workdir.to_owned(),
+                participant_count: active_agent_ids.len(),
+                vibe: crate::domain::sync::WorkspaceStatus::Stable,
+                active_intents: Vec::new(),
+                recent_messages,
+            });
+        }
         let summary = summarize_sync_context(&recent_messages, &active_agent_ids, CHATTER_LIMIT);
         let participant_count = active_agent_ids.len().max(1);
 
@@ -129,6 +162,7 @@ mod tests {
     use super::*;
     use crate::db::Database;
     use crate::domain::models::{Agent, Cli};
+    use crate::domain::project::Project;
     use chrono::Utc;
     use std::sync::Arc;
     use tempfile::{tempdir, NamedTempFile};
@@ -160,6 +194,10 @@ mod tests {
         }
     }
 
+    fn sample_project(path: &str) -> Project {
+        Project::new(path)
+    }
+
     #[test]
     fn activity_panel_auto_shows_for_single_agent_when_messages_exist() {
         let db = test_db();
@@ -185,33 +223,6 @@ mod tests {
         assert_eq!(state.workdir, "/tmp/project");
         assert_eq!(state.participant_count, 1);
         assert_eq!(state.recent_messages.len(), 1);
-    }
-
-    #[test]
-    fn activity_panel_manual_hide_persists_until_reenabled() {
-        let db = test_db();
-        db.insert_sync_message(
-            "/tmp/project",
-            "agent-a",
-            "copilot",
-            crate::domain::sync::MessageKind::Info,
-            "first activity",
-            None,
-        )
-        .unwrap();
-
-        let data_dir = tempdir().expect("create data dir");
-        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
-        app.agents = vec![AgentEntry::Agent(sample_agent("bg-1", "/tmp/project"))];
-        app.selected = 0;
-
-        assert!(app.activity_panel_state().is_some());
-
-        app.toggle_activity_panel();
-        assert!(app.activity_panel_state().is_none());
-
-        app.toggle_activity_panel();
-        assert!(app.activity_panel_state().is_some());
     }
 
     #[test]
@@ -275,5 +286,111 @@ mod tests {
             .activity_panel_state()
             .expect("activity panel should render");
         assert!(expanded.recent_messages.len() > RECENT_MESSAGE_LIMIT);
+    }
+
+    #[test]
+    fn selected_activity_workdir_uses_selected_project_in_projects_mode() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        let project = sample_project("/tmp/project");
+        app.projects = vec![project];
+        app.sidebar_mode = SidebarMode::Projects;
+
+        assert_eq!(app.selected_activity_workdir(), Some("/tmp/project"));
+    }
+
+    #[test]
+    fn activity_panel_stays_visible_in_projects_mode_without_messages() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        let project = sample_project("/tmp/project");
+        app.projects = vec![project];
+        app.sidebar_mode = SidebarMode::Projects;
+
+        let state = app
+            .activity_panel_state()
+            .expect("projects mode should keep activity panel visible");
+
+        assert_eq!(state.workdir, "/tmp/project");
+        assert!(state.recent_messages.is_empty());
+        assert_eq!(state.participant_count, 0);
+    }
+
+    #[test]
+    fn toggle_activity_panel_is_ignored_in_projects_mode() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        let project = sample_project("/tmp/project");
+        app.projects = vec![project];
+        app.sidebar_mode = SidebarMode::Projects;
+
+        assert!(app.activity_panel_state().is_some());
+        app.toggle_activity_panel();
+        assert!(app.activity_panel_state().is_some());
+    }
+
+    #[test]
+    fn explicit_activity_toggle_forces_width_on_narrow_screens() {
+        let db = test_db();
+        db.insert_sync_message(
+            "/tmp/project",
+            "agent-a",
+            "copilot",
+            crate::domain::sync::MessageKind::Info,
+            "first activity",
+            None,
+        )
+        .unwrap();
+
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.agents = vec![AgentEntry::Agent(sample_agent("bg-1", "/tmp/project"))];
+        app.selected = 0;
+        app.hidden_activity_workdirs
+            .insert("/tmp/project".to_string());
+
+        assert_eq!(app.activity_panel_layout_width(60, true), 0);
+
+        app.toggle_activity_panel();
+
+        assert!(app.forced_activity_workdirs.contains("/tmp/project"));
+        assert!(app.activity_panel_layout_width(60, true) > 0);
+    }
+
+    #[test]
+    fn toggle_activity_panel_shows_when_auto_panel_is_suppressed_by_width() {
+        let db = test_db();
+        db.insert_sync_message(
+            "/tmp/project",
+            "agent-a",
+            "copilot",
+            crate::domain::sync::MessageKind::Info,
+            "first activity",
+            None,
+        )
+        .unwrap();
+
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.agents = vec![AgentEntry::Agent(sample_agent("bg-1", "/tmp/project"))];
+        app.selected = 0;
+        app.term_width = 60;
+
+        assert_eq!(
+            app.activity_panel_layout_width(app.term_width, app.activity_panel_state().is_some()),
+            0
+        );
+
+        app.toggle_activity_panel();
+
+        assert!(app.forced_activity_workdirs.contains("/tmp/project"));
+        assert!(!app.hidden_activity_workdirs.contains("/tmp/project"));
+        assert!(
+            app.activity_panel_layout_width(app.term_width, app.activity_panel_state().is_some())
+                > 0
+        );
     }
 }

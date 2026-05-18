@@ -31,6 +31,7 @@ pub struct LaunchpadDialog {
     pub selected: LaunchpadChoice,
     pub new_mission: String,
     pub cursor: usize,
+    pub submit_blocked: bool,
     /// Active missions from peer agents in this workdir (mission handoff context).
     pub active_missions: Vec<ActiveMissionSummary>,
 }
@@ -130,6 +131,7 @@ impl LaunchpadDialog {
             selected,
             new_mission: String::new(),
             cursor: 0,
+            submit_blocked: false,
             active_missions,
         })
     }
@@ -145,6 +147,35 @@ impl LaunchpadDialog {
             LaunchpadChoice::NewMission if self.has_previous() => LaunchpadChoice::ContinuePrevious,
             LaunchpadChoice::NewMission => LaunchpadChoice::NewMission,
         };
+        self.submit_blocked = false;
+    }
+
+    pub fn new_mission_title(&self) -> Option<&str> {
+        let mission = self.new_mission.trim();
+        (!mission.is_empty()).then_some(mission)
+    }
+
+    pub fn can_confirm_selection(&self) -> bool {
+        match self.selected {
+            LaunchpadChoice::ContinuePrevious => self.has_previous(),
+            LaunchpadChoice::NewMission => self.new_mission_title().is_some(),
+        }
+    }
+
+    pub fn validation_message(&self) -> Option<&'static str> {
+        if self.selected == LaunchpadChoice::NewMission && self.new_mission_title().is_none() {
+            Some("Type a mission or use Continue previous.")
+        } else {
+            None
+        }
+    }
+
+    pub fn mark_submit_blocked(&mut self) {
+        self.submit_blocked = true;
+    }
+
+    pub fn clear_submit_blocked(&mut self) {
+        self.submit_blocked = false;
     }
 
     pub fn insert_char(&mut self, c: char) {
@@ -153,6 +184,7 @@ impl LaunchpadDialog {
         }
         self.new_mission.insert(self.cursor, c);
         self.cursor += c.len_utf8();
+        self.clear_submit_blocked();
     }
 
     pub fn backspace(&mut self) {
@@ -168,6 +200,7 @@ impl LaunchpadDialog {
             .unwrap_or(0);
         self.new_mission.drain(prev..self.cursor);
         self.cursor = prev;
+        self.clear_submit_blocked();
     }
 
     pub fn delete(&mut self) {
@@ -181,6 +214,7 @@ impl LaunchpadDialog {
             .map(|(idx, _)| idx)
             .unwrap_or(self.new_mission.len());
         self.new_mission.drain(self.cursor..next);
+        self.clear_submit_blocked();
     }
 
     pub fn move_cursor_left(&mut self) {
@@ -206,5 +240,35 @@ impl LaunchpadDialog {
             .find(|(idx, _)| *idx > self.cursor)
             .map(|(idx, _)| idx)
             .unwrap_or(self.new_mission.len());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn can_confirm_selection_requires_explicit_new_mission_text() {
+        let mut dialog = LaunchpadDialog {
+            workdir: "/tmp/project".to_string(),
+            previous: None,
+            selected: LaunchpadChoice::NewMission,
+            new_mission: "   ".to_string(),
+            cursor: 3,
+            submit_blocked: false,
+            active_missions: Vec::new(),
+        };
+
+        assert!(!dialog.can_confirm_selection());
+        assert_eq!(
+            dialog.validation_message(),
+            Some("Type a mission or use Continue previous.")
+        );
+
+        dialog.new_mission = "Refactor sync panel".to_string();
+        dialog.cursor = dialog.new_mission.len();
+
+        assert!(dialog.can_confirm_selection());
+        assert_eq!(dialog.new_mission_title(), Some("Refactor sync panel"));
     }
 }

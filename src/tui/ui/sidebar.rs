@@ -597,7 +597,7 @@ fn draw_projects_list(frame: &mut Frame, area: Rect, app: &App) {
         .skip(scroll.start)
         .take(scroll.max_visible)
     {
-        if y + 2 > area.y + area.height {
+        if y + 3 > area.y + area.height {
             break;
         }
         draw_project_row(
@@ -633,10 +633,17 @@ fn draw_project_row(
     );
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            format!("{}  {}", project.hash, last_two_segments(&project.path)),
+            truncate_str(&project.hash, area.width as usize),
             meta_style,
         ))),
         Rect::new(area.x, y + 1, area.width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            truncate_str(&last_two_segments(&project.path), area.width as usize),
+            meta_style,
+        ))),
+        Rect::new(area.x, y + 2, area.width, 1),
     );
 }
 
@@ -672,7 +679,7 @@ fn draw_workflows_list(frame: &mut Frame, area: Rect, app: &App) {
         .skip(scroll.start)
         .take(scroll.max_visible)
     {
-        if y + 2 > area.y + area.height {
+        if y + 3 > area.y + area.height {
             break;
         }
         draw_workflow_row(
@@ -709,14 +716,20 @@ fn draw_workflow_row(
     );
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            format!(
-                "{}  {}",
-                workflow.status.as_str().to_uppercase(),
-                last_two_segments(&workflow.workdir)
+            truncate_str(
+                &workflow.status.as_str().to_uppercase(),
+                area.width as usize,
             ),
             meta_style,
         ))),
         Rect::new(area.x, y + 1, area.width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            truncate_str(&last_two_segments(&workflow.workdir), area.width as usize),
+            meta_style,
+        ))),
+        Rect::new(area.x, y + 2, area.width, 1),
     );
 }
 

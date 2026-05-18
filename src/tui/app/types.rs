@@ -70,6 +70,7 @@ pub(crate) struct WorkflowEditorDialog {
     pub buffer: String,
     pub cursor: usize,
     pub mode: WorkflowEditorMode,
+    pub parse_error: Option<String>,
 }
 
 impl WorkflowEditorDialog {
@@ -90,6 +91,7 @@ impl WorkflowEditorDialog {
             buffer,
             cursor,
             mode,
+            parse_error: None,
         }
     }
 
@@ -248,6 +250,7 @@ pub struct App {
     pub(crate) rag_file_status: Vec<crate::db::project::RagPerFileStatus>,
     pub(crate) sidebar_visible: bool,
     pub(crate) hidden_activity_workdirs: HashSet<String>,
+    pub(crate) forced_activity_workdirs: HashSet<String>,
     pub(crate) term_width: u16,
     pub(crate) show_legend: bool,
     pub(crate) show_copied: bool,

@@ -113,19 +113,24 @@ impl Database {
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
 
-        let interactive_name = conn
+        let interactive = conn
             .query_row(
-                "SELECT name
+                "SELECT name, cli
                  FROM interactive_sessions
                  WHERE id = ?1 AND working_dir = ?2
                  ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, started_at DESC
                  LIMIT 1",
                 rusqlite::params![agent_id, workdir],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?;
-        if interactive_name.is_some() {
-            return Ok(interactive_name);
+        if let Some((name, cli)) = interactive {
+            let display = if cli.is_empty() {
+                name
+            } else {
+                format!("{name} · {cli}")
+            };
+            return Ok(Some(display));
         }
 
         let terminal_name = conn

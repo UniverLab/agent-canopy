@@ -94,6 +94,7 @@ impl App {
             rag_file_status: Vec::new(),
             sidebar_visible: true,
             hidden_activity_workdirs: HashSet::new(),
+            forced_activity_workdirs: HashSet::new(),
             term_width: 0,
             show_legend: false,
             show_copied: false,
@@ -250,24 +251,47 @@ impl App {
                 if self.projects.is_empty() {
                     return;
                 }
-                self.selected_project = (self.selected_project + 1) % self.projects.len();
-                self.refresh_workflows_selection();
+                let next = self.selected_project + 1;
+                if next < self.projects.len() {
+                    self.selected_project = next;
+                    self.refresh_workflows_selection();
+                } else {
+                    // Cross to Workflows panel when past the last project.
+                    let first_id = self.visible_workflows().first().map(|w| w.id.clone());
+                    if let Some(id) = first_id {
+                        self.projects_panel_focus = ProjectsPanelFocus::Workflows;
+                        self.selected_workflow_id = Some(id);
+                        self.refresh_workflows_selection();
+                    } else {
+                        self.selected_project = 0; // wrap within Projects if no workflows
+                    }
+                }
             }
             ProjectsPanelFocus::Workflows => {
-                let visible = self.visible_workflows();
-                if visible.is_empty() {
+                let visible_ids: Vec<String> = self
+                    .visible_workflows()
+                    .into_iter()
+                    .map(|w| w.id.clone())
+                    .collect();
+                if visible_ids.is_empty() {
                     return;
                 }
                 let current = self
-                    .selected_workflow()
-                    .and_then(|workflow| {
-                        visible
-                            .iter()
-                            .position(|candidate| candidate.id == workflow.id)
-                    })
+                    .selected_workflow_id
+                    .as_ref()
+                    .and_then(|id| visible_ids.iter().position(|vid| vid == id))
                     .unwrap_or(0);
-                self.selected_workflow_id = Some(visible[(current + 1) % visible.len()].id.clone());
-                self.refresh_workflows_selection();
+                let next = current + 1;
+                if next < visible_ids.len() {
+                    self.selected_workflow_id = Some(visible_ids[next].clone());
+                    self.refresh_workflows_selection();
+                } else if self.rag_info.has_rag_activity() {
+                    self.projects_panel_focus = ProjectsPanelFocus::RagInfo;
+                } else {
+                    // Wrap back to Projects first item.
+                    self.projects_panel_focus = ProjectsPanelFocus::Projects;
+                    self.selected_project = 0;
+                }
             }
             ProjectsPanelFocus::RagInfo => return,
         }
@@ -323,30 +347,60 @@ impl App {
                 if self.projects.is_empty() {
                     return;
                 }
-                self.selected_project = self
-                    .selected_project
-                    .checked_sub(1)
-                    .unwrap_or(self.projects.len() - 1);
-                self.refresh_workflows_selection();
+                if self.selected_project > 0 {
+                    self.selected_project -= 1;
+                    self.refresh_workflows_selection();
+                } else {
+                    // Cross to Workflows panel (last item) when before the first project.
+                    let last_id = self.visible_workflows().last().map(|w| w.id.clone());
+                    if let Some(id) = last_id {
+                        self.projects_panel_focus = ProjectsPanelFocus::Workflows;
+                        self.selected_workflow_id = Some(id);
+                        self.refresh_workflows_selection();
+                    } else {
+                        self.selected_project = self.projects.len() - 1; // wrap within Projects
+                    }
+                }
             }
             ProjectsPanelFocus::Workflows => {
-                let visible = self.visible_workflows();
-                if visible.is_empty() {
+                let visible_ids: Vec<String> = self
+                    .visible_workflows()
+                    .into_iter()
+                    .map(|w| w.id.clone())
+                    .collect();
+                if visible_ids.is_empty() {
                     return;
                 }
                 let current = self
-                    .selected_workflow()
-                    .and_then(|workflow| {
-                        visible
-                            .iter()
-                            .position(|candidate| candidate.id == workflow.id)
-                    })
+                    .selected_workflow_id
+                    .as_ref()
+                    .and_then(|id| visible_ids.iter().position(|vid| vid == id))
                     .unwrap_or(0);
-                let prev = current.checked_sub(1).unwrap_or(visible.len() - 1);
-                self.selected_workflow_id = Some(visible[prev].id.clone());
-                self.refresh_workflows_selection();
+                if current > 0 {
+                    self.selected_workflow_id = Some(visible_ids[current - 1].clone());
+                    self.refresh_workflows_selection();
+                } else if !self.projects.is_empty() {
+                    // Cross to Projects panel (last item) when before the first workflow.
+                    self.projects_panel_focus = ProjectsPanelFocus::Projects;
+                    self.selected_project = self.projects.len() - 1;
+                } else {
+                    // Wrap within Workflows if no projects.
+                    self.selected_workflow_id = Some(visible_ids[visible_ids.len() - 1].clone());
+                    self.refresh_workflows_selection();
+                }
             }
-            ProjectsPanelFocus::RagInfo => return,
+            ProjectsPanelFocus::RagInfo => {
+                // Coming back from RagInfo: go to last Workflow or last Project.
+                let last_id = self.visible_workflows().last().map(|w| w.id.clone());
+                if let Some(id) = last_id {
+                    self.projects_panel_focus = ProjectsPanelFocus::Workflows;
+                    self.selected_workflow_id = Some(id);
+                    self.refresh_workflows_selection();
+                } else if !self.projects.is_empty() {
+                    self.projects_panel_focus = ProjectsPanelFocus::Projects;
+                    self.selected_project = self.projects.len() - 1;
+                }
+            }
         }
         self.reset_log_scroll();
     }
@@ -783,7 +837,16 @@ impl App {
                 config
             }
             crate::tui::app::types::WorkflowEditorMode::NodeConfig => {
-                serde_json::from_str::<serde_json::Value>(&dialog.buffer)?
+                match serde_json::from_str::<serde_json::Value>(&dialog.buffer) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let mut d = dialog;
+                        d.parse_error = Some(format!("JSON error: {e}"));
+                        self.workflow_editor_dialog = Some(d);
+                        self.focus = Focus::WorkflowEditorDialog;
+                        return Ok(());
+                    }
+                }
             }
         };
 
@@ -804,17 +867,30 @@ impl App {
     }
 
     pub fn toggle_activity_panel(&mut self) {
+        if self.sidebar_mode == SidebarMode::Projects {
+            return;
+        }
+
         let Some(workdir) = self.selected_activity_workdir().map(str::to_owned) else {
             return;
         };
+        let panel_rendered = self
+            .activity_panel_layout_width(self.term_width, self.activity_panel_state().is_some())
+            > 0;
 
         if self.hidden_activity_workdirs.remove(&workdir) {
+            self.forced_activity_workdirs.insert(workdir);
             self.sync_scroll_offset = 0;
             return;
         }
 
         if self.selected_activity_state().is_some() {
-            self.hidden_activity_workdirs.insert(workdir);
+            if panel_rendered || self.forced_activity_workdirs.contains(&workdir) {
+                self.forced_activity_workdirs.remove(&workdir);
+                self.hidden_activity_workdirs.insert(workdir);
+            } else {
+                self.forced_activity_workdirs.insert(workdir);
+            }
             self.sync_scroll_offset = 0;
         }
     }

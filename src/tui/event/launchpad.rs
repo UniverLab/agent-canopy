@@ -7,7 +7,22 @@ use crate::tui::app::types::App;
 pub fn handle_launchpad_key(app: &mut App, code: KeyCode) -> Result<()> {
     match code {
         KeyCode::Esc => app.close_launchpad_dialog(),
-        KeyCode::Enter => app.confirm_launchpad_dialog()?,
+        KeyCode::Enter => {
+            let can_confirm = if let Some(dialog) = app.launchpad_dialog.as_mut() {
+                if dialog.can_confirm_selection() {
+                    dialog.clear_submit_blocked();
+                    true
+                } else {
+                    dialog.mark_submit_blocked();
+                    false
+                }
+            } else {
+                false
+            };
+            if can_confirm {
+                app.confirm_launchpad_dialog()?;
+            }
+        }
         _ => {
             let Some(dialog) = app.launchpad_dialog.as_mut() else {
                 return Ok(());

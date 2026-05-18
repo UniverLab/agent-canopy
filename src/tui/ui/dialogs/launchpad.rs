@@ -8,7 +8,7 @@ use ratatui::Frame;
 use crate::tui::app::dialog::LaunchpadChoice;
 use crate::tui::app::types::App;
 
-use super::{centered_rect, truncate_str, ACCENT, BG_SELECTED, DIM};
+use super::{centered_rect, truncate_str, ACCENT, BG_SELECTED, DIM, ERROR_COLOR};
 
 fn mission_view_window(text: &str, cursor_byte: usize, max_cols: usize) -> (String, usize) {
     let max_cols = max_cols.max(1);
@@ -37,7 +37,7 @@ pub fn draw_launchpad_dialog(frame: &mut Frame, app: &App) {
         return;
     };
 
-    let area = centered_rect(70, 14, frame.area());
+    let area = centered_rect(70, 16, frame.area());
     frame.render_widget(Clear, area);
 
     let title = format!(
@@ -117,6 +117,14 @@ pub fn draw_launchpad_dialog(frame: &mut Frame, app: &App) {
             format!("Mission: {mission_text}"),
             Style::default().fg(ratatui::style::Color::White),
         )));
+        if let Some(message) = dialog.validation_message() {
+            let style = if dialog.submit_blocked {
+                Style::default().fg(ERROR_COLOR)
+            } else {
+                Style::default().fg(DIM)
+            };
+            lines.push(Line::from(Span::styled(format!("  {message}"), style)));
+        }
     }
 
     lines.push(Line::from(""));
@@ -129,7 +137,14 @@ pub fn draw_launchpad_dialog(frame: &mut Frame, app: &App) {
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" confirm  ", Style::default().fg(DIM)),
+        Span::styled(
+            if dialog.can_confirm_selection() {
+                " confirm  "
+            } else {
+                " confirm (disabled)  "
+            },
+            Style::default().fg(DIM),
+        ),
         Span::styled(
             "Tab",
             Style::default()
