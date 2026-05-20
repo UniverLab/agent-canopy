@@ -70,6 +70,33 @@ pub fn handle_home_key(app: &mut App, code: KeyCode, _modifiers: KeyModifiers) -
 // ── Preview: navigate agents, Enter → Focus ─────────────────────────
 
 pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
+    // Modal delete confirm intercepts all keys
+    if app.delete_project_confirm {
+        match code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                let _ = app.delete_selected_project();
+                app.delete_project_confirm = false;
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                app.delete_project_confirm = false;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+    if app.delete_workflow_confirm {
+        match code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                let _ = app.delete_selected_workflow();
+                app.delete_workflow_confirm = false;
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                app.delete_workflow_confirm = false;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
     if handle_playground_key(app, code, modifiers) {
         return Ok(());
     }
@@ -195,10 +222,16 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
         }
         KeyCode::Char('n') => app.open_new_agent_dialog(),
         KeyCode::F(4) => {
-            if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::Projects
-            {
-                let _ = app.delete_selected_project();
+            if app.sidebar_mode == SidebarMode::Projects {
+                match app.projects_panel_focus {
+                    ProjectsPanelFocus::Projects => {
+                        app.delete_project_confirm = true;
+                    }
+                    ProjectsPanelFocus::Workflows => {
+                        app.delete_workflow_confirm = true;
+                    }
+                    _ => {}
+                }
             } else if app.sidebar_mode != SidebarMode::Projects && !app.agents_rag_focused {
                 let _ = app.delete_selected();
             }

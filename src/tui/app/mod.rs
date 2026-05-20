@@ -75,6 +75,8 @@ impl App {
             launchpad_dialog: None,
             pending_launch_dialog: None,
             quit_confirm: false,
+            delete_project_confirm: false,
+            delete_workflow_confirm: false,
             sidebar_brain: None,
             home_brain: None,
             sidebar_click_map: Vec::new(),
@@ -262,8 +264,10 @@ impl App {
                         self.projects_panel_focus = ProjectsPanelFocus::Workflows;
                         self.selected_workflow_id = Some(id);
                         self.refresh_workflows_selection();
+                    } else if self.rag_info.has_rag_activity() {
+                        self.projects_panel_focus = ProjectsPanelFocus::RagInfo;
                     } else {
-                        self.selected_project = 0; // wrap within Projects if no workflows
+                        self.selected_project = 0; // wrap within Projects if no workflows or ragInfo
                     }
                 }
             }
@@ -293,7 +297,14 @@ impl App {
                     self.selected_project = 0;
                 }
             }
-            ProjectsPanelFocus::RagInfo => return,
+            ProjectsPanelFocus::RagInfo => {
+                // Allow cycling Down from RagInfo to Projects (first)
+                if !self.projects.is_empty() {
+                    self.projects_panel_focus = ProjectsPanelFocus::Projects;
+                    self.selected_project = 0;
+                    self.refresh_workflows_selection();
+                }
+            }
         }
         self.reset_log_scroll();
     }
@@ -350,6 +361,9 @@ impl App {
                 if self.selected_project > 0 {
                     self.selected_project -= 1;
                     self.refresh_workflows_selection();
+                } else if self.rag_info.has_rag_activity() {
+                    // At top of Projects and ragInfo exists: cycle to ragInfo panel
+                    self.projects_panel_focus = ProjectsPanelFocus::RagInfo;
                 } else {
                     // Cross to Workflows panel (last item) when before the first project.
                     let last_id = self.visible_workflows().last().map(|w| w.id.clone());
@@ -622,6 +636,17 @@ impl App {
         Ok(())
     }
 
+    pub fn delete_selected_workflow(&mut self) -> Result<()> {
+        let Some(workflow) = self.selected_workflow() else {
+            return Ok(());
+        };
+        self.db.delete_workflow(&workflow.id)?;
+        self.refresh_workflows()?;
+        self.refresh_projects()?;
+        self.refresh_rag_state()?;
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub fn visible_projects_panels(&self) -> Vec<ProjectsPanelFocus> {
         let mut panels = vec![ProjectsPanelFocus::Projects, ProjectsPanelFocus::Workflows];
@@ -884,15 +909,15 @@ impl App {
             return;
         }
 
-        if self.selected_activity_state().is_some() {
-            if panel_rendered || self.forced_activity_workdirs.contains(&workdir) {
-                self.forced_activity_workdirs.remove(&workdir);
-                self.hidden_activity_workdirs.insert(workdir);
-            } else {
-                self.forced_activity_workdirs.insert(workdir);
-            }
-            self.sync_scroll_offset = 0;
+        // Nueva lógica: siempre permite togglear el panel de actividad con F3,
+        // aunque no haya actividad previa en el workdir seleccionado.
+        if panel_rendered || self.forced_activity_workdirs.contains(&workdir) {
+            self.forced_activity_workdirs.remove(&workdir);
+            self.hidden_activity_workdirs.insert(workdir);
+        } else {
+            self.forced_activity_workdirs.insert(workdir);
         }
+        self.sync_scroll_offset = 0;
     }
 
     fn live_agent_for_entry(&self, entry: &AgentEntry) -> Option<&InteractiveAgent> {

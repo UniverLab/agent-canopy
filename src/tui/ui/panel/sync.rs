@@ -105,7 +105,14 @@ fn draw_sync_section(frame: &mut Frame, area: Rect, state: &SyncPanelState, scro
         Style::default().fg(DIM).add_modifier(Modifier::BOLD),
     )));
 
-    for message in recent_messages_for_display(&state.recent_messages) {
+    let recent_msgs = recent_messages_for_display(&state.recent_messages);
+    if state.active_intents.is_empty() && recent_msgs.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  nothing to show",
+            Style::default().fg(DIM),
+        )));
+    }
+    for message in recent_msgs {
         let icon = match message.kind {
             MessageKind::Intent => "◉",
             MessageKind::Status => "≈",

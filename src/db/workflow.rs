@@ -12,6 +12,15 @@ use crate::domain::workflow::{
 };
 
 impl Database {
+    pub fn delete_workflow(&self, workflow_id: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        conn.execute("DELETE FROM workflows WHERE id = ?1", params![workflow_id])?;
+        Ok(())
+    }
+
     pub fn insert_workflow(&self, workflow: &Workflow) -> Result<()> {
         let conn = self
             .conn

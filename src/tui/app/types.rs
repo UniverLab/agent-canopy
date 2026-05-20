@@ -215,6 +215,8 @@ pub struct App {
     pub(crate) launchpad_dialog: Option<LaunchpadDialog>,
     pub(crate) pending_launch_dialog: Option<NewAgentDialog>,
     pub(crate) quit_confirm: bool,
+    pub(crate) delete_project_confirm: bool,
+    pub(crate) delete_workflow_confirm: bool,
 
     // Brian's Brain automaton (sidebar decoration)
     pub(crate) sidebar_brain: Option<crate::tui::brians_brain::BriansBrain>,

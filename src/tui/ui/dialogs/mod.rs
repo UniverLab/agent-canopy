@@ -17,7 +17,9 @@ pub use launchpad::draw_launchpad_dialog;
 pub use new_agent_dialog::draw_new_agent_dialog;
 pub use pickers::{draw_split_picker, draw_suggestion_picker};
 pub use rag_transfer::draw_rag_transfer_modal;
-pub use simple_modals::{draw_legend, draw_quit_confirm};
+pub use simple_modals::{
+    draw_delete_project_confirm, draw_delete_workflow_confirm, draw_legend, draw_quit_confirm,
+};
 pub use simple_prompt::draw_simple_prompt_dialog;
 pub use workflow_editor::draw_workflow_editor_dialog;
 

@@ -115,6 +115,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     if app.quit_confirm {
         dialogs::draw_quit_confirm(frame);
+    } else if app.delete_project_confirm {
+        dialogs::draw_delete_project_confirm(frame);
+    } else if app.delete_workflow_confirm {
+        dialogs::draw_delete_workflow_confirm(frame);
     }
 
     if app.show_legend {

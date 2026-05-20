@@ -7,19 +7,40 @@ use super::{centered_rect, ACCENT, DIM};
 use crate::tui::app::types::App;
 
 pub fn draw_quit_confirm(frame: &mut Frame) {
-    let text = "Press y/Enter to quit, any key to cancel";
+    draw_modal_confirm(frame, " Quit? ", "Press y/Enter to quit, any key to cancel");
+}
+
+pub fn draw_delete_project_confirm(frame: &mut Frame) {
+    draw_modal_confirm(
+        frame,
+        " Delete Project? ",
+        "Are you sure you want to delete this project?\nY/Enter = Confirm  N/Esc = Cancel",
+    );
+}
+
+pub fn draw_delete_workflow_confirm(frame: &mut Frame) {
+    draw_modal_confirm(
+        frame,
+        " Delete Workflow? ",
+        "Are you sure you want to delete this workflow?\nY/Enter = Confirm  N/Esc = Cancel",
+    );
+}
+
+fn draw_modal_confirm(frame: &mut Frame, title: &str, text: &str) {
     let dialog_width = frame.area().width * 40 / 100;
     let inner_width = dialog_width.saturating_sub(2).max(1);
     let chars_per_line = inner_width as usize;
-    let text_len = text.len();
-    let needed_lines = text_len.div_ceil(chars_per_line).max(1) as u16;
+    let needed_lines = text
+        .split('\n')
+        .map(|line| (line.len().div_ceil(chars_per_line)).max(1) as u16)
+        .sum::<u16>();
     let height = needed_lines + 2; // +2 for borders
 
     let area = centered_rect(40, height, frame.area());
     frame.render_widget(Clear, area);
 
     let block = Block::default()
-        .title(" Quit? ")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
         .style(Style::default().bg(Color::Rgb(15, 25, 15)));
@@ -32,6 +53,7 @@ pub fn draw_quit_confirm(frame: &mut Frame) {
         .wrap(ratatui::widgets::Wrap { trim: true });
     frame.render_widget(msg, inner);
 }
+
 fn format_uptime_precise(seconds: u64) -> String {
     let days = seconds / 86_400;
     let hours = (seconds % 86_400) / 3_600;

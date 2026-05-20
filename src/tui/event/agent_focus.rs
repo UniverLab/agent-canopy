@@ -267,8 +267,35 @@ fn handle_agent_cycle_shortcut(app: &mut App, code: KeyCode, modifiers: KeyModif
             current_pos == 0
         };
 
+        // Handle focus cycling to/from ragInfo (agents_rag_focused)
         if at_edge {
-            app.activate_playground();
+            if !app.agents_rag_focused {
+                app.agents_rag_focused = true;
+                app.focus = Focus::Agent;
+                app.sidebar_mode = crate::tui::app::SidebarMode::Agents;
+                return true;
+            } else {
+                // If rag is already focused and we cycle forward, wrap back to agents
+                app.agents_rag_focused = false;
+                if forward && !focusable.is_empty() {
+                    app.selected = 0;
+                } else if !forward && !focusable.is_empty() {
+                    app.selected = focusable.len() - 1;
+                }
+                app.focus = Focus::Agent;
+                app.sidebar_mode = crate::tui::app::SidebarMode::Agents;
+                return true;
+            }
+        }
+
+        // If moving away from ragInfo (already focused), clear the flag
+        if app.agents_rag_focused {
+            app.agents_rag_focused = false;
+            if forward && !focusable.is_empty() {
+                app.selected = 0;
+            } else if !focusable.is_empty() {
+                app.selected = focusable.len() - 1;
+            }
             app.focus = Focus::Agent;
             app.sidebar_mode = crate::tui::app::SidebarMode::Agents;
             return true;
