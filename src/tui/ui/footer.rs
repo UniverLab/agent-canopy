@@ -150,6 +150,12 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("Ctrl+S", "save"),
             ("Esc", "cancel"),
         ],
+        Focus::ProjectRelationDialog => vec![
+            ("↑↓", "select"),
+            ("←→", "relation"),
+            ("Enter", "confirm"),
+            ("Esc", "cancel"),
+        ],
     };
 
     let mut spans = Vec::new();

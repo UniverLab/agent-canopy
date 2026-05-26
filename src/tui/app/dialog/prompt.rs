@@ -1196,7 +1196,7 @@ mod tests {
 }
 
 /// Snapshot of `SimplePromptDialog` state used to persist the prompt builder
-/// per workdir across openings within the same canopy session.
+/// per agent/session across openings within the same canopy TUI session.
 #[derive(Clone)]
 pub struct PromptBuilderSession {
     pub sections: HashMap<String, String>,

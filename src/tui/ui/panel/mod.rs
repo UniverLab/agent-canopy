@@ -202,6 +202,7 @@ fn show_home_fallback(app: &App) -> bool {
                 | Focus::RagTransfer
                 | Focus::PromptTemplateDialog
                 | Focus::WorkflowEditorDialog
+                | Focus::ProjectRelationDialog
         )
 }
 
@@ -230,6 +231,10 @@ fn draw_log_panel_focus(frame: &mut Frame, area: Rect, app: &mut App) -> bool {
         | Focus::RagTransfer
         | Focus::PromptTemplateDialog
         | Focus::WorkflowEditorDialog => false,
+        Focus::ProjectRelationDialog => {
+            draw_projects_mode_panel(frame, area, app);
+            true
+        }
     }
 }
 

@@ -7,6 +7,15 @@ use crate::domain::models_db::{self, ModelCatalog, ModelEntry};
 
 use crate::tui::app::types::Focus;
 
+/// Seed identity option for the agent creation dialog.
+#[derive(Clone, Debug)]
+pub enum SeedOption {
+    /// No seed identity — default behavior.
+    None,
+    /// Bind to an existing seed identity.
+    Seed { id: String, name: String },
+}
+
 /// Type of background_agent to create.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum NewTaskType {
@@ -77,6 +86,10 @@ pub struct NewAgentDialog {
     pub selected_session: Option<(String, String)>,
     /// Whether to launch the agent in yolo (autonomous) mode.
     pub yolo_mode: bool,
+    /// Index into `seed_options` for the selected seed identity.
+    pub seed_index: usize,
+    /// Available seed identity options.
+    pub seed_options: Vec<SeedOption>,
 }
 
 impl NewAgentDialog {
@@ -88,6 +101,7 @@ impl NewAgentDialog {
                 .unwrap_or_default()
         });
         let catalog = models_db::load_catalog();
+        let seed_options = load_seed_options();
         let mut dialog = Self {
             edit_id: None,
             task_type: NewTaskType::Interactive,
@@ -131,6 +145,8 @@ impl NewAgentDialog {
             session_picker_idx: 0,
             selected_session: None,
             yolo_mode: false,
+            seed_index: 0,
+            seed_options,
         };
         dialog.refresh_dir_entries();
         dialog.refresh_model_suggestions();
@@ -143,6 +159,13 @@ impl NewAgentDialog {
             .get(self.shell_index)
             .map(|s| s.as_str())
             .unwrap_or("bash")
+    }
+
+    pub fn selected_seed_id(&self) -> Option<&str> {
+        match self.seed_options.get(self.seed_index) {
+            Some(SeedOption::Seed { id, .. }) => Some(id),
+            _ => None,
+        }
     }
 
     fn load_available_clis() -> (Vec<Cli>, Vec<Option<crate::domain::cli_config::CliConfig>>) {
@@ -654,6 +677,21 @@ fn collect_file_names(entries: &[std::fs::DirEntry], prefix: &str) -> Vec<String
             }
         })
         .collect()
+}
+
+fn load_seed_options() -> Vec<SeedOption> {
+    let mut options = vec![SeedOption::None];
+    if let Ok(seed_ids) = crate::domain::seeds::list_seeds() {
+        for seed_id in seed_ids {
+            if let Ok(identity) = crate::domain::seeds::load_seed(&seed_id) {
+                options.push(SeedOption::Seed {
+                    id: seed_id,
+                    name: identity.name,
+                });
+            }
+        }
+    }
+    options
 }
 
 #[cfg(test)]

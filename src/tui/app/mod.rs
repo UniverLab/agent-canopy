@@ -1,6 +1,7 @@
 mod agents;
 mod data;
 pub mod dialog;
+mod project_graph;
 mod sync;
 
 use anyhow::Result;
@@ -144,6 +145,9 @@ impl App {
             sync_scroll_offset: 0,
             last_sync_area: None,
             workdir_system_state: HashMap::new(),
+            project_relation_dialog: None,
+            project_graph_edges: Vec::new(),
+            project_graph_trees: Vec::new(),
         };
         app.refresh()?;
         Ok(app)
@@ -156,6 +160,7 @@ impl App {
         self.refresh_agents()?;
         self.refresh_projects()?;
         self.refresh_workflows()?;
+        self.refresh_project_graph().ok();
         self.refresh_rag_state()?;
         self.refresh_active_runs()?;
         self.poll_interactive_agents();
@@ -632,6 +637,7 @@ impl App {
         self.db.delete_project(&hash)?;
         self.refresh_projects()?;
         self.refresh_workflows()?;
+        self.refresh_project_graph().ok();
         self.refresh_rag_state()?;
         Ok(())
     }
@@ -949,6 +955,35 @@ impl App {
                     .unwrap_or(&self.data_dir)
                     .to_path_buf()
             })
+    }
+
+    /// Return a unique key for the current prompt-builder session.
+    /// Uses the agent/session ID when available, falls back to workdir path.
+    pub fn current_prompt_session_key(&self) -> String {
+        if let Some(entry) = self.selected_agent() {
+            match entry {
+                types::AgentEntry::Interactive(idx) => {
+                    if let Some(agent) = self.interactive_agents.get(*idx) {
+                        return format!("interactive:{}", agent.id);
+                    }
+                }
+                types::AgentEntry::Terminal(idx) => {
+                    if let Some(agent) = self.terminal_agents.get(*idx) {
+                        return format!("terminal:{}", agent.id);
+                    }
+                }
+                types::AgentEntry::Agent(a) => {
+                    return format!("agent:{}", a.id);
+                }
+                types::AgentEntry::Group(_) => {}
+            }
+        }
+        if self.sidebar_mode == SidebarMode::Projects {
+            if let Some(project) = self.selected_project() {
+                return format!("project:{}", project.path);
+            }
+        }
+        format!("workdir:{}", self.current_workdir().display())
     }
 
     pub fn focused_agent_name(&self) -> String {
@@ -1624,6 +1659,7 @@ impl App {
             &existing_ids,
             None,
             cli_config.and_then(|config| config.model_flag.as_deref()),
+            None,
         ) {
             Ok(agent) => agent,
             Err(e) => {

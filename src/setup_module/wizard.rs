@@ -1,7 +1,7 @@
 use crate::setup_module::daemon_service::{
     install_service_if_needed, start_daemon_if_needed, stop_daemon,
 };
-use crate::setup_module::dir_browser::browse_directories_multiselect;
+use crate::setup_module::dir_browser::browse_directories_multiselect_with_preselected;
 use crate::setup_module::models::{is_platform_available, Platform};
 use crate::setup_module::platform_adapter::clear_wizard_screen;
 use crate::setup_module::registry_fetch::{fetch_registry, print_banner};
@@ -159,13 +159,30 @@ pub fn run_setup() -> Result<()> {
 
         // ── RAG directories ─────────────────────────────────────────
         let prev_dirs = existing_config.rag_personal_dirs.clone();
+        // Start browser at the parent of the first configured dir so the user
+        // sees their selection highlighted instead of landing inside an empty dir.
+        let browser_start = if !prev_dirs.is_empty() {
+            prev_dirs
+                .first()
+                .and_then(|p| {
+                    std::path::Path::new(p)
+                        .parent()
+                        .map(|pp| pp.to_string_lossy().to_string())
+                })
+                .filter(|pp| std::path::Path::new(pp).is_dir())
+                .unwrap_or_else(|| prev_dirs.first().unwrap().clone())
+        } else if !existing_config.rag_personal_root.is_empty() {
+            std::path::Path::new(&existing_config.rag_personal_root)
+                .parent()
+                .map(|pp| pp.to_string_lossy().to_string())
+                .filter(|pp| std::path::Path::new(pp).is_dir())
+                .unwrap_or(existing_config.rag_personal_root.clone())
+        } else {
+            String::new()
+        };
         let rag_personal_dirs = pick_multiple_directories(
             "Personal RAG directories (your own notes/docs — indexed for global retrieval):",
-            if prev_dirs.is_empty() {
-                &existing_config.rag_personal_root
-            } else {
-                prev_dirs.first().map(String::as_str).unwrap_or("")
-            },
+            &browser_start,
             &prev_dirs,
         )?;
         wiz.add(format!(
@@ -393,7 +410,8 @@ fn pick_multiple_directories(
     }
     println!("  \x1b[90mUse Space to mark directories, navigate with ↑↓, → to enter folders, ← to go up, Enter to confirm.\x1b[0m");
 
-    let selected = browse_directories_multiselect(initial);
+    let pre_selected: std::collections::HashSet<String> = existing.iter().cloned().collect();
+    let selected = browse_directories_multiselect_with_preselected(initial, pre_selected);
 
     if selected.is_empty() {
         anyhow::bail!("At least one RAG directory is required");

@@ -380,18 +380,34 @@ pub(crate) fn browse_directory(start_dir: &str) -> String {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn browse_directories_multiselect(start_dir: &str) -> Vec<String> {
+    browse_directories_multiselect_with_preselected(start_dir, std::collections::HashSet::new())
+}
+
+pub(crate) fn browse_directories_multiselect_with_preselected(
+    start_dir: &str,
+    pre_selected: std::collections::HashSet<String>,
+) -> Vec<String> {
     use ratatui::crossterm::event::{read, Event, KeyEventKind};
     use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
     let mut current = std::path::PathBuf::from(start_dir);
     if !current.is_dir() {
-        current = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+        if let Some(parent) = current.parent() {
+            if parent.is_dir() {
+                current = parent.to_path_buf();
+            } else {
+                current = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+            }
+        } else {
+            current = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+        }
     }
 
     let mut cursor: usize = 0;
     let mut filter = String::new();
-    let mut selected = std::collections::HashSet::new();
+    let mut selected = pre_selected;
     let visible: usize = 10;
     let total_rows = 4 + visible;
 

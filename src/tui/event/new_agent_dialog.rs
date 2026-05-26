@@ -40,6 +40,7 @@ struct DialogFields {
     is_terminal: bool,
     is_background: bool,
     cli_field: usize,
+    identity_field: usize,
     model_field: usize,
     prompt_field: usize,
     extra_field: usize,
@@ -62,11 +63,12 @@ impl DialogFields {
             } else {
                 0
             },
+            identity_field: if is_interactive { 5 } else { 0 },
             model_field: 3,
             prompt_field: 4,
             extra_field: 5,
             dir_field: if is_interactive {
-                3
+                6
             } else if is_terminal {
                 1
             } else {
@@ -94,7 +96,7 @@ impl DialogFields {
         if is_watch_dir {
             self.prompt_field
         } else if self.is_interactive {
-            self.cli_field
+            self.yolo_field
         } else if self.is_terminal {
             0
         } else {
@@ -201,6 +203,9 @@ fn handle_dialog_field_key(dialog: &mut NewAgentDialog, code: KeyCode) {
         1 if fields.is_interactive => handle_mode_field(dialog, code, fields),
         1 if fields.is_background => handle_trigger_field(dialog, code, fields),
         n if n == fields.cli_field && !fields.is_terminal => handle_cli_field(dialog, code, fields),
+        n if n == fields.identity_field && fields.is_interactive => {
+            handle_identity_field(dialog, code, fields);
+        }
         n if n == fields.model_field && fields.is_background => {
             handle_model_field(dialog, code, fields);
         }
@@ -294,7 +299,7 @@ fn handle_cli_field(dialog: &mut NewAgentDialog, code: KeyCode, fields: DialogFi
         }
         KeyCode::Down => {
             dialog.field = if fields.is_interactive {
-                fields.yolo_field
+                fields.identity_field
             } else {
                 fields.model_field
             };
@@ -454,10 +459,27 @@ fn handle_yolo_field(dialog: &mut NewAgentDialog, code: KeyCode, fields: DialogF
             dialog.yolo_mode = !dialog.yolo_mode;
         }
         KeyCode::Char(' ') => {}
-        KeyCode::Up | KeyCode::BackTab => dialog.field = fields.cli_field,
+        KeyCode::Up | KeyCode::BackTab => dialog.field = fields.identity_field,
         KeyCode::Down | KeyCode::Tab => dialog.field = fields.dir_field,
         _ => {}
     }
+}
+
+fn handle_identity_field(dialog: &mut NewAgentDialog, code: KeyCode, fields: DialogFields) {
+    match code {
+        KeyCode::Left => step_seed_selection(dialog, false),
+        KeyCode::Right => step_seed_selection(dialog, true),
+        KeyCode::Up | KeyCode::BackTab => dialog.field = fields.cli_field,
+        KeyCode::Down | KeyCode::Tab => dialog.field = fields.yolo_field,
+        _ => {}
+    }
+}
+
+fn step_seed_selection(dialog: &mut NewAgentDialog, forward: bool) {
+    let Some(next) = wrapped_index(dialog.seed_index, dialog.seed_options.len(), forward) else {
+        return;
+    };
+    dialog.seed_index = next;
 }
 
 fn wrapped_index(current: usize, len: usize, forward: bool) -> Option<usize> {

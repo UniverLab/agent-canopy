@@ -17,7 +17,7 @@ use ratatui::style::Color;
 
 use crate::domain::models::Cli;
 use crate::shared::sync_identity::{
-    CANOPY_AGENT_ID_ENV, CANOPY_SESSION_NAME_ENV, CANOPY_WORKDIR_ENV,
+    CANOPY_AGENT_ID_ENV, CANOPY_SEED_ID_ENV, CANOPY_SESSION_NAME_ENV, CANOPY_WORKDIR_ENV,
 };
 
 #[cfg(unix)]
@@ -56,10 +56,14 @@ fn apply_canopy_session_env(
     agent_id: &str,
     session_name: &str,
     working_dir: &str,
+    seed_id: Option<&str>,
 ) {
     cmd.env(CANOPY_AGENT_ID_ENV, agent_id);
     cmd.env(CANOPY_SESSION_NAME_ENV, session_name);
     cmd.env(CANOPY_WORKDIR_ENV, working_dir);
+    if let Some(sid) = seed_id {
+        cmd.env(CANOPY_SEED_ID_ENV, sid);
+    }
 }
 
 /// An interactive agent with a virtual terminal screen.
@@ -138,6 +142,7 @@ impl InteractiveAgent {
         existing_ids: &[&str],
         model: Option<&str>,
         model_flag: Option<&str>,
+        seed_id: Option<&str>,
     ) -> Result<Self> {
         #[cfg(unix)]
         ignore_signals();
@@ -172,7 +177,7 @@ impl InteractiveAgent {
             }
         }
         cmd.cwd(working_dir);
-        apply_canopy_session_env(&mut cmd, &id, &name, working_dir);
+        apply_canopy_session_env(&mut cmd, &id, &name, working_dir, seed_id);
 
         // Advertise truecolor capability so child CLIs (Kiro, etc.) use
         // 24-bit RGB color sequences for their accent colors instead of
@@ -286,7 +291,7 @@ impl InteractiveAgent {
 
         let mut cmd = CommandBuilder::new(shell);
         cmd.cwd(working_dir);
-        apply_canopy_session_env(&mut cmd, &id, &session_name, working_dir);
+        apply_canopy_session_env(&mut cmd, &id, &session_name, working_dir, None);
         // Compact prompt since warp mode shows its own prompt line
         cmd.env("PS1", "$ ");
         cmd.env("PROMPT_COMMAND", "");

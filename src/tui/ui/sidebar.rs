@@ -306,7 +306,26 @@ fn draw_projects_sidebar(frame: &mut Frame, areas: SidebarContentAreas, app: &Ap
 
     render_brain_if_visible(frame, layout.brain, app);
 
+    // Project graph — show in brain area if we have graph trees
+    if !app.project_graph_trees.is_empty() {
+        if let Some(graph_area) = layout.brain.filter(|area| area.height >= 4) {
+            render_titled_panel(
+                frame,
+                graph_area,
+                " project graph ",
+                Style::default().fg(DIM),
+                Style::default().fg(DIM),
+                |frame, inner| draw_project_graph(frame, inner, app),
+            );
+        }
+    }
+
     render_dashboard_if_present(frame, areas.dashboard, app);
+
+    // Project relation dialog overlay
+    if let Some(dialog) = app.project_relation_dialog.as_ref() {
+        draw_project_relation_dialog(frame, areas.content, app, dialog);
+    }
 }
 
 fn split_top_panel(content: Rect, enabled: bool, top_height: u16) -> (Option<Rect>, Rect) {
@@ -585,10 +604,11 @@ fn draw_projects_list(frame: &mut Frame, area: Rect, app: &App) {
     let scroll = scroll_state(
         app.projects.len(),
         Some(app.selected_project),
-        (area.height / 3).max(1) as usize,
+        (area.height / 4).max(1) as usize, // Ajustado para cards de 3 + separación
     );
     let panel_focused = app.projects_panel_focus == ProjectsPanelFocus::Projects;
     let mut y = area.y;
+    let row_h = 4u16;
 
     for (idx, project) in app
         .projects
@@ -600,50 +620,56 @@ fn draw_projects_list(frame: &mut Frame, area: Rect, app: &App) {
         if y + 3 > area.y + area.height {
             break;
         }
-        draw_project_row(
+        draw_project_workflow_card(
             frame,
-            area,
-            y,
-            project,
+            Rect::new(area.x, y, area.width, 3),
             idx == app.selected_project,
+            &project.name,
+            &project.hash,
+            &last_two_segments(&project.path),
             panel_focused,
         );
-        y += 3;
+        y += row_h; // card + gap visual
     }
 
     draw_scroll_indicators(frame, area, scroll.has_up, scroll.has_down);
 }
 
-fn draw_project_row(
+fn draw_project_workflow_card(
     frame: &mut Frame,
     area: Rect,
-    y: u16,
-    project: &crate::domain::project::Project,
     selected: bool,
+    title: &str,
+    meta1: &str,
+    meta2: &str,
     panel_focused: bool,
 ) {
+    let bg = if selected { BG_SELECTED } else { Color::Reset };
     let title_style = project_title_style(selected, panel_focused);
     let meta_style = project_meta_style(selected);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            truncate_str(&project.name, area.width as usize),
+            truncate_str(title, area.width as usize),
             title_style,
-        ))),
-        Rect::new(area.x, y, area.width, 1),
+        )))
+        .style(Style::default().bg(bg)),
+        Rect::new(area.x, area.y, area.width, 1),
     );
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            truncate_str(&project.hash, area.width as usize),
+            truncate_str(meta1, area.width as usize),
             meta_style,
-        ))),
-        Rect::new(area.x, y + 1, area.width, 1),
+        )))
+        .style(Style::default().bg(bg)),
+        Rect::new(area.x, area.y + 1, area.width, 1),
     );
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            truncate_str(&last_two_segments(&project.path), area.width as usize),
+            truncate_str(meta2, area.width as usize),
             meta_style,
-        ))),
-        Rect::new(area.x, y + 2, area.width, 1),
+        )))
+        .style(Style::default().bg(bg)),
+        Rect::new(area.x, area.y + 2, area.width, 1),
     );
 }
 
@@ -668,12 +694,13 @@ fn draw_workflows_list(frame: &mut Frame, area: Rect, app: &App) {
     let scroll = scroll_state(
         workflows.len(),
         selected_index,
-        (area.height / 3).max(1) as usize,
+        (area.height / 4).max(1) as usize, // Ajustado para cards
     );
     let panel_focused = app.projects_panel_focus == ProjectsPanelFocus::Workflows;
     let mut y = area.y;
+    let row_h = 4u16;
 
-    for (idx, workflow) in workflows
+    for (_idx, workflow) in workflows
         .iter()
         .enumerate()
         .skip(scroll.start)
@@ -682,55 +709,19 @@ fn draw_workflows_list(frame: &mut Frame, area: Rect, app: &App) {
         if y + 3 > area.y + area.height {
             break;
         }
-        draw_workflow_row(
+        draw_project_workflow_card(
             frame,
-            area,
-            y,
-            workflow,
+            Rect::new(area.x, y, area.width, 3),
             app.selected_workflow_id.as_deref() == Some(workflow.id.as_str()),
+            &workflow.name,
+            &workflow.status.as_str().to_uppercase(),
+            &last_two_segments(&workflow.workdir),
             panel_focused,
         );
-        let _ = idx;
-        y += 3;
+        y += row_h;
     }
 
     draw_scroll_indicators(frame, area, scroll.has_up, scroll.has_down);
-}
-
-fn draw_workflow_row(
-    frame: &mut Frame,
-    area: Rect,
-    y: u16,
-    workflow: &crate::domain::workflow::Workflow,
-    selected: bool,
-    panel_focused: bool,
-) {
-    let title_style = project_title_style(selected, panel_focused);
-    let meta_style = project_meta_style(selected);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            truncate_str(&workflow.name, area.width as usize),
-            title_style,
-        ))),
-        Rect::new(area.x, y, area.width, 1),
-    );
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            truncate_str(
-                &workflow.status.as_str().to_uppercase(),
-                area.width as usize,
-            ),
-            meta_style,
-        ))),
-        Rect::new(area.x, y + 1, area.width, 1),
-    );
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            truncate_str(&last_two_segments(&workflow.workdir), area.width as usize),
-            meta_style,
-        ))),
-        Rect::new(area.x, y + 2, area.width, 1),
-    );
 }
 
 fn project_title_style(selected: bool, panel_focused: bool) -> Style {
@@ -1207,4 +1198,169 @@ fn draw_groups_list(frame: &mut Frame, area: Rect, app: &mut App) {
             1
         };
     }
+}
+
+// ── Project Graph ────────────────────────────────────────────────
+
+fn draw_project_graph(frame: &mut Frame, area: Rect, app: &App) {
+    if app.project_graph_trees.is_empty() || app.project_graph_edges.is_empty() {
+        let msg = if app.projects.len() <= 1 {
+            "No relationships yet. Press Enter on a project to link."
+        } else {
+            "No relationships yet. Press Enter to link projects."
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                msg,
+                Style::default().fg(Color::DarkGray),
+            ))),
+            area,
+        );
+        return;
+    }
+
+    let mut y = area.y;
+    let edge_count = app
+        .project_graph_edges
+        .len()
+        .min(area.height.saturating_sub(2) as usize);
+
+    for i in 0..edge_count {
+        if y + 1 > area.y + area.height {
+            break;
+        }
+        let edge = &app.project_graph_edges[i];
+        let relation = match edge.relation.as_str() {
+            "depends_on" => "(depends)",
+            "complements" => "(complements)",
+            _ => "",
+        };
+        let label = format!(
+            "{} → {} {}",
+            truncate_str(&edge.from_name, 14),
+            truncate_str(&edge.to_name, 14),
+            relation,
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate_str(&label, (area.width - 2) as usize),
+                Style::default().fg(Color::Cyan),
+            ))),
+            Rect::new(area.x, y, area.width, 1),
+        );
+        y += 1;
+    }
+}
+
+// ── Project Relation Dialog ──────────────────────────────────────
+
+fn draw_project_relation_dialog(
+    frame: &mut Frame,
+    _area: Rect,
+    _app: &App,
+    dialog: &crate::tui::app::types::ProjectRelationDialog,
+) {
+    // Center the dialog in the screen area
+    let dialog_w = 50u16.min(frame.area().width.saturating_sub(4));
+    let dialog_h = 14u16.min(frame.area().height.saturating_sub(2));
+    let x = frame.area().x + (frame.area().width.saturating_sub(dialog_w)) / 2;
+    let y = frame.area().y + (frame.area().height.saturating_sub(dialog_h)) / 2;
+    let area = Rect::new(x, y, dialog_w, dialog_h);
+
+    let block = Block::default()
+        .title(format!(" Link: {} ", dialog.from_name))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT));
+    frame.render_widget(block, area);
+
+    let inner = Rect::new(area.x + 1, area.y + 1, area.width - 2, area.height - 2);
+
+    // Relation type selector
+    let rel_line = format!(
+        "Relation: ◀ {} ▶",
+        dialog.relation_types[dialog.relation_idx]
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            rel_line,
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ))),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+
+    if let Some(ref error) = dialog.error {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate_str(error, inner.width as usize),
+                Style::default().fg(Color::Red),
+            ))),
+            Rect::new(inner.x, inner.y + 1, inner.width, 1),
+        );
+    }
+
+    // Search/filter field
+    let filter_label = if dialog.filter_buffer.is_empty() {
+        "filter: _"
+    } else {
+        &dialog.filter_buffer
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("{}|", filter_label),
+            Style::default().fg(Color::Yellow),
+        ))),
+        Rect::new(inner.x, inner.y + 2, inner.width, 1),
+    );
+
+    // Project list
+    let list_start_y = inner.y + 3;
+    let max_items = inner
+        .height
+        .saturating_sub(4)
+        .min(dialog.filtered.len() as u16);
+
+    for i in 0..max_items {
+        let idx = dialog.filtered[i as usize];
+        let project = &dialog.available[idx];
+        let name = format!(
+            "{}  {}",
+            if i as usize == dialog.selected_idx {
+                "▶"
+            } else {
+                " "
+            },
+            truncate_str(&project.title, (inner.width - 4) as usize),
+        );
+        let style = if i as usize == dialog.selected_idx {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(name, style))),
+            Rect::new(inner.x, list_start_y + i, inner.width, 1),
+        );
+    }
+
+    if dialog.filtered.is_empty() && dialog.filter_buffer.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "No other projects indexed.",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            Rect::new(inner.x, list_start_y, inner.width, 1),
+        );
+    }
+
+    // Footer
+    let footer_y = inner.y + inner.height - 1;
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " Enter confirm  ·  ←→ relation  ·  Esc cancel  ·  type filter ",
+            Style::default().fg(DIM),
+        ))),
+        Rect::new(inner.x, footer_y, inner.width, 1),
+    );
 }

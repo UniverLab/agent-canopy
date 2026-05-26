@@ -83,14 +83,12 @@ impl App {
     ) {
         let prev_focus = self.focus;
         let workdir = self.current_workdir();
+        let session_key = self.current_prompt_session_key();
         let mut dialog = SimplePromptDialog::new();
 
-        // Restore persisted session for this workdir if available
-        let has_persisted = self.prompt_builder_sessions.contains_key(&workdir);
-        if has_persisted {
-            if let Some(session) = self.prompt_builder_sessions.get(&workdir) {
-                session.restore_into(&mut dialog);
-            }
+        // Restore persisted session for this agent/session if available
+        if let Some(session) = self.prompt_builder_sessions.get(&session_key) {
+            session.restore_into(&mut dialog);
         }
         let current_project_path = self
             .db
@@ -318,9 +316,9 @@ impl App {
                 self.focus = super::super::types::Focus::Agent;
             }
             if persist {
-                let workdir = self.current_workdir();
+                let session_key = self.current_prompt_session_key();
                 let session = super::prompt::PromptBuilderSession::from_dialog(&dialog);
-                self.prompt_builder_sessions.insert(workdir, session);
+                self.prompt_builder_sessions.insert(session_key, session);
             }
         } else {
             self.focus = super::super::types::Focus::Agent;
@@ -619,6 +617,7 @@ impl App {
             .iter()
             .map(|a| a.name.as_str())
             .collect();
+        let seed_id = dialog.selected_seed_id();
         let agent = InteractiveAgent::spawn(
             cli,
             &dir,
@@ -631,6 +630,7 @@ impl App {
             &existing_refs,
             model.as_deref(),
             model_flag.as_deref(),
+            seed_id,
         )?;
         // Persist session in registry
         let _ = self.db.insert_interactive_session(

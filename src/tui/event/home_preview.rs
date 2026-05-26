@@ -101,6 +101,10 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
         return Ok(());
     }
 
+    if handle_project_relation_dialog_key(app, code) {
+        return Ok(());
+    }
+
     match code {
         KeyCode::Esc | KeyCode::Char('h') => {
             app.focus = Focus::Home;
@@ -109,7 +113,9 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
             if app.sidebar_mode == SidebarMode::Projects {
                 match app.projects_panel_focus {
                     ProjectsPanelFocus::RagInfo => app.activate_playground(),
-                    ProjectsPanelFocus::Projects => {}
+                    ProjectsPanelFocus::Projects => {
+                        let _ = app.open_project_relation_dialog();
+                    }
                     ProjectsPanelFocus::Workflows => {
                         let _ = app.open_workflow_editor_dialog();
                     }
@@ -213,6 +219,9 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
         }
         KeyCode::Char('r') if !app.agents_rag_focused => {
             let _ = app.rerun_selected();
+        }
+        KeyCode::Char('R') if app.sidebar_mode == SidebarMode::Projects => {
+            let _ = app.open_project_relation_dialog();
         }
         KeyCode::Char('p')
             if app.sidebar_mode == SidebarMode::Projects
@@ -349,6 +358,40 @@ pub(super) fn handle_playground_key(app: &mut App, code: KeyCode, modifiers: Key
         _ => {}
     }
 
+    true
+}
+
+// ── Project Relation Dialog ──────────────────────────────────────
+
+fn handle_project_relation_dialog_key(app: &mut App, code: KeyCode) -> bool {
+    if !matches!(app.focus, Focus::ProjectRelationDialog) {
+        return false;
+    }
+    let Some(dialog) = app.project_relation_dialog.as_mut() else {
+        return false;
+    };
+
+    match code {
+        KeyCode::Esc => {
+            app.close_project_relation_dialog();
+        }
+        KeyCode::Enter => {
+            let _ = app.confirm_project_relation();
+        }
+        KeyCode::Up | KeyCode::Char('k') => dialog.move_up(),
+        KeyCode::Down | KeyCode::Char('j') => dialog.move_down(),
+        KeyCode::Left | KeyCode::Char('h') => dialog.cycle_relation(false),
+        KeyCode::Right | KeyCode::Char('l') => dialog.cycle_relation(true),
+        KeyCode::Backspace => {
+            dialog.filter_buffer.pop();
+            dialog.rebuild_filtered();
+        }
+        KeyCode::Char(c) if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' => {
+            dialog.filter_buffer.push(c);
+            dialog.rebuild_filtered();
+        }
+        _ => return true,
+    }
     true
 }
 

@@ -5,7 +5,7 @@ use ratatui::Frame;
 
 use super::{centered_rect, truncate_str, DIM};
 use crate::tui::app::{
-    dialog::new_agent::{BackgroundTrigger, NewAgentDialog, NewTaskMode, NewTaskType},
+    dialog::new_agent::{BackgroundTrigger, NewAgentDialog, NewTaskMode, NewTaskType, SeedOption},
     types::App,
 };
 
@@ -23,6 +23,7 @@ const DIR_BROWSER_VISIBLE: usize = 10;
 #[derive(Clone, Copy)]
 struct FieldLayout {
     cli: usize,
+    identity: usize,
     model: usize,
     prompt: usize,
     extra: usize,
@@ -35,14 +36,16 @@ impl FieldLayout {
         match task_type {
             NewTaskType::Interactive => Self {
                 cli: 2,
+                identity: 5,
                 model: 3,
                 prompt: 4,
                 extra: 5,
-                dir: 3,
+                dir: 6,
                 yolo: 4,
             },
             NewTaskType::Terminal => Self {
                 cli: 0,
+                identity: 0,
                 model: 3,
                 prompt: 4,
                 extra: 5,
@@ -51,6 +54,7 @@ impl FieldLayout {
             },
             NewTaskType::Background => Self {
                 cli: 2,
+                identity: 0,
                 model: 3,
                 prompt: 4,
                 extra: 5,
@@ -107,7 +111,7 @@ pub fn draw_new_agent_dialog(frame: &mut Frame, app: &App) {
 fn dialog_height(dialog: &NewAgentDialog, filtered_clis: &[usize]) -> u16 {
     let dir_rows = dir_browser_rows(dialog);
     let base_height = match dialog.task_type {
-        NewTaskType::Interactive => 12 + dir_rows,
+        NewTaskType::Interactive => 14 + dir_rows,
         NewTaskType::Terminal => 10 + dir_rows,
         NewTaskType::Background => 15 + dir_rows,
     };
@@ -351,6 +355,7 @@ fn append_interactive_sections(
 
     append_cli_section(lines, dialog, accent, filtered_clis, layout.cli);
     append_session_picker_rows(lines, dialog);
+    append_identity_section(lines, dialog, accent, layout.identity);
     append_yolo_section(lines, dialog, accent, layout.yolo);
     append_directory_section(lines, dialog, accent, layout.dir, false, layout.dir);
 }
@@ -687,6 +692,30 @@ fn cron_value(dialog: &NewAgentDialog) -> String {
         " * * * * *  (min hr dom mon dow)".to_string()
     } else {
         format!(" {}▏", dialog.cron_expr)
+    }
+}
+
+fn append_identity_section(
+    lines: &mut Vec<Line<'static>>,
+    dialog: &NewAgentDialog,
+    accent: Color,
+    identity_field: usize,
+) {
+    let label = identity_label(dialog);
+    let locked = dialog.seed_options.len() <= 1;
+    push_spaced_row(
+        lines,
+        Line::from(vec![
+            Span::styled("  Identity: ", Style::default().fg(DIM)),
+            selector_span(&label, identity_field, locked, accent, dialog.field),
+        ]),
+    );
+}
+
+fn identity_label(dialog: &NewAgentDialog) -> String {
+    match dialog.seed_options.get(dialog.seed_index) {
+        Some(SeedOption::Seed { name, .. }) => truncate_with_ellipsis(name, 30),
+        _ => "None".to_string(),
     }
 }
 

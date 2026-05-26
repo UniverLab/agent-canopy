@@ -708,9 +708,10 @@ fn submit_prompt(app: &mut App, prompt: &str) {
         .is_some();
     let is_solo = !app.sync_available();
     let workdir = app.current_workdir();
+    let session_key = app.current_prompt_session_key();
 
     write_prompt_to_selected_agent(app, prompt);
-    app.prompt_builder_sessions.remove(&workdir);
+    app.prompt_builder_sessions.remove(&session_key);
     app.discard_simple_prompt_dialog();
 
     // Record that system block was sent for this workdir

@@ -46,6 +46,7 @@ pub enum Focus {
     RagTransfer,
     PromptTemplateDialog,
     WorkflowEditorDialog,
+    ProjectRelationDialog,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -272,9 +273,9 @@ pub struct App {
     pub(crate) prompt_templates: crate::tui::prompt_templates::PromptTemplates,
     /// Current simple prompt dialog state
     pub(crate) simple_prompt_dialog: Option<SimplePromptDialog>,
-    /// Persisted prompt-builder sessions per workdir (cleared on send).
+    /// Persisted prompt-builder sessions per agent/session (cleared on send).
     pub(crate) prompt_builder_sessions:
-        HashMap<PathBuf, crate::tui::app::dialog::PromptBuilderSession>,
+        HashMap<String, crate::tui::app::dialog::PromptBuilderSession>,
     /// Whether to send OS-level desktop notifications (agent done/failed).
     pub(crate) notifications_enabled: bool,
     /// Notification service for sending cross-platform notifications.
@@ -320,6 +321,34 @@ pub struct App {
     pub(crate) playground_project_hash: Option<String>,
     /// Tracks whether the system block has been sent per workdir.
     pub(crate) workdir_system_state: HashMap<PathBuf, WorkdirSystemState>,
+
+    // Project relation graph
+    pub(crate) project_relation_dialog: Option<ProjectRelationDialog>,
+    pub(crate) project_graph_edges: Vec<ProjectGraphEdge>,
+    pub(crate) project_graph_trees: Vec<Vec<String>>,
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+pub(crate) struct ProjectGraphEdge {
+    pub from_name: String,
+    pub to_name: String,
+    pub from_hash: String,
+    pub to_hash: String,
+    pub relation: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct ProjectRelationDialog {
+    pub from_hash: String,
+    pub from_name: String,
+    pub available: Vec<crate::db::intelligence::IntelligenceNodeRecord>,
+    pub filtered: Vec<usize>,
+    pub selected_idx: usize,
+    pub relation_idx: usize,
+    pub relation_types: Vec<String>,
+    pub filter_buffer: String,
+    pub error: Option<String>,
 }
 
 /// Tracks system block delivery per workdir for idempotency.
