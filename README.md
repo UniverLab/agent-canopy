@@ -17,67 +17,144 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-2E8B57?style=for-the-badge" alt="License"/></a>
 </p>
 
-harness-canopy is a modern, self-contained MCP (Multi-Agent Control Point) server for orchestrating AI agent tasks and file event triggers. Designed for reliability, modularity, and performance, it enables advanced scheduling, file watching, and interactive agent management with zero runtime dependencies.
+harness-canopy is a modern, self-contained MCP (Multi-Agent Control Point) server and TUI for orchestrating AI agent sessions, background tasks, and file event triggers. Designed for reliability, modularity, and performance — it enables advanced scheduling, persistent knowledge graphs, multi-agent coordination, workflow automation, and interactive terminal management with zero runtime dependencies.
 
 ---
 
 ## Features
 
-### 🎯 Core Capabilities
+### 🎯 Core Platform
 
-- **🚀 High-Performance Scheduler:** Event-driven cron scheduler using Tokio with zero polling overhead. Computes precise wake-up times and sleeps until needed, reducing CPU usage to near-zero when idle.
-- **📊 Real-time File Watcher:** Instantly reacts to file system events (create, modify, delete, move) using the notify crate with configurable debouncing and recursive directory monitoring.
-- **💾 Persistent State Management:** All tasks, watchers, execution logs, and agent state are stored in an embedded SQLite database with automatic migrations and transaction safety.
-- **🧠 Personal RAG Pipeline:** Markdown/PDF notes are semantically chunked, embedded with your configured model, and stored in a LanceDB vector store for higher quality retrieval.
+- **🚀 High-Performance Scheduler** — Event-driven cron scheduler using Tokio with zero polling overhead. Computes precise wake-up times and sleeps until needed; CPU usage drops to near-zero when idle.
+- **📊 Real-time File Watcher** — Instantly reacts to file system events (create, modify, delete, move) using the `notify` crate with configurable debouncing, recursive directory monitoring, and macOS FSEvents compatibility.
+- **💾 Persistent State** — All tasks, watchers, execution logs, agent state, sync messages, intelligence nodes, workflows, and projects are stored in an embedded SQLite database with WAL mode and automatic schema migration.
+- **🔄 Auto-Update** — Checks GitHub releases daily for new stable versions, downloads the platform-specific binary (linux-musl, macos-darwin; x86_64/aarch64), and atomically replaces the running executable.
+- **🔔 Cross-Platform Notifications** — Native desktop notifications for task completions, failures, and watcher triggers. Auto-detects platform: WSL (PowerShell toasts with AUMID), macOS (`osascript`), Linux (`notify-send`).
 
-### 🤖 Agent Orchestration
+### 🤖 Agent Management
 
-- **Interactive PTY Agents:** Each agent runs in a dedicated pseudo-terminal (PTY) with full vt100 emulation, supporting 24-bit colors, cursor positioning, and interactive applications.
-- **Terminal Sessions:** Raw shell sessions with command history, tab autocomplete, directory navigation, and Warp-like input mode for efficient command entry.
-- **Split View Mode:** Side-by-side or stacked terminal/agent sessions with independent focus, allowing simultaneous monitoring of multiple agents.
-- **Context Transfer:** Seamlessly transfer context between agents while preserving session state and scrollback history. Capture conversation history, prompts, and outputs from one agent and inject them into another.
-- **Prompt Builder:** Structured prompt templates with configurable sections (instruction, context, resources, examples) to create well-formatted prompts for agents.
+- **Interactive PTY Agents** — Each agent runs in a dedicated pseudo-terminal with full vt100 emulation, 24-bit color support, cursor positioning, and interactive applications.
+- **Terminal Sessions** — Raw shell sessions with per-session command history (TOML-backed), cross-session autocomplete search, and Warp-like input mode for efficient command entry.
+- **Background Agents** — Cron-scheduled and file-watcher-triggered agents with configurable timeouts, automatic retries, execution logging (5 MB rotation), and per-run status tracking.
+- **Seed Identity System** — Persistent, evolvable agent identities stored as structured TOML at `~/.canopy/seeds/<id>/identity.toml`. Each seed has a unique name, family, behavioral directives, and personality traits. Binded sessions receive the seed's prompt injection automatically. The `evolve_identity` MCP tool lets agents refine themselves over time. 4 KB size cap, case-insensitive name uniqueness, and mandatory field validation.
+- **Context Transfer** — Seamlessly transfer conversation context, prompts, and output between agents while preserving session state and scrollback history.
+- **Prompt Builder** — Structured prompt templates with configurable sections (instruction, context, resources, examples), section picker, and @-mention agent references.
+- **Launchpad** — Start new interactive sessions with previous mission recovery, mission input, and auto-injected context.
 
-### 🔧 Advanced Task Management
+### 🧠 Intelligence V2 — Knowledge Graph
 
-- **Flexible Scheduling:** Support for cron expressions, one-time tasks, and event-triggered watchers with configurable timeouts and expiration.
-- **Execution Control:** Task locking, concurrency limits, and per-run logging with detailed execution history and status tracking.
-- **Auto-Update System:** Automatically checks for and installs stable releases from GitHub at 24-hour intervals, ensuring you always have the latest features and fixes. Canopy detects new stable releases on startup and uses the built-in `scripts/install.sh` to perform atomic binary replacement.
+- **Project-Scoped Knowledge** — Store facts, patterns, and session summaries scoped to individual projects via `project_hash` (SHA-256 of canonical workdir path, truncated to 8 hex). Auto-detected from the session workdir — agents never need to set it manually.
+- **Full-Text Search** — Search intelligence nodes by query and optional kind filter across all projects.
+- **Graph Walk** — Traverse the knowledge graph from any node up to a configurable depth, returning connected facts, patterns, and cross-references.
+- **Project Relationships** — Link projects with typed relations (`depends_on`, `complements`, `relates_to`, `independent`) and query related projects for context enrichment.
+- **Context Retrieval** — `intelligence_get_context` auto-detects the project, returns a curated mix of session knowledge, project facts, and related-project summaries.
 
-### 🌐 Cross-Platform Support
+### 🔄 Multi-Agent Sync
 
-- **Single Static Binary:** Zero runtime dependencies — just download and run on Linux, macOS, or Windows.
-- **Platform-Specific Optimizations:** Native filesystem monitoring, process management, and terminal handling for each operating system.
-- **Unified Configuration:** Consistent CLI and API interface across all supported platforms.
+- **Mission Declaration** — Agents declare high-level missions with impact levels (`low`/`high`/`breaking`) so peers can see what's happening.
+- **Workspace Status** — Report workspace stability (`stable`/`unstable`/`testing`) to coordinate safe concurrent work.
+- **Broadcast Messaging** — Info, query, and answer messages between agents in the same workdir.
+- **Active Context** — `sync_get_context` returns active missions, recent chatter, and a computed workspace "vibe" (worst status among active intents).
 
-### 🧩 Modular Architecture
+### 🔀 Workflow DAG Engine
 
-- **Clear Separation of Concerns:** Independent modules for application logic, daemon lifecycle, database persistence, domain models, execution engine, scheduling, TUI, and file watching.
-- **Extensible Design:** Easy to add new CLI integrations, custom triggers, or agent types without modifying core components.
-- **Test Coverage:** Comprehensive unit and integration tests with 100% code coverage for critical paths.
+- **Ordered Specs** — Workflows contain sequenced `Spec`s, each with `Node`s connected by `Edge`s with routing conditions (`pass`/`fail`/`always`).
+- **Node Kinds** — `agent` nodes invoke CLI tools with prompt templates; `check` nodes execute shell commands; `gate` nodes validate previous output (e.g., `output_contains`).
+- **Full Lifecycle** — Create, update, run, pause, continue (retry or skip), complete nodes, and report blockers for human intervention.
+- **Template Variables** — Workflow prompts support `{{workflow_name}}`, `{{spec_content}}`, `{{node_id}}`, `{{previous_feedback}}`, and more.
+- **15 MCP Tools** — Complete CRUD + runtime management: `workflow_create`, `workflow_update`, `workflow_add_spec`, `workflow_add_node`, `workflow_add_edge`, `workflow_run`, `workflow_pause`, `workflow_continue`, `workflow_complete_node`, `workflow_report_blocker`, `workflow_get`, `workflow_list`, `workflow_update_spec`, `workflow_update_node`, `workflow_update_edge`.
+
+### 📚 Personal RAG Pipeline
+
+- **Semantic Search** — Embed and query personal documents (Markdown, MDX, PDF) with local ONNX models (fastembed/BGE, multilingual-e5) or remote APIs (OpenAI, Gemini).
+- **Language-Aware Chunking** — Markdown split by headings with paragraph fallback, similarity-aware merging, and overlap for context preservation.
+- **PDF Extraction** — Isolated subprocess prevents parser crashes from taking down the daemon, with HTML detection and raw-text salvage fallback.
+- **Auto-Ingestion** — Background watcher monitors configured RAG roots with 3-second debounce, enqueues changes, and reconciles orphan chunks on startup.
+- **Per-Agent Rate Limiting** — 10 calls/minute sliding window per agent.
+- **`.canopy/ragignore`** — Regex-based exclusion patterns for files and directories.
+
+### 🖥️ Interactive TUI (Canopy Hub)
+
+- **NewAgentDialog** — Three modes (Interactive, Background Cron/Watch, Terminal) with CLI picker, model picker, seed identity selector (`◀ None / SeedName ▶`), directory browser, and yolo mode toggle.
+- **Split Groups** — Side-by-side horizontal/vertical views for monitoring multiple agents simultaneously.
+- **System Dashboard** — CPU, memory, disk, GPU (NVIDIA/Linux/macOS), temperatures with amber/red alert thresholds. WSL queries Windows host metrics via PowerShell.
+- **Workflow Editor** — Inline node config JSON editing with validation.
+- **RAG Transfer Modal** — Send semantic search results to other agents as injected context.
+- **Context Transfer** — Two-step modal (preview → agent picker) to inject conversation context between sessions.
+- **Brian's Brain** — 3-state cellular automaton with auto-noise for idle state visualization.
+- **Whimsg** — Animated kaomoji status messages with typing effects.
+
+### 🔧 Additional Features
+
+- **Prompt Template Engine** — Background agent prompts support `{{TIMESTAMP}}`, `{{TASK_ID}}`, `{{LOG_PATH}}`, `{{FILE_PATH}}`, `{{EVENT_TYPE}}` placeholders.
+- **Project Registry** — Automatic project index keyed by workdir hash. README descriptions extracted from project roots (min 20 words, before first `##` heading). Search and update via `project_search` and `project_update` MCP tools.
+- **Action Protocol Advisor** — `get_tools` MCP tool returns scope-sensitive action protocols (`session_start`, `file_write`, `test_run`, `close_session`, `multi_agent`) with risk levels and recommended tool sets.
+- **Setup Wizard** — Interactive `canopy setup` detects installed AI CLIs from a GitHub-hosted registry, configures binary paths, model flags, headless modes, environment variables, and temperature units. Generates `~/.canopy/config.toml`.
+- **MCP Wizard** — `canopy mcp` subcommand for syncing, adding, and removing MCP server entries across all detected platforms with automatic format conversion (JSON ↔ TOML).
+- **Skills Manager** — List, validate symlink integrity, and remove installed skills across platforms.
+- **Doctor Diagnostics** — `canopy doctor` checks data directory, database, config, harnesses, RAG status, file watchers, daemon process, registry connectivity, and auto-update health.
+- **Desktop Notifications** — Cross-platform alerts for task completions, failures, watcher triggers, and RAG indexing events.
+
+---
+
+## MCP Tools (43)
+
+| Category | Tools |
+|----------|-------|
+| **Agent Management** (12) | `agent_add`, `agent_watch`, `agent_list`, `agent_remove`, `agent_enable`, `agent_disable`, `agent_run`, `agent_status`, `agent_models`, `agent_logs`, `agent_update`, `agent_report` |
+| **Multi-Agent Sync** (4) | `sync_declare_intent`, `sync_report_status`, `sync_broadcast`, `sync_get_context` |
+| **Intelligence V2** (6) | `intelligence_get_context`, `intelligence_upsert`, `intelligence_search`, `intelligence_graph_walk`, `intelligence_list_projects`, `intelligence_link_projects` |
+| **Seed Identity** (2) | `get_identity`, `evolve_identity` |
+| **Workflow Engine** (15) | `workflow_create`, `workflow_update`, `workflow_add_spec`, `workflow_update_spec`, `workflow_add_node`, `workflow_update_node`, `workflow_add_edge`, `workflow_update_edge`, `workflow_get`, `workflow_list`, `workflow_run`, `workflow_pause`, `workflow_continue`, `workflow_complete_node`, `workflow_report_blocker` |
+| **Project** (2) | `project_search`, `project_update` |
+| **RAG** (1) | `rag_search` |
+| **Protocol** (1) | `get_tools` |
 
 ---
 
 ## Architecture Overview
 
-- **Daemon:** Owns the MCP server, scheduler, watcher engine, and database. Exposes a Streamable HTTP API and stdio mode.
-- **Scheduler:** Computes next fire times for all active tasks, sleeping until needed. Wakes instantly on changes.
-- **Watcher Engine:** Reacts to file system events, triggering tasks as defined.
-- **Executor:** Runs tasks and agents, manages locking, logs, and status.
-- **TUI:** Interactive terminal UI for managing agents and viewing output in real time.
+- **Daemon** — Owns the MCP server (Streamable HTTP on port 7755 + stdio), scheduler, watcher engine, and database. Exposes all 43 MCP tools.
+- **Scheduler** — Computes next fire times for all active tasks, sleeping until needed. Wakes instantly on changes.
+- **Watcher Engine** — Reacts to file system events, triggering tasks as defined.
+- **Executor** — Runs tasks and agents, manages locking, logs, and status.
+- **Intelligence V2** — Project-scoped knowledge graph with node/edge CRUD, graph walk, project relationships.
+- **Sync Manager** — Per-workdir in-memory broadcast channels (64 capacity), DB persistence, and intelligence node auto-upsert.
+- **Workflow Engine** — DAG execution engine: check/gate/agent node runners, iteration limits, pause/continue, blocker reporting.
+- **RAG Pipeline** — Background ingestion, language-aware chunking, embedding client, vector store, and rate-limited search.
+- **TUI** — Full-screen ratatui terminal UI for managing agents, viewing output, workflows, and system metrics in real time.
 
 ---
 
 ## Main Modules
 
 - `application/` — Application ports and abstractions
-- `daemon/` — Daemon process and lifecycle
-- `db/` — SQLite persistence and migrations
-- `domain/` — Core models: Task, Watcher, ExecutionLog, etc.
+- `autoupdate/` — Self-update system (GitHub releases)
+- `daemon/` — MCP server, handler, params, RAG CLI, doctor
+- `db/` — SQLite persistence and migrations (agents, runs, sessions, sync, intelligence, workflows, projects, seeds, groups, state)
+- `domain/` — Core models: Agent, Trigger, WatchEvent, Project, SeedIdentity, Workflow, SyncMessage, IntelligenceNode
 - `executor/` — Task and agent execution logic
-- `scheduler/` — Internal cron scheduler
-- `tui/` — Terminal UI and agent management
+- `rag/` — RAG pipeline (ingestion, chunking, embedding, vector store, rate limiting)
+- `scheduler/` — Internal cron scheduler with template variables
+- `sync_manager/` — Multi-agent coordination broadcast
+- `tui/` — Terminal UI: agent management, dialogs, sidebar, system dashboard, context transfer
 - `watchers/` — File system watcher engine
+- `workflow_engine/` — DAG workflow execution engine
+
+---
+
+## Data Storage
+
+| Data | Location | Format |
+|------|----------|--------|
+| Structured data | `~/.canopy/background_agents.db` | SQLite (WAL mode) |
+| Vector embeddings | `~/.canopy/rag/vectors.lancedb` | LanceDB |
+| Seed identities | `~/.canopy/seeds/<id>/identity.toml` | TOML |
+| Terminal history | `~/.canopy/terminals/<name>/history.toml` | TOML |
+| Configuration | `~/.canopy/config.toml` | TOML |
+| Agent logs | `~/.canopy/logs/<id>.log` | Text (5 MB rotation) |
+| Daemon log | `~/.canopy/daemon.log` | Text |
+| RAG indexed files | `~/.canopy/rag/` | Markdown, PDF |
 
 ---
 
@@ -87,30 +164,43 @@ harness-canopy is a modern, self-contained MCP (Multi-Agent Control Point) serve
    ```bash
    canopy daemon start
    ```
-2. **Configure Personal RAG (optional but recommended):**
-   Run `canopy setup` and choose an `embeddings_model` plus `similarity_threshold` for semantic chunking. Canopy will embed indexed notes during daemon ingestion and persist the vectors for similarity search.
-3. **Add tasks and watchers:**
-   Use the CLI or API to register scheduled tasks and file event watchers. Each task can specify:
-   - `id`, `prompt`, `schedule_expr`, `cli`, `model`, `working_dir`, `timeout_minutes`, etc.
-   - Watchers specify `path`, `events`, and trigger logic.
-4. **Monitor and manage:**
-   - View logs, status, and manage agents interactively via the TUI.
-   - All state is persisted in `~/.canopy/tasks.db`.
 
-**Note:** Canopy automatically checks for updates every 24 hours and installs stable releases. No manual intervention required! The system verifies GitHub releases, downloads the appropriate binary for your platform, and performs an atomic replacement of the running executable.
+2. **Configure (first time):**
+   ```bash
+   canopy setup
+   ```
+   Choose AI CLI platforms, model flags, temperature units, and RAG settings. Generates `~/.canopy/config.toml`.
 
----
+3. **Launch the TUI:**
+   ```bash
+   canopy
+   ```
+   Opens the full-screen Canopy Hub. Press `Ctrl+N` or `n` to create a new agent (Interactive, Background, or Terminal). Select a seed identity to give the agent a persistent personality.
 
-## Extending
+4. **Check health:**
+   ```bash
+   canopy doctor
+   ```
 
-- Add new CLI integrations by extending the `domain` and `executor` modules.
-- Implement custom triggers or agent types by building on the modular architecture.
+5. **Manage MCP servers across platforms:**
+   ```bash
+   canopy mcp
+   ```
+
+6. **RAG indexing:**
+   ```bash
+   canopy rag auto-index start   # Start background watcher
+   canopy rag auto-index stop    # Stop
+   canopy rag report             # Per-file indexing report
+   ```
+
+All state persists in `~/.canopy/`. The daemon auto-updates to stable releases every 24 hours.
 
 ---
 
 ## Tech Stack
 
-- Rust 2021, Tokio, Axum, rusqlite, notify, vt100, ratatui, clap, serde, tracing
+|Rust 2021| Tokio | Axum | rusqlite | LanceDB | notify | vt100 | ratatui | clap | serde | tracing | fastembed |
 
 ---
 
