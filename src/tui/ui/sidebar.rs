@@ -1219,17 +1219,16 @@ fn draw_project_graph(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let mut y = area.y;
     let edge_count = app
         .project_graph_edges
         .len()
         .min(area.height.saturating_sub(2) as usize);
 
-    for i in 0..edge_count {
+    for (i, edge) in app.project_graph_edges.iter().take(edge_count).enumerate() {
+        let y = area.y + i as u16;
         if y + 1 > area.y + area.height {
             break;
         }
-        let edge = &app.project_graph_edges[i];
         let relation = match edge.relation.as_str() {
             "depends_on" => "(depends)",
             "complements" => "(complements)",
@@ -1248,7 +1247,6 @@ fn draw_project_graph(frame: &mut Frame, area: Rect, app: &App) {
             ))),
             Rect::new(area.x, y, area.width, 1),
         );
-        y += 1;
     }
 }
 
