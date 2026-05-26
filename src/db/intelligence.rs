@@ -374,4 +374,228 @@ impl Database {
             created_at: row.get(5)?,
         })
     }
+
+    // ── Intelligence V2: Project-Linked Knowledge ──
+
+    /// List all indexed project nodes for the project picker.
+    pub fn list_intelligence_projects(
+        &self,
+        query: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<IntelligenceNodeRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+
+        let sql = if query.is_some() {
+            "SELECT id, kind, title, body, metadata, project_hash, session_id, created_at, updated_at
+             FROM intelligence_nodes
+             WHERE kind = 'project'
+               AND (instr(lower(title), ?1) > 0 OR instr(lower(body), ?1) > 0 OR instr(lower(coalesce(metadata, '')), ?1) > 0)
+             ORDER BY updated_at DESC
+             LIMIT ?2"
+        } else {
+            "SELECT id, kind, title, body, metadata, project_hash, session_id, created_at, updated_at
+             FROM intelligence_nodes
+             WHERE kind = 'project'
+             ORDER BY updated_at DESC
+             LIMIT ?1"
+        };
+
+        let mut stmt = conn.prepare(sql)?;
+        let rows = if let Some(q) = query {
+            stmt.query_map(
+                rusqlite::params![q.to_lowercase(), limit as i64],
+                Self::read_intelligence_node,
+            )?
+        } else {
+            stmt.query_map(
+                rusqlite::params![limit as i64],
+                Self::read_intelligence_node,
+            )?
+        };
+        Ok(rows.filter_map(|row| row.ok()).collect())
+    }
+
+    /// Create a relationship edge between two project nodes.
+    /// If an edge with the same from/to/relation already exists, returns it.
+    pub fn link_projects(
+        &self,
+        from_project_hash: &str,
+        to_project_hash: &str,
+        relation: &str,
+        weight: Option<f64>,
+    ) -> Result<IntelligenceEdgeRecord> {
+        let from_node = self
+            .find_project_node(from_project_hash)?
+            .ok_or_else(|| anyhow!("Project node not found for hash '{}'", from_project_hash))?;
+        let to_node = self
+            .find_project_node(to_project_hash)?
+            .ok_or_else(|| anyhow!("Project node not found for hash '{}'", to_project_hash))?;
+
+        let weight = weight.unwrap_or(1.0);
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+
+        // Check for existing edge with the same from/to/relation.
+        let mut stmt = conn.prepare(
+            "SELECT id, from_node_id, to_node_id, relation, weight, created_at
+             FROM intelligence_edges
+             WHERE from_node_id = ?1 AND to_node_id = ?2 AND relation = ?3
+             LIMIT 1",
+        )?;
+        let existing = stmt
+            .query_row(
+                rusqlite::params![from_node.id, to_node.id, relation],
+                Self::read_intelligence_edge,
+            )
+            .ok();
+        if let Some(edge) = existing {
+            return Ok(edge);
+        }
+
+        let now = Utc::now().timestamp();
+        drop(stmt);
+        let mut stmt = conn.prepare(
+            "INSERT INTO intelligence_edges (from_node_id, to_node_id, relation, weight, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        stmt.execute(rusqlite::params![
+            from_node.id,
+            to_node.id,
+            relation,
+            weight,
+            now
+        ])?;
+        drop(stmt);
+
+        let edge_id = conn.last_insert_rowid();
+        Ok(IntelligenceEdgeRecord {
+            id: edge_id,
+            from_node_id: from_node.id,
+            to_node_id: to_node.id,
+            relation: relation.to_string(),
+            weight,
+            created_at: now,
+        })
+    }
+
+    /// Find a project node by its hash (project_hash column or id match).
+    fn find_project_node(&self, project_hash: &str) -> Result<Option<IntelligenceNodeRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, kind, title, body, metadata, project_hash, session_id, created_at, updated_at
+             FROM intelligence_nodes
+             WHERE kind = 'project'
+               AND (project_hash = ?1 OR id = ?1)
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![project_hash])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(Self::read_intelligence_node(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get facts and patterns linked to a specific project.
+    pub fn list_project_knowledge(
+        &self,
+        project_hash: &str,
+        kind: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<IntelligenceNodeRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+
+        let sql = match kind {
+            Some(_k) => "SELECT id, kind, title, body, metadata, project_hash, session_id, created_at, updated_at
+                        FROM intelligence_nodes
+                        WHERE project_hash = ?1 AND kind = ?2
+                        ORDER BY updated_at DESC
+                        LIMIT ?3",
+            None => "SELECT id, kind, title, body, metadata, project_hash, session_id, created_at, updated_at
+                     FROM intelligence_nodes
+                     WHERE project_hash = ?1 AND kind IN ('fact', 'pattern')
+                     ORDER BY updated_at DESC
+                     LIMIT ?2",
+        };
+
+        let mut stmt = conn.prepare(sql)?;
+        let rows = match kind {
+            Some(_) => stmt.query_map(
+                rusqlite::params![project_hash, kind.unwrap(), limit as i64],
+                Self::read_intelligence_node,
+            )?,
+            None => stmt.query_map(
+                rusqlite::params![project_hash, limit as i64],
+                Self::read_intelligence_node,
+            )?,
+        };
+        Ok(rows.filter_map(|row| row.ok()).collect())
+    }
+
+    /// List projects related to a given project via edges.
+    /// Returns (related_node, edge) where edge is reoriented so
+    /// from_node_id always equals the queried project's node id.
+    pub fn list_related_projects(
+        &self,
+        project_hash: &str,
+        limit: usize,
+    ) -> Result<Vec<(IntelligenceNodeRecord, IntelligenceEdgeRecord)>> {
+        let Some(project_node) = self.find_project_node(project_hash)? else {
+            return Ok(Vec::new());
+        };
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT
+                 n.id, n.kind, n.title, n.body, n.metadata, n.project_hash, n.session_id, n.created_at, n.updated_at,
+                 e.id, e.from_node_id, e.to_node_id, e.relation, e.weight, e.created_at
+             FROM intelligence_edges e
+             JOIN intelligence_nodes n ON (
+                 (e.from_node_id = ?1 AND n.id = e.to_node_id) OR
+                 (e.to_node_id = ?1 AND n.id = e.from_node_id)
+             )
+             WHERE n.kind = 'project'
+             ORDER BY e.weight DESC, e.created_at DESC
+             LIMIT ?2",
+        )?;
+        let project_id = project_node.id.clone();
+        let rows = stmt.query_map(
+            rusqlite::params![project_node.id, limit as i64],
+            move |row| -> rusqlite::Result<_> {
+                let node = Self::read_intelligence_node(row)?;
+                let raw_from: String = row.get(10)?;
+                let raw_to: String = row.get(11)?;
+                // Reorient so from_node_id is always the queried project.
+                let (oriented_from, oriented_to) = if raw_from == project_id {
+                    (raw_from, raw_to)
+                } else {
+                    (raw_to, raw_from)
+                };
+                let edge = IntelligenceEdgeRecord {
+                    id: row.get(9)?,
+                    from_node_id: oriented_from,
+                    to_node_id: oriented_to,
+                    relation: row.get(12)?,
+                    weight: row.get(13)?,
+                    created_at: row.get(14)?,
+                };
+                Ok((node, edge))
+            },
+        )?;
+        Ok(rows.filter_map(|row| row.ok()).collect())
+    }
 }

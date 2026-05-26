@@ -1070,3 +1070,257 @@ fn test_set_state_overwrites() {
     db.set_state("version", "0.2.0").unwrap();
     assert_eq!(db.get_state("version").unwrap(), Some("0.2.0".to_string()));
 }
+
+// ── Intelligence V2: Project-Linked Knowledge ─────────────────────
+
+#[test]
+fn test_list_projects_returns_project_nodes() {
+    let db = test_db();
+
+    db.upsert_intelligence_node(IntelligenceNodeInput {
+        id: Some("proj-a".to_string()),
+        kind: "project".to_string(),
+        title: "Project Alpha".to_string(),
+        body: "Alpha project description".to_string(),
+        metadata: Some(serde_json::json!({"hash": "hash-a"})),
+        project_hash: Some("hash-a".to_string()),
+        session_id: None,
+        relations: None,
+    })
+    .unwrap();
+
+    db.upsert_intelligence_node(IntelligenceNodeInput {
+        id: Some("fact-1".to_string()),
+        kind: "fact".to_string(),
+        title: "Some fact".to_string(),
+        body: "fact body".to_string(),
+        metadata: None,
+        project_hash: Some("hash-a".to_string()),
+        session_id: None,
+        relations: None,
+    })
+    .unwrap();
+
+    let projects = db.list_intelligence_projects(None, 10).unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0].id, "proj-a");
+    assert_eq!(projects[0].kind, "project");
+}
+
+#[test]
+fn test_list_projects_filters_by_query() {
+    let db = test_db();
+
+    db.upsert_intelligence_node(IntelligenceNodeInput {
+        id: Some("proj-a".to_string()),
+        kind: "project".to_string(),
+        title: "Alpha Backend".to_string(),
+        body: "Backend services".to_string(),
+        metadata: Some(serde_json::json!({"hash": "hash-a"})),
+        project_hash: Some("hash-a".to_string()),
+        session_id: None,
+        relations: None,
+    })
+    .unwrap();
+
+    db.upsert_intelligence_node(IntelligenceNodeInput {
+        id: Some("proj-b".to_string()),
+        kind: "project".to_string(),
+        title: "Beta Frontend".to_string(),
+        body: "Frontend app".to_string(),
+        metadata: Some(serde_json::json!({"hash": "hash-b"})),
+        project_hash: Some("hash-b".to_string()),
+        session_id: None,
+        relations: None,
+    })
+    .unwrap();
+
+    let results = db.list_intelligence_projects(Some("frontend"), 10).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].title, "Beta Frontend");
+}
+
+#[test]
+fn test_link_projects_creates_edge_between_projects() {
+    let db = test_db();
+
+    db.upsert_intelligence_node(IntelligenceNodeInput {
+        id: Some("proj-a".to_string()),
+        kind: "project".to_string(),
+        title: "Project A".to_string(),
+        body: "A".to_string(),
+        metadata: Some(serde_json::json!({"hash": "hash-a"})),
+        project_hash: Some("hash-a".to_string()),
+        session_id: None,
+        relations: None,
+    })
+    .unwrap();
+
+    db.upsert_intelligence_node(IntelligenceNodeInput {
+        id: Some("proj-b".to_string()),
+        kind: "project".to_string(),
+        title: "Project B".to_string(),
+        body: "B".to_string(),
+        metadata: Some(serde_json::json!({"hash": "hash-b"})),
+        project_hash: Some("hash-b".to_string()),
+        session_id: None,
+        relations: None,
+    })
+    .unwrap();
+
+    let edge = db
+        .link_projects("hash-a", "hash-b", "depends_on", Some(2.0))
+        .unwrap();
+    assert_eq!(edge.relation, "depends_on");
+    assert_eq!(edge.weight, 2.0);
+    assert_eq!(edge.from_node_id, "proj-a");
+    assert_eq!(edge.to_node_id, "proj-b");
+}
+
+#[test]
+fn test_link_projects_fails_when_project_missing() {
+    let db = test_db();
+    let result = db.link_projects("nonexistent-a", "nonexistent-b", "relates_to", None);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_list_project_knowledge_returns_facts_and_patterns() {
+    let db = test_db();
+
+    db.upsert_intelligence_node(IntelligenceNodeInput {
+        id: Some("proj-a".to_string()),
+        kind: "project".to_string(),
+        title: "Project A".to_string(),
+        body: "A".to_string(),
+        metadata: Some(serde_json::json!({"hash": "hash-a"})),
+        project_hash: Some("hash-a".to_string()),
+        session_id: None,
+        relations: None,
+    })
+    .unwrap();
+
+    db.upsert_intelligence_node(IntelligenceNodeInput {
+        id: Some("fact-1".to_string()),
+        kind: "fact".to_string(),
+        title: "DB convention".to_string(),
+        body: "Always use SQLite".to_string(),
+        metadata: None,
+        project_hash: Some("hash-a".to_string()),
+        session_id: None,
+        relations: None,
+    })
+    .unwrap();
+
+    db.upsert_intelligence_node(IntelligenceNodeInput {
+        id: Some("pattern-1".to_string()),
+        kind: "pattern".to_string(),
+        title: "Error handling".to_string(),
+        body: "Use anyhow".to_string(),
+        metadata: None,
+        project_hash: Some("hash-a".to_string()),
+        session_id: None,
+        relations: None,
+    })
+    .unwrap();
+
+    db.upsert_intelligence_node(IntelligenceNodeInput {
+        id: Some("fact-other".to_string()),
+        kind: "fact".to_string(),
+        title: "Other fact".to_string(),
+        body: "unrelated".to_string(),
+        metadata: None,
+        project_hash: Some("hash-other".to_string()),
+        session_id: None,
+        relations: None,
+    })
+    .unwrap();
+
+    let knowledge = db.list_project_knowledge("hash-a", None, 10).unwrap();
+    assert_eq!(knowledge.len(), 2);
+
+    let facts = db
+        .list_project_knowledge("hash-a", Some("fact"), 10)
+        .unwrap();
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0].kind, "fact");
+
+    let patterns = db
+        .list_project_knowledge("hash-a", Some("pattern"), 10)
+        .unwrap();
+    assert_eq!(patterns.len(), 1);
+    assert_eq!(patterns[0].kind, "pattern");
+}
+
+#[test]
+fn test_list_related_projects_finds_linked_projects() {
+    let db = test_db();
+
+    db.upsert_intelligence_node(IntelligenceNodeInput {
+        id: Some("proj-a".to_string()),
+        kind: "project".to_string(),
+        title: "Project A".to_string(),
+        body: "A".to_string(),
+        metadata: Some(serde_json::json!({"hash": "hash-a"})),
+        project_hash: Some("hash-a".to_string()),
+        session_id: None,
+        relations: None,
+    })
+    .unwrap();
+
+    db.upsert_intelligence_node(IntelligenceNodeInput {
+        id: Some("proj-b".to_string()),
+        kind: "project".to_string(),
+        title: "Project B".to_string(),
+        body: "B".to_string(),
+        metadata: Some(serde_json::json!({"hash": "hash-b"})),
+        project_hash: Some("hash-b".to_string()),
+        session_id: None,
+        relations: None,
+    })
+    .unwrap();
+
+    db.upsert_intelligence_node(IntelligenceNodeInput {
+        id: Some("proj-c".to_string()),
+        kind: "project".to_string(),
+        title: "Project C".to_string(),
+        body: "C".to_string(),
+        metadata: Some(serde_json::json!({"hash": "hash-c"})),
+        project_hash: Some("hash-c".to_string()),
+        session_id: None,
+        relations: None,
+    })
+    .unwrap();
+
+    db.link_projects("hash-a", "hash-b", "depends_on", Some(2.0))
+        .unwrap();
+    db.link_projects("hash-a", "hash-c", "relates_to", Some(1.0))
+        .unwrap();
+
+    let related = db.list_related_projects("hash-a", 10).unwrap();
+    assert_eq!(related.len(), 2);
+
+    let titles: Vec<_> = related.iter().map(|(n, _)| n.title.as_str()).collect();
+    assert!(titles.contains(&"Project B"));
+    assert!(titles.contains(&"Project C"));
+}
+
+#[test]
+fn test_list_related_projects_returns_empty_for_unlinked_project() {
+    let db = test_db();
+
+    db.upsert_intelligence_node(IntelligenceNodeInput {
+        id: Some("proj-lone".to_string()),
+        kind: "project".to_string(),
+        title: "Lone Project".to_string(),
+        body: "No relations".to_string(),
+        metadata: Some(serde_json::json!({"hash": "hash-lone"})),
+        project_hash: Some("hash-lone".to_string()),
+        session_id: None,
+        relations: None,
+    })
+    .unwrap();
+
+    let related = db.list_related_projects("hash-lone", 10).unwrap();
+    assert!(related.is_empty());
+}
