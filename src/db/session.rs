@@ -44,6 +44,15 @@ impl Database {
         Ok(())
     }
 
+    /// Get the working directory for an interactive session by id.
+    pub fn get_session_workdir(&self, session_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut stmt =
+            conn.prepare("SELECT working_dir FROM interactive_sessions WHERE id = ?1")?;
+        let result = stmt.query_row(params![session_id], |row| row.get(0)).ok();
+        Ok(result)
+    }
+
     /// Mark a session as exited with a status and optional exit code.
     pub fn finish_interactive_session(&self, id: &str, exit_code: i32) -> Result<()> {
         let status = if exit_code == 0 { "completed" } else { "error" };

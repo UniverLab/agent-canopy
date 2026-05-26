@@ -251,7 +251,17 @@ impl Database {
                 ON workflow_runs(spec_id, started_at ASC);
 
             CREATE INDEX IF NOT EXISTS idx_workflow_runs_node_iteration
-                ON workflow_runs(node_id, iteration DESC);",
+                ON workflow_runs(node_id, iteration DESC);
+
+            CREATE TABLE IF NOT EXISTS seed_sessions (
+                session_id TEXT PRIMARY KEY,
+                seed_id TEXT NOT NULL,
+                bound_at TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES interactive_sessions(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_seed_sessions_seed
+                ON seed_sessions(seed_id);",
         )?;
 
         Ok(())
@@ -263,6 +273,7 @@ pub mod group;
 pub mod intelligence;
 pub mod project;
 pub mod run;
+pub mod seeds;
 pub mod session;
 pub mod state;
 pub mod sync;
