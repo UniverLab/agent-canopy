@@ -297,3 +297,47 @@ pub(crate) fn map_action_result<T>(
         Err(e) => error_result(&e.to_string()),
     }
 }
+
+// ── Intelligence context helpers ─────────────────────────────────
+
+use crate::db::Database;
+use crate::shared::sync_identity::{self, header_str};
+
+/// Try to auto-detect the effective project_hash from session workdir,
+/// falling back to the caller-supplied value.
+pub(crate) fn resolve_effective_project_hash(
+    db: &Database,
+    provided: Option<&str>,
+    agent_id: &str,
+) -> Option<String> {
+    if let Some(ph) = provided {
+        return Some(ph.to_string());
+    }
+    db.get_session_workdir(agent_id)
+        .ok()
+        .flatten()
+        .map(|wd| crate::domain::project::workdir_hash(&wd))
+}
+
+/// Load the seed identity bound to the current session.
+/// Returns (seed_id, identity) after resolving from headers or DB.
+pub(crate) fn load_bound_seed_identity(
+    db: &crate::db::Database,
+    parts: &axum::http::request::Parts,
+) -> Result<(String, crate::domain::seeds::SeedIdentity), String> {
+    let Some(agent_id) = header_str(parts, sync_identity::CANOPY_AGENT_ID_HEADER) else {
+        return Err("Missing session identity".to_string());
+    };
+
+    let seed_id = if let Some(sid) = header_str(parts, sync_identity::CANOPY_SEED_ID_HEADER) {
+        let _ = db.bind_session_to_seed(agent_id, sid);
+        sid.to_string()
+    } else {
+        db.resolve_session_seed(agent_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "No seed identity bound to this session.".to_string())?
+    };
+
+    let identity = crate::domain::seeds::load_seed(&seed_id)?;
+    Ok((seed_id, identity))
+}

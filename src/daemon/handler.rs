@@ -24,13 +24,14 @@ use crate::daemon::handler_formatting::{
     make_log_path, recent_runs_output, resolve_log_path,
 };
 use crate::daemon::handler_helpers::{
-    apply_scalar_updates, apply_trigger_updates, handle_timed_out_run, map_action_result,
-    new_agent_base, parse_report_status, prepare_cron_task, prepare_watch_task,
-    update_agent_last_run, validate_report_summary, validate_run_transition,
-    watcher_restart_needed,
+    apply_scalar_updates, apply_trigger_updates, handle_timed_out_run, load_bound_seed_identity,
+    map_action_result, new_agent_base, parse_report_status, prepare_cron_task, prepare_watch_task,
+    resolve_effective_project_hash, update_agent_last_run, validate_report_summary,
+    validate_run_transition, watcher_restart_needed,
 };
 use crate::daemon::helpers::{data_dir, error_result, notify_run_result, success_result};
 use crate::daemon::params::*;
+use crate::db::intelligence::IntelligenceNodeRecord;
 use crate::db::Database;
 use crate::domain::models::{Agent, Trigger};
 use crate::domain::sync::{MessageKind, MissionImpact, WorkspaceStatus};
@@ -42,7 +43,7 @@ use crate::domain::workflow::{
 };
 use crate::executor::Executor;
 use crate::rag::rate_limiter::RateLimiter;
-use crate::shared::sync_identity::{CANOPY_AGENT_ID_HEADER, CANOPY_CLIENT_NAME_HEADER};
+use crate::shared::sync_identity::{header_str, CANOPY_AGENT_ID_HEADER, CANOPY_CLIENT_NAME_HEADER};
 use crate::sync_manager::SyncManager;
 use crate::watchers::WatcherEngine;
 use crate::workflow_engine::WorkflowEngine;
@@ -83,6 +84,41 @@ impl TaskTriggerHandler {
 
     fn resolve_sync_client_name<'a>(&self, parts: &'a Parts) -> Option<&'a str> {
         header_str(parts, CANOPY_CLIENT_NAME_HEADER)
+    }
+
+    /// Fetch knowledge for the context endpoint.
+    /// When project_hash is provided, returns project-scoped facts/patterns
+    /// alongside session nodes; otherwise returns all node kinds.
+    fn fetch_context_knowledge(
+        &self,
+        project_hash: Option<&str>,
+        scope: &str,
+    ) -> Result<
+        (
+            Vec<crate::db::intelligence::IntelligenceNodeRecord>,
+            Vec<crate::db::intelligence::IntelligenceNodeRecord>,
+        ),
+        String,
+    > {
+        let knowledge_limit = if scope == "full" { 20 } else { 5 };
+        if let Some(ph) = project_hash {
+            let pk_limit = if scope == "full" { 50 } else { 20 };
+            let pk = self
+                .db
+                .list_project_knowledge(ph, None, pk_limit)
+                .map_err(|e| e.to_string())?;
+            let generic = self
+                .db
+                .list_intelligence_nodes(Some("session"), knowledge_limit)
+                .map_err(|e| e.to_string())?;
+            Ok((generic, pk))
+        } else {
+            let generic = self
+                .db
+                .list_intelligence_nodes(None, knowledge_limit)
+                .map_err(|e| e.to_string())?;
+            Ok((generic, Vec::new()))
+        }
     }
 
     pub fn new(
@@ -795,27 +831,39 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "intelligence_get_context",
-        description = "Return project context at the requested scope: light or full."
+        description = "Return project context at the requested scope: light or full. \
+         When project_hash is provided (or auto-detected from session workdir), \
+         returns project-scoped facts and patterns instead of generic knowledge."
     )]
     async fn intelligence_get_context(
         &self,
         Parameters(params): Parameters<IntelligenceGetContextParams>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         let scope = params.scope.trim().to_lowercase();
-        let (session_limit, knowledge_limit, sync_limit, dependency_limit) = match scope.as_str() {
+        let (session_limit, _knowledge_limit, sync_limit, dependency_limit) = match scope.as_str() {
             "light" => (2, 5, 8, 0),
             "full" => (10, 20, 25, 30),
             _ => return Ok(error_result("Invalid scope. Must be: light or full.")),
         };
 
+        // Auto-detect project_hash from session workdir if not provided.
+        let effective_project_hash = self
+            .resolve_sync_agent_id(&parts)
+            .ok()
+            .and_then(|agent_id| {
+                resolve_effective_project_hash(&self.db, params.project_hash.as_deref(), agent_id)
+            });
+
         let sessions = self
             .db
             .list_intelligence_nodes(Some("session"), session_limit)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        let knowledge = self
-            .db
-            .list_intelligence_nodes(None, knowledge_limit)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let (knowledge, project_knowledge) = self
+            .fetch_context_knowledge(effective_project_hash.as_deref(), &scope)
+            .map_err(|e| McpError::internal_error(e, None))?;
+
         let sync_messages = self
             .db
             .list_recent_sync_messages(sync_limit)
@@ -827,13 +875,26 @@ impl TaskTriggerHandler {
         } else {
             Vec::new()
         };
+
+        let related_projects = if scope == "full" {
+            if let Some(ref ph) = effective_project_hash {
+                self.db
+                    .list_related_projects(ph, 10)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
         let summary_prefix = if scope == "light" {
             "Light context"
         } else {
             "Full context"
         };
 
-        let out = serde_json::json!({
+        let mut out = serde_json::json!({
             "scope": scope,
             "summary": format!(
                 "{}: {} session node(s), {} knowledge node(s), {} sync message(s).",
@@ -848,6 +909,14 @@ impl TaskTriggerHandler {
             "cross_project_dependencies": cross_project_dependencies,
         });
 
+        inject_project_context(
+            &mut out,
+            effective_project_hash.as_deref(),
+            &project_knowledge,
+            &related_projects,
+        );
+        inject_seed_identity(&mut out, &self.db, &parts);
+
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&out).unwrap_or_default(),
         )]))
@@ -855,19 +924,28 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "intelligence_upsert",
-        description = "Create or update an intelligence node and optional relations."
+        description = "Create or update an intelligence node and optional relations. \
+         project_hash is auto-detected from the session workdir if not provided."
     )]
     async fn intelligence_upsert(
         &self,
         Parameters(params): Parameters<IntelligenceUpsertParams>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
+        // Auto-detect project_hash from session workdir if not provided.
+        let project_hash = params.node_data.project_hash.or_else(|| {
+            let agent_id = self.resolve_sync_agent_id(&parts).ok()?;
+            let workdir = self.db.get_session_workdir(agent_id).ok()??;
+            Some(crate::domain::project::workdir_hash(&workdir))
+        });
+
         let node = crate::db::intelligence::IntelligenceNodeInput {
             id: params.node_data.id,
             kind: params.node_data.kind,
             title: params.node_data.title,
             body: params.node_data.body,
             metadata: params.node_data.metadata,
-            project_hash: params.node_data.project_hash,
+            project_hash,
             session_id: params.node_data.session_id,
             relations: params.node_data.relations.map(|relations| {
                 relations
@@ -946,6 +1024,129 @@ impl TaskTriggerHandler {
             "root": intelligence_node_json(&graph.root),
             "nodes": graph.nodes.iter().map(intelligence_node_json).collect::<Vec<_>>(),
             "edges": graph.edges.iter().map(intelligence_edge_json).collect::<Vec<_>>(),
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&out).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        name = "get_identity",
+        description = "Read the agent's own structured identity contract (identity.toml). \
+         Returns the full TOML content including name, family, directives, and traits."
+    )]
+    async fn get_identity(
+        &self,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let (_, identity) = load_bound_seed_identity(&self.db, &parts)
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        let toml_str = identity
+            .to_toml()
+            .map_err(|e| McpError::internal_error(e, None))?;
+        Ok(CallToolResult::success(vec![Content::text(toml_str)]))
+    }
+
+    #[tool(
+        name = "evolve_identity",
+        description = "Suggest refinements to the agent's directives or traits based on \
+         the current session's learnings. The Daemon validates updates against the schema \
+         and the 4KB size cap, then overwrites the global identity.toml."
+    )]
+    async fn evolve_identity(
+        &self,
+        Parameters(params): Parameters<EvolveIdentityParams>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let (seed_id, mut identity) = load_bound_seed_identity(&self.db, &parts)
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        identity
+            .evolve(params.new_directives, params.new_traits)
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        crate::domain::seeds::save_seed(&seed_id, &identity)
+            .map_err(|e| McpError::internal_error(e, None))?;
+        Ok(success_result("Identity evolved and saved successfully."))
+    }
+
+    #[tool(
+        name = "intelligence_list_projects",
+        description = "List all indexed projects for the project picker. \
+         Returns project nodes with their hash, name, and description. \
+         Supports optional query filtering by name/body."
+    )]
+    async fn intelligence_list_projects(
+        &self,
+        Parameters(params): Parameters<IntelligenceListProjectsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let limit = params.limit.unwrap_or(20).min(100);
+        let projects = self
+            .db
+            .list_intelligence_projects(params.query.as_deref(), limit)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let projects_json: Vec<serde_json::Value> = projects
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "id": p.id,
+                    "title": p.title,
+                    "body": p.body,
+                    "project_hash": p.project_hash,
+                    "metadata": p.metadata.as_ref().and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok()),
+                    "updated_at": p.updated_at,
+                })
+            })
+            .collect();
+
+        let out = serde_json::json!({
+            "count": projects_json.len(),
+            "projects": projects_json,
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&out).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        name = "intelligence_link_projects",
+        description = "Create a relationship between two indexed projects. \
+         The relation defaults to 'relates_to' if not specified. \
+         Both projects must exist as kind='project' nodes in the intelligence graph."
+    )]
+    async fn intelligence_link_projects(
+        &self,
+        Parameters(params): Parameters<IntelligenceLinkProjectsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if params.from_project_hash.trim().is_empty() {
+            return Ok(error_result("from_project_hash must not be empty."));
+        }
+        if params.to_project_hash.trim().is_empty() {
+            return Ok(error_result("to_project_hash must not be empty."));
+        }
+
+        let relation = params.relation.as_deref().unwrap_or("relates_to");
+        if relation.trim().is_empty() {
+            return Ok(error_result("Relation must not be empty."));
+        }
+
+        let edge = self
+            .db
+            .link_projects(
+                &params.from_project_hash,
+                &params.to_project_hash,
+                relation,
+                params.weight,
+            )
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+        let out = serde_json::json!({
+            "edge_id": edge.id,
+            "from_node_id": edge.from_node_id,
+            "to_node_id": edge.to_node_id,
+            "relation": edge.relation,
+            "weight": edge.weight,
         });
 
         Ok(CallToolResult::success(vec![Content::text(
@@ -2206,14 +2407,101 @@ fn append_temporal_agents_section(status: &mut String, agents: &[Agent]) {
     status.push_str(&temporal);
 }
 
-fn header_str<'a>(parts: &'a Parts, name: &str) -> Option<&'a str> {
-    parts
-        .headers
-        .get(name)?
-        .to_str()
-        .ok()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
+// ── Context injection helpers ────────────────────────────────────
+
+fn inject_project_context(
+    out: &mut serde_json::Value,
+    project_hash: Option<&str>,
+    project_knowledge: &[IntelligenceNodeRecord],
+    related_projects: &[(
+        IntelligenceNodeRecord,
+        crate::db::intelligence::IntelligenceEdgeRecord,
+    )],
+) {
+    if let Some(ph) = project_hash {
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert("project_hash".to_string(), serde_json::json!(ph));
+        }
+    }
+
+    if !project_knowledge.is_empty() {
+        let pk_json: Vec<serde_json::Value> = project_knowledge
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "id": n.id,
+                    "kind": n.kind,
+                    "title": n.title,
+                    "body": n.body,
+                    "project_hash": n.project_hash,
+                })
+            })
+            .collect();
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert(
+                "project_knowledge".to_string(),
+                serde_json::Value::Array(pk_json),
+            );
+            if let Some(summary) = obj.get("summary").and_then(|s| s.as_str()) {
+                let new_summary = format!(
+                    "{} (+ {} project fact(s)/pattern(s))",
+                    summary,
+                    project_knowledge.len()
+                );
+                obj.insert(
+                    "summary".to_string(),
+                    serde_json::Value::String(new_summary),
+                );
+            }
+        }
+    }
+
+    if !related_projects.is_empty() {
+        let rp_json: Vec<serde_json::Value> = related_projects
+            .iter()
+            .map(|(node, edge)| {
+                serde_json::json!({
+                    "project": {
+                        "id": node.id,
+                        "title": node.title,
+                        "project_hash": node.project_hash,
+                    },
+                    "relation": edge.relation,
+                    "weight": edge.weight,
+                })
+            })
+            .collect();
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert(
+                "related_projects".to_string(),
+                serde_json::Value::Array(rp_json),
+            );
+        }
+    }
+}
+
+fn inject_seed_identity(
+    out: &mut serde_json::Value,
+    db: &crate::db::Database,
+    parts: &axum::http::request::Parts,
+) {
+    if let Ok((_, identity)) = load_bound_seed_identity(db, parts) {
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert(
+                "seed_identity".to_string(),
+                serde_json::json!({
+                    "name": identity.name,
+                    "family": identity.family,
+                    "directives": identity.directives.general,
+                    "traits": serde_json::json!({
+                        "tone": identity.traits.tone,
+                        "focus": identity.traits.focus,
+                    }),
+                    "prompt_injection": identity.prompt_injection(),
+                }),
+            );
+        }
+    }
 }
 
 #[tool_handler]

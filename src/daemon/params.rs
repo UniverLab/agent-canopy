@@ -151,6 +151,8 @@ pub struct SyncGetContextParams {
 pub struct IntelligenceGetContextParams {
     /// Context depth: light or full.
     pub scope: String,
+    /// Optional project hash to scope facts/patterns to a specific project.
+    pub project_hash: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -391,4 +393,36 @@ pub struct WorkflowReportBlockerParams {
     pub node_id: String,
     /// Human-readable blocker description.
     pub description: String,
+}
+
+// ── Seed Identity tool parameter types ─────────────────────────────
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EvolveIdentityParams {
+    /// New directives list (replaces existing).
+    pub new_directives: Option<Vec<String>>,
+    /// New traits map (updates existing keys).
+    pub new_traits: Option<std::collections::HashMap<String, String>>,
+}
+
+// ── Intelligence V2 tool parameter types ─────────────────────────────
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct IntelligenceListProjectsParams {
+    /// Optional search query to filter projects by name/body.
+    pub query: Option<String>,
+    /// Maximum number of results to return (default: 20).
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct IntelligenceLinkProjectsParams {
+    /// Source project hash.
+    pub from_project_hash: String,
+    /// Target project hash.
+    pub to_project_hash: String,
+    /// Relation label (default: "relates_to").
+    pub relation: Option<String>,
+    /// Optional edge weight (default: 1.0).
+    pub weight: Option<f64>,
 }
