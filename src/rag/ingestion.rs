@@ -796,93 +796,143 @@ fn is_html_bytes(bytes: &[u8]) -> bool {
 /// Very simple HTML-to-text: strips tags, decodes common entities, collapses whitespace.
 fn strip_html_to_text(html: &str) -> String {
     let mut out = String::with_capacity(html.len() / 2);
-    let mut in_tag = false;
-    let mut in_script = false;
-    let mut tag_buf = String::new();
-    let mut pending_space = false;
-
+    let mut state = HtmlStripState::new();
     let mut chars = html.chars().peekable();
+
     while let Some(ch) = chars.next() {
-        if in_tag {
-            tag_buf.push(ch);
-            if ch == '>' {
-                let tag_lower = tag_buf.to_ascii_lowercase();
-                let tag_name = tag_lower
-                    .trim_start_matches('<')
-                    .trim_start_matches('/')
-                    .split(|c: char| c.is_whitespace() || c == '>')
-                    .next()
-                    .unwrap_or("");
-                in_script = matches!(tag_name, "script" | "style");
-                // Block-level tags produce a line break in the output.
-                if matches!(
-                    tag_name,
-                    "p" | "div"
-                        | "br"
-                        | "li"
-                        | "h1"
-                        | "h2"
-                        | "h3"
-                        | "h4"
-                        | "h5"
-                        | "h6"
-                        | "tr"
-                        | "td"
-                        | "th"
-                        | "blockquote"
-                        | "section"
-                        | "article"
-                ) {
-                    out.push('\n');
-                    pending_space = false;
-                }
-                tag_buf.clear();
-                in_tag = false;
-            }
-        } else if ch == '<' {
-            in_tag = true;
-            tag_buf.clear();
-            tag_buf.push(ch);
-        } else if in_script {
-            // skip script/style content
-        } else if ch == '&' {
-            // Decode HTML entity.
-            let mut entity = String::new();
-            for ec in chars.by_ref() {
-                if ec == ';' {
-                    break;
-                }
-                entity.push(ec);
-                if entity.len() > 8 {
-                    break;
-                }
-            }
-            let decoded = match entity.as_str() {
-                "amp" => "&",
-                "lt" => "<",
-                "gt" => ">",
-                "nbsp" | "#160" => " ",
-                "quot" => "\"",
-                "apos" | "#39" => "'",
-                _ => " ",
-            };
-            out.push_str(decoded);
-            pending_space = false;
-        } else if ch.is_whitespace() {
-            pending_space = true;
+        if ch == '&' && !state.in_tag && !state.in_script {
+            decode_html_entity(&mut chars, &mut out);
+            state.pending_space = false;
         } else {
-            if pending_space && !out.ends_with('\n') {
-                out.push(' ');
-            }
-            pending_space = false;
+            state.process_char(ch, &mut out);
+        }
+    }
+
+    collapse_blank_lines(&out)
+}
+
+struct HtmlStripState {
+    in_tag: bool,
+    in_script: bool,
+    tag_buf: String,
+    pending_space: bool,
+}
+
+impl HtmlStripState {
+    fn new() -> Self {
+        Self {
+            in_tag: false,
+            in_script: false,
+            tag_buf: String::new(),
+            pending_space: false,
+        }
+    }
+
+    fn process_char(&mut self, ch: char, out: &mut String) {
+        if self.in_tag {
+            self.handle_tag_char(ch, out);
+        } else if ch == '<' {
+            self.in_tag = true;
+            self.tag_buf.clear();
+            self.tag_buf.push(ch);
+        } else if self.in_script {
+            // skip script/style content
+        } else if ch.is_whitespace() {
+            self.pending_space = true;
+        } else {
+            self.flush_pending_space(out);
             out.push(ch);
         }
     }
 
-    // Collapse runs of blank lines down to a single blank line.
-    let mut result = String::with_capacity(out.len());
+    fn handle_tag_char(&mut self, ch: char, out: &mut String) {
+        self.tag_buf.push(ch);
+        if ch != '>' {
+            return;
+        }
+
+        let tag_name = extract_tag_name(&self.tag_buf);
+        self.in_script = matches!(tag_name.as_str(), "script" | "style");
+
+        if is_block_level_tag(&tag_name) {
+            out.push('\n');
+            self.pending_space = false;
+        }
+
+        self.tag_buf.clear();
+        self.in_tag = false;
+    }
+
+    fn flush_pending_space(&mut self, out: &mut String) {
+        if self.pending_space && !out.ends_with('\n') {
+            out.push(' ');
+        }
+        self.pending_space = false;
+    }
+}
+
+fn decode_html_entity(chars: &mut std::iter::Peekable<std::str::Chars>, out: &mut String) {
+    let mut entity = String::new();
+    for ec in chars.by_ref() {
+        if ec == ';' {
+            break;
+        }
+        entity.push(ec);
+        if entity.len() > 8 {
+            break;
+        }
+    }
+    out.push_str(decode_entity(&entity));
+}
+
+fn decode_entity(entity: &str) -> &'static str {
+    match entity {
+        "amp" => "&",
+        "lt" => "<",
+        "gt" => ">",
+        "nbsp" | "#160" => " ",
+        "quot" => "\"",
+        "apos" | "#39" => "'",
+        _ => " ",
+    }
+}
+
+fn extract_tag_name(tag_buf: &str) -> String {
+    let tag_lower = tag_buf.to_ascii_lowercase();
+    tag_lower
+        .trim_start_matches('<')
+        .trim_start_matches('/')
+        .split(|c: char| c.is_whitespace() || c == '>')
+        .next()
+        .unwrap_or("")
+        .to_owned()
+}
+
+fn is_block_level_tag(tag_name: &str) -> bool {
+    matches!(
+        tag_name,
+        "p" | "div"
+            | "br"
+            | "li"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "tr"
+            | "td"
+            | "th"
+            | "blockquote"
+            | "section"
+            | "article"
+    )
+}
+
+fn collapse_blank_lines(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
     let mut blank_run = 0usize;
-    for line in out.lines() {
+    for line in input.lines() {
         if line.trim().is_empty() {
             blank_run += 1;
             if blank_run <= 1 {
