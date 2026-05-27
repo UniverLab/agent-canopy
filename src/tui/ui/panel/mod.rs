@@ -468,15 +468,83 @@ pub(super) fn draw_log_panel(frame: &mut Frame, area: Rect, app: &mut App) {
     draw_log_text(frame, area, inner, app);
 }
 
-fn draw_project_overview(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(project) = app.selected_project() else {
-        frame.render_widget(
-            Paragraph::new("No registered projects").style(Style::default().fg(DIM)),
-            area,
-        );
-        return;
-    };
+fn format_intent_lines(
+    state: &crate::tui::app::types::SyncPanelState,
+    _area_width: u16,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if state.active_intents.is_empty() {
+        lines.push(Line::from("active missions: none"));
+        return lines;
+    }
 
+    lines.push(Line::from("active missions:"));
+    for intent in state.active_intents.iter().take(3) {
+        lines.push(Line::from(format!(
+            "  - {} [{}]: {}",
+            intent.agent_name,
+            intent.impact.as_str(),
+            intent.mission
+        )));
+        if !intent.description.trim().is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("    {}", truncate_str(intent.description.trim(), 92)),
+                Style::default().fg(DIM),
+            )));
+        }
+    }
+    lines
+}
+
+fn format_recent_activity_lines(
+    state: &crate::tui::app::types::SyncPanelState,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let recent_messages = state
+        .recent_messages
+        .iter()
+        .rev()
+        .take(3)
+        .collect::<Vec<_>>();
+
+    if recent_messages.is_empty() {
+        lines.push(Line::from("recent activity: none"));
+        return lines;
+    }
+
+    lines.push(Line::from("recent activity:"));
+    for message in recent_messages {
+        lines.push(Line::from(format!(
+            "  - {}: {}",
+            message.agent_name,
+            truncate_str(message.message.trim(), 92)
+        )));
+    }
+    lines
+}
+
+fn format_recent_session_lines(sessions: &[(String, String)]) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if sessions.is_empty() {
+        lines.push(Line::from("  none"));
+        return lines;
+    }
+
+    for (title, summary) in sessions {
+        lines.push(Line::from(format!("  - {}", truncate_str(title, 92))));
+        lines.push(Line::from(Span::styled(
+            format!("    {}", summary),
+            Style::default().fg(DIM),
+        )));
+    }
+    lines
+}
+
+fn build_project_overview_lines<'a>(
+    project: &'a crate::domain::project::Project,
+    project_activity: Option<&crate::tui::app::types::SyncPanelState>,
+    recent_sessions: &[(String, String)],
+) -> Vec<Line<'a>> {
     let tags = project.tags.as_deref().unwrap_or("none");
     let indexed = project
         .indexed_at
@@ -487,8 +555,7 @@ fn draw_project_overview(frame: &mut Frame, area: Rect, app: &App) {
         .description
         .as_deref()
         .unwrap_or("No description extracted yet.");
-    let project_activity = app.activity_panel_state_for_workdir(&project.path);
-    let recent_sessions = recent_project_session_summaries(app, project, 3);
+
     let mut lines = vec![
         Line::from(vec![
             Span::styled("Project ", Style::default().fg(DIM)),
@@ -515,44 +582,8 @@ fn draw_project_overview(frame: &mut Frame, area: Rect, app: &App) {
             state.participant_count,
             state.vibe.as_str()
         )));
-        if state.active_intents.is_empty() {
-            lines.push(Line::from("active missions: none"));
-        } else {
-            lines.push(Line::from("active missions:"));
-            for intent in state.active_intents.iter().take(3) {
-                lines.push(Line::from(format!(
-                    "  - {} [{}]: {}",
-                    intent.agent_name,
-                    intent.impact.as_str(),
-                    intent.mission
-                )));
-                if !intent.description.trim().is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        format!("    {}", truncate_str(intent.description.trim(), 92)),
-                        Style::default().fg(DIM),
-                    )));
-                }
-            }
-        }
-
-        let recent_messages = state
-            .recent_messages
-            .iter()
-            .rev()
-            .take(3)
-            .collect::<Vec<_>>();
-        if recent_messages.is_empty() {
-            lines.push(Line::from("recent activity: none"));
-        } else {
-            lines.push(Line::from("recent activity:"));
-            for message in recent_messages {
-                lines.push(Line::from(format!(
-                    "  - {}: {}",
-                    message.agent_name,
-                    truncate_str(message.message.trim(), 92)
-                )));
-            }
-        }
+        lines.extend(format_intent_lines(state, 0));
+        lines.extend(format_recent_activity_lines(state));
     } else {
         lines.push(Line::from("participants: 0  vibe: stable"));
         lines.push(Line::from("active missions: none"));
@@ -564,17 +595,23 @@ fn draw_project_overview(frame: &mut Frame, area: Rect, app: &App) {
         "recent sessions",
         Style::default().fg(DIM),
     )));
-    if recent_sessions.is_empty() {
-        lines.push(Line::from("  none"));
-    } else {
-        for (title, summary) in recent_sessions {
-            lines.push(Line::from(format!("  - {}", truncate_str(&title, 92))));
-            lines.push(Line::from(Span::styled(
-                format!("    {}", summary),
-                Style::default().fg(DIM),
-            )));
-        }
-    }
+    lines.extend(format_recent_session_lines(recent_sessions));
+
+    lines
+}
+
+fn draw_project_overview(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(project) = app.selected_project() else {
+        frame.render_widget(
+            Paragraph::new("No registered projects").style(Style::default().fg(DIM)),
+            area,
+        );
+        return;
+    };
+
+    let project_activity = app.activity_panel_state_for_workdir(&project.path);
+    let recent_sessions = recent_project_session_summaries(app, project, 3);
+    let lines = build_project_overview_lines(project, project_activity.as_ref(), &recent_sessions);
 
     render_wrapped_paragraph(frame, area, lines);
 }
@@ -714,6 +751,100 @@ fn workflow_node_summary(node: &crate::domain::workflow::WorkflowNode) -> String
     }
 }
 
+fn workflow_node_box_styles(selected: bool) -> (Style, Style) {
+    if selected {
+        (
+            Style::default().fg(ACCENT),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (Style::default().fg(DIM), Style::default().fg(Color::White))
+    }
+}
+
+fn workflow_node_content_line(
+    node: &crate::domain::workflow::WorkflowNode,
+    selected: bool,
+    inner: usize,
+) -> Option<Line<'static>> {
+    let summary = workflow_node_summary(node);
+    if summary.is_empty() {
+        return None;
+    }
+
+    let summary_trunc = truncate_str(&summary, inner.saturating_sub(3));
+    let summary_pad = inner.saturating_sub(3 + summary_trunc.len());
+    let summary_line = format!("  │   {}{}│", summary_trunc, " ".repeat(summary_pad));
+    Some(Line::from(Span::styled(
+        summary_line,
+        if selected {
+            Style::default().fg(Color::White)
+        } else {
+            Style::default().fg(DIM)
+        },
+    )))
+}
+
+fn workflow_node_lines(
+    node: &crate::domain::workflow::WorkflowNode,
+    selected: bool,
+    inner: usize,
+) -> Vec<Line<'static>> {
+    let (border_style, text_style) = workflow_node_box_styles(selected);
+    let kind_tag = format!("[{}]", node.kind.as_str());
+    let max_name = inner.saturating_sub(2 + kind_tag.len());
+    let name_display = truncate_str(&node.name, max_name);
+    let spaces = inner.saturating_sub(2 + name_display.len() + kind_tag.len());
+    let marker = if selected { "›" } else { " " };
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("  ┌{}┐", "─".repeat(inner)),
+            border_style,
+        )),
+        Line::from(Span::styled(
+            format!(
+                "  │{} {}{}{}│",
+                marker,
+                name_display,
+                " ".repeat(spaces),
+                kind_tag
+            ),
+            text_style,
+        )),
+    ];
+
+    if let Some(content) = workflow_node_content_line(node, selected, inner) {
+        lines.push(content);
+    }
+
+    lines.push(Line::from(Span::styled(
+        format!("  └{}┘", "─".repeat(inner)),
+        border_style,
+    )));
+
+    lines
+}
+
+fn workflow_edge_lines(
+    edges: &[(usize, crate::domain::workflow::WorkflowEdgeCondition)],
+    spec_nodes: &[crate::domain::workflow::WorkflowNode],
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for (i, (target_idx, condition)) in edges.iter().enumerate() {
+        let branch = if i == edges.len() - 1 { "└" } else { "├" };
+        let target_name = spec_nodes
+            .get(*target_idx)
+            .map(|n| n.name.clone())
+            .unwrap_or_else(|| "?".to_string());
+        lines.push(Line::from(Span::styled(
+            format!("   {}─ {} → {}", branch, condition.as_str(), target_name),
+            Style::default().fg(DIM),
+        )));
+    }
+    lines
+}
+
 fn workflow_graph_lines(
     spec: &crate::domain::workflow::WorkflowSpecDetails,
     selected_node_idx: usize,
@@ -721,7 +852,6 @@ fn workflow_graph_lines(
 ) -> Vec<Line<'static>> {
     use std::collections::HashMap;
 
-    // Build outgoing map: from_node_id → Vec<(to_node_idx, condition)>
     let mut outgoing: HashMap<&str, Vec<(usize, crate::domain::workflow::WorkflowEdgeCondition)>> =
         HashMap::new();
     for edge in &spec.edges {
@@ -740,67 +870,10 @@ fn workflow_graph_lines(
 
     for (idx, node) in spec.nodes.iter().enumerate() {
         let selected = idx == selected_node_idx;
-        let border_style = if selected {
-            Style::default().fg(ACCENT)
-        } else {
-            Style::default().fg(DIM)
-        };
-        let text_style = if selected {
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-
-        let kind_tag = format!("[{}]", node.kind.as_str());
-        // inner = marker(1) + space(1) + name + spaces + kind_tag
-        let max_name = inner.saturating_sub(2 + kind_tag.len());
-        let name_display = truncate_str(&node.name, max_name);
-        let spaces = inner.saturating_sub(2 + name_display.len() + kind_tag.len());
-        let marker = if selected { "›" } else { " " };
-
-        let top = format!("  ┌{}┐", "─".repeat(inner));
-        let content = format!(
-            "  │{} {}{}{}│",
-            marker,
-            name_display,
-            " ".repeat(spaces),
-            kind_tag
-        );
-        let bot = format!("  └{}┘", "─".repeat(inner));
-
-        lines.push(Line::from(Span::styled(top, border_style)));
-        lines.push(Line::from(Span::styled(content, text_style)));
-
-        let summary = workflow_node_summary(node);
-        if !summary.is_empty() {
-            let summary_trunc = truncate_str(&summary, inner.saturating_sub(3));
-            let summary_pad = inner.saturating_sub(3 + summary_trunc.len());
-            let summary_line = format!("  │   {}{}│", summary_trunc, " ".repeat(summary_pad));
-            lines.push(Line::from(Span::styled(
-                summary_line,
-                if selected {
-                    Style::default().fg(Color::White)
-                } else {
-                    Style::default().fg(DIM)
-                },
-            )));
-        }
-
-        lines.push(Line::from(Span::styled(bot, border_style)));
+        lines.extend(workflow_node_lines(node, selected, inner));
 
         if let Some(edges) = outgoing.get(node.id.as_str()) {
-            for (i, (target_idx, condition)) in edges.iter().enumerate() {
-                let branch = if i == edges.len() - 1 { "└" } else { "├" };
-                let target_name = spec
-                    .nodes
-                    .get(*target_idx)
-                    .map(|n| n.name.clone())
-                    .unwrap_or_else(|| "?".to_string());
-                lines.push(Line::from(Span::styled(
-                    format!("   {}─ {} → {}", branch, condition.as_str(), target_name),
-                    Style::default().fg(DIM),
-                )));
-            }
+            lines.extend(workflow_edge_lines(edges, &spec.nodes));
             lines.push(Line::from(""));
         } else if idx < spec.nodes.len() - 1 {
             lines.push(Line::from(""));
@@ -895,39 +968,42 @@ fn draw_rag_info_overview(frame: &mut Frame, area: Rect, app: &App) {
     render_wrapped_paragraph(frame, area, lines);
 }
 
-fn rag_file_status_lines(
-    files: &[crate::db::project::RagPerFileStatus],
-    area: Rect,
+fn rag_file_icon_and_color(event_type: &str) -> (&'static str, Color) {
+    match event_type {
+        "indexed" => ("✓", Color::Green),
+        "deleted" => ("○", DIM),
+        _ => ("✗", Color::Red),
+    }
+}
+
+fn rag_file_detail(file: &crate::db::project::RagPerFileStatus, detail_width: usize) -> String {
+    if file.last_event_type == "error" {
+        file.last_detail
+            .as_deref()
+            .map(|d| format!("error: {}", truncate_str_keep_tail(d, detail_width)))
+            .unwrap_or_else(|| "error".to_string())
+    } else if file.last_event_type == "deleted" {
+        "deleted".to_string()
+    } else {
+        format!("indexed ×{}", file.times_indexed)
+    }
+}
+
+fn rag_file_entry_lines(
+    file: &crate::db::project::RagPerFileStatus,
+    name_width: usize,
+    detail_width: usize,
 ) -> Vec<Line<'static>> {
-    // Reserve summary/header space and render a fixed non-interactive preview window.
-    let max_rows = (area.height as usize).saturating_sub(8).max(2);
-    let name_width = area.width.saturating_sub(4) as usize;
-    let detail_width = area.width.saturating_sub(6) as usize;
+    let (icon, icon_color) = rag_file_icon_and_color(&file.last_event_type);
+    let filename = std::path::Path::new(&file.file_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| file.file_path.clone());
+    let name_trunc = truncate_str(&filename, name_width);
+    let detail = rag_file_detail(file, detail_width);
 
-    let mut lines = Vec::new();
-    for file in files.iter().take(max_rows) {
-        let (icon, icon_color) = match file.last_event_type.as_str() {
-            "indexed" => ("✓", Color::Green),
-            "deleted" => ("○", DIM),
-            _ => ("✗", Color::Red),
-        };
-        let filename = std::path::Path::new(&file.file_path)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| file.file_path.clone());
-        let name_trunc = truncate_str(&filename, name_width);
-        let detail = if file.last_event_type == "error" {
-            file.last_detail
-                .as_deref()
-                .map(|d| format!("error: {}", truncate_str_keep_tail(d, detail_width)))
-                .unwrap_or_else(|| "error".to_string())
-        } else if file.last_event_type == "deleted" {
-            "deleted".to_string()
-        } else {
-            format!("indexed ×{}", file.times_indexed)
-        };
-
-        lines.push(Line::from(vec![
+    vec![
+        Line::from(vec![
             Span::styled(format!("{icon} "), Style::default().fg(icon_color)),
             Span::styled(
                 name_trunc,
@@ -935,11 +1011,25 @@ fn rag_file_status_lines(
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             ),
-        ]));
-        lines.push(Line::from(vec![
+        ]),
+        Line::from(vec![
             Span::styled("   ", Style::default().fg(DIM)),
             Span::styled(detail, Style::default().fg(DIM)),
-        ]));
+        ]),
+    ]
+}
+
+fn rag_file_status_lines(
+    files: &[crate::db::project::RagPerFileStatus],
+    area: Rect,
+) -> Vec<Line<'static>> {
+    let max_rows = (area.height as usize).saturating_sub(8).max(2);
+    let name_width = area.width.saturating_sub(4) as usize;
+    let detail_width = area.width.saturating_sub(6) as usize;
+
+    let mut lines = Vec::new();
+    for file in files.iter().take(max_rows) {
+        lines.extend(rag_file_entry_lines(file, name_width, detail_width));
     }
 
     if max_rows < files.len() {
