@@ -10,6 +10,7 @@ use crate::shared::sync_identity::{
     CANOPY_SESSION_NAME_ENV, CANOPY_SESSION_NAME_HEADER, CANOPY_WORKDIR_ENV, CANOPY_WORKDIR_HEADER,
 };
 use anyhow::Result;
+use std::collections::BTreeSet;
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -18,24 +19,26 @@ type JsonMap = serde_json::Map<String, serde_json::Value>;
 // ── Parsing & normalization ──────────────────────────────────────────────────
 
 fn substitute_placeholders(value: &mut serde_json::Value, home: &str, fs_dir: &str) {
-    if let serde_json::Value::String(content) = value {
-        if !content.contains("{filesystem_dir}") && !content.contains("{home}") {
-            return;
-        }
-        *content = substitute_string_placeholders(content, home, fs_dir);
+    let serde_json::Value::String(content) = value else {
+        substitute_in_container(value, home, fs_dir);
+        return;
+    };
+
+    if !content.contains("{filesystem_dir}") && !content.contains("{home}") {
         return;
     }
+    *content = substitute_string_placeholders(content, home, fs_dir);
+}
 
+fn substitute_in_container(value: &mut serde_json::Value, home: &str, fs_dir: &str) {
     match value {
         serde_json::Value::Array(arr) => {
-            for item in arr {
-                substitute_placeholders(item, home, fs_dir);
-            }
+            arr.iter_mut()
+                .for_each(|item| substitute_placeholders(item, home, fs_dir));
         }
         serde_json::Value::Object(map) => {
-            for nested_value in map.values_mut() {
-                substitute_placeholders(nested_value, home, fs_dir);
-            }
+            map.values_mut()
+                .for_each(|v| substitute_placeholders(v, home, fs_dir));
         }
         _ => {}
     }
@@ -238,85 +241,118 @@ pub fn adapt_config(
 
 // ── MCP config extraction & display ──────────────────────────────────────────
 
+fn empty_platform_config(
+    platform: &crate::setup_module::models::Platform,
+    config_path: String,
+) -> crate::config::PlatformMcpConfig {
+    crate::config::PlatformMcpConfig {
+        platform: platform.name.clone(),
+        config_path,
+        servers: Vec::new(),
+    }
+}
+
 pub(crate) fn extract_all_mcp_configs(
     home: &Path,
     selected: &[&Platform],
 ) -> Vec<crate::config::PlatformMcpConfig> {
-    let mut configs = Vec::new();
-    for p in selected {
-        let config_path = resolve_config_path(home, &p.config_path);
-        if !config_path.exists() {
-            configs.push(crate::config::PlatformMcpConfig {
-                platform: p.name.clone(),
-                config_path: config_path.to_string_lossy().to_string(),
-                servers: Vec::new(),
-            });
-            continue;
-        }
-        match crate::config::McpConfigRegistry::extract_from_platform(
-            &p.name,
-            &config_path,
-            &p.mcp_servers_key,
-        ) {
-            Ok(cfg) => configs.push(cfg),
-            Err(_) => configs.push(crate::config::PlatformMcpConfig {
-                platform: p.name.clone(),
-                config_path: config_path.to_string_lossy().to_string(),
-                servers: Vec::new(),
-            }),
-        }
-    }
-    configs
+    selected
+        .iter()
+        .map(|p| {
+            let config_path = resolve_config_path(home, &p.config_path);
+            let path_str = config_path.to_string_lossy().to_string();
+
+            if !config_path.exists() {
+                return empty_platform_config(p, path_str);
+            }
+
+            match crate::config::McpConfigRegistry::extract_from_platform(
+                &p.name,
+                &config_path,
+                &p.mcp_servers_key,
+            ) {
+                Ok(cfg) => cfg,
+                Err(_) => empty_platform_config(p, path_str),
+            }
+        })
+        .collect()
 }
 
-pub(crate) fn print_mcp_matrix(all_configs: &[crate::config::PlatformMcpConfig]) {
-    use std::collections::BTreeSet;
-
-    if all_configs.is_empty() {
-        return;
-    }
-
-    let mut all_servers: BTreeSet<String> = all_configs
+fn collect_all_server_names(all_configs: &[crate::config::PlatformMcpConfig]) -> BTreeSet<String> {
+    let mut names: BTreeSet<String> = all_configs
         .iter()
         .flat_map(|c| c.servers.iter().map(|s| s.name.clone()))
         .collect();
     for s in &["canopy", "fetch", "filesystem"] {
-        all_servers.insert(s.to_string());
+        names.insert(s.to_string());
     }
+    names
+}
 
+fn format_matrix_header(config_count: usize) -> String {
     let server_col = 20usize;
     let cell_col = 3usize;
-    let total_width = 2 + server_col + 1 + (all_configs.len() * (cell_col + 1));
-
-    println!(" MCP overview:");
-    println!(
+    format!(
         " {:<server_col$} {}",
         "Server",
-        (1..=all_configs.len())
+        (1..=config_count)
             .map(|i| format!("{:>cell_col$}", i, cell_col = cell_col))
             .collect::<Vec<_>>()
             .join(" "),
         server_col = server_col
-    );
-    println!(" {:─<width$}", "", width = total_width.max(34));
-    for server_name in &all_servers {
-        let mut row = format!(" {:<server_col$}", server_name, server_col = server_col);
-        for config in all_configs {
-            let has = config.servers.iter().any(|s| s.name == *server_name);
-            let icon = if has {
-                "\x1b[32m✓\x1b[0m"
-            } else {
-                "\x1b[31m✗\x1b[0m"
-            };
-            row.push_str(&format!(" {}{}", " ".repeat(cell_col - 1), icon));
-        }
-        println!("{}", row);
+    )
+}
+
+fn matrix_separator_width(config_count: usize) -> usize {
+    let server_col = 20usize;
+    let cell_col = 3usize;
+    2 + server_col + 1 + (config_count * (cell_col + 1))
+}
+
+fn format_matrix_row(
+    server_name: &str,
+    all_configs: &[crate::config::PlatformMcpConfig],
+) -> String {
+    let server_col = 20usize;
+    let cell_col = 3usize;
+    let mut row = format!(" {:<server_col$}", server_name, server_col = server_col);
+    for config in all_configs {
+        let has = config.servers.iter().any(|s| s.name == server_name);
+        let icon = if has {
+            "\x1b[32m✓\x1b[0m"
+        } else {
+            "\x1b[31m✗\x1b[0m"
+        };
+        row.push_str(&format!(" {}{}", " ".repeat(cell_col - 1), icon));
     }
-    println!();
+    row
+}
+
+fn print_platform_list(all_configs: &[crate::config::PlatformMcpConfig]) {
     println!(" Platforms:");
     for (idx, cfg) in all_configs.iter().enumerate() {
         println!(" {:>2}: {}", idx + 1, cfg.platform);
     }
+}
+
+pub(crate) fn print_mcp_matrix(all_configs: &[crate::config::PlatformMcpConfig]) {
+    if all_configs.is_empty() {
+        return;
+    }
+
+    let all_servers = collect_all_server_names(all_configs);
+    let total_width = matrix_separator_width(all_configs.len());
+
+    println!(" MCP overview:");
+    println!("{}", format_matrix_header(all_configs.len()));
+    println!(" {:─<width$}", "", width = total_width.max(34));
+
+    for server_name in &all_servers {
+        println!("{}", format_matrix_row(server_name, all_configs));
+    }
+
+    println!();
+    print_platform_list(all_configs);
 }
 
 pub(crate) fn clear_wizard_screen() -> Result<()> {
