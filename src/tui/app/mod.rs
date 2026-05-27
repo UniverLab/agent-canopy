@@ -254,64 +254,78 @@ impl App {
     fn select_next_project_panel(&mut self) {
         self.normalize_projects_panel_focus();
         match self.projects_panel_focus {
-            ProjectsPanelFocus::Projects => {
-                if self.projects.is_empty() {
-                    return;
-                }
-                let next = self.selected_project + 1;
-                if next < self.projects.len() {
-                    self.selected_project = next;
-                    self.refresh_workflows_selection();
-                } else {
-                    // Cross to Workflows panel when past the last project.
-                    let first_id = self.visible_workflows().first().map(|w| w.id.clone());
-                    if let Some(id) = first_id {
-                        self.projects_panel_focus = ProjectsPanelFocus::Workflows;
-                        self.selected_workflow_id = Some(id);
-                        self.refresh_workflows_selection();
-                    } else if self.rag_info.has_rag_activity() {
-                        self.projects_panel_focus = ProjectsPanelFocus::RagInfo;
-                    } else {
-                        self.selected_project = 0; // wrap within Projects if no workflows or ragInfo
-                    }
-                }
-            }
-            ProjectsPanelFocus::Workflows => {
-                let visible_ids: Vec<String> = self
-                    .visible_workflows()
-                    .into_iter()
-                    .map(|w| w.id.clone())
-                    .collect();
-                if visible_ids.is_empty() {
-                    return;
-                }
-                let current = self
-                    .selected_workflow_id
-                    .as_ref()
-                    .and_then(|id| visible_ids.iter().position(|vid| vid == id))
-                    .unwrap_or(0);
-                let next = current + 1;
-                if next < visible_ids.len() {
-                    self.selected_workflow_id = Some(visible_ids[next].clone());
-                    self.refresh_workflows_selection();
-                } else if self.rag_info.has_rag_activity() {
-                    self.projects_panel_focus = ProjectsPanelFocus::RagInfo;
-                } else {
-                    // Wrap back to Projects first item.
-                    self.projects_panel_focus = ProjectsPanelFocus::Projects;
-                    self.selected_project = 0;
-                }
-            }
-            ProjectsPanelFocus::RagInfo => {
-                // Allow cycling Down from RagInfo to Projects (first)
-                if !self.projects.is_empty() {
-                    self.projects_panel_focus = ProjectsPanelFocus::Projects;
-                    self.selected_project = 0;
-                    self.refresh_workflows_selection();
-                }
-            }
+            ProjectsPanelFocus::Projects => self.navigate_projects_next(),
+            ProjectsPanelFocus::Workflows => self.navigate_workflows_next(),
+            ProjectsPanelFocus::RagInfo => self.navigate_from_rag_info_next(),
         }
         self.reset_log_scroll();
+    }
+
+    fn navigate_projects_next(&mut self) {
+        if self.projects.is_empty() {
+            return;
+        }
+        let next = self.selected_project + 1;
+        if next < self.projects.len() {
+            self.selected_project = next;
+            self.refresh_workflows_selection();
+            return;
+        }
+        if self.try_cross_to_workflows_first() {
+            return;
+        }
+        if self.rag_info.has_rag_activity() {
+            self.projects_panel_focus = ProjectsPanelFocus::RagInfo;
+            return;
+        }
+        self.selected_project = 0;
+    }
+
+    fn try_cross_to_workflows_first(&mut self) -> bool {
+        let Some(id) = self.visible_workflows().first().map(|w| w.id.clone()) else {
+            return false;
+        };
+        self.projects_panel_focus = ProjectsPanelFocus::Workflows;
+        self.selected_workflow_id = Some(id);
+        self.refresh_workflows_selection();
+        true
+    }
+
+    fn navigate_workflows_next(&mut self) {
+        let visible_ids: Vec<String> = self
+            .visible_workflows()
+            .into_iter()
+            .map(|w| w.id.clone())
+            .collect();
+        if visible_ids.is_empty() {
+            return;
+        }
+        let current = self
+            .selected_workflow_id
+            .as_ref()
+            .and_then(|id| visible_ids.iter().position(|vid| vid == id))
+            .unwrap_or(0);
+        let next = current + 1;
+        if next < visible_ids.len() {
+            self.selected_workflow_id = Some(visible_ids[next].clone());
+            self.refresh_workflows_selection();
+            return;
+        }
+        if self.rag_info.has_rag_activity() {
+            self.projects_panel_focus = ProjectsPanelFocus::RagInfo;
+            return;
+        }
+        self.projects_panel_focus = ProjectsPanelFocus::Projects;
+        self.selected_project = 0;
+    }
+
+    fn navigate_from_rag_info_next(&mut self) {
+        if self.projects.is_empty() {
+            return;
+        }
+        self.projects_panel_focus = ProjectsPanelFocus::Projects;
+        self.selected_project = 0;
+        self.refresh_workflows_selection();
     }
 
     fn select_next_agent_panel(&mut self) {
@@ -359,69 +373,83 @@ impl App {
     fn select_prev_project_panel(&mut self) {
         self.normalize_projects_panel_focus();
         match self.projects_panel_focus {
-            ProjectsPanelFocus::Projects => {
-                if self.projects.is_empty() {
-                    return;
-                }
-                if self.selected_project > 0 {
-                    self.selected_project -= 1;
-                    self.refresh_workflows_selection();
-                } else if self.rag_info.has_rag_activity() {
-                    // At top of Projects and ragInfo exists: cycle to ragInfo panel
-                    self.projects_panel_focus = ProjectsPanelFocus::RagInfo;
-                } else {
-                    // Cross to Workflows panel (last item) when before the first project.
-                    let last_id = self.visible_workflows().last().map(|w| w.id.clone());
-                    if let Some(id) = last_id {
-                        self.projects_panel_focus = ProjectsPanelFocus::Workflows;
-                        self.selected_workflow_id = Some(id);
-                        self.refresh_workflows_selection();
-                    } else {
-                        self.selected_project = self.projects.len() - 1; // wrap within Projects
-                    }
-                }
-            }
-            ProjectsPanelFocus::Workflows => {
-                let visible_ids: Vec<String> = self
-                    .visible_workflows()
-                    .into_iter()
-                    .map(|w| w.id.clone())
-                    .collect();
-                if visible_ids.is_empty() {
-                    return;
-                }
-                let current = self
-                    .selected_workflow_id
-                    .as_ref()
-                    .and_then(|id| visible_ids.iter().position(|vid| vid == id))
-                    .unwrap_or(0);
-                if current > 0 {
-                    self.selected_workflow_id = Some(visible_ids[current - 1].clone());
-                    self.refresh_workflows_selection();
-                } else if !self.projects.is_empty() {
-                    // Cross to Projects panel (last item) when before the first workflow.
-                    self.projects_panel_focus = ProjectsPanelFocus::Projects;
-                    self.selected_project = self.projects.len() - 1;
-                } else {
-                    // Wrap within Workflows if no projects.
-                    self.selected_workflow_id = Some(visible_ids[visible_ids.len() - 1].clone());
-                    self.refresh_workflows_selection();
-                }
-            }
-            ProjectsPanelFocus::RagInfo => {
-                // Coming back from RagInfo: go to last Workflow or last Project.
-                let last_id = self.visible_workflows().last().map(|w| w.id.clone());
-                if let Some(id) = last_id {
-                    self.projects_panel_focus = ProjectsPanelFocus::Workflows;
-                    self.selected_workflow_id = Some(id);
-                    self.refresh_workflows_selection();
-                } else if !self.projects.is_empty() {
-                    self.projects_panel_focus = ProjectsPanelFocus::Projects;
-                    self.selected_project = self.projects.len() - 1;
-                }
-            }
+            ProjectsPanelFocus::Projects => self.navigate_projects_prev(),
+            ProjectsPanelFocus::Workflows => self.navigate_workflows_prev(),
+            ProjectsPanelFocus::RagInfo => self.navigate_from_rag_info_prev(),
         }
         self.reset_log_scroll();
+    }
+
+    fn navigate_projects_prev(&mut self) {
+        if self.projects.is_empty() {
+            return;
+        }
+        if self.selected_project > 0 {
+            self.selected_project -= 1;
+            self.refresh_workflows_selection();
+            return;
+        }
+        if self.rag_info.has_rag_activity() {
+            self.projects_panel_focus = ProjectsPanelFocus::RagInfo;
+            return;
+        }
+        if self.try_cross_to_workflows_last() {
+            return;
+        }
+        self.selected_project = self.projects.len() - 1;
+    }
+
+    fn try_cross_to_workflows_last(&mut self) -> bool {
+        let Some(id) = self.visible_workflows().last().map(|w| w.id.clone()) else {
+            return false;
+        };
+        self.projects_panel_focus = ProjectsPanelFocus::Workflows;
+        self.selected_workflow_id = Some(id);
+        self.refresh_workflows_selection();
+        true
+    }
+
+    fn navigate_workflows_prev(&mut self) {
+        let visible_ids: Vec<String> = self
+            .visible_workflows()
+            .into_iter()
+            .map(|w| w.id.clone())
+            .collect();
+        if visible_ids.is_empty() {
+            return;
+        }
+        let current = self
+            .selected_workflow_id
+            .as_ref()
+            .and_then(|id| visible_ids.iter().position(|vid| vid == id))
+            .unwrap_or(0);
+        if current > 0 {
+            self.selected_workflow_id = Some(visible_ids[current - 1].clone());
+            self.refresh_workflows_selection();
+            return;
+        }
+        if !self.projects.is_empty() {
+            self.projects_panel_focus = ProjectsPanelFocus::Projects;
+            self.selected_project = self.projects.len() - 1;
+            return;
+        }
+        self.selected_workflow_id = Some(visible_ids[visible_ids.len() - 1].clone());
+        self.refresh_workflows_selection();
+    }
+
+    fn navigate_from_rag_info_prev(&mut self) {
+        let last_id = self.visible_workflows().last().map(|w| w.id.clone());
+        if let Some(id) = last_id {
+            self.projects_panel_focus = ProjectsPanelFocus::Workflows;
+            self.selected_workflow_id = Some(id);
+            self.refresh_workflows_selection();
+            return;
+        }
+        if self.projects.is_empty() {
+            return;
+        }
+        self.projects_panel_focus = ProjectsPanelFocus::Projects;
+        self.selected_project = self.projects.len() - 1;
     }
 
     fn select_prev_agent_panel(&mut self) {
@@ -798,35 +826,11 @@ impl App {
     }
 
     pub fn open_workflow_editor_dialog(&mut self) -> Result<()> {
-        let Some(_) = self.selected_workflow() else {
-            return Ok(());
-        };
-        let Some(_) = self.selected_workflow_spec() else {
-            return Ok(());
-        };
         let Some(node) = self.selected_workflow_node() else {
             return Ok(());
         };
 
-        let (title, help, buffer, mode) = if node.kind == WorkflowNodeKind::Agent {
-            (
-                format!(" Workflow Prompt · {} ", node.name),
-                "Ctrl+S save  ·  Enter newline  ·  Esc cancel".to_string(),
-                node.config
-                    .get("prompt_template")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                crate::tui::app::types::WorkflowEditorMode::AgentPrompt,
-            )
-        } else {
-            (
-                format!(" Workflow Config · {} ", node.name),
-                "Ctrl+S save JSON  ·  Enter newline  ·  Esc cancel".to_string(),
-                serde_json::to_string_pretty(&node.config).unwrap_or_default(),
-                crate::tui::app::types::WorkflowEditorMode::NodeConfig,
-            )
-        };
+        let (title, help, buffer, mode) = self.build_editor_dialog_content(node);
 
         self.workflow_editor_dialog = Some(crate::tui::app::types::WorkflowEditorDialog::new(
             node.id.clone(),
@@ -838,6 +842,61 @@ impl App {
         ));
         self.focus = Focus::WorkflowEditorDialog;
         Ok(())
+    }
+
+    fn build_editor_dialog_content(
+        &self,
+        node: &crate::domain::workflow::WorkflowNode,
+    ) -> (
+        String,
+        String,
+        String,
+        crate::tui::app::types::WorkflowEditorMode,
+    ) {
+        if node.kind == WorkflowNodeKind::Agent {
+            self.build_agent_prompt_dialog(node)
+        } else {
+            self.build_node_config_dialog(node)
+        }
+    }
+
+    fn build_agent_prompt_dialog(
+        &self,
+        node: &crate::domain::workflow::WorkflowNode,
+    ) -> (
+        String,
+        String,
+        String,
+        crate::tui::app::types::WorkflowEditorMode,
+    ) {
+        let prompt = node
+            .config
+            .get("prompt_template")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        (
+            format!(" Workflow Prompt · {} ", node.name),
+            "Ctrl+S save  ·  Enter newline  ·  Esc cancel".to_string(),
+            prompt.to_string(),
+            crate::tui::app::types::WorkflowEditorMode::AgentPrompt,
+        )
+    }
+
+    fn build_node_config_dialog(
+        &self,
+        node: &crate::domain::workflow::WorkflowNode,
+    ) -> (
+        String,
+        String,
+        String,
+        crate::tui::app::types::WorkflowEditorMode,
+    ) {
+        (
+            format!(" Workflow Config · {} ", node.name),
+            "Ctrl+S save JSON  ·  Enter newline  ·  Esc cancel".to_string(),
+            serde_json::to_string_pretty(&node.config).unwrap_or_default(),
+            crate::tui::app::types::WorkflowEditorMode::NodeConfig,
+        )
     }
 
     pub fn cancel_workflow_editor_dialog(&mut self) {
@@ -854,33 +913,7 @@ impl App {
             return Ok(());
         };
 
-        let updated_config = match dialog.mode {
-            crate::tui::app::types::WorkflowEditorMode::AgentPrompt => {
-                let mut config = node.config;
-                if let Some(object) = config.as_object_mut() {
-                    object.insert(
-                        "prompt_template".to_string(),
-                        serde_json::Value::String(dialog.buffer),
-                    );
-                } else {
-                    config = serde_json::json!({ "prompt_template": dialog.buffer });
-                }
-                config
-            }
-            crate::tui::app::types::WorkflowEditorMode::NodeConfig => {
-                match serde_json::from_str::<serde_json::Value>(&dialog.buffer) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let mut d = dialog;
-                        d.parse_error = Some(format!("JSON error: {e}"));
-                        self.workflow_editor_dialog = Some(d);
-                        self.focus = Focus::WorkflowEditorDialog;
-                        return Ok(());
-                    }
-                }
-            }
-        };
-
+        let updated_config = self.compute_updated_node_config(&dialog, &node)?;
         self.db.update_workflow_node_details(
             &dialog.node_id,
             None,
@@ -891,6 +924,43 @@ impl App {
         self.focus = Focus::Preview;
         self.refresh_workflows()?;
         Ok(())
+    }
+
+    fn compute_updated_node_config(
+        &mut self,
+        dialog: &crate::tui::app::types::WorkflowEditorDialog,
+        node: &crate::domain::workflow::WorkflowNode,
+    ) -> Result<serde_json::Value> {
+        match dialog.mode {
+            crate::tui::app::types::WorkflowEditorMode::AgentPrompt => {
+                Ok(Self::update_prompt_config(&node.config, &dialog.buffer))
+            }
+            crate::tui::app::types::WorkflowEditorMode::NodeConfig => {
+                match serde_json::from_str::<serde_json::Value>(&dialog.buffer) {
+                    Ok(v) => Ok(v),
+                    Err(e) => {
+                        let mut d = dialog.clone();
+                        d.parse_error = Some(format!("JSON error: {e}"));
+                        self.workflow_editor_dialog = Some(d);
+                        self.focus = Focus::WorkflowEditorDialog;
+                        Err(anyhow::anyhow!("Invalid JSON"))
+                    }
+                }
+            }
+        }
+    }
+
+    fn update_prompt_config(config: &serde_json::Value, prompt: &str) -> serde_json::Value {
+        if let Some(object) = config.as_object() {
+            let mut updated = object.clone();
+            updated.insert(
+                "prompt_template".to_string(),
+                serde_json::Value::String(prompt.to_string()),
+            );
+            serde_json::Value::Object(updated)
+        } else {
+            serde_json::json!({ "prompt_template": prompt })
+        }
     }
 
     pub fn selected_playground_chunk(&self) -> Option<&crate::rag::vector_store::SearchResult> {
@@ -942,48 +1012,64 @@ impl App {
     /// Return the working directory of the currently selected agent,
     /// or the parent of the data directory as a fallback.
     pub fn current_workdir(&self) -> PathBuf {
-        if self.sidebar_mode == SidebarMode::Projects {
-            if let Some(project) = self.selected_project() {
-                return PathBuf::from(&project.path);
-            }
+        if let Some(workdir) = self.workdir_for_projects_mode() {
+            return workdir;
         }
+        if let Some(workdir) = self.workdir_for_selected_agent() {
+            return workdir;
+        }
+        self.data_dir
+            .parent()
+            .unwrap_or(&self.data_dir)
+            .to_path_buf()
+    }
+
+    fn workdir_for_projects_mode(&self) -> Option<PathBuf> {
+        if self.sidebar_mode != SidebarMode::Projects {
+            return None;
+        }
+        self.selected_project().map(|p| PathBuf::from(&p.path))
+    }
+
+    fn workdir_for_selected_agent(&self) -> Option<PathBuf> {
         self.selected_live_agent()
             .map(|agent| PathBuf::from(&agent.working_dir))
-            .unwrap_or_else(|| {
-                self.data_dir
-                    .parent()
-                    .unwrap_or(&self.data_dir)
-                    .to_path_buf()
-            })
     }
 
     /// Return a unique key for the current prompt-builder session.
     /// Uses the agent/session ID when available, falls back to workdir path.
     pub fn current_prompt_session_key(&self) -> String {
-        if let Some(entry) = self.selected_agent() {
-            match entry {
-                types::AgentEntry::Interactive(idx) => {
-                    if let Some(agent) = self.interactive_agents.get(*idx) {
-                        return format!("interactive:{}", agent.id);
-                    }
-                }
-                types::AgentEntry::Terminal(idx) => {
-                    if let Some(agent) = self.terminal_agents.get(*idx) {
-                        return format!("terminal:{}", agent.id);
-                    }
-                }
-                types::AgentEntry::Agent(a) => {
-                    return format!("agent:{}", a.id);
-                }
-                types::AgentEntry::Group(_) => {}
-            }
+        if let Some(key) = self.prompt_session_key_for_selected_agent() {
+            return key;
         }
-        if self.sidebar_mode == SidebarMode::Projects {
-            if let Some(project) = self.selected_project() {
-                return format!("project:{}", project.path);
-            }
+        if let Some(key) = self.prompt_session_key_for_selected_project() {
+            return key;
         }
         format!("workdir:{}", self.current_workdir().display())
+    }
+
+    fn prompt_session_key_for_selected_agent(&self) -> Option<String> {
+        let entry = self.selected_agent()?;
+        match entry {
+            types::AgentEntry::Interactive(idx) => {
+                let agent = self.interactive_agents.get(*idx)?;
+                Some(format!("interactive:{}", agent.id))
+            }
+            types::AgentEntry::Terminal(idx) => {
+                let agent = self.terminal_agents.get(*idx)?;
+                Some(format!("terminal:{}", agent.id))
+            }
+            types::AgentEntry::Agent(a) => Some(format!("agent:{}", a.id)),
+            types::AgentEntry::Group(_) => None,
+        }
+    }
+
+    fn prompt_session_key_for_selected_project(&self) -> Option<String> {
+        if self.sidebar_mode != SidebarMode::Projects {
+            return None;
+        }
+        let project = self.selected_project()?;
+        Some(format!("project:{}", project.path))
     }
 
     pub fn focused_agent_name(&self) -> String {
@@ -1130,23 +1216,24 @@ impl App {
     fn check_recent_run_events(&mut self) {
         use crate::tui::whimsg::WhimContext;
         let now = Utc::now();
-        for run in &self.recent_runs {
-            let Some(finished) = run.finished_at else {
-                continue;
-            };
-            if (now - finished).num_seconds() >= 60 {
-                continue;
-            }
-            match run.status {
-                crate::domain::models::RunStatus::Error
-                | crate::domain::models::RunStatus::Timeout => {
-                    self.whimsg.notify_event(WhimContext::AgentFailed);
+        let statuses: Vec<_> = self
+            .recent_runs
+            .iter()
+            .filter_map(|run| {
+                let finished = run.finished_at?;
+                if (now - finished).num_seconds() >= 60 {
+                    return None;
                 }
-                crate::domain::models::RunStatus::Success => {
-                    self.whimsg.notify_event(WhimContext::AgentDone);
+                match run.status {
+                    crate::domain::models::RunStatus::Error
+                    | crate::domain::models::RunStatus::Timeout => Some(WhimContext::AgentFailed),
+                    crate::domain::models::RunStatus::Success => Some(WhimContext::AgentDone),
+                    _ => None,
                 }
-                _ => {}
-            }
+            })
+            .collect();
+        for ctx in statuses {
+            self.whimsg.notify_event(ctx);
         }
     }
 
@@ -1323,14 +1410,16 @@ impl App {
     }
 
     fn focus_interactive_agent(&mut self, dest_ia_idx: usize) {
-        if let Some(entry_pos) = self
-            .agents
-            .iter()
-            .position(|entry| matches!(entry, AgentEntry::Interactive(idx) if *idx == dest_ia_idx))
-        {
+        if let Some(entry_pos) = self.find_agent_entry_position(dest_ia_idx) {
             self.selected = entry_pos;
         }
         self.focus = Focus::Agent;
+    }
+
+    fn find_agent_entry_position(&self, dest_ia_idx: usize) -> Option<usize> {
+        self.agents
+            .iter()
+            .position(|entry| matches!(entry, AgentEntry::Interactive(idx) if *idx == dest_ia_idx))
     }
 
     fn open_context_prompt_dialog(&mut self, context_payload: String, rag_query: Option<String>) {
@@ -1510,22 +1599,26 @@ impl App {
         source: ContextTransferSource,
     ) -> Option<ContextTransferModal> {
         match source {
-            ContextTransferSource::Interactive(idx) => {
-                let agent = self.context_transfer_agent(source)?;
-                let capture_kind = interactive_capture_kind(agent);
-                let max_units = Self::interactive_capture_units(agent, capture_kind);
-                let initial_units = if capture_kind == ContextCaptureKind::LinePages {
-                    1
-                } else {
-                    initial_capture_units(max_units, &self.context_transfer_config)
-                };
-                Some(ContextTransferModal::new(idx, capture_kind, initial_units))
-            }
-            ContextTransferSource::Terminal(idx) => {
-                self.context_transfer_agent(source)?;
-                Some(ContextTransferModal::new_terminal(idx, 1))
-            }
+            ContextTransferSource::Interactive(idx) => self.build_interactive_transfer_modal(idx),
+            ContextTransferSource::Terminal(idx) => self.build_terminal_transfer_modal(idx),
         }
+    }
+
+    fn build_interactive_transfer_modal(&self, idx: usize) -> Option<ContextTransferModal> {
+        let agent = self.context_transfer_agent(ContextTransferSource::Interactive(idx))?;
+        let capture_kind = interactive_capture_kind(agent);
+        let max_units = Self::interactive_capture_units(agent, capture_kind);
+        let initial_units = if capture_kind == ContextCaptureKind::LinePages {
+            1
+        } else {
+            initial_capture_units(max_units, &self.context_transfer_config)
+        };
+        Some(ContextTransferModal::new(idx, capture_kind, initial_units))
+    }
+
+    fn build_terminal_transfer_modal(&self, idx: usize) -> Option<ContextTransferModal> {
+        self.context_transfer_agent(ContextTransferSource::Terminal(idx))?;
+        Some(ContextTransferModal::new_terminal(idx, 1))
     }
 
     fn modal_source(&self, modal: &ContextTransferModal) -> Option<ContextTransferSource> {
