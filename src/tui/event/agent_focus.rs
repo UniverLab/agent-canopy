@@ -226,78 +226,10 @@ fn handle_agent_cycle_shortcut(app: &mut App, code: KeyCode, modifiers: KeyModif
     };
 
     if app.rag_info.has_rag_activity() {
-        if app.playground_active {
-            app.deactivate_playground();
-            if forward {
-                app.next_interactive();
-            } else {
-                app.prev_interactive();
-            }
-            app.sidebar_mode = crate::tui::app::SidebarMode::Agents;
+        if try_cycle_from_playground(app, forward) {
             return true;
         }
-
-        let focusable: Vec<usize> = app
-            .agents
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| {
-                matches!(
-                    entry,
-                    AgentEntry::Interactive(_) | AgentEntry::Terminal(_) | AgentEntry::Group(_)
-                )
-            })
-            .map(|(idx, _)| idx)
-            .collect();
-
-        if focusable.is_empty() {
-            app.activate_playground();
-            app.focus = Focus::Agent;
-            app.sidebar_mode = crate::tui::app::SidebarMode::Agents;
-            return true;
-        }
-
-        let current_pos = focusable
-            .iter()
-            .position(|&idx| idx == app.selected)
-            .unwrap_or(0);
-        let at_edge = if forward {
-            current_pos + 1 >= focusable.len()
-        } else {
-            current_pos == 0
-        };
-
-        // Handle focus cycling to/from ragInfo (agents_rag_focused)
-        if at_edge {
-            if !app.agents_rag_focused {
-                app.agents_rag_focused = true;
-                app.focus = Focus::Agent;
-                app.sidebar_mode = crate::tui::app::SidebarMode::Agents;
-                return true;
-            } else {
-                // If rag is already focused and we cycle forward, wrap back to agents
-                app.agents_rag_focused = false;
-                if forward && !focusable.is_empty() {
-                    app.selected = 0;
-                } else if !forward && !focusable.is_empty() {
-                    app.selected = focusable.len() - 1;
-                }
-                app.focus = Focus::Agent;
-                app.sidebar_mode = crate::tui::app::SidebarMode::Agents;
-                return true;
-            }
-        }
-
-        // If moving away from ragInfo (already focused), clear the flag
-        if app.agents_rag_focused {
-            app.agents_rag_focused = false;
-            if forward && !focusable.is_empty() {
-                app.selected = 0;
-            } else if !focusable.is_empty() {
-                app.selected = focusable.len() - 1;
-            }
-            app.focus = Focus::Agent;
-            app.sidebar_mode = crate::tui::app::SidebarMode::Agents;
+        if try_cycle_through_focusable(app, forward) {
             return true;
         }
     }
@@ -310,6 +242,110 @@ fn handle_agent_cycle_shortcut(app: &mut App, code: KeyCode, modifiers: KeyModif
 
     app.sidebar_mode = crate::tui::app::SidebarMode::Agents;
     true
+}
+
+fn try_cycle_from_playground(app: &mut App, forward: bool) -> bool {
+    if !app.playground_active {
+        return false;
+    }
+
+    app.deactivate_playground();
+    if forward {
+        app.next_interactive();
+    } else {
+        app.prev_interactive();
+    }
+    app.sidebar_mode = crate::tui::app::SidebarMode::Agents;
+    true
+}
+
+fn try_cycle_through_focusable(app: &mut App, forward: bool) -> bool {
+    let focusable: Vec<usize> = app
+        .agents
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            matches!(
+                entry,
+                AgentEntry::Interactive(_) | AgentEntry::Terminal(_) | AgentEntry::Group(_)
+            )
+        })
+        .map(|(idx, _)| idx)
+        .collect();
+
+    if focusable.is_empty() {
+        app.activate_playground();
+        app.focus = Focus::Agent;
+        app.sidebar_mode = crate::tui::app::SidebarMode::Agents;
+        return true;
+    }
+
+    if try_cycle_to_rag_info(app, forward, &focusable) {
+        return true;
+    }
+
+    if try_cycle_from_rag_info(app, forward, &focusable) {
+        return true;
+    }
+
+    advance_focusable_selection(app, forward, &focusable);
+    true
+}
+
+fn try_cycle_to_rag_info(app: &mut App, forward: bool, focusable: &[usize]) -> bool {
+    let current_pos = focusable
+        .iter()
+        .position(|&idx| idx == app.selected)
+        .unwrap_or(0);
+    let at_edge = if forward {
+        current_pos + 1 >= focusable.len()
+    } else {
+        current_pos == 0
+    };
+
+    if !at_edge {
+        return false;
+    }
+
+    if !app.agents_rag_focused {
+        app.agents_rag_focused = true;
+        app.focus = Focus::Agent;
+        app.sidebar_mode = crate::tui::app::SidebarMode::Agents;
+        return true;
+    }
+
+    app.agents_rag_focused = false;
+    app.selected = if forward { 0 } else { focusable.len() - 1 };
+    app.focus = Focus::Agent;
+    app.sidebar_mode = crate::tui::app::SidebarMode::Agents;
+    true
+}
+
+fn try_cycle_from_rag_info(app: &mut App, forward: bool, focusable: &[usize]) -> bool {
+    if !app.agents_rag_focused {
+        return false;
+    }
+
+    app.agents_rag_focused = false;
+    app.selected = if forward { 0 } else { focusable.len() - 1 };
+    app.focus = Focus::Agent;
+    app.sidebar_mode = crate::tui::app::SidebarMode::Agents;
+    true
+}
+
+fn advance_focusable_selection(app: &mut App, forward: bool, focusable: &[usize]) {
+    let current_pos = focusable
+        .iter()
+        .position(|&idx| idx == app.selected)
+        .unwrap_or(0);
+    let next_pos = if forward {
+        (current_pos + 1) % focusable.len()
+    } else {
+        current_pos.checked_sub(1).unwrap_or(focusable.len() - 1)
+    };
+    app.selected = focusable[next_pos];
+    app.focus = Focus::Agent;
+    app.sidebar_mode = crate::tui::app::SidebarMode::Agents;
 }
 
 fn resolve_focused_agent(app: &mut App) -> Option<FocusedAgent> {
