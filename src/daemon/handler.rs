@@ -55,6 +55,287 @@ fn missing_sync_identity_error() -> McpError {
     McpError::invalid_params(MISSING_SYNC_IDENTITY_MESSAGE.to_string(), None)
 }
 
+fn validate_non_empty(value: &str, field: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        Err(format!("{field} must not be empty."))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_absolute_dir(path: &str) -> Result<(), String> {
+    let p = std::path::Path::new(path);
+    if !p.is_absolute() {
+        return Err("Workflow workdir must be an absolute path.".into());
+    }
+    if !p.is_dir() {
+        return Err("Workflow workdir must point to an existing directory.".into());
+    }
+    Ok(())
+}
+
+fn validate_workflow_exists(db: &Database, workflow_id: &str) -> Result<(), String> {
+    db.get_workflow(workflow_id)
+        .map_err(|e| e.to_string())?
+        .is_some()
+        .then_some(())
+        .ok_or_else(|| format!("Workflow '{workflow_id}' not found."))
+}
+
+fn validate_spec_exists(db: &Database, spec_id: &str) -> Result<WorkflowSpec, String> {
+    db.get_workflow_spec(spec_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Spec '{spec_id}' not found."))
+}
+
+fn validate_node_exists(db: &Database, node_id: &str) -> Result<WorkflowNode, String> {
+    db.get_workflow_node(node_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Workflow node '{node_id}' not found."))
+}
+
+fn validate_edge_exists(db: &Database, edge_id: &str) -> Result<WorkflowEdge, String> {
+    db.get_workflow_edge(edge_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Workflow edge '{edge_id}' not found."))
+}
+
+fn validate_position_conflict(
+    db: &Database,
+    workflow_id: &str,
+    exclude_spec_id: &str,
+    position: i64,
+) -> Result<(), String> {
+    let conflict = db
+        .list_workflow_specs(workflow_id)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .any(|s| s.id != exclude_spec_id && s.position == position);
+    if conflict {
+        Err(format!(
+            "Workflow '{workflow_id}' already has a spec at position {position}."
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_node_position_conflict(
+    db: &Database,
+    spec_id: &str,
+    exclude_node_id: &str,
+    position: i64,
+) -> Result<(), String> {
+    let conflict = db
+        .list_workflow_nodes(spec_id)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .any(|n| n.id != exclude_node_id && n.position == position);
+    if conflict {
+        Err(format!(
+            "Spec '{spec_id}' already has a node at position {position}."
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_edge_condition(condition: &str) -> Result<WorkflowEdgeCondition, String> {
+    WorkflowEdgeCondition::from_str(condition.trim())
+        .ok_or_else(|| "Workflow edge condition must be one of: pass, fail, always.".to_string())
+}
+
+fn validate_node_kind(kind: &str) -> Result<WorkflowNodeKind, String> {
+    WorkflowNodeKind::from_str(kind.trim())
+        .ok_or_else(|| "Workflow node kind must be one of: agent, check, gate.".to_string())
+}
+
+fn validate_at_least_one_bool(updates: &[bool], field_name: &str) -> Result<(), String> {
+    if updates.iter().all(|&b| !b) {
+        Err(format!(
+            "{field_name} requires at least one field to update."
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn build_workflow_update_response(workflow_id: &str) -> CallToolResult {
+    success_result(&format!("Workflow '{workflow_id}' updated."))
+}
+
+fn build_spec_update_response(spec_id: &str) -> CallToolResult {
+    success_result(&format!("Workflow spec '{spec_id}' updated."))
+}
+
+fn build_node_update_response(node_id: &str) -> CallToolResult {
+    success_result(&format!("Workflow node '{node_id}' updated."))
+}
+
+fn build_id_result(id: &str, key: &str) -> CallToolResult {
+    let mut map = serde_json::Map::new();
+    map.insert(key.to_string(), serde_json::json!(id));
+    CallToolResult::success(vec![Content::text(
+        serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap_or_default(),
+    )])
+}
+
+struct SpecRunInfo {
+    name: String,
+    current_node: Option<String>,
+    blocker: Option<String>,
+}
+
+fn build_spec_run_info(db: &Database, spec: &WorkflowSpec) -> Result<SpecRunInfo, McpError> {
+    let runs = db
+        .list_workflow_runs_for_spec(&spec.id)
+        .map_err(internal_error)?;
+    let current_node = runs
+        .iter()
+        .rev()
+        .find(|run| run.status == WorkflowRunStatus::Running)
+        .or_else(|| runs.last())
+        .map(|run| run.node_id.clone());
+    let blocker = runs.last().and_then(workflow_run_blocker);
+    Ok(SpecRunInfo {
+        name: spec.name.clone(),
+        current_node,
+        blocker,
+    })
+}
+
+fn build_workflow_summary_json(
+    db: &Database,
+    workflow: &Workflow,
+) -> Result<serde_json::Value, McpError> {
+    let specs = db
+        .list_workflow_specs(&workflow.id)
+        .map_err(internal_error)?;
+    let current_spec = specs
+        .into_iter()
+        .find(|spec| {
+            matches!(
+                spec.status,
+                WorkflowSpecStatus::Running | WorkflowSpecStatus::Pending
+            )
+        })
+        .map(|spec| build_spec_run_info(db, &spec))
+        .transpose()?;
+
+    Ok(serde_json::json!({
+        "id": workflow.id,
+        "name": workflow.name,
+        "status": workflow.status.as_str(),
+        "current_spec": current_spec.as_ref().map(|v| &v.name),
+        "current_node": current_spec.as_ref().and_then(|v| v.current_node.as_ref()),
+        "blocked": current_spec.as_ref().is_some_and(|v| v.blocker.is_some()),
+        "blocker": current_spec.and_then(|v| v.blocker),
+        "created_at": workflow.created_at.to_rfc3339(),
+        "workdir": workflow.workdir,
+    }))
+}
+
+fn build_workflow_list_json(
+    db: &Database,
+    workflows: &[Workflow],
+) -> Result<Vec<serde_json::Value>, McpError> {
+    workflows
+        .iter()
+        .map(|workflow| build_workflow_summary_json(db, workflow))
+        .collect()
+}
+
+fn build_get_tools_response(scope: &str) -> serde_json::Value {
+    match scope {
+        "session_start" => serde_json::json!({
+            "scope": "session_start",
+            "risk": "low",
+            "protocol": [
+                "1. Call intelligence_get_context(scope=\"light\") to load workspace brief.",
+                "2. Check active_missions in sync context — align your work with open missions.",
+                "3. If starting a new thread of work, call sync_declare_intent to register your mission.",
+                "4. Respond to the user with context in hand."
+            ],
+            "tools": [
+                "intelligence_get_context — pull session history, facts, patterns",
+                "sync_get_context — check active missions and workspace vibe",
+                "sync_declare_intent — announce your mission (impact: low/medium/high/breaking)"
+            ]
+        }),
+        "file_write" => serde_json::json!({
+            "scope": "file_write",
+            "risk": "high",
+            "protocol": [
+                "1. Call sync_get_context(workdir=...) — check for conflicting missions on this path.",
+                "2. If no conflict, call sync_declare_intent(impact=\"high\", mission=\"...\").",
+                "3. Modify the file.",
+                "4. Call sync_report_status(status=\"stable\", message=\"Changes complete: ...\")."
+            ],
+            "tools": [
+                "sync_get_context — check active missions, detect conflicts",
+                "sync_declare_intent — announce what you're changing and why",
+                "sync_report_status — report stable/unstable/testing after the change"
+            ]
+        }),
+        "test_run" => serde_json::json!({
+            "scope": "test_run",
+            "risk": "medium",
+            "protocol": [
+                "1. Call sync_broadcast(kind=\"info\", message=\"Running tests: <suite/command>\").",
+                "2. Run the tests.",
+                "3. Call sync_broadcast(kind=\"info\", message=\"Tests complete: PASSED/FAILED — <summary>\").",
+                "4. If failed, call sync_report_status(status=\"unstable\", message=\"Test failure: ...\")."
+            ],
+            "tools": [
+                "sync_broadcast — announce test start and result to peer agents",
+                "sync_report_status — mark workspace unstable if tests fail"
+            ]
+        }),
+        "close_session" => serde_json::json!({
+            "scope": "close_session",
+            "risk": "low",
+            "protocol": [
+                "1. Call intelligence_upsert(kind=\"session\", title=\"<mission>\", body=\"<what was done>\", \
+                   metadata={workdir, summary, ...}) — store session summary in project context.",
+                "2. Call sync_report_status(status=\"stable\", message=\"Mission complete: <summary>\") \
+                   — the daemon closes your mission automatically on exit.",
+                "3. Do NOT manually call any close/shutdown tool — daemon handles it."
+            ],
+            "tools": [
+                "intelligence_upsert — persist session summary as a 'session' node in project context",
+                "sync_report_status — leave a clean 'stable' marker for the next agent"
+            ]
+        }),
+        "multi_agent" => serde_json::json!({
+            "scope": "multi_agent",
+            "risk": "varies",
+            "protocol": [
+                "Follow the action-risk table: low=execute, medium=broadcast, high=declare+execute+report, breaking=same as high with impact=breaking.",
+                "Always non-blocking — act on last-known state, never wait for responses.",
+                "Communicate intent not implementation — missions explain what and why, not how."
+            ],
+            "tools": [
+                "sync_get_context — check active missions and workspace vibe (call first)",
+                "sync_declare_intent — announce mission (impact: low/medium/high/breaking)",
+                "sync_broadcast — send info/query/answer messages to peers",
+                "sync_report_status — report stable/unstable/testing after actions",
+                "intelligence_get_context(scope=\"full\") — deep project-context pull for architecture work",
+                "intelligence_upsert — persist facts, patterns, session summaries",
+                "intelligence_search — find prior art or decisions in project context"
+            ]
+        }),
+        _ => unreachable!(),
+    }
+}
+
+fn rag_result_json(r: &crate::rag::vector_store::SearchResult) -> serde_json::Value {
+    serde_json::json!({
+        "source": r.file_path,
+        "content": r.content,
+        "distance": r.distance,
+    })
+}
+
 #[derive(Clone)]
 pub struct TaskTriggerHandler {
     pub db: Arc<Database>,
@@ -1009,15 +1290,15 @@ impl TaskTriggerHandler {
         Parameters(params): Parameters<IntelligenceGraphWalkParams>,
     ) -> Result<CallToolResult, McpError> {
         let depth = params.depth.unwrap_or(2).min(8);
-        let Some(graph) = self
-            .db
-            .walk_intelligence_graph(&params.node_id, depth)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?
-        else {
-            return Ok(error_result(&format!(
-                "Intelligence node '{}' not found.",
-                params.node_id
-            )));
+        let graph = match self.db.walk_intelligence_graph(&params.node_id, depth) {
+            Ok(Some(g)) => g,
+            Ok(None) => {
+                return Ok(error_result(&format!(
+                    "Intelligence node '{}' not found.",
+                    params.node_id
+                )))
+            }
+            Err(e) => return Err(McpError::internal_error(e.to_string(), None)),
         };
 
         let out = serde_json::json!({
@@ -1119,16 +1400,16 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<IntelligenceLinkProjectsParams>,
     ) -> Result<CallToolResult, McpError> {
-        if params.from_project_hash.trim().is_empty() {
-            return Ok(error_result("from_project_hash must not be empty."));
+        if let Err(e) = validate_non_empty(&params.from_project_hash, "from_project_hash") {
+            return Ok(error_result(&e));
         }
-        if params.to_project_hash.trim().is_empty() {
-            return Ok(error_result("to_project_hash must not be empty."));
+        if let Err(e) = validate_non_empty(&params.to_project_hash, "to_project_hash") {
+            return Ok(error_result(&e));
         }
 
         let relation = params.relation.as_deref().unwrap_or("relates_to");
-        if relation.trim().is_empty() {
-            return Ok(error_result("Relation must not be empty."));
+        if let Err(e) = validate_non_empty(relation, "Relation") {
+            return Ok(error_result(&e));
         }
 
         let edge = self
@@ -1163,21 +1444,15 @@ impl TaskTriggerHandler {
         Parameters(params): Parameters<WorkflowCreateParams>,
     ) -> Result<CallToolResult, McpError> {
         let name = params.name.trim();
-        if name.is_empty() {
-            return Ok(error_result("Workflow name must not be empty."));
+        if let Err(e) = validate_non_empty(name, "Workflow name") {
+            return Ok(error_result(&e));
         }
         let workdir = params.workdir.trim();
-        if workdir.is_empty() {
-            return Ok(error_result("Workflow workdir must not be empty."));
+        if let Err(e) = validate_non_empty(workdir, "Workflow workdir") {
+            return Ok(error_result(&e));
         }
-        let workdir_path = std::path::Path::new(workdir);
-        if !workdir_path.is_absolute() {
-            return Ok(error_result("Workflow workdir must be an absolute path."));
-        }
-        if !workdir_path.is_dir() {
-            return Ok(error_result(
-                "Workflow workdir must point to an existing directory.",
-            ));
+        if let Err(e) = validate_absolute_dir(workdir) {
+            return Ok(error_result(&e));
         }
 
         let workflow = Workflow {
@@ -1192,16 +1467,11 @@ impl TaskTriggerHandler {
         };
 
         self.db.insert_workflow(&workflow).map_err(internal_error)?;
-        if let Err(error) = self.db.register_project_path(workdir_path) {
+        if let Err(error) = self.db.register_project_path(std::path::Path::new(workdir)) {
             tracing::debug!("Could not register workflow project at {workdir}: {error}");
         }
 
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&serde_json::json!({
-                "workflow_id": workflow.id,
-            }))
-            .unwrap_or_default(),
-        )]))
+        Ok(build_id_result(&workflow.id, "workflow_id"))
     }
 
     #[tool(
@@ -1213,19 +1483,11 @@ impl TaskTriggerHandler {
         Parameters(params): Parameters<WorkflowUpdateParams>,
     ) -> Result<CallToolResult, McpError> {
         let workflow_id = params.workflow_id.trim();
-        if workflow_id.is_empty() {
-            return Ok(error_result("Workflow ID must not be empty."));
+        if let Err(e) = validate_non_empty(workflow_id, "Workflow ID") {
+            return Ok(error_result(&e));
         }
-        if self
-            .db
-            .get_workflow(workflow_id)
-            .map_err(internal_error)?
-            .is_none()
-        {
-            return Ok(error_result(&format!(
-                "Workflow '{}' not found.",
-                params.workflow_id
-            )));
+        if let Err(e) = validate_workflow_exists(&self.db, workflow_id) {
+            return Ok(error_result(&e));
         }
 
         let name = match params.name.as_deref().map(str::trim) {
@@ -1242,34 +1504,26 @@ impl TaskTriggerHandler {
         let workdir = match params.workdir.as_deref().map(str::trim) {
             Some("") => return Ok(error_result("Workflow workdir must not be empty.")),
             Some(value) => {
-                let path = std::path::Path::new(value);
-                if !path.is_absolute() {
-                    return Ok(error_result("Workflow workdir must be an absolute path."));
-                }
-                if !path.is_dir() {
-                    return Ok(error_result(
-                        "Workflow workdir must point to an existing directory.",
-                    ));
+                if let Err(e) = validate_absolute_dir(value) {
+                    return Ok(error_result(&e));
                 }
                 Some(value)
             }
             None => None,
         };
 
-        if name.is_none() && description.is_none() && workdir.is_none() {
-            return Ok(error_result(
-                "workflow_update requires at least one field to update.",
-            ));
+        if let Err(e) = validate_at_least_one_bool(
+            &[name.is_some(), description.is_some(), workdir.is_some()],
+            "workflow_update",
+        ) {
+            return Ok(error_result(&e));
         }
 
         self.db
             .update_workflow_details(workflow_id, name, description, workdir)
             .map_err(internal_error)?;
 
-        Ok(success_result(&format!(
-            "Workflow '{}' updated.",
-            params.workflow_id
-        )))
+        Ok(build_workflow_update_response(workflow_id))
     }
 
     #[tool(
@@ -1281,20 +1535,12 @@ impl TaskTriggerHandler {
         Parameters(params): Parameters<WorkflowAddSpecParams>,
     ) -> Result<CallToolResult, McpError> {
         let name = params.name.trim();
-        if name.is_empty() {
-            return Ok(error_result("Workflow spec name must not be empty."));
+        if let Err(e) = validate_non_empty(name, "Workflow spec name") {
+            return Ok(error_result(&e));
         }
         let workflow_id = params.workflow_id.trim();
-        if self
-            .db
-            .get_workflow(workflow_id)
-            .map_err(internal_error)?
-            .is_none()
-        {
-            return Ok(error_result(&format!(
-                "Workflow '{}' not found.",
-                params.workflow_id
-            )));
+        if let Err(e) = validate_workflow_exists(&self.db, workflow_id) {
+            return Ok(error_result(&e));
         }
 
         let existing_specs = self
@@ -1306,8 +1552,8 @@ impl TaskTriggerHandler {
             .any(|spec| spec.position == params.position)
         {
             return Ok(error_result(&format!(
-                "Workflow '{}' already has a spec at position {}.",
-                params.workflow_id, params.position
+                "Workflow '{workflow_id}' already has a spec at position {}.",
+                params.position
             )));
         }
         let Some(description) = params.description.as_deref().map(str::trim) else {
@@ -1334,12 +1580,7 @@ impl TaskTriggerHandler {
             .insert_workflow_spec(&spec)
             .map_err(internal_error)?;
 
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&serde_json::json!({
-                "spec_id": spec.id,
-            }))
-            .unwrap_or_default(),
-        )]))
+        Ok(build_id_result(&spec.id, "spec_id"))
     }
 
     #[tool(
@@ -1351,11 +1592,9 @@ impl TaskTriggerHandler {
         Parameters(params): Parameters<WorkflowUpdateSpecParams>,
     ) -> Result<CallToolResult, McpError> {
         let spec_id = params.spec_id.trim();
-        let Some(spec) = self.db.get_workflow_spec(spec_id).map_err(internal_error)? else {
-            return Ok(error_result(&format!(
-                "Spec '{}' not found.",
-                params.spec_id
-            )));
+        let spec = match validate_spec_exists(&self.db, spec_id) {
+            Ok(spec) => spec,
+            Err(e) => return Ok(error_result(&e)),
         };
 
         let name = match params.name.as_deref().map(str::trim) {
@@ -1379,28 +1618,23 @@ impl TaskTriggerHandler {
         };
 
         if let Some(position) = params.position {
-            let conflict = self
-                .db
-                .list_workflow_specs(&spec.workflow_id)
-                .map_err(internal_error)?
-                .into_iter()
-                .any(|candidate| candidate.id != spec.id && candidate.position == position);
-            if conflict {
-                return Ok(error_result(&format!(
-                    "Workflow '{}' already has a spec at position {}.",
-                    spec.workflow_id, position
-                )));
+            if let Err(e) =
+                validate_position_conflict(&self.db, &spec.workflow_id, spec_id, position)
+            {
+                return Ok(error_result(&e));
             }
         }
 
-        if name.is_none()
-            && description.is_none()
-            && params.position.is_none()
-            && params.parallelizable.is_none()
-        {
-            return Ok(error_result(
-                "workflow_update_spec requires at least one field to update.",
-            ));
+        if let Err(e) = validate_at_least_one_bool(
+            &[
+                name.is_some(),
+                description.is_some(),
+                params.position.is_some(),
+                params.parallelizable.is_some(),
+            ],
+            "workflow_update_spec",
+        ) {
+            return Ok(error_result(&e));
         }
 
         self.db
@@ -1413,10 +1647,7 @@ impl TaskTriggerHandler {
             )
             .map_err(internal_error)?;
 
-        Ok(success_result(&format!(
-            "Workflow spec '{}' updated.",
-            spec_id
-        )))
+        Ok(build_spec_update_response(spec_id))
     }
 
     #[tool(
@@ -1428,26 +1659,17 @@ impl TaskTriggerHandler {
         Parameters(params): Parameters<WorkflowAddNodeParams>,
     ) -> Result<CallToolResult, McpError> {
         let name = params.name.trim();
-        if name.is_empty() {
-            return Ok(error_result("Workflow node name must not be empty."));
+        if let Err(e) = validate_non_empty(name, "Workflow node name") {
+            return Ok(error_result(&e));
         }
         let spec_id = params.spec_id.trim();
-        let spec_exists = self
-            .db
-            .get_workflow_spec(spec_id)
-            .map_err(internal_error)?
-            .is_some();
-        if !spec_exists {
-            return Ok(error_result(&format!(
-                "Spec '{}' not found.",
-                params.spec_id
-            )));
+        if let Err(e) = validate_spec_exists(&self.db, spec_id) {
+            return Ok(error_result(&e));
         }
 
-        let Some(kind) = WorkflowNodeKind::from_str(params.kind.trim()) else {
-            return Ok(error_result(
-                "Workflow node kind must be one of: agent, check, gate.",
-            ));
+        let kind = match validate_node_kind(params.kind.trim()) {
+            Ok(kind) => kind,
+            Err(e) => return Ok(error_result(&e)),
         };
 
         let next_position = self
@@ -1471,12 +1693,7 @@ impl TaskTriggerHandler {
             .insert_workflow_node(&node)
             .map_err(internal_error)?;
 
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&serde_json::json!({
-                "node_id": node.id,
-            }))
-            .unwrap_or_default(),
-        )]))
+        Ok(build_id_result(&node.id, "node_id"))
     }
 
     #[tool(
@@ -1488,11 +1705,9 @@ impl TaskTriggerHandler {
         Parameters(params): Parameters<WorkflowUpdateNodeParams>,
     ) -> Result<CallToolResult, McpError> {
         let node_id = params.node_id.trim();
-        let Some(node) = self.db.get_workflow_node(node_id).map_err(internal_error)? else {
-            return Ok(error_result(&format!(
-                "Workflow node '{}' not found.",
-                params.node_id
-            )));
+        let node = match validate_node_exists(&self.db, node_id) {
+            Ok(node) => node,
+            Err(e) => return Ok(error_result(&e)),
         };
 
         let name = match params.name.as_deref().map(str::trim) {
@@ -1502,37 +1717,31 @@ impl TaskTriggerHandler {
         };
         let kind = match params.kind.as_deref().map(str::trim) {
             Some("") => return Ok(error_result("Workflow node kind must not be empty.")),
-            Some(value) => match WorkflowNodeKind::from_str(value) {
-                Some(kind) => Some(kind),
-                None => {
-                    return Ok(error_result(
-                        "Workflow node kind must be one of: agent, check, gate.",
-                    ))
-                }
+            Some(value) => match validate_node_kind(value) {
+                Ok(kind) => Some(kind),
+                Err(e) => return Ok(error_result(&e)),
             },
             None => None,
         };
 
         if let Some(position) = params.position {
-            let conflict = self
-                .db
-                .list_workflow_nodes(&node.spec_id)
-                .map_err(internal_error)?
-                .into_iter()
-                .any(|candidate| candidate.id != node.id && candidate.position == position);
-            if conflict {
-                return Ok(error_result(&format!(
-                    "Spec '{}' already has a node at position {}.",
-                    node.spec_id, position
-                )));
+            if let Err(e) =
+                validate_node_position_conflict(&self.db, &node.spec_id, node_id, position)
+            {
+                return Ok(error_result(&e));
             }
         }
 
-        if name.is_none() && kind.is_none() && params.config.is_none() && params.position.is_none()
-        {
-            return Ok(error_result(
-                "workflow_update_node requires at least one field to update.",
-            ));
+        if let Err(e) = validate_at_least_one_bool(
+            &[
+                name.is_some(),
+                kind.is_some(),
+                params.config.is_some(),
+                params.position.is_some(),
+            ],
+            "workflow_update_node",
+        ) {
+            return Ok(error_result(&e));
         }
 
         self.db
@@ -1545,10 +1754,7 @@ impl TaskTriggerHandler {
             )
             .map_err(internal_error)?;
 
-        Ok(success_result(&format!(
-            "Workflow node '{}' updated.",
-            node_id
-        )))
+        Ok(build_node_update_response(node_id))
     }
 
     #[tool(
@@ -1559,10 +1765,9 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<WorkflowAddEdgeParams>,
     ) -> Result<CallToolResult, McpError> {
-        let Some(condition) = WorkflowEdgeCondition::from_str(params.condition.trim()) else {
-            return Ok(error_result(
-                "Workflow edge condition must be one of: pass, fail, always.",
-            ));
+        let condition = match validate_edge_condition(params.condition.trim()) {
+            Ok(c) => c,
+            Err(e) => return Ok(error_result(&e)),
         };
 
         let nodes = self
@@ -1595,10 +1800,7 @@ impl TaskTriggerHandler {
             .map_err(internal_error)?;
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&serde_json::json!({
-                "ok": true,
-            }))
-            .unwrap_or_default(),
+            serde_json::to_string_pretty(&serde_json::json!({ "ok": true })).unwrap_or_default(),
         )]))
     }
 
@@ -1610,20 +1812,13 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<WorkflowUpdateEdgeParams>,
     ) -> Result<CallToolResult, McpError> {
-        let Some(edge) = self
-            .db
-            .get_workflow_edge(params.edge_id.trim())
-            .map_err(internal_error)?
-        else {
-            return Ok(error_result(&format!(
-                "Workflow edge '{}' not found.",
-                params.edge_id
-            )));
+        let edge = match validate_edge_exists(&self.db, params.edge_id.trim()) {
+            Ok(e) => e,
+            Err(e) => return Ok(error_result(&e)),
         };
-        let Some(condition) = WorkflowEdgeCondition::from_str(params.condition.trim()) else {
-            return Ok(error_result(
-                "Workflow edge condition must be one of: pass, fail, always.",
-            ));
+        let condition = match validate_edge_condition(params.condition.trim()) {
+            Ok(c) => c,
+            Err(e) => return Ok(error_result(&e)),
         };
 
         if edge.condition == condition {
@@ -1652,15 +1847,15 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<WorkflowGetParams>,
     ) -> Result<CallToolResult, McpError> {
-        let Some(workflow) = self
-            .db
-            .get_workflow_details(&params.workflow_id)
-            .map_err(internal_error)?
-        else {
-            return Ok(error_result(&format!(
-                "Workflow '{}' not found.",
-                params.workflow_id
-            )));
+        let workflow = match self.db.get_workflow_details(&params.workflow_id) {
+            Ok(Some(w)) => w,
+            Ok(None) => {
+                return Ok(error_result(&format!(
+                    "Workflow '{}' not found.",
+                    params.workflow_id
+                )))
+            }
+            Err(e) => return Err(internal_error(e.to_string())),
         };
 
         Ok(CallToolResult::success(vec![Content::text(
@@ -1684,47 +1879,7 @@ impl TaskTriggerHandler {
             .list_workflows(params.workdir.as_deref())
             .map_err(internal_error)?;
 
-        let mut out = Vec::with_capacity(workflows.len());
-        for workflow in workflows {
-            let specs = self
-                .db
-                .list_workflow_specs(&workflow.id)
-                .map_err(internal_error)?;
-            let current_spec = specs
-                .into_iter()
-                .find(|spec| {
-                    matches!(
-                        spec.status,
-                        WorkflowSpecStatus::Running | WorkflowSpecStatus::Pending
-                    )
-                })
-                .map(|spec| {
-                    let runs = self
-                        .db
-                        .list_workflow_runs_for_spec(&spec.id)
-                        .map_err(internal_error)?;
-                    let current_node = runs
-                        .iter()
-                        .rev()
-                        .find(|run| run.status == WorkflowRunStatus::Running)
-                        .or_else(|| runs.last())
-                        .map(|run| run.node_id.clone());
-                    let blocker = runs.last().and_then(workflow_run_blocker);
-                    Ok::<_, McpError>((spec.name, current_node, blocker))
-                })
-                .transpose()?;
-            out.push(serde_json::json!({
-                "id": workflow.id,
-                "name": workflow.name,
-                "status": workflow.status.as_str(),
-                "current_spec": current_spec.as_ref().map(|value| &value.0),
-                "current_node": current_spec.as_ref().and_then(|value| value.1.as_ref()),
-                "blocked": current_spec.as_ref().and_then(|value| value.2.as_ref()).is_some(),
-                "blocker": current_spec.and_then(|value| value.2),
-                "created_at": workflow.created_at.to_rfc3339(),
-                "workdir": workflow.workdir,
-            }));
-        }
+        let out = build_workflow_list_json(&self.db, &workflows)?;
 
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&out).unwrap_or_default(),
@@ -1739,15 +1894,15 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<WorkflowRunParams>,
     ) -> Result<CallToolResult, McpError> {
-        let Some(workflow) = self
-            .db
-            .get_workflow(&params.workflow_id)
-            .map_err(internal_error)?
-        else {
-            return Ok(error_result(&format!(
-                "Workflow '{}' not found.",
-                params.workflow_id
-            )));
+        let workflow = match self.db.get_workflow(&params.workflow_id) {
+            Ok(Some(w)) => w,
+            Ok(None) => {
+                return Ok(error_result(&format!(
+                    "Workflow '{}' not found.",
+                    params.workflow_id
+                )))
+            }
+            Err(e) => return Err(internal_error(e.to_string())),
         };
 
         if workflow.status == WorkflowStatus::Running {
@@ -1805,15 +1960,15 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<WorkflowContinueParams>,
     ) -> Result<CallToolResult, McpError> {
-        let Some(workflow) = self
-            .db
-            .get_workflow(&params.workflow_id)
-            .map_err(internal_error)?
-        else {
-            return Ok(error_result(&format!(
-                "Workflow '{}' not found.",
-                params.workflow_id
-            )));
+        let workflow = match self.db.get_workflow(&params.workflow_id) {
+            Ok(Some(w)) => w,
+            Ok(None) => {
+                return Ok(error_result(&format!(
+                    "Workflow '{}' not found.",
+                    params.workflow_id
+                )))
+            }
+            Err(e) => return Err(internal_error(e.to_string())),
         };
         if workflow.status != WorkflowStatus::Paused {
             return Ok(error_result(&format!(
@@ -1824,27 +1979,7 @@ impl TaskTriggerHandler {
 
         match params.action.trim() {
             "retry_current_node" => {}
-            "skip_next_spec" => {
-                let current_spec = self
-                    .db
-                    .list_workflow_specs(&params.workflow_id)
-                    .map_err(internal_error)?
-                    .into_iter()
-                    .find(|spec| spec.status == WorkflowSpecStatus::Running);
-                let Some(current_spec) = current_spec else {
-                    return Ok(error_result(
-                        "No running spec found to skip from this paused workflow.",
-                    ));
-                };
-                self.db
-                    .update_workflow_spec_status(
-                        &current_spec.id,
-                        WorkflowSpecStatus::Skipped,
-                        None,
-                        Some(chrono::Utc::now()),
-                    )
-                    .map_err(internal_error)?;
-            }
+            "skip_next_spec" => self.handle_skip_next_spec(&params.workflow_id)?,
             _ => {
                 return Ok(error_result(
                     "workflow_continue action must be retry_current_node or skip_next_spec.",
@@ -1881,15 +2016,15 @@ impl TaskTriggerHandler {
                 "workflow_complete_node status must be pass or fail.",
             ));
         };
-        let Some(run) = self
-            .db
-            .get_active_workflow_run_for_node(&params.node_id)
-            .map_err(internal_error)?
-        else {
-            return Ok(error_result(&format!(
-                "No active workflow run found for node '{}'.",
-                params.node_id
-            )));
+        let run = match self.db.get_active_workflow_run_for_node(&params.node_id) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                return Ok(error_result(&format!(
+                    "No active workflow run found for node '{}'.",
+                    params.node_id
+                )))
+            }
+            Err(e) => return Err(internal_error(e.to_string())),
         };
 
         self.db
@@ -1915,15 +2050,15 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<WorkflowReportBlockerParams>,
     ) -> Result<CallToolResult, McpError> {
-        let Some(run) = self
-            .db
-            .get_active_workflow_run_for_node(&params.node_id)
-            .map_err(internal_error)?
-        else {
-            return Ok(error_result(&format!(
-                "No active workflow run found for node '{}'.",
-                params.node_id
-            )));
+        let run = match self.db.get_active_workflow_run_for_node(&params.node_id) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                return Ok(error_result(&format!(
+                    "No active workflow run found for node '{}'.",
+                    params.node_id
+                )))
+            }
+            Err(e) => return Err(internal_error(e.to_string())),
         };
 
         self.db
@@ -1961,93 +2096,26 @@ impl TaskTriggerHandler {
         Parameters(params): Parameters<GetToolsParams>,
     ) -> Result<CallToolResult, McpError> {
         let scope = params.scope.trim().to_lowercase();
-        let out = match scope.as_str() {
-            "session_start" => serde_json::json!({
-                "scope": "session_start",
-                "risk": "low",
-                "protocol": [
-                    "1. Call intelligence_get_context(scope=\"light\") to load workspace brief.",
-                    "2. Check active_missions in sync context — align your work with open missions.",
-                    "3. If starting a new thread of work, call sync_declare_intent to register your mission.",
-                    "4. Respond to the user with context in hand."
-                ],
-                "tools": [
-                    "intelligence_get_context — pull session history, facts, patterns",
-                    "sync_get_context — check active missions and workspace vibe",
-                    "sync_declare_intent — announce your mission (impact: low/medium/high/breaking)"
-                ]
-            }),
-            "file_write" => {
-                let path_hint = params.path.as_deref().unwrap_or("(not specified)");
-                serde_json::json!({
-                    "scope": "file_write",
-                    "risk": "high",
-                    "path": path_hint,
-                    "protocol": [
-                        "1. Call sync_get_context(workdir=...) — check for conflicting missions on this path.",
-                        "2. If no conflict, call sync_declare_intent(impact=\"high\", mission=\"...\").",
-                        "3. Modify the file.",
-                        "4. Call sync_report_status(status=\"stable\", message=\"Changes complete: ...\")."
-                    ],
-                    "tools": [
-                        "sync_get_context — check active missions, detect conflicts",
-                        "sync_declare_intent — announce what you're changing and why",
-                        "sync_report_status — report stable/unstable/testing after the change"
-                    ]
-                })
+        if !matches!(
+            scope.as_str(),
+            "session_start" | "file_write" | "test_run" | "close_session" | "multi_agent"
+        ) {
+            return Ok(error_result(
+                "Invalid scope. Must be one of: session_start, file_write, test_run, close_session, multi_agent.",
+            ));
+        }
+
+        let out = if scope == "file_write" {
+            let mut result = build_get_tools_response(&scope);
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert(
+                    "path".to_string(),
+                    serde_json::json!(params.path.as_deref().unwrap_or("(not specified)")),
+                );
             }
-            "test_run" => serde_json::json!({
-                "scope": "test_run",
-                "risk": "medium",
-                "protocol": [
-                    "1. Call sync_broadcast(kind=\"info\", message=\"Running tests: <suite/command>\").",
-                    "2. Run the tests.",
-                    "3. Call sync_broadcast(kind=\"info\", message=\"Tests complete: PASSED/FAILED — <summary>\").",
-                    "4. If failed, call sync_report_status(status=\"unstable\", message=\"Test failure: ...\")."
-                ],
-                "tools": [
-                    "sync_broadcast — announce test start and result to peer agents",
-                    "sync_report_status — mark workspace unstable if tests fail"
-                ]
-            }),
-            "close_session" => serde_json::json!({
-                "scope": "close_session",
-                "risk": "low",
-                "protocol": [
-                    "1. Call intelligence_upsert(kind=\"session\", title=\"<mission>\", body=\"<what was done>\", \
-                       metadata={workdir, summary, ...}) — store session summary in project context.",
-                    "2. Call sync_report_status(status=\"stable\", message=\"Mission complete: <summary>\") \
-                       — the daemon closes your mission automatically on exit.",
-                    "3. Do NOT manually call any close/shutdown tool — daemon handles it."
-                ],
-                "tools": [
-                    "intelligence_upsert — persist session summary as a 'session' node in project context",
-                    "sync_report_status — leave a clean 'stable' marker for the next agent"
-                ]
-            }),
-            "multi_agent" => serde_json::json!({
-                "scope": "multi_agent",
-                "risk": "varies",
-                "protocol": [
-                    "Follow the action-risk table: low=execute, medium=broadcast, high=declare+execute+report, breaking=same as high with impact=breaking.",
-                    "Always non-blocking — act on last-known state, never wait for responses.",
-                    "Communicate intent not implementation — missions explain what and why, not how."
-                ],
-                "tools": [
-                    "sync_get_context — check active missions and workspace vibe (call first)",
-                    "sync_declare_intent — announce mission (impact: low/medium/high/breaking)",
-                    "sync_broadcast — send info/query/answer messages to peers",
-                    "sync_report_status — report stable/unstable/testing after actions",
-                    "intelligence_get_context(scope=\"full\") — deep project-context pull for architecture work",
-                    "intelligence_upsert — persist facts, patterns, session summaries",
-                    "intelligence_search — find prior art or decisions in project context"
-                ]
-            }),
-            _ => {
-                return Ok(error_result(
-                    "Invalid scope. Must be one of: session_start, file_write, test_run, close_session, multi_agent.",
-                ))
-            }
+            result
+        } else {
+            build_get_tools_response(&scope)
         };
 
         Ok(CallToolResult::success(vec![Content::text(
@@ -2176,16 +2244,7 @@ impl TaskTriggerHandler {
             return Ok(success_result("No results found."));
         }
 
-        let out: Vec<serde_json::Value> = results
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "source": r.file_path,
-                    "content": r.content,
-                    "distance": r.distance,
-                })
-            })
-            .collect();
+        let out: Vec<serde_json::Value> = results.iter().map(rag_result_json).collect();
 
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&out).unwrap_or_default(),
@@ -2194,6 +2253,31 @@ impl TaskTriggerHandler {
 }
 
 impl TaskTriggerHandler {
+    fn handle_skip_next_spec(&self, workflow_id: &str) -> Result<(), McpError> {
+        let current_spec = self
+            .db
+            .list_workflow_specs(workflow_id)
+            .map_err(internal_error)?
+            .into_iter()
+            .find(|spec| spec.status == WorkflowSpecStatus::Running)
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "No running spec found to skip from this paused workflow.",
+                    None,
+                )
+            })?;
+
+        self.db
+            .update_workflow_spec_status(
+                &current_spec.id,
+                WorkflowSpecStatus::Skipped,
+                None,
+                Some(chrono::Utc::now()),
+            )
+            .map_err(internal_error)?;
+        Ok(())
+    }
+
     async fn restart_updated_watcher(
         &self,
         params: &TaskUpdateParams,
