@@ -132,3 +132,186 @@ fn test_seeds_dir_points_to_home() {
     assert!(dir.to_string_lossy().contains(".canopy"));
     assert!(dir.ends_with("seeds"));
 }
+
+// ── Filesystem I/O tests ─────────────────────────────────────────────
+
+#[test]
+fn save_and_load_seed_roundtrip() {
+    let seed_id = "test-save-load-roundtrip";
+    let identity = make_test_identity();
+
+    // Clean up any existing seed first
+    let _ = remove_seed(seed_id);
+
+    let result = save_seed(seed_id, &identity);
+    assert!(result.is_ok());
+
+    let loaded = load_seed(seed_id).unwrap();
+    assert_eq!(loaded.name, identity.name);
+    assert_eq!(loaded.family, identity.family);
+    assert_eq!(loaded.directives.general, identity.directives.general);
+    assert_eq!(loaded.traits.tone, identity.traits.tone);
+    assert_eq!(loaded.traits.focus, identity.traits.focus);
+
+    // Clean up
+    let _ = remove_seed(seed_id);
+}
+
+#[test]
+fn save_seed_creates_directory() {
+    let seed_id = "test-creates-dir";
+    let identity = SeedIdentity::new("NewSeed".to_string(), "Fungi".to_string());
+
+    let _ = remove_seed(seed_id);
+    save_seed(seed_id, &identity).unwrap();
+
+    let dir = seeds_dir().join(seed_id);
+    assert!(dir.exists());
+    assert!(dir.join("identity.toml").exists());
+
+    let _ = remove_seed(seed_id);
+}
+
+#[test]
+fn load_seed_not_found_returns_error() {
+    let result = load_seed("nonexistent-seed-id");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("not found"));
+}
+
+#[test]
+fn remove_seed_deletes_directory() {
+    let seed_id = "test-remove-seed";
+    let identity = SeedIdentity::new("ToRemove".to_string(), "Minerals".to_string());
+
+    let _ = remove_seed(seed_id);
+    save_seed(seed_id, &identity).unwrap();
+    assert!(seeds_dir().join(seed_id).exists());
+
+    remove_seed(seed_id).unwrap();
+    assert!(!seeds_dir().join(seed_id).exists());
+}
+
+#[test]
+fn remove_seed_not_found_returns_error() {
+    let result = remove_seed("nonexistent-seed-id");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("not found"));
+}
+
+#[test]
+fn list_seeds_returns_created_seed() {
+    let seed_id = "test-list-seeds";
+    let identity = SeedIdentity::new("Listable".to_string(), "Weather".to_string());
+
+    let _ = remove_seed(seed_id);
+    save_seed(seed_id, &identity).unwrap();
+
+    let seeds = list_seeds().unwrap();
+    assert!(seeds.contains(&seed_id.to_string()));
+
+    let _ = remove_seed(seed_id);
+}
+
+#[test]
+fn list_seeds_sorted_alphabetically() {
+    // Create two seeds with names that sort in a specific order
+    let id_a = "test-alpha-seed";
+    let id_b = "test-beta-seed";
+
+    let _ = remove_seed(id_a);
+    let _ = remove_seed(id_b);
+
+    save_seed(
+        id_a,
+        &SeedIdentity::new("Alpha".to_string(), "Trees".to_string()),
+    )
+    .unwrap();
+    save_seed(
+        id_b,
+        &SeedIdentity::new("Beta".to_string(), "Trees".to_string()),
+    )
+    .unwrap();
+
+    let seeds = list_seeds().unwrap();
+    // Seeds are sorted by ID, not name
+    let alpha_pos = seeds.iter().position(|s| s == id_a).unwrap();
+    let beta_pos = seeds.iter().position(|s| s == id_b).unwrap();
+    assert!(alpha_pos < beta_pos);
+
+    let _ = remove_seed(id_a);
+    let _ = remove_seed(id_b);
+}
+
+#[test]
+fn is_name_unique_returns_true_for_new_name() {
+    assert!(is_name_unique("CompletelyNewName", None).unwrap());
+}
+
+#[test]
+fn is_name_unique_detects_collision() {
+    let seed_id = "test-unique-check";
+    let identity = SeedIdentity::new("UniqueChecker".to_string(), "Trees".to_string());
+
+    let _ = remove_seed(seed_id);
+    save_seed(seed_id, &identity).unwrap();
+
+    // Same name should not be unique
+    assert!(!is_name_unique("UniqueChecker", None).unwrap());
+    // Case-insensitive
+    assert!(!is_name_unique("uniquechecker", None).unwrap());
+    // Different name should be unique
+    assert!(is_name_unique("DifferentName", None).unwrap());
+
+    let _ = remove_seed(seed_id);
+}
+
+#[test]
+fn is_name_unique_excludes_self() {
+    let seed_id = "test-exclude-self";
+    let identity = SeedIdentity::new("SelfCheck".to_string(), "Fungi".to_string());
+
+    let _ = remove_seed(seed_id);
+    save_seed(seed_id, &identity).unwrap();
+
+    // Should be unique when excluding itself
+    assert!(is_name_unique("SelfCheck", Some(seed_id)).unwrap());
+
+    let _ = remove_seed(seed_id);
+}
+
+#[test]
+fn resolve_seed_by_name_finds_seed() {
+    let seed_id = "test-resolve-by-name";
+    let identity = SeedIdentity::new("Resolvable".to_string(), "Trees".to_string());
+
+    let _ = remove_seed(seed_id);
+    save_seed(seed_id, &identity).unwrap();
+
+    let found = resolve_seed_by_name("Resolvable").unwrap();
+    assert_eq!(found, Some(seed_id.to_string()));
+
+    // Case-insensitive
+    let found_lower = resolve_seed_by_name("resolvable").unwrap();
+    assert_eq!(found_lower, Some(seed_id.to_string()));
+
+    // Non-existent name returns None
+    let not_found = resolve_seed_by_name("NonExistent").unwrap();
+    assert!(not_found.is_none());
+
+    let _ = remove_seed(seed_id);
+}
+
+#[test]
+fn validate_combined_fields_and_size() {
+    let identity = make_test_identity();
+    assert!(identity.validate().is_ok());
+
+    let mut empty_name = make_test_identity();
+    empty_name.name = String::new();
+    assert!(empty_name.validate().is_err());
+
+    let mut empty_family = make_test_identity();
+    empty_family.family = String::new();
+    assert!(empty_family.validate().is_err());
+}
