@@ -322,7 +322,10 @@ pub struct WorkflowDetails {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_spec_description_template;
+    use super::{
+        validate_spec_description_template, WorkflowEdgeCondition, WorkflowNodeKind,
+        WorkflowRunStatus, WorkflowSpecStatus, WorkflowStatus,
+    };
 
     #[test]
     fn spec_template_validation_accepts_markdown_sections() {
@@ -397,5 +400,124 @@ Task:
         assert!(error.contains("guidelines"));
         assert!(error.contains("in scope"));
         assert!(error.contains("out of scope"));
+    }
+
+    #[test]
+    fn workflow_status_as_str_roundtrip() {
+        assert_eq!(WorkflowStatus::Draft.as_str(), "draft");
+        assert_eq!(WorkflowStatus::Running.as_str(), "running");
+        assert_eq!(WorkflowStatus::Paused.as_str(), "paused");
+        assert_eq!(WorkflowStatus::Completed.as_str(), "completed");
+        assert_eq!(WorkflowStatus::Failed.as_str(), "failed");
+    }
+
+    #[test]
+    fn workflow_status_from_str() {
+        assert_eq!(WorkflowStatus::from_str("running"), WorkflowStatus::Running);
+        assert_eq!(WorkflowStatus::from_str("paused"), WorkflowStatus::Paused);
+        assert_eq!(
+            WorkflowStatus::from_str("completed"),
+            WorkflowStatus::Completed
+        );
+        assert_eq!(WorkflowStatus::from_str("failed"), WorkflowStatus::Failed);
+        assert_eq!(WorkflowStatus::from_str("invalid"), WorkflowStatus::Draft);
+    }
+
+    #[test]
+    fn workflow_spec_status_as_str() {
+        assert_eq!(WorkflowSpecStatus::Pending.as_str(), "pending");
+        assert_eq!(WorkflowSpecStatus::Running.as_str(), "running");
+        assert_eq!(WorkflowSpecStatus::Completed.as_str(), "completed");
+        assert_eq!(WorkflowSpecStatus::Failed.as_str(), "failed");
+        assert_eq!(WorkflowSpecStatus::Skipped.as_str(), "skipped");
+    }
+
+    #[test]
+    fn workflow_spec_status_from_str() {
+        assert_eq!(
+            WorkflowSpecStatus::from_str("running"),
+            WorkflowSpecStatus::Running
+        );
+        assert_eq!(
+            WorkflowSpecStatus::from_str("completed"),
+            WorkflowSpecStatus::Completed
+        );
+        assert_eq!(
+            WorkflowSpecStatus::from_str("failed"),
+            WorkflowSpecStatus::Failed
+        );
+        assert_eq!(
+            WorkflowSpecStatus::from_str("skipped"),
+            WorkflowSpecStatus::Skipped
+        );
+        assert_eq!(
+            WorkflowSpecStatus::from_str("invalid"),
+            WorkflowSpecStatus::Pending
+        );
+    }
+
+    #[test]
+    fn workflow_node_kind_as_str() {
+        assert_eq!(WorkflowNodeKind::Agent.as_str(), "agent");
+        assert_eq!(WorkflowNodeKind::Check.as_str(), "check");
+        assert_eq!(WorkflowNodeKind::Gate.as_str(), "gate");
+    }
+
+    #[test]
+    fn workflow_node_kind_from_str() {
+        assert_eq!(
+            WorkflowNodeKind::from_str("agent"),
+            Some(WorkflowNodeKind::Agent)
+        );
+        assert_eq!(
+            WorkflowNodeKind::from_str("check"),
+            Some(WorkflowNodeKind::Check)
+        );
+        assert_eq!(
+            WorkflowNodeKind::from_str("gate"),
+            Some(WorkflowNodeKind::Gate)
+        );
+        assert!(WorkflowNodeKind::from_str("invalid").is_none());
+    }
+
+    #[test]
+    fn workflow_edge_condition_as_str() {
+        assert_eq!(WorkflowEdgeCondition::Pass.as_str(), "pass");
+        assert_eq!(WorkflowEdgeCondition::Fail.as_str(), "fail");
+        assert_eq!(WorkflowEdgeCondition::Always.as_str(), "always");
+    }
+
+    #[test]
+    fn workflow_edge_condition_from_str() {
+        assert_eq!(
+            WorkflowEdgeCondition::from_str("pass"),
+            Some(WorkflowEdgeCondition::Pass)
+        );
+        assert_eq!(
+            WorkflowEdgeCondition::from_str("fail"),
+            Some(WorkflowEdgeCondition::Fail)
+        );
+        assert_eq!(
+            WorkflowEdgeCondition::from_str("always"),
+            Some(WorkflowEdgeCondition::Always)
+        );
+        assert!(WorkflowEdgeCondition::from_str("invalid").is_none());
+    }
+
+    #[test]
+    fn workflow_run_status_as_str() {
+        assert_eq!(WorkflowRunStatus::Running.as_str(), "running");
+        assert_eq!(WorkflowRunStatus::Pass.as_str(), "pass");
+        assert_eq!(WorkflowRunStatus::Fail.as_str(), "fail");
+    }
+
+    #[test]
+    fn workflow_run_status_from_str() {
+        assert_eq!(WorkflowRunStatus::from_str("pass"), WorkflowRunStatus::Pass);
+        assert_eq!(WorkflowRunStatus::from_str("fail"), WorkflowRunStatus::Fail);
+        assert_eq!(
+            WorkflowRunStatus::from_str("invalid"),
+            WorkflowRunStatus::Running
+        );
     }
 }
