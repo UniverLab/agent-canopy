@@ -1351,6 +1351,67 @@ impl TaskTriggerHandler {
     }
 
     #[tool(
+        name = "list_seeds",
+        description = "List all existing seed identities. Returns seed IDs and their names."
+    )]
+    async fn list_seeds(&self) -> Result<CallToolResult, McpError> {
+        let seed_ids =
+            crate::domain::seeds::list_seeds().map_err(|e| McpError::internal_error(e, None))?;
+        let mut seeds_info = Vec::new();
+        for seed_id in &seed_ids {
+            if let Ok(identity) = crate::domain::seeds::load_seed(seed_id) {
+                seeds_info.push(serde_json::json!({
+                    "id": seed_id,
+                    "name": identity.name,
+                    "family": identity.family,
+                }));
+            }
+        }
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&seeds_info).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        name = "create_seed",
+        description = "Create a new seed identity. Validates name uniqueness, structure, and 4KB size cap."
+    )]
+    async fn create_seed(
+        &self,
+        Parameters(params): Parameters<CreateSeedParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let seed_id = crate::domain::nursery::slugify(&params.name);
+        let identity = crate::domain::seeds::SeedIdentity {
+            name: params.name,
+            family: params.family,
+            created_at: chrono::Utc::now(),
+            directives: params.directives.unwrap_or_default(),
+            traits: params.traits.unwrap_or_default(),
+        };
+        crate::domain::seeds::save_seed(&seed_id, &identity)
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Seed '{seed_id}' created successfully."
+        ))]))
+    }
+
+    #[tool(
+        name = "remove_seed",
+        description = "Remove a seed identity completely by ID."
+    )]
+    async fn remove_seed(
+        &self,
+        Parameters(params): Parameters<RemoveSeedParams>,
+    ) -> Result<CallToolResult, McpError> {
+        crate::domain::seeds::remove_seed(&params.seed_id)
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Seed '{}' removed successfully.",
+            params.seed_id
+        ))]))
+    }
+
+    #[tool(
         name = "intelligence_list_projects",
         description = "List all indexed projects for the project picker. \
          Returns project nodes with their hash, name, and description. \

@@ -405,6 +405,24 @@ pub struct EvolveIdentityParams {
     pub new_traits: Option<std::collections::HashMap<String, String>>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CreateSeedParams {
+    /// Unique display name (enforced case-insensitive across all seeds).
+    pub name: String,
+    /// Family/category label (e.g. "Trees", "Fungi").
+    pub family: String,
+    /// Behavioral directives injected into prompts.
+    pub directives: Option<crate::domain::seeds::SeedDirectives>,
+    /// Personality/style traits.
+    pub traits: Option<crate::domain::seeds::SeedTraits>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RemoveSeedParams {
+    /// Seed ID to remove.
+    pub seed_id: String,
+}
+
 // ── Intelligence V2 tool parameter types ─────────────────────────────
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
