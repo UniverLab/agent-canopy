@@ -1324,3 +1324,86 @@ fn test_list_related_projects_returns_empty_for_unlinked_project() {
     let related = db.list_related_projects("hash-lone", 10).unwrap();
     assert!(related.is_empty());
 }
+
+// ── Seed session binding tests ──────────────────────────────────────
+
+#[test]
+fn seed_bind_and_resolve() {
+    let db = test_db();
+    db.insert_interactive_session("session-abc", "test-session", "opencode", "/tmp", None)
+        .unwrap();
+
+    db.bind_session_to_seed("session-abc", "seed-oak").unwrap();
+    let resolved = db.resolve_session_seed("session-abc").unwrap();
+    assert_eq!(resolved, Some("seed-oak".to_string()));
+}
+
+#[test]
+fn seed_resolve_missing_returns_none() {
+    let db = test_db();
+
+    let resolved = db.resolve_session_seed("nonexistent-session").unwrap();
+    assert!(resolved.is_none());
+}
+
+#[test]
+fn seed_bind_replaces_existing() {
+    let db = test_db();
+    db.insert_interactive_session("session-abc", "test-session", "opencode", "/tmp", None)
+        .unwrap();
+
+    db.bind_session_to_seed("session-abc", "seed-oak").unwrap();
+    db.bind_session_to_seed("session-abc", "seed-pine").unwrap();
+
+    let resolved = db.resolve_session_seed("session-abc").unwrap();
+    assert_eq!(resolved, Some("seed-pine".to_string()));
+}
+
+#[test]
+fn seed_unbind_removes_binding() {
+    let db = test_db();
+    db.insert_interactive_session("session-abc", "test-session", "opencode", "/tmp", None)
+        .unwrap();
+
+    db.bind_session_to_seed("session-abc", "seed-oak").unwrap();
+    db.unbind_session_seed("session-abc").unwrap();
+
+    let resolved = db.resolve_session_seed("session-abc").unwrap();
+    assert!(resolved.is_none());
+}
+
+#[test]
+fn seed_unbind_nonexistent_is_ok() {
+    let db = test_db();
+
+    let result = db.unbind_session_seed("nonexistent-session");
+    assert!(result.is_ok());
+}
+
+#[test]
+fn seed_get_sessions_for_seed_empty() {
+    let db = test_db();
+
+    let sessions = db.get_sessions_for_seed("seed-oak").unwrap();
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn seed_multiple_sessions_for_same_seed() {
+    let db = test_db();
+    db.insert_interactive_session("session-1", "s1", "opencode", "/tmp", None)
+        .unwrap();
+    db.insert_interactive_session("session-2", "s2", "opencode", "/tmp", None)
+        .unwrap();
+    db.insert_interactive_session("session-3", "s3", "opencode", "/tmp", None)
+        .unwrap();
+
+    db.bind_session_to_seed("session-1", "seed-oak").unwrap();
+    db.bind_session_to_seed("session-2", "seed-oak").unwrap();
+    db.bind_session_to_seed("session-3", "seed-pine").unwrap();
+
+    // Verify bindings exist
+    assert!(db.resolve_session_seed("session-1").unwrap().is_some());
+    assert!(db.resolve_session_seed("session-2").unwrap().is_some());
+    assert!(db.resolve_session_seed("session-3").unwrap().is_some());
+}
