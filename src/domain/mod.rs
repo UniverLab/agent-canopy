@@ -9,6 +9,7 @@ pub mod cli_strategy;
 pub mod models;
 pub mod models_db;
 pub mod notification;
+pub mod nursery;
 pub mod project;
 pub mod seeds;
 pub mod sync;
