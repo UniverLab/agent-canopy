@@ -341,3 +341,423 @@ pub(crate) fn load_bound_seed_identity(
     let identity = crate::domain::seeds::load_seed(&seed_id)?;
     Ok((seed_id, identity))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::models::RunStatus;
+
+    #[test]
+    fn parse_report_status_valid() {
+        assert!(matches!(
+            parse_report_status("in_progress"),
+            Ok(RunStatus::InProgress)
+        ));
+        assert!(matches!(
+            parse_report_status("success"),
+            Ok(RunStatus::Success)
+        ));
+        assert!(matches!(parse_report_status("error"), Ok(RunStatus::Error)));
+    }
+
+    #[test]
+    fn parse_report_status_invalid() {
+        assert!(parse_report_status("invalid").is_err());
+        assert!(parse_report_status("").is_err());
+        assert!(parse_report_status("pending").is_err());
+    }
+
+    #[test]
+    fn validate_report_summary_success_requires_summary() {
+        assert!(validate_report_summary(RunStatus::Success, Some("done")).is_ok());
+        assert!(validate_report_summary(RunStatus::Success, None).is_err());
+    }
+
+    #[test]
+    fn validate_report_summary_error_requires_summary() {
+        assert!(validate_report_summary(RunStatus::Error, Some("failed")).is_ok());
+        assert!(validate_report_summary(RunStatus::Error, None).is_err());
+    }
+
+    #[test]
+    fn validate_report_summary_in_progress_no_summary_needed() {
+        assert!(validate_report_summary(RunStatus::InProgress, None).is_ok());
+        assert!(validate_report_summary(RunStatus::InProgress, Some("working")).is_ok());
+    }
+
+    #[test]
+    fn validate_run_transition_valid() {
+        assert!(validate_run_transition(RunStatus::Pending, RunStatus::InProgress).is_ok());
+        assert!(validate_run_transition(RunStatus::InProgress, RunStatus::Success).is_ok());
+        assert!(validate_run_transition(RunStatus::InProgress, RunStatus::Error).is_ok());
+        assert!(validate_run_transition(RunStatus::Pending, RunStatus::Success).is_ok());
+        assert!(validate_run_transition(RunStatus::Pending, RunStatus::Error).is_ok());
+    }
+
+    #[test]
+    fn validate_run_transition_invalid() {
+        assert!(validate_run_transition(RunStatus::Success, RunStatus::InProgress).is_err());
+        assert!(validate_run_transition(RunStatus::Error, RunStatus::Pending).is_err());
+        assert!(validate_run_transition(RunStatus::Success, RunStatus::Error).is_err());
+    }
+
+    #[test]
+    fn update_expiration_positive_minutes() {
+        let result = update_expiration(Some(30));
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn update_expiration_zero_minutes() {
+        let result = update_expiration(Some(0));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn update_expiration_negative_minutes() {
+        let result = update_expiration(Some(-5));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn update_expiration_none() {
+        let result = update_expiration(None);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn watcher_restart_needed_true() {
+        let mut params = TaskUpdateParams {
+            id: "test".to_string(),
+            prompt: None,
+            cli: None,
+            model: None,
+            schedule: None,
+            working_dir: None,
+            duration_minutes: None,
+            path: None,
+            events: None,
+            debounce_seconds: None,
+            recursive: None,
+            enabled: None,
+        };
+        assert!(!watcher_restart_needed(&params));
+
+        params.path = Some("/tmp/test".to_string());
+        assert!(watcher_restart_needed(&params));
+
+        params.path = None;
+        params.events = Some(vec!["modify".to_string()]);
+        assert!(watcher_restart_needed(&params));
+
+        params.events = None;
+        params.debounce_seconds = Some(5);
+        assert!(watcher_restart_needed(&params));
+
+        params.debounce_seconds = None;
+        params.recursive = Some(true);
+        assert!(watcher_restart_needed(&params));
+
+        params.recursive = None;
+        params.cli = Some("claude".to_string());
+        assert!(watcher_restart_needed(&params));
+
+        params.cli = None;
+        params.prompt = Some("new prompt".to_string());
+        assert!(watcher_restart_needed(&params));
+
+        params.prompt = None;
+        params.model = Some(Some("claude-4".to_string()));
+        assert!(watcher_restart_needed(&params));
+    }
+
+    #[test]
+    fn new_agent_base_sets_defaults() {
+        let agent = new_agent_base(
+            "test-id".to_string(),
+            "test prompt".to_string(),
+            Cli::new("opencode"),
+            None,
+            None,
+            None,
+            "/tmp/test.log".to_string(),
+        );
+
+        assert_eq!(agent.id, "test-id");
+        assert_eq!(agent.prompt, "test prompt");
+        assert_eq!(agent.cli.as_str(), "opencode");
+        assert!(agent.model.is_none());
+        assert!(agent.working_dir.is_none());
+        assert!(agent.enabled);
+        assert_eq!(agent.timeout_minutes, 15);
+        assert!(agent.expires_at.is_none());
+        assert!(agent.trigger.is_none());
+        assert_eq!(agent.log_path, "/tmp/test.log");
+    }
+
+    #[test]
+    fn new_agent_base_custom_timeout() {
+        let agent = new_agent_base(
+            "test-id".to_string(),
+            "test".to_string(),
+            Cli::new("opencode"),
+            None,
+            None,
+            Some(30),
+            "/tmp/test.log".to_string(),
+        );
+        assert_eq!(agent.timeout_minutes, 30);
+    }
+
+    #[test]
+    fn apply_scalar_updates_prompt() {
+        let mut agent = Agent {
+            id: "test".to_string(),
+            prompt: "old".to_string(),
+            trigger: None,
+            cli: Cli::new("opencode"),
+            model: None,
+            working_dir: None,
+            enabled: true,
+            created_at: Utc::now(),
+            log_path: "/tmp/test.log".to_string(),
+            timeout_minutes: 15,
+            expires_at: None,
+            last_run_at: None,
+            last_run_ok: None,
+            last_triggered_at: None,
+            trigger_count: 0,
+        };
+
+        let params = TaskUpdateParams {
+            id: "test".to_string(),
+            prompt: Some("new prompt".to_string()),
+            cli: None,
+            model: None,
+            schedule: None,
+            working_dir: None,
+            duration_minutes: None,
+            path: None,
+            events: None,
+            debounce_seconds: None,
+            recursive: None,
+            enabled: None,
+        };
+
+        apply_scalar_updates(&mut agent, &params).unwrap();
+        assert_eq!(agent.prompt, "new prompt");
+    }
+
+    #[test]
+    fn apply_scalar_updates_enabled_toggle() {
+        let mut agent = Agent {
+            id: "test".to_string(),
+            prompt: "test".to_string(),
+            trigger: None,
+            cli: Cli::new("opencode"),
+            model: None,
+            working_dir: None,
+            enabled: true,
+            created_at: Utc::now(),
+            log_path: "/tmp/test.log".to_string(),
+            timeout_minutes: 15,
+            expires_at: None,
+            last_run_at: None,
+            last_run_ok: None,
+            last_triggered_at: None,
+            trigger_count: 0,
+        };
+
+        let params = TaskUpdateParams {
+            id: "test".to_string(),
+            prompt: None,
+            cli: None,
+            model: None,
+            schedule: None,
+            working_dir: None,
+            duration_minutes: None,
+            path: None,
+            events: None,
+            debounce_seconds: None,
+            recursive: None,
+            enabled: Some(false),
+        };
+
+        apply_scalar_updates(&mut agent, &params).unwrap();
+        assert!(!agent.enabled);
+    }
+
+    #[test]
+    fn apply_scalar_updates_empty_params_no_change() {
+        let mut agent = Agent {
+            id: "test".to_string(),
+            prompt: "original".to_string(),
+            trigger: None,
+            cli: Cli::new("opencode"),
+            model: Some("model-1".to_string()),
+            working_dir: Some("/original".to_string()),
+            enabled: true,
+            created_at: Utc::now(),
+            log_path: "/tmp/test.log".to_string(),
+            timeout_minutes: 15,
+            expires_at: None,
+            last_run_at: None,
+            last_run_ok: None,
+            last_triggered_at: None,
+            trigger_count: 0,
+        };
+
+        let params = TaskUpdateParams {
+            id: "test".to_string(),
+            prompt: None,
+            cli: None,
+            model: None,
+            schedule: None,
+            working_dir: None,
+            duration_minutes: None,
+            path: None,
+            events: None,
+            debounce_seconds: None,
+            recursive: None,
+            enabled: None,
+        };
+
+        apply_scalar_updates(&mut agent, &params).unwrap();
+        assert_eq!(agent.prompt, "original");
+        assert_eq!(agent.model, Some("model-1".to_string()));
+        assert_eq!(agent.working_dir, Some("/original".to_string()));
+        assert!(agent.enabled);
+    }
+
+    #[test]
+    fn map_action_result_error() {
+        let result: Result<(), String> = Err("something failed".to_string());
+        let tool_result = map_action_result(result, "done");
+        // Error results have is_error = Some(true)
+        assert_eq!(tool_result.is_error, Some(true));
+    }
+
+    #[test]
+    fn map_action_result_success() {
+        let result: Result<(), String> = Ok(());
+        let tool_result = map_action_result(result, "done");
+        // Success results have is_error = None or Some(false)
+        assert_ne!(tool_result.is_error, Some(true));
+    }
+
+    #[test]
+    fn prepare_cron_task_valid() {
+        let params = TaskAddParams {
+            id: "test-agent".to_string(),
+            prompt: "Run tests".to_string(),
+            schedule: "0 9 * * *".to_string(),
+            cli: Some("opencode".to_string()),
+            model: None,
+            duration_minutes: None,
+            working_dir: None,
+            timeout_minutes: None,
+        };
+
+        let result = prepare_cron_task(&params, &|_| true);
+        assert!(result.is_ok());
+        let prepared = result.unwrap();
+        assert_eq!(prepared.schedule_expr, "0 9 * * *");
+        assert_eq!(prepared.cli.as_str(), "opencode");
+    }
+
+    #[test]
+    fn prepare_cron_task_invalid_id() {
+        let params = TaskAddParams {
+            id: "".to_string(),
+            prompt: "Run tests".to_string(),
+            schedule: "0 9 * * *".to_string(),
+            cli: None,
+            model: None,
+            duration_minutes: None,
+            working_dir: None,
+            timeout_minutes: None,
+        };
+
+        let result = prepare_cron_task(&params, &|_| true);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn prepare_cron_task_invalid_schedule() {
+        let params = TaskAddParams {
+            id: "test-agent".to_string(),
+            prompt: "Run tests".to_string(),
+            schedule: "not a cron".to_string(),
+            cli: None,
+            model: None,
+            duration_minutes: None,
+            working_dir: None,
+            timeout_minutes: None,
+        };
+
+        let result = prepare_cron_task(&params, &|_| false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn prepare_watch_task_valid() {
+        let params = TaskWatchParams {
+            id: "test-watcher".to_string(),
+            path: "/tmp/test".to_string(),
+            events: vec!["create".to_string(), "modify".to_string()],
+            prompt: "Check files".to_string(),
+            cli: Some("claude".to_string()),
+            model: None,
+            debounce_seconds: Some(5),
+            recursive: Some(true),
+            timeout_minutes: None,
+        };
+
+        let result = prepare_watch_task(&params);
+        assert!(result.is_ok());
+        let prepared = result.unwrap();
+        assert_eq!(prepared.cli.as_str(), "claude");
+        assert_eq!(prepared.debounce_seconds, 5);
+        assert!(prepared.recursive);
+        assert_eq!(prepared.events.len(), 2);
+    }
+
+    #[test]
+    fn prepare_watch_task_defaults() {
+        let params = TaskWatchParams {
+            id: "test-watcher".to_string(),
+            path: "/tmp/test".to_string(),
+            events: vec!["modify".to_string()],
+            prompt: "Check files".to_string(),
+            cli: Some("opencode".to_string()),
+            model: None,
+            debounce_seconds: None,
+            recursive: None,
+            timeout_minutes: None,
+        };
+
+        let prepared = prepare_watch_task(&params).expect("prepare_watch_task should succeed");
+        assert_eq!(prepared.debounce_seconds, 2); // default
+        assert!(!prepared.recursive); // default
+    }
+
+    #[test]
+    fn prepare_watch_task_invalid_path() {
+        let params = TaskWatchParams {
+            id: "test-watcher".to_string(),
+            path: "".to_string(),
+            events: vec!["modify".to_string()],
+            prompt: "Check files".to_string(),
+            cli: None,
+            model: None,
+            debounce_seconds: None,
+            recursive: None,
+            timeout_minutes: None,
+        };
+
+        let result = prepare_watch_task(&params);
+        assert!(result.is_err());
+    }
+}
