@@ -14,6 +14,8 @@ pub enum SeedOption {
     None,
     /// Bind to an existing seed identity.
     Seed { id: String, name: String },
+    /// Create a new seed via the Nursery workflow.
+    PlantNewSeed,
 }
 
 /// Type of background_agent to create.
@@ -166,6 +168,14 @@ impl NewAgentDialog {
             Some(SeedOption::Seed { id, .. }) => Some(id),
             _ => None,
         }
+    }
+
+    /// Returns true if the user selected "Plant New Seed".
+    pub fn is_planting_new_seed(&self) -> bool {
+        matches!(
+            self.seed_options.get(self.seed_index),
+            Some(SeedOption::PlantNewSeed)
+        )
     }
 
     fn load_available_clis() -> (Vec<Cli>, Vec<Option<crate::domain::cli_config::CliConfig>>) {
@@ -691,6 +701,7 @@ fn load_seed_options() -> Vec<SeedOption> {
             }
         }
     }
+    options.push(SeedOption::PlantNewSeed);
     options
 }
 
@@ -757,5 +768,127 @@ mod tests {
         dialog.task_type = NewTaskType::Terminal;
 
         assert_eq!(dialog.selected_accent_color(), crate::tui::ui::ACCENT);
+    }
+
+    #[test]
+    fn is_planting_new_seed_returns_true_when_selected() {
+        let mut dialog = NewAgentDialog::new(None);
+        // Find the PlantNewSeed option
+        if let Some(idx) = dialog
+            .seed_options
+            .iter()
+            .position(|o| matches!(o, SeedOption::PlantNewSeed))
+        {
+            dialog.seed_index = idx;
+            assert!(dialog.is_planting_new_seed());
+        }
+    }
+
+    #[test]
+    fn is_planting_new_seed_returns_false_for_none() {
+        let dialog = NewAgentDialog::new(None);
+        // Seed index 0 is always None
+        assert_eq!(dialog.seed_index, 0);
+        assert!(!dialog.is_planting_new_seed());
+    }
+
+    #[test]
+    fn is_planting_new_seed_returns_false_for_existing_seed() {
+        let mut dialog = NewAgentDialog::new(None);
+        // Find an existing seed option
+        if let Some(idx) = dialog
+            .seed_options
+            .iter()
+            .position(|o| matches!(o, SeedOption::Seed { .. }))
+        {
+            dialog.seed_index = idx;
+            assert!(!dialog.is_planting_new_seed());
+        }
+    }
+
+    #[test]
+    fn selected_seed_id_returns_none_for_plant_new_seed() {
+        let mut dialog = NewAgentDialog::new(None);
+        if let Some(idx) = dialog
+            .seed_options
+            .iter()
+            .position(|o| matches!(o, SeedOption::PlantNewSeed))
+        {
+            dialog.seed_index = idx;
+            assert!(dialog.selected_seed_id().is_none());
+        }
+    }
+
+    #[test]
+    fn selected_seed_id_returns_none_for_none_option() {
+        let dialog = NewAgentDialog::new(None);
+        assert!(dialog.selected_seed_id().is_none());
+    }
+
+    #[test]
+    fn load_seed_options_always_has_none_and_plant() {
+        let options = load_seed_options();
+        assert!(options.len() >= 2);
+        assert!(matches!(options.first(), Some(SeedOption::None)));
+        assert!(matches!(options.last(), Some(SeedOption::PlantNewSeed)));
+    }
+
+    #[test]
+    fn parse_session_list_handles_empty_input() {
+        let result = parse_session_list("");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_session_list_skips_header_and_separator() {
+        let input = "Session        Title              Updated\n\
+                     ──────────────────────────────────────\n\
+                     ses_abc123     My Session         2h ago";
+        let result = parse_session_list(input);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "ses_abc123");
+        assert_eq!(result[0].1, "My Session         2h ago");
+    }
+
+    #[test]
+    fn parse_session_list_skips_short_ids() {
+        let input = "Header    Title\n\
+                     abc       Short ID\n\
+                     ses_abc123def   Valid Session";
+        let result = parse_session_list(input);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "ses_abc123def");
+    }
+
+    #[test]
+    fn parse_session_list_handles_multiple_entries() {
+        let input = "ses_aaa111   Session One\n\
+                     ses_bbb222   Session Two\n\
+                     ses_ccc333   Session Three";
+        let result = parse_session_list(input);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].0, "ses_aaa111");
+        assert_eq!(result[1].0, "ses_bbb222");
+        assert_eq!(result[2].0, "ses_ccc333");
+    }
+
+    #[test]
+    fn parse_session_list_handles_whitespace_only_lines() {
+        let input = "ses_abc123   First\n\n   \nses_def456   Second";
+        let result = parse_session_list(input);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn seed_option_display_order() {
+        let options = load_seed_options();
+        // First is always None
+        assert!(matches!(options.first(), Some(SeedOption::None)));
+        // Last is always PlantNewSeed
+        assert!(matches!(options.last(), Some(SeedOption::PlantNewSeed)));
+        // Any seeds in between are Seed variants
+        for opt in options.iter().skip(1).take(options.len().saturating_sub(2)) {
+            assert!(matches!(opt, SeedOption::Seed { .. }));
+        }
     }
 }

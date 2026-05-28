@@ -326,6 +326,9 @@ pub struct App {
     pub(crate) project_relation_dialog: Option<ProjectRelationDialog>,
     pub(crate) project_graph_edges: Vec<ProjectGraphEdge>,
     pub(crate) project_graph_trees: Vec<Vec<String>>,
+
+    // Nursery — temporary path for seed creation workflow
+    pub(crate) nursery_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone)]

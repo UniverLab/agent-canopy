@@ -715,6 +715,7 @@ fn append_identity_section(
 fn identity_label(dialog: &NewAgentDialog) -> String {
     match dialog.seed_options.get(dialog.seed_index) {
         Some(SeedOption::Seed { name, .. }) => truncate_with_ellipsis(name, 30),
+        Some(SeedOption::PlantNewSeed) => "🌱 New".to_string(),
         _ => "None".to_string(),
     }
 }

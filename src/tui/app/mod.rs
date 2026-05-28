@@ -148,6 +148,7 @@ impl App {
             project_relation_dialog: None,
             project_graph_edges: Vec::new(),
             project_graph_trees: Vec::new(),
+            nursery_path: None,
         };
         app.refresh()?;
         Ok(app)

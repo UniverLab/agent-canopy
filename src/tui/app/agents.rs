@@ -399,6 +399,27 @@ impl App {
         let cli = agent.cli.as_str().to_string();
         let output_snippet = recent_output_snippet(agent, 5);
 
+        // Finalize nursery if this was a seed creation session
+        if let Some(ref nursery_path) = self.nursery_path {
+            if nursery_path.to_string_lossy() == working_dir && code == 0 {
+                match crate::domain::nursery::finalize_nursery(nursery_path) {
+                    Ok(seed_id) => {
+                        // Bind the session to the new seed
+                        let _ = self.db.bind_session_to_seed(&agent_id, &seed_id);
+                    }
+                    Err(e) => {
+                        // Log the error — nursery cleanup is non-fatal
+                        eprintln!("Nursery finalization failed: {e}");
+                    }
+                }
+                self.nursery_path = None;
+            } else if code != 0 {
+                // Clean up temp dir on error exit
+                let _ = std::fs::remove_dir_all(nursery_path);
+                self.nursery_path = None;
+            }
+        }
+
         let _ = self.db.finish_interactive_session(&agent_id, code);
         let _ = self
             .db

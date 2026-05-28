@@ -584,7 +584,19 @@ impl App {
         use crate::tui::agent::InteractiveAgent;
         let cli = dialog.selected_cli();
         self.record_cli_usage(cli.as_str());
-        let dir = dialog.working_dir.clone();
+
+        // Check if planting a new seed via Nursery
+        let (dir, is_nursery) = if dialog.is_planting_new_seed() {
+            let nursery_dir = crate::domain::nursery::create_nursery(cli.as_str())
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let d = nursery_dir.to_string_lossy().to_string();
+            // Store nursery path for finalization on session end
+            self.nursery_path = Some(nursery_dir);
+            (d, true)
+        } else {
+            (dialog.working_dir.clone(), false)
+        };
+
         // Append yolo flag to args when yolo mode is enabled
         let base_args = dialog.selected_args();
         let args = if dialog.yolo_mode {
@@ -617,7 +629,12 @@ impl App {
             .iter()
             .map(|a| a.name.as_str())
             .collect();
-        let seed_id = dialog.selected_seed_id();
+        // For nursery sessions, don't pass seed_id (it gets bound on finalization)
+        let seed_id = if is_nursery {
+            None
+        } else {
+            dialog.selected_seed_id()
+        };
         let agent = InteractiveAgent::spawn(
             cli,
             &dir,
