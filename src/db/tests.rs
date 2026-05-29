@@ -191,8 +191,15 @@ fn test_list_sync_messages_returns_chronological_order() {
 #[test]
 fn test_list_active_sync_agent_ids_includes_live_sessions_and_running_background_agents() {
     let db = test_db();
-    db.insert_interactive_session("ix-1", "copilot", "copilot", "/tmp/project", None)
-        .unwrap();
+    db.insert_interactive_session(
+        "ix-1",
+        "copilot",
+        "copilot",
+        "/tmp/project",
+        None,
+        "interactive",
+    )
+    .unwrap();
     db.insert_terminal_session("term-1", "shell", "bash", "/tmp/project")
         .unwrap();
     db.upsert_agent(&sample_cron_agent("bg-1")).unwrap();
@@ -299,8 +306,15 @@ fn test_recent_sync_messages_returns_global_order() {
 #[test]
 fn test_resolve_sync_actor_name_prefers_interactive_session_name() {
     let db = test_db();
-    db.insert_interactive_session("ix-1", "violet-river", "copilot", "/tmp/project", None)
-        .unwrap();
+    db.insert_interactive_session(
+        "ix-1",
+        "violet-river",
+        "copilot",
+        "/tmp/project",
+        None,
+        "interactive",
+    )
+    .unwrap();
     db.insert_sync_message(
         "/tmp/project",
         "ix-1",
@@ -1330,8 +1344,15 @@ fn test_list_related_projects_returns_empty_for_unlinked_project() {
 #[test]
 fn seed_bind_and_resolve() {
     let db = test_db();
-    db.insert_interactive_session("session-abc", "test-session", "opencode", "/tmp", None)
-        .unwrap();
+    db.insert_interactive_session(
+        "session-abc",
+        "test-session",
+        "opencode",
+        "/tmp",
+        None,
+        "interactive",
+    )
+    .unwrap();
 
     db.bind_session_to_seed("session-abc", "seed-oak").unwrap();
     let resolved = db.resolve_session_seed("session-abc").unwrap();
@@ -1349,8 +1370,15 @@ fn seed_resolve_missing_returns_none() {
 #[test]
 fn seed_bind_replaces_existing() {
     let db = test_db();
-    db.insert_interactive_session("session-abc", "test-session", "opencode", "/tmp", None)
-        .unwrap();
+    db.insert_interactive_session(
+        "session-abc",
+        "test-session",
+        "opencode",
+        "/tmp",
+        None,
+        "interactive",
+    )
+    .unwrap();
 
     db.bind_session_to_seed("session-abc", "seed-oak").unwrap();
     db.bind_session_to_seed("session-abc", "seed-pine").unwrap();
@@ -1362,8 +1390,15 @@ fn seed_bind_replaces_existing() {
 #[test]
 fn seed_unbind_removes_binding() {
     let db = test_db();
-    db.insert_interactive_session("session-abc", "test-session", "opencode", "/tmp", None)
-        .unwrap();
+    db.insert_interactive_session(
+        "session-abc",
+        "test-session",
+        "opencode",
+        "/tmp",
+        None,
+        "interactive",
+    )
+    .unwrap();
 
     db.bind_session_to_seed("session-abc", "seed-oak").unwrap();
     db.unbind_session_seed("session-abc").unwrap();
@@ -1391,11 +1426,11 @@ fn seed_get_sessions_for_seed_empty() {
 #[test]
 fn seed_multiple_sessions_for_same_seed() {
     let db = test_db();
-    db.insert_interactive_session("session-1", "s1", "opencode", "/tmp", None)
+    db.insert_interactive_session("session-1", "s1", "opencode", "/tmp", None, "interactive")
         .unwrap();
-    db.insert_interactive_session("session-2", "s2", "opencode", "/tmp", None)
+    db.insert_interactive_session("session-2", "s2", "opencode", "/tmp", None, "interactive")
         .unwrap();
-    db.insert_interactive_session("session-3", "s3", "opencode", "/tmp", None)
+    db.insert_interactive_session("session-3", "s3", "opencode", "/tmp", None, "interactive")
         .unwrap();
 
     db.bind_session_to_seed("session-1", "seed-oak").unwrap();

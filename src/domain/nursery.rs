@@ -5,7 +5,7 @@
 //! - A draft `identity.toml` with empty/default fields
 //! - An instruction file (e.g. `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`) containing
 //!   "Gardener Instructions" that guide the agent to interview the user and define
-//!   the seed's name, family, directives, and traits.
+//!   the seed's name, directives, and traits.
 
 use std::path::PathBuf;
 
@@ -24,26 +24,23 @@ across sessions.
 Work with the user to define the following, then write them to `identity.toml` in this directory:
 
 1. **name** — A unique display name (e.g. "Liquidambar", "Quercus", "Boletus"). Use a plant, fungi, or nature-inspired name.
-2. **family** — A category label (e.g. "Trees", "Fungi", "Minerals", "Weather").
-3. **directives.general** — A list of behavioral rules (e.g. "Prioritize type-safety", "Explain structural changes before executing").
-4. **traits.tone** — Communication style (e.g. "Concise, Technical, Patient").
-5. **traits.focus** — Specialization areas (e.g. "Refactoring, Bug Hunting, Architecture").
+2. **directives.general** — A list of behavioral rules (e.g. "Prioritize type-safety", "Explain structural changes before executing").
+3. **traits.tone** — Communication style (e.g. "Concise, Technical, Patient").
+4. **traits.focus** — Specialization areas (e.g. "Refactoring, Bug Hunting, Architecture").
 
 ## Process
 
 1. Greet the user and explain you're helping define a new Seed identity.
 2. Ask for a name suggestion. If they're stuck, suggest some nature-inspired names.
-3. Ask for a family/category.
-4. Ask what behavioral directives they want (coding style, safety rules, etc.).
-5. Ask about tone and focus preferences.
-6. Write the final `identity.toml` using the format below.
-7. Confirm with the user that everything looks correct.
+3. Ask what behavioral directives they want (coding style, safety rules, etc.).
+4. Ask about tone and focus preferences.
+5. Write the final `identity.toml` using the format below.
+6. Confirm with the user that everything looks correct.
 
 ## identity.toml Format
 
 ```toml
 name = "TheName"
-family = "TheFamily"
 created_at = "2026-01-01T00:00:00Z"
 
 [directives]
@@ -89,7 +86,6 @@ pub fn create_nursery(cli_name: &str) -> Result<PathBuf, String> {
     // Write draft identity.toml
     let identity = SeedIdentity {
         name: String::new(),
-        family: String::new(),
         created_at: chrono::Utc::now(),
         directives: SeedDirectives::default(),
         traits: SeedTraits::default(),
@@ -194,7 +190,6 @@ mod tests {
         assert!(!GARDENER_INSTRUCTIONS.is_empty());
         assert!(GARDENER_INSTRUCTIONS.contains("identity.toml"));
         assert!(GARDENER_INSTRUCTIONS.contains("name"));
-        assert!(GARDENER_INSTRUCTIONS.contains("family"));
         assert!(GARDENER_INSTRUCTIONS.contains("directives"));
         assert!(GARDENER_INSTRUCTIONS.contains("traits"));
     }
@@ -220,7 +215,6 @@ mod tests {
 
         let content = std::fs::read_to_string(&identity_path).unwrap();
         assert!(content.contains("name = \"\""));
-        assert!(content.contains("family = \"\""));
         assert!(content.contains("created_at"));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -255,7 +249,6 @@ mod tests {
         let content = std::fs::read_to_string(temp_dir.join("identity.toml")).unwrap();
         let identity = SeedIdentity::from_toml(&content).unwrap();
         assert!(identity.name.is_empty());
-        assert!(identity.family.is_empty());
         assert!(identity.directives.general.is_empty());
         assert!(identity.traits.tone.is_none());
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -266,7 +259,7 @@ mod tests {
         let temp_dir = create_nursery("opencode").unwrap();
 
         // Write a valid identity
-        let identity = SeedIdentity::new("TestNurseryOak".to_string(), "Trees".to_string());
+        let identity = SeedIdentity::new("TestNurseryOak".to_string());
         std::fs::write(temp_dir.join("identity.toml"), identity.to_toml().unwrap()).unwrap();
 
         let seed_id = finalize_nursery(&temp_dir).unwrap();
@@ -276,7 +269,6 @@ mod tests {
         assert!(seeds::load_seed(&seed_id).is_ok());
         let loaded = seeds::load_seed(&seed_id).unwrap();
         assert_eq!(loaded.name, "TestNurseryOak");
-        assert_eq!(loaded.family, "Trees");
 
         // Verify temp dir was cleaned up
         assert!(!temp_dir.exists());
@@ -312,13 +304,13 @@ mod tests {
     #[test]
     fn finalize_nursery_rejects_name_collision() {
         // First, create a seed with a known name
-        let existing = SeedIdentity::new("UniqueNurseryName".to_string(), "Fungi".to_string());
+        let existing = SeedIdentity::new("UniqueNurseryName".to_string());
         let existing_id = slugify("UniqueNurseryName");
         seeds::save_seed(&existing_id, &existing).unwrap();
 
         // Now try to finalize a nursery with the same name
         let temp_dir = create_nursery("opencode").unwrap();
-        let identity = SeedIdentity::new("UniqueNurseryName".to_string(), "Trees".to_string());
+        let identity = SeedIdentity::new("UniqueNurseryName".to_string());
         std::fs::write(temp_dir.join("identity.toml"), identity.to_toml().unwrap()).unwrap();
 
         let result = finalize_nursery(&temp_dir);
@@ -333,7 +325,7 @@ mod tests {
     #[test]
     fn finalize_nursery_slugifies_special_characters() {
         let temp_dir = create_nursery("opencode").unwrap();
-        let identity = SeedIdentity::new("Red Oak 🌳".to_string(), "Trees".to_string());
+        let identity = SeedIdentity::new("Red Oak 🌳".to_string());
         std::fs::write(temp_dir.join("identity.toml"), identity.to_toml().unwrap()).unwrap();
 
         let seed_id = finalize_nursery(&temp_dir).unwrap();

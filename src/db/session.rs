@@ -13,7 +13,8 @@ pub struct InteractiveSession {
     pub working_dir: String,
     pub args: Option<String>,
     pub started_at: String,
-    pub status: String, // active, completed, error
+    pub status: String,
+    pub session_type: String,
 }
 
 #[allow(dead_code)]
@@ -34,12 +35,13 @@ impl Database {
         cli: &str,
         working_dir: &str,
         args: Option<&str>,
+        session_type: &str,
     ) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         conn.execute(
-            "INSERT OR REPLACE INTO interactive_sessions (id, name, cli, working_dir, args, started_at, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active')",
-            params![id, name, cli, working_dir, args, Utc::now().to_rfc3339()],
+            "INSERT OR REPLACE INTO interactive_sessions (id, name, cli, working_dir, args, started_at, status, session_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7)",
+            params![id, name, cli, working_dir, args, Utc::now().to_rfc3339(), session_type],
         )?;
         Ok(())
     }
@@ -68,7 +70,7 @@ impl Database {
     pub fn get_active_sessions(&self) -> Result<Vec<InteractiveSession>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, cli, working_dir, args, started_at, status
+            "SELECT id, name, cli, working_dir, args, started_at, status, session_type
              FROM interactive_sessions WHERE status = 'active' ORDER BY started_at DESC",
         )?;
         let rows = stmt
@@ -81,6 +83,7 @@ impl Database {
                     args: row.get(4)?,
                     started_at: row.get(5)?,
                     status: row.get(6)?,
+                    session_type: row.get(7)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -151,6 +154,25 @@ impl Database {
         conn.execute(
             "UPDATE terminal_sessions SET status = 'orphaned' WHERE status = 'idle'",
             [],
+        )?;
+        Ok(())
+    }
+
+    /// Get the session_type for an interactive session by id.
+    pub fn get_session_type(&self, session_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut stmt =
+            conn.prepare("SELECT session_type FROM interactive_sessions WHERE id = ?1")?;
+        let result = stmt.query_row(params![session_id], |row| row.get(0)).ok();
+        Ok(result)
+    }
+
+    /// Remove an interactive session record entirely (used for nursery cleanup).
+    pub fn remove_interactive_session(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        conn.execute(
+            "DELETE FROM interactive_sessions WHERE id = ?1",
+            params![id],
         )?;
         Ok(())
     }

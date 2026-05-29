@@ -409,8 +409,6 @@ pub struct EvolveIdentityParams {
 pub struct CreateSeedParams {
     /// Unique display name (enforced case-insensitive across all seeds).
     pub name: String,
-    /// Family/category label (e.g. "Trees", "Fungi").
-    pub family: String,
     /// Behavioral directives injected into prompts.
     pub directives: Option<crate::domain::seeds::SeedDirectives>,
     /// Personality/style traits.

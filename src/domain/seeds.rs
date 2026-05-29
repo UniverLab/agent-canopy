@@ -31,8 +31,6 @@ pub fn identity_path(seed_id: &str) -> PathBuf {
 pub struct SeedIdentity {
     /// Unique display name (enforced case-insensitive across all seeds).
     pub name: String,
-    /// Family/category label (e.g. "Trees", "Fungi").
-    pub family: String,
     /// ISO 8601 creation timestamp.
     pub created_at: DateTime<Utc>,
     /// Behavioral directives injected into prompts.
@@ -65,10 +63,9 @@ pub struct SeedTraits {
 impl SeedIdentity {
     /// Create a new seed with the current timestamp.
     #[allow(dead_code)]
-    pub fn new(name: String, family: String) -> Self {
+    pub fn new(name: String) -> Self {
         Self {
             name,
-            family,
             created_at: Utc::now(),
             directives: SeedDirectives::default(),
             traits: SeedTraits::default(),
@@ -101,9 +98,6 @@ impl SeedIdentity {
     pub fn validate_fields(&self) -> Result<(), String> {
         if self.name.trim().is_empty() {
             return Err("Field 'name' must not be empty.".to_string());
-        }
-        if self.family.trim().is_empty() {
-            return Err("Field 'family' must not be empty.".to_string());
         }
         Ok(())
     }
@@ -148,7 +142,7 @@ impl SeedIdentity {
     pub fn prompt_injection(&self) -> String {
         let mut parts = Vec::new();
 
-        parts.push(format!("## Seed Identity: {} ({})", self.name, self.family));
+        parts.push(format!("## Seed Identity: {}", self.name));
 
         if !self.directives.general.is_empty() {
             parts.push("### Directives".to_string());

@@ -367,6 +367,22 @@ impl TaskTriggerHandler {
         header_str(parts, CANOPY_CLIENT_NAME_HEADER)
     }
 
+    fn reject_if_nursery(&self, parts: &Parts) -> Result<(), McpError> {
+        match self.db.get_session_type(
+            header_str(parts, CANOPY_AGENT_ID_HEADER)
+                .ok_or_else(missing_sync_identity_error)?,
+        ) {
+            Ok(Some(st)) if st == "nursery" => {
+                Err(McpError::invalid_params(
+                    "This tool is not available during a seed creation session (nursery). Complete the seed identity interview first.".to_string(),
+                    None,
+                ))
+            }
+            Ok(_) => Ok(()),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+        }
+    }
+
     /// Fetch knowledge for the context endpoint.
     /// When project_hash is provided, returns project-scoped facts/patterns
     /// alongside session nodes; otherwise returns all node kinds.
@@ -944,6 +960,7 @@ impl TaskTriggerHandler {
         Parameters(params): Parameters<SyncDeclareIntentParams>,
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
+        self.reject_if_nursery(&parts)?;
         let Some(impact) = MissionImpact::from_str(&params.impact) else {
             return Ok(error_result(
                 "Invalid impact. Must be: low, high, breaking.",
@@ -978,6 +995,7 @@ impl TaskTriggerHandler {
         Parameters(params): Parameters<SyncReportStatusParams>,
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
+        self.reject_if_nursery(&parts)?;
         let Some(status) = WorkspaceStatus::from_str(&params.status) else {
             return Ok(error_result(
                 "Invalid status. Must be: stable, unstable, testing.",
@@ -1012,6 +1030,7 @@ impl TaskTriggerHandler {
         Parameters(params): Parameters<SyncBroadcastParams>,
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
+        self.reject_if_nursery(&parts)?;
         let Some(kind) = MessageKind::from_str(&params.kind) else {
             return Ok(error_result("Invalid kind. Must be: info, query, answer."));
         };
@@ -1049,7 +1068,9 @@ impl TaskTriggerHandler {
     async fn sync_get_context(
         &self,
         Parameters(params): Parameters<SyncGetContextParams>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
+        self.reject_if_nursery(&parts)?;
         let limit = params.limit.unwrap_or(10);
 
         let context = self
@@ -1121,6 +1142,7 @@ impl TaskTriggerHandler {
         Parameters(params): Parameters<IntelligenceGetContextParams>,
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
+        self.reject_if_nursery(&parts)?;
         let scope = params.scope.trim().to_lowercase();
         let (session_limit, _knowledge_limit, sync_limit, dependency_limit) = match scope.as_str() {
             "light" => (2, 5, 8, 0),
@@ -1213,6 +1235,7 @@ impl TaskTriggerHandler {
         Parameters(params): Parameters<IntelligenceUpsertParams>,
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
+        self.reject_if_nursery(&parts)?;
         // Auto-detect project_hash from session workdir if not provided.
         let project_hash = params.node_data.project_hash.or_else(|| {
             let agent_id = self.resolve_sync_agent_id(&parts).ok()?;
@@ -1262,7 +1285,9 @@ impl TaskTriggerHandler {
     async fn intelligence_search(
         &self,
         Parameters(params): Parameters<IntelligenceSearchParams>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
+        self.reject_if_nursery(&parts)?;
         let limit = params.limit.unwrap_or(10).min(50);
         let results = self
             .db
@@ -1315,12 +1340,13 @@ impl TaskTriggerHandler {
     #[tool(
         name = "get_identity",
         description = "Read the agent's own structured identity contract (identity.toml). \
-         Returns the full TOML content including name, family, directives, and traits."
+         Returns the full TOML content including name, directives, and traits."
     )]
     async fn get_identity(
         &self,
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
+        self.reject_if_nursery(&parts)?;
         let (_, identity) = load_bound_seed_identity(&self.db, &parts)
             .map_err(|e| McpError::invalid_params(e, None))?;
         let toml_str = identity
@@ -1340,6 +1366,7 @@ impl TaskTriggerHandler {
         Parameters(params): Parameters<EvolveIdentityParams>,
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
+        self.reject_if_nursery(&parts)?;
         let (seed_id, mut identity) = load_bound_seed_identity(&self.db, &parts)
             .map_err(|e| McpError::invalid_params(e, None))?;
         identity
@@ -1363,7 +1390,6 @@ impl TaskTriggerHandler {
                 seeds_info.push(serde_json::json!({
                     "id": seed_id,
                     "name": identity.name,
-                    "family": identity.family,
                 }));
             }
         }
@@ -1379,11 +1405,12 @@ impl TaskTriggerHandler {
     async fn create_seed(
         &self,
         Parameters(params): Parameters<CreateSeedParams>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
+        self.reject_if_nursery(&parts)?;
         let seed_id = crate::domain::nursery::slugify(&params.name);
         let identity = crate::domain::seeds::SeedIdentity {
             name: params.name,
-            family: params.family,
             created_at: chrono::Utc::now(),
             directives: params.directives.unwrap_or_default(),
             traits: params.traits.unwrap_or_default(),
@@ -2155,7 +2182,9 @@ impl TaskTriggerHandler {
     async fn get_tools(
         &self,
         Parameters(params): Parameters<GetToolsParams>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
+        self.reject_if_nursery(&parts)?;
         let scope = params.scope.trim().to_lowercase();
         if !matches!(
             scope.as_str(),
@@ -2262,7 +2291,9 @@ impl TaskTriggerHandler {
     async fn rag_search(
         &self,
         Parameters(params): Parameters<RagSearchParams>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
+        self.reject_if_nursery(&parts)?;
         if let Some(result) = self.check_rag_rate_limit(&params).await {
             return Ok(result);
         }
@@ -2636,7 +2667,6 @@ fn inject_seed_identity(
                 "seed_identity".to_string(),
                 serde_json::json!({
                     "name": identity.name,
-                    "family": identity.family,
                     "directives": identity.directives.general,
                     "traits": serde_json::json!({
                         "tone": identity.traits.tone,

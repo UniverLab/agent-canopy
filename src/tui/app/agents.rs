@@ -400,9 +400,11 @@ impl App {
         let output_snippet = recent_output_snippet(agent, 5);
 
         // Finalize nursery if this was a seed creation session
-        if let Some(ref nursery_path) = self.nursery_path {
+        if let Some(ref nursery_path_ref) = self.nursery_path {
+            // Clone the path to avoid borrow conflict when we clear self.nursery_path
+            let nursery_path = nursery_path_ref.clone();
             if nursery_path.to_string_lossy() == working_dir && code == 0 {
-                match crate::domain::nursery::finalize_nursery(nursery_path) {
+                match crate::domain::nursery::finalize_nursery(&nursery_path) {
                     Ok(seed_id) => {
                         // Bind the session to the new seed
                         let _ = self.db.bind_session_to_seed(&agent_id, &seed_id);
@@ -412,15 +414,19 @@ impl App {
                         eprintln!("Nursery finalization failed: {e}");
                     }
                 }
-                self.nursery_path = None;
             } else if code != 0 {
                 // Clean up temp dir on error exit
-                let _ = std::fs::remove_dir_all(nursery_path);
-                self.nursery_path = None;
+                let _ = std::fs::remove_dir_all(&nursery_path);
             }
+            // Remove nursery session record from DB — it should not persist as a normal session
+            let _ = self.db.remove_interactive_session(&agent_id);
+            // Also remove the nursery project entry if it was registered
+            let _ = self.db.unregister_project_path(&nursery_path);
+            // Clear nursery state — do this after all uses of nursery_path
+            self.nursery_path = None;
+        } else {
+            let _ = self.db.finish_interactive_session(&agent_id, code);
         }
-
-        let _ = self.db.finish_interactive_session(&agent_id, code);
         let _ = self
             .db
             .close_agent_missions(&agent_id, &agent_name, &working_dir);

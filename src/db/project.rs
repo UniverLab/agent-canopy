@@ -88,6 +88,13 @@ impl Database {
         Ok(())
     }
 
+    pub fn unregister_project_path(&self, path: &Path) -> Result<()> {
+        if let Ok(Some(project)) = self.get_project_by_path(path) {
+            self.delete_project(&project.hash)?;
+        }
+        Ok(())
+    }
+
     pub fn clear_rag_queue(&self) -> Result<()> {
         let conn = self
             .conn

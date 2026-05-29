@@ -650,14 +650,19 @@ impl App {
             seed_id,
         )?;
         // Persist session in registry
+        let session_type = if is_nursery { "nursery" } else { "interactive" };
         let _ = self.db.insert_interactive_session(
             &agent.id,
             &agent.name,
             agent.cli.as_str(),
             &dir,
             args.as_deref(),
+            session_type,
         );
-        let _ = self.db.register_project_path(Path::new(&dir));
+        // Don't register nursery temp dir as a project — it's ephemeral
+        if !is_nursery {
+            let _ = self.db.register_project_path(Path::new(&dir));
+        }
         self.interactive_agents.push(agent);
         self.whimsg
             .notify_event(crate::tui::whimsg::WhimContext::AgentSpawned);

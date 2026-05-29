@@ -1768,6 +1768,7 @@ impl App {
             cli.as_str(),
             &session.working_dir,
             args.as_deref(),
+            &session.session_type,
         );
         self.interactive_agents.push(agent);
     }
@@ -2107,6 +2108,7 @@ mod tests {
             args: Some("--tui --yolo".to_string()),
             started_at: "2023-01-01T00:00:00Z".to_string(),
             status: "active".to_string(),
+            session_type: "interactive".to_string(),
         };
 
         assert!(
@@ -2126,6 +2128,7 @@ mod tests {
             args: Some("--tui --yolo".to_string()),
             started_at: "2023-01-01T00:00:00Z".to_string(),
             status: "active".to_string(),
+            session_type: "interactive".to_string(),
         };
 
         let args = build_resumed_session_args(&session, None, None, None, Some("--yolo")).unwrap();
@@ -2142,6 +2145,7 @@ mod tests {
             args: Some("--session abc123 --yolo".to_string()),
             started_at: "2023-01-01T00:00:00Z".to_string(),
             status: "active".to_string(),
+            session_type: "interactive".to_string(),
         };
 
         let args = build_resumed_session_args(
@@ -2167,6 +2171,7 @@ mod tests {
             args: None,
             started_at: "2023-01-01T00:00:00Z".to_string(),
             status: "active".to_string(),
+            session_type: "interactive".to_string(),
         };
 
         let args =
@@ -2186,6 +2191,7 @@ mod tests {
             args: Some("chat --trust-all-tools".to_string()),
             started_at: "2023-01-01T00:00:00Z".to_string(),
             status: "active".to_string(),
+            session_type: "interactive".to_string(),
         };
 
         let args = build_resumed_session_args(
