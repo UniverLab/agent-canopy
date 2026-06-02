@@ -1,5 +1,6 @@
 use super::types::{AgentEntry, App, Focus};
 use crate::tui::agent::{AgentStatus, InteractiveAgent};
+use crate::tui::terminal_history::{delete_history, save_history};
 use std::time::Duration;
 
 const SHADOW_SUMMARY_LINGER_SECS: u64 = 7;
@@ -755,6 +756,14 @@ impl App {
         let Some(agent) = self.terminal_agents.get_mut(idx) else {
             return false;
         };
+
+        let scrollback = agent.last_lines(2000);
+        if let Some(hist) = self.terminal_histories.get_mut(&agent.name) {
+            let lines: Vec<String> = scrollback.lines().map(|s| s.to_string()).collect();
+            hist.update_scrollback(&lines);
+            save_history(&self.data_dir, &agent.name, hist);
+        }
+        delete_history(&self.data_dir, &agent.name);
         agent.kill();
         self.remove_session_target(SessionTarget::Terminal(idx))
     }

@@ -500,6 +500,10 @@ fn handle_cd_command(app: &mut App, idx: usize, trimmed: &str) -> bool {
     };
 
     app.terminal_agents[idx].update_working_dir(&abs_path.to_string_lossy());
+    let _ = app.db.update_terminal_session_working_dir(
+        &app.terminal_agents[idx].id,
+        &abs_path.to_string_lossy(),
+    );
     true
 }
 

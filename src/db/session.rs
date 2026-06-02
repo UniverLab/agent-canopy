@@ -127,6 +127,16 @@ impl Database {
         Ok(())
     }
 
+    /// Update the working directory of an active terminal session.
+    pub fn update_terminal_session_working_dir(&self, id: &str, working_dir: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        conn.execute(
+            "UPDATE terminal_sessions SET working_dir = ?1, last_active = ?2 WHERE id = ?3",
+            params![working_dir, Utc::now().to_rfc3339(), id],
+        )?;
+        Ok(())
+    }
+
     /// Get all terminal sessions that are still active (idle = was active when canopy last ran).
     pub fn get_active_terminal_sessions(&self) -> Result<Vec<TerminalSession>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;

@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 /// Maximum entries per session history file.
 const MAX_ENTRIES: usize = 500;
+const MAX_SCROLLBACK_LINES: usize = 2000;
 
 // ── Data model ──────────────────────────────────────────────────
 
@@ -29,6 +30,8 @@ pub struct CommandEntry {
 pub struct SessionHistory {
     #[serde(default)]
     pub commands: Vec<CommandEntry>,
+    #[serde(default)]
+    pub scrollback: Vec<String>,
 }
 
 impl SessionHistory {
@@ -63,6 +66,27 @@ impl SessionHistory {
             self.commands
                 .sort_by_key(|entry| std::cmp::Reverse(entry.last_run));
             self.commands.truncate(MAX_ENTRIES);
+        }
+        if self.scrollback.len() > MAX_SCROLLBACK_LINES {
+            self.scrollback
+                .drain(0..self.scrollback.len() - MAX_SCROLLBACK_LINES);
+        }
+    }
+
+    /// Update the scrollback buffer with new lines from the terminal.
+    pub fn update_scrollback(&mut self, lines: &[String]) {
+        self.scrollback.extend_from_slice(lines);
+        if self.scrollback.len() > MAX_SCROLLBACK_LINES * 2 {
+            self.scrollback
+                .drain(0..self.scrollback.len() - MAX_SCROLLBACK_LINES);
+        }
+        self.enforce_scrollback_limit();
+    }
+
+    fn enforce_scrollback_limit(&mut self) {
+        if self.scrollback.len() > MAX_SCROLLBACK_LINES {
+            self.scrollback
+                .drain(0..self.scrollback.len() - MAX_SCROLLBACK_LINES);
         }
     }
 
@@ -189,6 +213,13 @@ pub fn save_history(data_dir: &Path, session_name: &str, history: &SessionHistor
     if let Ok(content) = toml::to_string_pretty(history) {
         let _ = fs::write(&path, content);
     }
+}
+
+/// Delete a session's history from disk.
+pub fn delete_history(data_dir: &Path, session_name: &str) {
+    let path = history_path(data_dir, session_name);
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir(path.parent().unwrap());
 }
 
 /// Load and merge histories from ALL terminal sessions for global search.
