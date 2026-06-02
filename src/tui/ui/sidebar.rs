@@ -9,7 +9,9 @@ use ratatui::Frame;
 use super::{last_two_segments, truncate_str, ACCENT, BG_SELECTED, DIM, INTERACTIVE_COLOR};
 use super::{STATUS_DISABLED, STATUS_FAIL, STATUS_OK, STATUS_RUNNING};
 use crate::tui::agent::AgentStatus;
-use crate::tui::app::types::{AgentEntry, App, Focus, ProjectsPanelFocus, SidebarMode};
+use crate::tui::app::types::{
+    AgentEntry, AgentSectionFocus, App, Focus, ProjectsPanelFocus, SidebarMode,
+};
 use ratatui::style::Color;
 
 pub(super) fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -488,6 +490,7 @@ fn draw_agents_sidebar(
         background_indices,
         app,
         ACCENT,
+        AgentSectionFocus::Background,
     );
     render_agent_list_panel(
         frame,
@@ -496,6 +499,7 @@ fn draw_agents_sidebar(
         interactive_indices,
         app,
         INTERACTIVE_COLOR,
+        AgentSectionFocus::Interactive,
     );
     render_agent_list_panel(
         frame,
@@ -504,8 +508,9 @@ fn draw_agents_sidebar(
         terminal_indices,
         app,
         Color::Green,
+        AgentSectionFocus::Terminal,
     );
-    render_groups_panel(frame, layout.groups, app);
+    render_groups_panel(frame, layout.groups, app, AgentSectionFocus::Groups);
     render_brain_if_visible(frame, layout.brain, app);
     if let Some(rag_info_area) = layout.rag_info {
         draw_agents_rag_info_panel(frame, rag_info_area, app);
@@ -561,6 +566,7 @@ fn render_agent_list_panel(
     indices: &[usize],
     app: &mut App,
     accent: Color,
+    section: AgentSectionFocus,
 ) {
     let Some(area) = area else {
         return;
@@ -570,12 +576,17 @@ fn render_agent_list_panel(
         area,
         title,
         Style::default().fg(DIM),
-        Style::default().fg(DIM),
+        agent_section_border_style(app, section),
         |frame, inner| draw_agent_list(frame, inner, indices, app, accent),
     );
 }
 
-fn render_groups_panel(frame: &mut Frame, area: Option<Rect>, app: &mut App) {
+fn render_groups_panel(
+    frame: &mut Frame,
+    area: Option<Rect>,
+    app: &mut App,
+    section: AgentSectionFocus,
+) {
     let Some(area) = area else {
         return;
     };
@@ -584,7 +595,7 @@ fn render_groups_panel(frame: &mut Frame, area: Option<Rect>, app: &mut App) {
         area,
         " groups ",
         Style::default().fg(DIM),
-        Style::default().fg(DIM),
+        agent_section_border_style(app, section),
         |frame, inner| draw_groups_list(frame, inner, app),
     );
 }
@@ -906,6 +917,14 @@ fn projects_panel_border_style(app: &App, panel: ProjectsPanelFocus) -> Style {
     let focused = app.sidebar_mode == SidebarMode::Projects
         && matches!(app.focus, Focus::Home | Focus::Preview)
         && app.projects_panel_focus == panel
+        && !app.playground_active;
+    Style::default().fg(if focused { ACCENT } else { DIM })
+}
+
+fn agent_section_border_style(app: &App, section: AgentSectionFocus) -> Style {
+    let focused = app.sidebar_mode == SidebarMode::Agents
+        && matches!(app.focus, Focus::Home | Focus::Preview)
+        && app.agent_section_focus == section
         && !app.playground_active;
     Style::default().fg(if focused { ACCENT } else { DIM })
 }

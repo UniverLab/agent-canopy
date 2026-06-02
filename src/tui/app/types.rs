@@ -56,6 +56,16 @@ pub enum ProjectsPanelFocus {
     RagInfo,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[expect(dead_code)]
+pub enum AgentSectionFocus {
+    Background,
+    Interactive,
+    Terminal,
+    Groups,
+    Brain,
+}
+
 #[derive(Clone)]
 pub(crate) enum WorkflowEditorMode {
     AgentPrompt,
@@ -239,6 +249,7 @@ pub struct App {
     pub(crate) projects: Vec<Project>,
     pub(crate) selected_project: usize,
     pub(crate) projects_panel_focus: ProjectsPanelFocus,
+    pub(crate) agent_section_focus: AgentSectionFocus,
     pub(crate) workflows: Vec<Workflow>,
     pub(crate) selected_workflow_id: Option<String>,
     pub(crate) workflow_details: Option<WorkflowDetails>,

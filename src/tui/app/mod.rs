@@ -37,7 +37,7 @@ pub(crate) use session_resume::build_resumed_session_args;
 pub use terminal_search::TerminalSearch;
 pub(crate) use types::ContextTransferSource;
 use types::RagTransferModal;
-pub use types::{AgentEntry, App, Focus, ProjectsPanelFocus, SidebarMode};
+pub use types::{AgentEntry, AgentSectionFocus, App, Focus, ProjectsPanelFocus, SidebarMode};
 
 impl App {
     pub fn new(db: Arc<Database>, data_dir: &Path) -> Result<Self> {
@@ -84,6 +84,7 @@ impl App {
             projects: Vec::new(),
             selected_project: 0,
             projects_panel_focus: ProjectsPanelFocus::Projects,
+            agent_section_focus: AgentSectionFocus::Background,
             workflows: Vec::new(),
             selected_workflow_id: None,
             workflow_details: None,
