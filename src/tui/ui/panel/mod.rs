@@ -369,11 +369,11 @@ fn draw_terminal_warp_mode(
     app: &mut App,
     idx: usize,
     snap: Option<&crate::tui::agent::ScreenSnapshot>,
-    sensitive: bool,
+    _sensitive: bool,
 ) {
     let (pty_area, input_area) = split_warp_areas(area);
     if let Some(snap) = snap {
-        render_snapshot(frame, pty_area, snap, app, sensitive, false);
+        render_snapshot(frame, pty_area, snap, app, false, false);
     }
     draw_warp_input_box(frame, input_area, app, idx);
     app.last_panel_inner = (pty_area.width, pty_area.height);
