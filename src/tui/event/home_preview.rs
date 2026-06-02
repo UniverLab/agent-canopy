@@ -22,10 +22,12 @@ pub fn handle_home_key(app: &mut App, code: KeyCode, _modifiers: KeyModifiers) -
             || app.rag_info.total_chunks > 0);
 
     match code {
-        KeyCode::F(10) if !app.agents.is_empty() => {
-            app.dismiss_brain();
-            app.log_scroll = 0;
-            app.focus = Focus::Preview;
+        KeyCode::F(10) => {
+            if app.focus == Focus::Home {
+                app.focus = Focus::Preview;
+            } else if app.focus == Focus::Preview {
+                app.focus = Focus::Home;
+            }
         }
         KeyCode::Esc => {
             app.quit_confirm = true;
