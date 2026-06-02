@@ -483,6 +483,7 @@ impl App {
                 }),
             })?;
 
+        let is_nursery = dialog.is_planting_new_seed();
         self.launch_interactive(&dialog)?;
         let new_agent_name = self
             .interactive_agents
@@ -498,6 +499,10 @@ impl App {
             {
                 self.selected = position;
             }
+        }
+
+        if is_nursery {
+            return Ok(());
         }
 
         let mut initial_content = std::collections::HashMap::new();
@@ -525,7 +530,9 @@ impl App {
             initial_content.insert("project_context".to_string(), project.path);
         }
         self.focus = super::super::types::Focus::Agent;
-        self.open_simple_prompt_dialog(Some(initial_content));
+        if !dialog.is_planting_new_seed() {
+            self.open_simple_prompt_dialog(Some(initial_content));
+        }
         Ok(())
     }
 
@@ -635,6 +642,7 @@ impl App {
         } else {
             dialog.selected_seed_id()
         };
+        let agent_name = if is_nursery { Some("semillero") } else { None };
         let agent = InteractiveAgent::spawn(
             cli,
             &dir,
@@ -643,7 +651,7 @@ impl App {
             args.as_deref(),
             fallback.as_deref(),
             accent,
-            None,
+            agent_name,
             &existing_refs,
             model.as_deref(),
             model_flag.as_deref(),
