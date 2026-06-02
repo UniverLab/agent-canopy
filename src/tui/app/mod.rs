@@ -359,8 +359,47 @@ impl App {
             return;
         }
 
+        let prev = self.selected;
         self.selected = (self.selected + 1) % self.agents.len();
+        self.update_agent_section_focus_on_change(prev);
         self.reset_log_scroll();
+    }
+
+    fn agent_section_ranges(&self) -> (Option<usize>, Option<usize>, Option<usize>) {
+        let mut bg_start: Option<usize> = None;
+        let mut int_start: Option<usize> = None;
+        let mut term_start: Option<usize> = None;
+        for (i, agent) in self.agents.iter().enumerate() {
+            match agent {
+                AgentEntry::Agent(_) | AgentEntry::Group(_) => {
+                    if bg_start.is_none() {
+                        bg_start = Some(i);
+                    }
+                }
+                AgentEntry::Interactive(_) => {
+                    if int_start.is_none() {
+                        int_start = Some(i);
+                    }
+                }
+                AgentEntry::Terminal(_) => {
+                    if term_start.is_none() {
+                        term_start = Some(i);
+                    }
+                }
+            }
+        }
+        (bg_start, int_start, term_start)
+    }
+
+    fn update_agent_section_focus_on_change(&mut self, _prev_selected: usize) {
+        let (bg_start, int_start, term_start) = self.agent_section_ranges();
+        if Some(self.selected) == int_start {
+            self.agent_section_focus = AgentSectionFocus::Interactive;
+        } else if Some(self.selected) == term_start {
+            self.agent_section_focus = AgentSectionFocus::Terminal;
+        } else if Some(self.selected) == bg_start {
+            self.agent_section_focus = AgentSectionFocus::Background;
+        }
     }
 
     pub fn select_prev(&mut self) {
@@ -483,10 +522,12 @@ impl App {
             return;
         }
 
+        let prev = self.selected;
         self.selected = self
             .selected
             .checked_sub(1)
             .unwrap_or(self.agents.len() - 1);
+        self.update_agent_section_focus_on_change(prev);
         self.reset_log_scroll();
     }
 
