@@ -172,19 +172,33 @@ fn render_browse_display(
     has_below: bool,
 ) {
     print!("\x1b[{total_rows}A");
-    print!("\r\x1b[2K \x1b[36m»\x1b[0m {}\r\n", current.display());
+    let path_str = current.to_string_lossy();
+    let dashes = "─".repeat(60usize.saturating_sub(path_str.len() + 4));
     print!(
-        "\r\x1b[2K \x1b[90m↑↓ navigate → enter ← back Enter confirm Esc cancel type to filter\x1b[0m\r\n"
+        "\r\x1b[2K\x1b[36m┌─»\x1b[0m \x1b[36m{}\x1b[0m\x1b[36m{dashes}┐\x1b[0m\r\n",
+        path_str
+    );
+    print!(
+        "\r\x1b[2K\x1b[90m│ ↑↓ navigate → enter ← back Enter confirm Esc cancel type to filter │\x1b[0m\r\n"
     );
 
     if filter.is_empty() {
-        print!("\r\x1b[2K \x1b[90mfilter: _\x1b[0m\r\n");
+        print!("\r\x1b[2K\x1b[90m│ filter: _                                                                   │\x1b[0m\r\n");
     } else {
-        print!("\r\x1b[2K filter: \x1b[33m{filter}\x1b[0m \x1b[90m(Backspace to clear)\x1b[0m\r\n");
+        print!("\r\x1b[2K\x1b[90m│ filter: \x1b[33m{}\x1b[0m                                                                   │\x1b[0m\r\n", filter);
     }
 
     render_subdirs_section(subdirs, cursor, scroll, visible, filter);
-    render_pagination_line(subdirs, cursor, has_above, has_below);
+    let up = if has_above { "↑" } else { " " };
+    let dn = if has_below { "↓" } else { " " };
+    print!(
+        "\r\x1b[2K\x1b[90m└{} {} {}/{} {}┘\x1b[0m\r\n",
+        "─".repeat(20),
+        up,
+        cursor.saturating_add(1),
+        subdirs.len(),
+        dn
+    );
 }
 
 fn render_subdirs_section(
@@ -234,21 +248,34 @@ fn render_multiselect_display(
     selected: &std::collections::HashSet<String>,
 ) {
     print!("\x1b[{total_rows}A");
-    print!("\r\x1b[2K \x1b[36m»\x1b[0m {}\r\n", current.display());
     let selected_count = selected.len();
+    let path_str = current.to_string_lossy();
+    let dashes = "─".repeat(60usize.saturating_sub(path_str.len() + 4));
     print!(
-        "\r\x1b[2K \x1b[90m↑↓ navigate Space mark → enter ← back Enter confirm Esc cancel ({} selected)\x1b[0m\r\n",
-        selected_count
+        "\r\x1b[2K\x1b[36m┌─»\x1b[0m \x1b[36m{}\x1b[0m\x1b[36m{}┐\x1b[0m\r\n",
+        path_str, dashes
+    );
+    print!(
+        "\r\x1b[2K\x1b[90m│ ↑↓ navigate Space mark → enter ← back Enter confirm Esc cancel ({selected_count} selected) │\x1b[0m\r\n"
     );
 
     if filter.is_empty() {
-        print!("\r\x1b[2K \x1b[90mfilter: _\x1b[0m\r\n");
+        print!("\r\x1b[2K\x1b[90m│ filter: _                                                                   │\x1b[0m\r\n");
     } else {
-        print!("\r\x1b[2K filter: \x1b[33m{filter}\x1b[0m \x1b[90m(Backspace to clear)\x1b[0m\r\n");
+        print!("\r\x1b[2K\x1b[90m│ filter: \x1b[33m{}\x1b[0m\x1b[90m                                                                   │\x1b[0m\r\n", filter);
     }
 
     render_multiselect_subdirs(subdirs, cursor, scroll, visible, filter, current, selected);
-    render_pagination_line(subdirs, cursor, has_above, has_below);
+    let up = if has_above { "↑" } else { " " };
+    let dn = if has_below { "↓" } else { " " };
+    print!(
+        "\r\x1b[2K\x1b[90m└{} {} {}/{} {}┘\x1b[0m\r\n",
+        "─".repeat(20),
+        up,
+        cursor.saturating_add(1),
+        subdirs.len(),
+        dn
+    );
 }
 
 fn render_multiselect_subdirs(
@@ -287,20 +314,6 @@ fn render_multiselect_subdirs(
         for _ in drawn..visible {
             print!("\r\x1b[2K\r\n");
         }
-    }
-}
-
-fn render_pagination_line(subdirs: &[String], cursor: usize, has_above: bool, has_below: bool) {
-    if subdirs.is_empty() {
-        print!("\r\x1b[2K \x1b[90m0 items\x1b[0m\r\n");
-    } else {
-        let up = if has_above { "↑ " } else { " " };
-        let dn = if has_below { " ↓" } else { " " };
-        print!(
-            "\r\x1b[2K \x1b[90m{up}{}/{}{dn}\x1b[0m\r\n",
-            cursor + 1,
-            subdirs.len()
-        );
     }
 }
 
