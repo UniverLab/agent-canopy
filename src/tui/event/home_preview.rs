@@ -23,14 +23,22 @@ pub fn handle_home_key(app: &mut App, code: KeyCode, _modifiers: KeyModifiers) -
 
     match code {
         KeyCode::F(10) => {
-            if app.focus == Focus::Home {
+            if app.focus == Focus::Agent {
                 app.focus = Focus::Preview;
             } else if app.focus == Focus::Preview {
                 app.focus = Focus::Home;
+            } else {
+                app.quit_confirm = true;
             }
         }
         KeyCode::Esc => {
-            app.quit_confirm = true;
+            if app.focus == Focus::Agent {
+                app.focus = Focus::Preview;
+            } else if app.focus == Focus::Preview {
+                app.focus = Focus::Home;
+            } else {
+                app.quit_confirm = true;
+            }
         }
         KeyCode::F(1) => {
             app.show_legend = true;
