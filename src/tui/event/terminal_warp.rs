@@ -7,6 +7,33 @@ use crate::tui::agent::{key_to_bytes, InteractiveAgent};
 use crate::tui::app::terminal_search::TerminalSearch;
 use crate::tui::app::types::App;
 
+// ── Clipboard paste in terminal warp mode ─────────────────────────────
+
+fn paste_clipboard_to_terminal(app: &mut App, idx: usize) {
+    let Some(text) = read_clipboard_from_terminal(app, idx) else {
+        return;
+    };
+    let agent = &mut app.terminal_agents[idx];
+    if agent.should_bypass_warp_input() || agent.warp_passthrough {
+        let _ = agent.write_to_pty(text.as_bytes());
+    } else if agent.warp_mode {
+        if let Ok(mut buf) = agent.input_buffer.lock() {
+            let pos = agent.warp_cursor.min(buf.len());
+            buf.insert_str(pos, &text);
+            agent.warp_cursor = pos + text.len();
+        }
+    }
+}
+
+fn read_clipboard_from_terminal(app: &App, idx: usize) -> Option<String> {
+    let agent = app.terminal_agents.get(idx)?;
+    if agent.should_bypass_warp_input() || agent.warp_passthrough || agent.warp_mode {
+        arboard::Clipboard::new().ok()?.get_text().ok()
+    } else {
+        None
+    }
+}
+
 const DIRECT_SYNC_WAIT_MS: u64 = 35;
 const TAB_SYNC_WAIT_MS: u64 = 90;
 const SCROLL_STEP: usize = 3;
@@ -174,6 +201,7 @@ fn handle_terminal_warp_control_key(app: &mut App, idx: usize, code: KeyCode) {
         KeyCode::Char('k') => clear_after_cursor(&mut app.terminal_agents[idx]),
         KeyCode::Char('a') => app.terminal_agents[idx].warp_cursor = 0,
         KeyCode::Char('e') => move_cursor_to_end(&mut app.terminal_agents[idx]),
+        KeyCode::Char('v') => paste_clipboard_to_terminal(app, idx),
         _ => {}
     }
 }

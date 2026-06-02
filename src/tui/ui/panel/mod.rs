@@ -418,8 +418,8 @@ fn adjusted_interactive_cursor_col(
         return cursor_col;
     }
 
-    // Copilot can render its own in-band cursor decoration; when present, trust
-    // the inverse-highlighted cell rather than vt cursor coordinates.
+    // Copilot renders its own in-band cursor as an inverse-highlighted cell.
+    // Trust that decoration over the vt cursor coordinates.
     if let Some(row) = snap.cells.get(snap.cursor_row as usize) {
         if let Some((idx, _)) = row
             .iter()
@@ -430,8 +430,7 @@ fn adjusted_interactive_cursor_col(
         }
     }
 
-    // Legacy offset fallback for Copilot prompts that report one cell ahead.
-    cursor_col.saturating_sub(1)
+    cursor_col
 }
 
 pub(super) fn draw_log_panel(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -1430,14 +1429,14 @@ mod tests {
     use ratatui::style::Color;
 
     #[test]
-    fn copilot_cursor_is_shifted_left_by_one() {
+    fn copilot_cursor_no_longer_shifted_without_inverse() {
         let snap = ScreenSnapshot {
             cells: vec![(0..8).map(|_| None).collect()],
             cursor_row: 0,
             cursor_col: 5,
             scrolled: false,
         };
-        assert_eq!(adjusted_interactive_cursor_col("copilot", &snap), 4);
+        assert_eq!(adjusted_interactive_cursor_col("copilot", &snap), 5);
         let snap_zero = ScreenSnapshot {
             cursor_col: 0,
             ..snap
