@@ -1085,31 +1085,60 @@ fn draw_playground_panel(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn playground_header_lines(scope_label: &str, query: &str) -> Vec<Line<'static>> {
-    vec![
-        Line::from(vec![
-            Span::styled("RAG Playground ", Style::default().fg(DIM)),
-            Span::styled(format!("({scope_label}) "), Style::default().fg(Color::Yellow)),
+fn playground_header_lines(app: &App) -> Vec<Line<'static>> {
+    let scope_label = playground_scope_label(app);
+    let query = &app.playground_query;
+
+    let mut header = vec![Line::from(vec![
+        Span::styled("RAG Playground ", Style::default().fg(DIM)),
+        Span::styled(
+            format!("({scope_label}) "),
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::styled(
+            format!("· {query}"),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+    ])];
+
+    if app.playground_search_pending {
+        header.push(Line::from(vec![
+            Span::styled("  ◉ Searching", Style::default().fg(Color::Yellow)),
+            Span::styled(" · press Esc to cancel", Style::default().fg(DIM)),
+        ]));
+    } else if !app.playground_results.is_empty() {
+        header.push(Line::from(vec![
+            Span::styled("  ✓ ", Style::default().fg(ACCENT)),
             Span::styled(
-                format!("· {query}"),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                format!("{} results", app.playground_results.len()),
+                Style::default().fg(ACCENT),
             ),
-        ]),
-        Line::from(Span::styled(
-            "Type to search · ↑↓ navigate · Tab toggle scope · Enter focus · Ctrl+T transfer · Esc close",
-            Style::default().fg(DIM),
-        )),
-        Line::from(""),
-    ]
+        ]));
+    }
+
+    header.push(Line::from(Span::styled(
+        "Type to search · ↑↓ navigate · Tab toggle scope · Enter focus · Ctrl+T transfer · Esc close",
+        Style::default().fg(DIM),
+    )));
+    header.push(Line::from(""));
+
+    header
 }
 
-fn playground_empty_state(query: &str) -> Line<'static> {
-    let message = if query.trim().is_empty() {
+fn playground_empty_state(app: &App) -> Line<'static> {
+    let message = if app.playground_query.trim().is_empty() {
         "Start typing to search indexed chunks."
+    } else if app.playground_search_pending {
+        "◉ Searching..."
     } else {
         "No matching chunks."
     };
-    Line::from(Span::styled(message, Style::default().fg(DIM)))
+    let color = if app.playground_search_pending {
+        Color::Yellow
+    } else {
+        DIM
+    };
+    Line::from(Span::styled(message, Style::default().fg(color)))
 }
 
 fn visible_playground_window(area: Rect, selected: usize) -> (usize, usize) {
@@ -1133,11 +1162,10 @@ fn project_name_for_chunk<'a>(
 }
 
 fn draw_playground_list(frame: &mut Frame, area: Rect, app: &App) {
-    let scope_label = playground_scope_label(app);
-    let mut lines = playground_header_lines(&scope_label, &app.playground_query);
+    let mut lines = playground_header_lines(app);
 
     if app.playground_results.is_empty() {
-        lines.push(playground_empty_state(&app.playground_query));
+        lines.push(playground_empty_state(app));
         render_wrapped_paragraph(frame, area, lines);
         return;
     }
@@ -1162,6 +1190,11 @@ fn draw_playground_list(frame: &mut Frame, area: Rect, app: &App) {
     if total > max_visible {
         lines.push(Line::from(Span::styled(
             format!("  {}/{} results", app.playground_selected + 1, total),
+            Style::default().fg(DIM),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!("  {} results", total),
             Style::default().fg(DIM),
         )));
     }
