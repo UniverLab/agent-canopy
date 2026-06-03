@@ -37,7 +37,11 @@ pub fn draw_launchpad_dialog(frame: &mut Frame, app: &App) {
     };
 
     let mission_count = dialog.recent_missions.len();
-    let extra_lines = if mission_count > 0 { mission_count + 1 } else { 0 };
+    let extra_lines = if mission_count > 0 {
+        mission_count + 1
+    } else {
+        0
+    };
     let dialog_height = (12 + extra_lines as u16).min(24);
     let area = centered_rect(70, dialog_height, frame.area());
     frame.render_widget(Clear, area);
@@ -82,7 +86,12 @@ pub fn draw_launchpad_dialog(frame: &mut Frame, app: &App) {
             };
             let marker = if is_selected { ">" } else { " " };
             lines.push(Line::from(Span::styled(
-                format!("  {} [{}] {}", marker, i + 1, truncate_str(&mission.mission, 72)),
+                format!(
+                    "  {} [{}] {}",
+                    marker,
+                    i + 1,
+                    truncate_str(&mission.mission, 72)
+                ),
                 style,
             )));
         }

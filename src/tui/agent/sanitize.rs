@@ -162,7 +162,9 @@ pub fn strip_borders(line: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_ui_line, line_looks_sensitive_prompt, looks_like_shell_prompt, strip_shell_prompt_prefix};
+    use super::{
+        is_ui_line, line_looks_sensitive_prompt, looks_like_shell_prompt, strip_shell_prompt_prefix,
+    };
 
     #[test]
     fn detects_sensitive_prompts() {

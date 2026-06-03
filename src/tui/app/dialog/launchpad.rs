@@ -93,11 +93,7 @@ impl LaunchpadDialog {
             }
         }
 
-        let selected_index = if recent_missions.is_empty() {
-            0
-        } else {
-            0
-        };
+        let selected_index = 0;
 
         let active_missions = db
             .list_sync_messages(workdir, 30)

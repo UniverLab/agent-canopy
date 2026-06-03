@@ -1,4 +1,6 @@
-use crate::tui::agent::sanitize::{is_ui_line, looks_like_shell_prompt, sanitize_line, strip_borders};
+use crate::tui::agent::sanitize::{
+    is_ui_line, looks_like_shell_prompt, sanitize_line, strip_borders,
+};
 use crate::tui::agent::InteractiveAgent;
 
 /// Read a single line from the vt100 screen at `row`, with panic protection.
@@ -266,9 +268,8 @@ impl InteractiveAgent {
         while row > 0 && walked < 5 {
             row -= 1;
             walked += 1;
-            let line_text = match read_screen_line(screen, row, cols) {
-                Some(t) => t,
-                None => break,
+            let Some(line_text) = read_screen_line(screen, row, cols) else {
+                break;
             };
             let trimmed = sanitize_line(&line_text).trim_end().to_string();
             if trimmed.trim().is_empty() {
