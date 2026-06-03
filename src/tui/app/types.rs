@@ -41,6 +41,7 @@ pub enum Focus {
     Preview,
     NewAgentDialog,
     LaunchpadDialog,
+    KnowledgeDialog,
     Agent,
     ContextTransfer,
     RagTransfer,
@@ -225,6 +226,7 @@ pub struct App {
     pub(crate) running: bool,
     pub(crate) new_agent_dialog: Option<NewAgentDialog>,
     pub(crate) launchpad_dialog: Option<LaunchpadDialog>,
+    pub(crate) knowledge_dialog: Option<crate::tui::app::dialog::KnowledgeDialog>,
     pub(crate) pending_launch_dialog: Option<NewAgentDialog>,
     pub(crate) quit_confirm: bool,
     pub(crate) delete_project_confirm: bool,
@@ -266,6 +268,8 @@ pub struct App {
     /// Knowledge nodes (facts/patterns) for the selected project.
     pub(crate) project_knowledge: Vec<crate::db::intelligence::IntelligenceNodeRecord>,
     pub(crate) selected_knowledge: usize,
+    pub(crate) knowledge_filter: String,
+    pub(crate) knowledge_filter_mode: bool,
     pub(crate) sidebar_visible: bool,
     pub(crate) hidden_activity_workdirs: HashSet<String>,
     pub(crate) forced_activity_workdirs: HashSet<String>,
@@ -344,6 +348,12 @@ pub struct App {
 
     // Nursery — temporary path for seed creation workflow
     pub(crate) nursery_path: Option<std::path::PathBuf>,
+
+    // Atmosphere engine
+    pub(crate) atmosphere: crate::tui::atmosphere::SceneManager,
+    pub(crate) atmosphere_ctx: crate::tui::atmosphere::AtmosphereCtx,
+    /// Previous mouse position for delta calculation.
+    pub(crate) atmosphere_last_mouse: (u16, u16),
 }
 
 #[derive(Clone)]

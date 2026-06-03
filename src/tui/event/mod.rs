@@ -52,6 +52,7 @@ fn tick_duration(app: &App) -> Duration {
         Focus::Agent
         | Focus::NewAgentDialog
         | Focus::LaunchpadDialog
+        | Focus::KnowledgeDialog
         | Focus::ContextTransfer
         | Focus::RagTransfer
         | Focus::PromptTemplateDialog
@@ -79,6 +80,7 @@ fn dispatch_event(app: &mut App, event: Event) -> Result<()> {
         }
         Event::Mouse(mouse) => {
             app.notify_mouse_move();
+            app.notify_atmosphere_mouse(mouse.column, mouse.row);
             handle_mouse(app, mouse)
         }
         Event::Paste(text) => {
@@ -94,6 +96,7 @@ fn dispatch_event(app: &mut App, event: Event) -> Result<()> {
 mod agent_focus;
 mod context_transfer;
 mod home_preview;
+pub(crate) mod knowledge_dialog;
 mod launchpad;
 mod new_agent_dialog;
 mod paste;
@@ -101,6 +104,8 @@ mod prompt_template;
 mod rag_transfer;
 mod search_picker;
 mod terminal_warp;
+
+use knowledge_dialog::handle_knowledge_dialog_key;
 mod workflow_editor;
 
 pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
@@ -169,6 +174,7 @@ fn dispatch_focus_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> 
         Focus::Preview => handle_preview_key(app, code, modifiers),
         Focus::NewAgentDialog => handle_dialog_key(app, code),
         Focus::LaunchpadDialog => handle_launchpad_key(app, code),
+        Focus::KnowledgeDialog => handle_knowledge_dialog_key(app, code),
         Focus::Agent => handle_agent_key(app, code, modifiers),
         Focus::ContextTransfer => handle_context_transfer_key(app, code),
         Focus::RagTransfer => handle_rag_transfer_key(app, code),
@@ -354,6 +360,7 @@ fn handle_scroll(app: &mut App, dir: i32) {
             }
         }
         Focus::LaunchpadDialog
+        | Focus::KnowledgeDialog
         | Focus::ContextTransfer
         | Focus::RagTransfer
         | Focus::PromptTemplateDialog

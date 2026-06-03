@@ -6,6 +6,7 @@
 
 mod agent;
 mod app;
+mod atmosphere;
 mod brians_brain;
 pub(crate) mod context_transfer;
 mod event;

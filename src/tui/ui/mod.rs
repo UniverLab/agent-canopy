@@ -141,6 +141,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         dialogs::draw_workflow_editor_dialog(frame, app);
     }
 
+    if app.knowledge_dialog.is_some() {
+        dialogs::draw_knowledge_dialog(frame, app);
+    }
+
     if app.split_picker_open {
         dialogs::draw_split_picker(frame, app);
     }
@@ -184,6 +188,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 .style(ratatui::style::Style::default().fg(ACCENT).bg(Color::Black));
             frame.render_widget(widget, area);
         }
+    }
+
+    // Atmosphere particles — absolute top layer, drawn last over everything
+    {
+        let area = frame.area();
+        let ctx = app.atmosphere_ctx.clone();
+        app.atmosphere.tick(area, &ctx);
+        let buf = frame.buffer_mut();
+        super::atmosphere::render_atmosphere(&app.atmosphere, buf, area);
     }
 
     let _ = sync_area;

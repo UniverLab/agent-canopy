@@ -74,6 +74,7 @@ impl App {
             running: true,
             new_agent_dialog: None,
             launchpad_dialog: None,
+            knowledge_dialog: None,
             pending_launch_dialog: None,
             quit_confirm: false,
             delete_project_confirm: false,
@@ -151,7 +152,12 @@ impl App {
             project_graph_trees: Vec::new(),
             project_knowledge: Vec::new(),
             selected_knowledge: 0,
+            knowledge_filter: String::new(),
+            knowledge_filter_mode: false,
             nursery_path: None,
+            atmosphere: crate::tui::atmosphere::SceneManager::new(),
+            atmosphere_ctx: crate::tui::atmosphere::AtmosphereCtx::default(),
+            atmosphere_last_mouse: (0, 0),
         };
         app.refresh()?;
         Ok(app)
@@ -177,6 +183,7 @@ impl App {
             .store(self.sidebar_visible, Ordering::Relaxed);
         self.dismiss_copied();
         self.update_whimsg_context();
+        self.tick_atmosphere();
         self.resize_interactive_agents();
         self.refresh_playground_search()?;
 
@@ -267,10 +274,15 @@ impl App {
     }
 
     fn navigate_knowledge_next(&mut self) {
-        if self.project_knowledge.is_empty() {
+        let filtered = self.filtered_knowledge_indices();
+        if filtered.is_empty() {
             return;
         }
-        self.selected_knowledge = (self.selected_knowledge + 1) % self.project_knowledge.len();
+        let current = filtered
+            .iter()
+            .position(|&idx| idx == self.selected_knowledge)
+            .unwrap_or(0);
+        self.selected_knowledge = filtered[(current + 1) % filtered.len()];
     }
 
     fn navigate_projects_next(&mut self) {
@@ -408,13 +420,16 @@ impl App {
     }
 
     fn navigate_knowledge_prev(&mut self) {
-        if self.project_knowledge.is_empty() {
+        let filtered = self.filtered_knowledge_indices();
+        if filtered.is_empty() {
             return;
         }
-        self.selected_knowledge = self
-            .selected_knowledge
-            .checked_sub(1)
-            .unwrap_or(self.project_knowledge.len() - 1);
+        let current = filtered
+            .iter()
+            .position(|&idx| idx == self.selected_knowledge)
+            .unwrap_or(0);
+        let next = current.checked_sub(1).unwrap_or(filtered.len() - 1);
+        self.selected_knowledge = filtered[next];
     }
 
     fn navigate_projects_prev(&mut self) {
@@ -552,12 +567,10 @@ impl App {
         Ok(())
     }
 
-    fn refresh_project_knowledge(&mut self) -> Result<()> {
+    pub fn refresh_project_knowledge(&mut self) -> Result<()> {
         if let Some(project) = self.projects.get(self.selected_project) {
             self.project_knowledge = self.db.list_project_knowledge(&project.hash, None, 50)?;
-            self.selected_knowledge = self
-                .selected_knowledge
-                .min(self.project_knowledge.len().saturating_sub(1));
+            self.normalize_selected_knowledge();
         } else {
             self.project_knowledge.clear();
             self.selected_knowledge = 0;
@@ -734,6 +747,77 @@ impl App {
         self.refresh_projects()?;
         self.refresh_rag_state()?;
         Ok(())
+    }
+
+    pub fn delete_selected_knowledge(&mut self) -> Result<()> {
+        let Some(node) = self.project_knowledge.get(self.selected_knowledge) else {
+            return Ok(());
+        };
+        let id = node.id.clone();
+        self.db.delete_intelligence_node(&id)?;
+        self.refresh_project_knowledge()?;
+        Ok(())
+    }
+
+    pub fn filtered_knowledge_indices(&self) -> Vec<usize> {
+        let query = self.knowledge_filter.trim().to_lowercase();
+        self.project_knowledge
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| {
+                if query.is_empty() {
+                    return true;
+                }
+
+                node.title.to_lowercase().contains(&query)
+                    || node.body.to_lowercase().contains(&query)
+                    || node.kind.to_lowercase().contains(&query)
+            })
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    pub fn selected_filtered_knowledge_index(&self) -> Option<usize> {
+        self.filtered_knowledge_indices()
+            .iter()
+            .position(|&idx| idx == self.selected_knowledge)
+    }
+
+    pub fn append_knowledge_filter(&mut self, value: char) {
+        self.knowledge_filter.push(value);
+        self.normalize_selected_knowledge();
+    }
+
+    pub fn pop_knowledge_filter(&mut self) {
+        self.knowledge_filter.pop();
+        self.normalize_selected_knowledge();
+    }
+
+    pub fn clear_knowledge_filter(&mut self) {
+        self.knowledge_filter.clear();
+        self.normalize_selected_knowledge();
+    }
+
+    pub fn enter_knowledge_filter_mode(&mut self) {
+        self.knowledge_filter_mode = true;
+    }
+
+    pub fn exit_knowledge_filter_mode(&mut self) {
+        self.knowledge_filter_mode = false;
+    }
+
+    fn normalize_selected_knowledge(&mut self) {
+        let filtered = self.filtered_knowledge_indices();
+        if filtered.is_empty() {
+            self.selected_knowledge = 0;
+            return;
+        }
+
+        if filtered.contains(&self.selected_knowledge) {
+            return;
+        }
+
+        self.selected_knowledge = filtered[0];
     }
 
     #[allow(dead_code)]

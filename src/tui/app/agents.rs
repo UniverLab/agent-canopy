@@ -92,6 +92,37 @@ impl App {
         }
     }
 
+    /// Update atmosphere mouse context (call from event loop on MouseMove).
+    pub fn notify_atmosphere_mouse(&mut self, col: u16, row: u16) {
+        let (prev_col, prev_row) = self.atmosphere_last_mouse;
+        let delta_col = col as i16 - prev_col as i16;
+        let delta_row = row as i16 - prev_row as i16;
+        self.atmosphere_ctx.mouse_col = col;
+        self.atmosphere_ctx.mouse_row = row;
+        self.atmosphere_ctx.mouse_delta_col = delta_col;
+        self.atmosphere_ctx.mouse_delta_row = delta_row;
+        self.atmosphere_last_mouse = (col, row);
+        self.atmosphere.notify_mouse(col, row, delta_col, delta_row);
+    }
+
+    /// Advance the atmosphere engine one tick (called from App::refresh).
+    pub(super) fn tick_atmosphere(&mut self) {
+        use chrono::Timelike;
+        self.atmosphere_ctx.hour = chrono::Local::now().hour() as u8;
+        // Reset delta each tick so it decays to zero when mouse is stationary
+        self.atmosphere_ctx.mouse_delta_col = 0;
+        self.atmosphere_ctx.mouse_delta_row = 0;
+        // activity signals from existing scroll/key state
+        let scroll_active = self.last_scroll_at.elapsed().as_secs_f32() < 1.0;
+        self.atmosphere_ctx.scroll_velocity = if scroll_active { 0.8 } else { 0.0 };
+        // typing speed: approximate from animation tick rate (non-idle = 1.0)
+        self.atmosphere_ctx.typing_speed = if self.animation_tick.is_multiple_of(3) {
+            0.1
+        } else {
+            0.0
+        };
+    }
+
     pub fn tick_banner_animation(&mut self) {
         if let Some(ref mut brain) = self.home_brain {
             brain.step();
