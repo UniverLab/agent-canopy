@@ -43,7 +43,6 @@ pub fn line_looks_sensitive_prompt(line: &str) -> bool {
     SENSITIVE_PROMPT_HINTS
         .iter()
         .any(|hint| lower.contains(hint))
-        && (trimmed.ends_with(':') || trimmed.ends_with('?'))
 }
 
 pub fn strip_shell_prompt_prefix(line: &str) -> String {
@@ -167,6 +166,15 @@ mod tests {
             "Password for https://example.com?"
         ));
         assert!(!line_looks_sensitive_prompt("$ git push"));
+    }
+
+    #[test]
+    fn detects_sensitive_prompts_without_suffix() {
+        // When terminal is narrow, the prompt may wrap and the keyword
+        // may appear on a line that doesn't end with : or ?
+        assert!(line_looks_sensitive_prompt("Enter passphrase for key"));
+        assert!(line_looks_sensitive_prompt("Enter your password"));
+        assert!(line_looks_sensitive_prompt("Please enter the verification code"));
     }
 
     #[test]
