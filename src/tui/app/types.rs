@@ -354,6 +354,8 @@ pub struct App {
     pub(crate) atmosphere_ctx: crate::tui::atmosphere::AtmosphereCtx,
     /// Previous mouse position for delta calculation.
     pub(crate) atmosphere_last_mouse: (u16, u16),
+    /// When true, particles are not rendered (suppressed by held click).
+    pub(crate) atmosphere_hidden: bool,
 }
 
 #[derive(Clone)]

@@ -158,6 +158,7 @@ impl App {
             atmosphere: crate::tui::atmosphere::SceneManager::new(),
             atmosphere_ctx: crate::tui::atmosphere::AtmosphereCtx::default(),
             atmosphere_last_mouse: (0, 0),
+            atmosphere_hidden: false,
         };
         app.refresh()?;
         Ok(app)

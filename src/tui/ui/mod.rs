@@ -191,7 +191,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     // Atmosphere particles — absolute top layer, drawn last over everything
-    {
+    if !app.atmosphere_hidden {
         let area = frame.area();
         let ctx = app.atmosphere_ctx.clone();
         app.atmosphere.tick(area, &ctx);

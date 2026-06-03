@@ -1,13 +1,8 @@
 //! Firefly particle scene (night mode).
 //!
-//! Each firefly = 3 terminal cells rendered separately:
-//!   [left_wing] [!] [right_wing]
-//!
-//! Wing frames (fast cycle):  ≽/= />   and  ≼/= /<
-//! Center `!` is always dim gray. On "glow" frames, its background
-//! flashes a soft yellow — as if the light source pulses.
-//!
-//! Fireflies repel from the mouse cursor and move faster overall.
+//! 3 cells per firefly: [left_wing] [¡] [right_wing]
+//! Glow is independent of wing animation — probabilistic ignition
+//! that builds up over time and lasts 500–2000ms randomly.
 
 use ratatui::layout::Rect;
 use ratatui::style::Color;
@@ -16,27 +11,34 @@ use crate::tui::atmosphere::{AtmosphereCtx, Particle, Scene};
 use crate::tui::whimsg::rng::Rng;
 use std::time::Instant;
 
-/// Wing pairs: (left, right). Index 0 = open, 1 = mid, 2 = closed.
+/// Wing pairs: (left, right).
 const WINGS: [(&str, &str); 3] = [("≽", "≼"), ("=", "="), (">", "<")];
-/// Frame 0 is the "glow" frame (wings fully open).
-const FRAME_DURATION: f32 = 0.12; // fast wing flap
-const MAX_FIREFLIES: usize = 7;
-const SPAWN_INTERVAL_SECS: f32 = 3.0;
+const FRAME_DURATION: f32 = 0.13;
+const MAX_FIREFLIES: usize = 4;
+const SPAWN_INTERVAL_SECS: f32 = 4.0;
 
-/// Center body color (dim gray when not glowing).
-const BODY_DIM: Color = Color::Rgb(100, 100, 100);
-/// Wing color.
-const WING_COLOR: Color = Color::Rgb(90, 110, 90);
-/// Glow background — soft warm yellow pulse on center cell.
-const GLOW_BG: Color = Color::Rgb(60, 50, 10);
+const BODY_DIM: Color = Color::Rgb(80, 80, 80);
+const WING_DIM: Color = Color::Rgb(70, 90, 70);
+/// Bright glow fg when lit
+const BODY_GLOW_FG: Color = Color::Rgb(255, 240, 120);
+/// Glow bg — warm yellow
+const GLOW_BG: Color = Color::Rgb(80, 65, 10);
 
-/// Speed range (cells/sec).
 const SPEED_MIN: f32 = 1.5;
 const SPEED_MAX: f32 = 3.5;
-/// Mouse repulsion radius (cells).
 const REPEL_RADIUS: f32 = 10.0;
-/// Repulsion force multiplier.
-const REPEL_FORCE: f32 = 18.0;
+const REPEL_FORCE: f32 = 20.0;
+
+/// Max seconds before a firefly is guaranteed to glow (probability ramps linearly).
+const GLOW_RAMP_SECS: f32 = 20.0;
+
+#[derive(Clone, Copy, PartialEq)]
+enum GlowState {
+    /// Off — time_in_state tracks seconds dark (used to ramp ignition probability)
+    Off,
+    /// On — time_in_state tracks remaining glow duration
+    On,
+}
 
 struct Firefly {
     x: f32,
@@ -46,6 +48,11 @@ struct Firefly {
     frame: usize,
     frame_timer: f32,
     life: f32,
+    glow: GlowState,
+    /// Seconds spent in current glow state
+    time_in_state: f32,
+    /// Glow duration chosen at ignition (seconds)
+    glow_duration: f32,
 }
 
 pub struct FireflyScene {
@@ -66,32 +73,26 @@ impl FireflyScene {
     }
 
     fn spawn(&mut self, area: Rect) {
-        if self.fireflies.len() >= MAX_FIREFLIES {
+        if self.fireflies.len() >= MAX_FIREFLIES || area.width < 5 || area.height < 2 {
             return;
         }
-        if area.width < 5 || area.height < 2 {
-            return;
-        }
-        // Keep away from left edge (need col-1 for left wing)
         let x = self.rng.between(2, area.width.saturating_sub(3) as u64) as f32 + area.x as f32;
         let y = self.rng.between(1, area.height.saturating_sub(2) as u64) as f32 + area.y as f32;
-
         let speed = SPEED_MIN + self.rng.between(0, 100) as f32 / 100.0 * (SPEED_MAX - SPEED_MIN);
-        let angle = self.rng.between(0, 628) as f32 / 100.0; // 0..2π
-        let vx = angle.cos() * speed;
-        let vy = angle.sin() * speed * 0.5; // flatter vertical movement
-
-        // Random starting frame so not all in sync
-        let frame = self.rng.range(WINGS.len());
-
+        let angle = self.rng.between(0, 628) as f32 / 100.0;
+        // Start dark with random offset so they don't all ignite at once
+        let initial_dark = self.rng.between(0, GLOW_RAMP_SECS as u64 / 2) as f32;
         self.fireflies.push(Firefly {
             x,
             y,
-            vx,
-            vy,
-            frame,
+            vx: angle.cos() * speed,
+            vy: angle.sin() * speed * 0.5,
+            frame: self.rng.range(WINGS.len()),
             frame_timer: 0.0,
-            life: self.rng.between(30, 80) as f32,
+            life: self.rng.between(40, 90) as f32,
+            glow: GlowState::Off,
+            time_in_state: initial_dark,
+            glow_duration: 0.0,
         });
     }
 }
@@ -101,9 +102,8 @@ impl Scene for FireflyScene {
         if area.width < 5 || area.height < 2 {
             return;
         }
-
         if !self.initialized {
-            for _ in 0..(MAX_FIREFLIES / 2).max(2) {
+            for _ in 0..2 {
                 self.spawn(area);
             }
             self.initialized = true;
@@ -115,11 +115,10 @@ impl Scene for FireflyScene {
             self.spawn(area);
         }
 
-        let x_min = area.x as f32 + 1.0; // +1 for left wing cell
-        let x_max = (area.x + area.width) as f32 - 2.0; // -1 for right wing cell
+        let x_min = area.x as f32 + 1.0;
+        let x_max = (area.x + area.width) as f32 - 2.0;
         let y_min = area.y as f32;
         let y_max = (area.y + area.height) as f32 - 1.0;
-
         let mx = ctx.mouse_col as f32;
         let my = ctx.mouse_row as f32;
 
@@ -127,6 +126,30 @@ impl Scene for FireflyScene {
             fly.life -= delta_secs;
             if fly.life <= 0.0 {
                 return false;
+            }
+
+            // Glow state machine
+            fly.time_in_state += delta_secs;
+            match fly.glow {
+                GlowState::Off => {
+                    // Probability ramps from 0% at t=0 to 100% at GLOW_RAMP_SECS
+                    let prob_per_sec = (fly.time_in_state / GLOW_RAMP_SECS).clamp(0.0, 1.0);
+                    if self
+                        .rng
+                        .chance((prob_per_sec * delta_secs * 5.0).min(1.0) as f64)
+                    {
+                        fly.glow = GlowState::On;
+                        fly.time_in_state = 0.0;
+                        // 500–2000 ms
+                        fly.glow_duration = 0.5 + self.rng.between(0, 150) as f32 / 100.0;
+                    }
+                }
+                GlowState::On => {
+                    if fly.time_in_state >= fly.glow_duration {
+                        fly.glow = GlowState::Off;
+                        fly.time_in_state = 0.0;
+                    }
+                }
             }
 
             // Mouse repulsion
@@ -149,7 +172,6 @@ impl Scene for FireflyScene {
             fly.x += fly.vx * delta_secs;
             fly.y += fly.vy * delta_secs;
 
-            // Bounce off edges
             if fly.x < x_min {
                 fly.vx = fly.vx.abs();
                 fly.x = x_min;
@@ -165,7 +187,6 @@ impl Scene for FireflyScene {
                 fly.y = y_max;
             }
 
-            // Wing animation
             fly.frame_timer += delta_secs;
             if fly.frame_timer >= FRAME_DURATION {
                 fly.frame_timer -= FRAME_DURATION;
@@ -182,30 +203,27 @@ impl Scene for FireflyScene {
             let col = fly.x as u16;
             let row = fly.y as u16;
             let (lw, rw) = WINGS[fly.frame];
-            let glowing = fly.frame == 0; // open wings = glow frame
+            let lit = fly.glow == GlowState::On;
 
-            // Left wing
             out.push(Particle {
                 col: col.saturating_sub(1),
                 row,
                 symbol: lw,
-                color: WING_COLOR,
+                color: WING_DIM,
                 bg: None,
             });
-            // Center body — always `!`, bg flashes on glow frame
             out.push(Particle {
                 col,
                 row,
-                symbol: "!",
-                color: BODY_DIM,
-                bg: if glowing { Some(GLOW_BG) } else { None },
+                symbol: "¡",
+                color: if lit { BODY_GLOW_FG } else { BODY_DIM },
+                bg: if lit { Some(GLOW_BG) } else { None },
             });
-            // Right wing
             out.push(Particle {
                 col: col + 1,
                 row,
                 symbol: rw,
-                color: WING_COLOR,
+                color: WING_DIM,
                 bg: None,
             });
         }
@@ -226,12 +244,40 @@ mod tests {
         let mut scene = FireflyScene::new();
         let area = Rect::new(0, 0, 80, 24);
         scene.tick(0.1, area, &AtmosphereCtx::default());
-        let n = scene.fireflies.len();
-        assert_eq!(scene.particles().len(), n * 3);
+        assert_eq!(scene.particles().len(), scene.fireflies.len() * 3);
     }
 
     #[test]
-    fn test_firefly_mouse_repulsion_moves_fly() {
+    fn test_glow_ignites_within_ramp() {
+        let mut scene = FireflyScene::new();
+        scene.fireflies.push(Firefly {
+            x: 20.0,
+            y: 10.0,
+            vx: 0.0,
+            vy: 0.0,
+            frame: 0,
+            frame_timer: 0.0,
+            life: 999.0,
+            glow: GlowState::Off,
+            // Already at max ramp — should ignite quickly
+            time_in_state: GLOW_RAMP_SECS,
+            glow_duration: 0.0,
+        });
+        let area = Rect::new(0, 0, 80, 24);
+        let ctx = AtmosphereCtx::default();
+        // Tick many times at max probability; should ignite within ~50 ticks
+        let lit = (0..200).any(|_| {
+            scene.tick(0.05, area, &ctx);
+            scene
+                .fireflies
+                .first()
+                .is_some_and(|f| f.glow == GlowState::On)
+        });
+        assert!(lit);
+    }
+
+    #[test]
+    fn test_repulsion_moves_fly() {
         let mut scene = FireflyScene::new();
         let area = Rect::new(0, 0, 80, 24);
         scene.fireflies.push(Firefly {
@@ -242,8 +288,10 @@ mod tests {
             frame: 0,
             frame_timer: 0.0,
             life: 60.0,
+            glow: GlowState::Off,
+            time_in_state: 0.0,
+            glow_duration: 0.0,
         });
-        // Mouse 2 cells away — within REPEL_RADIUS
         let ctx = AtmosphereCtx {
             mouse_col: 7,
             mouse_row: 5,
@@ -251,7 +299,6 @@ mod tests {
         };
         scene.tick(0.1, area, &ctx);
         let fly = &scene.fireflies[0];
-        let moved = (fly.x - 5.0).abs() > 0.01 || (fly.y - 5.0).abs() > 0.01;
-        assert!(moved);
+        assert!((fly.x - 5.0).abs() > 0.01 || (fly.y - 5.0).abs() > 0.01);
     }
 }
