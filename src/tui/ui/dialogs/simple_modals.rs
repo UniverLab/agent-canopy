@@ -128,6 +128,33 @@ pub fn draw_legend(frame: &mut Frame, app: &App) {
         lines.push(Line::from(""));
     }
 
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "🏅 Medals Unlocked",
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    let medals: Vec<_> = crate::tui::gamification::medal_icons(&app.mission_manager);
+    lines.push(Line::from(
+        medals
+            .iter()
+            .flat_map(|(icon, unlocked)| {
+                let style = if *unlocked { accent_style } else { label_style };
+                let symbol = if *unlocked { *icon } else { "·" };
+                vec![Span::styled(symbol, style), Span::raw(" ")]
+            })
+            .collect::<Vec<_>>(),
+    ));
+
+    let unlocked_n = app.mission_manager.unlocked_count();
+    lines.push(Line::from(Span::styled(
+        format!("{unlocked_n} / {}", medals.len()),
+        label_style,
+    )));
+    lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "F1 or Esc to close",
         Style::default().fg(DIM),
@@ -142,7 +169,7 @@ pub fn draw_legend(frame: &mut Frame, app: &App) {
         .unwrap_or(36)
         + 4; // padding
     let width = content_width.clamp(36, 50);
-    let height = content_height.clamp(10, 22);
+    let height = content_height.clamp(12, 28);
     let percent_x = (width * 100 / frame.area().width.max(1)).clamp(30, 60);
     let area = centered_rect(percent_x, height, frame.area());
     frame.render_widget(Clear, area);
