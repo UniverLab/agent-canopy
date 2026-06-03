@@ -3,9 +3,9 @@ use anyhow::Result;
 use crate::db::Database;
 use crate::domain::sync::summarize_sync_context;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaunchpadChoice {
-    ContinuePrevious,
+    ContinueMission,
     NewMission,
 }
 
@@ -27,8 +27,8 @@ pub struct ActiveMissionSummary {
 #[derive(Clone)]
 pub struct LaunchpadDialog {
     pub workdir: String,
-    pub previous: Option<LaunchpadContext>,
-    pub selected: LaunchpadChoice,
+    pub recent_missions: Vec<LaunchpadContext>,
+    pub selected_index: usize,
     pub new_mission: String,
     pub cursor: usize,
     pub submit_blocked: bool,
@@ -39,7 +39,7 @@ pub struct LaunchpadDialog {
 impl LaunchpadDialog {
     pub fn for_workdir(db: &Database, workdir: &str) -> Result<Self> {
         let nodes = db.search_intelligence_nodes(workdir, Some("session"), 50)?;
-        let mut previous: Option<LaunchpadContext> = None;
+        let mut recent_missions: Vec<LaunchpadContext> = Vec::new();
         let mut run_summary: Option<String> = None;
 
         for node in nodes {
@@ -61,26 +61,21 @@ impl LaunchpadDialog {
                 .get("source")
                 .and_then(|value| value.as_str())
                 .unwrap_or_default();
+            let kind = metadata
+                .get("kind")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
 
-            if previous.is_none() && source == "launchpad" {
-                previous = Some(LaunchpadContext {
+            if recent_missions.len() < 5
+                && (source == "launchpad" || (source == "sync" && kind == "intent"))
+            {
+                recent_missions.push(LaunchpadContext {
                     node_id: node.id.clone(),
                     mission: node.title.clone(),
                     summary: metadata
                         .get("summary")
                         .and_then(|value| value.as_str())
                         .map(str::to_owned),
-                });
-            }
-
-            if previous.is_none()
-                && source == "sync"
-                && metadata.get("kind").and_then(|value| value.as_str()) == Some("intent")
-            {
-                previous = Some(LaunchpadContext {
-                    node_id: node.id.clone(),
-                    mission: node.title.clone(),
-                    summary: None,
                 });
             }
 
@@ -92,16 +87,16 @@ impl LaunchpadDialog {
             }
         }
 
-        if let Some(context) = previous.as_mut() {
-            if context.summary.is_none() {
-                context.summary = run_summary;
+        if let Some(ctx) = recent_missions.first_mut() {
+            if ctx.summary.is_none() {
+                ctx.summary = run_summary;
             }
         }
 
-        let selected = if previous.is_some() {
-            LaunchpadChoice::ContinuePrevious
+        let selected_index = if recent_missions.is_empty() {
+            0
         } else {
-            LaunchpadChoice::NewMission
+            0
         };
 
         let active_missions = db
@@ -127,8 +122,8 @@ impl LaunchpadDialog {
 
         Ok(Self {
             workdir: workdir.to_owned(),
-            previous,
-            selected,
+            recent_missions,
+            selected_index,
             new_mission: String::new(),
             cursor: 0,
             submit_blocked: false,
@@ -136,17 +131,37 @@ impl LaunchpadDialog {
         })
     }
 
-    pub fn has_previous(&self) -> bool {
-        self.previous.is_some()
+    pub fn total_items(&self) -> usize {
+        self.recent_missions.len() + 1
     }
 
-    pub fn toggle_choice(&mut self) {
-        self.selected = match self.selected {
-            LaunchpadChoice::ContinuePrevious if self.has_previous() => LaunchpadChoice::NewMission,
-            LaunchpadChoice::ContinuePrevious => LaunchpadChoice::NewMission,
-            LaunchpadChoice::NewMission if self.has_previous() => LaunchpadChoice::ContinuePrevious,
-            LaunchpadChoice::NewMission => LaunchpadChoice::NewMission,
-        };
+    pub fn is_new_mission_selected(&self) -> bool {
+        self.selected_index >= self.recent_missions.len()
+    }
+
+    pub fn selected_mission(&self) -> Option<&LaunchpadContext> {
+        self.recent_missions.get(self.selected_index)
+    }
+
+    pub fn choice(&self) -> LaunchpadChoice {
+        if self.is_new_mission_selected() {
+            LaunchpadChoice::NewMission
+        } else {
+            LaunchpadChoice::ContinueMission
+        }
+    }
+
+    pub fn move_selection_up(&mut self) {
+        if self.selected_index > 0 {
+            self.selected_index -= 1;
+        }
+        self.submit_blocked = false;
+    }
+
+    pub fn move_selection_down(&mut self) {
+        if self.selected_index < self.total_items() - 1 {
+            self.selected_index += 1;
+        }
         self.submit_blocked = false;
     }
 
@@ -156,15 +171,16 @@ impl LaunchpadDialog {
     }
 
     pub fn can_confirm_selection(&self) -> bool {
-        match self.selected {
-            LaunchpadChoice::ContinuePrevious => self.has_previous(),
-            LaunchpadChoice::NewMission => self.new_mission_title().is_some(),
+        if self.is_new_mission_selected() {
+            self.new_mission_title().is_some()
+        } else {
+            self.selected_mission().is_some()
         }
     }
 
     pub fn validation_message(&self) -> Option<&'static str> {
-        if self.selected == LaunchpadChoice::NewMission && self.new_mission_title().is_none() {
-            Some("Type a mission or use Continue previous.")
+        if self.is_new_mission_selected() && self.new_mission_title().is_none() {
+            Some("Type a mission name above.")
         } else {
             None
         }
@@ -179,7 +195,7 @@ impl LaunchpadDialog {
     }
 
     pub fn insert_char(&mut self, c: char) {
-        if self.selected != LaunchpadChoice::NewMission {
+        if !self.is_new_mission_selected() {
             return;
         }
         self.new_mission.insert(self.cursor, c);
@@ -188,7 +204,7 @@ impl LaunchpadDialog {
     }
 
     pub fn backspace(&mut self) {
-        if self.selected != LaunchpadChoice::NewMission || self.cursor == 0 {
+        if !self.is_new_mission_selected() || self.cursor == 0 {
             return;
         }
         let prev = self
@@ -204,7 +220,7 @@ impl LaunchpadDialog {
     }
 
     pub fn delete(&mut self) {
-        if self.selected != LaunchpadChoice::NewMission || self.cursor >= self.new_mission.len() {
+        if !self.is_new_mission_selected() || self.cursor >= self.new_mission.len() {
             return;
         }
         let next = self
@@ -218,7 +234,7 @@ impl LaunchpadDialog {
     }
 
     pub fn move_cursor_left(&mut self) {
-        if self.selected != LaunchpadChoice::NewMission || self.cursor == 0 {
+        if !self.is_new_mission_selected() || self.cursor == 0 {
             return;
         }
         self.cursor = self
@@ -231,7 +247,7 @@ impl LaunchpadDialog {
     }
 
     pub fn move_cursor_right(&mut self) {
-        if self.selected != LaunchpadChoice::NewMission || self.cursor >= self.new_mission.len() {
+        if !self.is_new_mission_selected() || self.cursor >= self.new_mission.len() {
             return;
         }
         self.cursor = self
@@ -251,8 +267,8 @@ mod tests {
     fn can_confirm_selection_requires_explicit_new_mission_text() {
         let mut dialog = LaunchpadDialog {
             workdir: "/tmp/project".to_string(),
-            previous: None,
-            selected: LaunchpadChoice::NewMission,
+            recent_missions: Vec::new(),
+            selected_index: 0,
             new_mission: "   ".to_string(),
             cursor: 3,
             submit_blocked: false,
@@ -262,7 +278,7 @@ mod tests {
         assert!(!dialog.can_confirm_selection());
         assert_eq!(
             dialog.validation_message(),
-            Some("Type a mission or use Continue previous.")
+            Some("Type a mission name above.")
         );
 
         dialog.new_mission = "Refactor sync panel".to_string();
@@ -270,5 +286,62 @@ mod tests {
 
         assert!(dialog.can_confirm_selection());
         assert_eq!(dialog.new_mission_title(), Some("Refactor sync panel"));
+    }
+
+    #[test]
+    fn navigation_respects_bounds() {
+        let mut dialog = LaunchpadDialog {
+            workdir: "/tmp/project".to_string(),
+            recent_missions: vec![
+                LaunchpadContext {
+                    node_id: "1".into(),
+                    mission: "Mission 1".into(),
+                    summary: None,
+                },
+                LaunchpadContext {
+                    node_id: "2".into(),
+                    mission: "Mission 2".into(),
+                    summary: None,
+                },
+            ],
+            selected_index: 0,
+            new_mission: String::new(),
+            cursor: 0,
+            submit_blocked: false,
+            active_missions: Vec::new(),
+        };
+
+        dialog.move_selection_up();
+        assert_eq!(dialog.selected_index, 0);
+
+        dialog.move_selection_down();
+        assert_eq!(dialog.selected_index, 1);
+
+        dialog.move_selection_down();
+        assert_eq!(dialog.selected_index, 2);
+
+        dialog.move_selection_down();
+        assert_eq!(dialog.selected_index, 2);
+    }
+
+    #[test]
+    fn select_existing_mission() {
+        let dialog = LaunchpadDialog {
+            workdir: "/tmp/project".to_string(),
+            recent_missions: vec![LaunchpadContext {
+                node_id: "1".into(),
+                mission: "Fix bug".into(),
+                summary: None,
+            }],
+            selected_index: 0,
+            new_mission: String::new(),
+            cursor: 0,
+            submit_blocked: false,
+            active_missions: Vec::new(),
+        };
+
+        assert!(dialog.can_confirm_selection());
+        assert_eq!(dialog.choice(), LaunchpadChoice::ContinueMission);
+        assert_eq!(dialog.selected_mission().unwrap().mission, "Fix bug");
     }
 }

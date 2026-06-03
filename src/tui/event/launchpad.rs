@@ -1,7 +1,6 @@
 use anyhow::Result;
 use ratatui::crossterm::event::KeyCode;
 
-use crate::tui::app::dialog::LaunchpadChoice;
 use crate::tui::app::types::App;
 
 pub fn handle_launchpad_key(app: &mut App, code: KeyCode) -> Result<()> {
@@ -28,32 +27,36 @@ pub fn handle_launchpad_key(app: &mut App, code: KeyCode) -> Result<()> {
                 return Ok(());
             };
             match code {
-                KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
-                    dialog.toggle_choice();
+                KeyCode::Up | KeyCode::BackTab => {
+                    dialog.move_selection_up();
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    dialog.move_selection_down();
                 }
                 KeyCode::Left => {
-                    if dialog.selected == LaunchpadChoice::NewMission {
+                    if dialog.is_new_mission_selected() {
                         dialog.move_cursor_left();
-                    } else {
-                        dialog.toggle_choice();
                     }
                 }
                 KeyCode::Right => {
-                    if dialog.selected == LaunchpadChoice::NewMission {
+                    if dialog.is_new_mission_selected() {
                         dialog.move_cursor_right();
-                    } else {
-                        dialog.toggle_choice();
                     }
                 }
-                KeyCode::Home => dialog.cursor = 0,
-                KeyCode::End => dialog.cursor = dialog.new_mission.len(),
+                KeyCode::Home => {
+                    if dialog.is_new_mission_selected() {
+                        dialog.cursor = 0;
+                    }
+                }
+                KeyCode::End => {
+                    if dialog.is_new_mission_selected() {
+                        dialog.cursor = dialog.new_mission.len();
+                    }
+                }
                 KeyCode::Backspace => dialog.backspace(),
                 KeyCode::Delete => dialog.delete(),
                 KeyCode::Char(c) => dialog.insert_char(c),
                 _ => {}
-            }
-            if !dialog.has_previous() {
-                dialog.selected = LaunchpadChoice::NewMission;
             }
         }
     }

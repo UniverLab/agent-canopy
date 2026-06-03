@@ -5,7 +5,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::tui::app::dialog::LaunchpadChoice;
 use crate::tui::app::types::App;
 
 use super::{centered_rect, truncate_str, ACCENT, BG_SELECTED, DIM, ERROR_COLOR};
@@ -37,7 +36,10 @@ pub fn draw_launchpad_dialog(frame: &mut Frame, app: &App) {
         return;
     };
 
-    let area = centered_rect(70, 16, frame.area());
+    let mission_count = dialog.recent_missions.len();
+    let extra_lines = if mission_count > 0 { mission_count + 1 } else { 0 };
+    let dialog_height = (12 + extra_lines as u16).min(24);
+    let area = centered_rect(70, dialog_height, frame.area());
     frame.render_widget(Clear, area);
 
     let title = format!(
@@ -60,53 +62,46 @@ pub fn draw_launchpad_dialog(frame: &mut Frame, app: &App) {
 
     let mut lines: Vec<Line> = Vec::new();
     let mut mission_row: Option<u16> = None;
-    if let Some(previous) = &dialog.previous {
+
+    if dialog.recent_missions.is_empty() {
         lines.push(Line::from(Span::styled(
-            "Previous mission (incomplete):",
+            "No previous missions found for this workspace.",
             Style::default().fg(DIM),
         )));
-        lines.push(Line::from(format!(
-            "  {}",
-            truncate_str(&previous.mission, 80)
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Recent missions:",
+            Style::default().fg(DIM),
         )));
-        if let Some(summary) = &previous.summary {
+        for (i, mission) in dialog.recent_missions.iter().enumerate() {
+            let is_selected = dialog.selected_index == i;
+            let style = if is_selected {
+                Style::default().bg(BG_SELECTED).fg(ACCENT)
+            } else {
+                Style::default().fg(DIM)
+            };
+            let marker = if is_selected { ">" } else { " " };
             lines.push(Line::from(Span::styled(
-                format!("Previous summary: {}", truncate_str(summary, 78)),
-                Style::default().fg(DIM),
+                format!("  {} [{}] {}", marker, i + 1, truncate_str(&mission.mission, 72)),
+                style,
             )));
         }
-    } else {
-        lines.push(Line::from(Span::styled(
-            "No previous mission found for this workspace.",
-            Style::default().fg(DIM),
-        )));
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from("What do you want to do today?"));
-
-    let continue_style = if dialog.selected == LaunchpadChoice::ContinuePrevious {
+    let new_item_index = dialog.recent_missions.len();
+    let is_new_selected = dialog.is_new_mission_selected();
+    let new_style = if is_new_selected {
         Style::default().bg(BG_SELECTED).fg(ACCENT)
     } else {
         Style::default().fg(DIM)
     };
-    let new_style = if dialog.selected == LaunchpadChoice::NewMission {
-        Style::default().bg(BG_SELECTED).fg(ACCENT)
-    } else {
-        Style::default().fg(DIM)
-    };
-
+    let marker = if is_new_selected { ">" } else { " " };
     lines.push(Line::from(Span::styled(
-        if dialog.previous.is_some() {
-            "  [ Continue previous mission ]"
-        } else {
-            "  [ Continue previous mission ] (disabled)"
-        },
-        continue_style,
+        format!("  {} [{}] New mission", marker, new_item_index + 1),
+        new_style,
     )));
-    lines.push(Line::from(Span::styled("  [ New mission ]", new_style)));
 
-    if dialog.selected == LaunchpadChoice::NewMission {
+    if is_new_selected {
         lines.push(Line::from(""));
         mission_row = Some(lines.len() as u16);
         let mission_value_width =
@@ -146,12 +141,12 @@ pub fn draw_launchpad_dialog(frame: &mut Frame, app: &App) {
             Style::default().fg(DIM),
         ),
         Span::styled(
-            "Tab",
+            "Up/Down",
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" toggle  ", Style::default().fg(DIM)),
+        Span::styled(" navigate  ", Style::default().fg(DIM)),
         Span::styled(
             "Esc",
             Style::default()
@@ -163,7 +158,7 @@ pub fn draw_launchpad_dialog(frame: &mut Frame, app: &App) {
 
     frame.render_widget(Paragraph::new(lines).block(Block::default()), inner);
 
-    if dialog.selected == LaunchpadChoice::NewMission {
+    if is_new_selected {
         let mission_prefix = "Mission: ";
         let mission_value_width = inner
             .width

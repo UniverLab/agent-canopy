@@ -436,9 +436,9 @@ impl App {
             return Ok(());
         };
 
-        let (mission_title, mission_context, previous_node_id, mode) = match launchpad.selected {
-            LaunchpadChoice::ContinuePrevious => {
-                let Some(previous) = &launchpad.previous else {
+        let (mission_title, mission_context, previous_node_id, mode) = match launchpad.choice() {
+            LaunchpadChoice::ContinueMission => {
+                let Some(previous) = launchpad.selected_mission() else {
                     return Ok(());
                 };
                 (
