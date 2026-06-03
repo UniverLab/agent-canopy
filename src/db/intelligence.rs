@@ -152,6 +152,22 @@ impl Database {
         }
     }
 
+    pub fn delete_intelligence_node(&self, id: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        conn.execute(
+            "DELETE FROM intelligence_edges WHERE from_node_id = ?1 OR to_node_id = ?1",
+            rusqlite::params![id],
+        )?;
+        conn.execute(
+            "DELETE FROM intelligence_nodes WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
+        Ok(())
+    }
+
     pub fn list_intelligence_nodes(
         &self,
         kind: Option<&str>,
