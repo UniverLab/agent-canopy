@@ -103,7 +103,7 @@ impl FireflyScene {
 }
 
 impl Scene for FireflyScene {
-    fn tick(&mut self, delta_secs: f32, area: Rect, ctx: &AtmosphereCtx) {
+    fn tick(&mut self, delta_secs: f32, area: Rect, ctx: &mut AtmosphereCtx) {
         if area.width < 5 || area.height < 2 {
             return;
         }
@@ -126,6 +126,18 @@ impl Scene for FireflyScene {
         let y_max = (area.y + area.height) as f32 - 1.0;
         let mx = ctx.mouse_col as f32;
         let my = ctx.mouse_row as f32;
+
+        if ctx.mouse_clicked {
+            for fly in &self.fireflies {
+                let dx = fly.x - mx;
+                let dy = fly.y - my;
+                let dist = (dx * dx + dy * dy).sqrt();
+                if dist <= 1.5 {
+                    ctx.firefly_caught = true;
+                    break;
+                }
+            }
+        }
 
         self.fireflies.retain_mut(|fly| {
             fly.life -= delta_secs;
@@ -255,7 +267,8 @@ mod tests {
     fn test_firefly_emits_3_particles_per_fly() {
         let mut scene = FireflyScene::new();
         let area = Rect::new(0, 0, 80, 24);
-        scene.tick(0.1, area, &AtmosphereCtx::default());
+        let mut ctx = AtmosphereCtx::default();
+        scene.tick(0.1, area, &mut ctx);
         assert_eq!(scene.particles().len(), scene.fireflies.len() * 3);
     }
 
@@ -276,10 +289,10 @@ mod tests {
             glow_duration: 0.0,
         });
         let area = Rect::new(0, 0, 80, 24);
-        let ctx = AtmosphereCtx::default();
+        let mut ctx = AtmosphereCtx::default();
         // Tick many times at max probability; should ignite within ~50 ticks
         let lit = (0..200).any(|_| {
-            scene.tick(0.05, area, &ctx);
+            scene.tick(0.05, area, &mut ctx);
             scene
                 .fireflies
                 .first()
@@ -305,14 +318,40 @@ mod tests {
             glow_duration: 0.0,
         });
         // Mouse 10 cells away — within REPEL_RADIUS (18)
-        let ctx = AtmosphereCtx {
+        let mut ctx = AtmosphereCtx {
             mouse_col: 15,
             mouse_row: 5,
             ..Default::default()
         };
-        scene.tick(0.1, area, &ctx);
+        scene.tick(0.1, area, &mut ctx);
         let fly = &scene.fireflies[0];
         assert!((fly.x - 5.0).abs() > 0.01 || (fly.y - 5.0).abs() > 0.01);
+    }
+
+    #[test]
+    fn test_firefly_catch_on_click_within_range() {
+        let mut scene = FireflyScene::new();
+        let area = Rect::new(0, 0, 80, 24);
+        scene.fireflies.push(Firefly {
+            x: 10.0,
+            y: 12.0,
+            vx: 0.0,
+            vy: 0.0,
+            frame: 0,
+            frame_timer: 0.0,
+            life: 60.0,
+            glow: GlowState::Off,
+            time_in_state: 0.0,
+            glow_duration: 0.0,
+        });
+        let mut ctx = AtmosphereCtx {
+            mouse_col: 11,
+            mouse_row: 12,
+            mouse_clicked: true,
+            ..Default::default()
+        };
+        scene.tick(0.1, area, &mut ctx);
+        assert!(ctx.firefly_caught);
     }
 
     #[test]
@@ -332,12 +371,12 @@ mod tests {
             glow_duration: 0.0,
         });
         // Mouse 2 cells away — within UNIVERSAL_REPEL_RADIUS (4)
-        let ctx = AtmosphereCtx {
+        let mut ctx = AtmosphereCtx {
             mouse_col: 12,
             mouse_row: 12,
             ..Default::default()
         };
-        scene.tick(0.1, area, &ctx);
+        scene.tick(0.1, area, &mut ctx);
         let fly = &scene.fireflies[0];
         // Should be pushed away (x < 10 or vx negative)
         assert!(fly.x < 10.0 || fly.vx < 0.0);

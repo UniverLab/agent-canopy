@@ -31,7 +31,7 @@ pub struct Particle {
 /// A self-contained particle animation.
 pub trait Scene: Send {
     /// Advance the simulation by `delta_secs` seconds.
-    fn tick(&mut self, delta_secs: f32, area: Rect, ctx: &AtmosphereCtx);
+    fn tick(&mut self, delta_secs: f32, area: Rect, ctx: &mut AtmosphereCtx);
     /// Collect the particles for this frame.
     fn particles(&self) -> Vec<Particle>;
     /// Whether the scene has anything to render right now.
@@ -54,6 +54,10 @@ pub struct AtmosphereCtx {
     pub scroll_velocity: f32,
     /// Typing speed hint (0.0 = idle, 1.0 = fast).
     pub typing_speed: f32,
+    /// Set when the user clicks (consumed on the next atmosphere tick).
+    pub mouse_clicked: bool,
+    /// Set by `FireflyScene` when a firefly is caught.
+    pub firefly_caught: bool,
 }
 
 // ── Prerequisites ─────────────────────────────────────────────────
@@ -120,7 +124,7 @@ impl SceneManager {
     }
 
     /// Advance all matching scenes and collect their particles.
-    pub fn tick(&mut self, area: Rect, ctx: &AtmosphereCtx) {
+    pub fn tick(&mut self, area: Rect, ctx: &mut AtmosphereCtx) {
         let delta = self.last_tick.elapsed().as_secs_f32().min(0.1);
         self.last_tick = Instant::now();
 
@@ -209,10 +213,10 @@ mod tests {
     fn test_scene_manager_tick_does_not_panic() {
         let mut mgr = SceneManager::new();
         let area = Rect::new(0, 0, 80, 24);
-        let ctx = AtmosphereCtx {
+        let mut ctx = AtmosphereCtx {
             hour: 23,
             ..Default::default()
         };
-        mgr.tick(area, &ctx);
+        mgr.tick(area, &mut ctx);
     }
 }

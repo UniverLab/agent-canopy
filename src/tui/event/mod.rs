@@ -83,6 +83,12 @@ fn dispatch_event(app: &mut App, event: Event) -> Result<()> {
             app.notify_atmosphere_mouse(mouse.column, mouse.row);
             // Suppress particles while any mouse button is held
             match mouse.kind {
+                ratatui::crossterm::event::MouseEventKind::Down(
+                    ratatui::crossterm::event::MouseButton::Left,
+                ) => {
+                    app.atmosphere_hidden = true;
+                    app.atmosphere_ctx.mouse_clicked = true;
+                }
                 ratatui::crossterm::event::MouseEventKind::Down(_) => {
                     app.atmosphere_hidden = true;
                 }

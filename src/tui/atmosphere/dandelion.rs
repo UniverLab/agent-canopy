@@ -97,7 +97,7 @@ impl DandelionScene {
 }
 
 impl Scene for DandelionScene {
-    fn tick(&mut self, delta_secs: f32, area: Rect, ctx: &AtmosphereCtx) {
+    fn tick(&mut self, delta_secs: f32, area: Rect, ctx: &mut AtmosphereCtx) {
         if area.width < 4 || area.height < 2 {
             return;
         }
@@ -205,12 +205,12 @@ mod tests {
     fn test_seeds_respect_max() {
         let mut scene = DandelionScene::new();
         let area = Rect::new(0, 0, 80, 24);
-        let ctx = AtmosphereCtx {
+        let mut ctx = AtmosphereCtx {
             scroll_velocity: 1.0,
             ..Default::default()
         };
         for _ in 0..200 {
-            scene.tick(0.05, area, &ctx);
+            scene.tick(0.05, area, &mut ctx);
         }
         assert!(scene.seeds.len() <= MAX_SEEDS);
     }
@@ -229,12 +229,12 @@ mod tests {
             life: 60.0,
         });
         // Mouse 20 cells to the right — within ATTRACT_RADIUS (25)
-        let ctx = AtmosphereCtx {
+        let mut ctx = AtmosphereCtx {
             mouse_col: 30,
             mouse_row: 12,
             ..Default::default()
         };
-        scene.tick(0.1, area, &ctx);
+        scene.tick(0.1, area, &mut ctx);
         // vx should have increased toward the mouse (positive direction)
         assert!(scene.seeds[0].vx > 0.0);
     }
@@ -253,12 +253,12 @@ mod tests {
             life: 60.0,
         });
         // Mouse 2 cells away — within UNIVERSAL_REPEL_RADIUS (4)
-        let ctx = AtmosphereCtx {
+        let mut ctx = AtmosphereCtx {
             mouse_col: 12,
             mouse_row: 12,
             ..Default::default()
         };
-        scene.tick(0.1, area, &ctx);
+        scene.tick(0.1, area, &mut ctx);
         // vx should be negative (pushed away from mouse)
         assert!(scene.seeds[0].vx < 0.0);
     }
