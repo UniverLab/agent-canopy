@@ -195,6 +195,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let area = frame.area();
         let ctx = app.atmosphere_ctx.clone();
         app.atmosphere.tick(area, &ctx);
+        // Reset mouse deltas after the scene has consumed them
+        app.atmosphere_ctx.mouse_delta_col = 0;
+        app.atmosphere_ctx.mouse_delta_row = 0;
         let buf = frame.buffer_mut();
         super::atmosphere::render_atmosphere(&app.atmosphere, buf, area);
     }

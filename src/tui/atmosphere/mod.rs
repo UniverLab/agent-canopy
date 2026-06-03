@@ -99,7 +99,8 @@ impl SceneManager {
             AtmosphereEvent {
                 id: "fireflies",
                 prerequisites: EventPrerequisites {
-                    time_range: Some((22, 4)), // 22:00 – 04:00
+                    // time_range: Some((22, 4)), // night 22:00–04:00 — uncomment for prod
+                    time_range: None,
                 },
                 scene: Box::new(FireflyScene::new()),
             },

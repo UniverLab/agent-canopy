@@ -109,13 +109,8 @@ impl App {
     pub(super) fn tick_atmosphere(&mut self) {
         use chrono::Timelike;
         self.atmosphere_ctx.hour = chrono::Local::now().hour() as u8;
-        // Reset delta each tick so it decays to zero when mouse is stationary
-        self.atmosphere_ctx.mouse_delta_col = 0;
-        self.atmosphere_ctx.mouse_delta_row = 0;
-        // activity signals from existing scroll/key state
         let scroll_active = self.last_scroll_at.elapsed().as_secs_f32() < 1.0;
         self.atmosphere_ctx.scroll_velocity = if scroll_active { 0.8 } else { 0.0 };
-        // typing speed: approximate from animation tick rate (non-idle = 1.0)
         self.atmosphere_ctx.typing_speed = if self.animation_tick.is_multiple_of(3) {
             0.1
         } else {
