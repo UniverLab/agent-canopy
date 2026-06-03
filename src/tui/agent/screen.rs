@@ -1,4 +1,4 @@
-use crate::tui::agent::sanitize::{is_ui_line, sanitize_line, strip_borders};
+use crate::tui::agent::sanitize::{is_ui_line, looks_like_shell_prompt, sanitize_line, strip_borders};
 use crate::tui::agent::InteractiveAgent;
 
 /// Read a single line from the vt100 screen at `row`, with panic protection.
@@ -240,6 +240,47 @@ impl InteractiveAgent {
         }
 
         Some(sanitize_line(&line).trim_end().to_string())
+    }
+
+    /// Return concatenated text of the cursor line plus any wrapped continuation
+    /// lines above it that belong to the same prompt. This allows detecting
+    /// sensitive prompts even when the terminal is narrow and the keyword wraps
+    /// to a different row than the cursor.
+    ///
+    /// Walks at most 5 rows upward and stops at empty rows or shell prompt
+    /// boundaries to avoid false positives from unrelated screen history.
+    pub(crate) fn prompt_context_text(&self) -> Option<String> {
+        let vt = self.vt.try_lock().ok()?;
+        let screen = vt.screen();
+        let (rows, cols) = screen.size();
+        if rows == 0 || cols == 0 {
+            return None;
+        }
+
+        let cursor = screen.cursor_position().0.min(rows.saturating_sub(1));
+        let cursor_line = read_screen_line(screen, cursor, cols)?;
+        let mut combined = sanitize_line(&cursor_line).trim_end().to_string();
+
+        let mut row = cursor;
+        let mut walked = 0u16;
+        while row > 0 && walked < 5 {
+            row -= 1;
+            walked += 1;
+            let line_text = match read_screen_line(screen, row, cols) {
+                Some(t) => t,
+                None => break,
+            };
+            let trimmed = sanitize_line(&line_text).trim_end().to_string();
+            if trimmed.trim().is_empty() {
+                break;
+            }
+            if looks_like_shell_prompt(&trimmed) {
+                break;
+            }
+            combined = format!("{} {}", trimmed, combined);
+        }
+
+        Some(combined)
     }
 
     pub fn visible_text(&self) -> String {

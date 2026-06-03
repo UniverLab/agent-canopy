@@ -102,8 +102,8 @@ impl InteractiveAgent {
     }
 
     pub fn is_sensitive_input_active(&self) -> bool {
-        self.current_visible_line_text()
-            .is_some_and(|line| line_looks_sensitive_prompt(&line))
+        self.prompt_context_text()
+            .is_some_and(|text| line_looks_sensitive_prompt(&text))
     }
 
     pub fn should_bypass_warp_input(&self) -> bool {

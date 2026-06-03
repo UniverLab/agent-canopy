@@ -45,6 +45,13 @@ pub fn line_looks_sensitive_prompt(line: &str) -> bool {
         .any(|hint| lower.contains(hint))
 }
 
+pub fn looks_like_shell_prompt(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    TERMINAL_SHELL_PROMPTS
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
+}
+
 pub fn strip_shell_prompt_prefix(line: &str) -> String {
     let trimmed = line.trim_start();
     for prefix in TERMINAL_SHELL_PROMPTS {
@@ -155,7 +162,7 @@ pub fn strip_borders(line: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_ui_line, line_looks_sensitive_prompt, strip_shell_prompt_prefix};
+    use super::{is_ui_line, line_looks_sensitive_prompt, looks_like_shell_prompt, strip_shell_prompt_prefix};
 
     #[test]
     fn detects_sensitive_prompts() {
@@ -184,6 +191,16 @@ mod tests {
         assert_eq!(strip_shell_prompt_prefix("$ git status"), "git status");
         assert_eq!(strip_shell_prompt_prefix("# cargo test"), "cargo test");
         assert_eq!(strip_shell_prompt_prefix("plain text"), "plain text");
+    }
+
+    #[test]
+    fn detects_shell_prompt_boundaries() {
+        assert!(looks_like_shell_prompt("$ git push"));
+        assert!(looks_like_shell_prompt("# root command"));
+        assert!(looks_like_shell_prompt("❯ zsh prompt"));
+        assert!(!looks_like_shell_prompt("Enter passphrase for key"));
+        assert!(!looks_like_shell_prompt("Total 5, reused 3"));
+        assert!(!looks_like_shell_prompt("  indented text"));
     }
 
     #[test]
