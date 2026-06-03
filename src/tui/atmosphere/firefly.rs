@@ -26,8 +26,13 @@ const GLOW_BG: Color = Color::Rgb(80, 65, 10);
 
 const SPEED_MIN: f32 = 1.5;
 const SPEED_MAX: f32 = 3.5;
-const REPEL_RADIUS: f32 = 10.0;
-const REPEL_FORCE: f32 = 20.0;
+const REPEL_RADIUS: f32 = 18.0;
+const REPEL_FORCE: f32 = 35.0;
+
+/// Universal repulsion radius — pushes ALL particles away when very close.
+const UNIVERSAL_REPEL_RADIUS: f32 = 4.0;
+/// Universal repulsion force — strong push to keep particles off the cursor.
+const UNIVERSAL_REPEL_FORCE: f32 = 30.0;
 
 /// Max seconds before a firefly is guaranteed to glow (probability ramps linearly).
 const GLOW_RAMP_SECS: f32 = 20.0;
@@ -162,6 +167,13 @@ impl Scene for FireflyScene {
                 fly.vy += dy * force * delta_secs;
             }
 
+            // Universal repulsion — push away when very close to cursor
+            if dist < UNIVERSAL_REPEL_RADIUS {
+                let force = UNIVERSAL_REPEL_FORCE * (1.0 - dist / UNIVERSAL_REPEL_RADIUS) / dist;
+                fly.vx += dx * force * delta_secs;
+                fly.vy += dy * force * delta_secs;
+            }
+
             // Speed cap
             let spd = (fly.vx * fly.vx + fly.vy * fly.vy).sqrt();
             if spd > SPEED_MAX * 2.0 {
@@ -292,13 +304,42 @@ mod tests {
             time_in_state: 0.0,
             glow_duration: 0.0,
         });
+        // Mouse 10 cells away — within REPEL_RADIUS (18)
         let ctx = AtmosphereCtx {
-            mouse_col: 7,
+            mouse_col: 15,
             mouse_row: 5,
             ..Default::default()
         };
         scene.tick(0.1, area, &ctx);
         let fly = &scene.fireflies[0];
         assert!((fly.x - 5.0).abs() > 0.01 || (fly.y - 5.0).abs() > 0.01);
+    }
+
+    #[test]
+    fn test_universal_repulsion_pushes_fly_away() {
+        let mut scene = FireflyScene::new();
+        let area = Rect::new(0, 0, 80, 24);
+        scene.fireflies.push(Firefly {
+            x: 10.0,
+            y: 12.0,
+            vx: 0.0,
+            vy: 0.0,
+            frame: 0,
+            frame_timer: 0.0,
+            life: 60.0,
+            glow: GlowState::Off,
+            time_in_state: 0.0,
+            glow_duration: 0.0,
+        });
+        // Mouse 2 cells away — within UNIVERSAL_REPEL_RADIUS (4)
+        let ctx = AtmosphereCtx {
+            mouse_col: 12,
+            mouse_row: 12,
+            ..Default::default()
+        };
+        scene.tick(0.1, area, &ctx);
+        let fly = &scene.fireflies[0];
+        // Should be pushed away (x < 10 or vx negative)
+        assert!(fly.x < 10.0 || fly.vx < 0.0);
     }
 }

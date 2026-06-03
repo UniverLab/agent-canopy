@@ -19,9 +19,14 @@ const BASE_SPEED: f32 = 0.4;
 const DRIFT_VX: f32 = 3.0;
 
 /// Attraction radius (cells).
-const ATTRACT_RADIUS: f32 = 15.0;
+const ATTRACT_RADIUS: f32 = 25.0;
 /// Attraction force — pulls seed toward cursor.
-const ATTRACT_FORCE: f32 = 6.0;
+const ATTRACT_FORCE: f32 = 10.0;
+
+/// Universal repulsion radius — pushes ALL particles away when very close.
+const UNIVERSAL_REPEL_RADIUS: f32 = 4.0;
+/// Universal repulsion force — strong push to keep particles off the cursor.
+const UNIVERSAL_REPEL_FORCE: f32 = 30.0;
 
 const GUST_PROB_PER_SEC: f32 = 0.3;
 const DRIFT_PROB_PER_SEC: f32 = 0.05;
@@ -145,6 +150,13 @@ impl Scene for DandelionScene {
                 seed.vy += dy * force * delta_secs;
             }
 
+            // Universal repulsion — push away when very close to cursor
+            if dist < UNIVERSAL_REPEL_RADIUS {
+                let force = UNIVERSAL_REPEL_FORCE * (1.0 - dist / UNIVERSAL_REPEL_RADIUS) / dist;
+                seed.vx -= dx * force * delta_secs;
+                seed.vy -= dy * force * delta_secs;
+            }
+
             // Soft speed cap only — trajectory is conserved
             let spd = (seed.vx * seed.vx + seed.vy * seed.vy).sqrt();
             if spd > DRIFT_VX * 3.0 {
@@ -216,14 +228,38 @@ mod tests {
             phase: 0.0,
             life: 60.0,
         });
-        // Mouse 8 cells to the right — within ATTRACT_RADIUS (15)
+        // Mouse 20 cells to the right — within ATTRACT_RADIUS (25)
         let ctx = AtmosphereCtx {
-            mouse_col: 18,
+            mouse_col: 30,
             mouse_row: 12,
             ..Default::default()
         };
         scene.tick(0.1, area, &ctx);
         // vx should have increased toward the mouse (positive direction)
         assert!(scene.seeds[0].vx > 0.0);
+    }
+
+    #[test]
+    fn test_universal_repulsion_pushes_seed_away() {
+        let mut scene = DandelionScene::new();
+        let area = Rect::new(0, 0, 80, 24);
+        // Seed very close to cursor — universal repulsion should kick in
+        scene.seeds.push(Seed {
+            x: 10.0,
+            y: 12.0,
+            vx: 0.0,
+            vy: 0.0,
+            phase: 0.0,
+            life: 60.0,
+        });
+        // Mouse 2 cells away — within UNIVERSAL_REPEL_RADIUS (4)
+        let ctx = AtmosphereCtx {
+            mouse_col: 12,
+            mouse_row: 12,
+            ..Default::default()
+        };
+        scene.tick(0.1, area, &ctx);
+        // vx should be negative (pushed away from mouse)
+        assert!(scene.seeds[0].vx < 0.0);
     }
 }
