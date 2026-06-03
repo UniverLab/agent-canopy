@@ -10,6 +10,7 @@ mod atmosphere;
 mod brians_brain;
 pub(crate) mod context_transfer;
 mod event;
+mod gamification;
 pub(crate) mod prompt_templates;
 pub(crate) mod terminal_history;
 mod ui;

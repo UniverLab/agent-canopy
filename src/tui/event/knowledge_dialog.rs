@@ -82,6 +82,7 @@ fn save_knowledge_dialog(app: &mut App) -> anyhow::Result<()> {
     };
 
     app.db.upsert_intelligence_node(input)?;
+    app.record_gardener_edit().ok();
 
     app.refresh_project_knowledge()?;
     app.focus = dialog.prev_focus.unwrap_or(Focus::Home);

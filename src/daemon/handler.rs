@@ -18,7 +18,7 @@ use rmcp::ServerHandler;
 use tokio::sync::Notify;
 
 use crate::application::notification_service::NotificationService;
-use crate::application::ports::{AgentRepository, RunRepository};
+use crate::application::ports::{AgentRepository, RunRepository, StateRepository};
 use crate::daemon::handler_formatting::{
     format_agent_info, format_log_output, format_temporal_agents, format_uptime, internal_error,
     make_log_path, recent_runs_output, resolve_log_path,
@@ -1374,6 +1374,7 @@ impl TaskTriggerHandler {
             .map_err(|e| McpError::invalid_params(e, None))?;
         crate::domain::seeds::save_seed(&seed_id, &identity)
             .map_err(|e| McpError::internal_error(e, None))?;
+        let _ = self.db.set_state("gamification:identity_evolved", "1");
         Ok(success_result("Identity evolved and saved successfully."))
     }
 

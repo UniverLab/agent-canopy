@@ -356,6 +356,11 @@ pub struct App {
     pub(crate) atmosphere_last_mouse: (u16, u16),
     /// When true, particles are not rendered (suppressed by held click).
     pub(crate) atmosphere_hidden: bool,
+
+    // Gamification
+    pub(crate) mission_manager: crate::tui::gamification::MissionManager,
+    pub(crate) mission_pending_events: Vec<crate::tui::gamification::MissionEvent>,
+    pub(crate) max_cpu_frequency_seen: Option<u64>,
 }
 
 #[derive(Clone)]

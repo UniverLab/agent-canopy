@@ -116,6 +116,12 @@ impl App {
         } else {
             0.0
         };
+
+        if self.atmosphere_ctx.firefly_caught {
+            self.queue_mission_event(crate::tui::gamification::MissionEvent::FireflyCaught);
+            self.atmosphere_ctx.firefly_caught = false;
+        }
+        self.atmosphere_ctx.mouse_clicked = false;
     }
 
     pub fn tick_banner_animation(&mut self) {
@@ -435,6 +441,9 @@ impl App {
                     Ok(seed_id) => {
                         // Bind the session to the new seed
                         let _ = self.db.bind_session_to_seed(&agent_id, &seed_id);
+                        self.queue_mission_event(
+                            crate::tui::gamification::MissionEvent::FirstSeedCreated,
+                        );
                     }
                     Err(e) => {
                         // Log the error — nursery cleanup is non-fatal
@@ -459,6 +468,8 @@ impl App {
             .close_agent_missions(&agent_id, &agent_name, &working_dir);
         if code != 0 {
             self.notify_failed_interactive_exit(&agent_id, &cli, code, &output_snippet);
+        } else if self.session_args_contain_yolo(&agent_id) {
+            self.queue_mission_event(crate::tui::gamification::MissionEvent::YoloTaskCompleted);
         }
 
         let Some(agent) = self.interactive_agents.get_mut(idx) else {

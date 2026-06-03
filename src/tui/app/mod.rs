@@ -1,6 +1,7 @@
 mod agents;
 mod data;
 pub mod dialog;
+mod gamification;
 mod project_graph;
 mod sync;
 
@@ -47,6 +48,7 @@ impl App {
 
         let system_monitor_active = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let system_info_rx = spawn_system_monitor(&system_monitor_active);
+        let mission_manager = Self::init_mission_manager(Arc::clone(&db))?;
 
         let mut app = Self {
             db,
@@ -159,6 +161,9 @@ impl App {
             atmosphere_ctx: crate::tui::atmosphere::AtmosphereCtx::default(),
             atmosphere_last_mouse: (0, 0),
             atmosphere_hidden: false,
+            mission_manager,
+            mission_pending_events: Vec::new(),
+            max_cpu_frequency_seen: None,
         };
         app.refresh()?;
         Ok(app)
@@ -185,6 +190,7 @@ impl App {
         self.dismiss_copied();
         self.update_whimsg_context();
         self.tick_atmosphere();
+        self.tick_missions()?;
         self.resize_interactive_agents();
         self.refresh_playground_search()?;
 
@@ -244,6 +250,17 @@ impl App {
         }
 
         if let Ok(results) = self.rag_vector_search(&query, 50) {
+            let month_ago = chrono::Utc::now().timestamp() - 30 * 24 * 3600;
+            for result in &results {
+                if result.distance.is_some_and(|d| d < 0.2) {
+                    self.queue_mission_event(crate::tui::gamification::MissionEvent::DeepRagSearch);
+                }
+                if result.created_at < month_ago {
+                    self.queue_mission_event(
+                        crate::tui::gamification::MissionEvent::DigitalArcheologistFind,
+                    );
+                }
+            }
             self.playground_results = results;
             self.playground_selected = 0;
         }

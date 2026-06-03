@@ -94,6 +94,7 @@ impl App {
             return Ok(());
         }
 
+        self.queue_mission_event(crate::tui::gamification::MissionEvent::WorldLinked);
         self.close_project_relation_dialog();
         self.refresh_project_graph().ok();
         Ok(())
