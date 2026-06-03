@@ -54,6 +54,7 @@ struct SidebarContentAreas {
 struct ProjectsLayout {
     projects: Option<Rect>,
     workflows: Option<Rect>,
+    knowledge: Option<Rect>,
     rag_queue: Option<Rect>,
     brain: Option<Rect>,
 }
@@ -251,14 +252,21 @@ fn draw_projects_sidebar(frame: &mut Frame, areas: SidebarContentAreas, app: &Ap
     let show_rag_info = app.rag_info.has_rag_activity() && areas.content.height >= 6;
     // ragInfo sits at the TOP of the projects sidebar so it's always visible.
     let (rag_info_area, content_below) = split_top_panel(areas.content, show_rag_info, 6);
-    let (has_projects, has_workflows, projects_needed, workflows_needed, rag_needed) =
-        projects_layout_requirements(app, workflows.len(), rag_items, content_below.height);
+    let (
+        has_projects,
+        has_workflows,
+        projects_needed,
+        workflows_needed,
+        knowledge_needed,
+        rag_needed,
+    ) = projects_layout_requirements(app, workflows.len(), rag_items, content_below.height);
     let layout = layout_projects_sections(
         content_below,
         has_projects,
         has_workflows,
         projects_needed,
         workflows_needed,
+        knowledge_needed,
         rag_needed,
     );
 
@@ -292,6 +300,17 @@ fn draw_projects_sidebar(frame: &mut Frame, areas: SidebarContentAreas, app: &Ap
             Style::default().fg(DIM),
             projects_panel_border_style(app, ProjectsPanelFocus::Workflows),
             |frame, inner| draw_workflows_list(frame, inner, app),
+        );
+    }
+
+    if let Some(knowledge_area) = layout.knowledge {
+        render_titled_panel(
+            frame,
+            knowledge_area,
+            " knowledge ",
+            Style::default().fg(DIM),
+            projects_panel_border_style(app, ProjectsPanelFocus::Knowledge),
+            |frame, inner| draw_knowledge_list(frame, inner, app),
         );
     }
 
@@ -345,7 +364,7 @@ fn projects_layout_requirements(
     workflow_count: usize,
     rag_items: &[crate::db::project::RagQueueItem],
     content_height: u16,
-) -> (bool, bool, u16, u16, u16) {
+) -> (bool, bool, u16, u16, u16, u16) {
     let has_projects = !app.projects.is_empty();
     let has_workflows = true;
     let projects_needed = if has_projects {
@@ -355,6 +374,11 @@ fn projects_layout_requirements(
     };
     let workflows_needed = if workflow_count > 0 {
         (workflow_count as u16 * 3 + 2).min(content_height)
+    } else {
+        4.min(content_height)
+    };
+    let knowledge_needed = if !app.project_knowledge.is_empty() {
+        (app.project_knowledge.len() as u16 * 3 + 2).min(12)
     } else {
         4.min(content_height)
     };
@@ -369,6 +393,7 @@ fn projects_layout_requirements(
         has_workflows,
         projects_needed,
         workflows_needed,
+        knowledge_needed,
         rag_needed,
     )
 }
@@ -387,29 +412,36 @@ fn layout_projects_sections(
     has_workflows: bool,
     projects_needed: u16,
     workflows_needed: u16,
+    knowledge_needed: u16,
     rag_needed: u16,
 ) -> ProjectsLayout {
     if (has_projects || has_workflows)
         && rag_needed > 0
-        && projects_needed + workflows_needed + rag_needed < content_top.height
+        && projects_needed + workflows_needed + knowledge_needed + rag_needed < content_top.height
     {
         let mut remaining = content_top;
         let projects = take_top(&mut remaining, projects_needed);
         let workflows = take_top(&mut remaining, workflows_needed);
+        let knowledge = take_top(&mut remaining, knowledge_needed);
         let rag_queue = take_top(&mut remaining, rag_needed);
+
         return ProjectsLayout {
             projects,
             workflows,
+            knowledge,
             rag_queue,
             brain: Some(remaining),
         };
     }
 
-    if (has_projects || has_workflows) && projects_needed + workflows_needed < content_top.height {
+    if (has_projects || has_workflows)
+        && projects_needed + workflows_needed + knowledge_needed < content_top.height
+    {
         let mut remaining = content_top;
         return ProjectsLayout {
             projects: take_top(&mut remaining, projects_needed),
             workflows: take_top(&mut remaining, workflows_needed),
+            knowledge: take_top(&mut remaining, knowledge_needed),
             rag_queue: (rag_needed > 0 && remaining.height >= 3).then_some(remaining),
             brain: None,
         };
@@ -420,6 +452,7 @@ fn layout_projects_sections(
         return ProjectsLayout {
             projects: take_top(&mut remaining, projects_needed),
             workflows: take_top(&mut remaining, workflows_needed).or(Some(remaining)),
+            knowledge: None,
             ..ProjectsLayout::default()
         };
     }
@@ -684,6 +717,90 @@ fn draw_project_workflow_card(
     );
 }
 
+fn draw_knowledge_list(frame: &mut Frame, area: Rect, app: &App) {
+    if app.project_knowledge.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "No knowledge yet. Agents can add facts/patterns.",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            area,
+        );
+        return;
+    }
+
+    let scroll = scroll_state(
+        app.project_knowledge.len(),
+        Some(app.selected_knowledge),
+        (area.height / 3).max(1) as usize,
+    );
+    let panel_focused = app.projects_panel_focus == ProjectsPanelFocus::Knowledge;
+    let mut y = area.y;
+    let row_h = 3u16;
+
+    for (idx, node) in app
+        .project_knowledge
+        .iter()
+        .enumerate()
+        .skip(scroll.start)
+        .take(scroll.max_visible)
+    {
+        if y + 2 > area.y + area.height {
+            break;
+        }
+        let selected = idx == app.selected_knowledge;
+        draw_knowledge_card(
+            frame,
+            Rect::new(area.x, y, area.width, 2),
+            selected,
+            &node.title,
+            &node.kind,
+            panel_focused,
+        );
+        y += row_h;
+    }
+
+    draw_scroll_indicators(frame, area, scroll.has_up, scroll.has_down);
+}
+
+fn draw_knowledge_card(
+    frame: &mut Frame,
+    area: Rect,
+    selected: bool,
+    title: &str,
+    kind: &str,
+    panel_focused: bool,
+) {
+    let bg = if selected { BG_SELECTED } else { Color::Reset };
+    let kind_color = if kind == "fact" {
+        Color::Cyan
+    } else {
+        Color::Magenta
+    };
+    let title_style = if selected && panel_focused {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            truncate_str(title, area.width as usize),
+            title_style,
+        )))
+        .style(Style::default().bg(bg)),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("[{}]", kind),
+            Style::default().fg(kind_color),
+        )))
+        .style(Style::default().bg(bg)),
+        Rect::new(area.x, area.y + 1, area.width, 1),
+    );
+}
+
 fn draw_workflows_list(frame: &mut Frame, area: Rect, app: &App) {
     let workflows = app.visible_workflows();
     if workflows.is_empty() {
@@ -924,13 +1041,15 @@ fn projects_panel_border_style(app: &App, panel: ProjectsPanelFocus) -> Style {
 fn agent_section_border_style(app: &App, section: AgentSectionFocus) -> Style {
     let in_agents_mode = app.sidebar_mode == SidebarMode::Agents;
     let not_playground = !app.playground_active;
-    
+
     let focused = if matches!(app.focus, Focus::Home | Focus::Preview) {
         in_agents_mode && not_playground && app.agent_section_focus == section
     } else if app.focus == Focus::Agent {
         in_agents_mode && not_playground && {
             match app.agents.get(app.selected) {
-                Some(AgentEntry::Agent(_) | AgentEntry::Group(_)) => section == AgentSectionFocus::Background,
+                Some(AgentEntry::Agent(_) | AgentEntry::Group(_)) => {
+                    section == AgentSectionFocus::Background
+                }
                 Some(AgentEntry::Interactive(_)) => section == AgentSectionFocus::Interactive,
                 Some(AgentEntry::Terminal(_)) => section == AgentSectionFocus::Terminal,
                 None => false,
@@ -939,7 +1058,7 @@ fn agent_section_border_style(app: &App, section: AgentSectionFocus) -> Style {
     } else {
         false
     };
-    
+
     Style::default().fg(if focused { ACCENT } else { DIM })
 }
 

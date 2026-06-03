@@ -624,8 +624,55 @@ fn draw_projects_mode_panel(frame: &mut Frame, area: Rect, app: &App) {
     match app.projects_panel_focus {
         ProjectsPanelFocus::Projects => draw_project_overview(frame, area, app),
         ProjectsPanelFocus::Workflows => draw_workflow_overview(frame, area, app),
+        ProjectsPanelFocus::Knowledge => draw_knowledge_overview(frame, area, app),
         ProjectsPanelFocus::RagInfo => draw_rag_queue_overview(frame, area, app),
     }
+}
+
+fn draw_knowledge_overview(frame: &mut Frame, area: Rect, app: &App) {
+    if app.project_knowledge.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No knowledge yet. Agents can add facts/patterns.")
+                .style(Style::default().fg(DIM)),
+            area,
+        );
+        return;
+    }
+
+    let Some(node) = app.project_knowledge.get(app.selected_knowledge) else {
+        frame.render_widget(
+            Paragraph::new("No knowledge selected").style(Style::default().fg(DIM)),
+            area,
+        );
+        return;
+    };
+
+    let kind_color = if node.kind == "fact" {
+        Color::Cyan
+    } else {
+        Color::Magenta
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Knowledge ", Style::default().fg(DIM)),
+            Span::styled(
+                node.title.as_str(),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(format!("[{}]", node.kind), Style::default().fg(kind_color)),
+        ]),
+        Line::from(""),
+    ];
+
+    for line in node.body.lines() {
+        lines.push(Line::from(Span::styled(
+            line,
+            Style::default().fg(Color::White),
+        )));
+    }
+
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
 }
 
 fn draw_rag_queue_overview(frame: &mut Frame, area: Rect, app: &App) {

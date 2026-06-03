@@ -53,6 +53,7 @@ pub enum Focus {
 pub enum ProjectsPanelFocus {
     Projects,
     Workflows,
+    Knowledge,
     RagInfo,
 }
 
@@ -262,6 +263,9 @@ pub struct App {
     pub(crate) rag_info: RagInfoSummary,
     /// Per-file RAG status loaded from `rag_file_events` table.
     pub(crate) rag_file_status: Vec<crate::db::project::RagPerFileStatus>,
+    /// Knowledge nodes (facts/patterns) for the selected project.
+    pub(crate) project_knowledge: Vec<crate::db::intelligence::IntelligenceNodeRecord>,
+    pub(crate) selected_knowledge: usize,
     pub(crate) sidebar_visible: bool,
     pub(crate) hidden_activity_workdirs: HashSet<String>,
     pub(crate) forced_activity_workdirs: HashSet<String>,

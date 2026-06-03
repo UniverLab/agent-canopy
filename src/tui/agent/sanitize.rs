@@ -174,7 +174,9 @@ mod tests {
         // may appear on a line that doesn't end with : or ?
         assert!(line_looks_sensitive_prompt("Enter passphrase for key"));
         assert!(line_looks_sensitive_prompt("Enter your password"));
-        assert!(line_looks_sensitive_prompt("Please enter the verification code"));
+        assert!(line_looks_sensitive_prompt(
+            "Please enter the verification code"
+        ));
     }
 
     #[test]

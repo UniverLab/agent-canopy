@@ -129,6 +129,9 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
                     ProjectsPanelFocus::Workflows => {
                         let _ = app.open_workflow_editor_dialog();
                     }
+                    ProjectsPanelFocus::Knowledge => {
+                        // TODO: Open knowledge detail view
+                    }
                 }
                 return Ok(());
             }

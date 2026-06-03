@@ -149,6 +149,8 @@ impl App {
             project_relation_dialog: None,
             project_graph_edges: Vec::new(),
             project_graph_trees: Vec::new(),
+            project_knowledge: Vec::new(),
+            selected_knowledge: 0,
             nursery_path: None,
         };
         app.refresh()?;
@@ -258,9 +260,17 @@ impl App {
         match self.projects_panel_focus {
             ProjectsPanelFocus::Projects => self.navigate_projects_next(),
             ProjectsPanelFocus::Workflows => self.navigate_workflows_next(),
+            ProjectsPanelFocus::Knowledge => self.navigate_knowledge_next(),
             ProjectsPanelFocus::RagInfo => self.navigate_from_rag_info_next(),
         }
         self.reset_log_scroll();
+    }
+
+    fn navigate_knowledge_next(&mut self) {
+        if self.project_knowledge.is_empty() {
+            return;
+        }
+        self.selected_knowledge = (self.selected_knowledge + 1) % self.project_knowledge.len();
     }
 
     fn navigate_projects_next(&mut self) {
@@ -391,9 +401,20 @@ impl App {
         match self.projects_panel_focus {
             ProjectsPanelFocus::Projects => self.navigate_projects_prev(),
             ProjectsPanelFocus::Workflows => self.navigate_workflows_prev(),
+            ProjectsPanelFocus::Knowledge => self.navigate_knowledge_prev(),
             ProjectsPanelFocus::RagInfo => self.navigate_from_rag_info_prev(),
         }
         self.reset_log_scroll();
+    }
+
+    fn navigate_knowledge_prev(&mut self) {
+        if self.project_knowledge.is_empty() {
+            return;
+        }
+        self.selected_knowledge = self
+            .selected_knowledge
+            .checked_sub(1)
+            .unwrap_or(self.project_knowledge.len() - 1);
     }
 
     fn navigate_projects_prev(&mut self) {
@@ -526,6 +547,20 @@ impl App {
             self.selected_project = 0;
         } else {
             self.selected_project = self.selected_project.min(self.projects.len() - 1);
+        }
+        self.refresh_project_knowledge()?;
+        Ok(())
+    }
+
+    fn refresh_project_knowledge(&mut self) -> Result<()> {
+        if let Some(project) = self.projects.get(self.selected_project) {
+            self.project_knowledge = self.db.list_project_knowledge(&project.hash, None, 50)?;
+            self.selected_knowledge = self
+                .selected_knowledge
+                .min(self.project_knowledge.len().saturating_sub(1));
+        } else {
+            self.project_knowledge.clear();
+            self.selected_knowledge = 0;
         }
         Ok(())
     }
@@ -703,7 +738,11 @@ impl App {
 
     #[allow(dead_code)]
     pub fn visible_projects_panels(&self) -> Vec<ProjectsPanelFocus> {
-        let mut panels = vec![ProjectsPanelFocus::Projects, ProjectsPanelFocus::Workflows];
+        let mut panels = vec![
+            ProjectsPanelFocus::Projects,
+            ProjectsPanelFocus::Workflows,
+            ProjectsPanelFocus::Knowledge,
+        ];
         if self.rag_info.has_rag_activity() {
             panels.push(ProjectsPanelFocus::RagInfo);
         }
@@ -714,6 +753,7 @@ impl App {
         match panel {
             ProjectsPanelFocus::Projects => !self.projects.is_empty(),
             ProjectsPanelFocus::Workflows => !self.visible_workflows().is_empty(),
+            ProjectsPanelFocus::Knowledge => true,
             ProjectsPanelFocus::RagInfo => self.rag_info.has_rag_activity(),
         }
     }
