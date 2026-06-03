@@ -376,4 +376,12 @@ pub enum WhimContext {
     TaskRunning,
     Scrolling,
     Busy,
+    MissionUnlocked,
 }
+
+pub(crate) const PH_MISSION: &[&str] = &[
+    "mission unlocked — the canopy remembers",
+    "achievement logged in the moss",
+    "a new medal for your explorer's sash",
+    "the forest applauds quietly",
+];

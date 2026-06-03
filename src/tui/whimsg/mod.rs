@@ -96,6 +96,7 @@ pub struct Whimsg {
     seen_object: DedupRing,
     seen_twist: DedupRing,
     seen_phrase: DedupRing,
+    mission_title: Option<String>,
 }
 
 impl Whimsg {
@@ -117,8 +118,15 @@ impl Whimsg {
             seen_object: DedupRing::new(8),
             seen_twist: DedupRing::new(8),
             seen_phrase: DedupRing::new(8),
+            mission_title: None,
             rng,
         }
+    }
+
+    /// Celebrate a newly unlocked mission (one-shot, high priority).
+    pub fn notify_mission_unlocked(&mut self, title: &str) {
+        self.mission_title = Some(title.to_string());
+        self.notify_event(WhimContext::MissionUnlocked);
     }
 
     /// Set the ambient context (reflects ongoing state: idle, busy, etc.).
@@ -272,7 +280,9 @@ impl Whimsg {
         self.active_kaomoji = kaomojis[ki].to_string();
 
         // 30% chance of a direct context-driven phrase
-        if self.rng.chance(0.30) {
+        if let Some(title) = self.mission_title.take() {
+            self.active_text = format!("( ^ω^) Achieved: {title}!");
+        } else if self.rng.chance(0.30) {
             let phrases = match ctx {
                 WhimContext::Idle => PH_IDLE,
                 WhimContext::AgentSpawned => PH_SPAWN,
@@ -281,6 +291,7 @@ impl Whimsg {
                 WhimContext::TaskRunning => PH_BUSY,
                 WhimContext::Scrolling => PH_SCROLL,
                 WhimContext::Busy => PH_BUSY,
+                WhimContext::MissionUnlocked => kaomojis::PH_MISSION,
             };
             let pi = pick_no_repeat(&mut self.rng, phrases.len(), &self.seen_phrase);
             self.seen_phrase.push(pi);
@@ -373,6 +384,7 @@ impl Whimsg {
                     Intent::Thinking
                 }
             }
+            WhimContext::MissionUnlocked => Intent::Success,
         }
     }
 }
