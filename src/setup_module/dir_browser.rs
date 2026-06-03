@@ -182,22 +182,34 @@ fn render_browse_display(
         "─".repeat(top_dashes)
     );
     print!(
-        "\r\x1b[2K\x1b[90m│\x1b[0m {} \x1b[90m│\x1b[0m\r\n",
-        "↑↓ navigate → enter ← back Enter confirm Esc cancel type to filter"
+        "\r\x1b[2K\x1b[90m│\x1b[0m ↑↓ navigate → enter ← back Enter confirm Esc cancel type to filter \x1b[90m│\x1b[0m\r\n"
     );
 
     if filter.is_empty() {
-        print!("\r\x1b[2K\x1b[90m│\x1b[0m filter: _{} \x1b[90m│\x1b[0m\r\n", " ".repeat(59));
+        print!(
+            "\r\x1b[2K\x1b[90m│\x1b[0m filter: _{} \x1b[90m│\x1b[0m\r\n",
+            " ".repeat(59)
+        );
     } else {
         let filter_content = format!("filter: {}", filter);
         let filter_pad = box_width.saturating_sub(filter_content.len() + 2);
-        print!("\r\x1b[2K\x1b[90m│\x1b[0m \x1b[33m{}\x1b[0m{} \x1b[90m│\x1b[0m\r\n", filter, " ".repeat(filter_pad));
+        print!(
+            "\r\x1b[2K\x1b[90m│\x1b[0m \x1b[33m{}\x1b[0m{} \x1b[90m│\x1b[0m\r\n",
+            filter,
+            " ".repeat(filter_pad)
+        );
     }
 
     render_subdirs_section(subdirs, cursor, scroll, visible, filter);
     let up = if has_above { "↑" } else { " " };
     let dn = if has_below { "↓" } else { " " };
-    let footer_content = format!("{} {}/{} {}", up, cursor.saturating_add(1), subdirs.len(), dn);
+    let footer_content = format!(
+        "{} {}/{} {}",
+        up,
+        cursor.saturating_add(1),
+        subdirs.len(),
+        dn
+    );
     let bottom_dashes = box_width.saturating_sub(footer_content.len() + 2);
     print!(
         "\r\x1b[2K\x1b[90m└{} {}┘\x1b[0m\r\n",
@@ -267,20 +279,36 @@ fn render_multiselect_display(
         "↑↓ navigate Space mark → enter ← back Enter confirm Esc cancel ({} selected)",
         selected_count
     );
-    print!("\r\x1b[2K\x1b[90m│\x1b[0m {} \x1b[90m│\x1b[0m\r\n", help_text);
+    print!(
+        "\r\x1b[2K\x1b[90m│\x1b[0m {} \x1b[90m│\x1b[0m\r\n",
+        help_text
+    );
 
     if filter.is_empty() {
-        print!("\r\x1b[2K\x1b[90m│\x1b[0m filter: _{} \x1b[90m│\x1b[0m\r\n", " ".repeat(59));
+        print!(
+            "\r\x1b[2K\x1b[90m│\x1b[0m filter: _{} \x1b[90m│\x1b[0m\r\n",
+            " ".repeat(59)
+        );
     } else {
         let filter_content = format!("filter: {}", filter);
         let filter_pad = box_width.saturating_sub(filter_content.len() + 2);
-        print!("\r\x1b[2K\x1b[90m│\x1b[0m \x1b[33m{}\x1b[0m{} \x1b[90m│\x1b[0m\r\n", filter, " ".repeat(filter_pad));
+        print!(
+            "\r\x1b[2K\x1b[90m│\x1b[0m \x1b[33m{}\x1b[0m{} \x1b[90m│\x1b[0m\r\n",
+            filter,
+            " ".repeat(filter_pad)
+        );
     }
 
     render_multiselect_subdirs(subdirs, cursor, scroll, visible, filter, current, selected);
     let up = if has_above { "↑" } else { " " };
     let dn = if has_below { "↓" } else { " " };
-    let footer_content = format!("{} {}/{} {}", up, cursor.saturating_add(1), subdirs.len(), dn);
+    let footer_content = format!(
+        "{} {}/{} {}",
+        up,
+        cursor.saturating_add(1),
+        subdirs.len(),
+        dn
+    );
     let bottom_dashes = box_width.saturating_sub(footer_content.len() + 2);
     print!(
         "\r\x1b[2K\x1b[90m└{} {}┘\x1b[0m\r\n",
