@@ -284,7 +284,9 @@ impl Database {
     }
 }
 
+pub mod achievements;
 pub mod agent;
+pub mod gamification;
 pub mod group;
 pub mod intelligence;
 pub mod project;

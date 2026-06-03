@@ -6,6 +6,7 @@
 pub mod canopy_config;
 pub mod cli_config;
 pub mod cli_strategy;
+pub mod gamification;
 pub mod models;
 pub mod models_db;
 pub mod notification;
