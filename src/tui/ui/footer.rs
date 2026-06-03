@@ -156,6 +156,12 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("Enter", "confirm"),
             ("Esc", "cancel"),
         ],
+        Focus::KnowledgeDialog => vec![
+            ("Tab", "field"),
+            ("Space", "toggle kind"),
+            ("Enter", "next/save"),
+            ("Esc", "cancel"),
+        ],
     };
 
     let mut spans = Vec::new();

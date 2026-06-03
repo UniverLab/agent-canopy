@@ -718,40 +718,69 @@ fn draw_project_workflow_card(
 }
 
 fn draw_knowledge_list(frame: &mut Frame, area: Rect, app: &App) {
-    if app.project_knowledge.is_empty() {
+    let filtered = app.filtered_knowledge_indices();
+    let filter_active = app.knowledge_filter_mode || !app.knowledge_filter.trim().is_empty();
+    let list_area = if filter_active && area.height > 1 {
+        let filter_text = if app.knowledge_filter_mode {
+            format!("Filter: {}_", app.knowledge_filter)
+        } else {
+            format!("Filter: {}", app.knowledge_filter)
+        };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "No knowledge yet. Agents can add facts/patterns.",
+                truncate_str(&filter_text, area.width as usize),
+                Style::default().fg(Color::Yellow),
+            ))),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+        Rect::new(
+            area.x,
+            area.y + 1,
+            area.width,
+            area.height.saturating_sub(1),
+        )
+    } else {
+        area
+    };
+
+    if filtered.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                if app.project_knowledge.is_empty() {
+                    "No knowledge yet. Agents can add facts/patterns."
+                } else {
+                    "No knowledge matches the current filter."
+                },
                 Style::default().fg(Color::DarkGray),
             ))),
-            area,
+            list_area,
         );
         return;
     }
 
     let scroll = scroll_state(
-        app.project_knowledge.len(),
-        Some(app.selected_knowledge),
-        (area.height / 3).max(1) as usize,
+        filtered.len(),
+        app.selected_filtered_knowledge_index(),
+        (list_area.height / 3).max(1) as usize,
     );
     let panel_focused = app.projects_panel_focus == ProjectsPanelFocus::Knowledge;
-    let mut y = area.y;
+    let mut y = list_area.y;
     let row_h = 3u16;
 
-    for (idx, node) in app
-        .project_knowledge
+    for (display_idx, node_idx) in filtered
         .iter()
-        .enumerate()
         .skip(scroll.start)
         .take(scroll.max_visible)
+        .enumerate()
     {
-        if y + 2 > area.y + area.height {
+        if y + 2 > list_area.y + list_area.height {
             break;
         }
-        let selected = idx == app.selected_knowledge;
+        let node = &app.project_knowledge[*node_idx];
+        let selected = Some(display_idx + scroll.start) == app.selected_filtered_knowledge_index();
         draw_knowledge_card(
             frame,
-            Rect::new(area.x, y, area.width, 2),
+            Rect::new(list_area.x, y, list_area.width, 2),
             selected,
             &node.title,
             &node.kind,
@@ -760,7 +789,7 @@ fn draw_knowledge_list(frame: &mut Frame, area: Rect, app: &App) {
         y += row_h;
     }
 
-    draw_scroll_indicators(frame, area, scroll.has_up, scroll.has_down);
+    draw_scroll_indicators(frame, list_area, scroll.has_up, scroll.has_down);
 }
 
 fn draw_knowledge_card(

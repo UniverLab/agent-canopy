@@ -227,6 +227,7 @@ fn draw_log_panel_focus(frame: &mut Frame, area: Rect, app: &mut App) -> bool {
         Focus::Agent => draw_agent_panel(frame, area, app),
         Focus::NewAgentDialog => draw_new_agent_dialog_background(frame, area, app),
         Focus::LaunchpadDialog
+        | Focus::KnowledgeDialog
         | Focus::ContextTransfer
         | Focus::RagTransfer
         | Focus::PromptTemplateDialog

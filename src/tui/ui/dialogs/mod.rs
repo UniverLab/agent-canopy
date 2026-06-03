@@ -2,6 +2,7 @@
 
 pub mod at_picker;
 pub mod context_transfer;
+pub mod knowledge_dialog;
 pub mod launchpad;
 pub mod new_agent_dialog;
 pub mod pickers;
@@ -13,6 +14,7 @@ pub mod workflow_editor;
 
 // Re-export public drawing functions
 pub use context_transfer::draw_context_transfer_modal;
+pub use knowledge_dialog::draw_knowledge_dialog;
 pub use launchpad::draw_launchpad_dialog;
 pub use new_agent_dialog::draw_new_agent_dialog;
 pub use pickers::{draw_split_picker, draw_suggestion_picker};

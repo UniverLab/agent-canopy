@@ -2,6 +2,7 @@ use anyhow::Result;
 use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::tui::app::types::{AgentEntry, App, Focus, ProjectsPanelFocus, SidebarMode};
+use crate::tui::event::knowledge_dialog::{edit_knowledge_dialog, open_knowledge_dialog};
 
 // ── Home: screensaver — arrows enter Preview ────────────────────────
 
@@ -115,6 +116,34 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
         return Ok(());
     }
 
+    if app.sidebar_mode == SidebarMode::Projects
+        && app.projects_panel_focus == ProjectsPanelFocus::Knowledge
+        && app.knowledge_filter_mode
+    {
+        match code {
+            KeyCode::Esc => {
+                app.clear_knowledge_filter();
+                app.exit_knowledge_filter_mode();
+                return Ok(());
+            }
+            KeyCode::Enter => {
+                app.exit_knowledge_filter_mode();
+                return Ok(());
+            }
+            KeyCode::Backspace => {
+                app.pop_knowledge_filter();
+                return Ok(());
+            }
+            KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                app.append_knowledge_filter(c);
+                return Ok(());
+            }
+            _ => {
+                return Ok(());
+            }
+        }
+    }
+
     match code {
         KeyCode::Esc | KeyCode::Char('h') => {
             app.focus = Focus::Home;
@@ -130,7 +159,7 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
                         let _ = app.open_workflow_editor_dialog();
                     }
                     ProjectsPanelFocus::Knowledge => {
-                        // TODO: Open knowledge detail view
+                        edit_knowledge_dialog(app);
                     }
                 }
                 return Ok(());
@@ -195,6 +224,10 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
                 && app.projects_panel_focus == ProjectsPanelFocus::Workflows
             {
                 let _ = app.open_workflow_editor_dialog();
+            } else if app.sidebar_mode == SidebarMode::Projects
+                && app.projects_panel_focus == ProjectsPanelFocus::Knowledge
+            {
+                edit_knowledge_dialog(app);
             } else {
                 app.open_edit_dialog();
             }
@@ -214,7 +247,21 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
         {
             app.toggle_rag_pause();
         }
-        KeyCode::Char('n') => app.open_new_agent_dialog(),
+        KeyCode::Char('n') => {
+            if app.sidebar_mode == SidebarMode::Projects
+                && app.projects_panel_focus == ProjectsPanelFocus::Knowledge
+            {
+                open_knowledge_dialog(app);
+            } else {
+                app.open_new_agent_dialog();
+            }
+        }
+        KeyCode::Char('/')
+            if app.sidebar_mode == SidebarMode::Projects
+                && app.projects_panel_focus == ProjectsPanelFocus::Knowledge =>
+        {
+            app.enter_knowledge_filter_mode();
+        }
         KeyCode::F(4) => {
             if app.sidebar_mode == SidebarMode::Projects {
                 match app.projects_panel_focus {
@@ -223,6 +270,9 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
                     }
                     ProjectsPanelFocus::Workflows => {
                         app.delete_workflow_confirm = true;
+                    }
+                    ProjectsPanelFocus::Knowledge => {
+                        let _ = app.delete_selected_knowledge();
                     }
                     _ => {}
                 }
