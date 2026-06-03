@@ -173,31 +173,36 @@ fn render_browse_display(
 ) {
     print!("\x1b[{total_rows}A");
     let path_str = current.to_string_lossy();
-    let dashes = "─".repeat(60usize.saturating_sub(path_str.len() + 4));
+    let box_width = 70usize;
+    let top_content_len = 4 + path_str.len(); // "┌─» " + path + "┐"
+    let top_dashes = box_width.saturating_sub(top_content_len);
     print!(
-        "\r\x1b[2K\x1b[36m┌─»\x1b[0m \x1b[36m{}\x1b[0m\x1b[36m{dashes}┐\x1b[0m\r\n",
-        path_str
+        "\r\x1b[2K\x1b[36m┌─»\x1b[0m \x1b[36m{}\x1b[0m\x1b[36m{}┐\x1b[0m\r\n",
+        path_str,
+        "─".repeat(top_dashes)
     );
     print!(
-        "\r\x1b[2K\x1b[90m│ ↑↓ navigate → enter ← back Enter confirm Esc cancel type to filter │\x1b[0m\r\n"
+        "\r\x1b[2K\x1b[90m│\x1b[0m {} \x1b[90m│\x1b[0m\r\n",
+        "↑↓ navigate → enter ← back Enter confirm Esc cancel type to filter"
     );
 
     if filter.is_empty() {
-        print!("\r\x1b[2K\x1b[90m│ filter: _                                                                   │\x1b[0m\r\n");
+        print!("\r\x1b[2K\x1b[90m│\x1b[0m filter: _{} \x1b[90m│\x1b[0m\r\n", " ".repeat(59));
     } else {
-        print!("\r\x1b[2K\x1b[90m│ filter: \x1b[33m{}\x1b[0m                                                                   │\x1b[0m\r\n", filter);
+        let filter_content = format!("filter: {}", filter);
+        let filter_pad = box_width.saturating_sub(filter_content.len() + 2);
+        print!("\r\x1b[2K\x1b[90m│\x1b[0m \x1b[33m{}\x1b[0m{} \x1b[90m│\x1b[0m\r\n", filter, " ".repeat(filter_pad));
     }
 
     render_subdirs_section(subdirs, cursor, scroll, visible, filter);
     let up = if has_above { "↑" } else { " " };
     let dn = if has_below { "↓" } else { " " };
+    let footer_content = format!("{} {}/{} {}", up, cursor.saturating_add(1), subdirs.len(), dn);
+    let bottom_dashes = box_width.saturating_sub(footer_content.len() + 2);
     print!(
-        "\r\x1b[2K\x1b[90m└{} {} {}/{} {}┘\x1b[0m\r\n",
-        "─".repeat(20),
-        up,
-        cursor.saturating_add(1),
-        subdirs.len(),
-        dn
+        "\r\x1b[2K\x1b[90m└{} {}┘\x1b[0m\r\n",
+        "─".repeat(bottom_dashes),
+        footer_content
     );
 }
 
@@ -250,31 +255,37 @@ fn render_multiselect_display(
     print!("\x1b[{total_rows}A");
     let selected_count = selected.len();
     let path_str = current.to_string_lossy();
-    let dashes = "─".repeat(60usize.saturating_sub(path_str.len() + 4));
+    let box_width = 70usize;
+    let top_content_len = 4 + path_str.len(); // "┌─» " + path + "┐"
+    let top_dashes = box_width.saturating_sub(top_content_len);
     print!(
         "\r\x1b[2K\x1b[36m┌─»\x1b[0m \x1b[36m{}\x1b[0m\x1b[36m{}┐\x1b[0m\r\n",
-        path_str, dashes
+        path_str,
+        "─".repeat(top_dashes)
     );
-    print!(
-        "\r\x1b[2K\x1b[90m│ ↑↓ navigate Space mark → enter ← back Enter confirm Esc cancel ({selected_count} selected) │\x1b[0m\r\n"
+    let help_text = format!(
+        "↑↓ navigate Space mark → enter ← back Enter confirm Esc cancel ({} selected)",
+        selected_count
     );
+    print!("\r\x1b[2K\x1b[90m│\x1b[0m {} \x1b[90m│\x1b[0m\r\n", help_text);
 
     if filter.is_empty() {
-        print!("\r\x1b[2K\x1b[90m│ filter: _                                                                   │\x1b[0m\r\n");
+        print!("\r\x1b[2K\x1b[90m│\x1b[0m filter: _{} \x1b[90m│\x1b[0m\r\n", " ".repeat(59));
     } else {
-        print!("\r\x1b[2K\x1b[90m│ filter: \x1b[33m{}\x1b[0m\x1b[90m                                                                   │\x1b[0m\r\n", filter);
+        let filter_content = format!("filter: {}", filter);
+        let filter_pad = box_width.saturating_sub(filter_content.len() + 2);
+        print!("\r\x1b[2K\x1b[90m│\x1b[0m \x1b[33m{}\x1b[0m{} \x1b[90m│\x1b[0m\r\n", filter, " ".repeat(filter_pad));
     }
 
     render_multiselect_subdirs(subdirs, cursor, scroll, visible, filter, current, selected);
     let up = if has_above { "↑" } else { " " };
     let dn = if has_below { "↓" } else { " " };
+    let footer_content = format!("{} {}/{} {}", up, cursor.saturating_add(1), subdirs.len(), dn);
+    let bottom_dashes = box_width.saturating_sub(footer_content.len() + 2);
     print!(
-        "\r\x1b[2K\x1b[90m└{} {} {}/{} {}┘\x1b[0m\r\n",
-        "─".repeat(20),
-        up,
-        cursor.saturating_add(1),
-        subdirs.len(),
-        dn
+        "\r\x1b[2K\x1b[90m└{} {}┘\x1b[0m\r\n",
+        "─".repeat(bottom_dashes),
+        footer_content
     );
 }
 
