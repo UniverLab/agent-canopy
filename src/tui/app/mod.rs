@@ -339,7 +339,9 @@ impl App {
         if self.agents_rag_focused {
             self.agents_rag_focused = false;
             if !self.agents.is_empty() {
+                let prev = self.selected;
                 self.selected = 0;
+                self.update_agent_section_focus_on_change(prev);
             }
             self.reset_log_scroll();
             return;
@@ -502,7 +504,9 @@ impl App {
         if self.agents_rag_focused {
             self.agents_rag_focused = false;
             if !self.agents.is_empty() {
+                let prev = self.selected;
                 self.selected = self.agents.len() - 1;
+                self.update_agent_section_focus_on_change(prev);
             }
             self.reset_log_scroll();
             return;
