@@ -180,6 +180,7 @@ impl Scene for DandelionScene {
                 row: seed.y as u16,
                 symbol: SHIMMER_FRAMES[Self::shimmer_frame(seed.phase)],
                 color: SEED_COLOR,
+                bg: None,
             })
             .collect()
     }

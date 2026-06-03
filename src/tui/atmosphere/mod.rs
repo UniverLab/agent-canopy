@@ -22,6 +22,8 @@ pub struct Particle {
     pub row: u16,
     pub symbol: &'static str,
     pub color: ratatui::style::Color,
+    /// Optional background color for this cell.
+    pub bg: Option<ratatui::style::Color>,
 }
 
 // ── Scene trait ───────────────────────────────────────────────────
@@ -148,6 +150,9 @@ impl SceneManager {
                 if let Some(cell) = cell {
                     cell.set_symbol(p.symbol);
                     cell.set_fg(p.color);
+                    if let Some(bg) = p.bg {
+                        cell.set_bg(bg);
+                    }
                 }
             }
         }
