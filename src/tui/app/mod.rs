@@ -369,17 +369,11 @@ impl App {
 
     fn update_agent_section_focus_on_change(&mut self, _prev_selected: usize) {
         if let Some(agent) = self.agents.get(self.selected) {
-            match agent {
-                AgentEntry::Agent(_) | AgentEntry::Group(_) => {
-                    self.agent_section_focus = AgentSectionFocus::Background;
-                }
-                AgentEntry::Interactive(_) => {
-                    self.agent_section_focus = AgentSectionFocus::Interactive;
-                }
-                AgentEntry::Terminal(_) => {
-                    self.agent_section_focus = AgentSectionFocus::Terminal;
-                }
-            }
+            self.agent_section_focus = match agent {
+                AgentEntry::Agent(_) | AgentEntry::Group(_) => AgentSectionFocus::Background,
+                AgentEntry::Interactive(_) => AgentSectionFocus::Interactive,
+                AgentEntry::Terminal(_) => AgentSectionFocus::Terminal,
+            };
         }
     }
 

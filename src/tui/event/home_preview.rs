@@ -158,38 +158,10 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
             app.cycle_projects_panel_focus(false);
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if app.sidebar_mode == SidebarMode::Projects {
-                app.select_next();
-            } else {
-                // Agents mode: Down navigates agents; if at end and RAG exists, go to RagInfo.
-                if app.agents_rag_focused {
-                    app.agents_rag_focused = false;
-                    if !app.agents.is_empty() {
-                        app.selected = 0;
-                    }
-                } else {
-                    let at_last = app.selected + 1 >= app.agents.len();
-                    if at_last && app.rag_info.total_chunks > 0 {
-                        app.agents_rag_focused = true;
-                    } else {
-                        app.select_next();
-                    }
-                }
-            }
+            app.select_next();
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            if app.sidebar_mode == SidebarMode::Projects {
-                app.select_prev();
-            } else {
-                if app.agents_rag_focused {
-                    app.agents_rag_focused = false;
-                    if !app.agents.is_empty() {
-                        app.selected = app.agents.len() - 1;
-                    }
-                } else {
-                    app.select_prev();
-                }
-            }
+            app.select_prev();
         }
         KeyCode::Left
             if app.sidebar_mode == SidebarMode::Projects

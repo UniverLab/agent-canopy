@@ -56,7 +56,7 @@ pub enum ProjectsPanelFocus {
     RagInfo,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[expect(dead_code)]
 pub enum AgentSectionFocus {
     Background,

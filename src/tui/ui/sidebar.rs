@@ -922,10 +922,24 @@ fn projects_panel_border_style(app: &App, panel: ProjectsPanelFocus) -> Style {
 }
 
 fn agent_section_border_style(app: &App, section: AgentSectionFocus) -> Style {
-    let focused = app.sidebar_mode == SidebarMode::Agents
-        && matches!(app.focus, Focus::Home | Focus::Preview)
-        && app.agent_section_focus == section
-        && !app.playground_active;
+    let in_agents_mode = app.sidebar_mode == SidebarMode::Agents;
+    let not_playground = !app.playground_active;
+    
+    let focused = if matches!(app.focus, Focus::Home | Focus::Preview) {
+        in_agents_mode && not_playground && app.agent_section_focus == section
+    } else if app.focus == Focus::Agent {
+        in_agents_mode && not_playground && {
+            match app.agents.get(app.selected) {
+                Some(AgentEntry::Agent(_) | AgentEntry::Group(_)) => section == AgentSectionFocus::Background,
+                Some(AgentEntry::Interactive(_)) => section == AgentSectionFocus::Interactive,
+                Some(AgentEntry::Terminal(_)) => section == AgentSectionFocus::Terminal,
+                None => false,
+            }
+        }
+    } else {
+        false
+    };
+    
     Style::default().fg(if focused { ACCENT } else { DIM })
 }
 
