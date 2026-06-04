@@ -206,7 +206,7 @@ pub const MISSIONS: &[MissionDef] = &[
     MissionDef {
         id: MissionId::AutomationEngineer,
         title: "Ingeniero de Automatización",
-        icon: "⛓",
+        icon: "⎔",
         category: MissionCategory::Workflow,
     },
     MissionDef {
