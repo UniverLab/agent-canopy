@@ -859,6 +859,48 @@ impl SimplePromptDialog {
         lines.max(1)
     }
 
+    /// Distance from cursor position to the last word boundary (space or newline).
+    /// Returns 0 if cursor is at position 0 or no boundary found before cursor.
+    #[allow(dead_code)]
+    pub fn distance_to_last_space(text: &str, cursor_pos: usize) -> usize {
+        if cursor_pos == 0 {
+            return 0;
+        }
+        let prefix: String = text.chars().take(cursor_pos).collect();
+        // Find the last space or newline
+        let last_boundary = prefix.rfind([' ', '\n']);
+        match last_boundary {
+            Some(pos) => cursor_pos - pos - 1,
+            None => cursor_pos, // No boundary found, entire prefix is one word
+        }
+    }
+
+    /// Check if typing a character should trigger a newline (word-wrap at space boundary).
+    /// Returns true if the current word would overflow the available space.
+    #[allow(dead_code)]
+    pub fn should_wrap_at_word_boundary(
+        text: &str,
+        cursor_pos: usize,
+        field_width: usize,
+        new_chars: usize,
+    ) -> bool {
+        if field_width == 0 {
+            return false;
+        }
+        // Calculate current column position (accounting for existing newlines)
+        let prefix: String = text.chars().take(cursor_pos).collect();
+        let current_col = prefix
+            .rfind('\n')
+            .map(|pos| cursor_pos - pos - 1)
+            .unwrap_or(cursor_pos);
+
+        // Distance from cursor to last space (current word length from last break)
+        let word_dist = Self::distance_to_last_space(text, cursor_pos);
+
+        // If adding new_chars would overflow the line
+        current_col + word_dist + new_chars > field_width
+    }
+
     /// Visual lines occupied by the first `char_idx` chars of text.
     fn visual_lines_to_cursor(text: &str, char_idx: usize, field_width: usize) -> usize {
         let prefix: String = text.chars().take(char_idx).collect();
@@ -1192,6 +1234,70 @@ mod tests {
             .enabled_sections
             .iter()
             .any(|section_id| section_id.starts_with("project_context_")));
+    }
+
+    #[test]
+    fn distance_to_last_space_basic() {
+        assert_eq!(
+            SimplePromptDialog::distance_to_last_space("hello world", 11),
+            5
+        );
+        assert_eq!(
+            SimplePromptDialog::distance_to_last_space("hello world", 6),
+            0
+        );
+        assert_eq!(SimplePromptDialog::distance_to_last_space("hello", 5), 5);
+        assert_eq!(SimplePromptDialog::distance_to_last_space("", 0), 0);
+    }
+
+    #[test]
+    fn distance_to_last_space_after_space() {
+        assert_eq!(SimplePromptDialog::distance_to_last_space("hello w", 7), 1);
+        assert_eq!(SimplePromptDialog::distance_to_last_space("a b c d", 7), 1);
+    }
+
+    #[test]
+    fn should_wrap_at_word_boundary_basic() {
+        // "hello " is 6 chars, adding "world" (5 chars) = 11 chars
+        // With field_width=10, should wrap
+        assert!(SimplePromptDialog::should_wrap_at_word_boundary(
+            "hello ", 6, 10, 5
+        ));
+        // With field_width=20, should not wrap
+        assert!(!SimplePromptDialog::should_wrap_at_word_boundary(
+            "hello ", 6, 20, 5
+        ));
+    }
+
+    #[test]
+    fn should_wrap_at_word_boundary_with_newline() {
+        // After a newline, column resets to 0
+        assert!(!SimplePromptDialog::should_wrap_at_word_boundary(
+            "hello\n", 6, 10, 5
+        ));
+        assert!(SimplePromptDialog::should_wrap_at_word_boundary(
+            "hello\nworld ",
+            12,
+            10,
+            5
+        ));
+    }
+
+    #[test]
+    fn should_wrap_at_word_boundary_at_typing() {
+        // Typing one char at a time: "hello " + "w" = cursor at 7, word_dist = 1
+        // current_col = 7, word_dist = 1, new_chars = 1 → 7 + 1 + 1 = 9 < 10, no wrap
+        assert!(!SimplePromptDialog::should_wrap_at_word_boundary(
+            "hello w", 7, 10, 1
+        ));
+        // "hello worl" + "d" = cursor at 11, word_dist = 5
+        // current_col = 11, word_dist = 5, new_chars = 1 → 11 + 5 + 1 = 17 > 10, wrap
+        assert!(SimplePromptDialog::should_wrap_at_word_boundary(
+            "hello worl",
+            10,
+            10,
+            1
+        ));
     }
 }
 
