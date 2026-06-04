@@ -86,20 +86,21 @@ pub fn draw_legend(frame: &mut Frame, app: &mut App) {
         Line::from(vec![
             Span::styled("Session: ", label_style),
             Span::styled(&session_uptime, accent_style),
-            Span::raw("  "),
+            Span::raw("   "),
             Span::styled("Canopy: ", label_style),
             Span::styled(&canopy_uptime, accent_style),
         ]),
+        Line::from(""),
         Line::from(vec![
             Span::styled("Interactive: ", label_style),
             Span::styled(format!("{interactive_count}"), value_style),
-            Span::raw("  "),
+            Span::raw("   "),
             Span::styled("Terminal: ", label_style),
             Span::styled(format!("{terminal_count}"), value_style),
-            Span::raw("  "),
+            Span::raw("   "),
             Span::styled("BG: ", label_style),
             Span::styled(format!("{bg_count}"), value_style),
-            Span::raw("  "),
+            Span::raw("   "),
             Span::styled("Runs: ", label_style),
             Span::styled(format!("{runs_count}"), value_style),
         ]),
@@ -115,14 +116,14 @@ pub fn draw_legend(frame: &mut Frame, app: &mut App) {
             .collect();
         header_lines.push(Line::from(vec![
             Span::styled("Harnesses: ", label_style),
-            Span::styled(clis.join(" "), value_style),
+            Span::styled(clis.join("  "), value_style),
         ]));
         header_lines.push(Line::from(""));
     }
 
     let total = MISSIONS.len();
     let unlocked_n = app.mission_manager.unlocked_count();
-    let visible_rows = 8u16;
+    let visible_rows = 6u16;
     let scroll = app.legend_scroll.min(total.saturating_sub(1) as u16);
     app.legend_scroll = scroll;
 
@@ -137,41 +138,97 @@ pub fn draw_legend(frame: &mut Frame, app: &mut App) {
         }
     };
 
-    let mut medal_lines = vec![Line::from(vec![
-        Span::styled(
-            " Missions ",
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" {unlocked_n}/{total} "),
-            Style::default().fg(ACCENT),
-        ),
-    ])];
+    let category_label = |cat: &MissionCategory| -> &'static str {
+        match cat {
+            MissionCategory::Environment => "Environment",
+            MissionCategory::Intelligence => "Intelligence",
+            MissionCategory::Projects => "Projects",
+            MissionCategory::Workflow => "Workflow",
+            MissionCategory::Seeds => "Seeds",
+            MissionCategory::SysInfo => "System",
+        }
+    };
 
+    let now_ms = chrono::Utc::now().timestamp_millis() as f64;
+    let twinkle = |offset: usize| -> f64 {
+        let phase = (now_ms / 1500.0) + (offset as f64 * 0.7);
+        (phase.sin() + 1.0) / 2.0
+    };
+
+    let dim_color = |base: Color, factor: f64| -> Color {
+        match base {
+            Color::Rgb(r, g, b) => {
+                let min_brightness = 0.4;
+                let f = min_brightness + (1.0 - min_brightness) * factor;
+                Color::Rgb(
+                    (r as f64 * f) as u8,
+                    (g as f64 * f) as u8,
+                    (b as f64 * f) as u8,
+                )
+            }
+            _ => base,
+        }
+    };
+
+    let mut medal_lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                " ✦ ",
+                Style::default()
+                    .fg(ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Missions",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {unlocked_n}/{total}"),
+                Style::default().fg(DIM),
+            ),
+        ]),
+        Line::from(""),
+    ];
+
+    let mut visible_idx = 0usize;
     for (i, def) in MISSIONS.iter().enumerate() {
         if (i as u16) < scroll || (i as u16) >= scroll + visible_rows {
             continue;
         }
         let unlocked = app.mission_manager.is_unlocked(def.id);
-        let icon_style = if unlocked {
-            Style::default()
-                .fg(category_color(&def.category))
-                .add_modifier(Modifier::BOLD | Modifier::ITALIC)
+        let base_color = category_color(&def.category);
+
+        if unlocked {
+            let twinkle_factor = twinkle(visible_idx);
+            let icon_color = dim_color(base_color, twinkle_factor);
+            let icon_style = Style::default()
+                .fg(icon_color)
+                .add_modifier(Modifier::BOLD);
+
+            medal_lines.push(Line::from(vec![
+                Span::styled(format!("  {} ", def.icon), icon_style),
+                Span::styled(def.title, Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("  · {}", category_label(&def.category)),
+                    Style::default().fg(DIM),
+                ),
+            ]));
         } else {
-            Style::default().fg(Color::Rgb(60, 60, 60))
-        };
-        let title_style = if unlocked {
-            Style::default().fg(Color::White)
-        } else {
-            Style::default().fg(Color::Rgb(80, 80, 80))
-        };
-        let icon = if unlocked { def.icon } else { "·" };
-        medal_lines.push(Line::from(vec![
-            Span::styled(format!(" {icon} "), icon_style),
-            Span::styled(def.title, title_style),
-        ]));
+            medal_lines.push(Line::from(vec![
+                Span::styled("  · ", Style::default().fg(Color::Rgb(50, 50, 50))),
+                Span::styled(def.title, Style::default().fg(Color::Rgb(70, 70, 70))),
+                Span::styled(
+                    format!("  · {}", category_label(&def.category)),
+                    Style::default().fg(Color::Rgb(50, 50, 50)),
+                ),
+            ]));
+        }
+
+        visible_idx += 1;
+        medal_lines.push(Line::from(""));
     }
 
     let scroll_indicator = if total > visible_rows as usize {
@@ -188,8 +245,12 @@ pub fn draw_legend(frame: &mut Frame, app: &mut App) {
     let footer_lines = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled(" F1/Esc close ", label_style),
-            Span::styled(" ↑↓/jk scroll ", label_style),
+            Span::styled(" F1/Esc ", label_style),
+            Span::styled("close   ", Style::default().fg(Color::White)),
+            Span::styled("↑↓/jk ", label_style),
+            Span::styled("scroll   ", Style::default().fg(Color::White)),
+            Span::styled("⊞ ", label_style),
+            Span::styled("mouse wheel", Style::default().fg(Color::White)),
             if scroll_indicator.is_empty() {
                 Span::raw("")
             } else {
@@ -205,9 +266,9 @@ pub fn draw_legend(frame: &mut Frame, app: &mut App) {
         .collect();
 
     let content_height = all_lines.len() as u16 + 2;
-    let width = 44u16;
-    let height = content_height.clamp(12, 30);
-    let percent_x = (width * 100 / frame.area().width.max(1)).clamp(30, 60);
+    let width = 52u16;
+    let height = content_height.clamp(16, 36);
+    let percent_x = (width * 100 / frame.area().width.max(1)).clamp(35, 65);
     let area = centered_rect(percent_x, height, frame.area());
     frame.render_widget(Clear, area);
 
@@ -215,7 +276,7 @@ pub fn draw_legend(frame: &mut Frame, app: &mut App) {
         .title(" Canopy Stats ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
-        .style(Style::default().bg(Color::Rgb(15, 25, 15)));
+        .style(Style::default().bg(Color::Rgb(12, 20, 12)));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 

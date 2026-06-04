@@ -243,6 +243,18 @@ fn handle_mouse_scroll(app: &mut App, mouse: &MouseEvent) {
         return;
     };
 
+    if app.show_legend {
+        let total = crate::domain::gamification::MISSIONS.len() as u16;
+        let visible = 8u16;
+        let max_scroll = total.saturating_sub(visible);
+        if dir > 0 {
+            app.legend_scroll = app.legend_scroll.saturating_sub(1);
+        } else {
+            app.legend_scroll = app.legend_scroll.saturating_add(1).min(max_scroll);
+        }
+        return;
+    }
+
     if handle_sync_panel_scroll(app, mouse, dir) {
         return;
     }
