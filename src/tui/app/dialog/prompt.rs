@@ -861,7 +861,6 @@ impl SimplePromptDialog {
 
     /// Distance from cursor position to the last word boundary (space or newline).
     /// Returns 0 if cursor is at position 0 or no boundary found before cursor.
-    #[allow(dead_code)]
     pub fn distance_to_last_space(text: &str, cursor_pos: usize) -> usize {
         if cursor_pos == 0 {
             return 0;
@@ -877,7 +876,6 @@ impl SimplePromptDialog {
 
     /// Check if typing a character should trigger a newline (word-wrap at space boundary).
     /// Returns true if the current word would overflow the available space.
-    #[allow(dead_code)]
     pub fn should_wrap_at_word_boundary(
         text: &str,
         cursor_pos: usize,
@@ -982,12 +980,26 @@ impl SimplePromptDialog {
     /// Insert a character at cursor position in any section.
     pub fn insert_char_at_cursor(&mut self, section_id: &str, ch: char, field_width: usize) {
         let content = self.get_section_content(section_id);
-        let chars: Vec<char> = content.chars().collect();
-        let cur = self.cursor(section_id).min(chars.len());
-        let mut new_chars = chars;
-        new_chars.insert(cur, ch);
+        let cur = self.cursor(section_id).min(content.chars().count());
+
+        let adjusted_cur = cur;
+        let mut modified_content = content.clone();
+
+        if ch != ' ' && ch != '\n' && !content.is_empty()
+            && Self::should_wrap_at_word_boundary(&modified_content, adjusted_cur, field_width, 1)
+        {
+            let prefix: String = modified_content.chars().take(adjusted_cur).collect();
+            if let Some(space_pos) = prefix.rfind(' ') {
+                let mut chars: Vec<char> = modified_content.chars().collect();
+                chars[space_pos] = '\n';
+                modified_content = chars.into_iter().collect();
+            }
+        }
+
+        let mut new_chars: Vec<char> = modified_content.chars().collect();
+        new_chars.insert(adjusted_cur, ch);
         let new_content: String = new_chars.into_iter().collect();
-        self.set_content_and_cursor(section_id, new_content, cur + 1, field_width);
+        self.set_content_and_cursor(section_id, new_content, adjusted_cur + 1, field_width);
     }
 
     /// Delete the character before cursor in any section.
