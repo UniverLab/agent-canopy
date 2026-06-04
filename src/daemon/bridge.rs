@@ -7,7 +7,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use crate::application::ports::StateRepository;
 use crate::db::Database;
 use crate::shared::sync_identity::{
-    CANOPY_AGENT_ID_ENV, CANOPY_AGENT_ID_HEADER, CANOPY_WORKDIR_ENV, CANOPY_WORKDIR_HEADER,
+    CANOPY_AGENT_ID_ENV, CANOPY_AGENT_ID_HEADER, CANOPY_CLIENT_NAME_HEADER, CANOPY_WORKDIR_ENV,
+    CANOPY_WORKDIR_HEADER,
 };
 
 pub(crate) async fn run_bridge(
@@ -90,6 +91,7 @@ async fn forward_request(
         .post(endpoint)
         .header(CANOPY_AGENT_ID_HEADER, agent_id)
         .header(CANOPY_WORKDIR_HEADER, workdir)
+        .header(CANOPY_CLIENT_NAME_HEADER, "bridge")
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(line.to_string())
         .send()
