@@ -2,4 +2,4 @@
 
 mod manager;
 
-pub use manager::{medal_icons, MissionEvent, MissionManager, MissionSnapshot};
+pub use manager::{MissionEvent, MissionManager, MissionSnapshot};

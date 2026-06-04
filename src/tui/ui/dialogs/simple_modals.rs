@@ -66,7 +66,9 @@ fn format_uptime_precise(seconds: u64) -> String {
         (d, h, m) => format!("{d}d {h}h {m}m {secs}s"),
     }
 }
-pub fn draw_legend(frame: &mut Frame, app: &App) {
+pub fn draw_legend(frame: &mut Frame, app: &mut App) {
+    use crate::domain::gamification::{MissionCategory, MISSIONS};
+
     let label_style = Style::default().fg(DIM);
     let value_style = Style::default()
         .fg(Color::White)
@@ -80,31 +82,25 @@ pub fn draw_legend(frame: &mut Frame, app: &App) {
     let bg_count = app.db.count_background_agents().unwrap_or(0);
     let runs_count = app.db.count_runs().unwrap_or(0);
 
-    let mut lines = vec![
-        Line::from(""),
+    let mut header_lines = vec![
         Line::from(vec![
-            Span::styled("Session uptime: ", label_style),
+            Span::styled("Session: ", label_style),
             Span::styled(&session_uptime, accent_style),
-        ]),
-        Line::from(vec![
-            Span::styled("Canopy uptime:  ", label_style),
+            Span::raw("  "),
+            Span::styled("Canopy: ", label_style),
             Span::styled(&canopy_uptime, accent_style),
         ]),
-        Line::from(""),
         Line::from(vec![
-            Span::styled("Interactive:       ", label_style),
+            Span::styled("Interactive: ", label_style),
             Span::styled(format!("{interactive_count}"), value_style),
-        ]),
-        Line::from(vec![
-            Span::styled("Terminal:          ", label_style),
+            Span::raw("  "),
+            Span::styled("Terminal: ", label_style),
             Span::styled(format!("{terminal_count}"), value_style),
-        ]),
-        Line::from(vec![
-            Span::styled("Background agents: ", label_style),
+            Span::raw("  "),
+            Span::styled("BG: ", label_style),
             Span::styled(format!("{bg_count}"), value_style),
-        ]),
-        Line::from(vec![
-            Span::styled("Runs executed:     ", label_style),
+            Span::raw("  "),
+            Span::styled("Runs: ", label_style),
             Span::styled(format!("{runs_count}"), value_style),
         ]),
         Line::from(""),
@@ -112,64 +108,105 @@ pub fn draw_legend(frame: &mut Frame, app: &App) {
 
     let top_clis = app.cli_usage.ranked();
     if !top_clis.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "Most used harnesses",
+        let clis: Vec<String> = top_clis
+            .iter()
+            .take(3)
+            .map(|(name, count)| format!("{name}({count})"))
+            .collect();
+        header_lines.push(Line::from(vec![
+            Span::styled("Harnesses: ", label_style),
+            Span::styled(clis.join(" "), value_style),
+        ]));
+        header_lines.push(Line::from(""));
+    }
+
+    let total = MISSIONS.len();
+    let unlocked_n = app.mission_manager.unlocked_count();
+    let visible_rows = 8u16;
+    let scroll = app.legend_scroll.min(total.saturating_sub(1) as u16);
+    app.legend_scroll = scroll;
+
+    let category_color = |cat: &MissionCategory| -> Color {
+        match cat {
+            MissionCategory::Environment => Color::Rgb(100, 220, 100),
+            MissionCategory::Intelligence => Color::Rgb(100, 180, 255),
+            MissionCategory::Projects => Color::Rgb(255, 200, 80),
+            MissionCategory::Workflow => Color::Rgb(220, 120, 255),
+            MissionCategory::Seeds => Color::Rgb(80, 220, 180),
+            MissionCategory::SysInfo => Color::Rgb(255, 130, 80),
+        }
+    };
+
+    let mut medal_lines = vec![Line::from(vec![
+        Span::styled(
+            " Missions ",
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(""));
-        for (name, count) in top_clis.iter().take(4) {
-            lines.push(Line::from(vec![
-                Span::styled(format!("{name}  "), value_style),
-                Span::styled(format!("{count} launches"), label_style),
-            ]));
+        ),
+        Span::styled(
+            format!(" {unlocked_n}/{total} "),
+            Style::default().fg(ACCENT),
+        ),
+    ])];
+
+    for (i, def) in MISSIONS.iter().enumerate() {
+        if (i as u16) < scroll || (i as u16) >= scroll + visible_rows {
+            continue;
         }
-        lines.push(Line::from(""));
+        let unlocked = app.mission_manager.is_unlocked(def.id);
+        let icon_style = if unlocked {
+            Style::default()
+                .fg(category_color(&def.category))
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC)
+        } else {
+            Style::default().fg(Color::Rgb(60, 60, 60))
+        };
+        let title_style = if unlocked {
+            Style::default().fg(Color::White)
+        } else {
+            Style::default().fg(Color::Rgb(80, 80, 80))
+        };
+        let icon = if unlocked { def.icon } else { "·" };
+        medal_lines.push(Line::from(vec![
+            Span::styled(format!(" {icon} "), icon_style),
+            Span::styled(def.title, title_style),
+        ]));
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "🏅 Medals Unlocked",
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(""));
+    let scroll_indicator = if total > visible_rows as usize {
+        let pct = if total <= 1 {
+            0
+        } else {
+            scroll as usize * 100 / (total - visible_rows as usize).max(1)
+        };
+        format!(" {}% ", pct)
+    } else {
+        String::new()
+    };
 
-    let medals: Vec<_> = crate::tui::gamification::medal_icons(&app.mission_manager);
-    lines.push(Line::from(
-        medals
-            .iter()
-            .flat_map(|(icon, unlocked)| {
-                let style = if *unlocked { accent_style } else { label_style };
-                let symbol = if *unlocked { *icon } else { "·" };
-                vec![Span::styled(symbol, style), Span::raw(" ")]
-            })
-            .collect::<Vec<_>>(),
-    ));
+    let footer_lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" F1/Esc close ", label_style),
+            Span::styled(" ↑↓/jk scroll ", label_style),
+            if scroll_indicator.is_empty() {
+                Span::raw("")
+            } else {
+                Span::styled(scroll_indicator, accent_style)
+            },
+        ]),
+    ];
 
-    let unlocked_n = app.mission_manager.unlocked_count();
-    lines.push(Line::from(Span::styled(
-        format!("{unlocked_n} / {}", medals.len()),
-        label_style,
-    )));
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "F1 or Esc to close",
-        Style::default().fg(DIM),
-    )));
+    let all_lines: Vec<Line> = header_lines
+        .into_iter()
+        .chain(medal_lines)
+        .chain(footer_lines)
+        .collect();
 
-    // Responsive sizing
-    let content_height = lines.len() as u16 + 2; // +2 for borders
-    let content_width = lines
-        .iter()
-        .map(|l| l.to_string().chars().count() as u16)
-        .max()
-        .unwrap_or(36)
-        + 4; // padding
-    let width = content_width.clamp(36, 50);
-    let height = content_height.clamp(12, 28);
+    let content_height = all_lines.len() as u16 + 2;
+    let width = 44u16;
+    let height = content_height.clamp(12, 30);
     let percent_x = (width * 100 / frame.area().width.max(1)).clamp(30, 60);
     let area = centered_rect(percent_x, height, frame.area());
     frame.render_widget(Clear, area);
@@ -183,7 +220,7 @@ pub fn draw_legend(frame: &mut Frame, app: &App) {
     frame.render_widget(block, area);
 
     frame.render_widget(
-        Paragraph::new(lines).alignment(ratatui::layout::Alignment::Center),
+        Paragraph::new(all_lines).alignment(ratatui::layout::Alignment::Left),
         inner,
     );
 }

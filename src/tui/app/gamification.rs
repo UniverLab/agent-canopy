@@ -71,8 +71,15 @@ impl App {
     pub(super) fn tick_missions(&mut self) -> Result<()> {
         let events: Vec<_> = self.mission_pending_events.drain(..).collect();
         let snapshot = self.build_mission_snapshot()?;
-        self.mission_manager
-            .process_refresh(&snapshot, &events, &mut self.whimsg)?;
+        let unlocked =
+            self.mission_manager
+                .process_refresh(&snapshot, &events, &mut self.whimsg)?;
+        for title in &unlocked {
+            crate::domain::notification::send_notification(
+                "Canopy — mission unlocked",
+                title,
+            );
+        }
         Ok(())
     }
 

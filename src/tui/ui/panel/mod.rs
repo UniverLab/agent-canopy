@@ -33,7 +33,7 @@ pub use warp::compact_cwd;
 pub use warp::{draw_warp_input_box, render_command_chips};
 
 use home::draw_canopy_banner_animation;
-use vt100::{render_indicators, render_vt_screen_with_mask};
+use vt100::render_indicators;
 
 fn render_panel_block<'a>(
     frame: &mut Frame,
@@ -127,14 +127,10 @@ fn render_snapshot(
     area: Rect,
     snap: &ScreenSnapshot,
     app: &App,
-    mask_cursor_line: bool,
+    _mask_cursor_line: bool,
     show_cursor: bool,
 ) {
-    if mask_cursor_line {
-        render_vt_screen_with_mask(frame, area, snap, true);
-    } else {
-        render_vt_screen(frame, area, snap);
-    }
+    render_vt_screen(frame, area, snap);
     if show_cursor {
         set_cursor_from_snapshot(frame, area, snap);
     }

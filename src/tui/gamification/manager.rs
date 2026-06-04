@@ -6,7 +6,7 @@ use anyhow::Result;
 
 use crate::db::achievements::AchievementStore;
 use crate::db::Database;
-use crate::domain::gamification::{mission_def, MissionId, MISSIONS};
+use crate::domain::gamification::{mission_def, MissionId};
 use crate::tui::whimsg::Whimsg;
 
 /// One-shot events from atmosphere or user actions.
@@ -76,8 +76,9 @@ impl MissionManager {
         snapshot: &MissionSnapshot,
         events: &[MissionEvent],
         whimsg: &mut Whimsg,
-    ) -> Result<()> {
+    ) -> Result<Vec<String>> {
         let mut pending = Vec::new();
+        let mut newly_unlocked = Vec::new();
 
         for event in events {
             match event {
@@ -217,10 +218,11 @@ impl MissionManager {
             if self.store.unlock(id)? {
                 let title = mission_def(id).title;
                 whimsg.notify_mission_unlocked(title);
+                newly_unlocked.push(title.to_string());
             }
         }
 
-        Ok(())
+        Ok(newly_unlocked)
     }
 
     fn push_if(condition: bool, id: MissionId, pending: &mut Vec<MissionId>) {
@@ -228,12 +230,4 @@ impl MissionManager {
             pending.push(id);
         }
     }
-}
-
-/// All mission icons for the stats dashboard (unlocked vs locked).
-pub fn medal_icons(manager: &MissionManager) -> Vec<(&'static str, bool)> {
-    MISSIONS
-        .iter()
-        .map(|def| (def.icon, manager.is_unlocked(def.id)))
-        .collect()
 }

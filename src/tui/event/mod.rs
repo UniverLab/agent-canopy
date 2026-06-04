@@ -125,7 +125,7 @@ use knowledge_dialog::handle_knowledge_dialog_key;
 mod workflow_editor;
 
 pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
-    if dismiss_legend(app) || handle_global_key(app, code, modifiers) {
+    if dismiss_legend(app, code) || handle_global_key(app, code, modifiers) {
         return Ok(());
     }
 
@@ -136,12 +136,26 @@ pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Resu
     dispatch_focus_key(app, code, modifiers)
 }
 
-fn dismiss_legend(app: &mut App) -> bool {
+fn dismiss_legend(app: &mut App, code: KeyCode) -> bool {
     if !app.show_legend {
         return false;
     }
 
-    app.show_legend = false;
+    match code {
+        KeyCode::Esc | KeyCode::F(1) | KeyCode::Enter => {
+            app.show_legend = false;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.legend_scroll = app.legend_scroll.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let total = crate::domain::gamification::MISSIONS.len() as u16;
+            let visible = 8u16;
+            let max_scroll = total.saturating_sub(visible);
+            app.legend_scroll = app.legend_scroll.saturating_add(1).min(max_scroll);
+        }
+        _ => {}
+    }
     true
 }
 

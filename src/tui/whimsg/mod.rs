@@ -97,6 +97,7 @@ pub struct Whimsg {
     seen_twist: DedupRing,
     seen_phrase: DedupRing,
     mission_title: Option<String>,
+    celebration_remaining: u32,
 }
 
 impl Whimsg {
@@ -119,6 +120,7 @@ impl Whimsg {
             seen_twist: DedupRing::new(8),
             seen_phrase: DedupRing::new(8),
             mission_title: None,
+            celebration_remaining: 0,
             rng,
         }
     }
@@ -126,6 +128,7 @@ impl Whimsg {
     /// Celebrate a newly unlocked mission (one-shot, high priority).
     pub fn notify_mission_unlocked(&mut self, title: &str) {
         self.mission_title = Some(title.to_string());
+        self.celebration_remaining = 3;
         self.notify_event(WhimContext::MissionUnlocked);
     }
 
@@ -241,7 +244,20 @@ impl Whimsg {
     }
 
     fn tick_blank(&mut self, elapsed: u64) -> (WhimFrame, Option<Phase>) {
-        if elapsed >= BLANK_MS {
+        let blank_ms = if self.celebration_remaining > 0 {
+            100
+        } else {
+            BLANK_MS
+        };
+        if elapsed >= blank_ms {
+            if self.celebration_remaining > 0 {
+                self.celebration_remaining -= 1;
+                self.event_context = Some(WhimContext::MissionUnlocked);
+                self.event_at = Instant::now();
+                self.generate();
+                self.advance(Phase::ErasingTitle);
+                return (WhimFrame::empty_title(), None);
+            }
             let delay = self.rng.between(INTERVAL_MIN, INTERVAL_MAX);
             self.next_trigger = Instant::now() + Duration::from_secs(delay);
             self.advance(Phase::Idle);
