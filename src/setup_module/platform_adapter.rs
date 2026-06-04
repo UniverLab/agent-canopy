@@ -188,7 +188,13 @@ fn canopy_identity_headers(platform_name: &str) -> Option<JsonMap> {
             CANOPY_WORKDIR_HEADER: format!("{{env:{CANOPY_WORKDIR_ENV}}}"),
             CANOPY_CLIENT_NAME_HEADER: platform_name,
         }),
-        _ => return None,
+        // Generic fallback using ${VAR} syntax (works for most HTTP-based MCP servers)
+        _ => serde_json::json!({
+            CANOPY_AGENT_ID_HEADER: format!("${{{CANOPY_AGENT_ID_ENV}}}"),
+            CANOPY_SESSION_NAME_HEADER: format!("${{{CANOPY_SESSION_NAME_ENV}}}"),
+            CANOPY_WORKDIR_HEADER: format!("${{{CANOPY_WORKDIR_ENV}}}"),
+            CANOPY_CLIENT_NAME_HEADER: platform_name,
+        }),
     };
 
     headers.as_object().map(clone_object_entries)
