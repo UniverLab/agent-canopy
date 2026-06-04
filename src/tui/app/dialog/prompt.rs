@@ -985,7 +985,9 @@ impl SimplePromptDialog {
         let adjusted_cur = cur;
         let mut modified_content = content.clone();
 
-        if ch != ' ' && ch != '\n' && !content.is_empty()
+        if ch != ' '
+            && ch != '\n'
+            && !content.is_empty()
             && Self::should_wrap_at_word_boundary(&modified_content, adjusted_cur, field_width, 1)
         {
             let prefix: String = modified_content.chars().take(adjusted_cur).collect();
