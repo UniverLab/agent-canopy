@@ -113,6 +113,37 @@ impl Database {
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
 
+        // First, check if this session is bound to a seed identity
+        let seed_binding = conn
+            .query_row(
+                "SELECT seed_id FROM seed_sessions WHERE session_id = ?1",
+                rusqlite::params![agent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+
+        if let Some(seed_id) = seed_binding {
+            // Try to load the seed identity and use its name
+            if let Ok(identity) = crate::domain::seeds::load_seed(&seed_id) {
+                // Get the CLI name from the session for suffix
+                let cli_suffix = conn
+                    .query_row(
+                        "SELECT cli FROM interactive_sessions WHERE id = ?1",
+                        rusqlite::params![agent_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .filter(|cli| !cli.is_empty());
+
+                let display = match cli_suffix {
+                    Some(cli) => format!("{} · {}", identity.name, cli),
+                    None => identity.name,
+                };
+                return Ok(Some(display));
+            }
+        }
+
+        // Fallback to session name
         let interactive = conn
             .query_row(
                 "SELECT name, cli
