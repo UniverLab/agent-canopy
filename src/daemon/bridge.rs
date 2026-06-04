@@ -25,6 +25,7 @@ pub(crate) async fn run_bridge(
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
     let mut stdout = tokio::io::stdout();
+    let mut session_id: Option<String> = None;
 
     #[cfg(unix)]
     let mut sig_hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
@@ -62,9 +63,12 @@ pub(crate) async fn run_bridge(
             continue;
         }
 
-        let response = forward_request(&client, &endpoint, &agent_id, &workdir, &line).await;
+        let response = forward_request(&client, &endpoint, &agent_id, &workdir, &line, session_id.as_deref()).await;
         match response {
-            Ok(body) => {
+            Ok((body, new_session_id)) => {
+                if let Some(sid) = new_session_id {
+                    session_id = Some(sid);
+                }
                 stdout.write_all(body.as_bytes()).await?;
                 stdout.write_all(b"\n").await?;
                 stdout.flush().await?;
@@ -86,18 +90,33 @@ async fn forward_request(
     agent_id: &str,
     workdir: &str,
     line: &str,
-) -> Result<String> {
-    let response = client
+    session_id: Option<&str>,
+) -> Result<(String, Option<String>)> {
+    let mut request = client
         .post(endpoint)
         .header(CANOPY_AGENT_ID_HEADER, agent_id)
         .header(CANOPY_WORKDIR_HEADER, workdir)
         .header(CANOPY_CLIENT_NAME_HEADER, "bridge")
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(line.to_string())
+        .header(reqwest::header::ACCEPT, "application/json, text/event-stream")
+        .body(line.to_string());
+
+    if let Some(sid) = session_id {
+        request = request.header("Mcp-Session-Id", sid);
+    }
+
+    let response = request
         .send()
         .await
         .context("failed to reach canopy daemon")?;
     let status = response.status();
+
+    let new_session_id = response
+        .headers()
+        .get("Mcp-Session-Id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
     let body = response
         .text()
         .await
@@ -107,7 +126,7 @@ async fn forward_request(
         anyhow::bail!("daemon returned HTTP {status}: {body}");
     }
 
-    Ok(body)
+    Ok((body, new_session_id))
 }
 
 fn resolve_agent_id(agent_id_arg: Option<String>) -> Result<String> {
