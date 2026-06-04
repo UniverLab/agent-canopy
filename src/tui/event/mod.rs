@@ -141,7 +141,10 @@ fn dismiss_legend(app: &mut App, code: KeyCode) -> bool {
         return false;
     }
 
-    let total = crate::domain::gamification::MISSIONS.len();
+    let unlocked_count = app
+        .mission_manager
+        .unlocked_count();
+    let max_selected = unlocked_count.saturating_sub(1);
 
     match code {
         KeyCode::Esc | KeyCode::F(1) | KeyCode::Enter => {
@@ -151,17 +154,15 @@ fn dismiss_legend(app: &mut App, code: KeyCode) -> bool {
             if app.legend_selected > 0 {
                 app.legend_selected -= 1;
             } else {
-                app.legend_selected = total.saturating_sub(1);
+                app.legend_selected = max_selected;
             }
-            app.legend_scroll = app.legend_selected as u16;
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if app.legend_selected < total.saturating_sub(1) {
+            if app.legend_selected < max_selected {
                 app.legend_selected += 1;
             } else {
                 app.legend_selected = 0;
             }
-            app.legend_scroll = app.legend_selected as u16;
         }
         _ => {}
     }
@@ -253,21 +254,21 @@ fn handle_mouse_scroll(app: &mut App, mouse: &MouseEvent) {
     };
 
     if app.show_legend {
-        let total = crate::domain::gamification::MISSIONS.len();
+        let unlocked_count = app.mission_manager.unlocked_count();
+        let max_selected = unlocked_count.saturating_sub(1);
         if dir > 0 {
             if app.legend_selected > 0 {
                 app.legend_selected -= 1;
             } else {
-                app.legend_selected = total.saturating_sub(1);
+                app.legend_selected = max_selected;
             }
         } else {
-            if app.legend_selected < total.saturating_sub(1) {
+            if app.legend_selected < max_selected {
                 app.legend_selected += 1;
             } else {
                 app.legend_selected = 0;
             }
         }
-        app.legend_scroll = app.legend_selected as u16;
         return;
     }
 

@@ -104,7 +104,6 @@ impl App {
             forced_activity_workdirs: HashSet::new(),
             term_width: 0,
             show_legend: false,
-            legend_scroll: 0,
             legend_selected: 0,
             show_copied: false,
             copied_at: std::time::Instant::now() - std::time::Duration::from_secs(10),

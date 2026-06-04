@@ -278,7 +278,6 @@ pub struct App {
     pub(crate) forced_activity_workdirs: HashSet<String>,
     pub(crate) term_width: u16,
     pub(crate) show_legend: bool,
-    pub(crate) legend_scroll: u16,
     pub(crate) legend_selected: usize,
     pub(crate) show_copied: bool,
     pub(crate) copied_at: std::time::Instant,
