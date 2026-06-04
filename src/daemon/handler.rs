@@ -3,7 +3,7 @@
 //! Uses the `rmcp` SDK's `#[tool_router]` and `#[tool_handler]` macros
 //! with `Parameters<T>` for proper MCP protocol compliance.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::http::request::Parts;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -43,15 +43,13 @@ use crate::domain::workflow::{
 };
 use crate::executor::Executor;
 use crate::rag::rate_limiter::RateLimiter;
-use crate::shared::sync_identity::{
-    self, header_str, CANOPY_AGENT_ID_HEADER, CANOPY_CLIENT_NAME_HEADER, CANOPY_WORKDIR_HEADER,
-};
+use crate::shared::sync_identity::{header_str, CANOPY_AGENT_ID_HEADER, CANOPY_CLIENT_NAME_HEADER};
 use crate::sync_manager::SyncManager;
 use crate::watchers::WatcherEngine;
 use crate::workflow_engine::WorkflowEngine;
 
 const MISSING_SYNC_IDENTITY_MESSAGE: &str =
-    "Missing Canopy session identity. Launch the agent from Canopy so the MCP client sends the Canopy identity headers automatically.";
+    "Missing Canopy session identity. Launch via `canopy bridge --id <AGENT_ID>` so requests include Canopy identity headers.";
 
 fn missing_sync_identity_error() -> McpError {
     McpError::invalid_params(MISSING_SYNC_IDENTITY_MESSAGE.to_string(), None)
@@ -349,7 +347,6 @@ pub struct TaskTriggerHandler {
     pub sync_manager: Arc<SyncManager>,
     /// Rate limiters for rag_search (10 calls/min). Keyed by agent_id.
     pub rag_limiters: Arc<tokio::sync::Mutex<std::collections::HashMap<String, RateLimiter>>>,
-    sticky_agent_id: Arc<Mutex<Option<String>>>,
     pub start_time: std::time::Instant,
     pub port: u16,
     #[allow(dead_code)]
@@ -361,55 +358,13 @@ pub struct TaskTriggerHandler {
 impl TaskTriggerHandler {
     fn resolve_sync_agent_id(&self, parts: &Parts) -> Result<String, McpError> {
         if let Some(agent_id) = header_str(parts, CANOPY_AGENT_ID_HEADER) {
-            if let Ok(mut sticky) = self.sticky_agent_id.lock() {
-                *sticky = Some(agent_id.to_string());
-            }
             return Ok(agent_id.to_string());
         }
-
-        if let Ok(sticky) = self.sticky_agent_id.lock() {
-            if let Some(agent_id) = sticky.as_ref() {
-                return Ok(agent_id.clone());
-            }
-        }
-
-        if let Some(agent_id) = self.resolve_sync_agent_id_from_identity_file(parts) {
-            if let Ok(mut sticky) = self.sticky_agent_id.lock() {
-                *sticky = Some(agent_id.clone());
-            }
-            return Ok(agent_id);
-        }
-
         Err(missing_sync_identity_error())
     }
 
     fn resolve_sync_client_name<'a>(&self, parts: &'a Parts) -> Option<&'a str> {
         header_str(parts, CANOPY_CLIENT_NAME_HEADER)
-    }
-
-    fn resolve_sync_agent_id_from_identity_file(&self, parts: &Parts) -> Option<String> {
-        if let Some(workdir) = header_str(parts, CANOPY_WORKDIR_HEADER) {
-            if let Some(agent_id) = sync_identity::read_identity_file_agent_id(workdir) {
-                return Some(agent_id);
-            }
-        }
-
-        let client_name = self
-            .resolve_sync_client_name(parts)
-            .map(|value| value.trim().to_lowercase());
-        let sessions = self.db.get_active_sessions().ok()?;
-        for session in sessions {
-            if let Some(expected_client) = client_name.as_deref() {
-                if !session.cli.eq_ignore_ascii_case(expected_client) {
-                    continue;
-                }
-            }
-            if let Some(agent_id) = sync_identity::read_identity_file_agent_id(&session.working_dir)
-            {
-                return Some(agent_id);
-            }
-        }
-        None
     }
 
     fn reject_if_nursery(&self, parts: &Parts) -> Result<(), McpError> {
@@ -480,7 +435,6 @@ impl TaskTriggerHandler {
             notification_service,
             sync_manager,
             rag_limiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-            sticky_agent_id: Arc::new(Mutex::new(None)),
             start_time: std::time::Instant::now(),
             port,
             tool_router: Self::tool_router(),
@@ -2748,9 +2702,7 @@ impl ServerHandler for TaskTriggerHandler {
 #[cfg(test)]
 mod tests {
     use super::{header_str, missing_sync_identity_error, MISSING_SYNC_IDENTITY_MESSAGE};
-    use crate::shared::sync_identity::{
-        CANOPY_AGENT_ID_HEADER, CANOPY_SESSION_NAME_HEADER, CANOPY_WORKDIR_HEADER,
-    };
+    use crate::shared::sync_identity::{CANOPY_AGENT_ID_HEADER, CANOPY_WORKDIR_HEADER};
 
     #[test]
     fn resolve_sync_agent_id_reads_canopy_header() {
@@ -2769,7 +2721,7 @@ mod tests {
     #[test]
     fn resolve_sync_agent_id_requires_canopy_header() {
         let request = axum::http::Request::builder()
-            .header(CANOPY_SESSION_NAME_HEADER, "cedro")
+            .header("x-canopy-session-name", "cedro")
             .header(CANOPY_WORKDIR_HEADER, "/tmp/workdir")
             .body(())
             .unwrap();

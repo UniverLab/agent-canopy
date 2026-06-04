@@ -17,8 +17,7 @@ use ratatui::style::Color;
 
 use crate::domain::models::Cli;
 use crate::shared::sync_identity::{
-    write_identity_file, CANOPY_AGENT_ID_ENV, CANOPY_SEED_ID_ENV, CANOPY_SESSION_NAME_ENV,
-    CANOPY_WORKDIR_ENV,
+    CANOPY_AGENT_ID_ENV, CANOPY_SEED_ID_ENV, CANOPY_SESSION_NAME_ENV, CANOPY_WORKDIR_ENV,
 };
 
 #[cfg(unix)]
@@ -157,10 +156,6 @@ impl InteractiveAgent {
         let name = name
             .map(str::to_owned)
             .unwrap_or_else(|| naming::pick_random_name(existing_ids));
-        if let Err(error) = write_identity_file(working_dir, &id) {
-            tracing::debug!("Failed to write canopy identity file in '{working_dir}': {error}");
-        }
-
         let (seed_id_owned, seed_name) = match seed_id {
             Some(sid) => {
                 let resolved = crate::domain::seeds::load_seed(sid)
@@ -301,10 +296,6 @@ impl InteractiveAgent {
         let session_name = name
             .map(str::to_owned)
             .unwrap_or_else(|| naming::pick_terminal_name(existing_ids));
-        if let Err(error) = write_identity_file(working_dir, &id) {
-            tracing::debug!("Failed to write canopy identity file in '{working_dir}': {error}");
-        }
-
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
             rows,
