@@ -65,6 +65,7 @@ impl CliUsage {
     }
 
     /// Return CLI names sorted by usage count descending.
+    #[allow(dead_code)]
     pub fn ranked(&self) -> Vec<(&String, &u64)> {
         let mut pairs: Vec<_> = self.counts.iter().collect();
         pairs.sort_by(|a, b| b.1.cmp(a.1));

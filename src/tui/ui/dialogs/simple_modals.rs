@@ -68,6 +68,7 @@ fn format_uptime_precise(seconds: u64) -> String {
 }
 pub fn draw_legend(frame: &mut Frame, app: &mut App) {
     use crate::domain::gamification::{MissionCategory, MISSIONS};
+    use ratatui::layout::{Constraint, Direction, Layout};
 
     let label_style = Style::default().fg(DIM);
     let value_style = Style::default()
@@ -82,7 +83,40 @@ pub fn draw_legend(frame: &mut Frame, app: &mut App) {
     let bg_count = app.db.count_background_agents().unwrap_or(0);
     let runs_count = app.db.count_runs().unwrap_or(0);
 
-    let mut header_lines = vec![
+    let total = MISSIONS.len();
+    let unlocked_n = app.mission_manager.unlocked_count();
+
+    let selected = app.legend_selected.min(total.saturating_sub(1));
+    app.legend_selected = selected;
+
+    let width = 70u16;
+    let height = 22u16;
+    let percent_x = (width * 100 / frame.area().width.max(1)).clamp(40, 75);
+    let area = centered_rect(percent_x, height, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" Canopy Stats ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(Color::Rgb(12, 20, 12)));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+
+    let header_area = chunks[0];
+    let content_area = chunks[1];
+    let footer_area = chunks[2];
+
+    let header_lines = vec![
         Line::from(vec![
             Span::styled("Session: ", label_style),
             Span::styled(&session_uptime, accent_style),
@@ -90,7 +124,6 @@ pub fn draw_legend(frame: &mut Frame, app: &mut App) {
             Span::styled("Canopy: ", label_style),
             Span::styled(&canopy_uptime, accent_style),
         ]),
-        Line::from(""),
         Line::from(vec![
             Span::styled("Interactive: ", label_style),
             Span::styled(format!("{interactive_count}"), value_style),
@@ -104,28 +137,23 @@ pub fn draw_legend(frame: &mut Frame, app: &mut App) {
             Span::styled("Runs: ", label_style),
             Span::styled(format!("{runs_count}"), value_style),
         ]),
-        Line::from(""),
+        Line::from(vec![
+            Span::styled("Missions: ", label_style),
+            Span::styled(format!("{unlocked_n}/{total}"), value_style),
+        ]),
     ];
+    frame.render_widget(
+        Paragraph::new(header_lines).alignment(ratatui::layout::Alignment::Left),
+        header_area,
+    );
 
-    let top_clis = app.cli_usage.ranked();
-    if !top_clis.is_empty() {
-        let clis: Vec<String> = top_clis
-            .iter()
-            .take(3)
-            .map(|(name, count)| format!("{name}({count})"))
-            .collect();
-        header_lines.push(Line::from(vec![
-            Span::styled("Harnesses: ", label_style),
-            Span::styled(clis.join("  "), value_style),
-        ]));
-        header_lines.push(Line::from(""));
-    }
+    let content_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(content_area);
 
-    let total = MISSIONS.len();
-    let unlocked_n = app.mission_manager.unlocked_count();
-    let visible_rows = 6u16;
-    let scroll = app.legend_scroll.min(total.saturating_sub(1) as u16);
-    app.legend_scroll = scroll;
+    let list_area = content_chunks[0];
+    let cloud_area = content_chunks[1];
 
     let category_color = |cat: &MissionCategory| -> Color {
         match cat {
@@ -138,17 +166,6 @@ pub fn draw_legend(frame: &mut Frame, app: &mut App) {
         }
     };
 
-    let category_label = |cat: &MissionCategory| -> &'static str {
-        match cat {
-            MissionCategory::Environment => "Environment",
-            MissionCategory::Intelligence => "Intelligence",
-            MissionCategory::Projects => "Projects",
-            MissionCategory::Workflow => "Workflow",
-            MissionCategory::Seeds => "Seeds",
-            MissionCategory::SysInfo => "System",
-        }
-    };
-
     let now_ms = chrono::Utc::now().timestamp_millis() as f64;
     let twinkle = |offset: usize| -> f64 {
         let phase = (now_ms / 1500.0) + (offset as f64 * 0.7);
@@ -158,7 +175,7 @@ pub fn draw_legend(frame: &mut Frame, app: &mut App) {
     let dim_color = |base: Color, factor: f64| -> Color {
         match base {
             Color::Rgb(r, g, b) => {
-                let min_brightness = 0.4;
+                let min_brightness = 0.35;
                 let f = min_brightness + (1.0 - min_brightness) * factor;
                 Color::Rgb(
                     (r as f64 * f) as u8,
@@ -170,118 +187,161 @@ pub fn draw_legend(frame: &mut Frame, app: &mut App) {
         }
     };
 
-    let mut medal_lines = vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(
-                " ✦ ",
-                Style::default()
-                    .fg(ACCENT)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "Missions",
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("  {unlocked_n}/{total}"),
-                Style::default().fg(DIM),
-            ),
-        ]),
-        Line::from(""),
-    ];
+    let visible_rows = list_area.height as usize;
+    let scroll_start = if selected >= visible_rows {
+        selected - visible_rows + 1
+    } else {
+        0
+    };
 
-    let mut visible_idx = 0usize;
+    let mut mission_lines: Vec<Line> = Vec::new();
     for (i, def) in MISSIONS.iter().enumerate() {
-        if (i as u16) < scroll || (i as u16) >= scroll + visible_rows {
+        if i < scroll_start || i >= scroll_start + visible_rows {
             continue;
         }
         let unlocked = app.mission_manager.is_unlocked(def.id);
+        let is_selected = i == selected;
         let base_color = category_color(&def.category);
 
+        let marker = if is_selected { "▸" } else { " " };
+        let marker_style = if is_selected {
+            Style::default().fg(ACCENT)
+        } else {
+            Style::default().fg(Color::Rgb(40, 40, 40))
+        };
+
         if unlocked {
-            let twinkle_factor = twinkle(visible_idx);
+            let twinkle_factor = twinkle(i);
             let icon_color = dim_color(base_color, twinkle_factor);
             let icon_style = Style::default()
                 .fg(icon_color)
                 .add_modifier(Modifier::BOLD);
+            let title_style = if is_selected {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Rgb(200, 200, 200))
+            };
 
-            medal_lines.push(Line::from(vec![
-                Span::styled(format!("  {} ", def.icon), icon_style),
-                Span::styled(def.title, Style::default().fg(Color::White)),
-                Span::styled(
-                    format!("  · {}", category_label(&def.category)),
-                    Style::default().fg(DIM),
-                ),
+            mission_lines.push(Line::from(vec![
+                Span::styled(marker.to_string(), marker_style),
+                Span::styled(format!(" {} ", def.icon), icon_style),
+                Span::styled(def.title, title_style),
             ]));
         } else {
-            medal_lines.push(Line::from(vec![
-                Span::styled("  · ", Style::default().fg(Color::Rgb(50, 50, 50))),
-                Span::styled(def.title, Style::default().fg(Color::Rgb(70, 70, 70))),
-                Span::styled(
-                    format!("  · {}", category_label(&def.category)),
-                    Style::default().fg(Color::Rgb(50, 50, 50)),
-                ),
+            let title_style = if is_selected {
+                Style::default().fg(Color::Rgb(120, 120, 120))
+            } else {
+                Style::default().fg(Color::Rgb(70, 70, 70))
+            };
+
+            mission_lines.push(Line::from(vec![
+                Span::styled(marker.to_string(), marker_style),
+                Span::styled(" · ", Style::default().fg(Color::Rgb(50, 50, 50))),
+                Span::styled(def.title, title_style),
             ]));
         }
-
-        visible_idx += 1;
-        medal_lines.push(Line::from(""));
     }
 
-    let scroll_indicator = if total > visible_rows as usize {
-        let pct = if total <= 1 {
-            0
-        } else {
-            scroll as usize * 100 / (total - visible_rows as usize).max(1)
-        };
-        format!(" {}% ", pct)
+    frame.render_widget(
+        Paragraph::new(mission_lines).alignment(ratatui::layout::Alignment::Left),
+        list_area,
+    );
+
+    let selected_def = &MISSIONS[selected];
+    let selected_unlocked = app.mission_manager.is_unlocked(selected_def.id);
+    let selected_base_color = category_color(&selected_def.category);
+    let selected_twinkle = twinkle(selected);
+    let selected_icon_color = if selected_unlocked {
+        dim_color(selected_base_color, selected_twinkle)
     } else {
-        String::new()
+        Color::Rgb(60, 60, 60)
     };
 
-    let footer_lines = vec![
-        Line::from(""),
+    let cloud_title = if selected_unlocked {
         Line::from(vec![
-            Span::styled(" F1/Esc ", label_style),
-            Span::styled("close   ", Style::default().fg(Color::White)),
-            Span::styled("↑↓/jk ", label_style),
-            Span::styled("scroll   ", Style::default().fg(Color::White)),
-            Span::styled("⊞ ", label_style),
-            Span::styled("mouse wheel", Style::default().fg(Color::White)),
-            if scroll_indicator.is_empty() {
-                Span::raw("")
-            } else {
-                Span::styled(scroll_indicator, accent_style)
-            },
-        ]),
+            Span::styled(
+                format!("  {} ", selected_def.icon),
+                Style::default()
+                    .fg(selected_icon_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                selected_def.title,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(
+                "  · ",
+                Style::default().fg(Color::Rgb(60, 60, 60)),
+            ),
+            Span::styled(
+                selected_def.title,
+                Style::default().fg(Color::Rgb(100, 100, 100)),
+            ),
+        ])
+    };
+
+    let challenge_text = if selected_unlocked {
+        format!("✦ {}", selected_def.challenge)
+    } else {
+        format!("? {}", selected_def.challenge)
+    };
+
+    let challenge_style = if selected_unlocked {
+        Style::default().fg(Color::Rgb(180, 180, 180))
+    } else {
+        Style::default().fg(Color::Rgb(90, 90, 90))
+    };
+
+    let status_line = if selected_unlocked {
+        Line::from(vec![Span::styled(
+            "  ✓ Unlocked",
+            Style::default().fg(Color::Rgb(100, 200, 100)),
+        )])
+    } else {
+        Line::from(vec![Span::styled(
+            "  ○ Locked",
+            Style::default().fg(Color::Rgb(80, 80, 80)),
+        )])
+    };
+
+    let cloud_lines = vec![
+        cloud_title,
+        Line::from(""),
+        Line::from(""),
+        Line::from(vec![Span::styled(challenge_text, challenge_style)]),
+        Line::from(""),
+        status_line,
     ];
 
-    let all_lines: Vec<Line> = header_lines
-        .into_iter()
-        .chain(medal_lines)
-        .chain(footer_lines)
-        .collect();
-
-    let content_height = all_lines.len() as u16 + 2;
-    let width = 52u16;
-    let height = content_height.clamp(16, 36);
-    let percent_x = (width * 100 / frame.area().width.max(1)).clamp(35, 65);
-    let area = centered_rect(percent_x, height, frame.area());
-    frame.render_widget(Clear, area);
-
-    let block = Block::default()
-        .title(" Canopy Stats ")
+    let cloud_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
-        .style(Style::default().bg(Color::Rgb(12, 20, 12)));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+        .border_style(Style::default().fg(Color::Rgb(40, 50, 40)))
+        .style(Style::default().bg(Color::Rgb(18, 25, 18)));
+    let cloud_inner = cloud_block.inner(cloud_area);
+    frame.render_widget(cloud_block, cloud_area);
 
     frame.render_widget(
-        Paragraph::new(all_lines).alignment(ratatui::layout::Alignment::Left),
-        inner,
+        Paragraph::new(cloud_lines).alignment(ratatui::layout::Alignment::Left),
+        cloud_inner,
+    );
+
+    let footer_lines = vec![Line::from(vec![
+        Span::styled(" F1/Esc ", label_style),
+        Span::styled("close   ", Style::default().fg(Color::White)),
+        Span::styled("↑↓/jk ", label_style),
+        Span::styled("navigate   ", Style::default().fg(Color::White)),
+        Span::styled("⊞ ", label_style),
+        Span::styled("scroll", Style::default().fg(Color::White)),
+    ])];
+    frame.render_widget(
+        Paragraph::new(footer_lines).alignment(ratatui::layout::Alignment::Left),
+        footer_area,
     );
 }

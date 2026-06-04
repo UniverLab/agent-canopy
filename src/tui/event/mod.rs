@@ -141,18 +141,27 @@ fn dismiss_legend(app: &mut App, code: KeyCode) -> bool {
         return false;
     }
 
+    let total = crate::domain::gamification::MISSIONS.len();
+
     match code {
         KeyCode::Esc | KeyCode::F(1) | KeyCode::Enter => {
             app.show_legend = false;
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            app.legend_scroll = app.legend_scroll.saturating_sub(1);
+            if app.legend_selected > 0 {
+                app.legend_selected -= 1;
+            } else {
+                app.legend_selected = total.saturating_sub(1);
+            }
+            app.legend_scroll = app.legend_selected as u16;
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            let total = crate::domain::gamification::MISSIONS.len() as u16;
-            let visible = 8u16;
-            let max_scroll = total.saturating_sub(visible);
-            app.legend_scroll = app.legend_scroll.saturating_add(1).min(max_scroll);
+            if app.legend_selected < total.saturating_sub(1) {
+                app.legend_selected += 1;
+            } else {
+                app.legend_selected = 0;
+            }
+            app.legend_scroll = app.legend_selected as u16;
         }
         _ => {}
     }
@@ -244,14 +253,21 @@ fn handle_mouse_scroll(app: &mut App, mouse: &MouseEvent) {
     };
 
     if app.show_legend {
-        let total = crate::domain::gamification::MISSIONS.len() as u16;
-        let visible = 8u16;
-        let max_scroll = total.saturating_sub(visible);
+        let total = crate::domain::gamification::MISSIONS.len();
         if dir > 0 {
-            app.legend_scroll = app.legend_scroll.saturating_sub(1);
+            if app.legend_selected > 0 {
+                app.legend_selected -= 1;
+            } else {
+                app.legend_selected = total.saturating_sub(1);
+            }
         } else {
-            app.legend_scroll = app.legend_scroll.saturating_add(1).min(max_scroll);
+            if app.legend_selected < total.saturating_sub(1) {
+                app.legend_selected += 1;
+            } else {
+                app.legend_selected = 0;
+            }
         }
+        app.legend_scroll = app.legend_selected as u16;
         return;
     }
 
