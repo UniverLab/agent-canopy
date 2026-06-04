@@ -29,6 +29,7 @@ mod workflow_engine;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use daemon::bridge::run_bridge;
 use daemon::cli::{handle_daemon_action, DaemonAction};
 use daemon::doctor::run_doctor;
 use daemon::rag_cli::{handle_rag_action, RagAction};
@@ -65,6 +66,18 @@ enum Commands {
         #[command(subcommand)]
         action: RagAction,
     },
+    /// Run a stdio sidecar proxy that injects canopy identity headers.
+    Bridge {
+        /// Agent session ID to bind this bridge process.
+        #[arg(long = "id")]
+        agent_id: Option<String>,
+        /// Explicit daemon port override.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Working directory forwarded to the daemon.
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+    },
     #[command(hide = true)]
     InternalPdfExtract {
         path: PathBuf,
@@ -94,6 +107,11 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(Commands::Rag { action }) => handle_rag_action(action).await,
+        Some(Commands::Bridge {
+            agent_id,
+            port,
+            workdir,
+        }) => run_bridge(agent_id, port.or(cli.port), workdir).await,
         Some(Commands::InternalPdfExtract { path }) => {
             rag::ingestion::run_internal_pdf_extract(&path)
         }

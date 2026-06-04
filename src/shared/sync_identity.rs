@@ -46,9 +46,13 @@ pub fn read_identity_file_agent_id(workdir: &str) -> Option<String> {
     let path = Path::new(trimmed_workdir).join(CANOPY_IDENTITY_FILE);
     let raw = std::fs::read_to_string(path).ok()?;
     let first = raw.lines().find(|line| !line.trim().is_empty())?.trim();
-    if let Some(value) = first.strip_prefix("agent_id=") {
+    let parsed = if let Some(value) = first.strip_prefix("agent_id=") {
         let id = value.trim();
-        return (!id.is_empty()).then(|| id.to_string());
-    }
-    (!first.is_empty()).then(|| first.to_string())
+        (!id.is_empty()).then(|| id.to_string())
+    } else {
+        (!first.is_empty()).then(|| first.to_string())
+    }?;
+
+    let _ = std::fs::remove_file(Path::new(trimmed_workdir).join(CANOPY_IDENTITY_FILE));
+    Some(parsed)
 }
