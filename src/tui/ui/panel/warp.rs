@@ -63,22 +63,36 @@ pub fn draw_warp_input_box(frame: &mut Frame, area: Rect, app: &App, idx: usize)
         let input_len = input_chars.len();
 
         let visible_text = if input_len > available_width {
+            // Reserve space for ellipsis indicators
+            let has_leading_ellipsis = cursor_char_idx >= available_width;
+            let has_trailing_ellipsis = {
+                let scroll_start = if has_leading_ellipsis {
+                    cursor_char_idx.saturating_sub((available_width.saturating_sub(2)) / 2)
+                } else {
+                    0
+                };
+                scroll_start + available_width.saturating_sub(2) < input_len
+            };
+
+            let ellipsis_space = (has_leading_ellipsis as usize) + (has_trailing_ellipsis as usize);
+            let text_width = available_width.saturating_sub(ellipsis_space);
+
             // Calculate scroll offset to keep cursor visible
-            let scroll_start = if cursor_char_idx >= available_width {
-                cursor_char_idx.saturating_sub(available_width / 2)
+            let scroll_start = if has_leading_ellipsis {
+                cursor_char_idx.saturating_sub(text_width / 2)
             } else {
                 0
             };
-            let scroll_end = (scroll_start + available_width).min(input_len);
+            let scroll_end = (scroll_start + text_width).min(input_len);
             let visible: String = input_chars[scroll_start..scroll_end].iter().collect();
 
-            // Add ellipsis indicators
+            // Add ellipsis indicators (now accounted for in width calculation)
             let mut result = String::new();
-            if scroll_start > 0 {
+            if has_leading_ellipsis {
                 result.push('…');
             }
             result.push_str(&visible);
-            if scroll_end < input_len {
+            if has_trailing_ellipsis {
                 result.push('…');
             }
             result
@@ -101,13 +115,18 @@ pub fn draw_warp_input_box(frame: &mut Frame, area: Rect, app: &App, idx: usize)
     let input_chars_len = input_text.chars().count();
 
     let visible_cursor = if input_chars_len > available_width {
-        let scroll_start = if cursor_char_offset >= available_width {
-            cursor_char_offset.saturating_sub(available_width / 2)
+        let has_leading_ellipsis = cursor_char_offset >= available_width;
+        let ellipsis_space = if has_leading_ellipsis { 1 } else { 0 };
+        let text_width = available_width.saturating_sub(ellipsis_space * 2); // Reserve for both ellipsis
+
+        let scroll_start = if has_leading_ellipsis {
+            cursor_char_offset.saturating_sub(text_width / 2)
         } else {
             0
         };
-        // Account for leading ellipsis
-        let ellipsis_offset = if scroll_start > 0 { 1 } else { 0 };
+
+        // Account for leading ellipsis in cursor position
+        let ellipsis_offset = if has_leading_ellipsis { 1 } else { 0 };
         cursor_char_offset.saturating_sub(scroll_start) + ellipsis_offset
     } else {
         cursor_char_offset
