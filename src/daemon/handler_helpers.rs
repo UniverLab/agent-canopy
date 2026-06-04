@@ -319,16 +319,13 @@ pub(crate) fn resolve_effective_project_hash(
         .map(|wd| crate::domain::project::workdir_hash(&wd))
 }
 
-/// Load the seed identity bound to the current session.
-/// Returns (seed_id, identity) after resolving from headers or DB.
+/// Load the seed identity bound to the current session agent.
+/// Returns (seed_id, identity) after resolving from seed header or DB mapping.
 pub(crate) fn load_bound_seed_identity(
     db: &crate::db::Database,
     parts: &axum::http::request::Parts,
+    agent_id: &str,
 ) -> Result<(String, crate::domain::seeds::SeedIdentity), String> {
-    let Some(agent_id) = header_str(parts, sync_identity::CANOPY_AGENT_ID_HEADER) else {
-        return Err("Missing session identity".to_string());
-    };
-
     let seed_id = if let Some(sid) = header_str(parts, sync_identity::CANOPY_SEED_ID_HEADER) {
         let _ = db.bind_session_to_seed(agent_id, sid);
         sid.to_string()

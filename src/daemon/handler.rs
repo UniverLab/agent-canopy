@@ -3,7 +3,7 @@
 //! Uses the `rmcp` SDK's `#[tool_router]` and `#[tool_handler]` macros
 //! with `Parameters<T>` for proper MCP protocol compliance.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::http::request::Parts;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -43,7 +43,9 @@ use crate::domain::workflow::{
 };
 use crate::executor::Executor;
 use crate::rag::rate_limiter::RateLimiter;
-use crate::shared::sync_identity::{header_str, CANOPY_AGENT_ID_HEADER, CANOPY_CLIENT_NAME_HEADER};
+use crate::shared::sync_identity::{
+    self, header_str, CANOPY_AGENT_ID_HEADER, CANOPY_CLIENT_NAME_HEADER, CANOPY_WORKDIR_HEADER,
+};
 use crate::sync_manager::SyncManager;
 use crate::watchers::WatcherEngine;
 use crate::workflow_engine::WorkflowEngine;
@@ -347,6 +349,7 @@ pub struct TaskTriggerHandler {
     pub sync_manager: Arc<SyncManager>,
     /// Rate limiters for rag_search (10 calls/min). Keyed by agent_id.
     pub rag_limiters: Arc<tokio::sync::Mutex<std::collections::HashMap<String, RateLimiter>>>,
+    sticky_agent_id: Arc<Mutex<Option<String>>>,
     pub start_time: std::time::Instant,
     pub port: u16,
     #[allow(dead_code)]
@@ -356,22 +359,62 @@ pub struct TaskTriggerHandler {
 #[tool_router]
 #[allow(clippy::too_many_arguments)]
 impl TaskTriggerHandler {
-    fn resolve_sync_agent_id<'a>(&self, parts: &'a Parts) -> Result<&'a str, McpError> {
-        let Some(agent_id) = header_str(parts, CANOPY_AGENT_ID_HEADER) else {
-            return Err(missing_sync_identity_error());
-        };
-        Ok(agent_id)
+    fn resolve_sync_agent_id(&self, parts: &Parts) -> Result<String, McpError> {
+        if let Some(agent_id) = header_str(parts, CANOPY_AGENT_ID_HEADER) {
+            if let Ok(mut sticky) = self.sticky_agent_id.lock() {
+                *sticky = Some(agent_id.to_string());
+            }
+            return Ok(agent_id.to_string());
+        }
+
+        if let Ok(sticky) = self.sticky_agent_id.lock() {
+            if let Some(agent_id) = sticky.as_ref() {
+                return Ok(agent_id.clone());
+            }
+        }
+
+        if let Some(agent_id) = self.resolve_sync_agent_id_from_identity_file(parts) {
+            if let Ok(mut sticky) = self.sticky_agent_id.lock() {
+                *sticky = Some(agent_id.clone());
+            }
+            return Ok(agent_id);
+        }
+
+        Err(missing_sync_identity_error())
     }
 
     fn resolve_sync_client_name<'a>(&self, parts: &'a Parts) -> Option<&'a str> {
         header_str(parts, CANOPY_CLIENT_NAME_HEADER)
     }
 
+    fn resolve_sync_agent_id_from_identity_file(&self, parts: &Parts) -> Option<String> {
+        if let Some(workdir) = header_str(parts, CANOPY_WORKDIR_HEADER) {
+            if let Some(agent_id) = sync_identity::read_identity_file_agent_id(workdir) {
+                return Some(agent_id);
+            }
+        }
+
+        let client_name = self
+            .resolve_sync_client_name(parts)
+            .map(|value| value.trim().to_lowercase());
+        let sessions = self.db.get_active_sessions().ok()?;
+        for session in sessions {
+            if let Some(expected_client) = client_name.as_deref() {
+                if !session.cli.eq_ignore_ascii_case(expected_client) {
+                    continue;
+                }
+            }
+            if let Some(agent_id) = sync_identity::read_identity_file_agent_id(&session.working_dir)
+            {
+                return Some(agent_id);
+            }
+        }
+        None
+    }
+
     fn reject_if_nursery(&self, parts: &Parts) -> Result<(), McpError> {
-        match self.db.get_session_type(
-            header_str(parts, CANOPY_AGENT_ID_HEADER)
-                .ok_or_else(missing_sync_identity_error)?,
-        ) {
+        let agent_id = self.resolve_sync_agent_id(parts)?;
+        match self.db.get_session_type(&agent_id) {
             Ok(Some(st)) if st == "nursery" => {
                 Err(McpError::invalid_params(
                     "This tool is not available during a seed creation session (nursery). Complete the seed identity interview first.".to_string(),
@@ -437,6 +480,7 @@ impl TaskTriggerHandler {
             notification_service,
             sync_manager,
             rag_limiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            sticky_agent_id: Arc::new(Mutex::new(None)),
             start_time: std::time::Instant::now(),
             port,
             tool_router: Self::tool_router(),
@@ -973,7 +1017,7 @@ impl TaskTriggerHandler {
             self.sync_manager
                 .declare_intent(
                     &params.workdir,
-                    agent_id,
+                    &agent_id,
                     client_name,
                     &params.mission,
                     impact,
@@ -1008,7 +1052,7 @@ impl TaskTriggerHandler {
             self.sync_manager
                 .report_status(
                     &params.workdir,
-                    agent_id,
+                    &agent_id,
                     client_name,
                     status,
                     &params.message,
@@ -1050,7 +1094,7 @@ impl TaskTriggerHandler {
             self.sync_manager
                 .broadcast(
                     &params.workdir,
-                    agent_id,
+                    &agent_id,
                     client_name,
                     kind,
                     &params.message,
@@ -1151,12 +1195,10 @@ impl TaskTriggerHandler {
         };
 
         // Auto-detect project_hash from session workdir if not provided.
-        let effective_project_hash = self
-            .resolve_sync_agent_id(&parts)
-            .ok()
-            .and_then(|agent_id| {
-                resolve_effective_project_hash(&self.db, params.project_hash.as_deref(), agent_id)
-            });
+        let resolved_agent_id = self.resolve_sync_agent_id(&parts).ok();
+        let effective_project_hash = resolved_agent_id.as_deref().and_then(|agent_id| {
+            resolve_effective_project_hash(&self.db, params.project_hash.as_deref(), agent_id)
+        });
 
         let sessions = self
             .db
@@ -1218,7 +1260,7 @@ impl TaskTriggerHandler {
             &project_knowledge,
             &related_projects,
         );
-        inject_seed_identity(&mut out, &self.db, &parts);
+        inject_seed_identity(&mut out, &self.db, &parts, resolved_agent_id.as_deref());
 
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&out).unwrap_or_default(),
@@ -1239,7 +1281,7 @@ impl TaskTriggerHandler {
         // Auto-detect project_hash from session workdir if not provided.
         let project_hash = params.node_data.project_hash.or_else(|| {
             let agent_id = self.resolve_sync_agent_id(&parts).ok()?;
-            let workdir = self.db.get_session_workdir(agent_id).ok()??;
+            let workdir = self.db.get_session_workdir(&agent_id).ok()??;
             Some(crate::domain::project::workdir_hash(&workdir))
         });
 
@@ -1347,7 +1389,8 @@ impl TaskTriggerHandler {
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_nursery(&parts)?;
-        let (_, identity) = load_bound_seed_identity(&self.db, &parts)
+        let agent_id = self.resolve_sync_agent_id(&parts)?;
+        let (_, identity) = load_bound_seed_identity(&self.db, &parts, &agent_id)
             .map_err(|e| McpError::invalid_params(e, None))?;
         let toml_str = identity
             .to_toml()
@@ -1367,7 +1410,8 @@ impl TaskTriggerHandler {
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_nursery(&parts)?;
-        let (seed_id, mut identity) = load_bound_seed_identity(&self.db, &parts)
+        let agent_id = self.resolve_sync_agent_id(&parts)?;
+        let (seed_id, mut identity) = load_bound_seed_identity(&self.db, &parts, &agent_id)
             .map_err(|e| McpError::invalid_params(e, None))?;
         identity
             .evolve(params.new_directives, params.new_traits)
@@ -2661,8 +2705,12 @@ fn inject_seed_identity(
     out: &mut serde_json::Value,
     db: &crate::db::Database,
     parts: &axum::http::request::Parts,
+    agent_id: Option<&str>,
 ) {
-    if let Ok((_, identity)) = load_bound_seed_identity(db, parts) {
+    let Some(agent_id) = agent_id else {
+        return;
+    };
+    if let Ok((_, identity)) = load_bound_seed_identity(db, parts, agent_id) {
         if let Some(obj) = out.as_object_mut() {
             obj.insert(
                 "seed_identity".to_string(),
