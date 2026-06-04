@@ -5,10 +5,6 @@ use crate::setup_module::dir_browser::browse_directory;
 use crate::setup_module::models::{
     load_mcp_fs_root, resolve_config_path, save_mcp_fs_root, CanonicalServers, Platform,
 };
-use crate::shared::sync_identity::{
-    CANOPY_AGENT_ID_ENV, CANOPY_AGENT_ID_HEADER, CANOPY_CLIENT_NAME_HEADER,
-    CANOPY_SESSION_NAME_ENV, CANOPY_SESSION_NAME_HEADER, CANOPY_WORKDIR_ENV, CANOPY_WORKDIR_HEADER,
-};
 use anyhow::Result;
 use std::collections::BTreeSet;
 use std::io::{self, Write};
@@ -174,48 +170,35 @@ fn strip_unsupported_keys(adapted: &mut JsonMap, unsupported_keys: &[String]) {
     }
 }
 
-fn canopy_identity_headers(platform_name: &str) -> Option<JsonMap> {
-    let headers = match platform_name {
-        "copilot" => serde_json::json!({
-            CANOPY_AGENT_ID_HEADER: format!("${CANOPY_AGENT_ID_ENV}"),
-            CANOPY_SESSION_NAME_HEADER: format!("${CANOPY_SESSION_NAME_ENV}"),
-            CANOPY_WORKDIR_HEADER: format!("${CANOPY_WORKDIR_ENV}"),
-            CANOPY_CLIENT_NAME_HEADER: platform_name,
-        }),
-        "opencode" => serde_json::json!({
-            CANOPY_AGENT_ID_HEADER: format!("{{env:{CANOPY_AGENT_ID_ENV}}}"),
-            CANOPY_SESSION_NAME_HEADER: format!("{{env:{CANOPY_SESSION_NAME_ENV}}}"),
-            CANOPY_WORKDIR_HEADER: format!("{{env:{CANOPY_WORKDIR_ENV}}}"),
-            CANOPY_CLIENT_NAME_HEADER: platform_name,
-        }),
-        // Generic fallback using ${VAR} syntax (works for most HTTP-based MCP servers)
-        _ => serde_json::json!({
-            CANOPY_AGENT_ID_HEADER: format!("${{{CANOPY_AGENT_ID_ENV}}}"),
-            CANOPY_SESSION_NAME_HEADER: format!("${{{CANOPY_SESSION_NAME_ENV}}}"),
-            CANOPY_WORKDIR_HEADER: format!("${{{CANOPY_WORKDIR_ENV}}}"),
-            CANOPY_CLIENT_NAME_HEADER: platform_name,
-        }),
-    };
-
-    headers.as_object().map(clone_object_entries)
-}
-
-fn apply_canopy_identity_headers(adapted: &mut JsonMap, platform: &Platform, server_name: &str) {
-    if server_name != "canopy" || !adapted.contains_key("url") {
+fn enforce_canopy_bridge_transport(adapted: &mut JsonMap, platform: &Platform, server_name: &str) {
+    if server_name != "canopy" {
         return;
     }
 
-    let Some(identity_headers) = canopy_identity_headers(&platform.name) else {
-        return;
-    };
+    adapted.remove("url");
+    adapted.remove("headers");
 
-    let mut headers = adapted
-        .get("headers")
-        .and_then(serde_json::Value::as_object)
-        .map(clone_object_entries)
-        .unwrap_or_default();
-    merge_json_object(&mut headers, &identity_headers);
-    adapted.insert("headers".to_string(), serde_json::Value::Object(headers));
+    if platform.command_format == "merged" {
+        adapted.insert(
+            "command".to_string(),
+            serde_json::json!(["canopy", "bridge"]),
+        );
+        adapted.remove("args");
+        return;
+    }
+
+    adapted.insert(
+        "command".to_string(),
+        serde_json::Value::String("canopy".to_string()),
+    );
+    let needs_bridge = adapted
+        .get("args")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| !arr.iter().any(|v| v.as_str() == Some("bridge")))
+        .unwrap_or(true);
+    if needs_bridge {
+        adapted.insert("args".to_string(), serde_json::json!(["bridge"]));
+    }
 }
 
 /// Translate a canonical server config to a target platform's format.
@@ -223,9 +206,10 @@ fn apply_canopy_identity_headers(adapted: &mut JsonMap, platform: &Platform, ser
 /// Applies in order:
 /// 1. `command_format` — merge `command` + `args` into single array if "merged"
 /// 2. `fields_mapping` — rename fields (e.g. `env` → `environment`)
-/// 3. `required_fields` — inject missing required fields with default values
-/// 4. `server_extras` — merge per-server platform-specific fields
-/// 5. `unsupported_keys` — strip fields the platform doesn't support
+/// 3. `canopy bridge` enforcement — migrate canopy server to stdio sidecar
+/// 4. `required_fields` — inject missing required fields with default values
+/// 5. `server_extras` — merge per-server platform-specific fields
+/// 6. `unsupported_keys` — strip fields the platform doesn't support
 pub fn adapt_config(
     config: &serde_json::Value,
     platform: &Platform,
@@ -237,10 +221,10 @@ pub fn adapt_config(
 
     let mut adapted = apply_command_format(obj, &platform.command_format);
     adapted = rename_mapped_fields(adapted, &platform.fields_mapping);
+    enforce_canopy_bridge_transport(&mut adapted, platform, server_name);
     apply_required_fields(&mut adapted, &platform.required_fields);
     merge_server_extras(&mut adapted, platform, server_name);
     strip_unsupported_keys(&mut adapted, &platform.unsupported_keys);
-    apply_canopy_identity_headers(&mut adapted, platform, server_name);
 
     serde_json::Value::Object(adapted)
 }
@@ -555,9 +539,10 @@ mod tests {
             vec!["http".to_string(), "stdio".to_string()],
         );
         platform.unsupported_keys.push("remove_me".to_string());
-        platform
-            .server_extras
-            .insert("canopy".to_string(), serde_json::json!({"tools": ["*"]}));
+        platform.server_extras.insert(
+            "filesystem".to_string(),
+            serde_json::json!({"tools": ["*"]}),
+        );
 
         let adapted = adapt_config(
             &serde_json::json!({
@@ -567,7 +552,7 @@ mod tests {
                 "remove_me": true
             }),
             &platform,
-            "canopy",
+            "filesystem",
         );
 
         assert_eq!(
@@ -594,7 +579,7 @@ mod tests {
                 "type": "custom"
             }),
             &platform,
-            "canopy",
+            "fetch",
         );
 
         assert_eq!(
@@ -607,16 +592,18 @@ mod tests {
     }
 
     #[test]
-    fn adapt_config_adds_canopy_identity_headers_for_copilot() {
+    fn adapt_config_migrates_canopy_http_to_bridge_command() {
         let mut platform = test_platform();
         platform.name = "copilot".to_string();
-        platform
-            .required_fields
-            .insert("type".to_string(), vec!["http".to_string()]);
+        platform.required_fields.insert(
+            "type".to_string(),
+            vec!["http".to_string(), "stdio".to_string()],
+        );
 
         let adapted = adapt_config(
             &serde_json::json!({
                 "url": "http://localhost:7755/mcp",
+                "headers": {"x-any": "value"},
                 "tools": ["*"]
             }),
             &platform,
@@ -624,28 +611,30 @@ mod tests {
         );
 
         assert_eq!(
-            adapted.get("headers"),
-            Some(&serde_json::json!({
-                "x-canopy-agent-id": "$CANOPY_AGENT_ID",
-                "x-canopy-session-name": "$CANOPY_SESSION_NAME",
-                "x-canopy-workdir": "$CANOPY_WORKDIR",
-                "x-canopy-client-name": "copilot"
-            }))
+            adapted,
+            serde_json::json!({
+                "command": "canopy",
+                "args": ["bridge"],
+                "tools": ["*"],
+                "type": "stdio"
+            })
         );
     }
 
     #[test]
-    fn adapt_config_keeps_canopy_headers_for_opencode() {
+    fn adapt_config_forces_canopy_bridge_for_merged_platforms() {
         let mut platform = test_platform();
-        platform.name = "opencode".to_string();
-        platform.unsupported_keys.push("headers".to_string());
-        platform
-            .required_fields
-            .insert("type".to_string(), vec!["remote".to_string()]);
+        platform.name = "claude".to_string();
+        platform.command_format = "merged".to_string();
+        platform.required_fields.insert(
+            "type".to_string(),
+            vec!["http".to_string(), "stdio".to_string()],
+        );
 
         let adapted = adapt_config(
             &serde_json::json!({
-                "url": "http://localhost:7755/mcp",
+                "command": "ignored",
+                "args": ["ignored-too"],
                 "enabled": true
             }),
             &platform,
@@ -653,13 +642,12 @@ mod tests {
         );
 
         assert_eq!(
-            adapted.get("headers"),
-            Some(&serde_json::json!({
-                "x-canopy-agent-id": "{env:CANOPY_AGENT_ID}",
-                "x-canopy-session-name": "{env:CANOPY_SESSION_NAME}",
-                "x-canopy-workdir": "{env:CANOPY_WORKDIR}",
-                "x-canopy-client-name": "opencode"
-            }))
+            adapted,
+            serde_json::json!({
+                "command": ["canopy", "bridge"],
+                "enabled": true,
+                "type": "stdio"
+            })
         );
     }
 }
