@@ -89,6 +89,29 @@ fn read_abs_range(
 }
 
 impl InteractiveAgent {
+    /// Replay persisted plain-text scrollback into the VT100 parser.
+    ///
+    /// This reconstructs terminal history after session resume by feeding each
+    /// line as terminal output with CRLF separators.
+    pub fn replay_scrollback_lines(&self, lines: &[String]) {
+        if lines.is_empty() {
+            return;
+        }
+
+        if let Ok(mut vt) = self.vt.lock() {
+            let mut replay = Vec::new();
+            for line in lines {
+                replay.extend_from_slice(line.as_bytes());
+                replay.extend_from_slice(b"\r\n");
+            }
+            vt.process(&replay);
+        }
+
+        if let Ok(mut t) = self.last_output_at.lock() {
+            *t = chrono::Utc::now();
+        }
+    }
+
     /// Get a snapshot of the virtual terminal screen for rendering.
     ///
     /// Uses vt100's native scrollback: `set_scrollback(N)` shifts the

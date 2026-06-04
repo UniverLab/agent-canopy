@@ -799,6 +799,7 @@ impl App {
         let _ = self.db.register_project_path(Path::new(&dir));
         // Load command history into cache
         let hist = crate::tui::terminal_history::load_history(&self.data_dir, &agent.name);
+        agent.replay_scrollback_lines(&hist.scrollback);
         self.terminal_histories.insert(agent.name.clone(), hist);
         self.terminal_agents.push(agent);
         self.whimsg

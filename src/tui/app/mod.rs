@@ -1967,6 +1967,7 @@ impl App {
             &session.working_dir,
         );
         let hist = super::terminal_history::load_history(&self.data_dir, &agent.name);
+        agent.replay_scrollback_lines(&hist.scrollback);
         self.terminal_histories.insert(agent.name.clone(), hist);
         self.terminal_agents.push(agent);
     }

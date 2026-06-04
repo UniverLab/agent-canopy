@@ -3,7 +3,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use super::{centered_rect, ACCENT, DIM};
+use super::{truncate_str, ACCENT, DIM};
 use crate::tui::app::types::{AgentEntry, App};
 use crate::tui::ui::dialogs::at_picker::draw_at_picker_dropdown;
 use crate::tui::ui::dialogs::section_picker::draw_section_picker_modal;
@@ -54,8 +54,18 @@ fn style_collapsed_paste_blocks(
 
 // Old function removed - using simple prompt dialog instead
 fn generate_top_border(title: &str, width: u16, style: Style) -> Line<'static> {
-    let title_with_spaces = format!(" {} ", title);
-    let available_width = width.saturating_sub(title_with_spaces.len() as u16 + 2);
+    if width < 2 {
+        return Line::from(vec![Span::styled(String::new(), style)]);
+    }
+
+    let max_title_chars = width.saturating_sub(4) as usize;
+    let title_with_spaces = if max_title_chars == 0 {
+        String::new()
+    } else {
+        format!(" {} ", truncate_str(title, max_title_chars))
+    };
+    let title_width = title_with_spaces.chars().count() as u16;
+    let available_width = width.saturating_sub(title_width + 2);
     let left_dashes = available_width / 2;
     let right_dashes = available_width - left_dashes;
 
@@ -73,6 +83,19 @@ fn generate_bottom_border(width: u16, style: Style) -> Line<'static> {
     let border = format!("└{}┘", "─".repeat((width - 2) as usize));
     Line::from(vec![Span::styled(border, style)])
 }
+
+fn centered_rect_fixed(
+    width: u16,
+    height: u16,
+    area: ratatui::layout::Rect,
+) -> ratatui::layout::Rect {
+    let clamped_w = width.clamp(1, area.width.max(1));
+    let clamped_h = height.clamp(1, area.height.max(1));
+    let x = area.x + area.width.saturating_sub(clamped_w) / 2;
+    let y = area.y + area.height.saturating_sub(clamped_h) / 2;
+    ratatui::layout::Rect::new(x, y, clamped_w, clamped_h)
+}
+
 pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) {
     let Some(dialog) = &app.simple_prompt_dialog else {
         return;
@@ -91,7 +114,11 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) {
 
     // Use 65% of terminal width (responsive, not edge-to-edge)
     let percent_x = 65u16;
-    let dialog_width = (frame.area().width * percent_x / 100).max(40);
+    let frame_area = frame.area();
+    let max_dialog_w = frame_area.width.saturating_sub(2).max(1);
+    let preferred_dialog_w = frame_area.width.saturating_mul(percent_x) / 100;
+    let min_dialog_w = 40u16.min(max_dialog_w);
+    let dialog_width = preferred_dialog_w.clamp(min_dialog_w, max_dialog_w);
     let inner_width = dialog_width.saturating_sub(2);
     let field_width = inner_width.saturating_sub(2).max(10) as usize;
 
@@ -122,10 +149,12 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) {
     let total_height = 2 + 1 + 1 + total_sections_height + 1;
 
     // Cap dialog height — leave at least 4 rows margin, minimum 10 rows.
-    let max_dialog_h = frame.area().height.saturating_sub(4).max(10);
+    let max_dialog_h = frame_area.height.saturating_sub(2).max(1);
+    let min_dialog_h = 10u16.min(max_dialog_h);
     let height = total_height.min(max_dialog_h);
+    let height = height.max(min_dialog_h);
 
-    let area = centered_rect(percent_x, height, frame.area());
+    let area = centered_rect_fixed(dialog_width, height, frame_area);
     frame.render_widget(Clear, area);
 
     let title = " Prompt Builder ";
@@ -256,7 +285,7 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) {
         let is_locked = dialog.is_locked(section_name);
 
         let display_label = if is_locked {
-            format!("{display_label} 🔒")
+            format!("{display_label} [locked]")
         } else {
             display_label
         };
