@@ -251,6 +251,19 @@ impl App {
             skip re-explaining code just written, go straight to the point."
                 .to_string(),
         );
+        lines.push(String::new());
+        lines.push("[INTELLIGENCE]".to_string());
+        lines.push(
+            "- Proactive patterns: when you discover a recurring behavior, convention, \
+            or project-specific insight, call intelligence_upsert with kind=\"pattern\" \
+            or kind=\"fact\" to persist it for future sessions."
+                .to_string(),
+        );
+        lines.push(
+            "- Session closure: before ending work, upsert a session summary with \
+            kind=\"session\" including: mission outcome, key decisions, and reusable learnings."
+                .to_string(),
+        );
 
         lines.join("\n")
     }
