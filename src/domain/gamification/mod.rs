@@ -2,4 +2,5 @@
 
 mod missions;
 
-pub use missions::{MissionId, MISSIONS, mission_def};
+#[allow(unused_imports)]
+pub use missions::{mission_def, MissionId, MISSIONS};

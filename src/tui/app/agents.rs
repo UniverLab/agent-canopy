@@ -446,8 +446,8 @@ impl App {
                         );
                     }
                     Err(e) => {
-                        // Log the error — nursery cleanup is non-fatal
-                        eprintln!("Nursery finalization failed: {e}");
+                        tracing::error!("Nursery finalization failed: {e}");
+                        self.notification_service.notify_nursery_failed(&e);
                     }
                 }
             } else if code != 0 {

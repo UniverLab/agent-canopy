@@ -27,7 +27,10 @@ impl AgentEntry {
     pub fn id<'a>(&'a self, app: &'a App) -> &'a str {
         match self {
             Self::Agent(a) => &a.id,
-            Self::Interactive(idx) => app.interactive_agents.get(*idx).map_or("?", |a| &a.name),
+            Self::Interactive(idx) => app
+                .interactive_agents
+                .get(*idx)
+                .map_or("?", |a| a.seed_name.as_deref().unwrap_or(&a.name)),
             Self::Terminal(idx) => app.terminal_agents.get(*idx).map_or("?", |a| &a.name),
             Self::Group(idx) => app.split_groups.get(*idx).map_or("?", |g| &g.id),
         }

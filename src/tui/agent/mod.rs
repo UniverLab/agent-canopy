@@ -72,6 +72,11 @@ pub struct InteractiveAgent {
     pub id: String,
     /// Display name for personality (from RANDOM_NAMES)
     pub name: String,
+    /// Seed identity ID (if bound to a seed)
+    #[allow(dead_code)]
+    pub seed_id: Option<String>,
+    /// Seed display name (resolved from seed_id, shown in TUI instead of random name)
+    pub seed_name: Option<String>,
     pub cli: Cli,
     #[allow(dead_code)]
     pub working_dir: String,
@@ -151,6 +156,16 @@ impl InteractiveAgent {
         let name = name
             .map(str::to_owned)
             .unwrap_or_else(|| naming::pick_random_name(existing_ids));
+
+        let (seed_id_owned, seed_name) = match seed_id {
+            Some(sid) => {
+                let resolved = crate::domain::seeds::load_seed(sid)
+                    .ok()
+                    .map(|identity| identity.name);
+                (Some(sid.to_string()), resolved)
+            }
+            None => (None, None),
+        };
 
         let pty_system = native_pty_system();
 
@@ -234,6 +249,8 @@ impl InteractiveAgent {
         Ok(Self {
             id,
             name,
+            seed_id: seed_id_owned,
+            seed_name,
             cli,
             working_dir: working_dir.to_string(),
             started_at: Utc::now(),
@@ -337,6 +354,8 @@ impl InteractiveAgent {
         Ok(Self {
             id,
             name: session_name,
+            seed_id: None,
+            seed_name: None,
             cli,
             working_dir: working_dir.to_string(),
             started_at: Utc::now(),

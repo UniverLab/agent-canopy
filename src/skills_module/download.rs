@@ -1,21 +1,28 @@
 //! Essential Pack download — fetches skills from GitHub into `~/.agents/skills/`.
+//!
+//! Skills with `requires` in skills.toml are only installed if the binary is in PATH.
 
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::path::Path;
 
 use super::ensure_global_skills_dir;
 
 const ESSENTIAL_PACK_REPO: &str = "UniverLab/skills";
 const ESSENTIAL_PACK_API: &str = "https://api.github.com/repos/UniverLab/skills/contents";
+const SKILLS_TOML_URL: &str = "https://raw.githubusercontent.com/UniverLab/skills/main/skills.toml";
 
 pub fn download_essential_pack() -> Result<usize> {
     let global = ensure_global_skills_dir()?;
     let client = build_github_client()?;
+
+    let registry = fetch_skills_registry(&client);
+
     let Some(entries) = fetch_essential_pack_entries(&client)? else {
         return Ok(0);
     };
 
-    download_missing_skill_dirs(&client, &global, &entries)
+    download_missing_skill_dirs(&client, &global, &entries, &registry)
 }
 
 fn build_github_client() -> Result<reqwest::blocking::Client> {
@@ -23,6 +30,62 @@ fn build_github_client() -> Result<reqwest::blocking::Client> {
         .user_agent("canopy")
         .build()
         .map_err(Into::into)
+}
+
+fn fetch_skills_registry(client: &reqwest::blocking::Client) -> SkillsRegistry {
+    let Ok(response) = client.get(SKILLS_TOML_URL).send() else {
+        tracing::debug!("Could not fetch skills.toml, installing all skills");
+        return SkillsRegistry::default();
+    };
+
+    if !response.status().is_success() {
+        tracing::debug!(
+            "skills.toml not found ({}), installing all skills",
+            response.status()
+        );
+        return SkillsRegistry::default();
+    }
+
+    let Ok(content) = response.text() else {
+        return SkillsRegistry::default();
+    };
+
+    parse_skills_toml(&content)
+}
+
+fn parse_skills_toml(content: &str) -> SkillsRegistry {
+    let Ok(parsed) = content.parse::<toml::Table>() else {
+        tracing::warn!("Failed to parse skills.toml");
+        return SkillsRegistry::default();
+    };
+
+    let mut registry = SkillsRegistry::default();
+
+    if let Some(skills) = parsed.get("skills").and_then(|v| v.as_table()) {
+        for (name, value) in skills {
+            if let Some(skill_config) = value.as_table() {
+                if let Some(requires) = skill_config.get("requires").and_then(|v| v.as_str()) {
+                    registry.requires.insert(name.clone(), requires.to_string());
+                }
+            }
+        }
+    }
+
+    registry
+}
+
+#[derive(Default)]
+struct SkillsRegistry {
+    requires: HashMap<String, String>,
+}
+
+impl SkillsRegistry {
+    fn should_install(&self, skill_name: &str) -> bool {
+        match self.requires.get(skill_name) {
+            Some(binary) => which::which(binary).is_ok(),
+            None => true,
+        }
+    }
 }
 
 fn fetch_essential_pack_entries(
@@ -52,10 +115,20 @@ fn download_missing_skill_dirs(
     client: &reqwest::blocking::Client,
     global: &Path,
     entries: &[GhEntry],
+    registry: &SkillsRegistry,
 ) -> Result<usize> {
     let mut downloaded = 0usize;
 
     for entry in entries.iter().filter(|entry| entry.entry_type == "dir") {
+        if !registry.should_install(&entry.name) {
+            tracing::debug!(
+                "Skipping skill '{}': binary '{}' not found in PATH",
+                entry.name,
+                registry.requires.get(&entry.name).unwrap_or(&String::new())
+            );
+            continue;
+        }
+
         let skill_dir = global.join(&entry.name);
         if skill_dir.exists() {
             continue;

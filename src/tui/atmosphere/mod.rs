@@ -182,8 +182,10 @@ mod tests {
         let p = EventPrerequisites {
             time_range: Some((6, 18)),
         };
-        let mut ctx = AtmosphereCtx::default();
-        ctx.hour = 12;
+        let mut ctx = AtmosphereCtx {
+            hour: 12,
+            ..Default::default()
+        };
         assert!(p.matches(&ctx));
         ctx.hour = 5;
         assert!(!p.matches(&ctx));
@@ -196,8 +198,10 @@ mod tests {
         let p = EventPrerequisites {
             time_range: Some((22, 4)),
         };
-        let mut ctx = AtmosphereCtx::default();
-        ctx.hour = 23;
+        let mut ctx = AtmosphereCtx {
+            hour: 23,
+            ..Default::default()
+        };
         assert!(p.matches(&ctx));
         ctx.hour = 0;
         assert!(p.matches(&ctx));

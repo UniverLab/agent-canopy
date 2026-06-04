@@ -5,7 +5,7 @@
 
 /// Notification service for sending cross-platform desktop notifications.
 pub trait NotificationService: Send + Sync {
-    /// Send a notification about a completed background task.
+    /// Send a notification about a completing background task.
     fn notify_task_completed(&self, task_id: &str, success: bool, exit_code: Option<i32>);
 
     /// Send a notification about a failed background task.
@@ -17,6 +17,9 @@ pub trait NotificationService: Send + Sync {
 
     /// Send a notification about an interactive agent failure.
     fn notify_agent_failed(&self, agent_id: &str, cli: &str, exit_code: i32, output: &str);
+
+    /// Send a notification about a nursery (seed creation) failure.
+    fn notify_nursery_failed(&self, error_msg: &str);
 }
 
 /// Default notification service implementation using domain notification module.
@@ -59,6 +62,12 @@ impl NotificationService for DefaultNotificationService {
         } else {
             format!("{agent_id} ({cli}) exited ({exit_code})\n{output}")
         };
+        crate::domain::notification::send_notification(title, &body);
+    }
+
+    fn notify_nursery_failed(&self, error_msg: &str) {
+        let title = "Canopy — seed creation failed";
+        let body = format!("Nursery finalization failed: {error_msg}");
         crate::domain::notification::send_notification(title, &body);
     }
 }
