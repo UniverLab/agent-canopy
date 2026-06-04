@@ -1,6 +1,6 @@
 use super::types::{AgentEntry, App, Focus};
 use crate::tui::agent::{AgentStatus, InteractiveAgent};
-use crate::tui::terminal_history::{delete_history, save_history};
+use crate::tui::terminal_history::save_history;
 use std::time::Duration;
 
 const SHADOW_SUMMARY_LINGER_SECS: u64 = 7;
@@ -800,7 +800,6 @@ impl App {
             hist.update_scrollback(&lines);
             save_history(&self.data_dir, &agent.name, hist);
         }
-        delete_history(&self.data_dir, &agent.name);
         agent.kill();
         self.remove_session_target(SessionTarget::Terminal(idx))
     }

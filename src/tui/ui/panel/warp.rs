@@ -38,6 +38,7 @@ pub fn draw_warp_input_box(frame: &mut Frame, area: Rect, app: &App, idx: usize)
     // Prompt indicator: compact cwd + chevron
     let prompt = format!("{} ❯ ", cwd);
     let prompt_len = prompt.chars().count() as u16;
+    let available_width = inner.width.saturating_sub(prompt_len) as usize;
 
     // Build the line: [prompt] [input_text]
     let mut spans = vec![Span::styled(
@@ -56,16 +57,63 @@ pub fn draw_warp_input_box(frame: &mut Frame, area: Rect, app: &App, idx: usize)
             Style::default().fg(Color::Rgb(80, 80, 100)),
         ));
     } else {
-        spans.push(Span::styled(&input_text, Style::default().fg(Color::White)));
+        // Horizontal scroll: keep cursor visible
+        let cursor_char_idx = input_text[..cursor_pos].chars().count();
+        let input_chars: Vec<char> = input_text.chars().collect();
+        let input_len = input_chars.len();
+
+        let visible_text = if input_len > available_width {
+            // Calculate scroll offset to keep cursor visible
+            let scroll_start = if cursor_char_idx >= available_width {
+                cursor_char_idx.saturating_sub(available_width / 2)
+            } else {
+                0
+            };
+            let scroll_end = (scroll_start + available_width).min(input_len);
+            let visible: String = input_chars[scroll_start..scroll_end].iter().collect();
+
+            // Add ellipsis indicators
+            let mut result = String::new();
+            if scroll_start > 0 {
+                result.push('…');
+            }
+            result.push_str(&visible);
+            if scroll_end < input_len {
+                result.push('…');
+            }
+            result
+        } else {
+            input_text.clone()
+        };
+
+        spans.push(Span::styled(
+            visible_text,
+            Style::default().fg(Color::White),
+        ));
     }
 
     let line = Line::from(spans);
     let para = Paragraph::new(line);
     frame.render_widget(para, inner);
 
-    // Position cursor inside the input box
-    let cursor_char_offset = input_text[..cursor_pos].chars().count() as u16;
-    let cx = inner.x + prompt_len + cursor_char_offset;
+    // Position cursor inside the input box (accounting for scroll)
+    let cursor_char_offset = input_text[..cursor_pos].chars().count();
+    let input_chars_len = input_text.chars().count();
+
+    let visible_cursor = if input_chars_len > available_width {
+        let scroll_start = if cursor_char_offset >= available_width {
+            cursor_char_offset.saturating_sub(available_width / 2)
+        } else {
+            0
+        };
+        // Account for leading ellipsis
+        let ellipsis_offset = if scroll_start > 0 { 1 } else { 0 };
+        cursor_char_offset.saturating_sub(scroll_start) + ellipsis_offset
+    } else {
+        cursor_char_offset
+    };
+
+    let cx = inner.x + prompt_len + visible_cursor as u16;
     let cy = inner.y;
     if cx < inner.x + inner.width {
         frame.set_cursor_position((cx, cy));

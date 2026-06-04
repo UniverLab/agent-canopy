@@ -216,6 +216,7 @@ pub fn save_history(data_dir: &Path, session_name: &str, history: &SessionHistor
 }
 
 /// Delete a session's history from disk.
+#[allow(dead_code)]
 pub fn delete_history(data_dir: &Path, session_name: &str) {
     let path = history_path(data_dir, session_name);
     let _ = fs::remove_file(&path);
