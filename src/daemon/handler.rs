@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use axum::http::request::Parts;
+use rmcp::handler::server::common::AsRequestContext;
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
 use rmcp::tool;
@@ -16,6 +16,21 @@ use rmcp::tool_router;
 use rmcp::ErrorData as McpError;
 use rmcp::ServerHandler;
 use tokio::sync::Notify;
+
+#[derive(Clone, Debug)]
+pub struct OptionalExtension<T>(pub Option<T>);
+
+impl<C, T> rmcp::handler::server::common::FromContextPart<C> for OptionalExtension<T>
+where
+    C: AsRequestContext,
+    T: Send + Sync + 'static + Clone,
+{
+    fn from_context_part(context: &mut C) -> Result<Self, rmcp::ErrorData> {
+        Ok(OptionalExtension(
+            context.as_request_context().extensions.get::<T>().cloned(),
+        ))
+    }
+}
 
 use crate::application::notification_service::NotificationService;
 use crate::application::ports::{AgentRepository, RunRepository, StateRepository};
@@ -43,7 +58,10 @@ use crate::domain::workflow::{
 };
 use crate::executor::Executor;
 use crate::rag::rate_limiter::RateLimiter;
-use crate::shared::sync_identity::{header_str, CANOPY_AGENT_ID_HEADER, CANOPY_CLIENT_NAME_HEADER};
+use crate::shared::sync_identity::{
+    header_str, CANOPY_AGENT_ID_ENV, CANOPY_AGENT_ID_HEADER, CANOPY_CLIENT_NAME_ENV,
+    CANOPY_CLIENT_NAME_HEADER,
+};
 use crate::sync_manager::SyncManager;
 use crate::watchers::WatcherEngine;
 use crate::workflow_engine::WorkflowEngine;
@@ -356,18 +374,34 @@ pub struct TaskTriggerHandler {
 #[tool_router]
 #[allow(clippy::too_many_arguments)]
 impl TaskTriggerHandler {
-    fn resolve_sync_agent_id(&self, parts: &Parts) -> Result<String, McpError> {
-        if let Some(agent_id) = header_str(parts, CANOPY_AGENT_ID_HEADER) {
-            return Ok(agent_id.to_string());
+    fn resolve_sync_agent_id(&self, parts: Option<&Parts>) -> Result<String, McpError> {
+        if let Some(parts) = parts {
+            if let Some(agent_id) = header_str(parts, CANOPY_AGENT_ID_HEADER) {
+                return Ok(agent_id.to_string());
+            }
+        }
+        if let Ok(agent_id) = std::env::var(CANOPY_AGENT_ID_ENV) {
+            let trimmed = agent_id.trim();
+            if !trimmed.is_empty() {
+                return Ok(trimmed.to_string());
+            }
         }
         Err(missing_sync_identity_error())
     }
 
-    fn resolve_sync_client_name<'a>(&self, parts: &'a Parts) -> Option<&'a str> {
-        header_str(parts, CANOPY_CLIENT_NAME_HEADER)
+    fn resolve_sync_client_name(&self, parts: Option<&Parts>) -> Option<String> {
+        if let Some(parts) = parts {
+            if let Some(client_name) = header_str(parts, CANOPY_CLIENT_NAME_HEADER) {
+                return Some(client_name.to_string());
+            }
+        }
+        std::env::var(CANOPY_CLIENT_NAME_ENV)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
     }
 
-    fn reject_if_nursery(&self, parts: &Parts) -> Result<(), McpError> {
+    fn reject_if_nursery(&self, parts: Option<&Parts>) -> Result<(), McpError> {
         let agent_id = self.resolve_sync_agent_id(parts)?;
         match self.db.get_session_type(&agent_id) {
             Ok(Some(st)) if st == "nursery" => {
@@ -956,23 +990,23 @@ impl TaskTriggerHandler {
     async fn sync_declare_intent(
         &self,
         Parameters(params): Parameters<SyncDeclareIntentParams>,
-        Extension(parts): Extension<Parts>,
+        OptionalExtension(parts): OptionalExtension<Parts>,
     ) -> Result<CallToolResult, McpError> {
-        self.reject_if_nursery(&parts)?;
+        self.reject_if_nursery(parts.as_ref())?;
         let Some(impact) = MissionImpact::from_str(&params.impact) else {
             return Ok(error_result(
                 "Invalid impact. Must be: low, high, breaking.",
             ));
         };
-        let agent_id = self.resolve_sync_agent_id(&parts)?;
-        let client_name = self.resolve_sync_client_name(&parts);
+        let agent_id = self.resolve_sync_agent_id(parts.as_ref())?;
+        let client_name = self.resolve_sync_client_name(parts.as_ref());
 
         Ok(map_action_result(
             self.sync_manager
                 .declare_intent(
                     &params.workdir,
                     &agent_id,
-                    client_name,
+                    client_name.as_deref(),
                     &params.mission,
                     impact,
                     &params.description,
@@ -991,23 +1025,23 @@ impl TaskTriggerHandler {
     async fn sync_report_status(
         &self,
         Parameters(params): Parameters<SyncReportStatusParams>,
-        Extension(parts): Extension<Parts>,
+        OptionalExtension(parts): OptionalExtension<Parts>,
     ) -> Result<CallToolResult, McpError> {
-        self.reject_if_nursery(&parts)?;
+        self.reject_if_nursery(parts.as_ref())?;
         let Some(status) = WorkspaceStatus::from_str(&params.status) else {
             return Ok(error_result(
                 "Invalid status. Must be: stable, unstable, testing.",
             ));
         };
-        let agent_id = self.resolve_sync_agent_id(&parts)?;
-        let client_name = self.resolve_sync_client_name(&parts);
+        let agent_id = self.resolve_sync_agent_id(parts.as_ref())?;
+        let client_name = self.resolve_sync_client_name(parts.as_ref());
 
         Ok(map_action_result(
             self.sync_manager
                 .report_status(
                     &params.workdir,
                     &agent_id,
-                    client_name,
+                    client_name.as_deref(),
                     status,
                     &params.message,
                 )
@@ -1026,9 +1060,9 @@ impl TaskTriggerHandler {
     async fn sync_broadcast(
         &self,
         Parameters(params): Parameters<SyncBroadcastParams>,
-        Extension(parts): Extension<Parts>,
+        OptionalExtension(parts): OptionalExtension<Parts>,
     ) -> Result<CallToolResult, McpError> {
-        self.reject_if_nursery(&parts)?;
+        self.reject_if_nursery(parts.as_ref())?;
         let Some(kind) = MessageKind::from_str(&params.kind) else {
             return Ok(error_result("Invalid kind. Must be: info, query, answer."));
         };
@@ -1042,14 +1076,14 @@ impl TaskTriggerHandler {
             .metadata
             .as_ref()
             .map(|metadata| metadata.to_string());
-        let agent_id = self.resolve_sync_agent_id(&parts)?;
-        let client_name = self.resolve_sync_client_name(&parts);
+        let agent_id = self.resolve_sync_agent_id(parts.as_ref())?;
+        let client_name = self.resolve_sync_client_name(parts.as_ref());
         Ok(map_action_result(
             self.sync_manager
                 .broadcast(
                     &params.workdir,
                     &agent_id,
-                    client_name,
+                    client_name.as_deref(),
                     kind,
                     &params.message,
                     payload.as_deref(),
@@ -1066,9 +1100,9 @@ impl TaskTriggerHandler {
     async fn sync_get_context(
         &self,
         Parameters(params): Parameters<SyncGetContextParams>,
-        Extension(parts): Extension<Parts>,
+        OptionalExtension(parts): OptionalExtension<Parts>,
     ) -> Result<CallToolResult, McpError> {
-        self.reject_if_nursery(&parts)?;
+        self.reject_if_nursery(parts.as_ref())?;
         let limit = params.limit.unwrap_or(10);
 
         let context = self
@@ -1138,9 +1172,9 @@ impl TaskTriggerHandler {
     async fn intelligence_get_context(
         &self,
         Parameters(params): Parameters<IntelligenceGetContextParams>,
-        Extension(parts): Extension<Parts>,
+        OptionalExtension(parts): OptionalExtension<Parts>,
     ) -> Result<CallToolResult, McpError> {
-        self.reject_if_nursery(&parts)?;
+        self.reject_if_nursery(parts.as_ref())?;
         let scope = params.scope.trim().to_lowercase();
         let (session_limit, _knowledge_limit, sync_limit, dependency_limit) = match scope.as_str() {
             "light" => (2, 5, 8, 0),
@@ -1149,7 +1183,7 @@ impl TaskTriggerHandler {
         };
 
         // Auto-detect project_hash from session workdir if not provided.
-        let resolved_agent_id = self.resolve_sync_agent_id(&parts).ok();
+        let resolved_agent_id = self.resolve_sync_agent_id(parts.as_ref()).ok();
         let effective_project_hash = resolved_agent_id.as_deref().and_then(|agent_id| {
             resolve_effective_project_hash(&self.db, params.project_hash.as_deref(), agent_id)
         });
@@ -1214,7 +1248,12 @@ impl TaskTriggerHandler {
             &project_knowledge,
             &related_projects,
         );
-        inject_seed_identity(&mut out, &self.db, &parts, resolved_agent_id.as_deref());
+        inject_seed_identity(
+            &mut out,
+            &self.db,
+            parts.as_ref(),
+            resolved_agent_id.as_deref(),
+        );
 
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&out).unwrap_or_default(),
@@ -1229,12 +1268,12 @@ impl TaskTriggerHandler {
     async fn intelligence_upsert(
         &self,
         Parameters(params): Parameters<IntelligenceUpsertParams>,
-        Extension(parts): Extension<Parts>,
+        OptionalExtension(parts): OptionalExtension<Parts>,
     ) -> Result<CallToolResult, McpError> {
-        self.reject_if_nursery(&parts)?;
+        self.reject_if_nursery(parts.as_ref())?;
         // Auto-detect project_hash from session workdir if not provided.
         let project_hash = params.node_data.project_hash.or_else(|| {
-            let agent_id = self.resolve_sync_agent_id(&parts).ok()?;
+            let agent_id = self.resolve_sync_agent_id(parts.as_ref()).ok()?;
             let workdir = self.db.get_session_workdir(&agent_id).ok()??;
             Some(crate::domain::project::workdir_hash(&workdir))
         });
@@ -1281,9 +1320,9 @@ impl TaskTriggerHandler {
     async fn intelligence_search(
         &self,
         Parameters(params): Parameters<IntelligenceSearchParams>,
-        Extension(parts): Extension<Parts>,
+        OptionalExtension(parts): OptionalExtension<Parts>,
     ) -> Result<CallToolResult, McpError> {
-        self.reject_if_nursery(&parts)?;
+        self.reject_if_nursery(parts.as_ref())?;
         let limit = params.limit.unwrap_or(10).min(50);
         let results = self
             .db
@@ -1340,11 +1379,11 @@ impl TaskTriggerHandler {
     )]
     async fn get_identity(
         &self,
-        Extension(parts): Extension<Parts>,
+        OptionalExtension(parts): OptionalExtension<Parts>,
     ) -> Result<CallToolResult, McpError> {
-        self.reject_if_nursery(&parts)?;
-        let agent_id = self.resolve_sync_agent_id(&parts)?;
-        let (_, identity) = load_bound_seed_identity(&self.db, &parts, &agent_id)
+        self.reject_if_nursery(parts.as_ref())?;
+        let agent_id = self.resolve_sync_agent_id(parts.as_ref())?;
+        let (_, identity) = load_bound_seed_identity(&self.db, parts.as_ref(), &agent_id)
             .map_err(|e| McpError::invalid_params(e, None))?;
         let toml_str = identity
             .to_toml()
@@ -1361,11 +1400,11 @@ impl TaskTriggerHandler {
     async fn evolve_identity(
         &self,
         Parameters(params): Parameters<EvolveIdentityParams>,
-        Extension(parts): Extension<Parts>,
+        OptionalExtension(parts): OptionalExtension<Parts>,
     ) -> Result<CallToolResult, McpError> {
-        self.reject_if_nursery(&parts)?;
-        let agent_id = self.resolve_sync_agent_id(&parts)?;
-        let (seed_id, mut identity) = load_bound_seed_identity(&self.db, &parts, &agent_id)
+        self.reject_if_nursery(parts.as_ref())?;
+        let agent_id = self.resolve_sync_agent_id(parts.as_ref())?;
+        let (seed_id, mut identity) = load_bound_seed_identity(&self.db, parts.as_ref(), &agent_id)
             .map_err(|e| McpError::invalid_params(e, None))?;
         identity
             .evolve(params.new_directives, params.new_traits)
@@ -1404,9 +1443,9 @@ impl TaskTriggerHandler {
     async fn create_seed(
         &self,
         Parameters(params): Parameters<CreateSeedParams>,
-        Extension(parts): Extension<Parts>,
+        OptionalExtension(parts): OptionalExtension<Parts>,
     ) -> Result<CallToolResult, McpError> {
-        self.reject_if_nursery(&parts)?;
+        self.reject_if_nursery(parts.as_ref())?;
         let seed_id = crate::domain::nursery::slugify(&params.name);
         let identity = crate::domain::seeds::SeedIdentity {
             name: params.name,
@@ -2181,9 +2220,9 @@ impl TaskTriggerHandler {
     async fn get_tools(
         &self,
         Parameters(params): Parameters<GetToolsParams>,
-        Extension(parts): Extension<Parts>,
+        OptionalExtension(parts): OptionalExtension<Parts>,
     ) -> Result<CallToolResult, McpError> {
-        self.reject_if_nursery(&parts)?;
+        self.reject_if_nursery(parts.as_ref())?;
         let scope = params.scope.trim().to_lowercase();
         if !matches!(
             scope.as_str(),
@@ -2290,9 +2329,9 @@ impl TaskTriggerHandler {
     async fn rag_search(
         &self,
         Parameters(params): Parameters<RagSearchParams>,
-        Extension(parts): Extension<Parts>,
+        OptionalExtension(parts): OptionalExtension<Parts>,
     ) -> Result<CallToolResult, McpError> {
-        self.reject_if_nursery(&parts)?;
+        self.reject_if_nursery(parts.as_ref())?;
         if let Some(result) = self.check_rag_rate_limit(&params).await {
             return Ok(result);
         }
@@ -2658,7 +2697,7 @@ fn inject_project_context(
 fn inject_seed_identity(
     out: &mut serde_json::Value,
     db: &crate::db::Database,
-    parts: &axum::http::request::Parts,
+    parts: Option<&axum::http::request::Parts>,
     agent_id: Option<&str>,
 ) {
     let Some(agent_id) = agent_id else {
@@ -2702,7 +2741,7 @@ impl ServerHandler for TaskTriggerHandler {
 #[cfg(test)]
 mod tests {
     use super::{header_str, missing_sync_identity_error, MISSING_SYNC_IDENTITY_MESSAGE};
-    use crate::shared::sync_identity::{CANOPY_AGENT_ID_HEADER, CANOPY_WORKDIR_HEADER};
+    use crate::shared::sync_identity::CANOPY_AGENT_ID_HEADER;
 
     #[test]
     fn resolve_sync_agent_id_reads_canopy_header() {
@@ -2722,7 +2761,7 @@ mod tests {
     fn resolve_sync_agent_id_requires_canopy_header() {
         let request = axum::http::Request::builder()
             .header("x-canopy-session-name", "cedro")
-            .header(CANOPY_WORKDIR_HEADER, "/tmp/workdir")
+            .header("x-canopy-workdir", "/tmp/workdir")
             .body(())
             .unwrap();
         let (parts, _) = request.into_parts();

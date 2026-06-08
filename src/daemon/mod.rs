@@ -18,6 +18,8 @@ pub(crate) mod service_install;
 pub mod handler;
 
 #[cfg(test)]
+mod test_missions;
+#[cfg(test)]
 mod tests;
 
 pub use handler::TaskTriggerHandler;
