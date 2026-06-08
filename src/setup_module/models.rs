@@ -53,6 +53,8 @@ pub struct Platform {
     #[serde(default)]
     pub skills_dir: Option<String>,
     #[serde(default)]
+    pub instruction_file: Option<String>,
+    #[serde(default)]
     pub cli: Option<serde_json::Value>,
 }
 
@@ -75,6 +77,7 @@ impl Platform {
             serde_json::from_value::<crate::domain::cli_config::CliConfig>(v.clone())
                 .map(|mut c| {
                     c.name = self.name.clone();
+                    c.instruction_file = self.instruction_file.clone();
                     c
                 })
                 .ok()

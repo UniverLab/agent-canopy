@@ -78,7 +78,10 @@ pub fn instruction_file_for_cli(cli_name: &str) -> &'static str {
 
 /// Create a temporary nursery workspace for a new seed.
 /// Returns the path to the temporary directory.
-pub fn create_nursery(cli_name: &str) -> Result<PathBuf, String> {
+pub fn create_nursery(
+    cli_name: &str,
+    custom_instruction_file: Option<&str>,
+) -> Result<PathBuf, String> {
     let temp_dir = std::env::temp_dir().join(format!("canopy-nursery-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_dir)
         .map_err(|e| format!("Failed to create nursery directory: {e}"))?;
@@ -95,7 +98,8 @@ pub fn create_nursery(cli_name: &str) -> Result<PathBuf, String> {
         .map_err(|e| format!("Failed to write draft identity: {e}"))?;
 
     // Write instruction file for the selected CLI
-    let instr_filename = instruction_file_for_cli(cli_name);
+    let instr_filename =
+        custom_instruction_file.unwrap_or_else(|| instruction_file_for_cli(cli_name));
     let instr_path = temp_dir.join(instr_filename);
 
     // For nested paths like .github/copilot-instructions.md, create parent dirs
@@ -196,7 +200,7 @@ mod tests {
 
     #[test]
     fn create_nursery_creates_temp_directory() {
-        let result = create_nursery("opencode");
+        let result = create_nursery("opencode", None);
         assert!(result.is_ok());
         let temp_dir = result.unwrap();
         assert!(temp_dir.exists());
@@ -209,7 +213,7 @@ mod tests {
 
     #[test]
     fn create_nursery_writes_identity_toml() {
-        let temp_dir = create_nursery("claude").unwrap();
+        let temp_dir = create_nursery("claude", None).unwrap();
         let identity_path = temp_dir.join("identity.toml");
         assert!(identity_path.exists());
 
@@ -223,19 +227,19 @@ mod tests {
     #[test]
     fn create_nursery_writes_instruction_file_for_cli() {
         // Test flat path (AGENTS.md)
-        let temp_dir = create_nursery("opencode").unwrap();
+        let temp_dir = create_nursery("opencode", None).unwrap();
         assert!(temp_dir.join("AGENTS.md").exists());
         let content = std::fs::read_to_string(temp_dir.join("AGENTS.md")).unwrap();
         assert!(content.contains("Seed Nursery"));
         let _ = std::fs::remove_dir_all(&temp_dir);
 
         // Test flat path (CLAUDE.md)
-        let temp_dir = create_nursery("claude").unwrap();
+        let temp_dir = create_nursery("claude", None).unwrap();
         assert!(temp_dir.join("CLAUDE.md").exists());
         let _ = std::fs::remove_dir_all(&temp_dir);
 
         // Test nested path (.github/copilot-instructions.md)
-        let temp_dir = create_nursery("copilot").unwrap();
+        let temp_dir = create_nursery("copilot", None).unwrap();
         let instr_path = temp_dir.join(".github/copilot-instructions.md");
         assert!(instr_path.exists());
         let content = std::fs::read_to_string(&instr_path).unwrap();
@@ -245,7 +249,7 @@ mod tests {
 
     #[test]
     fn create_nursery_identity_is_parseable() {
-        let temp_dir = create_nursery("gemini").unwrap();
+        let temp_dir = create_nursery("gemini", None).unwrap();
         let content = std::fs::read_to_string(temp_dir.join("identity.toml")).unwrap();
         let identity = SeedIdentity::from_toml(&content).unwrap();
         assert!(identity.name.is_empty());
@@ -256,7 +260,7 @@ mod tests {
 
     #[test]
     fn finalize_nursery_valid_identity() {
-        let temp_dir = create_nursery("opencode").unwrap();
+        let temp_dir = create_nursery("opencode", None).unwrap();
 
         // Write a valid identity
         let identity = SeedIdentity::new("TestNurseryOak".to_string());
@@ -279,7 +283,7 @@ mod tests {
 
     #[test]
     fn finalize_nursery_rejects_empty_name() {
-        let temp_dir = create_nursery("opencode").unwrap();
+        let temp_dir = create_nursery("opencode", None).unwrap();
         // Leave identity.toml with empty name (default from create_nursery)
 
         let result = finalize_nursery(&temp_dir);
@@ -291,7 +295,7 @@ mod tests {
 
     #[test]
     fn finalize_nursery_rejects_missing_identity() {
-        let temp_dir = create_nursery("opencode").unwrap();
+        let temp_dir = create_nursery("opencode", None).unwrap();
         // Remove the identity.toml
         std::fs::remove_file(temp_dir.join("identity.toml")).unwrap();
 
@@ -309,7 +313,7 @@ mod tests {
         seeds::save_seed(&existing_id, &existing).unwrap();
 
         // Now try to finalize a nursery with the same name
-        let temp_dir = create_nursery("opencode").unwrap();
+        let temp_dir = create_nursery("opencode", None).unwrap();
         let identity = SeedIdentity::new("UniqueNurseryName".to_string());
         std::fs::write(temp_dir.join("identity.toml"), identity.to_toml().unwrap()).unwrap();
 
@@ -324,7 +328,7 @@ mod tests {
 
     #[test]
     fn finalize_nursery_slugifies_special_characters() {
-        let temp_dir = create_nursery("opencode").unwrap();
+        let temp_dir = create_nursery("opencode", None).unwrap();
         let identity = SeedIdentity::new("Red Oak 🌳".to_string());
         std::fs::write(temp_dir.join("identity.toml"), identity.to_toml().unwrap()).unwrap();
 

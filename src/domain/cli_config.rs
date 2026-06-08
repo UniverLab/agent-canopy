@@ -48,6 +48,9 @@ pub struct CliConfig {
     /// Flag to pass to disable approval prompts (yolo/autonomous mode).
     #[serde(default)]
     pub yolo_flag: Option<String>,
+    /// Path to the custom instructions file (e.g. `.github/copilot-instructions.md`).
+    #[serde(default)]
+    pub instruction_file: Option<String>,
 }
 
 /// Persisted CLI configuration for available CLIs.
@@ -149,6 +152,7 @@ mod tests {
             session_resume_cmd: None,
             accent_color: None,
             yolo_flag: None,
+            instruction_file: None,
         }
     }
 

@@ -505,6 +505,7 @@ mod tests {
             required_fields: std::collections::HashMap::new(),
             server_extras: std::collections::HashMap::new(),
             skills_dir: None,
+            instruction_file: None,
             cli: None,
         }
     }
