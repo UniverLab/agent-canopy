@@ -3,7 +3,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use super::{centered_rect, truncate_str, DIM};
+use super::{centered_rect, draw_dialog_left_wave, truncate_str, DIM};
 use crate::tui::app::{
     dialog::new_agent::{BackgroundTrigger, NewAgentDialog, NewTaskMode, NewTaskType, SeedOption},
     types::App,
@@ -92,6 +92,7 @@ pub fn draw_new_agent_dialog(frame: &mut Frame, app: &App) {
     let filtered_clis = dialog.filtered_cli_indices();
     let area = centered_rect(65, dialog_height(dialog, &filtered_clis), frame.area());
     frame.render_widget(Clear, area);
+    draw_dialog_left_wave(frame, area, app.animation_tick.into());
 
     let block = Block::default()
         .title(dialog_title(dialog))

@@ -1,5 +1,11 @@
 //! Dialog overlays — new agent, quit confirmation, color legend, context transfer.
 
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
+use ratatui::Frame;
+
 pub mod at_picker;
 pub mod context_transfer;
 pub mod knowledge_dialog;
@@ -29,3 +35,46 @@ pub use workflow_editor::draw_workflow_editor_dialog;
 pub(crate) use super::{centered_rect, truncate_str};
 pub(crate) use super::{ACCENT, DIM};
 pub(crate) use super::{BG_SELECTED, ERROR_COLOR, INTERACTIVE_COLOR};
+
+fn gradient_wave_color(index: usize, shift: usize) -> Color {
+    let gradient = crate::shared::banner::BANNER_GRADIENT;
+    let len = gradient.len();
+    if len == 0 {
+        return Color::White;
+    }
+    if len == 1 {
+        let (r, g, b) = gradient[0];
+        return Color::Rgb(r, g, b);
+    }
+
+    let cycle_len = len * 2 - 2;
+    let pos = (index + shift) % cycle_len;
+    let gradient_idx = if pos < len { pos } else { cycle_len - pos };
+    let (r, g, b) = gradient[gradient_idx];
+    Color::Rgb(r, g, b)
+}
+
+pub(crate) fn draw_dialog_left_wave(frame: &mut Frame, area: Rect, tick: u64) {
+    let wave = ["░", "▒", "░"];
+    let shift =
+        ((tick / 3) as usize) % (crate::shared::banner::BANNER_GRADIENT.len() * 2 - 1).max(1);
+    let x = area.x.saturating_sub(1);
+    let y = area.y + area.height.saturating_sub(wave.len() as u16) / 2;
+
+    for (i, glyph) in wave.iter().enumerate() {
+        let row = y + i as u16;
+        if row >= area.y + area.height {
+            break;
+        }
+
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                *glyph,
+                Style::default()
+                    .fg(gradient_wave_color(i, shift))
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            Rect::new(x, row, 1, 1),
+        );
+    }
+}

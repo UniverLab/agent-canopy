@@ -1,9 +1,10 @@
+use ratatui::layout::{Alignment, Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use super::{centered_rect, ACCENT, DIM};
+use super::{centered_rect, draw_dialog_left_wave, ACCENT, DIM};
 use crate::tui::app::types::App;
 
 pub fn draw_quit_confirm(frame: &mut Frame) {
@@ -66,6 +67,30 @@ fn format_uptime_precise(seconds: u64) -> String {
         (d, h, m) => format!("{d}d {h}h {m}m {secs}s"),
     }
 }
+
+fn category_label(category: &crate::domain::gamification::MissionCategory) -> &'static str {
+    use crate::domain::gamification::MissionCategory;
+    match category {
+        MissionCategory::Environment => "Environment",
+        MissionCategory::Intelligence => "Intelligence",
+        MissionCategory::Projects => "Projects",
+        MissionCategory::Workflow => "Workflow",
+        MissionCategory::Seeds => "Seeds",
+        MissionCategory::SysInfo => "System",
+    }
+}
+
+fn mission_unlock_text(
+    icon: &str,
+    title: &str,
+    category: &crate::domain::gamification::MissionCategory,
+) -> String {
+    format!(
+        "Unlocked medal {icon} {title} in {}.",
+        category_label(category)
+    )
+}
+
 pub fn draw_legend(frame: &mut Frame, app: &mut App) {
     use crate::domain::gamification::{MissionCategory, MISSIONS};
 
@@ -97,14 +122,21 @@ pub fn draw_legend(frame: &mut Frame, app: &mut App) {
 
     let selected = app.legend_selected;
 
-    let width = 60u16;
-    let height = 18u16;
-    let percent_x = (width * 100 / frame.area().width.max(1)).clamp(40, 70);
+    let base_height = 2 + 4 + 1; // summary + usage + instructions
+    let extra_height = if unlocked_missions.is_empty() {
+        0
+    } else {
+        1 + unlocked_missions.len().min(15) as u16 + 1 + 3 // spacers + missions + spacer + detail
+    };
+    let percent_x = 52u16;
+    let height =
+        (base_height + extra_height + 2).min(frame.area().height.saturating_sub(2).max(12));
     let area = centered_rect(percent_x, height, frame.area());
     frame.render_widget(Clear, area);
+    draw_dialog_left_wave(frame, area, app.animation_tick.into());
 
     let block = Block::default()
-        .title(" Canopy Stats ")
+        .title(" Canopy Missions ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
         .style(Style::default().bg(Color::Rgb(12, 20, 12)));
@@ -143,58 +175,63 @@ pub fn draw_legend(frame: &mut Frame, app: &mut App) {
         }
     };
 
-    let mut lines: Vec<Line> = Vec::new();
+    let sections = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(if unlocked_missions.is_empty() { 0 } else { 1 }),
+        Constraint::Length(if unlocked_missions.is_empty() {
+            0
+        } else {
+            unlocked_missions.len().min(15) as u16
+        }),
+        Constraint::Length(if unlocked_missions.is_empty() { 0 } else { 1 }),
+        Constraint::Length(if unlocked_missions.is_empty() { 0 } else { 3 }),
+        Constraint::Length(4),
+        Constraint::Length(1),
+    ])
+    .split(inner);
 
-    lines.push(Line::from(vec![
-        Span::styled("Session: ", label_style),
-        Span::styled(&session_uptime, accent_style),
-        Span::raw("   "),
-        Span::styled("Canopy: ", label_style),
-        Span::styled(&canopy_uptime, accent_style),
-    ]));
+    let summary_lines = vec![
+        Line::from(vec![
+            Span::styled("Missions ", value_style),
+            Span::styled(format!("{unlocked_n}/{total}"), accent_style),
+            Span::raw("    "),
+            Span::styled("Session ", label_style),
+            Span::styled(&session_uptime, accent_style),
+            Span::raw("    "),
+            Span::styled("Canopy ", label_style),
+            Span::styled(&canopy_uptime, accent_style),
+        ]),
+        Line::from(vec![
+            Span::styled("Interactive ", label_style),
+            Span::styled(format!("{interactive_count}"), value_style),
+            Span::raw("  "),
+            Span::styled("Terminal ", label_style),
+            Span::styled(format!("{terminal_count}"), value_style),
+            Span::raw("  "),
+            Span::styled("BG ", label_style),
+            Span::styled(format!("{bg_count}"), value_style),
+            Span::raw("  "),
+            Span::styled("Runs ", label_style),
+            Span::styled(format!("{runs_count}"), value_style),
+        ]),
+    ];
+    frame.render_widget(
+        Paragraph::new(summary_lines).alignment(Alignment::Center),
+        sections[0],
+    );
 
-    lines.push(Line::from(vec![
-        Span::styled("Interactive: ", label_style),
-        Span::styled(format!("{interactive_count}"), value_style),
-        Span::raw("   "),
-        Span::styled("Terminal: ", label_style),
-        Span::styled(format!("{terminal_count}"), value_style),
-        Span::raw("   "),
-        Span::styled("BG: ", label_style),
-        Span::styled(format!("{bg_count}"), value_style),
-        Span::raw("   "),
-        Span::styled("Runs: ", label_style),
-        Span::styled(format!("{runs_count}"), value_style),
-    ]));
-
-    lines.push(Line::from(""));
-
-    lines.push(Line::from(vec![
-        Span::styled("Missions ", value_style),
-        Span::styled(format!("{unlocked_n}/{total}"), accent_style),
-    ]));
-
-    lines.push(Line::from(""));
-
-    if unlocked_missions.is_empty() {
-        lines.push(Line::from(vec![Span::styled(
-            "  No missions unlocked yet...",
-            Style::default().fg(Color::Rgb(80, 80, 80)),
-        )]));
-    } else {
-        for (i, def) in unlocked_missions.iter().enumerate() {
-            let is_selected = i == selected;
+    let mut mission_lines: Vec<Line> = Vec::new();
+    if !unlocked_missions.is_empty() {
+        let visible_rows = sections[2].height as usize;
+        let start = selected.saturating_sub(visible_rows.saturating_sub(1) / 2);
+        let start = start.min(unlocked_missions.len().saturating_sub(visible_rows));
+        let end = (start + visible_rows).min(unlocked_missions.len());
+        for (i, def) in unlocked_missions[start..end].iter().enumerate() {
+            let mission_index = start + i;
+            let is_selected = mission_index == selected;
             let base_color = category_color(&def.category);
-            let twinkle_factor = twinkle(i);
-            let icon_color = dim_color(base_color, twinkle_factor);
-
-            let marker = if is_selected { "▸" } else { " " };
-            let marker_style = if is_selected {
-                Style::default().fg(ACCENT)
-            } else {
-                Style::default().fg(Color::Rgb(40, 40, 40))
-            };
-
+            let icon_color = dim_color(base_color, twinkle(i));
+            let marker = if is_selected { "▶" } else { "·" };
             let title_style = if is_selected {
                 Style::default()
                     .fg(Color::White)
@@ -202,42 +239,98 @@ pub fn draw_legend(frame: &mut Frame, app: &mut App) {
             } else {
                 Style::default().fg(Color::Rgb(200, 200, 200))
             };
-
-            lines.push(Line::from(vec![
-                Span::styled(marker.to_string(), marker_style),
+            mission_lines.push(Line::from(vec![
+                Span::styled(marker, Style::default().fg(ACCENT)),
+                Span::raw(" "),
                 Span::styled(
-                    format!(" {} ", def.icon),
-                    Style::default()
-                        .fg(icon_color)
-                        .add_modifier(Modifier::BOLD),
+                    def.icon,
+                    Style::default().fg(icon_color).add_modifier(Modifier::BOLD),
                 ),
+                Span::raw(" "),
                 Span::styled(def.title, title_style),
             ]));
         }
     }
+    frame.render_widget(
+        Paragraph::new(mission_lines).alignment(Alignment::Center),
+        sections[2],
+    );
 
-    lines.push(Line::from(""));
+    let selected_detail_lines = if let Some(selected_def) = unlocked_missions.get(selected) {
+        let date_str = app
+            .mission_manager
+            .unlock_timestamp(selected_def.id)
+            .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+            .map(|dt| dt.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "Unknown".to_string());
 
-    if let Some(selected_def) = unlocked_missions.get(selected) {
-        lines.push(Line::from(vec![Span::styled(
-            format!("  {}", selected_def.challenge),
-            Style::default().fg(Color::Rgb(150, 150, 150)),
-        )]));
-    }
+        vec![
+            Line::from(Span::styled(
+                selected_def.challenge,
+                Style::default().fg(Color::Rgb(190, 190, 190)),
+            )),
+            Line::from(Span::styled(
+                mission_unlock_text(
+                    selected_def.icon,
+                    selected_def.title,
+                    &selected_def.category,
+                ),
+                Style::default().fg(Color::Rgb(140, 205, 140)),
+            )),
+            Line::from(Span::styled(
+                format!("Completed: {}", date_str),
+                Style::default().fg(Color::Rgb(100, 100, 100)),
+            )),
+        ]
+    } else {
+        vec![]
+    };
+    frame.render_widget(
+        Paragraph::new(selected_detail_lines).alignment(Alignment::Center),
+        sections[4],
+    );
 
-    lines.push(Line::from(""));
-
-    lines.push(Line::from(vec![
-        Span::styled(" F1/Esc ", label_style),
-        Span::styled("close   ", Style::default().fg(Color::White)),
-        Span::styled("↑↓/jk ", label_style),
-        Span::styled("select   ", Style::default().fg(Color::White)),
-        Span::styled("⊞ ", label_style),
-        Span::styled("scroll", Style::default().fg(Color::White)),
-    ]));
+    let mut usage_pairs: Vec<_> = app.cli_usage.counts.iter().collect();
+    usage_pairs.sort_by(|(name_a, count_a), (name_b, count_b)| {
+        count_b.cmp(count_a).then_with(|| name_a.cmp(name_b))
+    });
+    let used_harnesses = usage_pairs.iter().filter(|(_, count)| **count > 0).count();
+    let usage_lines = if usage_pairs.is_empty() {
+        vec![Line::from(Span::styled(
+            "No harness usage yet.",
+            Style::default().fg(Color::White),
+        ))]
+    } else {
+        let visible_rows = sections[5].height.saturating_sub(1) as usize;
+        usage_pairs
+            .iter()
+            .take(visible_rows.max(1))
+            .map(|(name, count)| {
+                Line::from(Span::styled(
+                    format!("{name}: {count}"),
+                    Style::default().fg(Color::White),
+                ))
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut usage_panel_lines = vec![Line::from(Span::styled(
+        format!("Harnesses used: {used_harnesses}"),
+        Style::default().fg(Color::Rgb(210, 210, 210)),
+    ))];
+    usage_panel_lines.extend(usage_lines);
+    frame.render_widget(
+        Paragraph::new(usage_panel_lines).alignment(Alignment::Center),
+        sections[5],
+    );
 
     frame.render_widget(
-        Paragraph::new(lines).alignment(ratatui::layout::Alignment::Left),
-        inner,
+        Paragraph::new(Line::from(vec![
+            Span::styled("F1/Esc ", label_style),
+            Span::styled("close   ", Style::default().fg(Color::White)),
+            Span::styled("↑↓/jk ", label_style),
+            Span::styled("select", Style::default().fg(Color::White)),
+        ]))
+        .alignment(Alignment::Center),
+        sections[6],
     );
 }

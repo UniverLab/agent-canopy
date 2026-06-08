@@ -378,8 +378,30 @@ impl App {
 
         // ── Create mode ───────────────────────────────────────────────────
         if matches!(dialog.task_type, NewTaskType::Interactive) {
-            self.open_launchpad_dialog(dialog)?;
-            return Ok(());
+            if dialog.is_planting_new_seed() {
+                self.launch_interactive(&dialog)?;
+                let new_agent_name = self
+                    .interactive_agents
+                    .last()
+                    .map(|agent| agent.name.clone())
+                    .unwrap_or_default();
+                self.new_agent_dialog = None;
+                self.refresh_agents()?;
+                if !new_agent_name.is_empty() {
+                    if let Some(position) = self
+                        .agents
+                        .iter()
+                        .position(|entry| entry.id(self) == new_agent_name)
+                    {
+                        self.selected = position;
+                    }
+                }
+                self.focus = super::super::types::Focus::Agent;
+                return Ok(());
+            } else {
+                self.open_launchpad_dialog(dialog)?;
+                return Ok(());
+            }
         }
 
         // Track the name of the newly created agent to select it after refresh
@@ -515,6 +537,7 @@ impl App {
         }
 
         if is_nursery {
+            self.focus = super::super::types::Focus::Agent;
             return Ok(());
         }
 
@@ -607,7 +630,7 @@ impl App {
 
         // Check if planting a new seed via Nursery
         let (dir, is_nursery) = if dialog.is_planting_new_seed() {
-            let nursery_dir = crate::domain::nursery::create_nursery(cli.as_str())
+            let nursery_dir = crate::domain::nursery::create_nursery(cli.as_str(), None)
                 .map_err(|e| anyhow::anyhow!(e))?;
             let d = nursery_dir.to_string_lossy().to_string();
             // Store nursery path for finalization on session end
@@ -616,6 +639,17 @@ impl App {
         } else {
             (dialog.working_dir.clone(), false)
         };
+
+        // Ensure the CLI‑specific instruction file exists for every agent session
+        if !is_nursery {
+            use std::path::Path;
+            let instr_name = crate::domain::nursery::instruction_file_for_cli(cli.as_str());
+            let instr_path = Path::new(&dir).join(instr_name);
+            if let Some(parent) = instr_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&instr_path, crate::domain::nursery::GARDENER_INSTRUCTIONS);
+        }
 
         // Append yolo flag to args when yolo mode is enabled
         let base_args = dialog.selected_args();
@@ -655,7 +689,7 @@ impl App {
         } else {
             dialog.selected_seed_id()
         };
-        let agent_name = if is_nursery { Some("semillero") } else { None };
+        let agent_name = if is_nursery { Some("Gardener") } else { None };
         let agent = InteractiveAgent::spawn(
             cli,
             &dir,

@@ -3,7 +3,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use super::{truncate_str, ACCENT, DIM};
+use super::{draw_dialog_left_wave, truncate_str, ACCENT, DIM};
 use crate::tui::app::types::{AgentEntry, App};
 use crate::tui::ui::dialogs::at_picker::draw_at_picker_dropdown;
 use crate::tui::ui::dialogs::section_picker::draw_section_picker_modal;
@@ -156,6 +156,7 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) {
 
     let area = centered_rect_fixed(dialog_width, height, frame_area);
     frame.render_widget(Clear, area);
+    draw_dialog_left_wave(frame, area, app.animation_tick.into());
 
     let title = " Prompt Builder ";
     let block = Block::default()
