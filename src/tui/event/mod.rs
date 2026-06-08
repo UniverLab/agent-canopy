@@ -141,9 +141,7 @@ fn dismiss_legend(app: &mut App, code: KeyCode) -> bool {
         return false;
     }
 
-    let unlocked_count = app
-        .mission_manager
-        .unlocked_count();
+    let unlocked_count = app.mission_manager.unlocked_count();
     let max_selected = unlocked_count.saturating_sub(1);
 
     match code {
@@ -153,15 +151,11 @@ fn dismiss_legend(app: &mut App, code: KeyCode) -> bool {
         KeyCode::Up | KeyCode::Char('k') => {
             if app.legend_selected > 0 {
                 app.legend_selected -= 1;
-            } else {
-                app.legend_selected = max_selected;
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
             if app.legend_selected < max_selected {
                 app.legend_selected += 1;
-            } else {
-                app.legend_selected = 0;
             }
         }
         _ => {}
@@ -259,14 +253,10 @@ fn handle_mouse_scroll(app: &mut App, mouse: &MouseEvent) {
         if dir > 0 {
             if app.legend_selected > 0 {
                 app.legend_selected -= 1;
-            } else {
-                app.legend_selected = max_selected;
             }
         } else {
             if app.legend_selected < max_selected {
                 app.legend_selected += 1;
-            } else {
-                app.legend_selected = 0;
             }
         }
         return;

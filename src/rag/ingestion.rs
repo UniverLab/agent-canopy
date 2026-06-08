@@ -225,8 +225,10 @@ impl IngestionManager {
     }
 
     /// Scan the vector store for chunks whose source file no longer exists on disk
-    /// and delete them. Run once at startup to clean up any orphans left from a
-    /// previous session where the daemon was offline during file deletions.
+    /// **or** falls outside the currently configured personal RAG roots, and delete
+    /// them. Run once at startup to clean up orphans left from:
+    ///  - files deleted while the daemon was offline, and
+    ///  - a previous RAG root path that the user changed via `canopy setup`.
     pub async fn reconcile_orphan_chunks(&self) {
         let config = crate::domain::canopy_config::CanopyConfig::load(&self.data_dir);
         let Some(store) = open_vector_store(&config).await else {
@@ -242,16 +244,46 @@ impl IngestionManager {
         if paths.is_empty() {
             return;
         }
+
+        // Build the set of currently configured roots (as PathBufs) so we can
+        // check whether each indexed path still belongs to them.
+        let personal_roots: Vec<std::path::PathBuf> = config
+            .rag_personal_dirs
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect();
+
         tracing::info!(
-            "RAG reconcile: checking {} indexed path(s) for orphan chunks",
-            paths.len()
+            "RAG reconcile: checking {} indexed path(s) for orphan chunks (roots: {:?})",
+            paths.len(),
+            personal_roots
         );
         let mut purged = 0usize;
         for path in &paths {
-            if !std::path::Path::new(path).exists() {
+            let disk_path = std::path::Path::new(path);
+
+            // Case 1: file no longer exists on disk.
+            let missing_on_disk = !disk_path.exists();
+
+            // Case 2: file exists but is outside every configured root
+            // (i.e. the user changed the RAG root via `canopy setup`).
+            let outside_roots = !personal_roots.is_empty()
+                && !personal_roots
+                    .iter()
+                    .any(|root| disk_path.starts_with(root));
+
+            if missing_on_disk || outside_roots {
+                let reason = if missing_on_disk {
+                    "file no longer on disk — orphan chunks purged at startup"
+                } else {
+                    "file outside configured RAG roots — purged after root change"
+                };
                 tracing::info!(
-                    "RAG reconcile: '{}' no longer exists — purging chunks",
-                    path
+                    "RAG reconcile: '{}' — {} (missing={}, outside_roots={})",
+                    path,
+                    reason,
+                    missing_on_disk,
+                    outside_roots
                 );
                 if let Err(e) = store.delete_by_path(path).await {
                     tracing::warn!("RAG reconcile: failed to purge '{}': {e:#}", path);
@@ -260,14 +292,16 @@ impl IngestionManager {
                     let _ = self.db.log_rag_event(
                         path,
                         "deleted",
-                        Some("file no longer on disk — orphan chunks purged at startup"),
+                        Some(reason),
                         chrono::Utc::now().timestamp(),
                     );
                 }
             }
         }
         if purged > 0 {
-            tracing::info!("RAG reconcile: removed chunks for {purged} deleted file(s)");
+            tracing::info!(
+                "RAG reconcile: removed chunks for {purged} deleted/out-of-scope file(s)"
+            );
             refresh_rag_snapshot(&self.db, &self.data_dir).await;
         } else {
             tracing::debug!("RAG reconcile: no orphan chunks found");
