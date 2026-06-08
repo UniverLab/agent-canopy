@@ -71,6 +71,11 @@ impl MissionManager {
         self.store.unlocked_count()
     }
 
+    /// Returns the Unix timestamp (seconds) when the mission was unlocked, if known.
+    pub fn unlock_timestamp(&self, id: MissionId) -> Option<i64> {
+        self.store.unlock_timestamp(id)
+    }
+
     pub fn process_refresh(
         &mut self,
         snapshot: &MissionSnapshot,

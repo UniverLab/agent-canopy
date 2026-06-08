@@ -75,10 +75,7 @@ impl App {
             self.mission_manager
                 .process_refresh(&snapshot, &events, &mut self.whimsg)?;
         for title in &unlocked {
-            crate::domain::notification::send_notification(
-                "Canopy — mission unlocked",
-                title,
-            );
+            crate::domain::notification::send_notification("Canopy — mission unlocked", title);
         }
         Ok(())
     }

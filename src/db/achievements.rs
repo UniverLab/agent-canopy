@@ -1,6 +1,6 @@
 //! Achievement persistence via `daemon_state` keys.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -15,18 +15,28 @@ const ACHIEVEMENT_PREFIX: &str = "achievement:";
 pub struct AchievementStore {
     db: Arc<Database>,
     unlocked: HashSet<MissionId>,
+    /// Unix timestamps (seconds) at which each mission was unlocked.
+    unlock_timestamps: HashMap<MissionId, i64>,
 }
 
 impl AchievementStore {
     pub fn load(db: Arc<Database>) -> Result<Self> {
         let mut unlocked = HashSet::new();
+        let mut unlock_timestamps = HashMap::new();
         for def in MISSIONS {
             let key = achievement_key(def.id);
-            if db.get_state(&key)?.is_some() {
+            if let Some(ts_str) = db.get_state(&key)? {
                 unlocked.insert(def.id);
+                if let Ok(ts) = ts_str.parse::<i64>() {
+                    unlock_timestamps.insert(def.id, ts);
+                }
             }
         }
-        Ok(Self { db, unlocked })
+        Ok(Self {
+            db,
+            unlocked,
+            unlock_timestamps,
+        })
     }
 
     pub fn is_unlocked(&self, id: MissionId) -> bool {
@@ -37,14 +47,20 @@ impl AchievementStore {
         self.unlocked.len()
     }
 
+    /// Returns the Unix timestamp (seconds) when the mission was unlocked, if available.
+    pub fn unlock_timestamp(&self, id: MissionId) -> Option<i64> {
+        self.unlock_timestamps.get(&id).copied()
+    }
+
     /// Unlock a mission if not already unlocked. Returns `true` when newly unlocked.
     pub fn unlock(&mut self, id: MissionId) -> Result<bool> {
         if self.unlocked.contains(&id) {
             return Ok(false);
         }
-        let ts = chrono::Utc::now().timestamp().to_string();
-        self.db.set_state(&achievement_key(id), &ts)?;
+        let now = chrono::Utc::now().timestamp();
+        self.db.set_state(&achievement_key(id), &now.to_string())?;
         self.unlocked.insert(id);
+        self.unlock_timestamps.insert(id, now);
         Ok(true)
     }
 }
