@@ -148,15 +148,11 @@ fn dismiss_legend(app: &mut App, code: KeyCode) -> bool {
         KeyCode::Esc | KeyCode::F(1) | KeyCode::Enter => {
             app.show_legend = false;
         }
-        KeyCode::Up | KeyCode::Char('k') => {
-            if app.legend_selected > 0 {
-                app.legend_selected -= 1;
-            }
+        KeyCode::Up | KeyCode::Char('k') if app.legend_selected > 0 => {
+            app.legend_selected -= 1;
         }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if app.legend_selected < max_selected {
-                app.legend_selected += 1;
-            }
+        KeyCode::Down | KeyCode::Char('j') if app.legend_selected < max_selected => {
+            app.legend_selected += 1;
         }
         _ => {}
     }
