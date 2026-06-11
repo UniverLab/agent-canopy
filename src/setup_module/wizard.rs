@@ -8,7 +8,7 @@ use crate::setup_module::registry_fetch::{fetch_registry, print_banner};
 use crate::setup_module::sync_and_skills::{run_essential_skills_step, run_sync_step};
 use crate::setup_module::PlatformWithCli;
 use anyhow::{Context, Result};
-use inquire::{Confirm, MultiSelect, Select, Text};
+use inquire::{Confirm, MultiSelect, Select};
 use std::io::{self, Write};
 
 pub fn run_setup() -> Result<()> {
@@ -134,28 +134,11 @@ pub fn run_setup() -> Result<()> {
             embeddings_model
         ));
 
-        // ── Similarity threshold ───────────────────────────────────
-        wiz.render()?;
-        let similarity_threshold = {
-            let default = existing_config.similarity_threshold;
-            let input = Text::new("Similarity threshold for semantic chunk merging (0.3-0.5):")
-                .with_initial_value(&format!("{:.2}", default))
-                .with_help_message("Value between 0.3 and 0.5 (recommended 0.4)")
-                .prompt()
-                .map_err(|e| anyhow::anyhow!("Similarity threshold selection cancelled: {}", e))?;
-            let parsed = input
-                .trim()
-                .parse::<f32>()
-                .map_err(|e| anyhow::anyhow!("Invalid number: {}", e))?;
-            if !(0.3f32..=0.5f32).contains(&parsed) {
-                anyhow::bail!("Similarity threshold must be between 0.3 and 0.5");
-            }
-            parsed
-        };
-        wiz.add(format!(
-            "\x1b[32m✓\x1b[0m Similarity threshold: {:.2}",
-            similarity_threshold
-        ));
+        // Chunk-merge similarity threshold: internal tuning knob with no
+        // user-observable effect in its valid range, so it is not prompted.
+        // The config.toml value (default 0.4) is carried forward and can
+        // still be edited manually for experimentation.
+        let similarity_threshold = existing_config.similarity_threshold;
 
         // ── RAG directories ─────────────────────────────────────────
         let prev_dirs = existing_config.rag_personal_dirs.clone();
