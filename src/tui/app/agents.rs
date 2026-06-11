@@ -468,7 +468,7 @@ impl App {
             .close_agent_missions(&agent_id, &agent_name, &working_dir);
         if code != 0 {
             self.notify_failed_interactive_exit(&agent_id, &cli, code, &output_snippet);
-        } else if self.session_args_contain_yolo(&agent_id) {
+        } else if self.session_args_contain_yolo(&agent_id, &cli) {
             self.queue_mission_event(crate::tui::gamification::MissionEvent::YoloTaskCompleted);
         }
 

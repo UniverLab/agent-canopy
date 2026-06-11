@@ -2362,11 +2362,26 @@ impl TaskTriggerHandler {
             return Ok(success_result("No results found."));
         }
 
+        self.record_rag_search_missions(&results);
+
         let out: Vec<serde_json::Value> = results.iter().map(rag_result_json).collect();
 
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&out).unwrap_or_default(),
         )]))
+    }
+
+    /// Flag one-shot RAG missions for the TUI to pick up via shared state,
+    /// mirroring the `gamification:identity_evolved` mechanism.
+    fn record_rag_search_missions(&self, results: &[crate::rag::vector_store::SearchResult]) {
+        if results.iter().any(|r| r.distance.is_some_and(|d| d < 0.2)) {
+            let _ = self.db.set_state("gamification:deep_rag_search", "1");
+        }
+
+        let month_ago = chrono::Utc::now().timestamp() - 30 * 24 * 3600;
+        if results.iter().any(|r| r.created_at < month_ago) {
+            let _ = self.db.set_state("gamification:digital_archeologist", "1");
+        }
     }
 }
 

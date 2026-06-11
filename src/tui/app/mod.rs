@@ -165,6 +165,7 @@ impl App {
             mission_manager,
             mission_pending_events: Vec::new(),
             max_cpu_frequency_seen: None,
+            uptime_anchor: None,
         };
         app.refresh()?;
         Ok(app)

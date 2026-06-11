@@ -42,18 +42,6 @@ impl CliUsage {
         }
     }
 
-    /// Total seconds since the first Canopy run.
-    pub fn canopy_uptime_seconds(&self) -> u64 {
-        let Some(ref first) = self.first_run_at else {
-            return 0;
-        };
-        let Ok(dt) = chrono::DateTime::parse_from_rfc3339(first) else {
-            return 0;
-        };
-        let elapsed = chrono::Utc::now().signed_duration_since(dt.with_timezone(&chrono::Utc));
-        elapsed.num_seconds().max(0) as u64
-    }
-
     /// Increment the counter for a CLI by name.
     pub fn record(&mut self, cli_name: &str) {
         *self.counts.entry(cli_name.to_string()).or_insert(0) += 1;

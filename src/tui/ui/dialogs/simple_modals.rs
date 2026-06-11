@@ -101,7 +101,7 @@ pub fn draw_legend(frame: &mut Frame, app: &mut App) {
     let accent_style = Style::default().fg(ACCENT);
 
     let session_uptime = format_uptime_precise(app.process_start_time.elapsed().as_secs());
-    let canopy_uptime = format_uptime_precise(app.cli_usage.canopy_uptime_seconds());
+    let canopy_uptime = format_uptime_precise(app.accumulated_uptime_secs());
     let interactive_count = app.db.count_interactive_sessions().unwrap_or(0);
     let terminal_count = app.db.count_terminal_sessions().unwrap_or(0);
     let bg_count = app.db.count_background_agents().unwrap_or(0);

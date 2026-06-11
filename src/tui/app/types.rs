@@ -365,6 +365,8 @@ pub struct App {
     pub(crate) mission_manager: crate::tui::gamification::MissionManager,
     pub(crate) mission_pending_events: Vec<crate::tui::gamification::MissionEvent>,
     pub(crate) max_cpu_frequency_seen: Option<u64>,
+    /// Monotonic anchor for accumulating real Canopy uptime (persisted in state).
+    pub(crate) uptime_anchor: Option<std::time::Instant>,
 }
 
 #[derive(Clone)]
