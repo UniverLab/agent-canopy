@@ -208,7 +208,7 @@ impl App {
         );
         lines.push(
             "2. Before modifying files: call get_tools(scope=\"file_write\", path=\"...\") \
-            — check for mission conflicts, then declare_intent."
+            — check for mission conflicts, then sync_declare_intent."
                 .to_string(),
         );
         lines.push(
@@ -222,7 +222,7 @@ impl App {
                 .to_string(),
         );
         lines.push(
-            "- Report execution status with canopy_agent_report when working on \
+            "- Report execution status with agent_report when working on \
             scheduled tasks."
                 .to_string(),
         );

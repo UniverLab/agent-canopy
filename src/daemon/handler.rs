@@ -277,7 +277,7 @@ fn build_get_tools_response(scope: &str) -> serde_json::Value {
             "tools": [
                 "intelligence_get_context — pull session history, facts, patterns",
                 "sync_get_context — check active missions and workspace vibe",
-                "sync_declare_intent — announce your mission (impact: low/medium/high/breaking)"
+                "sync_declare_intent — announce your mission (impact: low/high/breaking)"
             ]
         }),
         "file_write" => serde_json::json!({
@@ -328,13 +328,13 @@ fn build_get_tools_response(scope: &str) -> serde_json::Value {
             "scope": "multi_agent",
             "risk": "varies",
             "protocol": [
-                "Follow the action-risk table: low=execute, medium=broadcast, high=declare+execute+report, breaking=same as high with impact=breaking.",
+                "Follow the action-risk table: low=execute and broadcast if notable, high=declare+execute+report, breaking=same as high with impact=breaking.",
                 "Always non-blocking — act on last-known state, never wait for responses.",
                 "Communicate intent not implementation — missions explain what and why, not how."
             ],
             "tools": [
                 "sync_get_context — check active missions and workspace vibe (call first)",
-                "sync_declare_intent — announce mission (impact: low/medium/high/breaking)",
+                "sync_declare_intent — announce mission (impact: low/high/breaking)",
                 "sync_broadcast — send info/query/answer messages to peers",
                 "sync_report_status — report stable/unstable/testing after actions",
                 "intelligence_get_context(scope=\"full\") — deep project-context pull for architecture work",

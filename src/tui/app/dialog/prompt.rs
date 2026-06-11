@@ -603,7 +603,13 @@ impl SimplePromptDialog {
             &resources,
         ) {
             result = strip_resources_section(&result);
-            result.push_str(&section);
+            // Keep the <system> block as the closing element of the prompt:
+            // resolved resources go before it, never after.
+            if let Some(system_pos) = result.find("<system>\n") {
+                result.insert_str(system_pos, &section);
+            } else {
+                result.push_str(&section);
+            }
         }
 
         Ok(result)
