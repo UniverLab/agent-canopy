@@ -336,11 +336,14 @@ async fn shutdown_signal() {
 }
 
 fn init_tracing() {
+    // Logs must never touch stdout: in stdio MCP mode it is reserved
+    // exclusively for JSON-RPC messages.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive(tracing_subscriber::filter::LevelFilter::INFO.into()),
         )
         .with_target(false)
+        .with_writer(std::io::stderr)
         .init();
 }
