@@ -194,3 +194,69 @@ pub(crate) fn format_temporal_agents(agents: &[Agent]) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+/// Providers surfaced by `agent_models`, with display names.
+const MODEL_PROVIDERS: &[(&str, &str)] = &[
+    ("anthropic", "Anthropic"),
+    ("openai", "OpenAI"),
+    ("google", "Google"),
+    ("mistral", "Mistral"),
+    ("xai", "xAI"),
+    ("deepseek", "DeepSeek"),
+    ("amazon", "Amazon"),
+    ("alibaba", "Alibaba"),
+];
+
+/// Newest models listed per provider in `agent_models`.
+const MODELS_PER_PROVIDER: usize = 8;
+
+/// Format the cached models.dev catalog: newest models per major provider.
+pub(crate) fn format_catalog_models(catalog: &crate::domain::models_db::ModelCatalog) -> String {
+    let mut sections = Vec::new();
+
+    for (slug, display) in MODEL_PROVIDERS {
+        let mut models: Vec<_> = catalog
+            .models
+            .iter()
+            .filter(|m| m.provider == *slug)
+            .collect();
+        if models.is_empty() {
+            continue;
+        }
+        // ISO release dates sort lexically; undated models go last.
+        models.sort_by(|a, b| b.release_date.cmp(&a.release_date));
+
+        let lines = models
+            .iter()
+            .take(MODELS_PER_PROVIDER)
+            .map(|m| format!("  {}  ({display})", m.id))
+            .collect::<Vec<_>>()
+            .join("\n");
+        sections.push(lines);
+    }
+
+    sections.join("\n")
+}
+
+/// Static list used when the models.dev catalog is unavailable.
+pub(crate) fn format_fallback_models() -> String {
+    let models = [
+        ("Anthropic", "claude-fable-5"),
+        ("Anthropic", "claude-opus-4-8"),
+        ("Anthropic", "claude-sonnet-4-6"),
+        ("Anthropic", "claude-haiku-4-5"),
+        ("OpenAI", "gpt-4.1"),
+        ("OpenAI", "o3"),
+        ("OpenAI", "o4-mini"),
+        ("Google", "gemini-2.5-pro"),
+        ("Google", "gemini-2.5-flash"),
+        ("Mistral", "mistral-large-latest"),
+        ("Amazon", "nova-pro"),
+    ];
+
+    models
+        .iter()
+        .map(|(provider, model)| format!("  {model}  ({provider})"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}

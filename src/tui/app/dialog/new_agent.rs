@@ -102,7 +102,7 @@ impl NewAgentDialog {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default()
         });
-        let catalog = models_db::load_catalog();
+        let catalog = models_db::load_catalog_nonblocking();
         let seed_options = load_seed_options();
         let mut dialog = Self {
             edit_id: None,
@@ -581,9 +581,7 @@ impl NewAgentDialog {
             return;
         };
         let binding = self.selected_cli();
-        let cli_name = binding.as_str();
-        let cli_models = models_db::models_for_cli(catalog, cli_name);
-        self.model_suggestions = models_db::filter_models(&cli_models, &self.model);
+        self.model_suggestions = models_db::suggestions_for(catalog, binding.as_str(), &self.model);
         // Clamp selection index
         if self.model_suggestion_idx >= self.model_suggestions.len() {
             self.model_suggestion_idx = 0;

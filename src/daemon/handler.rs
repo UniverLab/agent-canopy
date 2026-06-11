@@ -35,8 +35,9 @@ where
 use crate::application::notification_service::NotificationService;
 use crate::application::ports::{AgentRepository, RunRepository, StateRepository};
 use crate::daemon::handler_formatting::{
-    format_agent_info, format_log_output, format_temporal_agents, format_uptime, internal_error,
-    make_log_path, recent_runs_output, resolve_log_path,
+    format_agent_info, format_catalog_models, format_fallback_models, format_log_output,
+    format_temporal_agents, format_uptime, internal_error, make_log_path, recent_runs_output,
+    resolve_log_path,
 };
 use crate::daemon::handler_helpers::{
     apply_scalar_updates, apply_trigger_updates, handle_timed_out_run, load_bound_seed_identity,
@@ -818,35 +819,20 @@ impl TaskTriggerHandler {
         description = "List common AI models available for use with agents. Returns provider/model strings that can be passed to the model field of agent_add or agent_watch."
     )]
     async fn task_models(&self) -> Result<CallToolResult, McpError> {
-        let models = [
-            ("OpenAI", "gpt-4.1"),
-            ("OpenAI", "gpt-4o"),
-            ("OpenAI", "gpt-4o-mini"),
-            ("OpenAI", "o1"),
-            ("OpenAI", "o3"),
-            ("OpenAI", "o4-mini"),
-            ("Anthropic", "claude-sonnet-4-20250514"),
-            ("Anthropic", "claude-opus-4-20250514"),
-            ("Anthropic", "claude-3-5-sonnet-20241022"),
-            ("Anthropic", "claude-3-7-sonnet-20250219"),
-            ("Google", "gemini-2.5-pro"),
-            ("Google", "gemini-2.5-flash"),
-            ("Google", "gemini-2.0-flash"),
-            ("Amazon", "nova-pro"),
-            ("Amazon", "nova-lite"),
-            ("Mistral", "mistral-large-2411"),
-            ("Meta", "llama-4-maverick"),
-            ("Meta", "llama-4-scout"),
-        ];
+        // The catalog load touches disk and possibly the network; keep it off
+        // the async executor.
+        let catalog = tokio::task::spawn_blocking(crate::domain::models_db::load_catalog)
+            .await
+            .ok()
+            .flatten();
 
-        let output = models
-            .iter()
-            .map(|(provider, model)| format!("  {}  ({})", model, provider))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let output = catalog
+            .as_ref()
+            .map(format_catalog_models)
+            .unwrap_or_else(format_fallback_models);
 
         let result = format!(
-            "Available models (use the second column value as the model field):\n\
+            "Available models (use the model id as the model field):\n\
              {}\n\n\
              Note: Model availability depends on the CLI's configured API keys.\n\
              If model is omitted, the CLI uses its own default.",
