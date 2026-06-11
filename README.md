@@ -17,7 +17,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-2E8B57?style=for-the-badge" alt="License"/></a>
 </p>
 
-harness-canopy is a modern, self-contained MCP (Multi-Agent Control Point) server and TUI for orchestrating AI agent sessions, background tasks, and file event triggers. Designed for reliability, modularity, and performance — it enables advanced scheduling, persistent knowledge graphs, multi-agent coordination, workflow automation, and interactive terminal management with zero runtime dependencies.
+harness-canopy is a modern, self-contained MCP (Model Context Protocol) server and TUI for orchestrating AI agent sessions, background tasks, and file event triggers. Designed for reliability, modularity, and performance — it enables advanced scheduling, persistent knowledge graphs, multi-agent coordination, workflow automation, and interactive terminal management with zero runtime dependencies.
 
 ---
 
@@ -97,14 +97,14 @@ harness-canopy is a modern, self-contained MCP (Multi-Agent Control Point) serve
 
 ---
 
-## MCP Tools (43)
+## MCP Tools (46)
 
 | Category | Tools |
 |----------|-------|
 | **Agent Management** (12) | `agent_add`, `agent_watch`, `agent_list`, `agent_remove`, `agent_enable`, `agent_disable`, `agent_run`, `agent_status`, `agent_models`, `agent_logs`, `agent_update`, `agent_report` |
 | **Multi-Agent Sync** (4) | `sync_declare_intent`, `sync_report_status`, `sync_broadcast`, `sync_get_context` |
 | **Intelligence V2** (6) | `intelligence_get_context`, `intelligence_upsert`, `intelligence_search`, `intelligence_graph_walk`, `intelligence_list_projects`, `intelligence_link_projects` |
-| **Seed Identity** (2) | `get_identity`, `evolve_identity` |
+| **Seed Identity** (5) | `get_identity`, `evolve_identity`, `create_seed`, `list_seeds`, `remove_seed` |
 | **Workflow Engine** (15) | `workflow_create`, `workflow_update`, `workflow_add_spec`, `workflow_update_spec`, `workflow_add_node`, `workflow_update_node`, `workflow_add_edge`, `workflow_update_edge`, `workflow_get`, `workflow_list`, `workflow_run`, `workflow_pause`, `workflow_continue`, `workflow_complete_node`, `workflow_report_blocker` |
 | **Project** (2) | `project_search`, `project_update` |
 | **RAG** (1) | `rag_search` |
@@ -114,7 +114,7 @@ harness-canopy is a modern, self-contained MCP (Multi-Agent Control Point) serve
 
 ## Architecture Overview
 
-- **Daemon** — Owns the MCP server (Streamable HTTP on port 7755 + stdio), scheduler, watcher engine, and database. Exposes all 43 MCP tools.
+- **Daemon** — Owns the MCP server (Streamable HTTP on port 7755 + stdio), scheduler, watcher engine, and database. Exposes all 46 MCP tools.
 - **Scheduler** — Computes next fire times for all active tasks, sleeping until needed. Wakes instantly on changes.
 - **Watcher Engine** — Reacts to file system events, triggering tasks as defined.
 - **Executor** — Runs tasks and agents, manages locking, logs, and status.
