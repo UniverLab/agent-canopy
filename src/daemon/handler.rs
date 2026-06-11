@@ -35,9 +35,8 @@ where
 use crate::application::notification_service::NotificationService;
 use crate::application::ports::{AgentRepository, RunRepository, StateRepository};
 use crate::daemon::handler_formatting::{
-    format_agent_info, format_catalog_models, format_fallback_models, format_log_output,
-    format_temporal_agents, format_uptime, internal_error, make_log_path, recent_runs_output,
-    resolve_log_path,
+    format_agent_info, format_catalog_models, format_log_output, format_temporal_agents,
+    format_uptime, internal_error, make_log_path, recent_runs_output, resolve_log_path,
 };
 use crate::daemon::handler_helpers::{
     apply_scalar_updates, apply_trigger_updates, handle_timed_out_run, load_bound_seed_identity,
@@ -826,17 +825,20 @@ impl TaskTriggerHandler {
             .ok()
             .flatten();
 
-        let output = catalog
-            .as_ref()
-            .map(format_catalog_models)
-            .unwrap_or_else(format_fallback_models);
+        let Some(catalog) = catalog else {
+            return Ok(error_result(
+                "Model catalog unavailable: could not reach models.dev and no local \
+                 cache exists at ~/.canopy/models_cache.json. Omit the model field to \
+                 use the CLI's default, or retry once network access is restored.",
+            ));
+        };
 
         let result = format!(
             "Available models (use the model id as the model field):\n\
              {}\n\n\
              Note: Model availability depends on the CLI's configured API keys.\n\
              If model is omitted, the CLI uses its own default.",
-            output
+            format_catalog_models(&catalog)
         );
 
         Ok(CallToolResult::success(vec![Content::text(result)]))

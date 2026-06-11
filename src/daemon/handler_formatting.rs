@@ -237,26 +237,3 @@ pub(crate) fn format_catalog_models(catalog: &crate::domain::models_db::ModelCat
 
     sections.join("\n")
 }
-
-/// Static list used when the models.dev catalog is unavailable.
-pub(crate) fn format_fallback_models() -> String {
-    let models = [
-        ("Anthropic", "claude-fable-5"),
-        ("Anthropic", "claude-opus-4-8"),
-        ("Anthropic", "claude-sonnet-4-6"),
-        ("Anthropic", "claude-haiku-4-5"),
-        ("OpenAI", "gpt-4.1"),
-        ("OpenAI", "o3"),
-        ("OpenAI", "o4-mini"),
-        ("Google", "gemini-2.5-pro"),
-        ("Google", "gemini-2.5-flash"),
-        ("Mistral", "mistral-large-latest"),
-        ("Amazon", "nova-pro"),
-    ];
-
-    models
-        .iter()
-        .map(|(provider, model)| format!("  {model}  ({provider})"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
