@@ -67,37 +67,6 @@ pub fn draw_launchpad_dialog(frame: &mut Frame, app: &App) {
     let mut lines: Vec<Line> = Vec::new();
     let mut mission_row: Option<u16> = None;
 
-    if dialog.recent_missions.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "No previous missions found for this workspace.",
-            Style::default().fg(DIM),
-        )));
-    } else {
-        lines.push(Line::from(Span::styled(
-            "Recent missions:",
-            Style::default().fg(DIM),
-        )));
-        for (i, mission) in dialog.recent_missions.iter().enumerate() {
-            let is_selected = dialog.selected_index == i;
-            let style = if is_selected {
-                Style::default().bg(BG_SELECTED).fg(ACCENT)
-            } else {
-                Style::default().fg(DIM)
-            };
-            let marker = if is_selected { ">" } else { " " };
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "  {} [{}] {}",
-                    marker,
-                    i + 1,
-                    truncate_str(&mission.mission, 72)
-                ),
-                style,
-            )));
-        }
-    }
-
-    let new_item_index = dialog.recent_missions.len();
     let is_new_selected = dialog.is_new_mission_selected();
     let new_style = if is_new_selected {
         Style::default().bg(BG_SELECTED).fg(ACCENT)
@@ -106,7 +75,7 @@ pub fn draw_launchpad_dialog(frame: &mut Frame, app: &App) {
     };
     let marker = if is_new_selected { ">" } else { " " };
     lines.push(Line::from(Span::styled(
-        format!("  {} [{}] New mission", marker, new_item_index + 1),
+        format!("  {marker} [1] New mission"),
         new_style,
     )));
 
@@ -128,6 +97,37 @@ pub fn draw_launchpad_dialog(frame: &mut Frame, app: &App) {
                 Style::default().fg(DIM)
             };
             lines.push(Line::from(Span::styled(format!("  {message}"), style)));
+        }
+    }
+
+    if dialog.recent_missions.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No previous missions found for this workspace.",
+            Style::default().fg(DIM),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Recent missions:",
+            Style::default().fg(DIM),
+        )));
+        for (i, mission) in dialog.recent_missions.iter().enumerate() {
+            let item_index = i + 1; // 0 is "New mission"
+            let is_selected = dialog.selected_index == item_index;
+            let style = if is_selected {
+                Style::default().bg(BG_SELECTED).fg(ACCENT)
+            } else {
+                Style::default().fg(DIM)
+            };
+            let marker = if is_selected { ">" } else { " " };
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  {} [{}] {}",
+                    marker,
+                    item_index + 1,
+                    truncate_str(&mission.mission, 72)
+                ),
+                style,
+            )));
         }
     }
 

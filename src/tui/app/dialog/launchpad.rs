@@ -40,6 +40,7 @@ impl LaunchpadDialog {
     pub fn for_workdir(db: &Database, workdir: &str) -> Result<Self> {
         let nodes = db.search_intelligence_nodes(workdir, Some("session"), 50)?;
         let mut recent_missions: Vec<LaunchpadContext> = Vec::new();
+        let mut seen_titles = std::collections::HashSet::new();
         let mut run_summary: Option<String> = None;
 
         for node in nodes {
@@ -66,8 +67,11 @@ impl LaunchpadDialog {
                 .and_then(|value| value.as_str())
                 .unwrap_or_default();
 
+            // Nodes arrive newest-first; continuing a mission creates a new
+            // node with the same title, so dedupe to keep only the latest.
             if recent_missions.len() < 5
                 && (source == "launchpad" || (source == "sync" && kind == "intent"))
+                && seen_titles.insert(node.title.trim().to_lowercase())
             {
                 recent_missions.push(LaunchpadContext {
                     node_id: node.id.clone(),
@@ -131,12 +135,13 @@ impl LaunchpadDialog {
         self.recent_missions.len() + 1
     }
 
+    /// "New mission" is the first option (index 0) and the default selection.
     pub fn is_new_mission_selected(&self) -> bool {
-        self.selected_index >= self.recent_missions.len()
+        self.selected_index == 0
     }
 
     pub fn selected_mission(&self) -> Option<&LaunchpadContext> {
-        self.recent_missions.get(self.selected_index)
+        self.recent_missions.get(self.selected_index.checked_sub(1)?)
     }
 
     pub fn choice(&self) -> LaunchpadChoice {
@@ -329,7 +334,7 @@ mod tests {
                 mission: "Fix bug".into(),
                 summary: None,
             }],
-            selected_index: 0,
+            selected_index: 1,
             new_mission: String::new(),
             cursor: 0,
             submit_blocked: false,
@@ -339,5 +344,26 @@ mod tests {
         assert!(dialog.can_confirm_selection());
         assert_eq!(dialog.choice(), LaunchpadChoice::ContinueMission);
         assert_eq!(dialog.selected_mission().unwrap().mission, "Fix bug");
+    }
+
+    #[test]
+    fn new_mission_is_first_and_default() {
+        let dialog = LaunchpadDialog {
+            workdir: "/tmp/project".to_string(),
+            recent_missions: vec![LaunchpadContext {
+                node_id: "1".into(),
+                mission: "Fix bug".into(),
+                summary: None,
+            }],
+            selected_index: 0,
+            new_mission: String::new(),
+            cursor: 0,
+            submit_blocked: false,
+            active_missions: Vec::new(),
+        };
+
+        assert!(dialog.is_new_mission_selected());
+        assert!(dialog.selected_mission().is_none());
+        assert_eq!(dialog.choice(), LaunchpadChoice::NewMission);
     }
 }
