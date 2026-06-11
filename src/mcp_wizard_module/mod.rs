@@ -31,8 +31,13 @@ enum WizardAction {
 
 struct AddServerInput {
     name: String,
-    url: String,
     server_type: String,
+    transport: ServerTransport,
+}
+
+enum ServerTransport {
+    Url(String),
+    Command { command: String, args: Vec<String> },
 }
 
 /// Run the interactive `canopy mcp` wizard.
@@ -201,7 +206,7 @@ fn run_add(home: &Path, detected: &[&Platform]) -> Result<()> {
         return Ok(());
     };
 
-    let config = build_server_config(&input.url, &input.server_type);
+    let config = build_server_config(&input);
 
     println!();
     println!(
@@ -235,21 +240,52 @@ fn prompt_add_server_input() -> Result<Option<AddServerInput>> {
         return Ok(None);
     }
 
-    let url = prompt_trimmed_text("Server URL (e.g. \"https://example.com/mcp\"):")?;
     let server_type = prompt_server_type()?;
+    let Some(transport) = prompt_server_transport(&server_type)? else {
+        return Ok(None);
+    };
 
     Ok(Some(AddServerInput {
         name,
-        url,
         server_type,
+        transport,
     }))
 }
 
-fn build_server_config(url: &str, server_type: &str) -> serde_json::Value {
-    serde_json::json!({
-        "type": server_type,
-        "url": url,
-    })
+fn prompt_server_transport(server_type: &str) -> Result<Option<ServerTransport>> {
+    if server_type != "stdio" {
+        let url = prompt_trimmed_text("Server URL (e.g. \"https://example.com/mcp\"):")?;
+        if !validate_required_input(&url, "Server URL is required.") {
+            return Ok(None);
+        }
+        return Ok(Some(ServerTransport::Url(url)));
+    }
+
+    let command_line = prompt_trimmed_text("Command (e.g. \"npx -y @scope/server\"):")?;
+    if !validate_required_input(&command_line, "Command is required.") {
+        return Ok(None);
+    }
+
+    let mut parts = command_line.split_whitespace().map(str::to_owned);
+    let command = parts.next().unwrap_or_default();
+    Ok(Some(ServerTransport::Command {
+        command,
+        args: parts.collect(),
+    }))
+}
+
+fn build_server_config(input: &AddServerInput) -> serde_json::Value {
+    match &input.transport {
+        ServerTransport::Url(url) => serde_json::json!({
+            "type": input.server_type,
+            "url": url,
+        }),
+        ServerTransport::Command { command, args } => serde_json::json!({
+            "type": input.server_type,
+            "command": command,
+            "args": args,
+        }),
+    }
 }
 
 fn add_server_to_platforms(
