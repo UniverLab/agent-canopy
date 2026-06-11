@@ -1442,3 +1442,57 @@ fn seed_multiple_sessions_for_same_seed() {
     assert!(db.resolve_session_seed("session-2").unwrap().is_some());
     assert!(db.resolve_session_seed("session-3").unwrap().is_some());
 }
+
+#[test]
+fn registering_project_creates_intelligence_root_node() {
+    let db = test_db();
+    let dir_a = tempdir().expect("tempdir a");
+    let dir_b = tempdir().expect("tempdir b");
+
+    let a = db.register_project_path(dir_a.path()).expect("register a");
+    let b = db.register_project_path(dir_b.path()).expect("register b");
+
+    let projects = db
+        .list_intelligence_projects(None, 10)
+        .expect("list project nodes");
+    assert_eq!(projects.len(), 2, "each registered project gets a root node");
+
+    let edge = db
+        .link_projects(&a.hash, &b.hash, "relates_to", None)
+        .expect("link via hashes resolves the auto-created nodes");
+    assert_eq!(edge.relation, "relates_to");
+
+    let graph = db
+        .walk_intelligence_graph(&format!("project:{}", a.hash), 2)
+        .expect("walk")
+        .expect("root exists");
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .any(|n| n.id == format!("project:{}", b.hash)),
+        "linked project is reachable from the root"
+    );
+}
+
+#[test]
+fn backfill_recreates_missing_project_nodes() {
+    let db = test_db();
+    let dir = tempdir().expect("tempdir");
+    let project = db.register_project_path(dir.path()).expect("register");
+
+    let node_id = format!("project:{}", project.hash);
+    db.delete_intelligence_node(&node_id)
+        .expect("simulate legacy db without project nodes");
+    assert!(db
+        .list_intelligence_projects(None, 10)
+        .expect("list")
+        .is_empty());
+
+    let created = db.backfill_project_nodes().expect("backfill");
+    assert_eq!(created, 1);
+    assert_eq!(
+        db.list_intelligence_projects(None, 10).expect("list").len(),
+        1
+    );
+}

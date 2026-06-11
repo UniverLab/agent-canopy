@@ -21,6 +21,9 @@ impl Database {
             conn: Arc::new(Mutex::new(conn)),
         };
         db.init()?;
+        if let Err(e) = db.backfill_project_nodes() {
+            tracing::warn!("Could not backfill project intelligence nodes: {e}");
+        }
         Ok(db)
     }
 

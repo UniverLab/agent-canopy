@@ -393,6 +393,45 @@ impl Database {
 
     // ── Intelligence V2: Project-Linked Knowledge ──
 
+    /// Upsert the intelligence root node (`kind='project'`) for a registered
+    /// project. Idempotent: node id is derived from the project hash.
+    pub fn ensure_project_node(
+        &self,
+        project: &crate::domain::project::Project,
+    ) -> Result<IntelligenceNodeRecord> {
+        self.upsert_intelligence_node(IntelligenceNodeInput {
+            id: Some(format!("project:{}", project.hash)),
+            kind: "project".to_string(),
+            title: project.name.clone(),
+            body: project
+                .description
+                .clone()
+                .unwrap_or_else(|| project.path.clone()),
+            metadata: Some(serde_json::json!({
+                "source": "registry",
+                "path": project.path,
+            })),
+            project_hash: Some(project.hash.clone()),
+            session_id: None,
+            relations: None,
+        })
+    }
+
+    /// Create missing `kind='project'` root nodes for already-registered
+    /// projects. Runs at database open so graphs created before this code
+    /// existed become linkable.
+    pub fn backfill_project_nodes(&self) -> Result<usize> {
+        let projects = self.list_projects()?;
+        let mut created = 0;
+        for project in &projects {
+            if self.find_project_node(&project.hash)?.is_none() {
+                self.ensure_project_node(project)?;
+                created += 1;
+            }
+        }
+        Ok(created)
+    }
+
     /// List all indexed project nodes for the project picker.
     pub fn list_intelligence_projects(
         &self,

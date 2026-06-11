@@ -35,29 +35,36 @@ impl Database {
     // ── projects ───────────────────────────────────────────────────────
 
     pub fn upsert_project(&self, p: &Project) -> Result<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-        conn.execute(
-            "INSERT INTO projects (hash, path, name, description, tags, indexed_at, created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7)
-             ON CONFLICT(hash) DO UPDATE SET
-               path=excluded.path,
-               name=excluded.name,
-               description=COALESCE(description, excluded.description),
-               tags=COALESCE(tags, excluded.tags),
-               indexed_at=COALESCE(projects.indexed_at, excluded.indexed_at)",
-            rusqlite::params![
-                p.hash,
-                p.path,
-                p.name,
-                p.description,
-                p.tags,
-                p.indexed_at,
-                p.created_at
-            ],
-        )?;
+        {
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+            conn.execute(
+                "INSERT INTO projects (hash, path, name, description, tags, indexed_at, created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)
+                 ON CONFLICT(hash) DO UPDATE SET
+                   path=excluded.path,
+                   name=excluded.name,
+                   description=COALESCE(description, excluded.description),
+                   tags=COALESCE(tags, excluded.tags),
+                   indexed_at=COALESCE(projects.indexed_at, excluded.indexed_at)",
+                rusqlite::params![
+                    p.hash,
+                    p.path,
+                    p.name,
+                    p.description,
+                    p.tags,
+                    p.indexed_at,
+                    p.created_at
+                ],
+            )?;
+        }
+
+        // Keep the intelligence graph root in sync: every registered project
+        // must exist as a kind='project' node or link_projects and the TUI
+        // relation picker have nothing to operate on.
+        self.ensure_project_node(p)?;
         Ok(())
     }
 
