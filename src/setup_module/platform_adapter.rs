@@ -95,23 +95,58 @@ fn rename_mapped_fields(
 
 // ── Validation & resolution ─────────────────────────────────────────────────
 
-fn infer_server_type_index(config: &JsonMap) -> Option<usize> {
-    if config.contains_key("url") {
-        return Some(0);
-    }
-    if config.contains_key("command") {
-        return Some(1);
-    }
-    None
+/// Transport kind inferred from the server config shape.
+#[derive(Clone, Copy, PartialEq)]
+enum ServerKind {
+    /// Remote server reached over HTTP/SSE (`url` field present).
+    Url,
+    /// Local subprocess spoken to over stdio (`command` field present).
+    Command,
+    Unknown,
 }
 
+fn infer_server_kind(config: &JsonMap) -> ServerKind {
+    if config.contains_key("url") {
+        return ServerKind::Url;
+    }
+    if config.contains_key("command") {
+        return ServerKind::Command;
+    }
+    ServerKind::Unknown
+}
+
+/// Type names platforms use for url-based servers, in preference order.
+const URL_TYPE_VALUES: &[&str] = &["http", "sse", "remote", "streamable-http", "url"];
+/// Type names platforms use for command-based servers, in preference order.
+/// "local" is preferred when listed because platforms that use it (e.g.
+/// copilot) name their stdio transport that way; "stdio" is the generic name.
+const COMMAND_TYPE_VALUES: &[&str] = &["local", "stdio", "command"];
+
+fn pick_allowed_value<'a>(allowed: &'a [String], candidates: &[&str]) -> Option<&'a str> {
+    candidates
+        .iter()
+        .find_map(|candidate| allowed.iter().find(|v| v == candidate))
+        .map(String::as_str)
+}
+
+/// Resolve the value to write for a platform-required field.
+///
+/// The registry lists *allowed values* per field (e.g. `type = ["stdio",
+/// "http"]`). The value is chosen by matching the server's transport kind
+/// against known type names — never by list position, since registry authors
+/// order these lists inconsistently. Returns `None` to leave the field as-is.
 fn resolve_required_field_value(
     allowed: &[String],
-    type_idx: Option<usize>,
+    kind: ServerKind,
     field_exists: bool,
 ) -> Option<&str> {
-    if let Some(idx) = type_idx {
-        return allowed.get(idx).map(String::as_str);
+    let semantic = match kind {
+        ServerKind::Url => pick_allowed_value(allowed, URL_TYPE_VALUES),
+        ServerKind::Command => pick_allowed_value(allowed, COMMAND_TYPE_VALUES),
+        ServerKind::Unknown => None,
+    };
+    if semantic.is_some() {
+        return semantic;
     }
     if field_exists {
         return None;
@@ -137,10 +172,9 @@ fn apply_required_fields(
     adapted: &mut JsonMap,
     required_fields: &std::collections::HashMap<String, Vec<String>>,
 ) {
-    let type_idx = infer_server_type_index(adapted);
+    let kind = infer_server_kind(adapted);
     for (field, allowed) in required_fields {
-        let Some(value) =
-            resolve_required_field_value(allowed, type_idx, adapted.contains_key(field))
+        let Some(value) = resolve_required_field_value(allowed, kind, adapted.contains_key(field))
         else {
             continue;
         };
@@ -590,6 +624,83 @@ mod tests {
                 "type": "custom"
             })
         );
+    }
+
+    #[test]
+    fn adapt_config_resolves_type_semantically_regardless_of_list_order() {
+        // Regression: registry claude.toml lists `type = ["stdio", "http"]`.
+        // The old positional logic picked index 1 ("http") for command-based
+        // servers, producing invalid Claude configs missing a `url`.
+        let mut platform = test_platform();
+        platform.required_fields.insert(
+            "type".to_string(),
+            vec!["stdio".to_string(), "http".to_string()],
+        );
+
+        let stdio = adapt_config(
+            &serde_json::json!({"command": "uvx", "args": ["mcp-server-fetch"]}),
+            &platform,
+            "fetch",
+        );
+        assert_eq!(stdio.get("type"), Some(&serde_json::json!("stdio")));
+
+        let http = adapt_config(
+            &serde_json::json!({"url": "https://example.com/mcp"}),
+            &platform,
+            "remote-server",
+        );
+        assert_eq!(http.get("type"), Some(&serde_json::json!("http")));
+    }
+
+    #[test]
+    fn adapt_config_prefers_local_when_platform_lists_it() {
+        let mut platform = test_platform();
+        platform.required_fields.insert(
+            "type".to_string(),
+            vec!["stdio".to_string(), "local".to_string()],
+        );
+
+        let adapted = adapt_config(
+            &serde_json::json!({"command": "canopy", "args": ["bridge"]}),
+            &platform,
+            "canopy",
+        );
+        assert_eq!(adapted.get("type"), Some(&serde_json::json!("local")));
+    }
+
+    #[test]
+    fn adapt_config_repairs_wrong_existing_type() {
+        // A previously mis-written entry (`type: "http"` with `command`)
+        // must be corrected on the next sync/setup pass.
+        let mut platform = test_platform();
+        platform.required_fields.insert(
+            "type".to_string(),
+            vec!["stdio".to_string(), "http".to_string()],
+        );
+
+        let adapted = adapt_config(
+            &serde_json::json!({"command": "uvx", "args": ["x"], "type": "http"}),
+            &platform,
+            "fetch",
+        );
+        assert_eq!(adapted.get("type"), Some(&serde_json::json!("stdio")));
+    }
+
+    #[test]
+    fn adapt_config_keeps_existing_type_without_semantic_match() {
+        // Url-based server on a platform that only knows command types:
+        // never overwrite an existing value with a known-wrong one.
+        let mut platform = test_platform();
+        platform
+            .required_fields
+            .insert("type".to_string(), vec!["stdio".to_string()]);
+
+        let adapted = adapt_config(
+            &serde_json::json!({"url": "https://example.com/mcp", "type": "sse"}),
+            &platform,
+            "remote-server",
+        );
+        assert_eq!(adapted.get("type"), Some(&serde_json::json!("sse")));
     }
 
     #[test]

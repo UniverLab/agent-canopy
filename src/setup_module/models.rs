@@ -41,7 +41,9 @@ pub struct Platform {
     #[serde(default)]
     pub fields_mapping: std::collections::HashMap<String, String>,
     /// Fields that are required by this platform, with their allowed values.
-    /// e.g. `{"type": ["http", "remote"]}`.
+    /// e.g. `{"type": ["stdio", "http"]}`. Order is irrelevant: the value is
+    /// chosen by matching the server's transport (url vs command) against
+    /// known type names — see `platform_adapter::resolve_required_field_value`.
     #[serde(default)]
     pub required_fields: std::collections::HashMap<String, Vec<String>>,
     /// Per-server extra fields merged into the adapted config.
