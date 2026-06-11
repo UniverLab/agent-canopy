@@ -730,6 +730,11 @@ fn write_prompt_to_selected_agent(app: &mut App, prompt: &str) {
         return;
     };
 
+    // Register the prompt in the session history so context transfer can
+    // pair it with the agent's response — builder prompts are the main
+    // conversation driver, not just direct typing.
+    agent.record_prompt(prompt);
+
     let pasted = format!("\x1b[200~{prompt}\x1b[201~");
     let _ = agent.write_to_pty(pasted.as_bytes());
     let _ = agent.write_to_pty(b"\r");

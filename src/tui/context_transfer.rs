@@ -197,7 +197,7 @@ fn append_interactive_prompt_context(out: &mut String, agent: &InteractiveAgent,
 
     let total_depth = agent.total_depth();
     for (idx, entry) in prompts.iter().enumerate() {
-        out.push_str(&format!("> {}\n", entry.input));
+        push_prompt_block(out, &entry.input);
 
         let is_last_prompt = idx + 1 == prompts.len();
         let response_end = response_end_line(entry, is_last_prompt, total_depth);
@@ -236,6 +236,19 @@ fn append_line_context(out: &mut String, agent: &InteractiveAgent, n_units: usiz
     out.push_str(&history);
     if !history.ends_with('\n') {
         out.push('\n');
+    }
+}
+
+/// Append a prompt with every line `> `-prefixed so multi-line prompts
+/// (e.g. from the prompt builder) stay visually separated from responses.
+fn push_prompt_block(out: &mut String, input: &str) {
+    for line in input.lines() {
+        out.push_str("> ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    if input.is_empty() {
+        out.push_str(">\n");
     }
 }
 
@@ -387,6 +400,13 @@ mod tests {
         assert_eq!(prompts.len(), 2);
         assert_eq!(prompts[0].input, "two");
         assert_eq!(prompts[1].input, "three");
+    }
+
+    #[test]
+    fn push_prompt_block_prefixes_every_line() {
+        let mut out = String::new();
+        super::push_prompt_block(&mut out, "# [INSTRUCTIONS]\nfix the bug\nrun tests");
+        assert_eq!(out, "> # [INSTRUCTIONS]\n> fix the bug\n> run tests\n");
     }
 
     #[test]
