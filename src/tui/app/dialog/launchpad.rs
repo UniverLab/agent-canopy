@@ -141,7 +141,8 @@ impl LaunchpadDialog {
     }
 
     pub fn selected_mission(&self) -> Option<&LaunchpadContext> {
-        self.recent_missions.get(self.selected_index.checked_sub(1)?)
+        self.recent_missions
+            .get(self.selected_index.checked_sub(1)?)
     }
 
     pub fn choice(&self) -> LaunchpadChoice {

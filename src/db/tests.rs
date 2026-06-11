@@ -1455,7 +1455,11 @@ fn registering_project_creates_intelligence_root_node() {
     let projects = db
         .list_intelligence_projects(None, 10)
         .expect("list project nodes");
-    assert_eq!(projects.len(), 2, "each registered project gets a root node");
+    assert_eq!(
+        projects.len(),
+        2,
+        "each registered project gets a root node"
+    );
 
     let edge = db
         .link_projects(&a.hash, &b.hash, "relates_to", None)
