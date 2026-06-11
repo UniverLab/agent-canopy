@@ -45,14 +45,18 @@ pub fn chunk(content: &str, lang: &str) -> Vec<(usize, String)> {
     }
 }
 
-/// Chunk `content` using structural chunking followed by similarity-aware merges.
+/// Chunk `content` semantically: structural units (markdown sections or
+/// paragraphs) merged while adjacent units stay lexically cohesive.
+///
+/// Plain text deliberately uses per-paragraph units instead of the windowed
+/// packer (`chunk_paragraph_texts`): packing first would erase the natural
+/// boundaries the similarity merge needs to operate on.
 pub fn chunk_semantic(content: &str, lang: &str, threshold: f32) -> Vec<SemanticChunk> {
     let chunks = match lang {
-        "markdown" => chunk_markdown_texts(content),
-        _ => chunk_paragraph_texts(content),
+        "markdown" => annotate_similarity(coalesce_small_chunks(chunk_markdown_texts(content))),
+        _ => chunk_paragraphs(content),
     };
-    let chunks = coalesce_small_chunks(chunks);
-    merge_low_similarity_chunks(annotate_similarity(chunks), threshold)
+    merge_similar_chunks(chunks, threshold)
 }
 
 /// Compute cosine similarity using normalized term frequencies.
@@ -86,11 +90,15 @@ pub fn cosine_similarity(text1: &str, text2: &str) -> f32 {
     }
 }
 
-/// Merge adjacent chunks whose similarity metadata falls below `threshold`.
-pub fn merge_low_similarity_chunks(
-    chunks: Vec<SemanticChunk>,
-    threshold: f32,
-) -> Vec<SemanticChunk> {
+/// Merge adjacent chunks that are lexically cohesive — similarity at or above
+/// `threshold` — so each chunk covers one topic and boundaries land where the
+/// vocabulary shifts (TextTiling-style). Merged chunks never grow past the
+/// structural window size, keeping retrieval granularity bounded.
+///
+/// Threshold guidance (measured on real markdown docs): adjacent same-topic
+/// sections score ~0.2–0.5 on term-frequency cosine; unrelated ones ~0.0–0.15.
+pub fn merge_similar_chunks(chunks: Vec<SemanticChunk>, threshold: f32) -> Vec<SemanticChunk> {
+    let max_len = MAX_CHUNK_TOKENS * CHARS_PER_TOKEN;
     let mut iter = chunks.into_iter();
     let Some(first) = iter.next() else {
         return Vec::new();
@@ -100,12 +108,15 @@ pub fn merge_low_similarity_chunks(
     let mut merged_texts = vec![first.content];
 
     for chunk in iter {
-        let should_merge = chunk.similarity_to_prev.unwrap_or(1.0) < threshold;
-        if should_merge {
-            if let Some(current) = merged_texts.last_mut() {
-                current.push_str("\n\n");
-                current.push_str(&chunk.content);
-            }
+        let is_similar = chunk.similarity_to_prev.unwrap_or(0.0) >= threshold;
+        let current = merged_texts
+            .last_mut()
+            .expect("merged_texts starts non-empty");
+        let fits = current.len() + 2 + chunk.content.len() <= max_len;
+
+        if is_similar && fits {
+            current.push_str("\n\n");
+            current.push_str(&chunk.content);
         } else {
             merged_texts.push(chunk.content);
         }
@@ -144,16 +155,17 @@ fn chunk_markdown_texts(content: &str) -> Vec<String> {
 ///
 /// Each paragraph becomes its own chunk so similarity can be evaluated across
 /// natural boundaries. Oversized paragraphs are still split with the same
-/// window/overlap constraints used by structural chunking.
+/// window/overlap constraints used by structural chunking; undersized
+/// fragments coalesce into their neighbor.
 fn chunk_paragraphs(content: &str) -> Vec<SemanticChunk> {
-    let chunks = content
+    let units = content
         .split("\n\n")
         .map(str::trim)
         .filter(|paragraph| !paragraph.is_empty())
         .flat_map(split_paragraph)
         .collect();
 
-    annotate_similarity(chunks)
+    annotate_similarity(coalesce_small_chunks(units))
 }
 
 fn chunk_paragraph_texts(content: &str) -> Vec<String> {
@@ -413,25 +425,56 @@ mod tests {
     }
 
     #[test]
-    fn chunk_semantic_merges_chunks_below_threshold() {
+    fn chunk_semantic_merges_similar_neighbors_and_splits_at_topic_shifts() {
+        // Sections One and Two share vocabulary (same topic); Three is disjoint.
         let content = "# One\n\nalpha beta gamma\n\n## Two\n\nalpha beta delta\n\n## Three\n\nomega sigma tau";
         let chunks = chunk_semantic(content, "markdown", 0.2);
 
         assert_eq!(chunks.len(), 2);
         assert!(chunks[0].content.contains("# One"));
-        assert!(chunks[1].content.contains("## Two"));
+        assert!(chunks[0].content.contains("## Two"));
         assert!(chunks[1].content.contains("## Three"));
         assert!(chunks[1].similarity_to_prev.is_some());
     }
 
     #[test]
-    fn chunk_semantic_preserves_similarity_metadata_after_merging() {
+    fn chunk_semantic_keeps_dissimilar_chunks_separate() {
+        // Cosine between these paragraphs is 0.4 (2 shared of 5 terms each),
+        // below a 0.5 threshold — they must stay separate chunks.
         let content = "alpha beta gamma delta epsilon\n\ndelta epsilon zeta theta iota";
         let chunks = chunk_semantic(content, "text", 0.5);
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].similarity_to_prev, None);
+        assert!(chunks[1].similarity_to_prev.is_some());
+    }
+
+    #[test]
+    fn chunk_semantic_merges_when_similarity_meets_threshold() {
+        let content = "alpha beta gamma delta epsilon\n\ndelta epsilon zeta theta iota";
+        let chunks = chunk_semantic(content, "text", 0.3);
 
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].similarity_to_prev, None);
         assert!(chunks[0].content.contains("delta epsilon zeta"));
+    }
+
+    #[test]
+    fn merge_similar_chunks_respects_window_size_cap() {
+        // Identical content (similarity 1.0) would always merge, but the
+        // combined size must never exceed the structural window.
+        let big = "alpha beta gamma ".repeat(80); // ~1.3 KB each
+        let texts: Vec<String> = (0..4).map(|_| big.trim().to_string()).collect();
+        let chunks = merge_similar_chunks(annotate_similarity(texts), 0.2);
+
+        let window = 512 * 4;
+        assert!(
+            chunks.len() > 1,
+            "size cap must prevent a single mega-chunk"
+        );
+        for chunk in &chunks {
+            assert!(chunk.content.len() <= window);
+        }
     }
 
     #[test]

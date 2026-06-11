@@ -29,7 +29,10 @@ pub struct CanopyConfig {
     #[serde(default)]
     pub embeddings_model: String,
 
-    /// Similarity threshold for semantic chunk merging (0.0 - 1.0).
+    /// Lexical-cohesion threshold for semantic chunk merging (0.0 - 1.0).
+    /// Adjacent chunks with term-frequency cosine similarity at or above this
+    /// value are merged. Measured on real docs: same-topic neighbors score
+    /// ~0.2-0.5, unrelated ones ~0.0-0.15 — hence the 0.25 default.
     #[serde(default = "default_similarity_threshold")]
     pub similarity_threshold: f32,
 
@@ -64,7 +67,7 @@ fn default_mcp_root() -> String {
 }
 
 fn default_similarity_threshold() -> f32 {
-    0.4
+    0.25
 }
 
 fn default_projects_root() -> String {
@@ -151,7 +154,7 @@ mod tests {
         assert!(config.clis.is_empty());
         assert_eq!(config.temperature_unit, TemperatureUnit::Celsius);
         assert_eq!(config.embeddings_model, "");
-        assert_eq!(config.similarity_threshold, 0.4);
+        assert_eq!(config.similarity_threshold, 0.25);
     }
 
     #[test]

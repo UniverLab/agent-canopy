@@ -486,7 +486,12 @@ mod tests {
         let embedder = MockEmbeddingClient::new(4);
         let content = "# Alpha\n\nalpha beta gamma\n\n## Beta\n\ndelta epsilon zeta";
 
-        for semantic_chunk in chunk_semantic(content, "markdown", 0.4) {
+        // Dissimilar sections stay separate under semantic chunking.
+        let semantic_chunks = chunk_semantic(content, "markdown", 0.4);
+        assert_eq!(semantic_chunks.len(), 2);
+        let first_content = semantic_chunks[0].content.clone();
+
+        for semantic_chunk in semantic_chunks {
             let embedding = embedder.embed(&semantic_chunk.content).unwrap();
             let chunk = VectorChunk {
                 id: format!("chunk-{}", semantic_chunk.index),
@@ -498,11 +503,14 @@ mod tests {
             store.insert_chunk(&chunk).await.unwrap();
         }
 
-        let query = embedder.embed("alpha beta gamma").unwrap();
+        // Querying with a stored chunk's exact text must return that chunk
+        // (identical embedding → distance 0). The mock embedder hashes by
+        // token position, so anything looser would test luck, not the store.
+        let query = embedder.embed(&first_content).unwrap();
         let results = store.search_similar(&query, 1).await.unwrap();
 
         assert_eq!(results.len(), 1);
-        assert!(results[0].content.contains("Alpha"));
+        assert_eq!(results[0].content, first_content);
         assert_eq!(results[0].file_path, "/docs/guide.md");
     }
 
