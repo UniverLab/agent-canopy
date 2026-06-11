@@ -21,8 +21,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use crate::application::ports::StateRepository;
 use crate::db::Database;
 use crate::shared::sync_identity::{
-    CANOPY_AGENT_ID_ENV, CANOPY_AGENT_ID_HEADER, CANOPY_CLIENT_NAME_ENV,
-    CANOPY_CLIENT_NAME_HEADER, CANOPY_SEED_ID_ENV, CANOPY_SEED_ID_HEADER, CANOPY_WORKDIR_ENV,
+    CANOPY_AGENT_ID_ENV, CANOPY_AGENT_ID_HEADER, CANOPY_CLIENT_NAME_ENV, CANOPY_CLIENT_NAME_HEADER,
+    CANOPY_SEED_ID_ENV, CANOPY_SEED_ID_HEADER, CANOPY_WORKDIR_ENV,
 };
 
 const MCP_SESSION_HEADER: &str = "mcp-session-id";
@@ -373,7 +373,10 @@ mod tests {
     fn parse_sse_extracts_single_data_event() {
         let body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n";
         let messages = parse_sse_messages(body);
-        assert_eq!(messages, vec!["{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}"]);
+        assert_eq!(
+            messages,
+            vec!["{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}"]
+        );
     }
 
     #[test]
