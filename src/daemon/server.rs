@@ -185,6 +185,10 @@ pub(crate) async fn run_stdio_server() -> Result<()> {
 }
 
 /// Scan the personal RAG root for existing files, enqueue them, and start the watcher.
+/// Version of the chunking algorithm; bump to force a full re-index.
+/// v2: merge lexically similar neighbors (size-capped) instead of dissimilar ones.
+const RAG_CHUNKING_VERSION: &str = "v2";
+
 async fn startup_personal_rag(ingestion: Arc<IngestionManager>, data_dir: &std::path::Path) {
     let config = crate::domain::canopy_config::CanopyConfig::load(data_dir);
     let personal_roots: Vec<std::path::PathBuf> = config
@@ -235,6 +239,36 @@ async fn startup_personal_rag(ingestion: Arc<IngestionManager>, data_dir: &std::
         }
 
         let _ = ingestion.db().set_state("rag_last_model", &current_model);
+    }
+
+    // ── Chunking-algorithm change detection ─────────────────────────────────
+    // Bump RAG_CHUNKING_VERSION whenever chunk boundaries change (e.g. the
+    // v2 switch from merge-dissimilar to merge-similar semantics). Existing
+    // chunks were produced by the old algorithm, so wipe and re-index.
+    let last_chunking = ingestion
+        .db()
+        .get_state("rag_chunking_version")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if last_chunking != RAG_CHUNKING_VERSION {
+        tracing::warn!(
+            "startup_personal_rag: chunking algorithm changed '{}' → '{}' \
+             — wiping vector store and clearing queue for full re-index",
+            if last_chunking.is_empty() {
+                "v1"
+            } else {
+                &last_chunking
+            },
+            RAG_CHUNKING_VERSION
+        );
+        if let Err(e) = crate::rag::ingestion::wipe_lancedb(ingestion.db()).await {
+            tracing::error!("startup_personal_rag: LanceDB wipe failed: {e:#}");
+        }
+        ingestion.clear_queue().await;
+        let _ = ingestion
+            .db()
+            .set_state("rag_chunking_version", RAG_CHUNKING_VERSION);
     }
 
     // Reload any items already in the DB queue from a previous session.
