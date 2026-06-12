@@ -1,5 +1,10 @@
-use super::{AgentEntry, App, Focus};
+use super::types::{AgentEntry, App, Focus};
 use crate::tui::agent::{AgentStatus, InteractiveAgent};
+use crate::tui::terminal_history::save_history;
+use std::time::Duration;
+
+const SHADOW_SUMMARY_LINGER_SECS: u64 = 7;
+const SHADOW_SUMMARY_INSTRUCTION: &str = "Session terminated by user. Before exit, call intelligence_upsert with kind='session' and persist a concise summary including: mission outcome, key decisions, pending follow-ups, and any reusable facts/patterns.";
 
 /// Strip ANSI escape sequences from a string for plain-text display.
 fn strip_ansi_codes(s: &str) -> String {
@@ -39,6 +44,44 @@ fn recent_output_snippet(agent: &InteractiveAgent, n: usize) -> String {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SessionTarget {
+    Interactive(usize),
+    Terminal(usize),
+}
+
+fn reverse_sorted_indices(mut indices: Vec<usize>) -> Vec<usize> {
+    indices.sort_unstable();
+    indices.reverse();
+    indices
+}
+
+fn poll_agents(agents: &mut [InteractiveAgent]) {
+    for agent in agents {
+        agent.poll();
+    }
+}
+
+fn remove_session_name(sessions: &mut Vec<InteractiveAgent>, idx: usize) -> Option<String> {
+    let agent_name = sessions.get(idx).map(|agent| agent.name.clone())?;
+
+    sessions.remove(idx);
+    Some(agent_name)
+}
+
+fn log_terminal_exit(name: &str, shell: &str, code: i32, output_snippet: &str) {
+    tracing::warn!(
+        "Terminal '{}' ({}) exited with code {code}.{}",
+        name,
+        shell,
+        if output_snippet.is_empty() {
+            ""
+        } else {
+            output_snippet
+        }
+    );
+}
+
 impl App {
     pub fn notify_mouse_move(&mut self) {
         if let Some(ref mut brain) = self.home_brain {
@@ -49,88 +92,70 @@ impl App {
         }
     }
 
-    pub fn tick_banner_glitch(&mut self) {
-        // Always step the brain if it exists so animation continues
-        // across focus changes (e.g. closing all sessions → Preview).
+    /// Update atmosphere mouse context (call from event loop on MouseMove).
+    pub fn notify_atmosphere_mouse(&mut self, col: u16, row: u16) {
+        let (prev_col, prev_row) = self.atmosphere_last_mouse;
+        let delta_col = col as i16 - prev_col as i16;
+        let delta_row = row as i16 - prev_row as i16;
+        self.atmosphere_ctx.mouse_col = col;
+        self.atmosphere_ctx.mouse_row = row;
+        self.atmosphere_ctx.mouse_delta_col = delta_col;
+        self.atmosphere_ctx.mouse_delta_row = delta_row;
+        self.atmosphere_last_mouse = (col, row);
+        self.atmosphere.notify_mouse(col, row, delta_col, delta_row);
+    }
+
+    /// Advance the atmosphere engine one tick (called from App::refresh).
+    pub(super) fn tick_atmosphere(&mut self) {
+        use chrono::Timelike;
+        self.atmosphere_ctx.hour = chrono::Local::now().hour() as u8;
+        let scroll_active = self.last_scroll_at.elapsed().as_secs_f32() < 1.0;
+        self.atmosphere_ctx.scroll_velocity = if scroll_active { 0.8 } else { 0.0 };
+        self.atmosphere_ctx.typing_speed = if self.animation_tick.is_multiple_of(3) {
+            0.1
+        } else {
+            0.0
+        };
+
+        if self.atmosphere_ctx.firefly_caught {
+            self.queue_mission_event(crate::tui::gamification::MissionEvent::FireflyCaught);
+            self.atmosphere_ctx.firefly_caught = false;
+        }
+        self.atmosphere_ctx.mouse_clicked = false;
+    }
+
+    pub fn tick_banner_animation(&mut self) {
         if let Some(ref mut brain) = self.home_brain {
             brain.step();
         }
 
-        // Only resize/reinitialize when on Home focus
         if self.focus != Focus::Home {
             return;
         }
 
-        let (pw, ph) = self.last_panel_inner;
-        let panel_cols = pw as usize;
-        let panel_rows = ph as usize;
+        let (cols, rows) = effective_brain_dims(self.last_panel_inner);
+        if cols < 6 || rows < 3 {
+            return;
+        }
 
-        if panel_cols < 6 || panel_rows < 3 {
-            let (tw, th) = ratatui::crossterm::terminal::size().unwrap_or((120, 40));
-            let fallback_cols = (tw / 2).saturating_sub(2) as usize;
-            let fallback_rows = th.saturating_sub(3) as usize;
-            if fallback_cols < 6 || fallback_rows < 3 {
-                return;
-            }
-            let needs_reinit = match &self.home_brain {
-                None => true,
-                Some(b) => b.rows != fallback_rows || b.cols != fallback_cols,
-            };
-            if needs_reinit {
-                let mut brain =
-                    super::super::brians_brain::BriansBrain::new(fallback_rows, fallback_cols, 80);
-                brain.last_step = std::time::Instant::now()
-                    - std::time::Duration::from_millis(brain.step_interval_ms);
-                self.home_brain = Some(brain);
-            }
-        } else {
-            let needs_reinit = match &self.home_brain {
-                None => true,
-                Some(b) => b.rows != panel_rows || b.cols != panel_cols,
-            };
-            if needs_reinit {
-                let mut brain =
-                    super::super::brians_brain::BriansBrain::new(panel_rows, panel_cols, 80);
-                brain.last_step = std::time::Instant::now()
-                    - std::time::Duration::from_millis(brain.step_interval_ms);
-                self.home_brain = Some(brain);
-            }
+        if brain_needs_reinit(&self.home_brain, rows, cols) {
+            self.home_brain = Some(make_brain(rows, cols, 80));
         }
     }
 
     pub fn ensure_sidebar_brain(&mut self) {
-        // The exact sidebar brain dimensions depend on layout (agent card count, etc.)
-        // so we compute them the same way sidebar.rs does.
         let (_tw, th) = ratatui::crossterm::terminal::size().unwrap_or((120, 40));
-        let sidebar_w = 29u16;
-        let sidebar_h = th.saturating_sub(2); // minus header + footer
-
-        // Approximate: inner width = sidebar - 2 borders
-        let inner_w = sidebar_w.saturating_sub(2) as usize;
-        // Dashboard takes 6 rows if sidebar is tall enough
+        let sidebar_h = th.saturating_sub(2);
+        let cols = (30u16.saturating_sub(2)) as usize;
         let dashboard_h = if sidebar_h >= 6 { 6 } else { 0 };
-        let content_h = sidebar_h.saturating_sub(dashboard_h) as usize;
-
-        // The brain gets whatever space is left after agent cards.
-        // We can't know the exact amount without rendering, so use the full
-        // content height as a max bound. The sidebar clips to brain_area anyway.
-        let rows = content_h;
-        let cols = inner_w;
+        let rows = sidebar_h.saturating_sub(dashboard_h) as usize;
 
         if cols < 6 || rows < 3 {
             return;
         }
 
-        let needs_reinit = match &self.sidebar_brain {
-            None => true,
-            Some(b) => b.rows != rows || b.cols != cols,
-        };
-        if needs_reinit {
-            let mut brain = super::super::brians_brain::BriansBrain::new(rows, cols, 60);
-            // Allow immediate first step
-            brain.last_step = std::time::Instant::now()
-                - std::time::Duration::from_millis(brain.step_interval_ms);
-            self.sidebar_brain = Some(brain);
+        if brain_needs_reinit(&self.sidebar_brain, rows, cols) {
+            self.sidebar_brain = Some(make_brain(rows, cols, 60));
         }
 
         if let Some(ref mut brain) = self.sidebar_brain {
@@ -150,85 +175,399 @@ impl App {
         }
     }
 
-    pub fn next_interactive(&mut self) {
-        let focusable: Vec<usize> = self
-            .agents
+    fn focusable_agent_indices(&self) -> Vec<usize> {
+        self.agents
             .iter()
             .enumerate()
-            .filter(|(_, a)| {
+            .filter(|(_, entry)| {
                 matches!(
-                    a,
+                    entry,
                     AgentEntry::Interactive(_) | AgentEntry::Terminal(_) | AgentEntry::Group(_)
                 )
             })
-            .map(|(i, _)| i)
-            .collect();
+            .map(|(idx, _)| idx)
+            .collect()
+    }
 
+    fn move_interactive_selection(&mut self, forward: bool) {
+        let focusable = self.focusable_agent_indices();
         if focusable.is_empty() {
             return;
         }
 
         let current_pos = focusable
             .iter()
-            .position(|&i| i == self.selected)
+            .position(|&idx| idx == self.selected)
             .unwrap_or(0);
 
-        let next_pos = (current_pos + 1) % focusable.len();
+        let next_pos = if forward {
+            (current_pos + 1) % focusable.len()
+        } else {
+            current_pos.checked_sub(1).unwrap_or(focusable.len() - 1)
+        };
+
         self.selected = focusable[next_pos];
         self.focus = Focus::Agent;
         self.activate_selected_entry();
     }
 
-    pub fn prev_interactive(&mut self) {
-        let focusable: Vec<usize> = self
-            .agents
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| {
-                matches!(
-                    a,
-                    AgentEntry::Interactive(_) | AgentEntry::Terminal(_) | AgentEntry::Group(_)
-                )
-            })
-            .map(|(i, _)| i)
-            .collect();
+    fn activate_split_group(&mut self, idx: usize) {
+        let Some(group) = self.split_groups.get(idx) else {
+            self.active_split_id = None;
+            return;
+        };
 
-        if focusable.is_empty() {
+        self.active_split_id = Some(group.id.clone());
+        self.split_right_focused = false;
+    }
+
+    fn activate_interactive_session(&mut self, idx: usize) {
+        self.active_split_id = None;
+
+        let Some(agent) = self.interactive_agents.get(idx) else {
+            return;
+        };
+
+        agent.mark_viewed();
+    }
+
+    fn activate_terminal_session(&mut self, idx: usize) {
+        self.active_split_id = None;
+
+        let Some(agent) = self.terminal_agents.get(idx) else {
+            return;
+        };
+
+        agent.mark_viewed();
+    }
+
+    fn active_split_sessions(&self) -> Option<(String, String)> {
+        let split_id = self.active_split_id.as_ref()?;
+        let group = self
+            .split_groups
+            .iter()
+            .find(|group| group.id == *split_id)?;
+
+        Some((group.session_a.clone(), group.session_b.clone()))
+    }
+
+    fn selected_session_target(&self) -> Option<SessionTarget> {
+        let selected = self.selected_agent()?;
+        match selected {
+            AgentEntry::Interactive(idx) => Some(SessionTarget::Interactive(*idx)),
+            AgentEntry::Terminal(idx) => Some(SessionTarget::Terminal(*idx)),
+            _ => None,
+        }
+    }
+
+    fn session_target_by_name(&self, name: &str) -> Option<SessionTarget> {
+        if let Some(idx) = self
+            .interactive_agents
+            .iter()
+            .position(|agent| agent.name == name)
+        {
+            return Some(SessionTarget::Interactive(idx));
+        }
+
+        let idx = self
+            .terminal_agents
+            .iter()
+            .position(|agent| agent.name == name)?;
+        Some(SessionTarget::Terminal(idx))
+    }
+
+    fn close_session_target(&mut self, target: SessionTarget, exit_code: i32) -> bool {
+        match target {
+            SessionTarget::Interactive(idx) => self.close_interactive_session_at(idx, exit_code),
+            SessionTarget::Terminal(idx) => self.close_terminal_session_at(idx),
+        }
+    }
+
+    fn remove_session_target(&mut self, target: SessionTarget) -> bool {
+        match target {
+            SessionTarget::Interactive(idx) => self.remove_interactive_session_entry(idx),
+            SessionTarget::Terminal(idx) => self.remove_terminal_session_entry(idx),
+        }
+    }
+
+    fn delete_group_at(&mut self, idx: usize) -> bool {
+        let Some(group_id) = self.split_groups.get(idx).map(|group| group.id.clone()) else {
+            return false;
+        };
+
+        self.delete_group_by_id(&group_id)
+    }
+
+    fn delete_group_by_id(&mut self, id: &str) -> bool {
+        if !self.split_groups.iter().any(|group| group.id == id) {
+            return false;
+        }
+
+        let _ = self.db.delete_group(id);
+        self.split_groups.retain(|group| group.id != id);
+        if self.active_split_id.as_deref() == Some(id) {
+            self.active_split_id = None;
+        }
+        true
+    }
+
+    fn mark_selected_terminal_viewed(&mut self) {
+        if !matches!(self.focus, Focus::Agent | Focus::Preview) {
             return;
         }
 
-        let current_pos = focusable
-            .iter()
-            .position(|&i| i == self.selected)
-            .unwrap_or(0);
-
-        let prev_pos = if current_pos == 0 {
-            focusable.len() - 1
-        } else {
-            current_pos - 1
+        let Some(AgentEntry::Terminal(idx)) = self.agents.get(self.selected) else {
+            return;
         };
-        self.selected = focusable[prev_pos];
-        self.focus = Focus::Agent;
-        self.activate_selected_entry();
+        let Some(agent) = self.terminal_agents.get(*idx) else {
+            return;
+        };
+
+        agent.mark_viewed();
+    }
+
+    fn mark_selected_interactive_viewed(&mut self) {
+        if !matches!(self.focus, Focus::Agent | Focus::Preview) {
+            return;
+        }
+
+        let Some(AgentEntry::Interactive(idx)) = self.agents.get(self.selected) else {
+            return;
+        };
+        let Some(agent) = self.interactive_agents.get(*idx) else {
+            return;
+        };
+
+        agent.mark_viewed();
+    }
+
+    fn exited_terminal_indices(&self) -> Vec<usize> {
+        self.terminal_agents
+            .iter()
+            .enumerate()
+            .filter(|(_, agent)| matches!(agent.status, AgentStatus::Exited(_)))
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    fn handle_terminal_exit(&mut self, idx: usize) {
+        let Some(agent) = self.terminal_agents.get(idx) else {
+            return;
+        };
+        if agent.exit_notified {
+            return;
+        }
+
+        let AgentStatus::Exited(code) = agent.status else {
+            return;
+        };
+
+        let agent_id = agent.id.clone();
+        let agent_name = agent.name.clone();
+        let shell = agent.shell.clone();
+        let output_snippet = recent_output_snippet(agent, 5);
+
+        let _ = self.db.finish_terminal_session(&agent_id);
+        if code != 0 {
+            log_terminal_exit(&agent_name, &shell, code, &output_snippet);
+        }
+
+        let Some(agent) = self.terminal_agents.get_mut(idx) else {
+            return;
+        };
+        agent.exit_notified = true;
+    }
+
+    fn exited_interactive_indices(&self) -> Vec<usize> {
+        self.interactive_agents
+            .iter()
+            .enumerate()
+            .filter(|(_, agent)| matches!(agent.status, AgentStatus::Exited(_)))
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    fn notify_failed_interactive_exit(
+        &mut self,
+        agent_id: &str,
+        cli: &str,
+        code: i32,
+        output_snippet: &str,
+    ) {
+        tracing::warn!(
+            "Agent '{agent_id}' ({cli}) exited with code {code}.{}",
+            if output_snippet.is_empty() {
+                ""
+            } else {
+                output_snippet
+            }
+        );
+
+        self.whimsg
+            .notify_event(crate::tui::whimsg::WhimContext::AgentFailed);
+        if !self.notifications_enabled {
+            return;
+        }
+
+        let output = output_snippet.trim_start_matches('\n').to_string();
+        self.notification_service
+            .notify_agent_failed(agent_id, cli, code, &output);
+    }
+
+    fn handle_interactive_exit(&mut self, idx: usize) {
+        let Some(agent) = self.interactive_agents.get(idx) else {
+            return;
+        };
+        if agent.exit_notified {
+            return;
+        }
+
+        let AgentStatus::Exited(code) = agent.status else {
+            return;
+        };
+
+        let agent_id = agent.id.clone();
+        let agent_name = agent.name.clone();
+        let working_dir = agent.working_dir.clone();
+        let cli = agent.cli.as_str().to_string();
+        let output_snippet = recent_output_snippet(agent, 5);
+
+        // Finalize nursery if this was a seed creation session
+        if let Some(ref nursery_path_ref) = self.nursery_path {
+            // Clone the path to avoid borrow conflict when we clear self.nursery_path
+            let nursery_path = nursery_path_ref.clone();
+            if nursery_path.to_string_lossy() == working_dir && code == 0 {
+                match crate::domain::nursery::finalize_nursery(&nursery_path) {
+                    Ok(seed_id) => {
+                        // Bind the session to the new seed
+                        let _ = self.db.bind_session_to_seed(&agent_id, &seed_id);
+                        self.queue_mission_event(
+                            crate::tui::gamification::MissionEvent::FirstSeedCreated,
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!("Nursery finalization failed: {e}");
+                        self.notification_service.notify_nursery_failed(&e);
+                    }
+                }
+            } else if code != 0 {
+                // Clean up temp dir on error exit
+                let _ = std::fs::remove_dir_all(&nursery_path);
+            }
+            // Remove nursery session record from DB — it should not persist as a normal session
+            let _ = self.db.remove_interactive_session(&agent_id);
+            // Also remove the nursery project entry if it was registered
+            let _ = self.db.unregister_project_path(&nursery_path);
+            // Clear nursery state — do this after all uses of nursery_path
+            self.nursery_path = None;
+        } else {
+            let _ = self.db.finish_interactive_session(&agent_id, code);
+        }
+        let _ = self
+            .db
+            .close_agent_missions(&agent_id, &agent_name, &working_dir);
+        if code != 0 {
+            self.notify_failed_interactive_exit(&agent_id, &cli, code, &output_snippet);
+        } else if self.session_args_contain_yolo(&agent_id, &cli) {
+            self.queue_mission_event(crate::tui::gamification::MissionEvent::YoloTaskCompleted);
+        }
+
+        let Some(agent) = self.interactive_agents.get_mut(idx) else {
+            return;
+        };
+        agent.exit_notified = true;
+    }
+
+    fn successful_interactive_exit_indices(&self) -> Vec<usize> {
+        self.interactive_agents
+            .iter()
+            .enumerate()
+            .filter(|(_, agent)| matches!(agent.status, AgentStatus::Exited(0)))
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    fn remove_terminal_sessions(&mut self, indices: Vec<usize>) {
+        for idx in reverse_sorted_indices(indices) {
+            let _ = self.remove_session_target(SessionTarget::Terminal(idx));
+        }
+    }
+
+    fn remove_interactive_sessions(&mut self, indices: Vec<usize>) {
+        for idx in reverse_sorted_indices(indices) {
+            let _ = self.remove_session_target(SessionTarget::Interactive(idx));
+        }
+    }
+
+    fn terminate_active_split_session(&mut self) -> bool {
+        let Some(split_id) = self.active_split_id.clone() else {
+            return false;
+        };
+        let Some(target) = self
+            .split_groups
+            .iter()
+            .find(|group| group.id == split_id)
+            .map(|group| {
+                if self.split_right_focused {
+                    group.session_b.clone()
+                } else {
+                    group.session_a.clone()
+                }
+            })
+        else {
+            return false;
+        };
+
+        self.kill_session_by_name(&target);
+        self.delete_group_by_id(&split_id)
+    }
+
+    fn terminate_selected_session(&mut self) -> bool {
+        let Some(target) = self.selected_session_target() else {
+            return false;
+        };
+
+        self.close_session_target(target, 0)
+    }
+
+    fn sync_selection_after_session_mutation(&mut self) {
+        if self.agents.is_empty() {
+            self.selected = 0;
+            return;
+        }
+
+        if self.selected >= self.agents.len() {
+            self.selected = self.agents.len() - 1;
+        }
+    }
+
+    fn reset_focus_after_session_mutation(&mut self) {
+        if self.focus == Focus::Agent
+            || matches!(self.focus, Focus::ContextTransfer | Focus::RagTransfer)
+        {
+            self.focus = Focus::Preview;
+        }
+    }
+
+    pub fn next_interactive(&mut self) {
+        self.move_interactive_selection(true);
+    }
+
+    pub fn prev_interactive(&mut self) {
+        self.move_interactive_selection(false);
     }
 
     /// Activate split or clear it based on the currently selected entry.
     fn activate_selected_entry(&mut self) {
-        match &self.agents[self.selected] {
-            AgentEntry::Group(idx) => {
-                if let Some(group) = self.split_groups.get(*idx) {
-                    self.active_split_id = Some(group.id.clone());
-                    self.split_right_focused = false;
-                }
-            }
-            AgentEntry::Interactive(idx) => {
-                self.active_split_id = None;
-                self.interactive_agents[*idx].mark_viewed();
-            }
-            AgentEntry::Terminal(idx) => {
-                self.active_split_id = None;
-                self.terminal_agents[*idx].mark_viewed();
-            }
+        let Some(entry) = self.agents.get(self.selected) else {
+            self.active_split_id = None;
+            return;
+        };
+
+        match entry {
+            AgentEntry::Group(idx) => self.activate_split_group(*idx),
+            AgentEntry::Interactive(idx) => self.activate_interactive_session(*idx),
+            AgentEntry::Terminal(idx) => self.activate_terminal_session(*idx),
             _ => {
                 self.active_split_id = None;
             }
@@ -243,13 +582,7 @@ impl App {
 
         // In split mode, only resize the two sessions participating in the split.
         // Other sessions keep their last size to avoid unnecessary resize churn.
-        let split_sessions: Option<(String, String)> =
-            self.active_split_id.as_ref().and_then(|id| {
-                self.split_groups
-                    .iter()
-                    .find(|g| g.id == *id)
-                    .map(|g| (g.session_a.clone(), g.session_b.clone()))
-            });
+        let split_sessions = self.active_split_sessions();
 
         for agent in &mut self.interactive_agents {
             let dominated = split_sessions
@@ -283,150 +616,36 @@ impl App {
 
     /// Poll terminal agent processes for exit status.
     pub(super) fn poll_terminal_agents(&mut self) {
-        if matches!(self.focus, Focus::Agent | Focus::Preview) {
-            if let Some(AgentEntry::Terminal(idx)) = self.agents.get(self.selected) {
-                self.terminal_agents[*idx].mark_viewed();
-            }
-        }
+        self.mark_selected_terminal_viewed();
+        poll_agents(&mut self.terminal_agents);
 
-        for agent in &mut self.terminal_agents {
-            agent.poll();
-        }
-
-        let exited_indices: Vec<usize> = self
-            .terminal_agents
-            .iter()
-            .enumerate()
-            .filter(|(_, agent)| matches!(agent.status, AgentStatus::Exited(_)))
-            .map(|(idx, _)| idx)
-            .collect();
+        let exited_indices = self.exited_terminal_indices();
         if exited_indices.is_empty() {
             return;
         }
 
         for &idx in &exited_indices {
-            let agent = &self.terminal_agents[idx];
-            if agent.exit_notified {
-                continue;
-            }
-
-            let AgentStatus::Exited(code) = agent.status else {
-                continue;
-            };
-            let _ = self.db.finish_terminal_session(&agent.id);
-
-            if code != 0 {
-                let output_snippet = recent_output_snippet(agent, 5);
-                tracing::warn!(
-                    "Terminal '{}' ({}) exited with code {code}.{}",
-                    agent.name,
-                    agent.shell,
-                    if output_snippet.is_empty() {
-                        ""
-                    } else {
-                        &output_snippet
-                    }
-                );
-            }
-
-            self.terminal_agents[idx].exit_notified = true;
+            self.handle_terminal_exit(idx);
         }
-
-        let mut removed = exited_indices;
-        removed.sort_unstable();
-        removed.reverse();
-        for idx in removed {
-            let _ = self.remove_terminal_session_entry(idx);
-        }
+        self.remove_terminal_sessions(exited_indices);
         self.finish_session_mutation();
     }
 
     pub(super) fn poll_interactive_agents(&mut self) {
-        if let Some(AgentEntry::Interactive(idx)) = self.agents.get(self.selected) {
-            if matches!(self.focus, Focus::Agent | Focus::Preview) {
-                self.interactive_agents[*idx].mark_viewed();
-            }
+        self.mark_selected_interactive_viewed();
+        poll_agents(&mut self.interactive_agents);
+
+        let exited_indices = self.exited_interactive_indices();
+        for &idx in &exited_indices {
+            self.handle_interactive_exit(idx);
         }
 
-        for agent in &mut self.interactive_agents {
-            agent.poll();
-        }
-
-        // Collect indices that just exited (any code) for notification handling.
-        let newly_exited: Vec<usize> = self
-            .interactive_agents
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| matches!(a.status, AgentStatus::Exited(_)))
-            .map(|(i, _)| i)
-            .collect();
-
-        // Send notifications / record DB finish for all newly-exited agents.
-        // Track which ones we already notified to avoid repeats on next poll.
-        for &idx in &newly_exited {
-            let agent = &self.interactive_agents[idx];
-            if agent.exit_notified {
-                continue;
-            }
-            let status = agent.status;
-            let agent_id = agent.id.clone();
-            match status {
-                AgentStatus::Exited(0) => {
-                    let _ = self.db.finish_interactive_session(&agent_id, 0);
-                }
-                AgentStatus::Exited(code) => {
-                    let _ = self.db.finish_interactive_session(&agent_id, code);
-                    let output_snippet = recent_output_snippet(&self.interactive_agents[idx], 5);
-                    tracing::warn!(
-                        "Agent '{agent_id}' ({}) exited with code {code}.{}",
-                        self.interactive_agents[idx].cli.as_str(),
-                        if output_snippet.is_empty() {
-                            ""
-                        } else {
-                            &output_snippet
-                        }
-                    );
-                    self.whimsg
-                        .notify_event(crate::tui::whimsg::WhimContext::AgentFailed);
-                    if self.notifications_enabled {
-                        let output = if output_snippet.is_empty() {
-                            String::new()
-                        } else {
-                            output_snippet.trim_start_matches('\n').to_string()
-                        };
-                        self.notification_service.notify_agent_failed(
-                            &agent_id,
-                            self.interactive_agents[idx].cli.as_str(),
-                            code,
-                            &output,
-                        );
-                    }
-                }
-                _ => {}
-            }
-            self.interactive_agents[idx].exit_notified = true;
-        }
-
-        // Only auto-remove agents that exited SUCCESSFULLY (code 0).
-        // Failed agents stay in the list so the user can inspect output.
-        let removed_indices: Vec<usize> = self
-            .interactive_agents
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| matches!(a.status, AgentStatus::Exited(0)))
-            .map(|(i, _)| i)
-            .collect();
-
+        let removed_indices = self.successful_interactive_exit_indices();
         if removed_indices.is_empty() {
             return;
         }
 
-        let mut sorted = removed_indices;
-        sorted.sort_unstable();
-        sorted.reverse();
-        for idx in sorted {
-            let _ = self.remove_interactive_session_entry(idx);
-        }
+        self.remove_interactive_sessions(removed_indices);
         self.finish_session_mutation();
     }
 
@@ -458,36 +677,32 @@ impl App {
     }
 
     pub fn delete_selected(&mut self) -> anyhow::Result<()> {
-        let Some(agent) = self.agents.get(self.selected) else {
+        let Some(selected) = self.selected_agent() else {
             return Ok(());
         };
-        match agent {
-            AgentEntry::Agent(a) => {
+
+        match selected {
+            AgentEntry::Agent(agent) => {
                 use crate::application::ports::AgentRepository;
-                self.db.delete_agent(&a.id)?;
+                self.db.delete_agent(&agent.id)?;
+            }
+            AgentEntry::Group(idx) => {
+                if !self.delete_group_at(*idx) {
+                    return Ok(());
+                }
             }
             AgentEntry::Interactive(idx) => {
-                if !self.close_interactive_session_at(*idx, 0) {
+                if !self.close_session_target(SessionTarget::Interactive(*idx), 0) {
                     return Ok(());
                 }
             }
             AgentEntry::Terminal(idx) => {
-                if !self.close_terminal_session_at(*idx) {
+                if !self.close_session_target(SessionTarget::Terminal(*idx), 0) {
                     return Ok(());
                 }
             }
-            AgentEntry::Group(idx) => {
-                let idx = *idx;
-                if idx < self.split_groups.len() {
-                    let id = self.split_groups[idx].id.clone();
-                    let _ = self.db.delete_group(&id);
-                    self.split_groups.remove(idx);
-                    if self.active_split_id.as_deref() == Some(&id) {
-                        self.active_split_id = None;
-                    }
-                }
-            }
         }
+
         self.finish_session_mutation();
         Ok(())
     }
@@ -497,18 +712,13 @@ impl App {
         let ids_to_dissolve: Vec<String> = self
             .split_groups
             .iter()
-            .filter(|g| g.session_a == session_name || g.session_b == session_name)
-            .map(|g| g.id.clone())
+            .filter(|group| group.session_a == session_name || group.session_b == session_name)
+            .map(|group| group.id.clone())
             .collect();
 
-        for id in &ids_to_dissolve {
-            let _ = self.db.delete_group(id);
-            if self.active_split_id.as_deref() == Some(id.as_str()) {
-                self.active_split_id = None;
-            }
+        for id in ids_to_dissolve {
+            let _ = self.delete_group_by_id(&id);
         }
-        self.split_groups
-            .retain(|g| !ids_to_dissolve.contains(&g.id));
     }
 
     pub fn cleanup(&mut self) {
@@ -527,33 +737,13 @@ impl App {
     /// - Single agent/terminal: kill it and remove.
     /// - Active split group: kill both sessions and dissolve the group.
     pub fn terminate_focused_session(&mut self) {
-        if let Some(ref split_id) = self.active_split_id.clone() {
-            // Split mode — kill the focused panel's session, dissolve the group
-            let group = self.split_groups.iter().find(|g| g.id == *split_id);
-            let Some(group) = group else { return };
-            let target = if self.split_right_focused {
-                group.session_b.clone()
-            } else {
-                group.session_a.clone()
-            };
-            self.kill_session_by_name(&target);
-
-            // Dissolve the group
-            let _ = self.db.delete_group(split_id);
-            self.split_groups.retain(|g| g.id != *split_id);
-            self.active_split_id = None;
+        let terminated = if self.active_split_id.is_some() {
+            self.terminate_active_split_session()
         } else {
-            // Single session — kill the selected agent
-            let selection = match self.selected_agent() {
-                Some(AgentEntry::Interactive(idx)) => Some(("interactive", *idx)),
-                Some(AgentEntry::Terminal(idx)) => Some(("terminal", *idx)),
-                _ => None,
-            };
-            match selection {
-                Some(("interactive", idx)) if self.close_interactive_session_at(idx, 0) => {}
-                Some(("terminal", idx)) if self.close_terminal_session_at(idx) => {}
-                _ => return,
-            }
+            self.terminate_selected_session()
+        };
+        if !terminated {
+            return;
         }
 
         self.finish_session_mutation();
@@ -561,64 +751,105 @@ impl App {
 
     /// Kill and remove a session by name (interactive or terminal).
     fn kill_session_by_name(&mut self, name: &str) {
-        if let Some(idx) = self.interactive_agents.iter().position(|a| a.name == name) {
-            let _ = self.close_interactive_session_at(idx, 0);
-        } else if let Some(idx) = self.terminal_agents.iter().position(|a| a.name == name) {
-            let _ = self.close_terminal_session_at(idx);
-        }
+        let Some(target) = self.session_target_by_name(name) else {
+            return;
+        };
+
+        let _ = self.close_session_target(target, 0);
     }
 
     fn finish_session_mutation(&mut self) {
         let _ = self.refresh_agents();
-        if self.selected >= self.agents.len() && !self.agents.is_empty() {
-            self.selected = self.agents.len() - 1;
-        }
-        if self.focus == Focus::Agent || matches!(self.focus, Focus::ContextTransfer) {
-            self.focus = Focus::Preview;
-        }
+        self.sync_selection_after_session_mutation();
+        self.reset_focus_after_session_mutation();
     }
 
     fn close_interactive_session_at(&mut self, idx: usize, exit_code: i32) -> bool {
+        let Some(agent_id) = self
+            .interactive_agents
+            .get(idx)
+            .map(|agent| agent.id.clone())
+        else {
+            return false;
+        };
+
+        let _ = self.db.finish_interactive_session(&agent_id, exit_code);
         let Some(agent) = self.interactive_agents.get(idx) else {
             return false;
         };
-
-        let agent_id = agent.id.clone();
-        let _ = self.db.finish_interactive_session(&agent_id, exit_code);
-        self.interactive_agents[idx].kill();
-        self.remove_interactive_session_entry(idx)
+        agent.schedule_shadow_shutdown(
+            SHADOW_SUMMARY_INSTRUCTION,
+            Duration::from_secs(SHADOW_SUMMARY_LINGER_SECS),
+        );
+        self.remove_session_target(SessionTarget::Interactive(idx))
     }
 
     fn close_terminal_session_at(&mut self, idx: usize) -> bool {
-        let Some(agent) = self.terminal_agents.get(idx) else {
+        let Some(agent_id) = self.terminal_agents.get(idx).map(|agent| agent.id.clone()) else {
             return false;
         };
 
-        let agent_id = agent.id.clone();
         let _ = self.db.finish_terminal_session(&agent_id);
-        self.terminal_agents[idx].kill();
-        self.remove_terminal_session_entry(idx)
+        let Some(agent) = self.terminal_agents.get_mut(idx) else {
+            return false;
+        };
+
+        let scrollback = agent.last_lines(2000);
+        if let Some(hist) = self.terminal_histories.get_mut(&agent.name) {
+            let lines: Vec<String> = scrollback.lines().map(|s| s.to_string()).collect();
+            hist.update_scrollback(&lines);
+            save_history(&self.data_dir, &agent.name, hist);
+        }
+        agent.kill();
+        self.remove_session_target(SessionTarget::Terminal(idx))
     }
 
     fn remove_interactive_session_entry(&mut self, idx: usize) -> bool {
-        if idx >= self.interactive_agents.len() {
+        let Some(agent_name) = remove_session_name(&mut self.interactive_agents, idx) else {
             return false;
-        }
+        };
 
-        let agent_name = self.interactive_agents[idx].name.clone();
-        self.interactive_agents.remove(idx);
         self.dissolve_groups_for_session(&agent_name);
         true
     }
 
     fn remove_terminal_session_entry(&mut self, idx: usize) -> bool {
-        if idx >= self.terminal_agents.len() {
+        let Some(agent_name) = remove_session_name(&mut self.terminal_agents, idx) else {
             return false;
-        }
+        };
 
-        let agent_name = self.terminal_agents[idx].name.clone();
-        self.terminal_agents.remove(idx);
         self.dissolve_groups_for_session(&agent_name);
         true
     }
+}
+
+// ── Brain helpers ─────────────────────────────────────────────────
+
+fn make_brain(rows: usize, cols: usize, density: u64) -> super::super::brians_brain::BriansBrain {
+    let mut brain = super::super::brians_brain::BriansBrain::new(rows, cols, density);
+    brain.last_step =
+        std::time::Instant::now() - std::time::Duration::from_millis(brain.step_interval_ms);
+    brain
+}
+
+fn brain_needs_reinit(
+    brain: &Option<super::super::brians_brain::BriansBrain>,
+    rows: usize,
+    cols: usize,
+) -> bool {
+    brain
+        .as_ref()
+        .is_none_or(|b| b.rows != rows || b.cols != cols)
+}
+
+/// Resolve effective brain dimensions from panel size, falling back to terminal size.
+fn effective_brain_dims(panel: (u16, u16)) -> (usize, usize) {
+    let (pw, ph) = panel;
+    if pw >= 6 && ph >= 3 {
+        return (pw as usize, ph as usize);
+    }
+    let (tw, th) = ratatui::crossterm::terminal::size().unwrap_or((120, 40));
+    let cols = (tw / 2).saturating_sub(2) as usize;
+    let rows = th.saturating_sub(3) as usize;
+    (cols, rows)
 }

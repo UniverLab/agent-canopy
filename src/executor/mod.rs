@@ -39,6 +39,15 @@ struct CliRunResult {
     success: bool,
 }
 
+/// Context for a single agent execution (file path + event for watch triggers).
+struct ExecutionContext<'a> {
+    file_path: Option<&'a str>,
+    event_type: Option<&'a str>,
+    trigger_type: TriggerType,
+    /// True when this execution was triggered by a file-watch event.
+    is_watch: bool,
+}
+
 /// Agent execution engine.
 pub struct Executor {
     db: Arc<Database>,
@@ -71,6 +80,160 @@ impl Executor {
         let _ = self.db.update_agent_last_run(agent_id, false);
     }
 
+    /// Check if the agent is locked by an active run. Records a missed run and returns
+    /// `Some(-1)` if locked, `None` if free to proceed.
+    fn check_lock(&self, agent: &Agent, trigger_type: TriggerType) -> Result<Option<i32>> {
+        let Ok(Some(active)) = self.db.get_active_run(&agent.id) else {
+            return Ok(None);
+        };
+        tracing::info!(
+            "Agent '{}' is locked (run {}), recording as missed",
+            agent.id,
+            active.id
+        );
+        let missed = RunLog {
+            id: uuid::Uuid::new_v4().to_string(),
+            background_agent_id: agent.id.clone(),
+            status: RunStatus::Missed,
+            trigger_type,
+            summary: Some(format!("Skipped: agent locked by run {}", active.id)),
+            started_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            exit_code: None,
+            timeout_at: None,
+        };
+        let _ = self.db.insert_run(&missed);
+        Ok(Some(-1))
+    }
+
+    /// Create a pending run record and return its ID.
+    fn create_run(&self, agent: &Agent, trigger_type: TriggerType) -> Result<String> {
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now();
+        let timeout_at = now + chrono::Duration::minutes(i64::from(agent.timeout_minutes));
+        let run = RunLog {
+            id: run_id.clone(),
+            background_agent_id: agent.id.clone(),
+            status: RunStatus::Pending,
+            trigger_type,
+            summary: None,
+            started_at: now,
+            finished_at: None,
+            exit_code: None,
+            timeout_at: Some(timeout_at),
+        };
+        self.db.insert_run(&run)?;
+        Ok(run_id)
+    }
+
+    /// Finalize a run: update status, exit code, trigger count, and last_run.
+    fn finalize_run(
+        &self,
+        agent: &Agent,
+        run_id: &str,
+        result: &CliRunResult,
+        update_trigger_count: bool,
+    ) {
+        if let Ok(Some(run)) = self.db.get_run(run_id) {
+            if run.status.is_active() {
+                let status = if result.success {
+                    RunStatus::Success
+                } else {
+                    RunStatus::Error
+                };
+                let _ = self.db.update_run_status(
+                    run_id,
+                    status,
+                    Some(&format!(
+                        "Auto-closed: process exited with code {}",
+                        result.exit_code
+                    )),
+                );
+            }
+        }
+        let _ = self.db.update_run_exit_code(run_id, result.exit_code);
+
+        if let Err(e) = self.db.update_agent_last_run(&agent.id, result.success) {
+            tracing::error!("Failed to update last_run for agent '{}': {}", agent.id, e);
+        }
+
+        if update_trigger_count {
+            if let Err(e) = self.db.update_agent_triggered(&agent.id) {
+                tracing::error!(
+                    "Failed to update trigger count for agent '{}': {}",
+                    agent.id,
+                    e
+                );
+            }
+        }
+    }
+
+    /// Send success/failure notification if the agent still exists.
+    fn notify_result(&self, agent: &Agent, result: &CliRunResult, is_watch: bool) {
+        let agent_still_exists = self.db.get_agent(&agent.id).ok().flatten().is_some();
+        if !agent_still_exists {
+            return;
+        }
+        if result.success {
+            self.notification_service.notify_task_completed(
+                &agent.id,
+                true,
+                Some(result.exit_code),
+            );
+        } else if is_watch {
+            self.notification_service.notify_agent_failed(
+                &agent.id,
+                agent.cli.as_str(),
+                result.exit_code,
+                &format!("Watcher agent failed with exit code {}", result.exit_code),
+            );
+        } else {
+            self.notification_service.notify_task_failed(
+                &agent.id,
+                result.exit_code,
+                &format!("Agent failed with exit code {}", result.exit_code),
+            );
+        }
+    }
+
+    /// Core execution logic shared by all trigger types.
+    async fn run_agent(&self, agent: &Agent, ctx: ExecutionContext<'_>) -> Result<i32> {
+        self.resolve_timeout(&agent.id);
+
+        if let Some(code) = self.check_lock(agent, ctx.trigger_type)? {
+            return Ok(code);
+        }
+
+        let run_id = self.create_run(agent, ctx.trigger_type)?;
+
+        let user_prompt = substitute_variables(
+            &agent.prompt,
+            &agent.id,
+            &agent.log_path,
+            ctx.file_path,
+            ctx.event_type,
+        );
+        let wrapped = wrap_prompt(&user_prompt, &agent.id, &run_id);
+
+        let params = CliRunParams {
+            id: &agent.id,
+            cli: &agent.cli,
+            prompt: wrapped,
+            model: agent.model.as_deref(),
+            working_dir: agent.working_dir.as_deref(),
+            log_path: agent.log_path.clone(),
+            trigger: ctx.trigger_type,
+        };
+
+        let result = self.run_cli_process(&params).await?;
+
+        let is_watch = ctx.is_watch || agent.is_watch();
+        self.finalize_run(agent, &run_id, &result, is_watch);
+        self.notify_result(agent, &result, ctx.is_watch);
+
+        Ok(result.exit_code)
+    }
+
     /// Execute a unified agent.
     ///
     /// When `force` is true (manual runs), expiry and enabled checks are skipped.
@@ -88,133 +251,28 @@ impl Executor {
                 self.db.update_agent_enabled(&agent.id, false)?;
                 return Ok(-1);
             }
-
             if !agent.enabled {
                 tracing::info!("Agent '{}' is disabled, skipping", agent.id);
                 return Ok(-1);
             }
         }
 
-        self.resolve_timeout(&agent.id);
-        if let Ok(Some(active)) = self.db.get_active_run(&agent.id) {
-            tracing::info!(
-                "Agent '{}' is locked (run {}), recording as missed",
-                agent.id,
-                active.id
-            );
-            let missed = RunLog {
-                id: uuid::Uuid::new_v4().to_string(),
-                background_agent_id: agent.id.clone(),
-                status: RunStatus::Missed,
-                trigger_type,
-                summary: Some(format!("Skipped: agent locked by run {}", active.id)),
-                started_at: Utc::now(),
-                finished_at: Some(Utc::now()),
-                exit_code: None,
-                timeout_at: None,
-            };
-            let _ = self.db.insert_run(&missed);
-            return Ok(-1);
-        }
-
-        let run_id = uuid::Uuid::new_v4().to_string();
-        let now = Utc::now();
-        let timeout_at = now + chrono::Duration::minutes(i64::from(agent.timeout_minutes));
-
-        let run = RunLog {
-            id: run_id.clone(),
-            background_agent_id: agent.id.clone(),
-            status: RunStatus::Pending,
-            trigger_type,
-            summary: None,
-            started_at: now,
-            finished_at: None,
-            exit_code: None,
-            timeout_at: Some(timeout_at),
-        };
-        self.db.insert_run(&run)?;
-
-        let file_path = match &agent.trigger {
-            Some(Trigger::Watch { .. }) => Some("manual".to_string()),
-            _ => None,
-        };
-        let event_type = match &agent.trigger {
-            Some(Trigger::Watch { .. }) => Some("manual"),
-            _ => None,
-        };
-
-        let user_prompt = substitute_variables(
-            &agent.prompt,
-            &agent.id,
-            &agent.log_path,
-            file_path.as_deref(),
-            event_type,
-        );
-        let wrapped = wrap_prompt(&user_prompt, &agent.id, &run_id);
-
-        let params = CliRunParams {
-            id: &agent.id,
-            cli: &agent.cli,
-            prompt: wrapped,
-            model: agent.model.as_deref(),
-            working_dir: agent.working_dir.as_deref(),
-            log_path: agent.log_path.clone(),
-            trigger: trigger_type,
-        };
-
-        let result = self.run_cli_process(&params).await?;
-
-        if let Ok(Some(run)) = self.db.get_run(&run_id) {
-            if run.status.is_active() {
-                let status = if result.success {
-                    RunStatus::Success
-                } else {
-                    RunStatus::Error
-                };
-                let _ = self.db.update_run_status(
-                    &run_id,
-                    status,
-                    Some(&format!(
-                        "Auto-closed: process exited with code {}",
-                        result.exit_code
-                    )),
-                );
-            }
-        }
-        let _ = self.db.update_run_exit_code(&run_id, result.exit_code);
-
-        if let Err(e) = self.db.update_agent_last_run(&agent.id, result.success) {
-            tracing::error!("Failed to update last_run for agent '{}': {}", agent.id, e);
-        }
-
-        if agent.is_watch() {
-            if let Err(e) = self.db.update_agent_triggered(&agent.id) {
-                tracing::error!(
-                    "Failed to update trigger count for agent '{}': {}",
-                    agent.id,
-                    e
-                );
-            }
-        }
-
-        let agent_still_exists = self.db.get_agent(&agent.id).ok().flatten().is_some();
-        if agent_still_exists {
-            if result.success {
-                self.notification_service.notify_task_completed(
-                    &agent.id,
-                    true,
-                    Some(result.exit_code),
-                );
+        let ctx = ExecutionContext {
+            file_path: if agent.is_watch() {
+                Some("manual")
             } else {
-                self.notification_service.notify_task_failed(
-                    &agent.id,
-                    result.exit_code,
-                    &format!("Agent failed with exit code {}", result.exit_code),
-                );
-            }
-        }
+                None
+            },
+            event_type: if agent.is_watch() {
+                Some("manual")
+            } else {
+                None
+            },
+            trigger_type,
+            is_watch: false,
+        };
 
-        Ok(result.exit_code)
+        self.run_agent(agent, ctx).await
     }
 
     /// Execute a watcher-triggered agent with specific file path and event info.
@@ -228,112 +286,14 @@ impl Executor {
             return Ok(-1);
         }
 
-        self.resolve_timeout(&agent.id);
-        if let Ok(Some(active)) = self.db.get_active_run(&agent.id) {
-            tracing::info!(
-                "Agent '{}' is locked (run {}), recording as missed",
-                agent.id,
-                active.id
-            );
-            let missed = RunLog {
-                id: uuid::Uuid::new_v4().to_string(),
-                background_agent_id: agent.id.clone(),
-                status: RunStatus::Missed,
-                trigger_type: TriggerType::Watch,
-                summary: Some(format!("Skipped: locked by run {}", active.id)),
-                started_at: Utc::now(),
-                finished_at: Some(Utc::now()),
-                exit_code: None,
-                timeout_at: None,
-            };
-            let _ = self.db.insert_run(&missed);
-            return Ok(-1);
-        }
-
-        let run_id = uuid::Uuid::new_v4().to_string();
-        let now = Utc::now();
-        let timeout_at = now + chrono::Duration::minutes(i64::from(agent.timeout_minutes));
-
-        let run = RunLog {
-            id: run_id.clone(),
-            background_agent_id: agent.id.clone(),
-            status: RunStatus::Pending,
+        let ctx = ExecutionContext {
+            file_path: Some(file_path),
+            event_type: Some(event_type),
             trigger_type: TriggerType::Watch,
-            summary: None,
-            started_at: now,
-            finished_at: None,
-            exit_code: None,
-            timeout_at: Some(timeout_at),
-        };
-        self.db.insert_run(&run)?;
-
-        let user_prompt = substitute_variables(
-            &agent.prompt,
-            &agent.id,
-            &agent.log_path,
-            Some(file_path),
-            Some(event_type),
-        );
-        let wrapped = wrap_prompt(&user_prompt, &agent.id, &run_id);
-
-        let params = CliRunParams {
-            id: &agent.id,
-            cli: &agent.cli,
-            prompt: wrapped,
-            model: agent.model.as_deref(),
-            working_dir: agent.working_dir.as_deref(),
-            log_path: agent.log_path.clone(),
-            trigger: TriggerType::Watch,
+            is_watch: true,
         };
 
-        let result = self.run_cli_process(&params).await?;
-
-        if let Ok(Some(run)) = self.db.get_run(&run_id) {
-            if run.status.is_active() {
-                let status = if result.success {
-                    RunStatus::Success
-                } else {
-                    RunStatus::Error
-                };
-                let _ = self.db.update_run_status(
-                    &run_id,
-                    status,
-                    Some(&format!(
-                        "Auto-closed: process exited with code {}",
-                        result.exit_code
-                    )),
-                );
-            }
-        }
-        let _ = self.db.update_run_exit_code(&run_id, result.exit_code);
-
-        if let Err(e) = self.db.update_agent_triggered(&agent.id) {
-            tracing::error!(
-                "Failed to update trigger count for agent '{}': {}",
-                agent.id,
-                e
-            );
-        }
-
-        let agent_still_exists = self.db.get_agent(&agent.id).ok().flatten().is_some();
-        if agent_still_exists {
-            if result.success {
-                self.notification_service.notify_task_completed(
-                    &agent.id,
-                    true,
-                    Some(result.exit_code),
-                );
-            } else {
-                self.notification_service.notify_agent_failed(
-                    &agent.id,
-                    agent.cli.as_str(),
-                    result.exit_code,
-                    &format!("Watcher agent failed with exit code {}", result.exit_code),
-                );
-            }
-        }
-
-        Ok(result.exit_code)
+        self.run_agent(agent, ctx).await
     }
 
     /// Core CLI execution: resolve binary, build command, spawn, capture output, write log.

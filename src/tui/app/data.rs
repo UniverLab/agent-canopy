@@ -2,7 +2,8 @@ use anyhow::Result;
 
 use crate::application::ports::{AgentRepository, RunRepository, StateRepository};
 
-use super::{is_process_running, relative_time, tail_lines, AgentEntry, App};
+use super::types::{AgentEntry, App};
+use super::utils::{is_local_port_open, is_process_running, relative_time, tail_lines};
 
 impl App {
     pub(super) fn refresh_daemon_status(&mut self) {
@@ -10,20 +11,33 @@ impl App {
         self.daemon_pid = std::fs::read_to_string(&pid_path)
             .ok()
             .and_then(|s| s.trim().parse().ok());
-        self.daemon_running = self.daemon_pid.map(is_process_running).unwrap_or(false);
+        let daemon_running_by_pid = self.daemon_pid.map(is_process_running).unwrap_or(false);
         self.daemon_version = self
             .db
             .get_state("version")
             .ok()
             .flatten()
             .unwrap_or_default();
+        let daemon_port = self
+            .db
+            .get_state("port")
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(7755);
+        let daemon_running_by_port = is_local_port_open(daemon_port);
+        self.daemon_running = daemon_running_by_pid || daemon_running_by_port;
     }
 
     pub(super) fn refresh_agents(&mut self) -> Result<()> {
         let agents = self.db.list_agents()?;
 
         self.agents.clear();
-        // Interactive sessions first
+        // Background agents first (they are rendered at the top of the sidebar)
+        for a in agents {
+            self.agents.push(AgentEntry::Agent(a));
+        }
+        // Interactive sessions
         for i in 0..self.interactive_agents.len() {
             self.agents.push(AgentEntry::Interactive(i));
         }
@@ -34,10 +48,6 @@ impl App {
         // Then split groups
         for i in 0..self.split_groups.len() {
             self.agents.push(AgentEntry::Group(i));
-        }
-        // Agents last
-        for a in agents {
-            self.agents.push(AgentEntry::Agent(a));
         }
 
         let total = self.agents.len();

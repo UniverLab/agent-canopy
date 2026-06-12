@@ -46,5 +46,8 @@ mod test {
 
         // Test task completed notification
         service.notify_task_completed("test-agent", true, Some(0));
+
+        // Test nursery failed notification
+        service.notify_nursery_failed("identity.toml not found");
     }
 }

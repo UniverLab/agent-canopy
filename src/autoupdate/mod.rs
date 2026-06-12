@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::Path;
 
-const GITHUB_REPO: &str = "UniverLab/agent-canopy";
+const GITHUB_REPO: &str = "UniverLab/harness-canopy";
 const CHECK_INTERVAL_SECS: u64 = 24 * 3600;
 const LAST_CHECK_FILE: &str = "last_update_check.txt";
 

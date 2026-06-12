@@ -1,12 +1,12 @@
 [package]
-name = "agent-canopy"
+name = "harness-canopy"
 version = "2.0.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.91"
 description = "A self-contained MCP server for AI agent task scheduling and file watching"
 license = "MIT"
-repository = "https://github.com/UniverLab/agent-canopy"
-homepage = "https://github.com/UniverLab/agent-canopy"
+repository = "https://github.com/UniverLab/harness-canopy"
+homepage = "https://github.com/UniverLab/harness-canopy"
 keywords = ["mcp", "scheduler", "cron", "file-watcher", "ai-agent"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "README.md"
@@ -38,7 +38,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Schema generation for MCP tools
-schemars = { version = "0.9", features = ["derive"] }
+schemars = { version = "1.2.1", features = ["derive"] }
 
 # SQLite persistence
 rusqlite = { version = "0.39", features = ["bundled"] }
@@ -63,6 +63,15 @@ dirs = "6.0"
 
 # UUID generation for execution runs
 uuid = { version = "1", features = ["v4"] }
+
+# SHA-256 for workdir_hash
+sha2 = "0.11.0"
+
+# Directory traversal for RAG ingestion
+walkdir = "2"
+
+# Regex matching for ragignore patterns
+regex = "1"
 
 # Graceful shutdown coordination
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -100,6 +109,16 @@ flate2 = "1.0"
 tar = "0.4"
 tempfile = "3.8"
 sysinfo = "0.38"
+lancedb = "0.27.2"
+arrow-array = "57.3.1"
+arrow-schema = "57.3.1"
+futures = "0.3"
+
+# PDF text extraction
+pdf-extract = "0.10.0"
+
+# Local embedding models via ONNX Runtime (no API key required)
+fastembed = "5"
 
 # Unix process management (kill, setsid)
 [target.'cfg(unix)'.dependencies]

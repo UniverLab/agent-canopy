@@ -89,7 +89,7 @@ pub fn render_system_dashboard(
             .block(
                 Block::default()
                     .title(
-                        Line::from(Span::styled(" sysinfo ", Style::default().fg(DIM)))
+                        Line::from(Span::styled(" sysInfo ", Style::default().fg(DIM)))
                             .alignment(ratatui::layout::Alignment::Right),
                     )
                     .borders(Borders::ALL)
@@ -109,20 +109,20 @@ fn create_system_dashboard_lines(
     let cpu_usage = system_info.cpu_usage_percent();
     let cpu_color = alert_color(cpu_usage, 70.0, 90.0);
 
-    // Build CPU line: usage (alert) + freq (dim) + temp (alert) + cores (dim)
+    // Build CPU line: usage (alert) + temp (alert) + freq (dim) + cores (dim)
     let mut cpu_spans = vec![
         Span::styled("cpu: ", Style::default().fg(Color::White)),
         Span::styled(format!("{cpu_usage:.0}%"), Style::default().fg(cpu_color)),
     ];
-    if let Some(freq) = format_cpu_frequency(system_info.cpu_frequency_mhz) {
-        cpu_spans.push(Span::styled(format!(" {freq}"), Style::default().fg(DIM)));
-    }
     if let Some(temp_c) = system_info.cpu_temperature_celsius() {
         let temp_str = format_temperature(temp_c, temperature_unit);
         cpu_spans.push(Span::styled(
             format!(" {temp_str}"),
             Style::default().fg(temp_alert_color(temp_c)),
         ));
+    }
+    if let Some(freq) = format_cpu_frequency(system_info.cpu_frequency_mhz) {
+        cpu_spans.push(Span::styled(format!(" {freq}"), Style::default().fg(DIM)));
     }
     if system_info.cpu_cores > 0 {
         cpu_spans.push(Span::styled(
@@ -153,32 +153,32 @@ fn create_system_dashboard_lines(
             None
         };
 
-        let mut spans = vec![Span::styled("gpu: ", Style::default().fg(Color::White))];
+        // Only show GPU line if we have at least one piece of information
+        if gpu.usage.is_some() || gpu.temperature.is_some() || vram_text.is_some() {
+            let mut spans = vec![Span::styled("gpu: ", Style::default().fg(Color::White))];
 
-        if let Some(usage) = gpu.usage {
-            spans.push(Span::styled(
-                format!("{usage:.0}%"),
-                Style::default().fg(gpu_usage_color),
-            ));
-        }
-        if let Some(temp) = gpu.temperature {
-            let sep = if gpu.usage.is_some() { " " } else { "" };
-            spans.push(Span::styled(
-                format!("{sep}{}", format_temperature(temp, temperature_unit)),
-                Style::default().fg(gpu_temp_alert_color(temp)),
-            ));
-        }
-        if let Some(ref vram) = vram_text {
-            if gpu.usage.is_some() || gpu.temperature.is_some() {
-                spans.push(Span::styled(" · ", Style::default().fg(Color::White)));
+            if let Some(usage) = gpu.usage {
+                spans.push(Span::styled(
+                    format!("{usage:.0}%"),
+                    Style::default().fg(gpu_usage_color),
+                ));
             }
-            spans.push(Span::styled(vram.to_string(), Style::default().fg(DIM)));
-        }
-        if gpu.usage.is_none() && gpu.temperature.is_none() && vram_text.is_none() {
-            spans.push(Span::styled("n/a", Style::default().fg(DIM)));
-        }
+            if let Some(temp) = gpu.temperature {
+                let sep = if gpu.usage.is_some() { " " } else { "" };
+                spans.push(Span::styled(
+                    format!("{sep}{}", format_temperature(temp, temperature_unit)),
+                    Style::default().fg(gpu_temp_alert_color(temp)),
+                ));
+            }
+            if let Some(ref vram) = vram_text {
+                if gpu.usage.is_some() || gpu.temperature.is_some() {
+                    spans.push(Span::styled(" · ", Style::default().fg(Color::White)));
+                }
+                spans.push(Span::styled(vram.to_string(), Style::default().fg(DIM)));
+            }
 
-        lines.push(Line::from(spans));
+            lines.push(Line::from(spans));
+        }
     }
 
     // Memory line
@@ -199,39 +199,32 @@ fn create_system_dashboard_lines(
         ),
     ]));
 
-    // Disk line
-    let disk_pct = if system_info.disk_total > 0 {
-        (system_info.disk_used as f32 / system_info.disk_total as f32) * 100.0
-    } else {
-        0.0
-    };
-    lines.push(Line::from(vec![
-        Span::styled("disk: ", Style::default().fg(Color::White)),
-        Span::styled(
-            format!("{disk_pct:.0}%"),
-            Style::default().fg(alert_color(disk_pct, 80.0, 95.0)),
-        ),
-        Span::styled(
-            format!(" {}", format_bytes_smart(system_info.disk_used)),
-            Style::default().fg(DIM),
-        ),
-    ]));
+    // Power line (battery discharge or GPU draw) — only when a source reports it
+    if let Some(watts) = system_info.power_watts {
+        let limit = system_info.power_limit_watts.filter(|l| *l > 0.0);
+        let watts_color = limit
+            .map(|l| alert_color((watts / l) * 100.0, 70.0, 90.0))
+            .unwrap_or(DIM);
+        let mut spans = vec![
+            Span::styled("pwr: ", Style::default().fg(Color::White)),
+            Span::styled(format!("{watts:.0}W"), Style::default().fg(watts_color)),
+        ];
+        if let Some(limit) = limit {
+            spans.push(Span::styled(
+                format!(" / {limit:.0}W"),
+                Style::default().fg(DIM),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
 
-    // Swap line only if actually being used
+    // Swap line only if actually being used — always yellow, no percentage
     if system_info.swap_used > 0 {
-        let swap_pct = if system_info.swap_total > 0 {
-            (system_info.swap_used as f32 / system_info.swap_total as f32) * 100.0
-        } else {
-            0.0
-        };
-        // Swap is always yellow at minimum; red if >50%
-        let swap_color = if swap_pct >= 50.0 { DANGER } else { WARN };
         lines.push(Line::from(vec![
             Span::styled("swap: ", Style::default().fg(Color::White)),
-            Span::styled(format!("{swap_pct:.0}%"), Style::default().fg(swap_color)),
             Span::styled(
-                format!(" {}", format_bytes_smart(system_info.swap_used)),
-                Style::default().fg(DIM),
+                format_bytes_smart(system_info.swap_used),
+                Style::default().fg(WARN),
             ),
         ]));
     }
@@ -293,10 +286,10 @@ mod tests {
         let info = SystemInfo::new();
         let lines = create_system_dashboard_lines(&info, TemperatureUnit::Celsius, 10);
 
-        // Should have at least the 3 base lines (cpu, mem, disk)
+        // Should have at least the 2 base lines (cpu, mem)
         assert!(
-            lines.len() >= 3,
-            "Expected at least 3 lines, got {}",
+            lines.len() >= 2,
+            "Expected at least 2 lines, got {}",
             lines.len()
         );
         // Check key lines exist
@@ -307,6 +300,6 @@ mod tests {
             .join("\n");
         assert!(all_text.contains("cpu:"), "Missing cpu line");
         assert!(all_text.contains("mem:"), "Missing mem line");
-        assert!(all_text.contains("disk:"), "Missing disk line");
+        assert!(!all_text.contains("disk:"), "Disk line should be removed");
     }
 }

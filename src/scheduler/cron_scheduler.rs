@@ -149,72 +149,77 @@ impl CronScheduler {
         let now = Utc::now();
 
         for agent in &agents {
-            if !agent.enabled {
-                continue;
-            }
-
-            if agent.is_expired() {
-                tracing::info!("Agent '{}' has expired, disabling", agent.id);
-                self.db.update_agent_enabled(&agent.id, false)?;
-                continue;
-            }
-
-            let Some(schedule_expr) = agent.schedule_expr() else {
-                continue;
-            };
-
-            let cron_7field = to_7field_cron(schedule_expr);
-            let schedule = match Schedule::from_str(&cron_7field) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(
-                        "Agent '{}' has invalid cron expression '{}': {}",
-                        agent.id,
-                        schedule_expr,
-                        e
-                    );
-                    continue;
-                }
-            };
-
-            let window_start = now - chrono::Duration::seconds(60);
-            let mut upcoming = schedule.after(&window_start);
-
-            let Some(next_fire) = upcoming.next() else {
-                continue;
-            };
-
-            if next_fire > now {
-                continue;
-            }
-
-            let mut last_fired = self.last_fired.lock().await;
-            if let Some(last) = last_fired.get(&agent.id) {
-                if *last >= window_start {
-                    continue;
-                }
-            }
-
-            last_fired.insert(agent.id.clone(), now);
-            drop(last_fired);
-
-            let executor = Arc::clone(&self.executor);
-            let agent = agent.clone();
-            tokio::spawn(async move {
-                match executor.execute_agent(&agent, false).await {
-                    Ok(code) => {
-                        tracing::info!(
-                            "Scheduled agent '{}' completed (exit code: {})",
-                            agent.id,
-                            code
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!("Scheduled agent '{}' failed: {}", agent.id, e);
-                    }
-                }
-            });
+            self.try_fire_agent(agent, now).await?;
         }
+        Ok(())
+    }
+
+    /// Evaluate a single agent and spawn it if it is due. Returns early on
+    /// disabled/expired/parse-error conditions.
+    async fn try_fire_agent(
+        &self,
+        agent: &crate::domain::models::Agent,
+        now: chrono::DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        if !agent.enabled {
+            return Ok(());
+        }
+
+        if agent.is_expired() {
+            tracing::info!("Agent '{}' has expired, disabling", agent.id);
+            self.db.update_agent_enabled(&agent.id, false)?;
+            return Ok(());
+        }
+
+        let Some(schedule_expr) = agent.schedule_expr() else {
+            return Ok(());
+        };
+
+        let cron_7field = to_7field_cron(schedule_expr);
+        let schedule = match Schedule::from_str(&cron_7field) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    "Agent '{}' has invalid cron expression '{}': {}",
+                    agent.id,
+                    schedule_expr,
+                    e
+                );
+                return Ok(());
+            }
+        };
+
+        let window_start = now - chrono::Duration::seconds(60);
+        let Some(next_fire) = schedule.after(&window_start).next() else {
+            return Ok(());
+        };
+        if next_fire > now {
+            return Ok(());
+        }
+
+        {
+            let mut last_fired = self.last_fired.lock().await;
+            if last_fired
+                .get(&agent.id)
+                .is_some_and(|last| *last >= window_start)
+            {
+                return Ok(());
+            }
+            last_fired.insert(agent.id.clone(), now);
+        }
+
+        let executor = Arc::clone(&self.executor);
+        let agent = agent.clone();
+        tokio::spawn(async move {
+            match executor.execute_agent(&agent, false).await {
+                Ok(code) => tracing::info!(
+                    "Scheduled agent '{}' completed (exit code: {})",
+                    agent.id,
+                    code
+                ),
+                Err(e) => tracing::error!("Scheduled agent '{}' failed: {}", agent.id, e),
+            }
+        });
 
         Ok(())
     }
@@ -265,5 +270,20 @@ mod tests {
                 result.err()
             );
         }
+    }
+
+    #[test]
+    fn test_to_7field_cron_trims_whitespace() {
+        assert_eq!(to_7field_cron("  */5 * * * *  "), "0 */5 * * * * *");
+        assert_eq!(to_7field_cron("\t0 9 * * *\t"), "0 0 9 * * * *");
+    }
+
+    #[test]
+    fn test_cron_schedule_next_fire_time() {
+        let converted = to_7field_cron("* * * * *");
+        let schedule = Schedule::from_str(&converted).unwrap();
+        let now = chrono::Utc::now();
+        let next = schedule.after(&now).next();
+        assert!(next.is_some());
     }
 }

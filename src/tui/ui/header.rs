@@ -8,7 +8,7 @@ use ratatui::Frame;
 
 use super::{ACCENT, ERROR_COLOR};
 use crate::shared::banner::BANNER_GRADIENT;
-use crate::tui::app::App;
+use crate::tui::app::types::App;
 use crate::tui::whimsg::TITLE;
 
 /// Return the first `n` chars of `s`, respecting char boundaries.
@@ -62,7 +62,7 @@ pub(super) fn draw_header(frame: &mut Frame, area: Rect, app: &mut App) {
         (SPINNER[frame_idx], ACCENT)
     } else {
         // Blinking █ in red when stopped
-        let blink_on = (millis / 500) % 2 == 0;
+        let blink_on = (millis / 500).is_multiple_of(2);
         let color = if blink_on {
             ERROR_COLOR
         } else {

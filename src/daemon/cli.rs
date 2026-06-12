@@ -4,9 +4,13 @@ use clap::Subcommand;
 
 use crate::application::ports::{AgentRepository, StateRepository};
 use crate::daemon::process::{
-    is_process_running, is_service_enabled, is_systemd_available, kill_port_occupant,
-    print_last_n_lines, read_pid, remove_pid_file, send_signal,
+    is_process_running, kill_port_occupant, print_last_n_lines, read_pid, remove_pid_file,
+    send_signal,
 };
+
+#[cfg(target_os = "linux")]
+use crate::daemon::process::{is_service_enabled, is_systemd_available};
+
 use crate::daemon::service_install;
 use crate::db::Database;
 

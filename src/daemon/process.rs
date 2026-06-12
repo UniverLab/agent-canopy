@@ -79,19 +79,13 @@ pub(crate) fn read_pid(data_dir: &std::path::Path) -> Option<u32> {
         .and_then(|s| s.trim().parse().ok())
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn is_systemd_available() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        std::process::Command::new("systemctl")
-            .args(["--user", "is-system-running"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        false
-    }
+    std::process::Command::new("systemctl")
+        .args(["--user", "is-system-running"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 #[cfg(target_os = "linux")]
@@ -101,11 +95,6 @@ pub(crate) fn is_service_enabled() -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn is_service_enabled() -> bool {
-    false
 }
 
 pub(crate) fn print_last_n_lines(path: &std::path::Path, n: usize) -> Result<()> {

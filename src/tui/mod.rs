@@ -6,13 +6,17 @@
 
 mod agent;
 mod app;
+mod atmosphere;
 mod brians_brain;
 pub(crate) mod context_transfer;
 mod event;
+mod gamification;
 pub(crate) mod prompt_templates;
 pub(crate) mod terminal_history;
 mod ui;
 mod whimsg;
+
+pub(crate) use ui::truncate_str_keep_tail;
 
 use anyhow::{Context, Result};
 use ratatui::crossterm::{
@@ -25,7 +29,7 @@ use std::sync::Arc;
 
 use crate::db::Database;
 
-use app::App;
+use crate::tui::app::types::App;
 use event::run_event_loop;
 
 /// Entry point for `canopy tui`.

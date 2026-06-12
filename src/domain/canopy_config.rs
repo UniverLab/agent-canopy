@@ -6,7 +6,7 @@ use std::path::Path;
 use super::cli_config::CliConfig;
 
 /// Top-level canopy configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanopyConfig {
     /// RFC 3339 timestamp of when setup was last completed.
     /// If `None`, setup has not been run yet.
@@ -24,6 +24,31 @@ pub struct CanopyConfig {
     /// Temperature unit used by sysinfo widgets.
     #[serde(default)]
     pub temperature_unit: TemperatureUnit,
+
+    /// Embeddings model identifier used by the knowledge layer.
+    #[serde(default)]
+    pub embeddings_model: String,
+
+    /// Lexical-cohesion threshold for semantic chunk merging (0.0 - 1.0).
+    /// Adjacent chunks with term-frequency cosine similarity at or above this
+    /// value are merged. Measured on real docs: same-topic neighbors score
+    /// ~0.2-0.5, unrelated ones ~0.0-0.15 — hence the 0.25 default.
+    #[serde(default = "default_similarity_threshold")]
+    pub similarity_threshold: f32,
+
+    /// Personal RAG directories — all are indexed recursively.
+    /// Replaces the old `rag_personal_root` single-path field.
+    #[serde(default)]
+    pub rag_personal_dirs: Vec<String>,
+
+    /// Legacy single-path field kept for backward-compat deserialization only.
+    /// Migrated to `rag_personal_dirs` on first load.
+    #[serde(default, skip_serializing)]
+    pub rag_personal_root: String,
+
+    /// Root path used to discover or group related projects.
+    #[serde(default = "default_projects_root")]
+    pub projects_root: String,
 }
 
 /// Preferred unit for temperature display.
@@ -41,14 +66,36 @@ fn default_mcp_root() -> String {
         .unwrap_or_else(|| "/".to_string())
 }
 
+fn default_similarity_threshold() -> f32 {
+    0.25
+}
+
+fn default_projects_root() -> String {
+    if let Some(home) = dirs::home_dir() {
+        let preferred = home.join("Documents").join("Projects");
+        if preferred.exists() {
+            return preferred.to_string_lossy().to_string();
+        }
+        return home.to_string_lossy().to_string();
+    }
+    "/".to_string()
+}
+
 impl CanopyConfig {
     /// Load config from `~/.canopy/config.toml`. Returns default if not found.
     pub fn load(canopy_dir: &Path) -> Self {
         let config_path = canopy_dir.join("config.toml");
-        std::fs::read_to_string(&config_path)
+        let mut config: CanopyConfig = std::fs::read_to_string(&config_path)
             .ok()
             .and_then(|content| toml::from_str::<CanopyConfig>(&content).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // Migrate legacy single-root field to the new multi-dir vec.
+        if config.rag_personal_dirs.is_empty() && !config.rag_personal_root.is_empty() {
+            config
+                .rag_personal_dirs
+                .push(config.rag_personal_root.clone());
+        }
+        config
     }
 
     /// Save config to `~/.canopy/config.toml`.
@@ -79,6 +126,22 @@ impl CanopyConfig {
     }
 }
 
+impl Default for CanopyConfig {
+    fn default() -> Self {
+        Self {
+            configured_at: None,
+            mcp_filesystem_root: default_mcp_root(),
+            clis: Vec::new(),
+            temperature_unit: TemperatureUnit::default(),
+            embeddings_model: String::new(),
+            similarity_threshold: default_similarity_threshold(),
+            rag_personal_dirs: Vec::new(),
+            rag_personal_root: String::new(),
+            projects_root: default_projects_root(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,6 +153,8 @@ mod tests {
         assert!(!config.is_configured());
         assert!(config.clis.is_empty());
         assert_eq!(config.temperature_unit, TemperatureUnit::Celsius);
+        assert_eq!(config.embeddings_model, "");
+        assert_eq!(config.similarity_threshold, 0.25);
     }
 
     #[test]
@@ -101,6 +166,10 @@ mod tests {
         config.mark_configured();
         config.mcp_filesystem_root = "/custom/path".to_string();
         config.temperature_unit = TemperatureUnit::Fahrenheit;
+        config.embeddings_model = "custom-embed".to_string();
+        config.similarity_threshold = 0.35;
+        config.rag_personal_dirs = vec!["/rag/home".to_string(), "/rag/docs".to_string()];
+        config.projects_root = "/projects".to_string();
 
         config.save(&canopy_dir).unwrap();
 
@@ -108,6 +177,22 @@ mod tests {
         assert!(loaded.is_configured());
         assert_eq!(loaded.mcp_filesystem_root, "/custom/path");
         assert_eq!(loaded.temperature_unit, TemperatureUnit::Fahrenheit);
+        assert_eq!(loaded.embeddings_model, "custom-embed");
+        assert_eq!(loaded.rag_personal_dirs, vec!["/rag/home", "/rag/docs"]);
+        assert_eq!(loaded.projects_root, "/projects");
+    }
+
+    #[test]
+    fn test_legacy_rag_personal_root_migration() {
+        let dir = TempDir::new().unwrap();
+        let canopy_dir = dir.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        // Write a config with the old single-root field.
+        let toml = r#"rag_personal_root = "/old/rag""#;
+        std::fs::write(canopy_dir.join("config.toml"), toml).unwrap();
+
+        let loaded = CanopyConfig::load(&canopy_dir);
+        assert_eq!(loaded.rag_personal_dirs, vec!["/old/rag"]);
     }
 
     #[test]

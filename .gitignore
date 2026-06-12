@@ -31,3 +31,5 @@ target/
 
 # Ignore accidental HKCU directory (Windows registry reference, not a real directory)
 HKCU/
+bisect_results.txt
+run_output.txt

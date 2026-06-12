@@ -16,19 +16,25 @@ mod db;
 mod domain;
 mod executor;
 mod mcp_wizard_module;
+mod rag;
 mod scheduler;
 mod setup_module;
 mod shared;
 mod skills_module;
+mod sync_manager;
 mod system;
 mod tui;
 mod watchers;
+mod workflow_engine;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use daemon::bridge::run_bridge;
 use daemon::cli::{handle_daemon_action, DaemonAction};
 use daemon::doctor::run_doctor;
+use daemon::rag_cli::{handle_rag_action, RagAction};
 use daemon::server::{run_http_server, run_stdio_server};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "canopy", version, about)]
@@ -48,8 +54,34 @@ enum Commands {
     },
     Doctor,
     Stdio,
-    Setup,
+    Setup {
+        /// Use a local registry directory instead of fetching from GitHub.
+        /// Useful for development and testing registry changes before publishing.
+        #[arg(long = "local-registry", value_name = "PATH")]
+        local_registry: Option<PathBuf>,
+    },
     Mcp,
+    /// RAG indexing management.
+    Rag {
+        #[command(subcommand)]
+        action: RagAction,
+    },
+    /// Run a stdio sidecar proxy that injects canopy identity headers.
+    Bridge {
+        /// Agent session ID to bind this bridge process.
+        #[arg(long = "id")]
+        agent_id: Option<String>,
+        /// Explicit daemon port override.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Working directory forwarded to the daemon.
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+    },
+    #[command(hide = true)]
+    InternalPdfExtract {
+        path: PathBuf,
+    },
     #[command(hide = true)]
     Serve,
 }
@@ -63,13 +95,25 @@ async fn main() -> Result<()> {
         Some(Commands::Doctor) => run_doctor().await,
         Some(Commands::Stdio) => run_stdio_server().await,
         Some(Commands::Serve) => run_http_server(cli.port).await,
-        Some(Commands::Setup) => {
+        Some(Commands::Setup { local_registry }) => {
+            if let Some(path) = local_registry {
+                setup_module::registry_fetch::set_local_registry(path);
+            }
             tokio::task::block_in_place(setup_module::run_setup)?;
             Ok(())
         }
         Some(Commands::Mcp) => {
             tokio::task::block_in_place(mcp_wizard_module::run_mcp_wizard)?;
             Ok(())
+        }
+        Some(Commands::Rag { action }) => handle_rag_action(action).await,
+        Some(Commands::Bridge {
+            agent_id,
+            port,
+            workdir,
+        }) => run_bridge(agent_id, port.or(cli.port), workdir).await,
+        Some(Commands::InternalPdfExtract { path }) => {
+            rag::ingestion::run_internal_pdf_extract(&path)
         }
         None => {
             tokio::task::block_in_place(|| {

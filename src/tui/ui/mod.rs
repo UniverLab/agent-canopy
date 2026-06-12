@@ -8,10 +8,10 @@ mod sidebar;
 mod system_dashboard;
 
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Color;
+use ratatui::style::{Color, Style};
 use ratatui::Frame;
 
-use super::app::App;
+use super::app::types::App;
 
 // ── Shared palette ──────────────────────────────────────────────
 
@@ -30,6 +30,12 @@ pub(crate) const STATUS_WAIT_OFF: Color = Color::Rgb(30, 30, 30);
 // ── Main draw entry point ───────────────────────────────────────
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    let full = frame.area();
+    frame.render_widget(
+        ratatui::widgets::Paragraph::new("").style(Style::default().bg(Color::Rgb(18, 18, 18))),
+        full,
+    );
+
     let [header_area, body, footer_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
@@ -37,15 +43,36 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .areas(frame.area());
 
-    let panel_area = if app.sidebar_visible {
-        let [sidebar, panel] =
-            Layout::horizontal([Constraint::Length(29), Constraint::Min(0)]).areas(body);
+    let body_area = if app.sidebar_visible {
+        let [sidebar, content] =
+            Layout::horizontal([Constraint::Length(30), Constraint::Min(0)]).areas(body);
         header::draw_header(frame, header_area, app);
         sidebar::draw_sidebar(frame, sidebar, app);
-        panel
+        content
     } else {
         header::draw_header(frame, header_area, app);
         body
+    };
+
+    let activity_state = app.activity_panel_state();
+    let activity_width = app.activity_panel_layout_width(body_area.width, activity_state.is_some());
+    let (panel_area, sync_area) = if let Some(activity_state) = activity_state.as_ref() {
+        if activity_width > 0 {
+            let [panel, sync] = Layout::horizontal([
+                Constraint::Min(body_area.width.saturating_sub(activity_width)),
+                Constraint::Length(activity_width),
+            ])
+            .areas(body_area);
+            panel::draw_activity_panel(frame, sync, activity_state, app.sync_scroll_offset);
+            app.last_sync_area = Some(sync);
+            (panel, Some(sync))
+        } else {
+            app.last_sync_area = None;
+            (body_area, None)
+        }
+    } else {
+        app.last_sync_area = None;
+        (body_area, None)
     };
 
     // Split view: render two panels side-by-side (or stacked) when a split is active
@@ -82,8 +109,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         dialogs::draw_new_agent_dialog(frame, app);
     }
 
+    if app.launchpad_dialog.is_some() {
+        dialogs::draw_launchpad_dialog(frame, app);
+    }
+
     if app.quit_confirm {
         dialogs::draw_quit_confirm(frame);
+    } else if app.delete_project_confirm {
+        dialogs::draw_delete_project_confirm(frame);
+    } else if app.delete_workflow_confirm {
+        dialogs::draw_delete_workflow_confirm(frame);
     }
 
     if app.show_legend {
@@ -94,8 +129,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         dialogs::draw_context_transfer_modal(frame, app);
     }
 
+    if app.rag_transfer_modal.is_some() {
+        dialogs::draw_rag_transfer_modal(frame, app);
+    }
+
     if app.simple_prompt_dialog.is_some() {
         dialogs::draw_simple_prompt_dialog(frame, app);
+    }
+
+    if app.workflow_editor_dialog.is_some() {
+        dialogs::draw_workflow_editor_dialog(frame, app);
+    }
+
+    if app.knowledge_dialog.is_some() {
+        dialogs::draw_knowledge_dialog(frame, app);
     }
 
     if app.split_picker_open {
@@ -142,6 +189,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             frame.render_widget(widget, area);
         }
     }
+
+    // Atmosphere particles — absolute top layer, drawn last over everything
+    if !app.atmosphere_hidden {
+        let area = frame.area();
+        app.atmosphere.tick(area, &mut app.atmosphere_ctx);
+        // Reset mouse deltas after the scene has consumed them
+        app.atmosphere_ctx.mouse_delta_col = 0;
+        app.atmosphere_ctx.mouse_delta_row = 0;
+        let buf = frame.buffer_mut();
+        super::atmosphere::render_atmosphere(&app.atmosphere, buf, area);
+    }
+
+    let _ = sync_area;
 }
 
 // ── Shared helpers ──────────────────────────────────────────────
@@ -174,6 +234,21 @@ pub(crate) fn truncate_str(s: &str, max: usize) -> String {
     } else {
         String::new()
     }
+}
+
+pub(crate) fn truncate_str_keep_tail(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    if max <= 1 {
+        return String::new();
+    }
+
+    let tail_len = max.saturating_sub(1);
+    let chars: Vec<char> = s.chars().collect();
+    let tail_start = chars.len().saturating_sub(tail_len);
+    let tail: String = chars[tail_start..].iter().collect();
+    format!("…{tail}")
 }
 
 /// Extract the last two path segments, e.g. `/a/b/c/d` → `c/d`.

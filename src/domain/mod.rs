@@ -6,8 +6,17 @@
 pub mod canopy_config;
 pub mod cli_config;
 pub mod cli_strategy;
+pub mod gamification;
 pub mod models;
 pub mod models_db;
 pub mod notification;
+pub mod nursery;
+pub mod project;
+pub mod seeds;
+pub mod sync;
 pub mod usage_stats;
 pub mod validation;
+pub mod workflow;
+
+#[cfg(test)]
+mod domain_tests;

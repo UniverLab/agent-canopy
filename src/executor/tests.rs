@@ -28,4 +28,5 @@ fn test_notification_service_integration() {
     service.notify_task_failed("test-agent", 1, "test error");
     service.notify_agent_failed("test-agent", "opencode", 1, "test output");
     service.notify_task_completed("test-agent", true, Some(0));
+    service.notify_nursery_failed("test nursery error");
 }

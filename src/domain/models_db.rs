@@ -25,6 +25,10 @@ pub struct ModelEntry {
     pub name: String,
     /// Provider slug (e.g. `anthropic`).
     pub provider: String,
+    /// Release date from models.dev when available.
+    pub release_date: Option<String>,
+    /// Human-friendly size heuristic derived from the model identifier/name.
+    pub size_hint: Option<String>,
 }
 
 /// Full catalog of models.
@@ -42,6 +46,7 @@ pub fn providers_for_cli(cli: &str) -> &[&str] {
     match cli {
         "claude" => &["anthropic"],
         "codex" => &["openai"],
+        "mistral" => &["mistral"],
         "copilot" => &[
             "openai",
             "anthropic",
@@ -88,29 +93,39 @@ pub fn load_catalog() -> Option<ModelCatalog> {
     fetch_and_cache().or_else(load_from_cache)
 }
 
-/// Filter catalog entries to only models relevant for `cli_name`.
-pub fn models_for_cli(catalog: &ModelCatalog, cli_name: &str) -> Vec<ModelEntry> {
-    let providers = providers_for_cli(cli_name);
-    if providers.is_empty() {
-        return catalog.models.clone();
+/// Load the catalog without ever blocking on the network.
+///
+/// Returns whatever cache exists (even stale) immediately; when the cache is
+/// stale or missing, a background thread refreshes it for the next caller.
+/// Use this from interactive paths (TUI dialogs) where a synchronous fetch
+/// would freeze the UI for up to the request timeout.
+pub fn load_catalog_nonblocking() -> Option<ModelCatalog> {
+    let cached = load_from_cache();
+    let fresh = cached
+        .as_ref()
+        .is_some_and(|c| c.fetched_at.elapsed().unwrap_or(CACHE_TTL) < CACHE_TTL);
+
+    if !fresh {
+        std::thread::spawn(|| {
+            let _ = fetch_and_cache();
+        });
     }
+
+    cached
+}
+
+/// Models for `cli_name` matching `query` (case-insensitive substring),
+/// in a single pass that only clones the matching entries.
+pub fn suggestions_for(catalog: &ModelCatalog, cli_name: &str, query: &str) -> Vec<ModelEntry> {
+    let providers = providers_for_cli(cli_name);
+    let q = query.to_lowercase();
     catalog
         .models
         .iter()
-        .filter(|m| providers.contains(&m.provider.as_str()))
-        .cloned()
-        .collect()
-}
-
-/// Filter a model list by a search query (case-insensitive substring).
-pub fn filter_models(models: &[ModelEntry], query: &str) -> Vec<ModelEntry> {
-    if query.is_empty() {
-        return models.to_vec();
-    }
-    let q = query.to_lowercase();
-    models
-        .iter()
-        .filter(|m| m.id.to_lowercase().contains(&q) || m.name.to_lowercase().contains(&q))
+        .filter(|m| providers.is_empty() || providers.contains(&m.provider.as_str()))
+        .filter(|m| {
+            q.is_empty() || m.id.to_lowercase().contains(&q) || m.name.to_lowercase().contains(&q)
+        })
         .cloned()
         .collect()
 }
@@ -133,6 +148,8 @@ fn fetch_and_cache() -> Option<ModelCatalog> {
                 id: model.id.clone(),
                 name: model.name.clone().unwrap_or_else(|| model.id.clone()),
                 provider: provider_id.clone(),
+                release_date: model.release_date.clone(),
+                size_hint: infer_size_hint(&model.id, model.name.as_deref()),
             });
         }
     }
@@ -177,6 +194,40 @@ struct ProviderRaw {
 struct ModelRaw {
     id: String,
     name: Option<String>,
+    release_date: Option<String>,
+}
+
+fn infer_size_hint(id: &str, name: Option<&str>) -> Option<String> {
+    let combined = match name {
+        Some(name) => format!("{id} {name}"),
+        None => id.to_string(),
+    };
+    let lower = combined.to_lowercase();
+
+    for token in lower.split(|c: char| !c.is_ascii_alphanumeric() && c != '.') {
+        if let Some(stripped) = token.strip_suffix('b') {
+            if !stripped.is_empty() && stripped.chars().all(|c| c.is_ascii_digit() || c == '.') {
+                return Some(format!("{}B", stripped.to_uppercase()));
+            }
+        }
+        if let Some(stripped) = token.strip_suffix('m') {
+            if !stripped.is_empty() && stripped.chars().all(|c| c.is_ascii_digit() || c == '.') {
+                return Some(format!("{}M", stripped.to_uppercase()));
+            }
+        }
+    }
+
+    if lower.contains("small") {
+        return Some("small".to_string());
+    }
+    if lower.contains("large") {
+        return Some("large".to_string());
+    }
+    if lower.contains("base") {
+        return Some("base".to_string());
+    }
+
+    None
 }
 
 // ── Timestamp serde helper ──────────────────────────────────────────

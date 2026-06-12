@@ -1,291 +1,44 @@
 mod agents;
 mod data;
 pub mod dialog;
+mod gamification;
+mod project_graph;
+mod sync;
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
-use std::collections::HashMap;
+use chrono::Utc;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use crate::application::notification_service::{DefaultNotificationService, NotificationService};
-use crate::application::ports::AgentRepository;
+use crate::application::notification_service::DefaultNotificationService;
+use crate::application::ports::{AgentRepository, StateRepository};
 use crate::db::Database;
-use crate::domain::models::{Agent, RunLog};
 
 use super::agent::InteractiveAgent;
 use super::context_transfer::{
-    build_context_payload_for, ContextSourceKind, ContextTransferConfig, ContextTransferModal,
-    ContextTransferStep,
+    build_context_payload_for, initial_capture_units, interactive_capture_kind,
+    interactive_line_page_count, interactive_prompt_count, ContextCaptureKind, ContextSourceKind,
+    ContextTransferConfig, ContextTransferModal, ContextTransferStep,
 };
+use crate::domain::workflow::{WorkflowNodeKind, WorkflowSpecStatus};
 use crate::tui::prompt_templates::PromptTemplates;
-use dialog::SimplePromptDialog;
 
 pub(crate) use data::send_mcp_task_run;
-pub use dialog::NewAgentDialog;
-pub use dialog::{BackgroundTrigger, NewTaskMode, NewTaskType};
 
 // ── Types ───────────────────────────────────────────────────────
 
-/// Unified entry in the sidebar.
-#[allow(clippy::large_enum_variant)]
-pub enum AgentEntry {
-    Agent(Agent),
-    Interactive(usize), // index into App::interactive_agents
-    Terminal(usize),    // index into App::terminal_agents
-    Group(usize),       // index into App::split_groups
-}
+pub mod session_resume;
+pub mod terminal_search;
+pub mod types;
+pub mod utils;
 
-impl AgentEntry {
-    pub fn id<'a>(&'a self, app: &'a App) -> &'a str {
-        match self {
-            Self::Agent(a) => &a.id,
-            Self::Interactive(idx) => app.interactive_agents.get(*idx).map_or("?", |a| &a.name),
-            Self::Terminal(idx) => app.terminal_agents.get(*idx).map_or("?", |a| &a.name),
-            Self::Group(idx) => app.split_groups.get(*idx).map_or("?", |g| &g.id),
-        }
-    }
-}
-
-/// Which panel has focus.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Focus {
-    Home,
-    Preview,
-    NewAgentDialog,
-    Agent,
-    ContextTransfer,
-    PromptTemplateDialog,
-}
-
-#[derive(Clone, Copy)]
-enum ContextTransferSource {
-    Interactive(usize),
-    Terminal(usize),
-}
-
-// ── App struct ──────────────────────────────────────────────────
-
-/// Main application state.
-pub struct App {
-    pub db: Arc<Database>,
-    pub data_dir: PathBuf,
-
-    // Data cache (refreshed every tick)
-    pub agents: Vec<AgentEntry>,
-    pub active_runs: HashMap<String, RunLog>,
-    pub recent_runs: Vec<RunLog>,
-    pub interactive_agents: Vec<InteractiveAgent>,
-    /// Raw terminal sessions (no AI CLI).
-    pub terminal_agents: Vec<InteractiveAgent>,
-
-    // Split group state
-    pub split_groups: Vec<crate::domain::models::SplitGroup>,
-    /// ID of the split group currently being viewed (if any).
-    pub active_split_id: Option<String>,
-    /// True = right/bottom panel is focused in split view.
-    pub split_right_focused: bool,
-    /// Whether the split picker overlay is open.
-    pub split_picker_open: bool,
-    pub split_picker_idx: usize,
-    pub split_picker_orientation: crate::domain::models::SplitOrientation,
-    /// (name, type_label) for each available session in the picker.
-    pub split_picker_sessions: Vec<(String, String)>,
-
-    // Daemon info
-    pub daemon_running: bool,
-    pub daemon_pid: Option<u32>,
-    pub daemon_version: String,
-
-    // UI state
-    pub selected: usize,
-    pub focus: Focus,
-    pub log_content: String,
-    pub log_scroll: u16,
-    pub running: bool,
-    pub new_agent_dialog: Option<NewAgentDialog>,
-    pub quit_confirm: bool,
-
-    // Brian's Brain automaton (sidebar decoration)
-    pub sidebar_brain: Option<super::brians_brain::BriansBrain>,
-    // Brian's Brain for home banner background
-    pub home_brain: Option<super::brians_brain::BriansBrain>,
-
-    // System monitoring (updated asynchronously to avoid UI freezes)
-    pub system_info: crate::system::SystemInfo,
-    system_info_rx: std::sync::mpsc::Receiver<crate::system::SystemInfo>,
-    pub last_system_update: std::time::Instant,
-    pub process_start_time: std::time::Instant,
-
-    // Layout state
-    pub sidebar_click_map: Vec<(usize, u16, u16)>,
-    pub sidebar_visible: bool,
-    pub term_width: u16,
-    pub show_legend: bool,
-    pub show_copied: bool,
-    pub copied_at: std::time::Instant,
-    pub last_scroll_at: std::time::Instant,
-    pub last_panel_inner: (u16, u16),
-    pub whimsg: super::whimsg::Whimsg,
-    /// Hash of the last log chunk scanned for whimsg triggers — avoids re-firing
-    /// on the same content every tick.
-    whimsg_last_log_hash: u64,
-    pub context_transfer_modal: Option<ContextTransferModal>,
-    pub context_transfer_config: ContextTransferConfig,
-    /// Prompt templates loaded from registry
-    #[allow(dead_code)]
-    pub prompt_templates: PromptTemplates,
-    /// Current simple prompt dialog state
-    pub simple_prompt_dialog: Option<SimplePromptDialog>,
-    /// Whether to send OS-level desktop notifications (agent done/failed).
-    pub notifications_enabled: bool,
-    /// Notification service for sending cross-platform notifications.
-    pub notification_service: Arc<dyn NotificationService>,
-    /// IDs of runs that were active on the previous refresh tick.
-    prev_active_run_ids: std::collections::HashSet<String>,
-    /// Tick counter for animation (increments every refresh)
-    pub animation_tick: u32,
-    /// Preferred unit for sysinfo temperature labels.
-    pub temperature_unit: crate::domain::canopy_config::TemperatureUnit,
-    /// Terminal autocomplete suggestion picker (shown on Tab).
-    pub suggestion_picker: Option<super::terminal_history::SuggestionPicker>,
-    /// Per-session terminal histories (loaded on demand, cached in memory).
-    pub terminal_histories: HashMap<String, super::terminal_history::SessionHistory>,
-    /// Terminal scrollback search state (Ctrl+F).
-    pub terminal_search: Option<TerminalSearch>,
-    /// CLI launch usage counters (persisted to disk).
-    pub cli_usage: crate::domain::usage_stats::CliUsage,
-}
-
-fn args_contain_flag(args: &str, flag: &str) -> bool {
-    args.split_whitespace().any(|arg| arg == flag)
-}
-
-fn append_flag_if_missing(
-    base_args: Option<&str>,
-    yolo_flag: Option<&str>,
-    should_include_yolo: bool,
-) -> Option<String> {
-    let base = base_args.map(str::trim).filter(|args| !args.is_empty());
-
-    match (base, yolo_flag, should_include_yolo) {
-        (Some(args), Some(flag), true) if !args_contain_flag(args, flag) => {
-            Some(format!("{args} {flag}"))
-        }
-        (Some(args), _, _) => Some(args.to_string()),
-        (None, Some(flag), true) => Some(flag.to_string()),
-        (None, _, _) => None,
-    }
-}
-
-fn build_resumed_session_args(
-    session: &crate::db::InteractiveSession,
-    interactive_args: Option<&str>,
-    yolo_flag: Option<&str>,
-) -> Option<String> {
-    let original_args = session
-        .args
-        .as_deref()
-        .map(str::trim)
-        .filter(|args| !args.is_empty());
-    let inter_args = interactive_args
-        .map(str::trim)
-        .filter(|args| !args.is_empty());
-    let had_yolo = yolo_flag
-        .is_some_and(|flag| original_args.is_some_and(|args| args_contain_flag(args, flag)));
-
-    // Prefer original args (they were already constructed by launch_interactive).
-    // If none were persisted (legacy session), fall back to interactive_args from config.
-    append_flag_if_missing(original_args.or(inter_args), yolo_flag, had_yolo)
-}
-
-/// Search state for terminal scrollback.
-pub struct TerminalSearch {
-    /// Index of the terminal agent being searched.
-    pub agent_idx: usize,
-    /// Whether this is an interactive or terminal agent.
-    pub is_terminal: bool,
-    /// Current search query.
-    pub query: String,
-    /// Row indices (in the vt100 screen) where matches were found.
-    pub match_rows: Vec<usize>,
-    /// Current match index (cycles through match_rows).
-    pub current_match: usize,
-}
-
-impl TerminalSearch {
-    pub fn new(idx: usize) -> Self {
-        Self {
-            agent_idx: idx,
-            is_terminal: true,
-            query: String::new(),
-            match_rows: Vec::new(),
-            current_match: 0,
-        }
-    }
-
-    pub fn new_interactive(idx: usize) -> Self {
-        Self {
-            agent_idx: idx,
-            is_terminal: false,
-            query: String::new(),
-            match_rows: Vec::new(),
-            current_match: 0,
-        }
-    }
-
-    /// Search the agent's output for the query and populate match_rows.
-    pub fn search(&mut self, agent: &InteractiveAgent) {
-        self.match_rows.clear();
-        if self.query.is_empty() {
-            return;
-        }
-        let output = agent.output();
-        let query_lower = self.query.to_lowercase();
-        for (i, line) in output.lines().enumerate() {
-            if line.to_lowercase().contains(&query_lower) {
-                self.match_rows.push(i);
-            }
-        }
-        if !self.match_rows.is_empty() {
-            self.current_match = self.current_match.min(self.match_rows.len() - 1);
-        }
-    }
-
-    /// Jump to the current match by setting the agent's scroll_offset.
-    pub fn jump_to_match(&self, agent: &mut InteractiveAgent) {
-        if let Some(&row) = self.match_rows.get(self.current_match) {
-            let total = agent.total_depth();
-            let (_, screen_rows) = agent
-                .vt
-                .lock()
-                .map(|vt| vt.screen().size())
-                .unwrap_or((40, 80));
-            let screen_h = screen_rows as usize;
-            // Convert absolute row to scroll offset from bottom
-            if total > screen_h && row < total.saturating_sub(screen_h) {
-                agent.scroll_offset = total - screen_h - row;
-            } else {
-                agent.scroll_offset = 0;
-            }
-        }
-    }
-
-    pub fn next_match(&mut self) {
-        if !self.match_rows.is_empty() {
-            self.current_match = (self.current_match + 1) % self.match_rows.len();
-        }
-    }
-
-    pub fn prev_match(&mut self) {
-        if !self.match_rows.is_empty() {
-            self.current_match = self
-                .current_match
-                .checked_sub(1)
-                .unwrap_or(self.match_rows.len() - 1);
-        }
-    }
-}
+pub(crate) use session_resume::build_resumed_session_args;
+pub use terminal_search::TerminalSearch;
+pub(crate) use types::ContextTransferSource;
+use types::RagTransferModal;
+pub use types::{AgentEntry, AgentSectionFocus, App, Focus, ProjectsPanelFocus, SidebarMode};
 
 impl App {
     pub fn new(db: Arc<Database>, data_dir: &Path) -> Result<Self> {
@@ -293,17 +46,9 @@ impl App {
         let canopy_dir = home.join(".canopy");
         let canopy_config = crate::domain::canopy_config::CanopyConfig::load(&canopy_dir);
 
-        let (system_info_tx, system_info_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let initial = crate::system::SystemInfo::new();
-            let _ = system_info_tx.send(initial);
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(2));
-                let mut info = crate::system::SystemInfo::default();
-                info.update();
-                let _ = system_info_tx.send(info);
-            }
-        });
+        let system_monitor_active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let system_info_rx = spawn_system_monitor(&system_monitor_active);
+        let mission_manager = Self::init_mission_manager(Arc::clone(&db))?;
 
         let mut app = Self {
             db,
@@ -325,28 +70,55 @@ impl App {
             daemon_version: String::new(),
             selected: 0,
             focus: Focus::Home,
+            sidebar_mode: SidebarMode::Agents,
             log_content: String::new(),
             log_scroll: 0,
             running: true,
             new_agent_dialog: None,
+            launchpad_dialog: None,
+            knowledge_dialog: None,
+            pending_launch_dialog: None,
             quit_confirm: false,
+            delete_project_confirm: false,
+            delete_workflow_confirm: false,
             sidebar_brain: None,
             home_brain: None,
             sidebar_click_map: Vec::new(),
+            projects: Vec::new(),
+            selected_project: 0,
+            projects_panel_focus: ProjectsPanelFocus::Projects,
+            agent_section_focus: AgentSectionFocus::Background,
+            workflows: Vec::new(),
+            selected_workflow_id: None,
+            workflow_details: None,
+            workflow_runs: Vec::new(),
+            workflow_selected_spec: 0,
+            workflow_selected_node: 0,
+            workflow_editor_dialog: None,
+            global_rag_queue: Vec::new(),
+            selected_rag_queue: 0,
+            rag_info: crate::db::project::RagInfoSummary::default(),
+            rag_file_status: Vec::new(),
             sidebar_visible: true,
+            hidden_activity_workdirs: HashSet::new(),
+            forced_activity_workdirs: HashSet::new(),
             term_width: 0,
             show_legend: false,
+            legend_selected: 0,
             show_copied: false,
             copied_at: std::time::Instant::now() - std::time::Duration::from_secs(10),
             last_scroll_at: std::time::Instant::now() - std::time::Duration::from_secs(999),
             last_panel_inner: (0, 0),
+            last_panel_y: 0,
             whimsg: super::whimsg::Whimsg::new(),
             whimsg_last_log_hash: 0,
             context_transfer_modal: None,
+            rag_transfer_modal: None,
             context_transfer_config: ContextTransferConfig::default(),
             prompt_templates: PromptTemplates::load_from_registry()
                 .unwrap_or_else(|_| PromptTemplates::internal_templates()),
             simple_prompt_dialog: None,
+            prompt_builder_sessions: HashMap::new(),
             notifications_enabled: true,
             notification_service: Arc::new(DefaultNotificationService),
             prev_active_run_ids: std::collections::HashSet::new(),
@@ -356,19 +128,44 @@ impl App {
             terminal_histories: HashMap::new(),
             terminal_search: None,
             system_info: crate::system::SystemInfo::default(),
+            system_info_target: crate::system::SystemInfo::default(),
             system_info_rx,
+            system_monitor_active,
             last_system_update: std::time::Instant::now() - std::time::Duration::from_secs(10),
+            last_system_frame_at: std::time::Instant::now(),
             process_start_time: std::time::Instant::now(),
-            cli_usage: {
-                let mut usage = dirs::home_dir()
-                    .map(|h| crate::domain::usage_stats::CliUsage::load(&h.join(".canopy")))
-                    .unwrap_or_default();
-                if usage.ensure_first_run() {
-                    let _ = dirs::home_dir()
-                        .and_then(|h| usage.save(&h.join(".canopy")).ok().map(|_| ()));
-                }
-                usage
-            },
+            cli_usage: load_cli_usage(),
+            playground_active: false,
+            playground_query: String::new(),
+            playground_results: Vec::new(),
+            playground_selected: 0,
+            playground_last_search: std::time::Instant::now(),
+            playground_search_pending: false,
+            playground_last_executed_query: String::new(),
+            playground_detail_mode: false,
+            playground_scroll: 0,
+            playground_project_hash: None,
+            rag_paused: false,
+            agents_rag_focused: false,
+            sync_scroll_offset: 0,
+            last_sync_area: None,
+            workdir_system_state: HashMap::new(),
+            project_relation_dialog: None,
+            project_graph_edges: Vec::new(),
+            project_graph_trees: Vec::new(),
+            project_knowledge: Vec::new(),
+            selected_knowledge: 0,
+            knowledge_filter: String::new(),
+            knowledge_filter_mode: false,
+            nursery_path: None,
+            atmosphere: crate::tui::atmosphere::SceneManager::new(),
+            atmosphere_ctx: crate::tui::atmosphere::AtmosphereCtx::default(),
+            atmosphere_last_mouse: (0, 0),
+            atmosphere_hidden: false,
+            mission_manager,
+            mission_pending_events: Vec::new(),
+            max_cpu_frequency_seen: None,
+            uptime_anchor: None,
         };
         app.refresh()?;
         Ok(app)
@@ -379,43 +176,396 @@ impl App {
         self.animation_tick = self.animation_tick.wrapping_add(1);
         self.refresh_daemon_status();
         self.refresh_agents()?;
+        self.refresh_projects()?;
+        self.refresh_workflows()?;
+        self.refresh_project_graph().ok();
+        self.refresh_rag_state()?;
         self.refresh_active_runs()?;
         self.poll_interactive_agents();
         self.poll_terminal_agents();
-        self.tick_banner_glitch();
+        self.tick_banner_animation();
         self.ensure_sidebar_brain();
         self.refresh_log();
         self.auto_hide_sidebar();
+        self.system_monitor_active
+            .store(self.sidebar_visible, Ordering::Relaxed);
         self.dismiss_copied();
         self.update_whimsg_context();
+        self.tick_atmosphere();
+        self.tick_missions()?;
         self.resize_interactive_agents();
+        self.refresh_playground_search()?;
 
         // Non-blocking check for updated system info from background thread
         while let Ok(info) = self.system_info_rx.try_recv() {
-            self.system_info = info;
+            self.system_info_target = info;
             self.last_system_update = std::time::Instant::now();
         }
+        self.interpolate_system_info();
 
+        Ok(())
+    }
+
+    fn interpolate_system_info(&mut self) {
+        let now = std::time::Instant::now();
+        let elapsed = now.saturating_duration_since(self.last_system_frame_at);
+        self.last_system_frame_at = now;
+
+        // Blend toward the latest sampled snapshot with a longer window so
+        // values keep moving smoothly between monitoring samples.
+        let blend = (elapsed.as_secs_f32() / 0.9).clamp(0.0, 1.0);
+        if blend <= 0.0 {
+            return;
+        }
+
+        blend_system_info(&mut self.system_info, &self.system_info_target, blend);
+    }
+
+    /// Perform debounced RAG search in playground mode
+    fn refresh_playground_search(&mut self) -> Result<()> {
+        const PLAYGROUND_SEARCH_DEBOUNCE_MS: u128 = 2_000;
+
+        if !self.playground_active {
+            return Ok(());
+        }
+        if !self.playground_search_pending {
+            return Ok(());
+        }
+
+        let since_last = self.playground_last_search.elapsed().as_millis();
+        if since_last < PLAYGROUND_SEARCH_DEBOUNCE_MS {
+            return Ok(());
+        }
+
+        let query = self.playground_query.trim().to_string();
+        if query.is_empty() {
+            self.playground_results.clear();
+            self.playground_selected = 0;
+            self.playground_last_executed_query.clear();
+            self.playground_search_pending = false;
+            return Ok(());
+        }
+
+        if self.playground_last_executed_query == query {
+            self.playground_search_pending = false;
+            return Ok(());
+        }
+
+        if let Ok(results) = self.rag_vector_search(&query, 50) {
+            let month_ago = chrono::Utc::now().timestamp() - 30 * 24 * 3600;
+            for result in &results {
+                if result.distance.is_some_and(|d| d < 0.2) {
+                    self.queue_mission_event(crate::tui::gamification::MissionEvent::DeepRagSearch);
+                }
+                if result.created_at < month_ago {
+                    self.queue_mission_event(
+                        crate::tui::gamification::MissionEvent::DigitalArcheologistFind,
+                    );
+                }
+            }
+            self.playground_results = results;
+            self.playground_selected = 0;
+        }
+        self.playground_last_executed_query = query;
+        self.playground_search_pending = false;
         Ok(())
     }
 
     // ── Navigation ──────────────────────────────────────────────
 
     pub fn select_next(&mut self) {
-        if !self.agents.is_empty() {
-            self.selected = (self.selected + 1) % self.agents.len();
-            self.log_scroll = 0;
+        if self.sidebar_mode == SidebarMode::Projects {
+            self.select_next_project_panel();
+            return;
+        }
+
+        self.select_next_agent_panel();
+    }
+
+    fn select_next_project_panel(&mut self) {
+        self.normalize_projects_panel_focus();
+        match self.projects_panel_focus {
+            ProjectsPanelFocus::Projects => self.navigate_projects_next(),
+            ProjectsPanelFocus::Workflows => self.navigate_workflows_next(),
+            ProjectsPanelFocus::Knowledge => self.navigate_knowledge_next(),
+            ProjectsPanelFocus::RagInfo => self.navigate_from_rag_info_next(),
+        }
+        self.reset_log_scroll();
+    }
+
+    fn navigate_knowledge_next(&mut self) {
+        let filtered = self.filtered_knowledge_indices();
+        if filtered.is_empty() {
+            return;
+        }
+        let current = filtered
+            .iter()
+            .position(|&idx| idx == self.selected_knowledge)
+            .unwrap_or(0);
+        self.selected_knowledge = filtered[(current + 1) % filtered.len()];
+    }
+
+    fn navigate_projects_next(&mut self) {
+        if self.projects.is_empty() {
+            return;
+        }
+        let next = self.selected_project + 1;
+        if next < self.projects.len() {
+            self.selected_project = next;
+            self.refresh_workflows_selection();
+            return;
+        }
+        if self.try_cross_to_workflows_first() {
+            return;
+        }
+        if self.rag_info.has_rag_activity() {
+            self.projects_panel_focus = ProjectsPanelFocus::RagInfo;
+            return;
+        }
+        self.selected_project = 0;
+    }
+
+    fn try_cross_to_workflows_first(&mut self) -> bool {
+        let Some(id) = self.visible_workflows().first().map(|w| w.id.clone()) else {
+            return false;
+        };
+        self.projects_panel_focus = ProjectsPanelFocus::Workflows;
+        self.selected_workflow_id = Some(id);
+        self.refresh_workflows_selection();
+        true
+    }
+
+    fn navigate_workflows_next(&mut self) {
+        let visible_ids: Vec<String> = self
+            .visible_workflows()
+            .into_iter()
+            .map(|w| w.id.clone())
+            .collect();
+        if visible_ids.is_empty() {
+            return;
+        }
+        let current = self
+            .selected_workflow_id
+            .as_ref()
+            .and_then(|id| visible_ids.iter().position(|vid| vid == id))
+            .unwrap_or(0);
+        let next = current + 1;
+        if next < visible_ids.len() {
+            self.selected_workflow_id = Some(visible_ids[next].clone());
+            self.refresh_workflows_selection();
+            return;
+        }
+        if self.rag_info.has_rag_activity() {
+            self.projects_panel_focus = ProjectsPanelFocus::RagInfo;
+            return;
+        }
+        self.projects_panel_focus = ProjectsPanelFocus::Projects;
+        self.selected_project = 0;
+    }
+
+    fn navigate_from_rag_info_next(&mut self) {
+        if self.projects.is_empty() {
+            return;
+        }
+        self.projects_panel_focus = ProjectsPanelFocus::Projects;
+        self.selected_project = 0;
+        self.refresh_workflows_selection();
+    }
+
+    fn select_next_agent_panel(&mut self) {
+        if !self.rag_info.has_rag_activity() {
+            self.advance_agent_selection();
+            return;
+        }
+
+        if self.agents_rag_focused {
+            self.agents_rag_focused = false;
+            if !self.agents.is_empty() {
+                let prev = self.selected;
+                self.selected = 0;
+                self.update_agent_section_focus_on_change(prev);
+            }
+            self.reset_log_scroll();
+            return;
+        }
+
+        if self.agents.is_empty() || self.selected + 1 >= self.agents.len() {
+            self.agents_rag_focused = true;
+            self.reset_log_scroll();
+            return;
+        }
+
+        self.advance_agent_selection();
+    }
+
+    fn advance_agent_selection(&mut self) {
+        if self.agents.is_empty() {
+            return;
+        }
+
+        let prev = self.selected;
+        self.selected = (self.selected + 1) % self.agents.len();
+        self.update_agent_section_focus_on_change(prev);
+        self.reset_log_scroll();
+    }
+
+    fn update_agent_section_focus_on_change(&mut self, _prev_selected: usize) {
+        if let Some(agent) = self.agents.get(self.selected) {
+            self.agent_section_focus = match agent {
+                AgentEntry::Agent(_) | AgentEntry::Group(_) => AgentSectionFocus::Background,
+                AgentEntry::Interactive(_) => AgentSectionFocus::Interactive,
+                AgentEntry::Terminal(_) => AgentSectionFocus::Terminal,
+            };
         }
     }
 
     pub fn select_prev(&mut self) {
-        if !self.agents.is_empty() {
-            self.selected = self
-                .selected
-                .checked_sub(1)
-                .unwrap_or(self.agents.len() - 1);
-            self.log_scroll = 0;
+        if self.sidebar_mode == SidebarMode::Projects {
+            self.select_prev_project_panel();
+            return;
         }
+
+        self.select_prev_agent_panel();
+    }
+
+    fn select_prev_project_panel(&mut self) {
+        self.normalize_projects_panel_focus();
+        match self.projects_panel_focus {
+            ProjectsPanelFocus::Projects => self.navigate_projects_prev(),
+            ProjectsPanelFocus::Workflows => self.navigate_workflows_prev(),
+            ProjectsPanelFocus::Knowledge => self.navigate_knowledge_prev(),
+            ProjectsPanelFocus::RagInfo => self.navigate_from_rag_info_prev(),
+        }
+        self.reset_log_scroll();
+    }
+
+    fn navigate_knowledge_prev(&mut self) {
+        let filtered = self.filtered_knowledge_indices();
+        if filtered.is_empty() {
+            return;
+        }
+        let current = filtered
+            .iter()
+            .position(|&idx| idx == self.selected_knowledge)
+            .unwrap_or(0);
+        let next = current.checked_sub(1).unwrap_or(filtered.len() - 1);
+        self.selected_knowledge = filtered[next];
+    }
+
+    fn navigate_projects_prev(&mut self) {
+        if self.projects.is_empty() {
+            return;
+        }
+        if self.selected_project > 0 {
+            self.selected_project -= 1;
+            self.refresh_workflows_selection();
+            return;
+        }
+        if self.rag_info.has_rag_activity() {
+            self.projects_panel_focus = ProjectsPanelFocus::RagInfo;
+            return;
+        }
+        if self.try_cross_to_workflows_last() {
+            return;
+        }
+        self.selected_project = self.projects.len() - 1;
+    }
+
+    fn try_cross_to_workflows_last(&mut self) -> bool {
+        let Some(id) = self.visible_workflows().last().map(|w| w.id.clone()) else {
+            return false;
+        };
+        self.projects_panel_focus = ProjectsPanelFocus::Workflows;
+        self.selected_workflow_id = Some(id);
+        self.refresh_workflows_selection();
+        true
+    }
+
+    fn navigate_workflows_prev(&mut self) {
+        let visible_ids: Vec<String> = self
+            .visible_workflows()
+            .into_iter()
+            .map(|w| w.id.clone())
+            .collect();
+        if visible_ids.is_empty() {
+            return;
+        }
+        let current = self
+            .selected_workflow_id
+            .as_ref()
+            .and_then(|id| visible_ids.iter().position(|vid| vid == id))
+            .unwrap_or(0);
+        if current > 0 {
+            self.selected_workflow_id = Some(visible_ids[current - 1].clone());
+            self.refresh_workflows_selection();
+            return;
+        }
+        if !self.projects.is_empty() {
+            self.projects_panel_focus = ProjectsPanelFocus::Projects;
+            self.selected_project = self.projects.len() - 1;
+            return;
+        }
+        self.selected_workflow_id = Some(visible_ids[visible_ids.len() - 1].clone());
+        self.refresh_workflows_selection();
+    }
+
+    fn navigate_from_rag_info_prev(&mut self) {
+        let last_id = self.visible_workflows().last().map(|w| w.id.clone());
+        if let Some(id) = last_id {
+            self.projects_panel_focus = ProjectsPanelFocus::Workflows;
+            self.selected_workflow_id = Some(id);
+            self.refresh_workflows_selection();
+            return;
+        }
+        if self.projects.is_empty() {
+            return;
+        }
+        self.projects_panel_focus = ProjectsPanelFocus::Projects;
+        self.selected_project = self.projects.len() - 1;
+    }
+
+    fn select_prev_agent_panel(&mut self) {
+        if !self.rag_info.has_rag_activity() {
+            self.retreat_agent_selection();
+            return;
+        }
+
+        if self.agents_rag_focused {
+            self.agents_rag_focused = false;
+            if !self.agents.is_empty() {
+                let prev = self.selected;
+                self.selected = self.agents.len() - 1;
+                self.update_agent_section_focus_on_change(prev);
+            }
+            self.reset_log_scroll();
+            return;
+        }
+
+        if self.agents.is_empty() || self.selected == 0 {
+            self.agents_rag_focused = true;
+            self.reset_log_scroll();
+            return;
+        }
+
+        self.retreat_agent_selection();
+    }
+
+    fn retreat_agent_selection(&mut self) {
+        if self.agents.is_empty() {
+            return;
+        }
+
+        let prev = self.selected;
+        self.selected = self
+            .selected
+            .checked_sub(1)
+            .unwrap_or(self.agents.len() - 1);
+        self.update_agent_section_focus_on_change(prev);
+        self.reset_log_scroll();
+    }
+
+    fn reset_log_scroll(&mut self) {
+        self.log_scroll = 0;
     }
 
     pub fn scroll_log_down(&mut self) {
@@ -426,21 +576,670 @@ impl App {
         self.log_scroll = self.log_scroll.saturating_sub(3);
     }
 
+    fn refresh_projects(&mut self) -> Result<()> {
+        self.projects = self.db.list_projects()?;
+        if self.projects.is_empty() {
+            self.selected_project = 0;
+        } else {
+            self.selected_project = self.selected_project.min(self.projects.len() - 1);
+        }
+        self.refresh_project_knowledge()?;
+        Ok(())
+    }
+
+    pub fn refresh_project_knowledge(&mut self) -> Result<()> {
+        if let Some(project) = self.projects.get(self.selected_project) {
+            self.project_knowledge = self.db.list_project_knowledge(&project.hash, None, 50)?;
+            self.normalize_selected_knowledge();
+        } else {
+            self.project_knowledge.clear();
+            self.selected_knowledge = 0;
+        }
+        Ok(())
+    }
+
+    fn refresh_workflows(&mut self) -> Result<()> {
+        self.workflows = self.db.list_workflows(None)?;
+        self.refresh_workflows_selection();
+        Ok(())
+    }
+
+    fn refresh_workflows_selection(&mut self) {
+        let visible = self.visible_workflows();
+        if visible.is_empty() {
+            self.selected_workflow_id = None;
+            self.workflow_details = None;
+            self.workflow_runs.clear();
+            self.workflow_selected_spec = 0;
+            self.workflow_selected_node = 0;
+            return;
+        }
+
+        let previous_selected = self.selected_workflow_id.clone();
+        if self
+            .selected_workflow_id
+            .as_ref()
+            .is_none_or(|selected| !visible.iter().any(|workflow| workflow.id == *selected))
+        {
+            self.selected_workflow_id = Some(visible[0].id.clone());
+        }
+
+        let selected_changed = previous_selected != self.selected_workflow_id;
+        let Some(selected_id) = self.selected_workflow_id.clone() else {
+            return;
+        };
+        self.workflow_details = self.db.get_workflow_details(&selected_id).ok().flatten();
+        if selected_changed {
+            self.workflow_selected_spec = self.default_workflow_spec_index();
+            self.workflow_selected_node = 0;
+        } else {
+            self.clamp_workflow_selection();
+        }
+        self.refresh_workflow_runs_for_selected_spec();
+        self.select_default_workflow_node_if_needed(selected_changed);
+    }
+
+    fn refresh_rag_state(&mut self) -> Result<()> {
+        self.global_rag_queue = self.db.list_rag_queue(50)?;
+        self.rag_paused = self
+            .db
+            .get_state("rag_paused")?
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
+        let (queued, processing) = self
+            .db
+            .rag_queue_counts()
+            .unwrap_or((self.rag_info.queued_items, self.rag_info.processing_items));
+        let total_chunks = self
+            .db
+            .get_state("rag_total_chunks")?
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(self.rag_info.total_chunks);
+        let indexed_files = self
+            .db
+            .get_state("rag_indexed_files")?
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(self.rag_info.indexed_files);
+        self.rag_info = crate::db::project::RagInfoSummary {
+            total_chunks,
+            indexed_files,
+            queued_items: queued,
+            processing_items: processing,
+        };
+
+        if self.global_rag_queue.is_empty() {
+            self.selected_rag_queue = 0;
+        } else {
+            self.selected_rag_queue = self
+                .selected_rag_queue
+                .min(self.global_rag_queue.len().saturating_sub(1));
+        }
+
+        if !self.rag_info.has_rag_activity() {
+            if self.projects_panel_focus == ProjectsPanelFocus::RagInfo {
+                self.projects_panel_focus = ProjectsPanelFocus::Projects;
+            }
+            self.agents_rag_focused = false;
+        }
+
+        self.rag_file_status = self.db.rag_per_file_status().unwrap_or_default();
+
+        Ok(())
+    }
+
+    fn rag_vector_search(
+        &self,
+        query: &str,
+        top_k: usize,
+    ) -> anyhow::Result<Vec<crate::rag::vector_store::SearchResult>> {
+        let canopy_dir = dirs::home_dir()
+            .map(|h| h.join(".canopy"))
+            .ok_or_else(|| anyhow::anyhow!("No home directory"))?;
+        let config = crate::domain::canopy_config::CanopyConfig::load(&canopy_dir);
+        let model = config.embeddings_model.trim();
+        if model.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dimensions = crate::rag::embedding_client::model_dimensions(model)?;
+        let rt = tokio::runtime::Handle::try_current()
+            .map_err(|_| anyhow::anyhow!("No tokio runtime"))?;
+        rt.block_on(async {
+            let store = crate::rag::vector_store::VectorStore::new(dimensions).await?;
+            let embedder = crate::rag::embedding_client::client_from_config(&config)?;
+            let query_vec = embedder.embed(query)?;
+            store.search_similar(&query_vec, top_k).await
+        })
+    }
+
     pub fn selected_agent(&self) -> Option<&AgentEntry> {
         self.agents.get(self.selected)
     }
 
-    pub fn focused_agent_name(&self) -> String {
-        match self.selected_agent() {
-            Some(AgentEntry::Interactive(idx)) => {
-                self.interactive_agents.get(*idx).map(|a| a.name.clone())
-            }
-            Some(AgentEntry::Terminal(idx)) => {
-                self.terminal_agents.get(*idx).map(|a| a.name.clone())
-            }
-            _ => None,
+    pub fn selected_project(&self) -> Option<&crate::domain::project::Project> {
+        self.projects.get(self.selected_project)
+    }
+
+    pub fn visible_workflows(&self) -> Vec<&crate::domain::workflow::Workflow> {
+        self.workflows.iter().collect()
+    }
+
+    pub fn selected_workflow(&self) -> Option<&crate::domain::workflow::Workflow> {
+        let selected_id = self.selected_workflow_id.as_ref()?;
+        self.workflows
+            .iter()
+            .find(|workflow| workflow.id == *selected_id)
+    }
+
+    pub fn selected_workflow_details(&self) -> Option<&crate::domain::workflow::WorkflowDetails> {
+        self.workflow_details.as_ref()
+    }
+
+    pub fn selected_workflow_spec(&self) -> Option<&crate::domain::workflow::WorkflowSpecDetails> {
+        self.workflow_details
+            .as_ref()
+            .and_then(|details| details.specs.get(self.workflow_selected_spec))
+    }
+
+    pub fn selected_workflow_node(&self) -> Option<&crate::domain::workflow::WorkflowNode> {
+        self.selected_workflow_spec()
+            .and_then(|spec| spec.nodes.get(self.workflow_selected_node))
+    }
+
+    pub fn delete_selected_project(&mut self) -> Result<()> {
+        let Some(hash) = self.selected_project().map(|p| p.hash.clone()) else {
+            return Ok(());
+        };
+        self.db.delete_project(&hash)?;
+        self.refresh_projects()?;
+        self.refresh_workflows()?;
+        self.refresh_project_graph().ok();
+        self.refresh_rag_state()?;
+        Ok(())
+    }
+
+    pub fn delete_selected_workflow(&mut self) -> Result<()> {
+        let Some(workflow) = self.selected_workflow() else {
+            return Ok(());
+        };
+        self.db.delete_workflow(&workflow.id)?;
+        self.refresh_workflows()?;
+        self.refresh_projects()?;
+        self.refresh_rag_state()?;
+        Ok(())
+    }
+
+    pub fn delete_selected_knowledge(&mut self) -> Result<()> {
+        let Some(node) = self.project_knowledge.get(self.selected_knowledge) else {
+            return Ok(());
+        };
+        let id = node.id.clone();
+        self.db.delete_intelligence_node(&id)?;
+        self.refresh_project_knowledge()?;
+        Ok(())
+    }
+
+    pub fn filtered_knowledge_indices(&self) -> Vec<usize> {
+        let query = self.knowledge_filter.trim().to_lowercase();
+        self.project_knowledge
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| {
+                if query.is_empty() {
+                    return true;
+                }
+
+                node.title.to_lowercase().contains(&query)
+                    || node.body.to_lowercase().contains(&query)
+                    || node.kind.to_lowercase().contains(&query)
+            })
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    pub fn selected_filtered_knowledge_index(&self) -> Option<usize> {
+        self.filtered_knowledge_indices()
+            .iter()
+            .position(|&idx| idx == self.selected_knowledge)
+    }
+
+    pub fn append_knowledge_filter(&mut self, value: char) {
+        self.knowledge_filter.push(value);
+        self.normalize_selected_knowledge();
+    }
+
+    pub fn pop_knowledge_filter(&mut self) {
+        self.knowledge_filter.pop();
+        self.normalize_selected_knowledge();
+    }
+
+    pub fn clear_knowledge_filter(&mut self) {
+        self.knowledge_filter.clear();
+        self.normalize_selected_knowledge();
+    }
+
+    pub fn enter_knowledge_filter_mode(&mut self) {
+        self.knowledge_filter_mode = true;
+    }
+
+    pub fn exit_knowledge_filter_mode(&mut self) {
+        self.knowledge_filter_mode = false;
+    }
+
+    fn normalize_selected_knowledge(&mut self) {
+        let filtered = self.filtered_knowledge_indices();
+        if filtered.is_empty() {
+            self.selected_knowledge = 0;
+            return;
         }
-        .unwrap_or_default()
+
+        if filtered.contains(&self.selected_knowledge) {
+            return;
+        }
+
+        self.selected_knowledge = filtered[0];
+    }
+
+    #[allow(dead_code)]
+    pub fn visible_projects_panels(&self) -> Vec<ProjectsPanelFocus> {
+        let mut panels = vec![
+            ProjectsPanelFocus::Projects,
+            ProjectsPanelFocus::Workflows,
+            ProjectsPanelFocus::Knowledge,
+        ];
+        if self.rag_info.has_rag_activity() {
+            panels.push(ProjectsPanelFocus::RagInfo);
+        }
+        panels
+    }
+
+    fn project_panel_has_navigable_items(&self, panel: ProjectsPanelFocus) -> bool {
+        match panel {
+            ProjectsPanelFocus::Projects => !self.projects.is_empty(),
+            ProjectsPanelFocus::Workflows => !self.visible_workflows().is_empty(),
+            ProjectsPanelFocus::Knowledge => true,
+            ProjectsPanelFocus::RagInfo => self.rag_info.has_rag_activity(),
+        }
+    }
+
+    fn normalize_projects_panel_focus(&mut self) {
+        if self.project_panel_has_navigable_items(self.projects_panel_focus) {
+            return;
+        }
+
+        let fallback = self
+            .visible_projects_panels()
+            .into_iter()
+            .find(|panel| self.project_panel_has_navigable_items(*panel));
+        if let Some(panel) = fallback {
+            self.projects_panel_focus = panel;
+        }
+    }
+
+    pub(crate) fn focus_projects_panel_from_edge(&mut self, from_top: bool) {
+        let panels = self.visible_projects_panels();
+        let ordered = if from_top {
+            panels
+        } else {
+            panels.into_iter().rev().collect::<Vec<_>>()
+        };
+
+        let selected = ordered
+            .iter()
+            .copied()
+            .find(|panel| self.project_panel_has_navigable_items(*panel))
+            .or_else(|| ordered.first().copied())
+            .unwrap_or(ProjectsPanelFocus::Projects);
+        self.projects_panel_focus = selected;
+    }
+
+    #[allow(dead_code)]
+    pub fn cycle_projects_panel_focus(&mut self, forward: bool) {
+        let panels = self.visible_projects_panels();
+        let current = panels
+            .iter()
+            .position(|panel| *panel == self.projects_panel_focus)
+            .unwrap_or(0);
+        let next = if forward {
+            (current + 1) % panels.len()
+        } else {
+            current.checked_sub(1).unwrap_or(panels.len() - 1)
+        };
+        self.projects_panel_focus = panels[next];
+        self.log_scroll = 0;
+    }
+
+    pub fn activate_playground(&mut self) {
+        self.playground_active = true;
+        self.reset_playground_state();
+        // Personal RAG is global — no project_hash filter.
+        self.playground_project_hash = None;
+    }
+
+    pub fn deactivate_playground(&mut self) {
+        self.playground_active = false;
+        self.reset_playground_state();
+    }
+
+    fn reset_playground_state(&mut self) {
+        self.playground_query.clear();
+        self.playground_results.clear();
+        self.playground_selected = 0;
+        self.playground_search_pending = false;
+        self.playground_last_executed_query.clear();
+        self.playground_detail_mode = false;
+        self.playground_scroll = 0;
+    }
+
+    pub fn toggle_rag_pause(&mut self) {
+        let new_val = !self.rag_paused;
+        let _ = self
+            .db
+            .set_state("rag_paused", if new_val { "1" } else { "0" });
+        self.rag_paused = new_val;
+    }
+
+    pub fn toggle_sidebar_mode(&mut self) {
+        self.sidebar_mode = match self.sidebar_mode {
+            SidebarMode::Agents => SidebarMode::Projects,
+            SidebarMode::Projects => SidebarMode::Agents,
+        };
+        if self.sidebar_mode == SidebarMode::Projects {
+            self.normalize_projects_panel_focus();
+        }
+        self.agents_rag_focused = false;
+        self.reset_log_scroll();
+    }
+
+    pub fn cycle_workflow_spec(&mut self, forward: bool) {
+        let Some(details) = self.workflow_details.as_ref() else {
+            return;
+        };
+        if details.specs.is_empty() {
+            return;
+        }
+
+        self.workflow_selected_spec = if forward {
+            (self.workflow_selected_spec + 1) % details.specs.len()
+        } else {
+            self.workflow_selected_spec
+                .checked_sub(1)
+                .unwrap_or(details.specs.len() - 1)
+        };
+        self.workflow_selected_node = 0;
+        self.refresh_workflow_runs_for_selected_spec();
+        self.select_default_workflow_node_if_needed(true);
+        self.reset_log_scroll();
+    }
+
+    pub fn cycle_workflow_node(&mut self, forward: bool) {
+        let Some(spec) = self.selected_workflow_spec() else {
+            return;
+        };
+        if spec.nodes.is_empty() {
+            return;
+        }
+        self.workflow_selected_node = if forward {
+            (self.workflow_selected_node + 1) % spec.nodes.len()
+        } else {
+            self.workflow_selected_node
+                .checked_sub(1)
+                .unwrap_or(spec.nodes.len() - 1)
+        };
+        self.reset_log_scroll();
+    }
+
+    pub fn open_workflow_editor_dialog(&mut self) -> Result<()> {
+        let Some(node) = self.selected_workflow_node() else {
+            return Ok(());
+        };
+
+        let (title, help, buffer, mode) = self.build_editor_dialog_content(node);
+
+        self.workflow_editor_dialog = Some(crate::tui::app::types::WorkflowEditorDialog::new(
+            node.id.clone(),
+            node.name.clone(),
+            title,
+            help,
+            buffer,
+            mode,
+        ));
+        self.focus = Focus::WorkflowEditorDialog;
+        Ok(())
+    }
+
+    fn build_editor_dialog_content(
+        &self,
+        node: &crate::domain::workflow::WorkflowNode,
+    ) -> (
+        String,
+        String,
+        String,
+        crate::tui::app::types::WorkflowEditorMode,
+    ) {
+        if node.kind == WorkflowNodeKind::Agent {
+            self.build_agent_prompt_dialog(node)
+        } else {
+            self.build_node_config_dialog(node)
+        }
+    }
+
+    fn build_agent_prompt_dialog(
+        &self,
+        node: &crate::domain::workflow::WorkflowNode,
+    ) -> (
+        String,
+        String,
+        String,
+        crate::tui::app::types::WorkflowEditorMode,
+    ) {
+        let prompt = node
+            .config
+            .get("prompt_template")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        (
+            format!(" Workflow Prompt · {} ", node.name),
+            "Ctrl+S save  ·  Enter newline  ·  Esc cancel".to_string(),
+            prompt.to_string(),
+            crate::tui::app::types::WorkflowEditorMode::AgentPrompt,
+        )
+    }
+
+    fn build_node_config_dialog(
+        &self,
+        node: &crate::domain::workflow::WorkflowNode,
+    ) -> (
+        String,
+        String,
+        String,
+        crate::tui::app::types::WorkflowEditorMode,
+    ) {
+        (
+            format!(" Workflow Config · {} ", node.name),
+            "Ctrl+S save JSON  ·  Enter newline  ·  Esc cancel".to_string(),
+            serde_json::to_string_pretty(&node.config).unwrap_or_default(),
+            crate::tui::app::types::WorkflowEditorMode::NodeConfig,
+        )
+    }
+
+    pub fn cancel_workflow_editor_dialog(&mut self) {
+        self.workflow_editor_dialog = None;
+        self.focus = Focus::Preview;
+    }
+
+    pub fn save_workflow_editor_dialog(&mut self) -> Result<()> {
+        let Some(dialog) = self.workflow_editor_dialog.take() else {
+            return Ok(());
+        };
+        let Some(node) = self.db.get_workflow_node(&dialog.node_id)? else {
+            self.focus = Focus::Preview;
+            return Ok(());
+        };
+
+        let updated_config = self.compute_updated_node_config(&dialog, &node)?;
+        self.db.update_workflow_node_details(
+            &dialog.node_id,
+            None,
+            None,
+            Some(&updated_config),
+            None,
+        )?;
+        self.focus = Focus::Preview;
+        self.refresh_workflows()?;
+        Ok(())
+    }
+
+    fn compute_updated_node_config(
+        &mut self,
+        dialog: &crate::tui::app::types::WorkflowEditorDialog,
+        node: &crate::domain::workflow::WorkflowNode,
+    ) -> Result<serde_json::Value> {
+        match dialog.mode {
+            crate::tui::app::types::WorkflowEditorMode::AgentPrompt => {
+                Ok(Self::update_prompt_config(&node.config, &dialog.buffer))
+            }
+            crate::tui::app::types::WorkflowEditorMode::NodeConfig => {
+                match serde_json::from_str::<serde_json::Value>(&dialog.buffer) {
+                    Ok(v) => Ok(v),
+                    Err(e) => {
+                        let mut d = dialog.clone();
+                        d.parse_error = Some(format!("JSON error: {e}"));
+                        self.workflow_editor_dialog = Some(d);
+                        self.focus = Focus::WorkflowEditorDialog;
+                        Err(anyhow::anyhow!("Invalid JSON"))
+                    }
+                }
+            }
+        }
+    }
+
+    fn update_prompt_config(config: &serde_json::Value, prompt: &str) -> serde_json::Value {
+        if let Some(object) = config.as_object() {
+            let mut updated = object.clone();
+            updated.insert(
+                "prompt_template".to_string(),
+                serde_json::Value::String(prompt.to_string()),
+            );
+            serde_json::Value::Object(updated)
+        } else {
+            serde_json::json!({ "prompt_template": prompt })
+        }
+    }
+
+    pub fn selected_playground_chunk(&self) -> Option<&crate::rag::vector_store::SearchResult> {
+        self.playground_results.get(self.playground_selected)
+    }
+
+    pub fn toggle_activity_panel(&mut self) {
+        if self.sidebar_mode == SidebarMode::Projects {
+            return;
+        }
+
+        let Some(workdir) = self.selected_activity_workdir().map(str::to_owned) else {
+            return;
+        };
+        let panel_rendered = self
+            .activity_panel_layout_width(self.term_width, self.activity_panel_state().is_some())
+            > 0;
+
+        if self.hidden_activity_workdirs.remove(&workdir) {
+            self.forced_activity_workdirs.insert(workdir);
+            self.sync_scroll_offset = 0;
+            return;
+        }
+
+        // Nueva lógica: siempre permite togglear el panel de actividad con F3,
+        // aunque no haya actividad previa en el workdir seleccionado.
+        if panel_rendered || self.forced_activity_workdirs.contains(&workdir) {
+            self.forced_activity_workdirs.remove(&workdir);
+            self.hidden_activity_workdirs.insert(workdir);
+        } else {
+            self.forced_activity_workdirs.insert(workdir);
+        }
+        self.sync_scroll_offset = 0;
+    }
+
+    fn live_agent_for_entry(&self, entry: &AgentEntry) -> Option<&InteractiveAgent> {
+        match entry {
+            AgentEntry::Interactive(idx) => self.interactive_agents.get(*idx),
+            AgentEntry::Terminal(idx) => self.terminal_agents.get(*idx),
+            AgentEntry::Agent(_) | AgentEntry::Group(_) => None,
+        }
+    }
+
+    fn selected_live_agent(&self) -> Option<&InteractiveAgent> {
+        self.selected_agent()
+            .and_then(|entry| self.live_agent_for_entry(entry))
+    }
+
+    /// Return the working directory of the currently selected agent,
+    /// or the parent of the data directory as a fallback.
+    pub fn current_workdir(&self) -> PathBuf {
+        if let Some(workdir) = self.workdir_for_projects_mode() {
+            return workdir;
+        }
+        if let Some(workdir) = self.workdir_for_selected_agent() {
+            return workdir;
+        }
+        self.data_dir
+            .parent()
+            .unwrap_or(&self.data_dir)
+            .to_path_buf()
+    }
+
+    fn workdir_for_projects_mode(&self) -> Option<PathBuf> {
+        if self.sidebar_mode != SidebarMode::Projects {
+            return None;
+        }
+        self.selected_project().map(|p| PathBuf::from(&p.path))
+    }
+
+    fn workdir_for_selected_agent(&self) -> Option<PathBuf> {
+        self.selected_live_agent()
+            .map(|agent| PathBuf::from(&agent.working_dir))
+    }
+
+    /// Return a unique key for the current prompt-builder session.
+    /// Uses the agent/session ID when available, falls back to workdir path.
+    pub fn current_prompt_session_key(&self) -> String {
+        if let Some(key) = self.prompt_session_key_for_selected_agent() {
+            return key;
+        }
+        if let Some(key) = self.prompt_session_key_for_selected_project() {
+            return key;
+        }
+        format!("workdir:{}", self.current_workdir().display())
+    }
+
+    fn prompt_session_key_for_selected_agent(&self) -> Option<String> {
+        let entry = self.selected_agent()?;
+        match entry {
+            types::AgentEntry::Interactive(idx) => {
+                let agent = self.interactive_agents.get(*idx)?;
+                Some(format!("interactive:{}", agent.id))
+            }
+            types::AgentEntry::Terminal(idx) => {
+                let agent = self.terminal_agents.get(*idx)?;
+                Some(format!("terminal:{}", agent.id))
+            }
+            types::AgentEntry::Agent(a) => Some(format!("agent:{}", a.id)),
+            types::AgentEntry::Group(_) => None,
+        }
+    }
+
+    fn prompt_session_key_for_selected_project(&self) -> Option<String> {
+        if self.sidebar_mode != SidebarMode::Projects {
+            return None;
+        }
+        let project = self.selected_project()?;
+        Some(format!("project:{}", project.path))
+    }
+
+    pub fn focused_agent_name(&self) -> String {
+        self.selected_live_agent()
+            .map(|agent| agent.name.clone())
+            .unwrap_or_default()
     }
 
     pub fn selected_id(&self) -> String {
@@ -457,157 +1256,187 @@ impl App {
     }
 
     pub fn toggle_enable(&self) -> Result<()> {
-        let Some(agent) = self.agents.get(self.selected) else {
+        let Some(AgentEntry::Agent(agent)) = self.agents.get(self.selected) else {
             return Ok(());
         };
-        match agent {
-            AgentEntry::Agent(a) => {
-                self.db.update_agent_enabled(&a.id, !a.enabled)?;
-            }
-            AgentEntry::Interactive(_) => {}
-            AgentEntry::Terminal(_) => {}
-            AgentEntry::Group(_) => {}
-        }
+
+        self.db.update_agent_enabled(&agent.id, !agent.enabled)?;
         Ok(())
     }
 
     fn auto_hide_sidebar(&mut self) {
-        if let Ok((tw, _th)) = ratatui::crossterm::terminal::size() {
-            self.term_width = tw;
-            let should_hide = self.focus == Focus::Agent
-                && self.selected_agent().is_some_and(|a| {
-                    matches!(a, AgentEntry::Interactive(_) | AgentEntry::Terminal(_))
-                })
-                && tw < 80;
-            let should_show = tw >= 80 && !self.sidebar_visible;
-            if should_hide {
-                self.sidebar_visible = false;
-            } else if should_show {
-                self.sidebar_visible = true;
-            }
+        let Ok((tw, _th)) = ratatui::crossterm::terminal::size() else {
+            return;
+        };
+
+        self.term_width = tw;
+        let should_hide =
+            self.focus == Focus::Agent && self.selected_live_agent().is_some() && tw < 80;
+        let should_show = tw >= 80 && !self.sidebar_visible;
+        if should_hide {
+            self.sidebar_visible = false;
+        } else if should_show {
+            self.sidebar_visible = true;
         }
+    }
+
+    fn clamp_workflow_selection(&mut self) {
+        let Some(details) = self.workflow_details.as_ref() else {
+            self.workflow_selected_spec = 0;
+            self.workflow_selected_node = 0;
+            return;
+        };
+        if details.specs.is_empty() {
+            self.workflow_selected_spec = 0;
+            self.workflow_selected_node = 0;
+            return;
+        }
+
+        self.workflow_selected_spec = self.workflow_selected_spec.min(details.specs.len() - 1);
+        let node_count = details.specs[self.workflow_selected_spec].nodes.len();
+        self.workflow_selected_node = if node_count == 0 {
+            0
+        } else {
+            self.workflow_selected_node.min(node_count - 1)
+        };
+    }
+
+    fn default_workflow_spec_index(&self) -> usize {
+        self.workflow_details
+            .as_ref()
+            .and_then(|details| {
+                details
+                    .specs
+                    .iter()
+                    .position(|spec| spec.spec.status == WorkflowSpecStatus::Running)
+                    .or_else(|| {
+                        details
+                            .specs
+                            .iter()
+                            .position(|spec| spec.spec.status == WorkflowSpecStatus::Pending)
+                    })
+            })
+            .unwrap_or(0)
+    }
+
+    fn refresh_workflow_runs_for_selected_spec(&mut self) {
+        self.workflow_runs.clear();
+        let Some(spec) = self.selected_workflow_spec() else {
+            return;
+        };
+        self.workflow_runs = self
+            .db
+            .list_workflow_runs_for_spec(&spec.spec.id)
+            .unwrap_or_default();
+    }
+
+    fn select_default_workflow_node_if_needed(&mut self, reset: bool) {
+        let Some(spec) = self.selected_workflow_spec() else {
+            self.workflow_selected_node = 0;
+            return;
+        };
+        if spec.nodes.is_empty() {
+            self.workflow_selected_node = 0;
+            return;
+        }
+
+        if !reset && self.workflow_selected_node < spec.nodes.len() {
+            return;
+        }
+
+        let current_node_id = self
+            .workflow_runs
+            .iter()
+            .rev()
+            .find(|run| run.status == crate::domain::workflow::WorkflowRunStatus::Running)
+            .or_else(|| self.workflow_runs.last())
+            .map(|run| run.node_id.as_str());
+
+        self.workflow_selected_node = current_node_id
+            .and_then(|node_id| spec.nodes.iter().position(|node| node.id == node_id))
+            .unwrap_or(0);
     }
 
     fn update_whimsg_context(&mut self) {
         use crate::tui::whimsg::WhimContext;
-        use std::time::Duration;
 
-        // CRITICAL: If daemon is down, everything is an error state
         if !self.daemon_running {
             self.whimsg.set_ambient(WhimContext::AgentFailed);
             self.whimsg.notify_event(WhimContext::AgentFailed);
             return;
         }
 
-        // Check global health: recent background agent failures
-        let now = Utc::now();
-        for run in &self.recent_runs {
-            if let Some(finished) = run.finished_at {
-                let seconds_since = (now - finished).num_seconds();
-                if seconds_since < 60 {
-                    match run.status {
-                        crate::domain::models::RunStatus::Error
-                        | crate::domain::models::RunStatus::Timeout => {
-                            self.whimsg.notify_event(WhimContext::AgentFailed);
-                        }
-                        crate::domain::models::RunStatus::Success => {
-                            self.whimsg.notify_event(WhimContext::AgentDone);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
+        self.check_recent_run_events();
 
-        // Check if user scrolled recently
-        if self.last_scroll_at.elapsed() < Duration::from_secs(5) {
+        if self.last_scroll_at.elapsed() < std::time::Duration::from_secs(5) {
             self.whimsg.set_ambient(WhimContext::Scrolling);
             return;
         }
 
-        // Scan logs of selected agent for contextual triggers.
-        // Only re-evaluate when the log content actually changes.
-        if let Some(agent) = self.agents.get(self.selected) {
-            let raw_log = match agent {
-                AgentEntry::Interactive(idx) => {
-                    if let Some(ia) = self.interactive_agents.get(*idx) {
-                        ia.last_lines(50)
-                    } else {
-                        String::new()
-                    }
+        self.check_log_context();
+        self.update_ambient_context();
+    }
+
+    fn check_recent_run_events(&mut self) {
+        use crate::tui::whimsg::WhimContext;
+        let now = Utc::now();
+        let statuses: Vec<_> = self
+            .recent_runs
+            .iter()
+            .filter_map(|run| {
+                let finished = run.finished_at?;
+                if (now - finished).num_seconds() >= 60 {
+                    return None;
                 }
-                AgentEntry::Terminal(idx) => {
-                    if let Some(ia) = self.terminal_agents.get(*idx) {
-                        ia.last_lines(50)
-                    } else {
-                        String::new()
-                    }
+                match run.status {
+                    crate::domain::models::RunStatus::Error
+                    | crate::domain::models::RunStatus::Timeout => Some(WhimContext::AgentFailed),
+                    crate::domain::models::RunStatus::Success => Some(WhimContext::AgentDone),
+                    _ => None,
                 }
-                _ => self.log_content.clone(),
-            };
+            })
+            .collect();
+        for ctx in statuses {
+            self.whimsg.notify_event(ctx);
+        }
+    }
 
-            if !raw_log.is_empty() {
-                // Simple hash to detect changes — avoid re-firing on the same content
-                let log_hash: u64 = raw_log.bytes().enumerate().fold(0u64, |acc, (i, b)| {
-                    acc.wrapping_add((b as u64).wrapping_mul(i as u64 + 1))
-                });
-
-                if log_hash != self.whimsg_last_log_hash {
-                    self.whimsg_last_log_hash = log_hash;
-
-                    let log_up = raw_log.to_uppercase();
-
-                    // Error keywords — specific phrases to reduce false positives.
-                    // Avoid single "ERROR" or "FAILED" which appear in normal agent output
-                    // (e.g. "no errors found", "error handling", "failed test cases: 0").
-                    let is_error = log_up.contains("ERROR")
-                        || log_up.contains("FAILED")
-                        || log_up.contains("EXCEPTION")
-                        || log_up.contains("PANIC")
-                        || log_up.contains("SEGFAULT")
-                        || log_up.contains("TIMED OUT")
-                        || log_up.contains("CONNECTION REFUSED")
-                        || log_up.contains("PERMISSION DENIED")
-                        || log_up.contains("HALTED")
-                        // Spanish
-                        || log_up.contains("PROBLEMA")
-                        || log_up.contains("FALLO")
-                        || log_up.contains("FALLANDO");
-
-                    let is_success = log_up.contains("SUCCESS")
-                        || log_up.contains("ALL TESTS PASSED")
-                        || log_up.contains("BUILD SUCCEEDED")
-                        || log_up.contains("FINISHED")
-                        || log_up.contains("COMPLETED")
-                        || log_up.contains("DONE.")
-                        || log_up.contains("STABILIZED")
-                        || log_up.contains("READY")
-                        || log_up.contains("CONVERGED")
-                        || log_up.contains("DEPLOYED")
-                        // Spanish
-                        || log_up.contains("EXCELENTE")
-                        || log_up.contains("COMPLETADO")
-                        || log_up.contains("HECHO")
-                        || log_up.contains("LISTO")
-                        || log_up.contains("TERMINADO");
-
-                    let is_spawn = log_up.contains("SPAWNING")
-                        || log_up.contains("STARTING UP")
-                        || log_up.contains("BOOTSTRAPPING")
-                        || log_up.contains("INITIALIZING");
-
-                    if is_error {
-                        self.whimsg.notify_event(WhimContext::AgentFailed);
-                    } else if is_success {
-                        self.whimsg.notify_event(WhimContext::AgentDone);
-                    } else if is_spawn {
-                        self.whimsg.notify_event(WhimContext::AgentSpawned);
-                    }
-                }
-            }
+    fn check_log_context(&mut self) {
+        let raw_log = self.selected_log_excerpt();
+        if raw_log.is_empty() {
+            return;
         }
 
-        // Check how many interactive agents are running
+        self.notify_whimsg_for_log(&raw_log);
+    }
+
+    fn selected_log_excerpt(&self) -> String {
+        self.selected_live_agent()
+            .map(|agent| agent.visible_text())
+            .unwrap_or_else(|| self.log_content.clone())
+    }
+
+    fn notify_whimsg_for_log(&mut self, raw_log: &str) {
+        use crate::tui::whimsg::WhimContext;
+
+        let log_hash = calculate_log_hash(raw_log);
+        if log_hash == self.whimsg_last_log_hash {
+            return;
+        }
+        self.whimsg_last_log_hash = log_hash;
+
+        let log_up = raw_log.to_uppercase();
+        if log_contains_error(&log_up) {
+            self.whimsg.notify_event(WhimContext::AgentFailed);
+        } else if log_contains_success(&log_up) {
+            self.whimsg.notify_event(WhimContext::AgentDone);
+        } else if log_contains_spawn(&log_up) {
+            self.whimsg.notify_event(WhimContext::AgentSpawned);
+        }
+    }
+
+    fn update_ambient_context(&mut self) {
+        use crate::tui::whimsg::WhimContext;
         let running = self
             .interactive_agents
             .iter()
@@ -615,41 +1444,51 @@ impl App {
             .count();
         let has_active_runs = !self.active_runs.is_empty();
 
-        if running >= 3 || (running >= 1 && has_active_runs) {
-            self.whimsg.set_ambient(WhimContext::Busy);
+        let ctx = if running >= 3 || (running >= 1 && has_active_runs) {
+            WhimContext::Busy
         } else if has_active_runs {
-            self.whimsg.set_ambient(WhimContext::TaskRunning);
+            WhimContext::TaskRunning
         } else {
-            self.whimsg.set_ambient(WhimContext::Idle);
-        }
+            WhimContext::Idle
+        };
+        self.whimsg.set_ambient(ctx);
     }
 
     // ── Split Groups ────────────────────────────────────────────
 
     /// Open the split picker to pair the current session with another.
     pub fn open_split_picker(&mut self) {
-        let mut sessions: Vec<(String, String)> = Vec::new();
-        for a in &self.interactive_agents {
-            sessions.push((a.name.clone(), "Interactive".to_string()));
-        }
-        for a in &self.terminal_agents {
-            sessions.push((a.name.clone(), "Terminal".to_string()));
-        }
+        let sessions = self.available_split_sessions();
         if sessions.len() < 2 {
             return;
         }
+
         self.split_picker_sessions = sessions;
         self.split_picker_idx = 0;
         self.split_picker_orientation = crate::domain::models::SplitOrientation::Horizontal;
         self.split_picker_open = true;
     }
 
+    fn available_split_sessions(&self) -> Vec<(String, String)> {
+        self.interactive_agents
+            .iter()
+            .map(|agent| (agent.name.clone(), "Interactive".to_string()))
+            .chain(
+                self.terminal_agents
+                    .iter()
+                    .map(|agent| (agent.name.clone(), "Terminal".to_string())),
+            )
+            .collect()
+    }
+
+    fn selected_session_name(&self) -> Option<String> {
+        self.selected_live_agent().map(|agent| agent.name.clone())
+    }
+
     /// Create a split group from the current session and the picker selection.
     pub fn create_split(&mut self) {
-        let current_name = match self.selected_agent() {
-            Some(AgentEntry::Interactive(idx)) => self.interactive_agents[*idx].name.clone(),
-            Some(AgentEntry::Terminal(idx)) => self.terminal_agents[*idx].name.clone(),
-            _ => return,
+        let Some(current_name) = self.selected_session_name() else {
+            return;
         };
         let Some((other_name, _)) = self
             .split_picker_sessions
@@ -661,6 +1500,7 @@ impl App {
         if current_name == other_name {
             return;
         }
+
         let id = format!("split-{}", &uuid::Uuid::new_v4().to_string()[..8]);
         let group = crate::domain::models::SplitGroup {
             id: id.clone(),
@@ -678,7 +1518,6 @@ impl App {
         self.active_split_id = Some(id);
         self.split_groups.push(group);
         self.split_picker_open = false;
-        // Immediately enter split view in agent focus
         self.split_right_focused = false;
         self.focus = Focus::Agent;
     }
@@ -716,12 +1555,113 @@ impl App {
 
     /// Advance the modal from Preview to AgentPicker.
     pub fn context_transfer_to_picker(&mut self) {
-        if let Some(modal) = &mut self.context_transfer_modal {
-            if modal.step == ContextTransferStep::Preview {
-                modal.step = ContextTransferStep::AgentPicker;
-                modal.picker_selected = 0;
-            }
+        let Some(modal) = &mut self.context_transfer_modal else {
+            return;
+        };
+        if modal.step != ContextTransferStep::Preview {
+            return;
         }
+
+        modal.step = ContextTransferStep::AgentPicker;
+        modal.picker_selected = 0;
+    }
+
+    fn interactive_picker_destination(&self, dest_entry_idx: usize) -> Option<usize> {
+        self.picker_interactive_entries()
+            .get(dest_entry_idx)
+            .copied()
+            .filter(|idx| *idx < self.interactive_agents.len())
+    }
+
+    fn focus_interactive_agent(&mut self, dest_ia_idx: usize) {
+        if let Some(entry_pos) = self.find_agent_entry_position(dest_ia_idx) {
+            self.selected = entry_pos;
+        }
+        self.focus = Focus::Agent;
+    }
+
+    fn find_agent_entry_position(&self, dest_ia_idx: usize) -> Option<usize> {
+        self.agents
+            .iter()
+            .position(|entry| matches!(entry, AgentEntry::Interactive(idx) if *idx == dest_ia_idx))
+    }
+
+    fn open_context_prompt_dialog(&mut self, context_payload: String, rag_query: Option<String>) {
+        let mut initial_content = HashMap::from([("context".to_string(), context_payload)]);
+        if let Some(query) = rag_query.filter(|query| !query.trim().is_empty()) {
+            initial_content.insert("rag_search".to_string(), format!("global: {query}"));
+        }
+        self.open_simple_prompt_dialog(Some(initial_content));
+    }
+
+    fn context_transfer_source_for_entry(
+        &self,
+        entry: &AgentEntry,
+    ) -> Option<ContextTransferSource> {
+        match entry {
+            AgentEntry::Interactive(idx) => self
+                .interactive_agents
+                .get(*idx)
+                .map(|_| ContextTransferSource::Interactive(*idx)),
+            AgentEntry::Terminal(idx) => self
+                .terminal_agents
+                .get(*idx)
+                .map(|_| ContextTransferSource::Terminal(*idx)),
+            AgentEntry::Agent(_) | AgentEntry::Group(_) => None,
+        }
+    }
+
+    fn context_transfer_source_for_kind(
+        &self,
+        kind: ContextSourceKind,
+        idx: usize,
+    ) -> Option<ContextTransferSource> {
+        match kind {
+            ContextSourceKind::Interactive => self
+                .interactive_agents
+                .get(idx)
+                .map(|_| ContextTransferSource::Interactive(idx)),
+            ContextSourceKind::Terminal => self
+                .terminal_agents
+                .get(idx)
+                .map(|_| ContextTransferSource::Terminal(idx)),
+        }
+    }
+
+    fn context_transfer_agent(&self, source: ContextTransferSource) -> Option<&InteractiveAgent> {
+        match source {
+            ContextTransferSource::Interactive(idx) => self.interactive_agents.get(idx),
+            ContextTransferSource::Terminal(idx) => self.terminal_agents.get(idx),
+        }
+    }
+
+    fn context_transfer_source_kind(source: ContextTransferSource) -> ContextSourceKind {
+        match source {
+            ContextTransferSource::Interactive(_) => ContextSourceKind::Interactive,
+            ContextTransferSource::Terminal(_) => ContextSourceKind::Terminal,
+        }
+    }
+
+    fn interactive_capture_units(
+        agent: &InteractiveAgent,
+        capture_kind: ContextCaptureKind,
+    ) -> usize {
+        match capture_kind {
+            ContextCaptureKind::Prompts => interactive_prompt_count(agent),
+            ContextCaptureKind::LinePages => interactive_line_page_count(agent),
+        }
+    }
+
+    fn context_transfer_max_units_for_source(
+        &self,
+        source: ContextTransferSource,
+        capture_kind: ContextCaptureKind,
+    ) -> Option<usize> {
+        let ContextTransferSource::Interactive(_) = source else {
+            return Some(20);
+        };
+        let agent = self.context_transfer_agent(source)?;
+        Some(Self::interactive_capture_units(agent, capture_kind).max(1))
     }
 
     /// Execute the context transfer to the selected destination agent.
@@ -733,51 +1673,29 @@ impl App {
         let Some(modal) = self.context_transfer_modal.take() else {
             return;
         };
-
-        let dest_agent_idx = {
-            let picker_entries = self.picker_interactive_entries();
-            picker_entries.get(dest_entry_idx).copied()
-        };
-        let Some(dest_ia_idx) = dest_agent_idx else {
+        let Some(dest_ia_idx) = self.interactive_picker_destination(dest_entry_idx) else {
             return;
         };
-
-        if dest_ia_idx >= self.interactive_agents.len() {
-            return;
-        }
-
         let Some(payload) = self.build_context_transfer_payload(&modal) else {
             return;
         };
 
-        // Always switch tab to destination so the user sees where the context is going
-        if let Some(entry_pos) = self
-            .agents
-            .iter()
-            .position(|a| matches!(a, AgentEntry::Interactive(i) if *i == dest_ia_idx))
-        {
-            self.selected = entry_pos;
-        }
-        self.focus = Focus::Agent;
-
-        // Prepare initial content for the simple prompt dialog
-        let mut initial_content = HashMap::new();
-        // Always put context transfer content in the "context" section
-        initial_content.insert("context".to_string(), payload);
-
-        // Open the prompt template dialog with the pre-filled context
-        self.open_simple_prompt_dialog(Some(initial_content));
+        self.focus_interactive_agent(dest_ia_idx);
+        self.open_context_prompt_dialog(payload, None);
     }
 
     pub(crate) fn refresh_context_transfer_preview(&mut self) {
-        let Some((source, n_prompts)) = self.context_transfer_modal.as_ref().and_then(|modal| {
-            self.modal_source(modal)
-                .map(|source| (source, modal.n_prompts))
-        }) else {
+        let Some((source, n_units, capture_kind)) =
+            self.context_transfer_modal.as_ref().and_then(|modal| {
+                self.modal_source(modal)
+                    .map(|source| (source, modal.n_units, modal.capture_kind))
+            })
+        else {
             return;
         };
 
-        let Some(preview) = self.build_context_transfer_payload_from_source(source, n_prompts)
+        let Some(preview) =
+            self.build_context_transfer_payload_from_source(source, n_units, capture_kind)
         else {
             return;
         };
@@ -789,36 +1707,12 @@ impl App {
 
     pub(crate) fn context_transfer_max_units(&self) -> Option<usize> {
         let modal = self.context_transfer_modal.as_ref()?;
-        let max_units = match self.modal_source(modal)? {
-            ContextTransferSource::Interactive(idx) => self
-                .interactive_agents
-                .get(idx)
-                .and_then(|agent| {
-                    agent
-                        .prompt_history
-                        .lock()
-                        .ok()
-                        .map(|history| history.len())
-                })
-                .unwrap_or(0)
-                .max(1),
-            ContextTransferSource::Terminal(_) => 20,
-        };
-        Some(max_units)
+        self.context_transfer_max_units_for_source(self.modal_source(modal)?, modal.capture_kind)
     }
 
     fn selected_context_transfer_source(&self) -> Option<ContextTransferSource> {
-        match self.selected_agent()? {
-            AgentEntry::Interactive(idx) => self
-                .interactive_agents
-                .get(*idx)
-                .map(|_| ContextTransferSource::Interactive(*idx)),
-            AgentEntry::Terminal(idx) => self
-                .terminal_agents
-                .get(*idx)
-                .map(|_| ContextTransferSource::Terminal(*idx)),
-            _ => None,
-        }
+        self.selected_agent()
+            .and_then(|entry| self.context_transfer_source_for_entry(entry))
     }
 
     fn active_split_session_name(&self) -> Option<String> {
@@ -852,7 +1746,6 @@ impl App {
         let Some(source) = source else {
             return;
         };
-
         let Some(mut modal) = self.modal_for_context_transfer_source(source) else {
             return;
         };
@@ -870,140 +1763,234 @@ impl App {
         source: ContextTransferSource,
     ) -> Option<ContextTransferModal> {
         match source {
-            ContextTransferSource::Interactive(idx) => self
-                .interactive_agents
-                .get(idx)
-                .map(|_| ContextTransferModal::new(idx, &self.context_transfer_config)),
-            ContextTransferSource::Terminal(idx) => self
-                .terminal_agents
-                .get(idx)
-                .map(|_| ContextTransferModal::new_terminal(idx, &self.context_transfer_config)),
+            ContextTransferSource::Interactive(idx) => self.build_interactive_transfer_modal(idx),
+            ContextTransferSource::Terminal(idx) => self.build_terminal_transfer_modal(idx),
         }
+    }
+
+    fn build_interactive_transfer_modal(&self, idx: usize) -> Option<ContextTransferModal> {
+        let agent = self.context_transfer_agent(ContextTransferSource::Interactive(idx))?;
+        let capture_kind = interactive_capture_kind(agent);
+        let max_units = Self::interactive_capture_units(agent, capture_kind);
+        let initial_units = if capture_kind == ContextCaptureKind::LinePages {
+            1
+        } else {
+            initial_capture_units(max_units, &self.context_transfer_config)
+        };
+        Some(ContextTransferModal::new(idx, capture_kind, initial_units))
+    }
+
+    fn build_terminal_transfer_modal(&self, idx: usize) -> Option<ContextTransferModal> {
+        self.context_transfer_agent(ContextTransferSource::Terminal(idx))?;
+        Some(ContextTransferModal::new_terminal(idx, 1))
     }
 
     fn modal_source(&self, modal: &ContextTransferModal) -> Option<ContextTransferSource> {
-        match modal.source_kind() {
-            ContextSourceKind::Interactive => self
-                .interactive_agents
-                .get(modal.source_agent_idx)
-                .map(|_| ContextTransferSource::Interactive(modal.source_agent_idx)),
-            ContextSourceKind::Terminal => self
-                .terminal_agents
-                .get(modal.source_agent_idx)
-                .map(|_| ContextTransferSource::Terminal(modal.source_agent_idx)),
-        }
+        self.context_transfer_source_for_kind(modal.source_kind(), modal.source_agent_idx)
     }
 
     fn build_context_transfer_payload(&self, modal: &ContextTransferModal) -> Option<String> {
-        self.build_context_transfer_payload_from_source(self.modal_source(modal)?, modal.n_prompts)
+        self.build_context_transfer_payload_from_source(
+            self.modal_source(modal)?,
+            modal.n_units,
+            modal.capture_kind,
+        )
     }
 
     fn build_context_transfer_payload_from_source(
         &self,
         source: ContextTransferSource,
-        n_prompts: usize,
+        n_units: usize,
+        capture_kind: ContextCaptureKind,
     ) -> Option<String> {
-        match source {
-            ContextTransferSource::Interactive(idx) => {
-                self.interactive_agents.get(idx).map(|agent| {
-                    build_context_payload_for(agent, n_prompts, ContextSourceKind::Interactive)
-                })
-            }
-            ContextTransferSource::Terminal(idx) => self.terminal_agents.get(idx).map(|agent| {
-                build_context_payload_for(agent, n_prompts, ContextSourceKind::Terminal)
-            }),
-        }
+        let agent = self.context_transfer_agent(source)?;
+        Some(build_context_payload_for(
+            agent,
+            n_units,
+            Self::context_transfer_source_kind(source),
+            capture_kind,
+        ))
     }
 
     /// Collect interactive agent indices for use in the picker list.
     pub fn picker_interactive_entries(&self) -> Vec<usize> {
+        (0..self.interactive_agents.len()).collect()
+    }
+
+    pub fn open_rag_transfer_modal(&mut self) {
+        let Some(chunk) = self.selected_playground_chunk() else {
+            return;
+        };
+
+        let query = self.playground_query.trim().to_string();
+        let context_payload = format!(
+            "kind: rag_chunk\nquery: {}\npath: {}\ndistance: {}\ncontent:\n{}",
+            query,
+            chunk.file_path,
+            chunk
+                .distance
+                .map_or("—".to_string(), |d| format!("{d:.4}")),
+            chunk.content
+        );
+
+        self.rag_transfer_modal = Some(RagTransferModal {
+            picker_selected: 0,
+            query,
+            context_payload,
+        });
+        self.focus = Focus::RagTransfer;
+    }
+
+    pub fn close_rag_transfer_modal(&mut self) {
+        self.rag_transfer_modal = None;
+        self.focus = Focus::Preview;
+    }
+
+    pub fn execute_rag_transfer(&mut self, dest_entry_idx: usize) {
+        let Some(modal) = self.rag_transfer_modal.take() else {
+            return;
+        };
+        let Some(dest_ia_idx) = self.interactive_picker_destination(dest_entry_idx) else {
+            return;
+        };
+
+        self.focus_interactive_agent(dest_ia_idx);
+        self.open_context_prompt_dialog(modal.context_payload, Some(modal.query));
+    }
+
+    fn session_panel_size() -> (u16, u16) {
+        let (tw, th) = ratatui::crossterm::terminal::size().unwrap_or((120, 40));
+        (tw.saturating_sub(28), th.saturating_sub(4))
+    }
+
+    fn interactive_agent_names(&self) -> Vec<&str> {
         self.interactive_agents
             .iter()
-            .enumerate()
-            .map(|(i, _)| i)
+            .map(|agent| agent.name.as_str())
             .collect()
     }
 
-    /// Auto-resume previously active interactive sessions from the registry.
-    ///
-    /// On startup, any sessions marked 'active' are from a previous canopy run
-    /// where the PTY processes have since died. For CLIs that support resume
-    /// (e.g. `--continue`), we re-launch in resume mode in the same directory.
+    fn terminal_agent_names(&self) -> Vec<&str> {
+        self.terminal_agents
+            .iter()
+            .map(|agent| agent.name.as_str())
+            .collect()
+    }
+
+    fn resume_session_accent(
+        cli_config: Option<&crate::domain::cli_config::CliConfig>,
+    ) -> ratatui::style::Color {
+        cli_config
+            .and_then(|config| config.accent_color)
+            .map(|[r, g, b]| ratatui::style::Color::Rgb(r, g, b))
+            .unwrap_or(ratatui::style::Color::Rgb(102, 187, 106))
+    }
+
+    fn resume_interactive_session(
+        &mut self,
+        session: &crate::db::session::InteractiveSession,
+        canopy_config: &crate::domain::canopy_config::CanopyConfig,
+        cols: u16,
+        rows: u16,
+    ) {
+        let cli = crate::domain::models::Cli::from_str(&session.cli);
+        let cli_config = canopy_config.get_cli(cli.as_str());
+        let args = build_resumed_session_args(
+            session,
+            cli_config.and_then(|config| config.interactive_args.as_deref()),
+            cli_config.and_then(|config| config.resume_args.as_deref()),
+            cli_config.and_then(|config| config.session_resume_cmd.as_deref()),
+            cli_config.and_then(|config| config.yolo_flag.as_deref()),
+        );
+        let existing_ids = self.interactive_agent_names();
+
+        let agent = match InteractiveAgent::spawn(
+            cli.clone(),
+            &session.working_dir,
+            cols,
+            rows,
+            args.as_deref(),
+            cli_config.and_then(|config| config.fallback_interactive_args.as_deref()),
+            Self::resume_session_accent(cli_config),
+            Some(&session.name),
+            &existing_ids,
+            None,
+            cli_config.and_then(|config| config.model_flag.as_deref()),
+            None,
+        ) {
+            Ok(agent) => agent,
+            Err(e) => {
+                tracing::warn!("Failed to auto-resume session '{}': {e}", session.name);
+                return;
+            }
+        };
+
+        let _ = self.db.insert_interactive_session(
+            &agent.id,
+            &agent.name,
+            cli.as_str(),
+            &session.working_dir,
+            args.as_deref(),
+            &session.session_type,
+        );
+        self.interactive_agents.push(agent);
+    }
+
+    fn resume_terminal_session(
+        &mut self,
+        session: &crate::db::session::TerminalSession,
+        cols: u16,
+        rows: u16,
+    ) {
+        let existing_refs = self.terminal_agent_names();
+        let agent = match InteractiveAgent::spawn_terminal(
+            &session.shell,
+            &session.working_dir,
+            cols,
+            rows,
+            Some(&session.name),
+            &existing_refs,
+            crate::tui::ui::ACCENT,
+        ) {
+            Ok(agent) => agent,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to auto-resume terminal session '{}': {e}",
+                    session.name
+                );
+                return;
+            }
+        };
+
+        let _ = self.db.insert_terminal_session(
+            &agent.id,
+            &agent.name,
+            &session.shell,
+            &session.working_dir,
+        );
+        let hist = super::terminal_history::load_history(&self.data_dir, &agent.name);
+        agent.replay_scrollback_lines(&hist.scrollback);
+        self.terminal_histories.insert(agent.name.clone(), hist);
+        self.terminal_agents.push(agent);
+    }
+
     pub fn auto_resume_sessions(&mut self) {
         let Ok(sessions) = self.db.get_active_sessions() else {
             return;
         };
-
         if sessions.is_empty() {
             tracing::info!("No active sessions to resume");
             return;
         }
-
         tracing::info!("Resuming {} active session(s)", sessions.len());
-
-        // Mark all old active sessions as orphaned first
         let _ = self.db.mark_orphaned_sessions();
 
         let home = dirs::home_dir().unwrap_or_default();
-        let canopy_dir = home.join(".canopy");
-        let canopy_config = crate::domain::canopy_config::CanopyConfig::load(&canopy_dir);
-
-        let (cols, rows) = {
-            let (tw, th) = ratatui::crossterm::terminal::size().unwrap_or((120, 40));
-            (tw.saturating_sub(28), th.saturating_sub(4))
-        };
+        let canopy_config = crate::domain::canopy_config::CanopyConfig::load(&home.join(".canopy"));
+        let (cols, rows) = Self::session_panel_size();
 
         for session in &sessions {
-            let cli = crate::domain::models::Cli::from_str(&session.cli);
-
-            // Get CLI config for interactive args and accent color
-            let cli_config = canopy_config.get_cli(cli.as_str());
-            let interactive_args = cli_config.and_then(|c| c.interactive_args.as_deref());
-            let fallback = cli_config.and_then(|c| c.fallback_interactive_args.as_deref());
-            let accent = cli_config
-                .and_then(|c| c.accent_color)
-                .map(|[r, g, b]| ratatui::style::Color::Rgb(r, g, b))
-                .unwrap_or(ratatui::style::Color::Rgb(102, 187, 106));
-
-            let yolo_flag = cli_config.and_then(|c| c.yolo_flag.as_deref());
-            let args_str = build_resumed_session_args(session, interactive_args, yolo_flag);
-            let args = args_str.as_deref();
-            let model: Option<String> = None; // No model info in session registry
-            let model_flag = cli_config.and_then(|c| c.model_flag.clone());
-
-            let existing_ids: Vec<&str> = self
-                .interactive_agents
-                .iter()
-                .map(|a| a.name.as_str())
-                .collect();
-
-            match InteractiveAgent::spawn(
-                cli.clone(),
-                &session.working_dir,
-                cols,
-                rows,
-                args,
-                fallback,
-                accent,
-                Some(&session.name),
-                &existing_ids,
-                model.as_deref(),
-                model_flag.as_deref(),
-            ) {
-                Ok(agent) => {
-                    let _ = self.db.insert_interactive_session(
-                        &agent.id,
-                        &agent.name,
-                        cli.as_str(),
-                        &session.working_dir,
-                        args,
-                    );
-                    self.interactive_agents.push(agent);
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to auto-resume session '{}': {e}", session.name);
-                }
-            }
+            self.resume_interactive_session(session, &canopy_config, cols, rows);
         }
 
         if !self.interactive_agents.is_empty() {
@@ -1011,63 +1998,21 @@ impl App {
         }
     }
 
-    /// Auto-resume previously active terminal sessions.
-    ///
-    /// Terminal sessions are simpler than interactive — no CLI resume args needed,
-    /// just re-spawn a shell in the same working directory with the same name.
     pub fn auto_resume_terminal_sessions(&mut self) {
         let Ok(sessions) = self.db.get_active_terminal_sessions() else {
             return;
         };
-
         if sessions.is_empty() {
             tracing::info!("No active terminal sessions to resume");
             return;
         }
-
         tracing::info!("Resuming {} terminal session(s)", sessions.len());
         let _ = self.db.mark_orphaned_terminal_sessions();
 
-        let (cols, rows) = {
-            let (tw, th) = ratatui::crossterm::terminal::size().unwrap_or((120, 40));
-            (tw.saturating_sub(28), th.saturating_sub(4))
-        };
+        let (cols, rows) = Self::session_panel_size();
 
         for session in &sessions {
-            let existing_refs: Vec<&str> = self
-                .terminal_agents
-                .iter()
-                .map(|a| a.name.as_str())
-                .collect();
-
-            match InteractiveAgent::spawn_terminal(
-                &session.shell,
-                &session.working_dir,
-                cols,
-                rows,
-                Some(&session.name),
-                &existing_refs,
-                crate::tui::ui::ACCENT,
-            ) {
-                Ok(agent) => {
-                    let _ = self.db.insert_terminal_session(
-                        &agent.id,
-                        &agent.name,
-                        &session.shell,
-                        &session.working_dir,
-                    );
-                    // Load command history into cache
-                    let hist = super::terminal_history::load_history(&self.data_dir, &agent.name);
-                    self.terminal_histories.insert(agent.name.clone(), hist);
-                    self.terminal_agents.push(agent);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to auto-resume terminal session '{}': {e}",
-                        session.name
-                    );
-                }
-            }
+            self.resume_terminal_session(session, cols, rows);
         }
 
         if !self.terminal_agents.is_empty() {
@@ -1076,36 +2021,248 @@ impl App {
     }
 }
 
-// ── Free functions ──────────────────────────────────────────────
+#[derive(Debug, Clone, Copy, Default)]
+struct SystemSample {
+    cpu_usage: f32,
+    mem_pct: f32,
+    load: f32,
+    cpu_temp: f32,
+    gpu_usage: f32,
+    gpu_temp: f32,
+}
 
-pub fn relative_time(dt: &DateTime<Utc>) -> String {
-    let delta = Utc::now().signed_duration_since(*dt);
-    let secs = delta.num_seconds();
-    if secs < 60 {
-        "just now".to_string()
-    } else if secs < 3600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86400 {
-        format!("{}h ago", secs / 3600)
+fn sample_from(info: &crate::system::SystemInfo) -> SystemSample {
+    let mem_pct = if info.memory_total > 0 {
+        (info.memory_used as f32 / info.memory_total as f32) * 100.0
     } else {
-        format!("{}d ago", secs / 86400)
+        0.0
+    };
+
+    SystemSample {
+        cpu_usage: info.cpu_usage,
+        mem_pct,
+        load: info.load_average.unwrap_or(0.0) as f32,
+        cpu_temp: info.cpu_temperature.unwrap_or(0.0),
+        gpu_usage: info.gpu_info.as_ref().and_then(|g| g.usage).unwrap_or(0.0),
+        gpu_temp: info
+            .gpu_info
+            .as_ref()
+            .and_then(|g| g.temperature)
+            .unwrap_or(0.0),
     }
 }
 
-pub(super) fn tail_lines(content: &str, n: usize) -> String {
-    let lines: Vec<&str> = content.lines().collect();
-    let start = lines.len().saturating_sub(n);
-    lines[start..].join("\n")
+fn adaptive_change_score(prev: SystemSample, next: SystemSample) -> f32 {
+    let cpu_delta = (next.cpu_usage - prev.cpu_usage).abs() / 100.0;
+    let mem_delta = (next.mem_pct - prev.mem_pct).abs() / 100.0;
+    let load_delta = ((next.load - prev.load).abs() / 2.0).clamp(0.0, 1.0);
+    let cpu_temp_delta = ((next.cpu_temp - prev.cpu_temp).abs() / 20.0).clamp(0.0, 1.0);
+    let gpu_usage_delta = (next.gpu_usage - prev.gpu_usage).abs() / 100.0;
+    let gpu_temp_delta = ((next.gpu_temp - prev.gpu_temp).abs() / 20.0).clamp(0.0, 1.0);
+
+    cpu_delta
+        .max(mem_delta)
+        .max(load_delta)
+        .max(cpu_temp_delta)
+        .max(gpu_usage_delta)
+        .max(gpu_temp_delta)
+        .clamp(0.0, 1.0)
 }
 
-pub(super) fn is_process_running(pid: u32) -> bool {
-    crate::daemon::process::is_process_running(pid)
+fn adaptive_poll_interval_ms(change_score: f32) -> u64 {
+    const MIN_MS: f32 = 500.0;
+    const MAX_MS: f32 = 3_000.0;
+    let score = change_score.clamp(0.0, 1.0);
+    (MAX_MS - ((MAX_MS - MIN_MS) * score)) as u64
+}
+
+fn lerp_f32(from: f32, to: f32, t: f32) -> f32 {
+    from + (to - from) * t
+}
+
+fn lerp_u64(from: u64, to: u64, t: f32) -> u64 {
+    (from as f32 + (to as f32 - from as f32) * t).round() as u64
+}
+
+fn blend_optional_f32(current: Option<f32>, target: Option<f32>, t: f32) -> Option<f32> {
+    match (current, target) {
+        (Some(a), Some(b)) => Some(lerp_f32(a, b, t)),
+        (_, value) => value,
+    }
+}
+
+fn blend_optional_f64(current: Option<f64>, target: Option<f64>, t: f32) -> Option<f64> {
+    match (current, target) {
+        (Some(a), Some(b)) => Some(lerp_f32(a as f32, b as f32, t) as f64),
+        (_, value) => value,
+    }
+}
+
+fn blend_gpu_info(
+    current: &Option<crate::system::GpuInfo>,
+    target: &Option<crate::system::GpuInfo>,
+    t: f32,
+) -> Option<crate::system::GpuInfo> {
+    match (current, target) {
+        (Some(cur), Some(next)) => Some(crate::system::GpuInfo {
+            name: if next.name.is_empty() {
+                cur.name.clone()
+            } else {
+                next.name.clone()
+            },
+            vendor: if next.vendor.is_empty() {
+                cur.vendor.clone()
+            } else {
+                next.vendor.clone()
+            },
+            usage: blend_optional_f32(cur.usage, next.usage, t),
+            temperature: blend_optional_f32(cur.temperature, next.temperature, t),
+            vram_used: match (cur.vram_used, next.vram_used) {
+                (Some(a), Some(b)) => Some(lerp_u64(a, b, t)),
+                (_, value) => value,
+            },
+            vram_total: next.vram_total.or(cur.vram_total),
+            power_watts: blend_optional_f32(cur.power_watts, next.power_watts, t),
+            power_limit_watts: next.power_limit_watts.or(cur.power_limit_watts),
+        }),
+        (_, value) => value.clone(),
+    }
+}
+
+fn blend_system_info(
+    current: &mut crate::system::SystemInfo,
+    target: &crate::system::SystemInfo,
+    t: f32,
+) {
+    current.cpu_usage = lerp_f32(current.cpu_usage, target.cpu_usage, t);
+    current.cpu_cores = target.cpu_cores;
+    current.cpu_temperature =
+        blend_optional_f32(current.cpu_temperature, target.cpu_temperature, t);
+    current.cpu_frequency_mhz = target.cpu_frequency_mhz;
+    current.memory_used = lerp_u64(current.memory_used, target.memory_used, t);
+    current.memory_total = target.memory_total;
+    current.system_uptime = target.system_uptime;
+    current.process_count = target.process_count;
+    current.swap_used = lerp_u64(current.swap_used, target.swap_used, t);
+    current.swap_total = target.swap_total;
+    current.load_average = blend_optional_f64(current.load_average, target.load_average, t);
+    current.gpu_info = blend_gpu_info(&current.gpu_info, &target.gpu_info, t);
+    current.power_watts = blend_optional_f32(current.power_watts, target.power_watts, t);
+    current.power_limit_watts = target.power_limit_watts;
+}
+
+fn spawn_system_monitor(
+    system_monitor_active: &Arc<std::sync::atomic::AtomicBool>,
+) -> std::sync::mpsc::Receiver<crate::system::SystemInfo> {
+    let system_monitor_active_bg = Arc::clone(system_monitor_active);
+    let (system_info_tx, system_info_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let initial = crate::system::SystemInfo::new();
+        let mut previous_sample = sample_from(&initial);
+        let mut poll_interval_ms = adaptive_poll_interval_ms(0.3);
+        let mut was_active = true;
+        let _ = system_info_tx.send(initial);
+
+        loop {
+            if !system_monitor_active_bg.load(Ordering::Relaxed) {
+                was_active = false;
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue;
+            }
+
+            if !was_active {
+                // Immediate catch-up sample after becoming visible again.
+                let mut info = crate::system::SystemInfo::default();
+                info.update();
+                previous_sample = sample_from(&info);
+                poll_interval_ms = adaptive_poll_interval_ms(0.6);
+                let _ = system_info_tx.send(info);
+                was_active = true;
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(poll_interval_ms));
+            let mut info = crate::system::SystemInfo::default();
+            info.update();
+
+            let current_sample = sample_from(&info);
+            let change_score = adaptive_change_score(previous_sample, current_sample);
+            let target_ms = adaptive_poll_interval_ms(change_score) as f32;
+            poll_interval_ms = (poll_interval_ms as f32 * 0.6 + target_ms * 0.4) as u64;
+            previous_sample = current_sample;
+
+            let _ = system_info_tx.send(info);
+        }
+    });
+    system_info_rx
+}
+
+fn load_cli_usage() -> crate::domain::usage_stats::CliUsage {
+    let mut usage = dirs::home_dir()
+        .map(|h| crate::domain::usage_stats::CliUsage::load(&h.join(".canopy")))
+        .unwrap_or_default();
+    if usage.ensure_first_run() {
+        let _ = dirs::home_dir().and_then(|h| usage.save(&h.join(".canopy")).ok().map(|_| ()));
+    }
+    usage
+}
+
+fn calculate_log_hash(raw_log: &str) -> u64 {
+    raw_log.bytes().enumerate().fold(0u64, |acc, (idx, byte)| {
+        acc.wrapping_add((byte as u64).wrapping_mul(idx as u64 + 1))
+    })
+}
+
+fn log_contains_error(log_up: &str) -> bool {
+    [
+        "ERROR",
+        "FAILED",
+        "EXCEPTION",
+        "PANIC",
+        "SEGFAULT",
+        "TIMED OUT",
+        "CONNECTION REFUSED",
+        "PERMISSION DENIED",
+        "HALTED",
+        "PROBLEMA",
+        "FALLO",
+        "FALLANDO",
+    ]
+    .iter()
+    .any(|kw| log_up.contains(kw))
+}
+
+fn log_contains_success(log_up: &str) -> bool {
+    [
+        "SUCCESS",
+        "ALL TESTS PASSED",
+        "BUILD SUCCEEDED",
+        "FINISHED",
+        "COMPLETED",
+        "DONE.",
+        "STABILIZED",
+        "READY",
+        "CONVERGED",
+        "DEPLOYED",
+        "EXCELENTE",
+        "COMPLETADO",
+        "HECHO",
+        "LISTO",
+        "TERMINADO",
+    ]
+    .iter()
+    .any(|kw| log_up.contains(kw))
+}
+
+fn log_contains_spawn(log_up: &str) -> bool {
+    ["SPAWNING", "STARTING UP", "BOOTSTRAPPING", "INITIALIZING"]
+        .iter()
+        .any(|kw| log_up.contains(kw))
 }
 
 #[cfg(test)]
 mod tests {
     use super::build_resumed_session_args;
-    use crate::db::InteractiveSession;
+    use crate::db::session::InteractiveSession;
 
     #[test]
     fn test_yolo_mode_preservation_in_session_relaunch() {
@@ -1117,11 +2274,14 @@ mod tests {
             args: Some("--tui --yolo".to_string()),
             started_at: "2023-01-01T00:00:00Z".to_string(),
             status: "active".to_string(),
+            session_type: "interactive".to_string(),
         };
 
-        assert!(build_resumed_session_args(&session, None, Some("--yolo"))
-            .as_deref()
-            .is_some_and(|args| args.contains("--yolo")));
+        assert!(
+            build_resumed_session_args(&session, None, None, None, Some("--yolo"))
+                .as_deref()
+                .is_some_and(|args| args.contains("--yolo"))
+        );
     }
 
     #[test]
@@ -1134,47 +2294,82 @@ mod tests {
             args: Some("--tui --yolo".to_string()),
             started_at: "2023-01-01T00:00:00Z".to_string(),
             status: "active".to_string(),
+            session_type: "interactive".to_string(),
         };
 
-        let args = build_resumed_session_args(&session, None, Some("--yolo")).unwrap();
+        let args = build_resumed_session_args(&session, None, None, None, Some("--yolo")).unwrap();
         assert_eq!(args.matches("--yolo").count(), 1);
     }
 
     #[test]
-    fn test_original_args_preserved_over_config_args() {
+    fn test_original_resume_args_preserved_over_reconstructed_args() {
         let session = InteractiveSession {
             id: "test-session".to_string(),
             name: "test-session".to_string(),
             cli: "opencode".to_string(),
             working_dir: "/tmp".to_string(),
-            args: Some("--tui --yolo".to_string()),
+            args: Some("--session abc123 --yolo".to_string()),
             started_at: "2023-01-01T00:00:00Z".to_string(),
             status: "active".to_string(),
+            session_type: "interactive".to_string(),
         };
 
-        // Even if config has different interactive_args, original persisted args win.
-        let args = build_resumed_session_args(&session, Some("--chat"), Some("--yolo")).unwrap();
-        assert!(args.contains("--tui"));
+        let args = build_resumed_session_args(
+            &session,
+            Some("--chat"),
+            Some("-c"),
+            Some("--session"),
+            Some("--yolo"),
+        )
+        .unwrap();
+        assert!(args.contains("--session abc123"));
         assert!(args.contains("--yolo"));
-        assert!(!args.contains("--chat"));
+        assert!(!args.contains("-c"));
     }
 
     #[test]
-    fn test_falls_back_to_config_interactive_args_when_no_original() {
+    fn test_rebuilds_resume_args_for_fresh_session() {
+        let session = InteractiveSession {
+            id: "test-session".to_string(),
+            name: "test-session".to_string(),
+            cli: "copilot".to_string(),
+            working_dir: "/tmp".to_string(),
+            args: None,
+            started_at: "2023-01-01T00:00:00Z".to_string(),
+            status: "active".to_string(),
+            session_type: "interactive".to_string(),
+        };
+
+        let args =
+            build_resumed_session_args(&session, None, Some("--continue"), None, Some("--yolo"))
+                .unwrap();
+        assert!(args.contains("--continue"));
+        assert!(!args.contains("--yolo"));
+    }
+
+    #[test]
+    fn test_appends_resume_args_to_original_interactive_command() {
         let session = InteractiveSession {
             id: "test-session".to_string(),
             name: "test-session".to_string(),
             cli: "kiro".to_string(),
             working_dir: "/tmp".to_string(),
-            args: None,
+            args: Some("chat --trust-all-tools".to_string()),
             started_at: "2023-01-01T00:00:00Z".to_string(),
             status: "active".to_string(),
+            session_type: "interactive".to_string(),
         };
 
-        // When no original args are persisted, fall back to config interactive_args.
-        // Yolo is not added because we don't know if the original session had it.
-        let args = build_resumed_session_args(&session, Some("--tui"), Some("--yolo")).unwrap();
-        assert!(args.contains("--tui"));
-        assert!(!args.contains("--yolo"));
+        let args = build_resumed_session_args(
+            &session,
+            Some("chat"),
+            Some("--resume-picker"),
+            None,
+            Some("--trust-all-tools"),
+        )
+        .unwrap();
+        assert!(args.contains("chat"));
+        assert!(args.contains("--resume-picker"));
+        assert_eq!(args.matches("--trust-all-tools").count(), 1);
     }
 }
