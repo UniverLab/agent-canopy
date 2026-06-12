@@ -2122,6 +2122,8 @@ fn blend_gpu_info(
                 (_, value) => value,
             },
             vram_total: next.vram_total.or(cur.vram_total),
+            power_watts: blend_optional_f32(cur.power_watts, next.power_watts, t),
+            power_limit_watts: next.power_limit_watts.or(cur.power_limit_watts),
         }),
         (_, value) => value.clone(),
     }
@@ -2141,12 +2143,12 @@ fn blend_system_info(
     current.memory_total = target.memory_total;
     current.system_uptime = target.system_uptime;
     current.process_count = target.process_count;
-    current.disk_used = lerp_u64(current.disk_used, target.disk_used, t);
-    current.disk_total = target.disk_total;
     current.swap_used = lerp_u64(current.swap_used, target.swap_used, t);
     current.swap_total = target.swap_total;
     current.load_average = blend_optional_f64(current.load_average, target.load_average, t);
     current.gpu_info = blend_gpu_info(&current.gpu_info, &target.gpu_info, t);
+    current.power_watts = blend_optional_f32(current.power_watts, target.power_watts, t);
+    current.power_limit_watts = target.power_limit_watts;
 }
 
 fn spawn_system_monitor(

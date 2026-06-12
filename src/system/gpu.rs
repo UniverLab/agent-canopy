@@ -9,7 +9,7 @@ use super::GpuInfo;
 pub(super) fn try_get_nvidia_gpu_info() -> Option<GpuInfo> {
     let output = Command::new("nvidia-smi")
         .args([
-            "--query-gpu=name,utilization.gpu,temperature.gpu,memory.used,memory.total",
+            "--query-gpu=name,utilization.gpu,temperature.gpu,memory.used,memory.total,power.draw,power.limit",
             "--format=csv,noheader,nounits",
         ])
         .output()
@@ -33,6 +33,8 @@ pub(super) fn try_get_nvidia_gpu_info() -> Option<GpuInfo> {
         temperature: parse_optional_f32(parts.get(2).copied()),
         vram_used: parse_optional_u64(parts.get(3).copied()),
         vram_total: parse_optional_u64(parts.get(4).copied()),
+        power_watts: parse_optional_f32(parts.get(5).copied()),
+        power_limit_watts: parse_optional_f32(parts.get(6).copied()),
     })
 }
 
@@ -75,10 +77,7 @@ pub(super) fn get_macos_gpu_info() -> Option<GpuInfo> {
         .map(|name| GpuInfo {
             vendor: infer_gpu_vendor(&name),
             name,
-            usage: None,
-            temperature: None,
-            vram_used: None,
-            vram_total: None,
+            ..GpuInfo::default()
         })
 }
 
@@ -91,10 +90,7 @@ fn parse_lspci_gpu_line(line: &str) -> GpuInfo {
     GpuInfo {
         vendor: infer_gpu_vendor(&name),
         name,
-        usage: None,
-        temperature: None,
-        vram_used: None,
-        vram_total: None,
+        ..GpuInfo::default()
     }
 }
 

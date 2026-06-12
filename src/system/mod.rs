@@ -6,15 +6,17 @@
 
 mod gpu;
 mod platform;
+mod power;
 mod windows;
 
-use sysinfo::{Components, Disks, System};
+use sysinfo::{Components, System};
 
 use gpu::{get_linux_gpu_info, get_macos_gpu_info, try_get_nvidia_gpu_info};
 use platform::{
     detect_host_platform, is_cpu_temperature_label, is_gpu_temperature_label,
     normalize_temperature, HostPlatform,
 };
+use power::{get_linux_battery_watts, get_macos_battery_watts};
 use windows::get_windows_host_metrics;
 
 /// System information and metrics.
@@ -28,12 +30,12 @@ pub struct SystemInfo {
     pub memory_total: u64,
     pub system_uptime: u64,
     pub process_count: usize,
-    pub disk_used: u64,
-    pub disk_total: u64,
     pub swap_used: u64,
     pub swap_total: u64,
     pub load_average: Option<f64>,
     pub gpu_info: Option<GpuInfo>,
+    pub power_watts: Option<f32>,
+    pub power_limit_watts: Option<f32>,
 }
 
 /// GPU information.
@@ -46,6 +48,8 @@ pub struct GpuInfo {
     pub temperature: Option<f32>,
     pub vram_used: Option<u64>,
     pub vram_total: Option<u64>,
+    pub power_watts: Option<f32>,
+    pub power_limit_watts: Option<f32>,
 }
 
 /// Aggregated host-level metrics that override sysinfo values.
@@ -69,6 +73,7 @@ impl SystemInfo {
         self.refresh_sysinfo_metrics();
         self.apply_component_metrics();
         self.apply_host_metrics();
+        self.apply_power_metrics();
     }
 
     fn refresh_sysinfo_metrics(&mut self) {
@@ -90,11 +95,6 @@ impl SystemInfo {
         self.load_average = get_load_average();
         self.cpu_temperature = None;
         self.gpu_info = None;
-
-        let disks = Disks::new_with_refreshed_list();
-        let (disk_total, disk_used) = get_main_disk(&disks);
-        self.disk_total = disk_total;
-        self.disk_used = disk_used;
     }
 
     fn apply_component_metrics(&mut self) {
@@ -144,6 +144,27 @@ impl SystemInfo {
         }
     }
 
+    /// Prefer total-system draw (battery discharge) and fall back to GPU draw.
+    fn apply_power_metrics(&mut self) {
+        let battery_watts = match detect_host_platform() {
+            HostPlatform::Linux => get_linux_battery_watts(),
+            HostPlatform::MacOs => get_macos_battery_watts(),
+            HostPlatform::Wsl | HostPlatform::Windows => None,
+        };
+
+        match battery_watts {
+            Some(watts) => {
+                self.power_watts = Some(watts);
+                self.power_limit_watts = None;
+            }
+            None => {
+                let gpu = self.gpu_info.as_ref();
+                self.power_watts = gpu.and_then(|g| g.power_watts);
+                self.power_limit_watts = gpu.and_then(|g| g.power_limit_watts);
+            }
+        }
+    }
+
     fn collect_host_metrics(&self) -> HostMetrics {
         match detect_host_platform() {
             HostPlatform::Wsl | HostPlatform::Windows => get_windows_host_metrics(),
@@ -185,29 +206,6 @@ impl SystemInfo {
         }
         Some((used as f32 / total as f32) * 100.0)
     }
-}
-
-fn get_main_disk(disks: &Disks) -> (u64, u64) {
-    let target = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.to_str().map(str::to_string))
-        .unwrap_or_else(|| "/".to_string());
-
-    let mut best: Option<&sysinfo::Disk> = None;
-    let mut best_len = 0;
-    for disk in disks.iter() {
-        let mp = disk.mount_point().to_str().unwrap_or("");
-        if target.starts_with(mp) && mp.len() > best_len {
-            best = Some(disk);
-            best_len = mp.len();
-        }
-    }
-
-    best.map(|disk| {
-        let total = disk.total_space();
-        (total, total - disk.available_space())
-    })
-    .unwrap_or((0, 0))
 }
 
 fn get_load_average() -> Option<f64> {

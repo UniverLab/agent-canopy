@@ -136,9 +136,7 @@ fn get_windows_gpu_info() -> Option<GpuInfo> {
     Some(GpuInfo {
         name,
         vendor,
-        usage: None,
-        temperature: None,
-        vram_used: None,
         vram_total: controller.adapter_ram.map(bytes_to_megabytes),
+        ..GpuInfo::default()
     })
 }

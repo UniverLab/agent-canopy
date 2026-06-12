@@ -199,23 +199,24 @@ fn create_system_dashboard_lines(
         ),
     ]));
 
-    // Disk line
-    let disk_pct = if system_info.disk_total > 0 {
-        (system_info.disk_used as f32 / system_info.disk_total as f32) * 100.0
-    } else {
-        0.0
-    };
-    lines.push(Line::from(vec![
-        Span::styled("disk: ", Style::default().fg(Color::White)),
-        Span::styled(
-            format!("{disk_pct:.0}%"),
-            Style::default().fg(alert_color(disk_pct, 80.0, 95.0)),
-        ),
-        Span::styled(
-            format!(" {}", format_bytes_smart(system_info.disk_used)),
-            Style::default().fg(DIM),
-        ),
-    ]));
+    // Power line (battery discharge or GPU draw) — only when a source reports it
+    if let Some(watts) = system_info.power_watts {
+        let limit = system_info.power_limit_watts.filter(|l| *l > 0.0);
+        let watts_color = limit
+            .map(|l| alert_color((watts / l) * 100.0, 70.0, 90.0))
+            .unwrap_or(DIM);
+        let mut spans = vec![
+            Span::styled("pwr: ", Style::default().fg(Color::White)),
+            Span::styled(format!("{watts:.0}W"), Style::default().fg(watts_color)),
+        ];
+        if let Some(limit) = limit {
+            spans.push(Span::styled(
+                format!(" / {limit:.0}W"),
+                Style::default().fg(DIM),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
 
     // Swap line only if actually being used — always yellow, no percentage
     if system_info.swap_used > 0 {
@@ -285,10 +286,10 @@ mod tests {
         let info = SystemInfo::new();
         let lines = create_system_dashboard_lines(&info, TemperatureUnit::Celsius, 10);
 
-        // Should have at least the 3 base lines (cpu, mem, disk)
+        // Should have at least the 2 base lines (cpu, mem)
         assert!(
-            lines.len() >= 3,
-            "Expected at least 3 lines, got {}",
+            lines.len() >= 2,
+            "Expected at least 2 lines, got {}",
             lines.len()
         );
         // Check key lines exist
@@ -299,6 +300,6 @@ mod tests {
             .join("\n");
         assert!(all_text.contains("cpu:"), "Missing cpu line");
         assert!(all_text.contains("mem:"), "Missing mem line");
-        assert!(all_text.contains("disk:"), "Missing disk line");
+        assert!(!all_text.contains("disk:"), "Disk line should be removed");
     }
 }
