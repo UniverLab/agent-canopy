@@ -21,6 +21,26 @@ harness-canopy is a modern, self-contained MCP (Model Context Protocol) server a
 
 ---
 
+## Installation
+
+**Linux / macOS:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/UniverLab/harness-canopy/main/scripts/install.sh | sh
+```
+
+Or via cargo: `cargo install harness-canopy` (the binary is `canopy`).
+See [`docs/installation.md`](docs/installation.md) for all methods and first-time setup.
+
+## Documentation
+
+Full documentation lives in [`docs/`](docs/): installation, quick start, the
+TUI, agents and seed identities, intelligence & sync, workflows, the RAG
+pipeline, all 46 MCP tools, and the complete CLI reference.
+
+---
+
+
 ## Features
 
 ### 🎯 Core Platform
@@ -210,4 +230,5 @@ MIT — see [LICENSE](LICENSE) for details.
 
 ---
 
-Made with ❤️ by [JheisonMB](https://github.com/JheisonMB) and [UniverLab](https://github.com/UniverLab)
+An experiment of [UniverLab](https://github.com/UniverLab) — an open computational laboratory.
+Made with ❤️ by [JheisonMB](https://github.com/JheisonMB)
