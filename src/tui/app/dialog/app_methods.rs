@@ -640,16 +640,9 @@ impl App {
             (dialog.working_dir.clone(), false)
         };
 
-        // Ensure the CLI‑specific instruction file exists for every agent session
-        if !is_nursery {
-            use std::path::Path;
-            let instr_name = crate::domain::nursery::instruction_file_for_cli(cli.as_str());
-            let instr_path = Path::new(&dir).join(instr_name);
-            if let Some(parent) = instr_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(&instr_path, crate::domain::nursery::GARDENER_INSTRUCTIONS);
-        }
+        // The nursery instruction file is written only inside the ephemeral
+        // nursery temp dir by `create_nursery`; normal sessions must never get
+        // the Gardener instructions written into their working directory.
 
         // Append yolo flag to args when yolo mode is enabled
         let base_args = dialog.selected_args();
