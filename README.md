@@ -21,6 +21,12 @@ harness-canopy is a modern, self-contained MCP (Model Context Protocol) server a
 
 ---
 
+### Demo
+
+![Demo](assets/canopy.gif)
+
+---
+
 ## Installation
 
 **Linux / macOS:**
