@@ -1,5 +1,5 @@
 use crate::tui::agent::sanitize::{
-    is_ui_line, looks_like_shell_prompt, sanitize_line, strip_borders,
+    command_after_shell_prompt, is_ui_line, sanitize_line, strip_borders,
 };
 use crate::tui::agent::InteractiveAgent;
 
@@ -267,13 +267,16 @@ impl InteractiveAgent {
         Some(sanitize_line(&line).trim_end().to_string())
     }
 
-    /// Return concatenated text of the cursor line plus any wrapped continuation
-    /// lines above it that belong to the same prompt. This allows detecting
-    /// sensitive prompts even when the terminal is narrow and the keyword wraps
-    /// to a different row than the cursor.
+    /// Return the text of the *current command* — what the user is typing after
+    /// the active shell/program prompt — so sensitive-prompt detection only
+    /// looks at the line in progress, never at earlier output.
     ///
-    /// Walks at most 5 rows upward and stops at empty rows or shell prompt
-    /// boundaries to avoid false positives from unrelated screen history.
+    /// If the cursor line already carries a shell-prompt marker (e.g.
+    /// `user@host:~$ `), the command is just the text after it; a fresh empty
+    /// prompt yields an empty string and never matches. Otherwise the line is
+    /// program output (e.g. a `Vault passphrase:` prompt that wrapped on a
+    /// narrow terminal), so we walk up to 5 rows joining the continuation,
+    /// stopping at the shell prompt that launched it or at a blank row.
     pub(crate) fn prompt_context_text(&self) -> Option<String> {
         let vt = self.vt.try_lock().ok()?;
         let screen = vt.screen();
@@ -285,6 +288,13 @@ impl InteractiveAgent {
         let cursor = screen.cursor_position().0.min(rows.saturating_sub(1));
         let cursor_line = read_screen_line(screen, cursor, cols)?;
         let mut combined = sanitize_line(&cursor_line).trim_end().to_string();
+
+        // A marker on the cursor line bounds the current command: anything
+        // before it (including a stale `… wrong passphrase` error) is not part
+        // of what's being typed now, so return only the post-marker text.
+        if let Some(command) = command_after_shell_prompt(&combined) {
+            return Some(command);
+        }
 
         let mut row = cursor;
         let mut walked = 0u16;
@@ -298,7 +308,9 @@ impl InteractiveAgent {
             if trimmed.trim().is_empty() {
                 break;
             }
-            if looks_like_shell_prompt(&trimmed) {
+            // Reaching the shell prompt that launched this program means we've
+            // collected the whole wrapped prompt; earlier rows are history.
+            if command_after_shell_prompt(&trimmed).is_some() {
                 break;
             }
             combined = format!("{} {}", trimmed, combined);

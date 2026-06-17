@@ -45,11 +45,42 @@ pub fn line_looks_sensitive_prompt(line: &str) -> bool {
         .any(|hint| lower.contains(hint))
 }
 
-pub fn looks_like_shell_prompt(line: &str) -> bool {
+/// Extract the *current command* portion of a line: the text that follows the
+/// last shell-prompt marker.
+///
+/// Real prompts carry the marker mid-line (`user@host:~/path$ cmd`), so this
+/// scans for the rightmost `$`, `#`, `%` or `❯` that is a prompt boundary
+/// (followed by a space, or the trailing glyph of an otherwise-empty prompt),
+/// plus the leading `> ` some password prompts use.
+///
+/// Returns `None` when the line carries no marker at all — that means the line
+/// is program output (e.g. a wrapped `Vault passphrase:` prompt) rather than a
+/// shell prompt, so callers can keep walking earlier rows.
+pub fn command_after_shell_prompt(line: &str) -> Option<String> {
     let trimmed = line.trim_start();
-    TERMINAL_SHELL_PROMPTS
-        .iter()
-        .any(|prefix| trimmed.starts_with(prefix))
+
+    // Some password prompts render with a leading `> ` (e.g. `> Passphrase:`).
+    if let Some(rest) = trimmed.strip_prefix("> ") {
+        return Some(rest.trim().to_string());
+    }
+
+    // Rightmost prompt-boundary marker. A boundary is a marker glyph that is
+    // either the last visible glyph (empty command) or immediately followed by
+    // a space (command text after it). This keeps `100% done` and redirects
+    // from being mistaken for prompts mid-word.
+    let chars: Vec<(usize, char)> = trimmed.char_indices().collect();
+    let mut command_start: Option<usize> = None;
+    for (i, (byte_idx, ch)) in chars.iter().enumerate() {
+        if !matches!(ch, '$' | '#' | '%' | '❯') {
+            continue;
+        }
+        let is_boundary = matches!(chars.get(i + 1).map(|(_, c)| *c), None | Some(' '));
+        if is_boundary {
+            command_start = Some(byte_idx + ch.len_utf8());
+        }
+    }
+
+    command_start.map(|idx| trimmed[idx..].trim().to_string())
 }
 
 pub fn strip_shell_prompt_prefix(line: &str) -> String {
@@ -163,7 +194,8 @@ pub fn strip_borders(line: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_ui_line, line_looks_sensitive_prompt, looks_like_shell_prompt, strip_shell_prompt_prefix,
+        command_after_shell_prompt, is_ui_line, line_looks_sensitive_prompt,
+        strip_shell_prompt_prefix,
     };
 
     #[test]
@@ -194,16 +226,6 @@ mod tests {
     }
 
     #[test]
-    fn detects_shell_prompt_boundaries() {
-        assert!(looks_like_shell_prompt("$ git push"));
-        assert!(looks_like_shell_prompt("# root command"));
-        assert!(looks_like_shell_prompt("❯ zsh prompt"));
-        assert!(!looks_like_shell_prompt("Enter passphrase for key"));
-        assert!(!looks_like_shell_prompt("Total 5, reused 3"));
-        assert!(!looks_like_shell_prompt("  indented text"));
-    }
-
-    #[test]
     fn strips_prompt_suffixes_from_redrawn_shell_lines() {
         assert_eq!(
             strip_shell_prompt_prefix(
@@ -211,6 +233,50 @@ mod tests {
             ),
             "ls src"
         );
+    }
+
+    #[test]
+    fn command_after_shell_prompt_extracts_current_command() {
+        // Decorated prompt with the marker mid-line.
+        assert_eq!(
+            command_after_shell_prompt("user@host:~/repo$ git push").as_deref(),
+            Some("git push")
+        );
+        // Fresh empty prompt → empty command (never sensitive).
+        assert_eq!(
+            command_after_shell_prompt("user@host:~/repo$ ").as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            command_after_shell_prompt("user@host:~/repo$").as_deref(),
+            Some("")
+        );
+        // Leading `> ` password prompt.
+        assert_eq!(
+            command_after_shell_prompt("> Vault passphrase: ").as_deref(),
+            Some("Vault passphrase:")
+        );
+    }
+
+    #[test]
+    fn command_after_shell_prompt_ignores_plain_output() {
+        // A stale error mentioning passphrase is program output, not a prompt.
+        assert_eq!(
+            command_after_shell_prompt("Error: Decryption failed — wrong passphrase"),
+            None
+        );
+        assert_eq!(command_after_shell_prompt("Receiving objects: 100"), None);
+    }
+
+    #[test]
+    fn fresh_prompt_after_error_is_not_sensitive() {
+        // Regression: an empty prompt redrawn after a `… wrong passphrase` error
+        // must not be treated as a sensitive (hidden) input line.
+        let command = command_after_shell_prompt(
+            "jheisonmblivecom@WORKSTATION:~/Projects/UniverLab/scripts/ghscaff$ ",
+        )
+        .unwrap();
+        assert!(!line_looks_sensitive_prompt(&command));
     }
 
     #[test]
