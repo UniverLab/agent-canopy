@@ -14,22 +14,32 @@ use crate::tui::atmosphere::{AtmosphereCtx, Particle, Scene};
 use crate::tui::whimsg::rng::Rng;
 
 const SHIMMER_FRAMES: [&str; 4] = ["¤", "*", "+", "·"];
-const MAX_SEEDS: usize = 10;
+/// Hard ceiling on simultaneous seeds (reached only during a gust burst).
+const MAX_SEEDS: usize = 6;
+/// Ambient ceiling for the slow drift top-up; keeps the screen mostly sparse
+/// between gusts instead of perpetually full.
+const DRIFT_SOFT_CAP: usize = 3;
 const BASE_SPEED: f32 = 0.4;
 const DRIFT_VX: f32 = 3.0;
 
-/// Attraction radius (cells).
-const ATTRACT_RADIUS: f32 = 25.0;
-/// Attraction force — pulls seed toward cursor.
-const ATTRACT_FORCE: f32 = 10.0;
+/// Attraction radius (cells). Kept modest so the cursor deflects passing seeds
+/// rather than capturing them into a permanent orbit.
+const ATTRACT_RADIUS: f32 = 14.0;
+/// Attraction force — gentle pull toward the cursor.
+const ATTRACT_FORCE: f32 = 4.0;
 
 /// Universal repulsion radius — pushes ALL particles away when very close.
 const UNIVERSAL_REPEL_RADIUS: f32 = 4.0;
 /// Universal repulsion force — strong push to keep particles off the cursor.
 const UNIVERSAL_REPEL_FORCE: f32 = 30.0;
 
-const GUST_PROB_PER_SEC: f32 = 0.3;
-const DRIFT_PROB_PER_SEC: f32 = 0.05;
+/// Chance per second of a fresh gust once the screen is empty (rare, so there
+/// are calm stretches with no seeds at all).
+const GUST_PROB_PER_SEC: f32 = 0.06;
+/// Chance per second of a single ambient seed drifting in, up to `DRIFT_SOFT_CAP`.
+const DRIFT_PROB_PER_SEC: f32 = 0.02;
+/// How much faster seeds fade once the scene is outside its time window.
+const WINDDOWN_FADE: f32 = 4.0;
 
 const SEED_COLOR: Color = Color::Rgb(200, 220, 255);
 
@@ -102,25 +112,34 @@ impl Scene for DandelionScene {
             return;
         }
 
-        // Probabilistic spawn
-        if self.seeds.is_empty() {
-            if self.rng.chance(0.3) {
-                self.wind_dir = -self.wind_dir;
-            }
-            if self
-                .rng
-                .chance((GUST_PROB_PER_SEC * delta_secs).clamp(0.0, 1.0) as f64)
+        // Probabilistic spawn — only while inside the time window. When winding
+        // down (`!ctx.spawning`) existing seeds keep drifting but none are added.
+        if ctx.spawning {
+            if self.seeds.is_empty() {
+                if self.rng.chance(0.3) {
+                    self.wind_dir = -self.wind_dir;
+                }
+                if self
+                    .rng
+                    .chance((GUST_PROB_PER_SEC * delta_secs).clamp(0.0, 1.0) as f64)
+                {
+                    let count = self.rng.between(2, 4) as usize;
+                    self.spawn_gust(area, count);
+                }
+            } else if self.seeds.len() < DRIFT_SOFT_CAP
+                && self
+                    .rng
+                    .chance((DRIFT_PROB_PER_SEC * delta_secs).clamp(0.0, 1.0) as f64)
             {
-                let count = self.rng.between(2, 4) as usize;
-                self.spawn_gust(area, count);
+                self.spawn_gust(area, 1);
             }
-        } else if self.seeds.len() < MAX_SEEDS
-            && self
-                .rng
-                .chance((DRIFT_PROB_PER_SEC * delta_secs).clamp(0.0, 1.0) as f64)
-        {
-            self.spawn_gust(area, 1);
         }
+
+        let fade = if ctx.spawning {
+            delta_secs
+        } else {
+            delta_secs * WINDDOWN_FADE
+        };
 
         let x_exit_min = area.x as f32 - 3.0;
         let x_exit_max = (area.x + area.width) as f32 + 3.0;
@@ -131,7 +150,7 @@ impl Scene for DandelionScene {
         let my = ctx.mouse_row as f32;
 
         self.seeds.retain_mut(|seed| {
-            seed.life -= delta_secs;
+            seed.life -= fade;
             if seed.life <= 0.0 {
                 return false;
             }
@@ -207,12 +226,46 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         let mut ctx = AtmosphereCtx {
             scroll_velocity: 1.0,
+            spawning: true,
             ..Default::default()
         };
         for _ in 0..200 {
             scene.tick(0.05, area, &mut ctx);
         }
         assert!(scene.seeds.len() <= MAX_SEEDS);
+    }
+
+    #[test]
+    fn test_no_spawn_when_not_spawning() {
+        let mut scene = DandelionScene::new();
+        let area = Rect::new(0, 0, 80, 24);
+        let mut ctx = AtmosphereCtx::default(); // spawning = false
+        for _ in 0..200 {
+            scene.tick(0.05, area, &mut ctx);
+        }
+        assert!(scene.seeds.is_empty());
+    }
+
+    #[test]
+    fn test_winddown_clears_existing_seeds() {
+        // Regression: seeds present when the scene leaves its time window must
+        // keep aging and disappear instead of freezing on screen forever.
+        let mut scene = DandelionScene::new();
+        let area = Rect::new(0, 0, 80, 24);
+        scene.seeds.push(Seed {
+            x: 40.0,
+            y: 12.0,
+            vx: 0.0,
+            vy: 0.0,
+            phase: 0.0,
+            life: 30.0,
+        });
+        let mut ctx = AtmosphereCtx::default(); // spawning = false (winding down)
+        for _ in 0..400 {
+            scene.tick(0.05, area, &mut ctx);
+        }
+        assert!(scene.seeds.is_empty());
+        assert!(!scene.is_active());
     }
 
     #[test]
@@ -228,9 +281,9 @@ mod tests {
             phase: 0.0,
             life: 60.0,
         });
-        // Mouse 20 cells to the right — within ATTRACT_RADIUS (25)
+        // Mouse 10 cells to the right — within ATTRACT_RADIUS (14)
         let mut ctx = AtmosphereCtx {
-            mouse_col: 30,
+            mouse_col: 20,
             mouse_row: 12,
             ..Default::default()
         };

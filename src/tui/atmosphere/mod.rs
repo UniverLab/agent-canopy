@@ -58,6 +58,10 @@ pub struct AtmosphereCtx {
     pub mouse_clicked: bool,
     /// Set by `FireflyScene` when a firefly is caught.
     pub firefly_caught: bool,
+    /// Whether the active scene may spawn new particles this tick.
+    /// `false` while a scene is winding down outside its time window — existing
+    /// particles keep moving and expiring, but no new ones appear.
+    pub spawning: bool,
 }
 
 // ── Prerequisites ─────────────────────────────────────────────────
@@ -129,7 +133,12 @@ impl SceneManager {
         self.last_tick = Instant::now();
 
         for event in &mut self.events {
-            if event.prerequisites.matches(ctx) {
+            let in_window = event.prerequisites.matches(ctx);
+            // Keep ticking a scene that is winding down (out of its window but
+            // still showing particles) so they drift off and expire instead of
+            // freezing in place when the day/night boundary is crossed.
+            if in_window || event.scene.is_active() {
+                ctx.spawning = in_window;
                 event.scene.tick(delta, area, ctx);
             }
         }
