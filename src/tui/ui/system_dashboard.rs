@@ -199,21 +199,30 @@ fn create_system_dashboard_lines(
         ),
     ]));
 
-    // Power line (battery discharge or GPU draw) — current draw plus how much of
-    // the enforced power cap it represents, only when a source reports it.
+    // Power line (battery discharge or GPU draw) — percentage of the enforced
+    // power cap plus the current draw, only when a source reports it.
     if let Some(watts) = system_info.power_watts {
         let pct = system_info
             .power_limit_watts
             .filter(|l| *l > 0.0)
             .map(|l| (watts / l) * 100.0);
-        let watts_color = pct.map(|p| alert_color(p, 70.0, 90.0)).unwrap_or(DIM);
-        let mut spans = vec![
-            Span::styled("pwr: ", Style::default().fg(Color::White)),
-            Span::styled(format!("{watts:.0}W"), Style::default().fg(watts_color)),
-        ];
+        let mut spans = vec![Span::styled("pwr: ", Style::default().fg(Color::White))];
+        // Match the other lines: colored percentage first, then the raw value dimmed.
         if let Some(p) = pct {
-            spans.push(Span::styled(" · ", Style::default().fg(Color::White)));
-            spans.push(Span::styled(format!("{p:.0}%"), Style::default().fg(DIM)));
+            spans.push(Span::styled(
+                format!("{p:.0}%"),
+                Style::default().fg(alert_color(p, 70.0, 90.0)),
+            ));
+            spans.push(Span::styled(
+                format!(" {watts:.0}W"),
+                Style::default().fg(DIM),
+            ));
+        } else {
+            // No power cap reported — show the raw draw only.
+            spans.push(Span::styled(
+                format!("{watts:.0}W"),
+                Style::default().fg(DIM),
+            ));
         }
         lines.push(Line::from(spans));
     }
