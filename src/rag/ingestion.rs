@@ -328,8 +328,9 @@ impl IngestionManager {
         let initial_count = self.queue.lock().await.len();
         if initial_count > 0 {
             crate::domain::notification::send_notification(
-                "Canopy — RAG indexing",
-                &format!("Indexing queue active: {initial_count} file(s) pending"),
+                "RAG indexing",
+                &format!("{initial_count} file(s) pending"),
+                crate::domain::notification::NotificationLevel::Info,
             );
         }
 
@@ -379,8 +380,9 @@ impl IngestionManager {
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| source_path.clone());
                     crate::domain::notification::send_notification(
-                        "Canopy — RAG indexing error",
+                        "RAG indexing",
                         &format!("{filename} could not be indexed\nCause: {error_detail}"),
+                        crate::domain::notification::NotificationLevel::Error,
                     );
                 }
             }
@@ -390,8 +392,9 @@ impl IngestionManager {
             let dir_note = indexing_dir_summary(&indexed_paths);
             tracing::info!("Personal RAG: indexed {processed} file(s){dir_note}");
             crate::domain::notification::send_notification(
-                "Canopy — RAG indexing",
+                "RAG indexing",
                 &format!("{processed} file(s) indexed{dir_note}"),
+                crate::domain::notification::NotificationLevel::Success,
             );
         }
         if skipped > 0 {

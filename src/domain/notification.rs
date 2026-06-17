@@ -20,6 +20,34 @@ use std::process::Command;
 /// Must match exactly between registry key name and `CreateToastNotifier()` calls.
 const APP_ID: &str = "Canopy";
 
+/// Severity of a notification. Drives the native themed icon and urgency on
+/// platforms that support them (Linux). On WSL/macOS the platform shows the
+/// Canopy app icon regardless, so the level is informational only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationLevel {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+impl NotificationLevel {
+    /// Freedesktop standard (themed) icon name — rendered natively by the
+    /// desktop notification daemon, no bundled assets required.
+    fn icon_name(self) -> &'static str {
+        match self {
+            NotificationLevel::Info => "dialog-information",
+            NotificationLevel::Success => "emblem-default",
+            NotificationLevel::Warning => "dialog-warning",
+            NotificationLevel::Error => "dialog-error",
+        }
+    }
+
+    fn is_critical(self) -> bool {
+        matches!(self, NotificationLevel::Error)
+    }
+}
+
 /// Detected runtime platform for notification dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Platform {
@@ -104,9 +132,15 @@ pub fn register_aumid() {
 
 // ── Platform senders ─────────────────────────────────────────────────
 
-fn send_linux(title: &str, body: &str) {
-    let _ = Command::new("notify-send")
-        .arg("--app-name=Canopy")
+fn send_linux(title: &str, body: &str, level: NotificationLevel) {
+    let mut cmd = Command::new("notify-send");
+    cmd.arg("--app-name=Canopy")
+        .arg(format!("--icon={}", level.icon_name()));
+    if level.is_critical() {
+        // Critical alerts stay on screen until dismissed on most daemons.
+        cmd.arg("--urgency=critical");
+    }
+    let _ = cmd
         .arg(title)
         .arg(body)
         .stdout(std::process::Stdio::null())
@@ -220,16 +254,18 @@ pub fn clear_notifications_on_exit() {
 
 /// Send a desktop notification. Fire-and-forget — spawns a background thread
 /// and never blocks the caller. Failures are silently ignored.
-pub fn send_notification(title: &str, body: &str) {
+///
+/// `level` selects a native themed icon and urgency on Linux. On WSL and macOS
+/// the system shows the Canopy app icon, so the level has no visible effect
+/// there — the title (shown prominently) carries the subject and the body the
+/// outcome.
+pub fn send_notification(title: &str, body: &str, level: NotificationLevel) {
     let title = title.to_owned();
     let body = body.to_owned();
-    std::thread::spawn(move || {
-        let platform = detect_platform();
-        match platform {
-            Platform::Wsl => send_wsl(&title, &body),
-            Platform::MacOs => send_macos(&title, &body),
-            Platform::Linux => send_linux(&title, &body),
-        }
+    std::thread::spawn(move || match detect_platform() {
+        Platform::Wsl => send_wsl(&title, &body),
+        Platform::MacOs => send_macos(&title, &body),
+        Platform::Linux => send_linux(&title, &body, level),
     });
 }
 
