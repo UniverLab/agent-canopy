@@ -479,10 +479,20 @@ impl App {
     }
 
     fn successful_interactive_exit_indices(&self) -> Vec<usize> {
+        // Keep a successfully-finished session on screen while it is the one the
+        // user is currently viewing — its final output often carries useful
+        // end-of-run stats. It is reaped on a later poll, once the user moves
+        // the selection to another session.
+        let viewing = match self.selected_session_target() {
+            Some(SessionTarget::Interactive(idx)) => Some(idx),
+            _ => None,
+        };
         self.interactive_agents
             .iter()
             .enumerate()
-            .filter(|(_, agent)| matches!(agent.status, AgentStatus::Exited(0)))
+            .filter(|(idx, agent)| {
+                matches!(agent.status, AgentStatus::Exited(0)) && Some(*idx) != viewing
+            })
             .map(|(idx, _)| idx)
             .collect()
     }
