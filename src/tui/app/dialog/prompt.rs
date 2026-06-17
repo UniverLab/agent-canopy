@@ -871,9 +871,13 @@ impl SimplePromptDialog {
         if cursor_pos == 0 {
             return 0;
         }
-        let prefix: String = text.chars().take(cursor_pos).collect();
-        // Find the last space or newline
-        let last_boundary = prefix.rfind([' ', '\n']);
+        let prefix_chars: Vec<char> = text.chars().take(cursor_pos).collect();
+        // Find the last space or newline in the character slice
+        let last_boundary = prefix_chars
+            .iter()
+            .enumerate()
+            .rfind(|&(_, &c)| c == ' ' || c == '\n')
+            .map(|(idx, _)| idx);
         match last_boundary {
             Some(pos) => cursor_pos - pos - 1,
             None => cursor_pos, // No boundary found, entire prefix is one word
@@ -892,10 +896,12 @@ impl SimplePromptDialog {
             return false;
         }
         // Calculate current column position (accounting for existing newlines)
-        let prefix: String = text.chars().take(cursor_pos).collect();
-        let current_col = prefix
-            .rfind('\n')
-            .map(|pos| cursor_pos - pos - 1)
+        let prefix_chars: Vec<char> = text.chars().take(cursor_pos).collect();
+        let current_col = prefix_chars
+            .iter()
+            .enumerate()
+            .rfind(|&(_, &c)| c == '\n')
+            .map(|(idx, _)| cursor_pos - idx - 1)
             .unwrap_or(cursor_pos);
 
         // Distance from cursor to last space (current word length from last break)
@@ -996,10 +1002,10 @@ impl SimplePromptDialog {
             && !content.is_empty()
             && Self::should_wrap_at_word_boundary(&modified_content, adjusted_cur, field_width, 1)
         {
-            let prefix: String = modified_content.chars().take(adjusted_cur).collect();
-            if let Some(space_pos) = prefix.rfind(' ') {
+            let prefix_chars: Vec<char> = modified_content.chars().take(adjusted_cur).collect();
+            if let Some(space_char_idx) = prefix_chars.iter().rposition(|&c| c == ' ') {
                 let mut chars: Vec<char> = modified_content.chars().collect();
-                chars[space_pos] = '\n';
+                chars[space_char_idx] = '\n';
                 modified_content = chars.into_iter().collect();
             }
         }
@@ -1098,10 +1104,14 @@ impl SimplePromptDialog {
         let cursor_pos = self.cursor(section_id);
 
         // Find the collapsed placeholder pattern: "[Pasted ~N lines]"
-        if let Some(start) = content.find("[Pasted ~") {
-            if let Some(end) = content[start..].find(']') {
-                let placeholder_end = start + end + 1;
-                return cursor_pos > start && cursor_pos <= placeholder_end;
+        if let Some(start_byte) = content.find("[Pasted ~") {
+            if let Some(end_byte) = content[start_byte..].find(']') {
+                let start_char = content[..start_byte].chars().count();
+                let end_char = start_char
+                    + content[start_byte..start_byte + end_byte + 1]
+                        .chars()
+                        .count();
+                return cursor_pos > start_char && cursor_pos <= end_char;
             }
         }
         false
@@ -1117,15 +1127,16 @@ impl SimplePromptDialog {
         let content = self.get_section_content(section_id);
 
         // Find and remove the collapsed placeholder
-        if let Some(start) = content.find("[Pasted ~") {
-            if let Some(end) = content[start..].find(']') {
-                let placeholder_end = start + end + 1;
+        if let Some(start_byte) = content.find("[Pasted ~") {
+            if let Some(end_byte) = content[start_byte..].find(']') {
+                let placeholder_end_byte = start_byte + end_byte + 1;
+                let start_char = content[..start_byte].chars().count();
                 let mut new_content = String::with_capacity(content.len());
-                new_content.push_str(&content[..start]);
-                new_content.push_str(&content[placeholder_end..]);
+                new_content.push_str(&content[..start_byte]);
+                new_content.push_str(&content[placeholder_end_byte..]);
 
                 self.collapsed_pastes.remove(section_id);
-                self.set_content_and_cursor(section_id, new_content, start, field_width);
+                self.set_content_and_cursor(section_id, new_content, start_char, field_width);
             }
         }
     }
@@ -1310,14 +1321,105 @@ mod tests {
         assert!(!SimplePromptDialog::should_wrap_at_word_boundary(
             "hello w", 7, 10, 1
         ));
-        // "hello worl" + "d" = cursor at 11, word_dist = 5
-        // current_col = 11, word_dist = 5, new_chars = 1 → 11 + 5 + 1 = 17 > 10, wrap
         assert!(SimplePromptDialog::should_wrap_at_word_boundary(
             "hello worl",
             10,
             10,
             1
         ));
+    }
+
+    #[test]
+    fn test_non_ascii_handling_does_not_panic() {
+        // Test non-ASCII in distance_to_last_space
+        // "áéíóú " is 5 non-ASCII characters + 1 space = 6 characters.
+        // In UTF-8, "áéíóú" is 10 bytes. The space is at char index 5 (byte index 10).
+        let dist = SimplePromptDialog::distance_to_last_space("áéíóú world", 11);
+        assert_eq!(dist, 5); // distance to last space from end of "world"
+
+        // Test non-ASCII wrapping
+        // "áéíóú w" + "orl" = "áéíóú worl" (10 characters).
+        // Adding "d" should wrap with field_width=10.
+        assert!(SimplePromptDialog::should_wrap_at_word_boundary(
+            "áéíóú worl",
+            10,
+            10,
+            1
+        ));
+
+        // Test insert_char_at_cursor with non-ASCII
+        let mut dialog = SimplePromptDialog::new();
+        // Set section content with non-ASCII characters
+        dialog.set_section_content("instruction_1", "áéíóú ".to_string());
+        dialog
+            .section_cursors
+            .insert("instruction_1".to_string(), 6);
+        // This insert_char_at_cursor should trigger wrapping at the space.
+        // With field_width=10, "áéíóú " (6 chars) + "w" (1 char) doesn't wrap yet.
+        dialog.insert_char_at_cursor("instruction_1", 'w', 10);
+        assert_eq!(dialog.get_section_content("instruction_1"), "áéíóú w");
+        assert_eq!(dialog.cursor("instruction_1"), 7);
+
+        // Now if we insert 'o', 'r', 'l', 'd' one by one:
+        dialog.insert_char_at_cursor("instruction_1", 'o', 10); // "áéíóú wo"
+        dialog.insert_char_at_cursor("instruction_1", 'r', 10); // "áéíóú wor"
+        dialog.insert_char_at_cursor("instruction_1", 'l', 10); // "áéíóú worl"
+                                                                // At this point, length of word is 5 ("worl"), column is 10. Adding 'd' (1 char) overflows field_width=10.
+                                                                // The space at index 5 should be replaced with '\n'.
+        dialog.insert_char_at_cursor("instruction_1", 'd', 10);
+        assert_eq!(dialog.get_section_content("instruction_1"), "áéíóú\nworld");
+        assert_eq!(dialog.cursor("instruction_1"), 11);
+    }
+
+    #[test]
+    fn test_collapsed_placeholder_non_ascii_indices() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.set_section_content("instruction_1", "áéíóú [Pasted ~5 lines] extra".to_string());
+        dialog.collapsed_pastes.insert(
+            "instruction_1".to_string(),
+            "original content\nwith multiple lines".to_string(),
+        );
+
+        // Character indices:
+        // "áéíóú " is 6 characters.
+        // "[Pasted ~5 lines]" is 18 characters.
+        // "start" char of placeholder is 6.
+        // "end" char of placeholder is 6 + 18 = 24.
+
+        // Let's test cursor_in_collapsed_placeholder
+        // Cursor at 5 (on the space) -> false
+        dialog
+            .section_cursors
+            .insert("instruction_1".to_string(), 5);
+        assert!(!dialog.cursor_in_collapsed_placeholder("instruction_1"));
+
+        // Cursor at 7 (inside placeholder) -> true
+        dialog
+            .section_cursors
+            .insert("instruction_1".to_string(), 7);
+        assert!(dialog.cursor_in_collapsed_placeholder("instruction_1"));
+
+        // Cursor at 23 (on ']') -> true
+        dialog
+            .section_cursors
+            .insert("instruction_1".to_string(), 23);
+        assert!(dialog.cursor_in_collapsed_placeholder("instruction_1"));
+
+        // Cursor at 24 (after placeholder) -> false
+        dialog
+            .section_cursors
+            .insert("instruction_1".to_string(), 24);
+        assert!(!dialog.cursor_in_collapsed_placeholder("instruction_1"));
+
+        // Test backspace_collapsed_paste with cursor inside placeholder
+        dialog
+            .section_cursors
+            .insert("instruction_1".to_string(), 15);
+        dialog.backspace_collapsed_paste("instruction_1", 80);
+        // It should delete the placeholder "[Pasted ~5 lines]" and leave "áéíóú  extra"
+        assert_eq!(dialog.get_section_content("instruction_1"), "áéíóú  extra");
+        // Cursor should be at 6 (the start of deleted placeholder)
+        assert_eq!(dialog.cursor("instruction_1"), 6);
     }
 }
 
