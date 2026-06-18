@@ -75,8 +75,9 @@ pub struct SimplePromptDialog {
     pub collapsed_pastes: HashMap<String, String>,
     /// Section IDs that are read-only (auto-filled, cannot be edited).
     pub locked_sections: HashSet<String>,
-    /// Invisible system block appended at the bottom of the final prompt.
-    /// None = don't append. Set once per workdir session (idempotent).
+    /// Invisible system block rendered at the top of the final prompt so its
+    /// protocol is read before the task. None = omit. Set once per workdir
+    /// session (idempotent).
     pub system_content: Option<String>,
 }
 
@@ -581,43 +582,49 @@ impl SimplePromptDialog {
         db: &Database,
         current_workdir: &Path,
     ) -> Result<String> {
-        let mut result = self.build_prompt()?;
+        let system = self.render_system_block();
+        let mut body = self.build_body();
         let project_contexts = self.resolve_project_contexts(db);
         let default_project_hash = self.default_project_hash(db, current_workdir);
         let mut resources = self.resolve_resource_entries(db);
         resources.extend(self.resolve_rag_resources(db, default_project_hash.as_deref()));
 
+        // PROJECT CONTEXT leads the body, right below the system block.
         if let Some(section) = format_indexed_xml_section(
             "# [PROJECT CONTEXT]: Registered Project Metadata\n",
             "project_context",
             "project",
             &project_contexts,
         ) {
-            result = format!("{section}{result}");
+            body = format!("{section}{body}");
         }
 
+        // Resolved resources replace the raw resources section and close the body.
         if let Some(section) = format_indexed_xml_section(
             "# [RESOURCES]: Knowledge Base & Data\n",
             "resources",
             "resource",
             &resources,
         ) {
-            result = strip_resources_section(&result);
-            // Keep the <system> block as the closing element of the prompt:
-            // resolved resources go before it, never after.
-            if let Some(system_pos) = result.find("<system>\n") {
-                result.insert_str(system_pos, &section);
-            } else {
-                result.push_str(&section);
-            }
+            body = strip_resources_section(&body);
+            body.push_str(&section);
         }
 
-        Ok(result)
+        // System block stays first so its protocol is read before the task.
+        Ok(format!("{system}{body}"))
     }
 
-    /// Build the final prompt from the filled sections with structured format
-    /// Supports multiple instances of each section type
-    pub fn build_prompt(&self) -> Result<String> {
+    /// The invisible system block, rendered so its operating protocol is the
+    /// first thing the agent reads. Empty when there is no system content.
+    fn render_system_block(&self) -> String {
+        match &self.system_content {
+            Some(system) => format!("<system>\n{system}\n</system>\n\n"),
+            None => String::new(),
+        }
+    }
+
+    /// Build the prompt body (every section except the system block).
+    fn build_body(&self) -> String {
         let mut result = String::new();
         self.append_prompt_section(
             &mut result,
@@ -642,14 +649,7 @@ impl SimplePromptDialog {
             "constraint",
         );
         self.append_tools_section(&mut result);
-
-        if let Some(system) = &self.system_content {
-            result.push_str("<system>\n");
-            result.push_str(system);
-            result.push_str("\n</system>\n");
-        }
-
-        Ok(result)
+        result
     }
 
     pub fn migrate_legacy_sections(&mut self, current_project_path: Option<&str>) {
@@ -1246,6 +1246,31 @@ mod tests {
         assert!(prompt.contains(&project.hash));
         assert!(prompt.contains("kind: file"));
         assert!(prompt.contains("lib.rs"));
+    }
+
+    #[test]
+    fn system_block_leads_the_prompt() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("canopy.db");
+        let db = Database::new(&db_path).unwrap();
+        let project_dir = temp.path().join("proj");
+        std::fs::create_dir(&project_dir).unwrap();
+
+        let mut dialog = SimplePromptDialog::new();
+        dialog.set_section_content("instruction_1", "do it".to_string());
+        dialog.system_content = Some("[START HERE — required] call get_tools".to_string());
+
+        let prompt = dialog
+            .build_prompt_with_resolved_resources(&db, &project_dir)
+            .unwrap();
+
+        assert!(prompt.starts_with("<system>\n"));
+        let system_end = prompt.find("</system>").expect("system block present");
+        let instructions = prompt
+            .find("# [INSTRUCTIONS]")
+            .expect("instructions present");
+        // The whole system block must come before the task instructions.
+        assert!(system_end < instructions);
     }
 
     #[test]
