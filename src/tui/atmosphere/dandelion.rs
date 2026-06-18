@@ -22,11 +22,12 @@ const DRIFT_SOFT_CAP: usize = 3;
 const BASE_SPEED: f32 = 0.4;
 const DRIFT_VX: f32 = 3.0;
 
-/// Attraction radius (cells). Kept modest so the cursor deflects passing seeds
-/// rather than capturing them into a permanent orbit.
-const ATTRACT_RADIUS: f32 = 14.0;
-/// Attraction force — gentle pull toward the cursor.
-const ATTRACT_FORCE: f32 = 4.0;
+/// Attraction radius (cells). Wide enough that the cursor draws seeds in and
+/// they settle into an orbit around it (the signature dandelion behavior).
+const ATTRACT_RADIUS: f32 = 25.0;
+/// Attraction force — pulls seeds toward the cursor; combined with the small
+/// universal-repel core this produces an orbit rather than a direct hit.
+const ATTRACT_FORCE: f32 = 10.0;
 
 /// Universal repulsion radius — pushes ALL particles away when very close.
 const UNIVERSAL_REPEL_RADIUS: f32 = 4.0;
@@ -281,9 +282,9 @@ mod tests {
             phase: 0.0,
             life: 60.0,
         });
-        // Mouse 10 cells to the right — within ATTRACT_RADIUS (14)
+        // Mouse 20 cells to the right — within ATTRACT_RADIUS (25)
         let mut ctx = AtmosphereCtx {
-            mouse_col: 20,
+            mouse_col: 30,
             mouse_row: 12,
             ..Default::default()
         };
