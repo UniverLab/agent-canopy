@@ -195,6 +195,9 @@ impl App {
         self.tick_missions()?;
         self.resize_interactive_agents();
         self.refresh_playground_search()?;
+        if let Some(dialog) = self.simple_prompt_dialog.as_mut() {
+            dialog.tick_at_picker();
+        }
 
         // Non-blocking check for updated system info from background thread
         while let Ok(info) = self.system_info_rx.try_recv() {

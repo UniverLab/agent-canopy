@@ -118,6 +118,14 @@ impl SimplePromptDialog {
         self.section_scrolls.get(section).copied().unwrap_or(0)
     }
 
+    /// Drive the `@`-picker's debounced search. Call once per UI tick so a
+    /// pending search runs after typing pauses.
+    pub fn tick_at_picker(&mut self) {
+        if let Some(picker) = self.at_picker.as_mut() {
+            picker.tick_search();
+        }
+    }
+
     /// Returns true if the section is locked (read-only).
     pub fn is_locked(&self, section_id: &str) -> bool {
         self.locked_sections.contains(section_id)

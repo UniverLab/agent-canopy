@@ -496,7 +496,7 @@ fn handle_at_picker_backspace(
     };
 
     picker.query.pop();
-    picker.refresh();
+    picker.queue_search();
 }
 
 fn push_at_picker_query(dialog: &mut SimplePromptDialog, c: char, modifiers: KeyModifiers) {
@@ -510,7 +510,7 @@ fn push_at_picker_query(dialog: &mut SimplePromptDialog, c: char, modifiers: Key
         c
     };
     picker.query.push(ch);
-    picker.refresh();
+    picker.queue_search();
 }
 
 fn handle_dialog_key(
