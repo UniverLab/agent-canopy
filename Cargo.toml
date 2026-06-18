@@ -99,6 +99,8 @@ rand = "0.10"
 
 # Clipboard for text copy from TUI
 arboard = "3.6"
+# Decode OSC 52 clipboard payloads emitted by PTY programs
+base64 = "0.22"
 toml = "1.1.2"
 
 # Path manipulation for relative paths

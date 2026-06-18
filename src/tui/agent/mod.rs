@@ -51,6 +51,36 @@ pub struct PromptEntry {
 const MAX_PROMPT_HISTORY: usize = 20;
 const VT_SCROLLBACK_LINES: usize = 5_000;
 
+/// vt100 callbacks that mirror a PTY program's OSC 52 clipboard writes to the
+/// host system clipboard. Without this the parser silently drops OSC 52, so a
+/// harness (Claude Code, opencode, …) reports "copied" but nothing reaches the
+/// real clipboard.
+#[derive(Default)]
+pub(crate) struct ClipboardForwarder;
+
+impl vt100::Callbacks for ClipboardForwarder {
+    fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, _ty: &[u8], data: &[u8]) {
+        let Some(text) = decode_osc52_payload(data) else {
+            return;
+        };
+        // Set off-thread so clipboard I/O never blocks the held vt parser lock.
+        std::thread::spawn(move || crate::tui::clipboard::set_text(&text));
+    }
+}
+
+/// Decode an OSC 52 base64 payload into UTF-8 text, tolerating missing padding.
+fn decode_osc52_payload(data: &[u8]) -> Option<String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(data))
+        .ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// vt100 parser wired with our clipboard-forwarding callbacks.
+pub(crate) type Vt = vt100::Parser<ClipboardForwarder>;
+
 fn apply_canopy_session_env(
     cmd: &mut CommandBuilder,
     agent_id: &str,
@@ -93,7 +123,7 @@ pub struct InteractiveAgent {
     /// PTY writer — send bytes to the agent's stdin.
     pub(crate) writer: Arc<Mutex<Box<dyn Write + Send>>>,
     /// Virtual terminal screen — fed by PTY output (for live rendering with colors).
-    pub(crate) vt: Arc<Mutex<vt100::Parser>>,
+    pub(crate) vt: Arc<Mutex<Vt>>,
     /// Child process handle.
     pub(crate) child: Arc<Mutex<Box<dyn portable_pty::Child + Send>>>,
     /// PTY master — needed for resize.
@@ -216,10 +246,11 @@ impl InteractiveAgent {
         let mut reader = pair.master.try_clone_reader()?;
         let master = pair.master;
 
-        let vt = Arc::new(Mutex::new(vt100::Parser::new(
+        let vt = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
             rows,
             cols,
             VT_SCROLLBACK_LINES,
+            ClipboardForwarder,
         )));
         let vt_clone = Arc::clone(&vt);
 
@@ -320,10 +351,11 @@ impl InteractiveAgent {
         let mut reader = pair.master.try_clone_reader()?;
         let master = pair.master;
 
-        let vt = Arc::new(Mutex::new(vt100::Parser::new(
+        let vt = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
             rows,
             cols,
             VT_SCROLLBACK_LINES,
+            ClipboardForwarder,
         )));
         let vt_clone = Arc::clone(&vt);
 
@@ -465,3 +497,34 @@ impl InteractiveAgent {
 
 pub use pty::key_to_bytes;
 pub use screen::ScreenSnapshot;
+
+#[cfg(test)]
+mod tests {
+    use super::decode_osc52_payload;
+    use base64::Engine as _;
+
+    #[test]
+    fn decodes_padded_osc52_payload() {
+        let encoded = base64::engine::general_purpose::STANDARD.encode("hello world");
+        assert_eq!(
+            decode_osc52_payload(encoded.as_bytes()).as_deref(),
+            Some("hello world")
+        );
+    }
+
+    #[test]
+    fn decodes_unpadded_osc52_payload() {
+        // Some emitters strip the `=` padding; we must still decode it.
+        let unpadded = base64::engine::general_purpose::STANDARD_NO_PAD.encode("multi\nline");
+        assert!(!unpadded.ends_with('='));
+        assert_eq!(
+            decode_osc52_payload(unpadded.as_bytes()).as_deref(),
+            Some("multi\nline")
+        );
+    }
+
+    #[test]
+    fn rejects_non_base64_payload() {
+        assert_eq!(decode_osc52_payload(b"!!! not base64 !!!"), None);
+    }
+}

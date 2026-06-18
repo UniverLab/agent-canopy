@@ -8,6 +8,7 @@ mod agent;
 mod app;
 mod atmosphere;
 mod brians_brain;
+mod clipboard;
 pub(crate) mod context_transfer;
 mod event;
 mod gamification;

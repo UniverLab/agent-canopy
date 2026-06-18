@@ -350,7 +350,7 @@ fn handle_shift_click_copy(app: &mut App) {
         return;
     };
 
-    let _ = arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(&text));
+    crate::tui::clipboard::set_text(&text);
 }
 
 fn mark_copied(app: &mut App) {

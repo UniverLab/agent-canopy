@@ -26,7 +26,7 @@ fn read_screen_line(screen: &vt100::Screen, row: u16, cols: u16) -> Option<Strin
 /// emitted exactly once even when the final clamped page overlaps with the
 /// previous one.
 fn read_abs_range(
-    vt: &mut vt100::Parser,
+    vt: &mut super::Vt,
     max_sb: usize,
     rows: usize,
     from_abs: usize,
