@@ -50,13 +50,24 @@ impl App {
         summarize_sync_context(&messages, &active_agent_ids, 0).active_intents
     }
 
+    /// True when the selected sidebar entry is a terminal session.
+    fn selected_session_is_terminal(&self) -> bool {
+        matches!(self.selected_agent(), Some(AgentEntry::Terminal(_)))
+    }
+
     pub(crate) fn activity_panel_state(&self) -> Option<SyncPanelState> {
         let state = self.selected_activity_state()?;
         if self.sidebar_mode == SidebarMode::Projects {
-            Some(state)
-        } else {
-            (!self.hidden_activity_workdirs.contains(&state.workdir)).then_some(state)
+            return Some(state);
         }
+        // Terminal sessions hide the sync panel by default; an explicit toggle
+        // (F3 → forced) still brings it up.
+        if self.selected_session_is_terminal()
+            && !self.forced_activity_workdirs.contains(&state.workdir)
+        {
+            return None;
+        }
+        (!self.hidden_activity_workdirs.contains(&state.workdir)).then_some(state)
     }
 
     pub(crate) fn activity_panel_layout_width(&self, total_width: u16, enabled: bool) -> u16 {
