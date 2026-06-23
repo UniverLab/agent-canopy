@@ -3,7 +3,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use super::{centered_rect, truncate_str, ACCENT, DIM};
+use super::{centered_rect, draw_dialog_left_wave, truncate_str, ACCENT, BG_SELECTED, DIM};
 use crate::tui::app::types::App;
 
 pub fn draw_rag_transfer_modal(frame: &mut Frame, app: &App) {
@@ -31,6 +31,7 @@ pub fn draw_rag_transfer_modal(frame: &mut Frame, app: &App) {
         .style(Style::default().bg(Color::Rgb(15, 25, 15)));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    draw_dialog_left_wave(frame, area, app.animation_tick.into());
 
     let mut lines = vec![
         Line::from(vec![
@@ -61,6 +62,11 @@ pub fn draw_rag_transfer_modal(frame: &mut Frame, app: &App) {
 
     lines.push(Line::from(""));
 
+    // Full-width trailing filler so a selected row reads as a card spanning the
+    // whole dialog (like the sidebar), not just the background behind the text.
+    let row_fill =
+        |bg: Color| Span::styled(" ".repeat(inner.width as usize), Style::default().bg(bg));
+
     if agents.is_empty() {
         lines.push(Line::from(Span::styled(
             "  No interactive agents running.",
@@ -73,12 +79,14 @@ pub fn draw_rag_transfer_modal(frame: &mut Frame, app: &App) {
             }
             let is_sel = i == modal.picker_selected;
             let accent = agent.accent_color;
+            // Subtle selection (matches the sidebar): dark-gray background with
+            // the agent name in its accent color, instead of a full accent fill.
             let bg = if is_sel {
-                accent
+                BG_SELECTED
             } else {
                 Color::Rgb(15, 25, 15)
             };
-            let fg = if is_sel { Color::Black } else { Color::White };
+            let fg = if is_sel { accent } else { Color::White };
             let cursor = if is_sel { "›" } else { " " };
             lines.push(Line::from(vec![
                 Span::styled(format!("  {} ", cursor), Style::default().fg(accent).bg(bg)),
@@ -86,6 +94,7 @@ pub fn draw_rag_transfer_modal(frame: &mut Frame, app: &App) {
                     &agent.name,
                     Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
                 ),
+                row_fill(bg),
             ]));
             lines.push(Line::from(vec![
                 Span::styled("    ", Style::default().bg(bg)),
@@ -93,6 +102,7 @@ pub fn draw_rag_transfer_modal(frame: &mut Frame, app: &App) {
                     format!("pty · {}", agent.cli.as_str()),
                     Style::default().fg(DIM).bg(bg),
                 ),
+                row_fill(bg),
             ]));
             lines.push(Line::from(vec![
                 Span::styled("    ", Style::default().bg(bg)),
@@ -100,6 +110,7 @@ pub fn draw_rag_transfer_modal(frame: &mut Frame, app: &App) {
                     truncate_path(&agent.working_dir, inner.width.saturating_sub(6) as usize),
                     Style::default().fg(Color::Cyan).bg(bg),
                 ),
+                row_fill(bg),
             ]));
         }
     }

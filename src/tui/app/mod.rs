@@ -22,7 +22,7 @@ use super::context_transfer::{
     interactive_line_page_count, interactive_prompt_count, ContextCaptureKind, ContextSourceKind,
     ContextTransferConfig, ContextTransferModal, ContextTransferStep,
 };
-use crate::domain::workflow::{WorkflowNodeKind, WorkflowSpecStatus};
+use crate::domain::loops::{LoopNodeKind, LoopSpecStatus};
 use crate::tui::prompt_templates::PromptTemplates;
 
 pub(crate) use data::send_mcp_task_run;
@@ -80,7 +80,7 @@ impl App {
             pending_launch_dialog: None,
             quit_confirm: false,
             delete_project_confirm: false,
-            delete_workflow_confirm: false,
+            delete_loop_confirm: false,
             sidebar_brain: None,
             home_brain: None,
             sidebar_click_map: Vec::new(),
@@ -88,13 +88,13 @@ impl App {
             selected_project: 0,
             projects_panel_focus: ProjectsPanelFocus::Projects,
             agent_section_focus: AgentSectionFocus::Background,
-            workflows: Vec::new(),
-            selected_workflow_id: None,
-            workflow_details: None,
-            workflow_runs: Vec::new(),
-            workflow_selected_spec: 0,
-            workflow_selected_node: 0,
-            workflow_editor_dialog: None,
+            loops: Vec::new(),
+            selected_loop_id: None,
+            loop_details: None,
+            loop_runs: Vec::new(),
+            loop_selected_spec: 0,
+            loop_selected_node: 0,
+            loop_editor_dialog: None,
             global_rag_queue: Vec::new(),
             selected_rag_queue: 0,
             rag_info: crate::db::project::RagInfoSummary::default(),
@@ -177,7 +177,7 @@ impl App {
         self.refresh_daemon_status();
         self.refresh_agents()?;
         self.refresh_projects()?;
-        self.refresh_workflows()?;
+        self.refresh_loops()?;
         self.refresh_project_graph().ok();
         self.refresh_rag_state()?;
         self.refresh_active_runs()?;
@@ -289,7 +289,7 @@ impl App {
         self.normalize_projects_panel_focus();
         match self.projects_panel_focus {
             ProjectsPanelFocus::Projects => self.navigate_projects_next(),
-            ProjectsPanelFocus::Workflows => self.navigate_workflows_next(),
+            ProjectsPanelFocus::Loops => self.navigate_loops_next(),
             ProjectsPanelFocus::Knowledge => self.navigate_knowledge_next(),
             ProjectsPanelFocus::RagInfo => self.navigate_from_rag_info_next(),
         }
@@ -315,10 +315,10 @@ impl App {
         let next = self.selected_project + 1;
         if next < self.projects.len() {
             self.selected_project = next;
-            self.refresh_workflows_selection();
+            self.refresh_loops_selection();
             return;
         }
-        if self.try_cross_to_workflows_first() {
+        if self.try_cross_to_loops_first() {
             return;
         }
         if self.rag_info.has_rag_activity() {
@@ -328,19 +328,19 @@ impl App {
         self.selected_project = 0;
     }
 
-    fn try_cross_to_workflows_first(&mut self) -> bool {
-        let Some(id) = self.visible_workflows().first().map(|w| w.id.clone()) else {
+    fn try_cross_to_loops_first(&mut self) -> bool {
+        let Some(id) = self.visible_loops().first().map(|w| w.id.clone()) else {
             return false;
         };
-        self.projects_panel_focus = ProjectsPanelFocus::Workflows;
-        self.selected_workflow_id = Some(id);
-        self.refresh_workflows_selection();
+        self.projects_panel_focus = ProjectsPanelFocus::Loops;
+        self.selected_loop_id = Some(id);
+        self.refresh_loops_selection();
         true
     }
 
-    fn navigate_workflows_next(&mut self) {
+    fn navigate_loops_next(&mut self) {
         let visible_ids: Vec<String> = self
-            .visible_workflows()
+            .visible_loops()
             .into_iter()
             .map(|w| w.id.clone())
             .collect();
@@ -348,14 +348,14 @@ impl App {
             return;
         }
         let current = self
-            .selected_workflow_id
+            .selected_loop_id
             .as_ref()
             .and_then(|id| visible_ids.iter().position(|vid| vid == id))
             .unwrap_or(0);
         let next = current + 1;
         if next < visible_ids.len() {
-            self.selected_workflow_id = Some(visible_ids[next].clone());
-            self.refresh_workflows_selection();
+            self.selected_loop_id = Some(visible_ids[next].clone());
+            self.refresh_loops_selection();
             return;
         }
         if self.rag_info.has_rag_activity() {
@@ -372,7 +372,7 @@ impl App {
         }
         self.projects_panel_focus = ProjectsPanelFocus::Projects;
         self.selected_project = 0;
-        self.refresh_workflows_selection();
+        self.refresh_loops_selection();
     }
 
     fn select_next_agent_panel(&mut self) {
@@ -435,7 +435,7 @@ impl App {
         self.normalize_projects_panel_focus();
         match self.projects_panel_focus {
             ProjectsPanelFocus::Projects => self.navigate_projects_prev(),
-            ProjectsPanelFocus::Workflows => self.navigate_workflows_prev(),
+            ProjectsPanelFocus::Loops => self.navigate_loops_prev(),
             ProjectsPanelFocus::Knowledge => self.navigate_knowledge_prev(),
             ProjectsPanelFocus::RagInfo => self.navigate_from_rag_info_prev(),
         }
@@ -461,32 +461,32 @@ impl App {
         }
         if self.selected_project > 0 {
             self.selected_project -= 1;
-            self.refresh_workflows_selection();
+            self.refresh_loops_selection();
             return;
         }
         if self.rag_info.has_rag_activity() {
             self.projects_panel_focus = ProjectsPanelFocus::RagInfo;
             return;
         }
-        if self.try_cross_to_workflows_last() {
+        if self.try_cross_to_loops_last() {
             return;
         }
         self.selected_project = self.projects.len() - 1;
     }
 
-    fn try_cross_to_workflows_last(&mut self) -> bool {
-        let Some(id) = self.visible_workflows().last().map(|w| w.id.clone()) else {
+    fn try_cross_to_loops_last(&mut self) -> bool {
+        let Some(id) = self.visible_loops().last().map(|w| w.id.clone()) else {
             return false;
         };
-        self.projects_panel_focus = ProjectsPanelFocus::Workflows;
-        self.selected_workflow_id = Some(id);
-        self.refresh_workflows_selection();
+        self.projects_panel_focus = ProjectsPanelFocus::Loops;
+        self.selected_loop_id = Some(id);
+        self.refresh_loops_selection();
         true
     }
 
-    fn navigate_workflows_prev(&mut self) {
+    fn navigate_loops_prev(&mut self) {
         let visible_ids: Vec<String> = self
-            .visible_workflows()
+            .visible_loops()
             .into_iter()
             .map(|w| w.id.clone())
             .collect();
@@ -494,13 +494,13 @@ impl App {
             return;
         }
         let current = self
-            .selected_workflow_id
+            .selected_loop_id
             .as_ref()
             .and_then(|id| visible_ids.iter().position(|vid| vid == id))
             .unwrap_or(0);
         if current > 0 {
-            self.selected_workflow_id = Some(visible_ids[current - 1].clone());
-            self.refresh_workflows_selection();
+            self.selected_loop_id = Some(visible_ids[current - 1].clone());
+            self.refresh_loops_selection();
             return;
         }
         if !self.projects.is_empty() {
@@ -508,16 +508,16 @@ impl App {
             self.selected_project = self.projects.len() - 1;
             return;
         }
-        self.selected_workflow_id = Some(visible_ids[visible_ids.len() - 1].clone());
-        self.refresh_workflows_selection();
+        self.selected_loop_id = Some(visible_ids[visible_ids.len() - 1].clone());
+        self.refresh_loops_selection();
     }
 
     fn navigate_from_rag_info_prev(&mut self) {
-        let last_id = self.visible_workflows().last().map(|w| w.id.clone());
+        let last_id = self.visible_loops().last().map(|w| w.id.clone());
         if let Some(id) = last_id {
-            self.projects_panel_focus = ProjectsPanelFocus::Workflows;
-            self.selected_workflow_id = Some(id);
-            self.refresh_workflows_selection();
+            self.projects_panel_focus = ProjectsPanelFocus::Loops;
+            self.selected_loop_id = Some(id);
+            self.refresh_loops_selection();
             return;
         }
         if self.projects.is_empty() {
@@ -601,45 +601,45 @@ impl App {
         Ok(())
     }
 
-    fn refresh_workflows(&mut self) -> Result<()> {
-        self.workflows = self.db.list_workflows(None)?;
-        self.refresh_workflows_selection();
+    fn refresh_loops(&mut self) -> Result<()> {
+        self.loops = self.db.list_loops(None)?;
+        self.refresh_loops_selection();
         Ok(())
     }
 
-    fn refresh_workflows_selection(&mut self) {
-        let visible = self.visible_workflows();
+    fn refresh_loops_selection(&mut self) {
+        let visible = self.visible_loops();
         if visible.is_empty() {
-            self.selected_workflow_id = None;
-            self.workflow_details = None;
-            self.workflow_runs.clear();
-            self.workflow_selected_spec = 0;
-            self.workflow_selected_node = 0;
+            self.selected_loop_id = None;
+            self.loop_details = None;
+            self.loop_runs.clear();
+            self.loop_selected_spec = 0;
+            self.loop_selected_node = 0;
             return;
         }
 
-        let previous_selected = self.selected_workflow_id.clone();
+        let previous_selected = self.selected_loop_id.clone();
         if self
-            .selected_workflow_id
+            .selected_loop_id
             .as_ref()
-            .is_none_or(|selected| !visible.iter().any(|workflow| workflow.id == *selected))
+            .is_none_or(|selected| !visible.iter().any(|lp| lp.id == *selected))
         {
-            self.selected_workflow_id = Some(visible[0].id.clone());
+            self.selected_loop_id = Some(visible[0].id.clone());
         }
 
-        let selected_changed = previous_selected != self.selected_workflow_id;
-        let Some(selected_id) = self.selected_workflow_id.clone() else {
+        let selected_changed = previous_selected != self.selected_loop_id;
+        let Some(selected_id) = self.selected_loop_id.clone() else {
             return;
         };
-        self.workflow_details = self.db.get_workflow_details(&selected_id).ok().flatten();
+        self.loop_details = self.db.get_loop_details(&selected_id).ok().flatten();
         if selected_changed {
-            self.workflow_selected_spec = self.default_workflow_spec_index();
-            self.workflow_selected_node = 0;
+            self.loop_selected_spec = self.default_loop_spec_index();
+            self.loop_selected_node = 0;
         } else {
-            self.clamp_workflow_selection();
+            self.clamp_loop_selection();
         }
-        self.refresh_workflow_runs_for_selected_spec();
-        self.select_default_workflow_node_if_needed(selected_changed);
+        self.refresh_loop_runs_for_selected_spec();
+        self.select_default_loop_node_if_needed(selected_changed);
     }
 
     fn refresh_rag_state(&mut self) -> Result<()> {
@@ -723,30 +723,30 @@ impl App {
         self.projects.get(self.selected_project)
     }
 
-    pub fn visible_workflows(&self) -> Vec<&crate::domain::workflow::Workflow> {
-        self.workflows.iter().collect()
+    pub fn visible_loops(&self) -> Vec<&crate::domain::loops::Loop> {
+        self.loops.iter().collect()
     }
 
-    pub fn selected_workflow(&self) -> Option<&crate::domain::workflow::Workflow> {
-        let selected_id = self.selected_workflow_id.as_ref()?;
-        self.workflows
+    pub fn selected_loop(&self) -> Option<&crate::domain::loops::Loop> {
+        let selected_id = self.selected_loop_id.as_ref()?;
+        self.loops
             .iter()
-            .find(|workflow| workflow.id == *selected_id)
+            .find(|lp| lp.id == *selected_id)
     }
 
-    pub fn selected_workflow_details(&self) -> Option<&crate::domain::workflow::WorkflowDetails> {
-        self.workflow_details.as_ref()
+    pub fn selected_loop_details(&self) -> Option<&crate::domain::loops::LoopDetails> {
+        self.loop_details.as_ref()
     }
 
-    pub fn selected_workflow_spec(&self) -> Option<&crate::domain::workflow::WorkflowSpecDetails> {
-        self.workflow_details
+    pub fn selected_loop_spec(&self) -> Option<&crate::domain::loops::LoopSpecDetails> {
+        self.loop_details
             .as_ref()
-            .and_then(|details| details.specs.get(self.workflow_selected_spec))
+            .and_then(|details| details.specs.get(self.loop_selected_spec))
     }
 
-    pub fn selected_workflow_node(&self) -> Option<&crate::domain::workflow::WorkflowNode> {
-        self.selected_workflow_spec()
-            .and_then(|spec| spec.nodes.get(self.workflow_selected_node))
+    pub fn selected_loop_node(&self) -> Option<&crate::domain::loops::LoopNode> {
+        self.selected_loop_spec()
+            .and_then(|spec| spec.nodes.get(self.loop_selected_node))
     }
 
     pub fn delete_selected_project(&mut self) -> Result<()> {
@@ -755,18 +755,18 @@ impl App {
         };
         self.db.delete_project(&hash)?;
         self.refresh_projects()?;
-        self.refresh_workflows()?;
+        self.refresh_loops()?;
         self.refresh_project_graph().ok();
         self.refresh_rag_state()?;
         Ok(())
     }
 
-    pub fn delete_selected_workflow(&mut self) -> Result<()> {
-        let Some(workflow) = self.selected_workflow() else {
+    pub fn delete_selected_loop(&mut self) -> Result<()> {
+        let Some(lp) = self.selected_loop() else {
             return Ok(());
         };
-        self.db.delete_workflow(&workflow.id)?;
-        self.refresh_workflows()?;
+        self.db.delete_loop(&lp.id)?;
+        self.refresh_loops()?;
         self.refresh_projects()?;
         self.refresh_rag_state()?;
         Ok(())
@@ -847,7 +847,7 @@ impl App {
     pub fn visible_projects_panels(&self) -> Vec<ProjectsPanelFocus> {
         let mut panels = vec![
             ProjectsPanelFocus::Projects,
-            ProjectsPanelFocus::Workflows,
+            ProjectsPanelFocus::Loops,
             ProjectsPanelFocus::Knowledge,
         ];
         if self.rag_info.has_rag_activity() {
@@ -859,7 +859,7 @@ impl App {
     fn project_panel_has_navigable_items(&self, panel: ProjectsPanelFocus) -> bool {
         match panel {
             ProjectsPanelFocus::Projects => !self.projects.is_empty(),
-            ProjectsPanelFocus::Workflows => !self.visible_workflows().is_empty(),
+            ProjectsPanelFocus::Loops => !self.visible_loops().is_empty(),
             ProjectsPanelFocus::Knowledge => true,
             ProjectsPanelFocus::RagInfo => self.rag_info.has_rag_activity(),
         }
@@ -954,52 +954,52 @@ impl App {
         self.reset_log_scroll();
     }
 
-    pub fn cycle_workflow_spec(&mut self, forward: bool) {
-        let Some(details) = self.workflow_details.as_ref() else {
+    pub fn cycle_loop_spec(&mut self, forward: bool) {
+        let Some(details) = self.loop_details.as_ref() else {
             return;
         };
         if details.specs.is_empty() {
             return;
         }
 
-        self.workflow_selected_spec = if forward {
-            (self.workflow_selected_spec + 1) % details.specs.len()
+        self.loop_selected_spec = if forward {
+            (self.loop_selected_spec + 1) % details.specs.len()
         } else {
-            self.workflow_selected_spec
+            self.loop_selected_spec
                 .checked_sub(1)
                 .unwrap_or(details.specs.len() - 1)
         };
-        self.workflow_selected_node = 0;
-        self.refresh_workflow_runs_for_selected_spec();
-        self.select_default_workflow_node_if_needed(true);
+        self.loop_selected_node = 0;
+        self.refresh_loop_runs_for_selected_spec();
+        self.select_default_loop_node_if_needed(true);
         self.reset_log_scroll();
     }
 
-    pub fn cycle_workflow_node(&mut self, forward: bool) {
-        let Some(spec) = self.selected_workflow_spec() else {
+    pub fn cycle_loop_node(&mut self, forward: bool) {
+        let Some(spec) = self.selected_loop_spec() else {
             return;
         };
         if spec.nodes.is_empty() {
             return;
         }
-        self.workflow_selected_node = if forward {
-            (self.workflow_selected_node + 1) % spec.nodes.len()
+        self.loop_selected_node = if forward {
+            (self.loop_selected_node + 1) % spec.nodes.len()
         } else {
-            self.workflow_selected_node
+            self.loop_selected_node
                 .checked_sub(1)
                 .unwrap_or(spec.nodes.len() - 1)
         };
         self.reset_log_scroll();
     }
 
-    pub fn open_workflow_editor_dialog(&mut self) -> Result<()> {
-        let Some(node) = self.selected_workflow_node() else {
+    pub fn open_loop_editor_dialog(&mut self) -> Result<()> {
+        let Some(node) = self.selected_loop_node() else {
             return Ok(());
         };
 
         let (title, help, buffer, mode) = self.build_editor_dialog_content(node);
 
-        self.workflow_editor_dialog = Some(crate::tui::app::types::WorkflowEditorDialog::new(
+        self.loop_editor_dialog = Some(crate::tui::app::types::LoopEditorDialog::new(
             node.id.clone(),
             node.name.clone(),
             title,
@@ -1007,20 +1007,20 @@ impl App {
             buffer,
             mode,
         ));
-        self.focus = Focus::WorkflowEditorDialog;
+        self.focus = Focus::LoopEditorDialog;
         Ok(())
     }
 
     fn build_editor_dialog_content(
         &self,
-        node: &crate::domain::workflow::WorkflowNode,
+        node: &crate::domain::loops::LoopNode,
     ) -> (
         String,
         String,
         String,
-        crate::tui::app::types::WorkflowEditorMode,
+        crate::tui::app::types::LoopEditorMode,
     ) {
-        if node.kind == WorkflowNodeKind::Agent {
+        if node.kind == LoopNodeKind::Agent {
             self.build_agent_prompt_dialog(node)
         } else {
             self.build_node_config_dialog(node)
@@ -1029,12 +1029,12 @@ impl App {
 
     fn build_agent_prompt_dialog(
         &self,
-        node: &crate::domain::workflow::WorkflowNode,
+        node: &crate::domain::loops::LoopNode,
     ) -> (
         String,
         String,
         String,
-        crate::tui::app::types::WorkflowEditorMode,
+        crate::tui::app::types::LoopEditorMode,
     ) {
         let prompt = node
             .config
@@ -1042,46 +1042,46 @@ impl App {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
         (
-            format!(" Workflow Prompt · {} ", node.name),
+            format!(" Loop Prompt · {} ", node.name),
             "Ctrl+S save  ·  Enter newline  ·  Esc cancel".to_string(),
             prompt.to_string(),
-            crate::tui::app::types::WorkflowEditorMode::AgentPrompt,
+            crate::tui::app::types::LoopEditorMode::AgentPrompt,
         )
     }
 
     fn build_node_config_dialog(
         &self,
-        node: &crate::domain::workflow::WorkflowNode,
+        node: &crate::domain::loops::LoopNode,
     ) -> (
         String,
         String,
         String,
-        crate::tui::app::types::WorkflowEditorMode,
+        crate::tui::app::types::LoopEditorMode,
     ) {
         (
-            format!(" Workflow Config · {} ", node.name),
+            format!(" Loop Config · {} ", node.name),
             "Ctrl+S save JSON  ·  Enter newline  ·  Esc cancel".to_string(),
             serde_json::to_string_pretty(&node.config).unwrap_or_default(),
-            crate::tui::app::types::WorkflowEditorMode::NodeConfig,
+            crate::tui::app::types::LoopEditorMode::NodeConfig,
         )
     }
 
-    pub fn cancel_workflow_editor_dialog(&mut self) {
-        self.workflow_editor_dialog = None;
+    pub fn cancel_loop_editor_dialog(&mut self) {
+        self.loop_editor_dialog = None;
         self.focus = Focus::Preview;
     }
 
-    pub fn save_workflow_editor_dialog(&mut self) -> Result<()> {
-        let Some(dialog) = self.workflow_editor_dialog.take() else {
+    pub fn save_loop_editor_dialog(&mut self) -> Result<()> {
+        let Some(dialog) = self.loop_editor_dialog.take() else {
             return Ok(());
         };
-        let Some(node) = self.db.get_workflow_node(&dialog.node_id)? else {
+        let Some(node) = self.db.get_loop_node(&dialog.node_id)? else {
             self.focus = Focus::Preview;
             return Ok(());
         };
 
         let updated_config = self.compute_updated_node_config(&dialog, &node)?;
-        self.db.update_workflow_node_details(
+        self.db.update_loop_node_details(
             &dialog.node_id,
             None,
             None,
@@ -1089,27 +1089,27 @@ impl App {
             None,
         )?;
         self.focus = Focus::Preview;
-        self.refresh_workflows()?;
+        self.refresh_loops()?;
         Ok(())
     }
 
     fn compute_updated_node_config(
         &mut self,
-        dialog: &crate::tui::app::types::WorkflowEditorDialog,
-        node: &crate::domain::workflow::WorkflowNode,
+        dialog: &crate::tui::app::types::LoopEditorDialog,
+        node: &crate::domain::loops::LoopNode,
     ) -> Result<serde_json::Value> {
         match dialog.mode {
-            crate::tui::app::types::WorkflowEditorMode::AgentPrompt => {
+            crate::tui::app::types::LoopEditorMode::AgentPrompt => {
                 Ok(Self::update_prompt_config(&node.config, &dialog.buffer))
             }
-            crate::tui::app::types::WorkflowEditorMode::NodeConfig => {
+            crate::tui::app::types::LoopEditorMode::NodeConfig => {
                 match serde_json::from_str::<serde_json::Value>(&dialog.buffer) {
                     Ok(v) => Ok(v),
                     Err(e) => {
                         let mut d = dialog.clone();
                         d.parse_error = Some(format!("JSON error: {e}"));
-                        self.workflow_editor_dialog = Some(d);
-                        self.focus = Focus::WorkflowEditorDialog;
+                        self.loop_editor_dialog = Some(d);
+                        self.focus = Focus::LoopEditorDialog;
                         Err(anyhow::anyhow!("Invalid JSON"))
                     }
                 }
@@ -1283,79 +1283,79 @@ impl App {
         }
     }
 
-    fn clamp_workflow_selection(&mut self) {
-        let Some(details) = self.workflow_details.as_ref() else {
-            self.workflow_selected_spec = 0;
-            self.workflow_selected_node = 0;
+    fn clamp_loop_selection(&mut self) {
+        let Some(details) = self.loop_details.as_ref() else {
+            self.loop_selected_spec = 0;
+            self.loop_selected_node = 0;
             return;
         };
         if details.specs.is_empty() {
-            self.workflow_selected_spec = 0;
-            self.workflow_selected_node = 0;
+            self.loop_selected_spec = 0;
+            self.loop_selected_node = 0;
             return;
         }
 
-        self.workflow_selected_spec = self.workflow_selected_spec.min(details.specs.len() - 1);
-        let node_count = details.specs[self.workflow_selected_spec].nodes.len();
-        self.workflow_selected_node = if node_count == 0 {
+        self.loop_selected_spec = self.loop_selected_spec.min(details.specs.len() - 1);
+        let node_count = details.specs[self.loop_selected_spec].nodes.len();
+        self.loop_selected_node = if node_count == 0 {
             0
         } else {
-            self.workflow_selected_node.min(node_count - 1)
+            self.loop_selected_node.min(node_count - 1)
         };
     }
 
-    fn default_workflow_spec_index(&self) -> usize {
-        self.workflow_details
+    fn default_loop_spec_index(&self) -> usize {
+        self.loop_details
             .as_ref()
             .and_then(|details| {
                 details
                     .specs
                     .iter()
-                    .position(|spec| spec.spec.status == WorkflowSpecStatus::Running)
+                    .position(|spec| spec.spec.status == LoopSpecStatus::Running)
                     .or_else(|| {
                         details
                             .specs
                             .iter()
-                            .position(|spec| spec.spec.status == WorkflowSpecStatus::Pending)
+                            .position(|spec| spec.spec.status == LoopSpecStatus::Pending)
                     })
             })
             .unwrap_or(0)
     }
 
-    fn refresh_workflow_runs_for_selected_spec(&mut self) {
-        self.workflow_runs.clear();
-        let Some(spec) = self.selected_workflow_spec() else {
+    fn refresh_loop_runs_for_selected_spec(&mut self) {
+        self.loop_runs.clear();
+        let Some(spec) = self.selected_loop_spec() else {
             return;
         };
-        self.workflow_runs = self
+        self.loop_runs = self
             .db
-            .list_workflow_runs_for_spec(&spec.spec.id)
+            .list_loop_runs_for_spec(&spec.spec.id)
             .unwrap_or_default();
     }
 
-    fn select_default_workflow_node_if_needed(&mut self, reset: bool) {
-        let Some(spec) = self.selected_workflow_spec() else {
-            self.workflow_selected_node = 0;
+    fn select_default_loop_node_if_needed(&mut self, reset: bool) {
+        let Some(spec) = self.selected_loop_spec() else {
+            self.loop_selected_node = 0;
             return;
         };
         if spec.nodes.is_empty() {
-            self.workflow_selected_node = 0;
+            self.loop_selected_node = 0;
             return;
         }
 
-        if !reset && self.workflow_selected_node < spec.nodes.len() {
+        if !reset && self.loop_selected_node < spec.nodes.len() {
             return;
         }
 
         let current_node_id = self
-            .workflow_runs
+            .loop_runs
             .iter()
             .rev()
-            .find(|run| run.status == crate::domain::workflow::WorkflowRunStatus::Running)
-            .or_else(|| self.workflow_runs.last())
+            .find(|run| run.status == crate::domain::loops::LoopRunStatus::Running)
+            .or_else(|| self.loop_runs.last())
             .map(|run| run.node_id.as_str());
 
-        self.workflow_selected_node = current_node_id
+        self.loop_selected_node = current_node_id
             .and_then(|node_id| spec.nodes.iter().position(|node| node.id == node_id))
             .unwrap_or(0);
     }

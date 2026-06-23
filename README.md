@@ -11,13 +11,13 @@
 ```
 
 <p align="center">
-  <a href="https://github.com/UniverLab/harness-canopy/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/UniverLab/harness-canopy/ci.yml?branch=main&style=for-the-badge&label=CI" alt="CI"/></a>
+  <a href="https://github.com/UniverLab/harness-canopy/actions/loops/ci.yml"><img src="https://img.shields.io/github/actions/loop/status/UniverLab/harness-canopy/ci.yml?branch=main&style=for-the-badge&label=CI" alt="CI"/></a>
   <a href="https://crates.io/crates/harness-canopy"><img src="https://img.shields.io/crates/v/harness-canopy?style=for-the-badge&logo=rust&logoColor=white" alt="Crates.io"/></a>
   <img src="https://img.shields.io/badge/Status-Active-27AE60?style=for-the-badge" alt="Status"/>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-2E8B57?style=for-the-badge" alt="License"/></a>
 </p>
 
-harness-canopy is a modern, self-contained MCP (Model Context Protocol) server and TUI for orchestrating AI agent sessions, background tasks, and file event triggers. Designed for reliability, modularity, and performance — it enables advanced scheduling, persistent knowledge graphs, multi-agent coordination, workflow automation, and interactive terminal management with zero runtime dependencies.
+harness-canopy is a modern, self-contained MCP (Model Context Protocol) server and TUI for orchestrating AI agent sessions, background tasks, and file event triggers. Designed for reliability, modularity, and performance — it enables advanced scheduling, persistent knowledge graphs, multi-agent coordination, loop automation, and interactive terminal management with zero runtime dependencies.
 
 ---
 
@@ -41,7 +41,7 @@ See [`docs/installation.md`](docs/installation.md) for all methods and first-tim
 ## Documentation
 
 Full documentation lives in [`docs/`](docs/): installation, quick start, the
-TUI, agents and seed identities, intelligence & sync, workflows, the RAG
+TUI, agents and seed identities, intelligence & sync, loops, the RAG
 pipeline, all 46 MCP tools, and the complete CLI reference.
 
 ---
@@ -53,7 +53,7 @@ pipeline, all 46 MCP tools, and the complete CLI reference.
 
 - **🚀 High-Performance Scheduler** — Event-driven cron scheduler using Tokio with zero polling overhead. Computes precise wake-up times and sleeps until needed; CPU usage drops to near-zero when idle.
 - **📊 Real-time File Watcher** — Instantly reacts to file system events (create, modify, delete, move) using the `notify` crate with configurable debouncing, recursive directory monitoring, and macOS FSEvents compatibility.
-- **💾 Persistent State** — All tasks, watchers, execution logs, agent state, sync messages, intelligence nodes, workflows, and projects are stored in an embedded SQLite database with WAL mode and automatic schema migration.
+- **💾 Persistent State** — All tasks, watchers, execution logs, agent state, sync messages, intelligence nodes, loops, and projects are stored in an embedded SQLite database with WAL mode and automatic schema migration.
 - **🔄 Auto-Update** — Checks GitHub releases daily for new stable versions, downloads the platform-specific binary (linux-musl, macos-darwin; x86_64/aarch64), and atomically replaces the running executable.
 - **🔔 Cross-Platform Notifications** — Native desktop notifications for task completions, failures, and watcher triggers. Auto-detects platform: WSL (PowerShell toasts with AUMID), macOS (`osascript`), Linux (`notify-send`).
 
@@ -82,13 +82,13 @@ pipeline, all 46 MCP tools, and the complete CLI reference.
 - **Broadcast Messaging** — Info, query, and answer messages between agents in the same workdir.
 - **Active Context** — `sync_get_context` returns active missions, recent chatter, and a computed workspace "vibe" (worst status among active intents).
 
-### 🔀 Workflow DAG Engine
+### 🔀 Loop DAG Engine
 
-- **Ordered Specs** — Workflows contain sequenced `Spec`s, each with `Node`s connected by `Edge`s with routing conditions (`pass`/`fail`/`always`).
+- **Ordered Specs** — Loops contain sequenced `Spec`s, each with `Node`s connected by `Edge`s with routing conditions (`pass`/`fail`/`always`).
 - **Node Kinds** — `agent` nodes invoke CLI tools with prompt templates; `check` nodes execute shell commands; `gate` nodes validate previous output (e.g., `output_contains`).
 - **Full Lifecycle** — Create, update, run, pause, continue (retry or skip), complete nodes, and report blockers for human intervention.
-- **Template Variables** — Workflow prompts support `{{workflow_name}}`, `{{spec_content}}`, `{{node_id}}`, `{{previous_feedback}}`, and more.
-- **15 MCP Tools** — Complete CRUD + runtime management: `workflow_create`, `workflow_update`, `workflow_add_spec`, `workflow_add_node`, `workflow_add_edge`, `workflow_run`, `workflow_pause`, `workflow_continue`, `workflow_complete_node`, `workflow_report_blocker`, `workflow_get`, `workflow_list`, `workflow_update_spec`, `workflow_update_node`, `workflow_update_edge`.
+- **Template Variables** — Loop prompts support `{{loop_name}}`, `{{spec_content}}`, `{{node_id}}`, `{{previous_feedback}}`, and more.
+- **15 MCP Tools** — Complete CRUD + runtime management: `loop_create`, `loop_update`, `loop_add_spec`, `loop_add_node`, `loop_add_edge`, `loop_run`, `loop_pause`, `loop_continue`, `loop_complete_node`, `loop_report_blocker`, `loop_get`, `loop_list`, `loop_update_spec`, `loop_update_node`, `loop_update_edge`.
 
 ### 📚 Personal RAG Pipeline
 
@@ -104,7 +104,7 @@ pipeline, all 46 MCP tools, and the complete CLI reference.
 - **NewAgentDialog** — Three modes (Interactive, Background Cron/Watch, Terminal) with CLI picker, model picker, seed identity selector (`◀ None / SeedName ▶`), directory browser, and yolo mode toggle.
 - **Split Groups** — Side-by-side horizontal/vertical views for monitoring multiple agents simultaneously.
 - **System Dashboard** — CPU, memory, disk, GPU (NVIDIA/Linux/macOS), temperatures with amber/red alert thresholds. WSL queries Windows host metrics via PowerShell.
-- **Workflow Editor** — Inline node config JSON editing with validation.
+- **Loop Editor** — Inline node config JSON editing with validation.
 - **RAG Transfer Modal** — Send semantic search results to other agents as injected context.
 - **Context Transfer** — Two-step modal (preview → agent picker) to inject conversation context between sessions.
 - **Brian's Brain** — 3-state cellular automaton with auto-noise for idle state visualization.
@@ -131,7 +131,7 @@ pipeline, all 46 MCP tools, and the complete CLI reference.
 | **Multi-Agent Sync** (4) | `sync_declare_intent`, `sync_report_status`, `sync_broadcast`, `sync_get_context` |
 | **Intelligence V2** (6) | `intelligence_get_context`, `intelligence_upsert`, `intelligence_search`, `intelligence_graph_walk`, `intelligence_list_projects`, `intelligence_link_projects` |
 | **Seed Identity** (5) | `get_identity`, `evolve_identity`, `create_seed`, `list_seeds`, `remove_seed` |
-| **Workflow Engine** (15) | `workflow_create`, `workflow_update`, `workflow_add_spec`, `workflow_update_spec`, `workflow_add_node`, `workflow_update_node`, `workflow_add_edge`, `workflow_update_edge`, `workflow_get`, `workflow_list`, `workflow_run`, `workflow_pause`, `workflow_continue`, `workflow_complete_node`, `workflow_report_blocker` |
+| **Loop Engine** (15) | `loop_create`, `loop_update`, `loop_add_spec`, `loop_update_spec`, `loop_add_node`, `loop_update_node`, `loop_add_edge`, `loop_update_edge`, `loop_get`, `loop_list`, `loop_run`, `loop_pause`, `loop_continue`, `loop_complete_node`, `loop_report_blocker` |
 | **Project** (2) | `project_search`, `project_update` |
 | **RAG** (1) | `rag_search` |
 | **Protocol** (1) | `get_tools` |
@@ -146,9 +146,9 @@ pipeline, all 46 MCP tools, and the complete CLI reference.
 - **Executor** — Runs tasks and agents, manages locking, logs, and status.
 - **Intelligence V2** — Project-scoped knowledge graph with node/edge CRUD, graph walk, project relationships.
 - **Sync Manager** — Per-workdir in-memory broadcast channels (64 capacity), DB persistence, and intelligence node auto-upsert.
-- **Workflow Engine** — DAG execution engine: check/gate/agent node runners, iteration limits, pause/continue, blocker reporting.
+- **Loop Engine** — DAG execution engine: check/gate/agent node runners, iteration limits, pause/continue, blocker reporting.
 - **RAG Pipeline** — Background ingestion, language-aware chunking, embedding client, vector store, and rate-limited search.
-- **TUI** — Full-screen ratatui terminal UI for managing agents, viewing output, workflows, and system metrics in real time.
+- **TUI** — Full-screen ratatui terminal UI for managing agents, viewing output, loops, and system metrics in real time.
 
 ---
 
@@ -157,15 +157,15 @@ pipeline, all 46 MCP tools, and the complete CLI reference.
 - `application/` — Application ports and abstractions
 - `autoupdate/` — Self-update system (GitHub releases)
 - `daemon/` — MCP server, handler, params, RAG CLI, doctor
-- `db/` — SQLite persistence and migrations (agents, runs, sessions, sync, intelligence, workflows, projects, seeds, groups, state)
-- `domain/` — Core models: Agent, Trigger, WatchEvent, Project, SeedIdentity, Workflow, SyncMessage, IntelligenceNode
+- `db/` — SQLite persistence and migrations (agents, runs, sessions, sync, intelligence, loops, projects, seeds, groups, state)
+- `domain/` — Core models: Agent, Trigger, WatchEvent, Project, SeedIdentity, Loop, SyncMessage, IntelligenceNode
 - `executor/` — Task and agent execution logic
 - `rag/` — RAG pipeline (ingestion, chunking, embedding, vector store, rate limiting)
 - `scheduler/` — Internal cron scheduler with template variables
 - `sync_manager/` — Multi-agent coordination broadcast
 - `tui/` — Terminal UI: agent management, dialogs, sidebar, system dashboard, context transfer
 - `watchers/` — File system watcher engine
-- `workflow_engine/` — DAG workflow execution engine
+- `loop_engine/` — DAG loop execution engine
 
 ---
 

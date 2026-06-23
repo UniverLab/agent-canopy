@@ -9,7 +9,7 @@ use crate::db::Database;
 use crate::domain::models::{Agent, RunLog};
 use crate::domain::project::Project;
 use crate::domain::sync::{ActiveIntent, SyncMessage, WorkspaceStatus};
-use crate::domain::workflow::{Workflow, WorkflowDetails, WorkflowNodeRun};
+use crate::domain::loops::{Loop, LoopDetails, LoopNodeRun};
 use crate::rag::vector_store::SearchResult;
 use crate::tui::agent::InteractiveAgent;
 use crate::tui::app::dialog::{LaunchpadDialog, NewAgentDialog, SimplePromptDialog};
@@ -49,14 +49,14 @@ pub enum Focus {
     ContextTransfer,
     RagTransfer,
     PromptTemplateDialog,
-    WorkflowEditorDialog,
+    LoopEditorDialog,
     ProjectRelationDialog,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ProjectsPanelFocus {
     Projects,
-    Workflows,
+    Loops,
     Knowledge,
     RagInfo,
 }
@@ -72,31 +72,31 @@ pub enum AgentSectionFocus {
 }
 
 #[derive(Clone)]
-pub(crate) enum WorkflowEditorMode {
+pub(crate) enum LoopEditorMode {
     AgentPrompt,
     NodeConfig,
 }
 
 #[derive(Clone)]
-pub(crate) struct WorkflowEditorDialog {
+pub(crate) struct LoopEditorDialog {
     pub node_id: String,
     pub node_name: String,
     pub title: String,
     pub help: String,
     pub buffer: String,
     pub cursor: usize,
-    pub mode: WorkflowEditorMode,
+    pub mode: LoopEditorMode,
     pub parse_error: Option<String>,
 }
 
-impl WorkflowEditorDialog {
+impl LoopEditorDialog {
     pub fn new(
         node_id: String,
         node_name: String,
         title: String,
         help: String,
         buffer: String,
-        mode: WorkflowEditorMode,
+        mode: LoopEditorMode,
     ) -> Self {
         let cursor = buffer.chars().count();
         Self {
@@ -233,7 +233,7 @@ pub struct App {
     pub(crate) pending_launch_dialog: Option<NewAgentDialog>,
     pub(crate) quit_confirm: bool,
     pub(crate) delete_project_confirm: bool,
-    pub(crate) delete_workflow_confirm: bool,
+    pub(crate) delete_loop_confirm: bool,
 
     // Brian's Brain automaton (sidebar decoration)
     pub(crate) sidebar_brain: Option<crate::tui::brians_brain::BriansBrain>,
@@ -256,13 +256,13 @@ pub struct App {
     pub(crate) selected_project: usize,
     pub(crate) projects_panel_focus: ProjectsPanelFocus,
     pub(crate) agent_section_focus: AgentSectionFocus,
-    pub(crate) workflows: Vec<Workflow>,
-    pub(crate) selected_workflow_id: Option<String>,
-    pub(crate) workflow_details: Option<WorkflowDetails>,
-    pub(crate) workflow_runs: Vec<WorkflowNodeRun>,
-    pub(crate) workflow_selected_spec: usize,
-    pub(crate) workflow_selected_node: usize,
-    pub(crate) workflow_editor_dialog: Option<WorkflowEditorDialog>,
+    pub(crate) loops: Vec<Loop>,
+    pub(crate) selected_loop_id: Option<String>,
+    pub(crate) loop_details: Option<LoopDetails>,
+    pub(crate) loop_runs: Vec<LoopNodeRun>,
+    pub(crate) loop_selected_spec: usize,
+    pub(crate) loop_selected_node: usize,
+    pub(crate) loop_editor_dialog: Option<LoopEditorDialog>,
     pub(crate) global_rag_queue: Vec<RagQueueItem>,
     pub(crate) selected_rag_queue: usize,
     pub(crate) rag_info: RagInfoSummary,
@@ -350,7 +350,7 @@ pub struct App {
     pub(crate) project_graph_edges: Vec<ProjectGraphEdge>,
     pub(crate) project_graph_trees: Vec<Vec<String>>,
 
-    // Nursery — temporary path for seed creation workflow
+    // Nursery — temporary path for seed creation loop
     pub(crate) nursery_path: Option<std::path::PathBuf>,
 
     // Atmosphere engine

@@ -47,10 +47,10 @@ The dialog includes a CLI picker, model picker, seed identity selector
 - **Launchpad** — start new sessions with previous-mission recovery and
   auto-injected context.
 
-## Workflows in the TUI
+## Loops in the TUI
 
-The workflow editor allows inline editing of node config JSON with
-validation. See [Workflows](workflows.md) for the engine itself.
+The loop editor allows inline editing of node config JSON with
+validation. See [Loops](loops.md) for the engine itself.
 
 ## Notifications
 

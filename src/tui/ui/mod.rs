@@ -18,7 +18,7 @@ use super::app::types::App;
 pub(crate) const ACCENT: Color = Color::Rgb(76, 175, 80);
 pub(crate) const DIM: Color = Color::Rgb(150, 150, 170);
 pub(crate) const ERROR_COLOR: Color = Color::Rgb(229, 57, 53);
-pub(crate) const BG_SELECTED: Color = Color::Rgb(20, 40, 20);
+pub(crate) const BG_SELECTED: Color = Color::Rgb(45, 45, 45);
 pub(crate) const INTERACTIVE_COLOR: Color = Color::Rgb(102, 187, 106);
 pub(crate) const STATUS_DISABLED: Color = Color::Rgb(120, 120, 120);
 pub(crate) const STATUS_RUNNING: Color = Color::Rgb(76, 175, 80);
@@ -117,8 +117,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         dialogs::draw_quit_confirm(frame);
     } else if app.delete_project_confirm {
         dialogs::draw_delete_project_confirm(frame);
-    } else if app.delete_workflow_confirm {
-        dialogs::draw_delete_workflow_confirm(frame);
+    } else if app.delete_loop_confirm {
+        dialogs::draw_delete_loop_confirm(frame);
     }
 
     if app.show_legend {
@@ -137,8 +137,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         dialogs::draw_simple_prompt_dialog(frame, app);
     }
 
-    if app.workflow_editor_dialog.is_some() {
-        dialogs::draw_workflow_editor_dialog(frame, app);
+    if app.loop_editor_dialog.is_some() {
+        dialogs::draw_loop_editor_dialog(frame, app);
     }
 
     if app.knowledge_dialog.is_some() {

@@ -219,6 +219,7 @@ impl SimplePromptDialog {
 
         let mut sections = vec![
             ("instruction", "Instruction"),
+            ("goal", "Goal"),
             ("context", "Context"),
             ("project_context", "Project Context"),
             ("resources", "Resources"),
@@ -634,6 +635,13 @@ impl SimplePromptDialog {
     /// Build the prompt body (every section except the system block).
     fn build_body(&self) -> String {
         let mut result = String::new();
+        self.append_prompt_section(
+            &mut result,
+            "goal",
+            "# [GOAL]: Desired Outcome\n",
+            "goal",
+            "goal_item",
+        );
         self.append_prompt_section(
             &mut result,
             "context",

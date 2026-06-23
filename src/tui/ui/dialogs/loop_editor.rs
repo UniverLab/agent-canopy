@@ -7,8 +7,8 @@ use ratatui::Frame;
 use super::{centered_rect, ACCENT, DIM};
 use crate::tui::app::types::App;
 
-pub fn draw_workflow_editor_dialog(frame: &mut Frame, app: &App) {
-    let Some(dialog) = &app.workflow_editor_dialog else {
+pub fn draw_loop_editor_dialog(frame: &mut Frame, app: &App) {
+    let Some(dialog) = &app.loop_editor_dialog else {
         return;
     };
 

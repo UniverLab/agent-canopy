@@ -27,7 +27,7 @@ use new_agent_dialog::handle_dialog_key;
 use paste::handle_paste;
 use prompt_template::handle_prompt_template_key;
 use rag_transfer::handle_rag_transfer_key;
-use workflow_editor::handle_workflow_editor_key;
+use loop_editor::handle_loop_editor_key;
 
 type Terminal = ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
 
@@ -56,7 +56,7 @@ fn tick_duration(app: &App) -> Duration {
         | Focus::ContextTransfer
         | Focus::RagTransfer
         | Focus::PromptTemplateDialog
-        | Focus::WorkflowEditorDialog => Duration::from_millis(50),
+        | Focus::LoopEditorDialog => Duration::from_millis(50),
         Focus::ProjectRelationDialog => Duration::from_millis(50),
         Focus::Preview => Duration::from_millis(100),
         Focus::Home if app.home_brain.is_some() => Duration::from_millis(50),
@@ -122,7 +122,7 @@ mod search_picker;
 mod terminal_warp;
 
 use knowledge_dialog::handle_knowledge_dialog_key;
-mod workflow_editor;
+mod loop_editor;
 
 pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
     if dismiss_legend(app, code) || handle_global_key(app, code, modifiers) {
@@ -209,7 +209,7 @@ fn dispatch_focus_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> 
         Focus::ContextTransfer => handle_context_transfer_key(app, code),
         Focus::RagTransfer => handle_rag_transfer_key(app, code),
         Focus::PromptTemplateDialog => handle_prompt_template_key(app, code, modifiers),
-        Focus::WorkflowEditorDialog => handle_workflow_editor_key(app, code, modifiers),
+        Focus::LoopEditorDialog => handle_loop_editor_key(app, code, modifiers),
         Focus::ProjectRelationDialog => handle_preview_key(app, code, modifiers),
     }
 }
@@ -409,7 +409,7 @@ fn handle_scroll(app: &mut App, dir: i32) {
         | Focus::ContextTransfer
         | Focus::RagTransfer
         | Focus::PromptTemplateDialog
-        | Focus::WorkflowEditorDialog => {}
+        | Focus::LoopEditorDialog => {}
         Focus::ProjectRelationDialog => {}
     }
 }

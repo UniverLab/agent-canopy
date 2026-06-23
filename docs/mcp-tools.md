@@ -53,14 +53,14 @@ stdio. Connect any MCP-capable AI CLI with `canopy mcp`.
 | `evolve_identity` | Refine the identity over time |
 | `create_seed` / `list_seeds` / `remove_seed` | Manage the seed nursery |
 
-## Workflow engine (15)
+## Loop engine (15)
 
-`workflow_create`, `workflow_update`, `workflow_add_spec`,
-`workflow_update_spec`, `workflow_add_node`, `workflow_update_node`,
-`workflow_add_edge`, `workflow_update_edge`, `workflow_get`,
-`workflow_list`, `workflow_run`, `workflow_pause`, `workflow_continue`,
-`workflow_complete_node`, `workflow_report_blocker` — see
-[Workflows](workflows.md).
+`loop_create`, `loop_update`, `loop_add_spec`,
+`loop_update_spec`, `loop_add_node`, `loop_update_node`,
+`loop_add_edge`, `loop_update_edge`, `loop_get`,
+`loop_list`, `loop_run`, `loop_pause`, `loop_continue`,
+`loop_complete_node`, `loop_report_blocker` — see
+[Loops](loops.md).
 
 ## Project (2)
 

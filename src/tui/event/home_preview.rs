@@ -18,7 +18,7 @@ pub fn handle_home_key(app: &mut App, code: KeyCode, _modifiers: KeyModifiers) -
 
     let has_project_preview = app.sidebar_mode == SidebarMode::Projects
         && (!app.projects.is_empty()
-            || !app.visible_workflows().is_empty()
+            || !app.visible_loops().is_empty()
             || !app.global_rag_queue.is_empty()
             || app.rag_info.total_chunks > 0);
 
@@ -95,14 +95,14 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
         }
         return Ok(());
     }
-    if app.delete_workflow_confirm {
+    if app.delete_loop_confirm {
         match code {
             KeyCode::Char('y') | KeyCode::Enter => {
-                let _ = app.delete_selected_workflow();
-                app.delete_workflow_confirm = false;
+                let _ = app.delete_selected_loop();
+                app.delete_loop_confirm = false;
             }
             KeyCode::Char('n') | KeyCode::Esc => {
-                app.delete_workflow_confirm = false;
+                app.delete_loop_confirm = false;
             }
             _ => {}
         }
@@ -155,8 +155,8 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
                     ProjectsPanelFocus::Projects => {
                         let _ = app.open_project_relation_dialog();
                     }
-                    ProjectsPanelFocus::Workflows => {
-                        let _ = app.open_workflow_editor_dialog();
+                    ProjectsPanelFocus::Loops => {
+                        let _ = app.open_loop_editor_dialog();
                     }
                     ProjectsPanelFocus::Knowledge => {
                         edit_knowledge_dialog(app);
@@ -197,33 +197,33 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
         }
         KeyCode::Left
             if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::Workflows =>
+                && app.projects_panel_focus == ProjectsPanelFocus::Loops =>
         {
-            app.cycle_workflow_node(false);
+            app.cycle_loop_node(false);
         }
         KeyCode::Right
             if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::Workflows =>
+                && app.projects_panel_focus == ProjectsPanelFocus::Loops =>
         {
-            app.cycle_workflow_node(true);
+            app.cycle_loop_node(true);
         }
         KeyCode::Char('[')
             if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::Workflows =>
+                && app.projects_panel_focus == ProjectsPanelFocus::Loops =>
         {
-            app.cycle_workflow_spec(false);
+            app.cycle_loop_spec(false);
         }
         KeyCode::Char(']')
             if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::Workflows =>
+                && app.projects_panel_focus == ProjectsPanelFocus::Loops =>
         {
-            app.cycle_workflow_spec(true);
+            app.cycle_loop_spec(true);
         }
         KeyCode::Char('e') if !app.agents_rag_focused => {
             if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::Workflows
+                && app.projects_panel_focus == ProjectsPanelFocus::Loops
             {
-                let _ = app.open_workflow_editor_dialog();
+                let _ = app.open_loop_editor_dialog();
             } else if app.sidebar_mode == SidebarMode::Projects
                 && app.projects_panel_focus == ProjectsPanelFocus::Knowledge
             {
@@ -268,8 +268,8 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
                     ProjectsPanelFocus::Projects => {
                         app.delete_project_confirm = true;
                     }
-                    ProjectsPanelFocus::Workflows => {
-                        app.delete_workflow_confirm = true;
+                    ProjectsPanelFocus::Loops => {
+                        app.delete_loop_confirm = true;
                     }
                     ProjectsPanelFocus::Knowledge => {
                         let _ = app.delete_selected_knowledge();

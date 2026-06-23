@@ -16,7 +16,7 @@ pub mod seeds;
 pub mod sync;
 pub mod usage_stats;
 pub mod validation;
-pub mod workflow;
+pub mod loops;
 
 #[cfg(test)]
 mod domain_tests;

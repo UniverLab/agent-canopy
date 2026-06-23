@@ -53,7 +53,7 @@ struct SidebarContentAreas {
 #[derive(Default)]
 struct ProjectsLayout {
     projects: Option<Rect>,
-    workflows: Option<Rect>,
+    loops: Option<Rect>,
     knowledge: Option<Rect>,
     rag_queue: Option<Rect>,
     brain: Option<Rect>,
@@ -248,24 +248,24 @@ fn render_dashboard_if_present(frame: &mut Frame, area: Option<Rect>, app: &App)
 
 fn draw_projects_sidebar(frame: &mut Frame, areas: SidebarContentAreas, app: &App) {
     let rag_items = &app.global_rag_queue;
-    let workflows = app.visible_workflows();
+    let loops = app.visible_loops();
     let show_rag_info = app.rag_info.has_rag_activity() && areas.content.height >= 6;
     // ragInfo sits at the TOP of the projects sidebar so it's always visible.
     let (rag_info_area, content_below) = split_top_panel(areas.content, show_rag_info, 6);
     let (
         has_projects,
-        has_workflows,
+        has_loops,
         projects_needed,
-        workflows_needed,
+        loops_needed,
         knowledge_needed,
         rag_needed,
-    ) = projects_layout_requirements(app, workflows.len(), rag_items, content_below.height);
+    ) = projects_layout_requirements(app, loops.len(), rag_items, content_below.height);
     let layout = layout_projects_sections(
         content_below,
         has_projects,
-        has_workflows,
+        has_loops,
         projects_needed,
-        workflows_needed,
+        loops_needed,
         knowledge_needed,
         rag_needed,
     );
@@ -292,14 +292,14 @@ fn draw_projects_sidebar(frame: &mut Frame, areas: SidebarContentAreas, app: &Ap
         );
     }
 
-    if let Some(workflows_area) = layout.workflows {
+    if let Some(loops_area) = layout.loops {
         render_titled_panel(
             frame,
-            workflows_area,
-            " workflows ",
+            loops_area,
+            " loops ",
             Style::default().fg(DIM),
-            projects_panel_border_style(app, ProjectsPanelFocus::Workflows),
-            |frame, inner| draw_workflows_list(frame, inner, app),
+            projects_panel_border_style(app, ProjectsPanelFocus::Loops),
+            |frame, inner| draw_loops_list(frame, inner, app),
         );
     }
 
@@ -361,19 +361,19 @@ fn split_top_panel(content: Rect, enabled: bool, top_height: u16) -> (Option<Rec
 
 fn projects_layout_requirements(
     app: &App,
-    workflow_count: usize,
+    loop_count: usize,
     rag_items: &[crate::db::project::RagQueueItem],
     content_height: u16,
 ) -> (bool, bool, u16, u16, u16, u16) {
     let has_projects = !app.projects.is_empty();
-    let has_workflows = true;
+    let has_loops = true;
     let projects_needed = if has_projects {
         (app.projects.len() as u16 * 3 + 2).min(content_height)
     } else {
         0
     };
-    let workflows_needed = if workflow_count > 0 {
-        (workflow_count as u16 * 3 + 2).min(content_height)
+    let loops_needed = if loop_count > 0 {
+        (loop_count as u16 * 3 + 2).min(content_height)
     } else {
         4.min(content_height)
     };
@@ -390,9 +390,9 @@ fn projects_layout_requirements(
 
     (
         has_projects,
-        has_workflows,
+        has_loops,
         projects_needed,
-        workflows_needed,
+        loops_needed,
         knowledge_needed,
         rag_needed,
     )
@@ -409,49 +409,49 @@ fn rag_queue_title(rag_paused: bool) -> &'static str {
 fn layout_projects_sections(
     content_top: Rect,
     has_projects: bool,
-    has_workflows: bool,
+    has_loops: bool,
     projects_needed: u16,
-    workflows_needed: u16,
+    loops_needed: u16,
     knowledge_needed: u16,
     rag_needed: u16,
 ) -> ProjectsLayout {
-    if (has_projects || has_workflows)
+    if (has_projects || has_loops)
         && rag_needed > 0
-        && projects_needed + workflows_needed + knowledge_needed + rag_needed < content_top.height
+        && projects_needed + loops_needed + knowledge_needed + rag_needed < content_top.height
     {
         let mut remaining = content_top;
         let projects = take_top(&mut remaining, projects_needed);
-        let workflows = take_top(&mut remaining, workflows_needed);
+        let loops = take_top(&mut remaining, loops_needed);
         let knowledge = take_top(&mut remaining, knowledge_needed);
         let rag_queue = take_top(&mut remaining, rag_needed);
 
         return ProjectsLayout {
             projects,
-            workflows,
+            loops,
             knowledge,
             rag_queue,
             brain: Some(remaining),
         };
     }
 
-    if (has_projects || has_workflows)
-        && projects_needed + workflows_needed + knowledge_needed < content_top.height
+    if (has_projects || has_loops)
+        && projects_needed + loops_needed + knowledge_needed < content_top.height
     {
         let mut remaining = content_top;
         return ProjectsLayout {
             projects: take_top(&mut remaining, projects_needed),
-            workflows: take_top(&mut remaining, workflows_needed),
+            loops: take_top(&mut remaining, loops_needed),
             knowledge: take_top(&mut remaining, knowledge_needed),
             rag_queue: (rag_needed > 0 && remaining.height >= 3).then_some(remaining),
             brain: None,
         };
     }
 
-    if has_projects || has_workflows {
+    if has_projects || has_loops {
         let mut remaining = content_top;
         return ProjectsLayout {
             projects: take_top(&mut remaining, projects_needed),
-            workflows: take_top(&mut remaining, workflows_needed).or(Some(remaining)),
+            loops: take_top(&mut remaining, loops_needed).or(Some(remaining)),
             knowledge: None,
             ..ProjectsLayout::default()
         };
@@ -664,7 +664,7 @@ fn draw_projects_list(frame: &mut Frame, area: Rect, app: &App) {
         if y + 3 > area.y + area.height {
             break;
         }
-        draw_project_workflow_card(
+        draw_project_loop_card(
             frame,
             Rect::new(area.x, y, area.width, 3),
             idx == app.selected_project,
@@ -679,7 +679,7 @@ fn draw_projects_list(frame: &mut Frame, area: Rect, app: &App) {
     draw_scroll_indicators(frame, area, scroll.has_up, scroll.has_down);
 }
 
-fn draw_project_workflow_card(
+fn draw_project_loop_card(
     frame: &mut Frame,
     area: Rect,
     selected: bool,
@@ -830,12 +830,12 @@ fn draw_knowledge_card(
     );
 }
 
-fn draw_workflows_list(frame: &mut Frame, area: Rect, app: &App) {
-    let workflows = app.visible_workflows();
-    if workflows.is_empty() {
+fn draw_loops_list(frame: &mut Frame, area: Rect, app: &App) {
+    let loops = app.visible_loops();
+    if loops.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "No workflows yet",
+                "No loops yet",
                 Style::default().fg(Color::DarkGray),
             ))),
             area,
@@ -843,21 +843,21 @@ fn draw_workflows_list(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let selected_index = app.selected_workflow().and_then(|workflow| {
-        workflows
+    let selected_index = app.selected_loop().and_then(|lp| {
+        loops
             .iter()
-            .position(|candidate| candidate.id == workflow.id)
+            .position(|candidate| candidate.id == lp.id)
     });
     let scroll = scroll_state(
-        workflows.len(),
+        loops.len(),
         selected_index,
         (area.height / 4).max(1) as usize, // Ajustado para cards
     );
-    let panel_focused = app.projects_panel_focus == ProjectsPanelFocus::Workflows;
+    let panel_focused = app.projects_panel_focus == ProjectsPanelFocus::Loops;
     let mut y = area.y;
     let row_h = 4u16;
 
-    for (_idx, workflow) in workflows
+    for (_idx, lp) in loops
         .iter()
         .enumerate()
         .skip(scroll.start)
@@ -866,13 +866,13 @@ fn draw_workflows_list(frame: &mut Frame, area: Rect, app: &App) {
         if y + 3 > area.y + area.height {
             break;
         }
-        draw_project_workflow_card(
+        draw_project_loop_card(
             frame,
             Rect::new(area.x, y, area.width, 3),
-            app.selected_workflow_id.as_deref() == Some(workflow.id.as_str()),
-            &workflow.name,
-            &workflow.status.as_str().to_uppercase(),
-            &last_two_segments(&workflow.workdir),
+            app.selected_loop_id.as_deref() == Some(lp.id.as_str()),
+            &lp.name,
+            &lp.status.as_str().to_uppercase(),
+            &last_two_segments(&lp.workdir),
             panel_focused,
         );
         y += row_h;

@@ -19,11 +19,11 @@ pub fn draw_delete_project_confirm(frame: &mut Frame) {
     );
 }
 
-pub fn draw_delete_workflow_confirm(frame: &mut Frame) {
+pub fn draw_delete_loop_confirm(frame: &mut Frame) {
     draw_modal_confirm(
         frame,
-        " Delete Workflow? ",
-        "Are you sure you want to delete this workflow?\nY/Enter = Confirm  N/Esc = Cancel",
+        " Delete Loop? ",
+        "Are you sure you want to delete this loop?\nY/Enter = Confirm  N/Esc = Cancel",
     );
 }
 
@@ -74,7 +74,7 @@ fn category_label(category: &crate::domain::gamification::MissionCategory) -> &'
         MissionCategory::Environment => "Environment",
         MissionCategory::Intelligence => "Intelligence",
         MissionCategory::Projects => "Projects",
-        MissionCategory::Workflow => "Workflow",
+        MissionCategory::Loop => "Loop",
         MissionCategory::Seeds => "Seeds",
         MissionCategory::SysInfo => "System",
     }
@@ -148,7 +148,7 @@ pub fn draw_legend(frame: &mut Frame, app: &mut App) {
             MissionCategory::Environment => Color::Rgb(100, 220, 100),
             MissionCategory::Intelligence => Color::Rgb(100, 180, 255),
             MissionCategory::Projects => Color::Rgb(255, 200, 80),
-            MissionCategory::Workflow => Color::Rgb(220, 120, 255),
+            MissionCategory::Loop => Color::Rgb(220, 120, 255),
             MissionCategory::Seeds => Color::Rgb(80, 220, 180),
             MissionCategory::SysInfo => Color::Rgb(255, 130, 80),
         }

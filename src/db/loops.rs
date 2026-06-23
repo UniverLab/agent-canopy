@@ -5,47 +5,47 @@ use serde_json::Value;
 use std::io::{Error as IoError, ErrorKind};
 
 use crate::db::Database;
-use crate::domain::workflow::{
-    Workflow, WorkflowDetails, WorkflowEdge, WorkflowEdgeCondition, WorkflowNode, WorkflowNodeKind,
-    WorkflowNodeRun, WorkflowRunStatus, WorkflowSpec, WorkflowSpecDetails, WorkflowSpecStatus,
-    WorkflowStatus,
+use crate::domain::loops::{
+    Loop, LoopDetails, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind,
+    LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecDetails, LoopSpecStatus,
+    LoopStatus,
 };
 
 impl Database {
-    pub fn delete_workflow(&self, workflow_id: &str) -> Result<()> {
+    pub fn delete_loop(&self, loop_id: &str) -> Result<()> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
-        conn.execute("DELETE FROM workflows WHERE id = ?1", params![workflow_id])?;
+        conn.execute("DELETE FROM loops WHERE id = ?1", params![loop_id])?;
         Ok(())
     }
 
-    pub fn insert_workflow(&self, workflow: &Workflow) -> Result<()> {
+    pub fn insert_loop(&self, lp: &Loop) -> Result<()> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         conn.execute(
-            "INSERT INTO workflows (id, name, description, workdir, status, created_at, started_at, completed_at)
+            "INSERT INTO loops (id, name, description, workdir, status, created_at, started_at, completed_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
-                &workflow.id,
-                &workflow.name,
-                &workflow.description,
-                &workflow.workdir,
-                workflow.status.as_str(),
-                workflow.created_at.timestamp(),
-                workflow.started_at.map(|value| value.timestamp()),
-                workflow.completed_at.map(|value| value.timestamp()),
+                &lp.id,
+                &lp.name,
+                &lp.description,
+                &lp.workdir,
+                lp.status.as_str(),
+                lp.created_at.timestamp(),
+                lp.started_at.map(|value| value.timestamp()),
+                lp.completed_at.map(|value| value.timestamp()),
             ],
         )?;
         Ok(())
     }
 
-    pub fn update_workflow_details(
+    pub fn update_loop_details(
         &self,
-        workflow_id: &str,
+        loop_id: &str,
         name: Option<&str>,
         description: Option<Option<&str>>,
         workdir: Option<&str>,
@@ -55,7 +55,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let rows = conn.execute(
-            "UPDATE workflows
+            "UPDATE loops
              SET name = COALESCE(?1, name),
                  description = CASE
                      WHEN ?2 IS NULL THEN description
@@ -68,54 +68,54 @@ impl Database {
                 description.map(|_| 1),
                 description.flatten(),
                 workdir,
-                workflow_id
+                loop_id
             ],
         )?;
         Ok(rows > 0)
     }
 
-    pub fn get_workflow(&self, workflow_id: &str) -> Result<Option<Workflow>> {
+    pub fn get_loop(&self, loop_id: &str) -> Result<Option<Loop>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
             "SELECT id, name, description, workdir, status, created_at, started_at, completed_at
-             FROM workflows WHERE id = ?1",
+             FROM loops WHERE id = ?1",
         )?;
 
-        stmt.query_row(params![workflow_id], map_workflow_row)
+        stmt.query_row(params![loop_id], map_loop_row)
             .optional()
             .map_err(Into::into)
     }
 
-    pub fn list_workflows(&self, workdir: Option<&str>) -> Result<Vec<Workflow>> {
+    pub fn list_loops(&self, workdir: Option<&str>) -> Result<Vec<Loop>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let sql = if workdir.is_some() {
             "SELECT id, name, description, workdir, status, created_at, started_at, completed_at
-             FROM workflows WHERE workdir = ?1 ORDER BY created_at DESC"
+             FROM loops WHERE workdir = ?1 ORDER BY created_at DESC"
         } else {
             "SELECT id, name, description, workdir, status, created_at, started_at, completed_at
-             FROM workflows ORDER BY created_at DESC"
+             FROM loops ORDER BY created_at DESC"
         };
         let mut stmt = conn.prepare(sql)?;
         let rows = if let Some(workdir) = workdir {
-            stmt.query_map(params![workdir], map_workflow_row)?
+            stmt.query_map(params![workdir], map_loop_row)?
         } else {
-            stmt.query_map([], map_workflow_row)?
+            stmt.query_map([], map_loop_row)?
         };
 
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
 
-    pub fn update_workflow_status(
+    pub fn update_loop_status(
         &self,
-        workflow_id: &str,
-        status: WorkflowStatus,
+        loop_id: &str,
+        status: LoopStatus,
         started_at: Option<DateTime<Utc>>,
         completed_at: Option<DateTime<Utc>>,
     ) -> Result<bool> {
@@ -124,7 +124,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let rows = conn.execute(
-            "UPDATE workflows
+            "UPDATE loops
              SET status = ?1,
                  started_at = COALESCE(?2, started_at),
                  completed_at = COALESCE(?3, completed_at)
@@ -133,23 +133,23 @@ impl Database {
                 status.as_str(),
                 started_at.map(|value| value.timestamp()),
                 completed_at.map(|value| value.timestamp()),
-                workflow_id,
+                loop_id,
             ],
         )?;
         Ok(rows > 0)
     }
 
-    pub fn insert_workflow_spec(&self, spec: &WorkflowSpec) -> Result<()> {
+    pub fn insert_loop_spec(&self, spec: &LoopSpec) -> Result<()> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         conn.execute(
-            "INSERT INTO workflow_specs (id, workflow_id, name, description, position, parallelizable, status, started_at, completed_at)
+            "INSERT INTO loop_specs (id, loop_id, name, description, position, parallelizable, status, started_at, completed_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 &spec.id,
-                &spec.workflow_id,
+                &spec.loop_id,
                 &spec.name,
                 &spec.description,
                 spec.position,
@@ -162,37 +162,37 @@ impl Database {
         Ok(())
     }
 
-    pub fn list_workflow_specs(&self, workflow_id: &str) -> Result<Vec<WorkflowSpec>> {
+    pub fn list_loop_specs(&self, loop_id: &str) -> Result<Vec<LoopSpec>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, workflow_id, name, description, position, parallelizable, status, started_at, completed_at
-             FROM workflow_specs WHERE workflow_id = ?1 ORDER BY position ASC",
+            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at
+             FROM loop_specs WHERE loop_id = ?1 ORDER BY position ASC",
         )?;
-        let rows = stmt.query_map(params![workflow_id], map_workflow_spec_row)?;
+        let rows = stmt.query_map(params![loop_id], map_loop_spec_row)?;
 
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
 
-    pub fn get_workflow_spec(&self, spec_id: &str) -> Result<Option<WorkflowSpec>> {
+    pub fn get_loop_spec(&self, spec_id: &str) -> Result<Option<LoopSpec>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, workflow_id, name, description, position, parallelizable, status, started_at, completed_at
-             FROM workflow_specs WHERE id = ?1",
+            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at
+             FROM loop_specs WHERE id = ?1",
         )?;
 
-        stmt.query_row(params![spec_id], map_workflow_spec_row)
+        stmt.query_row(params![spec_id], map_loop_spec_row)
             .optional()
             .map_err(Into::into)
     }
 
-    pub fn update_workflow_spec_details(
+    pub fn update_loop_spec_details(
         &self,
         spec_id: &str,
         name: Option<&str>,
@@ -205,7 +205,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let rows = conn.execute(
-            "UPDATE workflow_specs
+            "UPDATE loop_specs
              SET name = COALESCE(?1, name),
                  description = COALESCE(?2, description),
                  position = COALESCE(?3, position),
@@ -216,10 +216,10 @@ impl Database {
         Ok(rows > 0)
     }
 
-    pub fn update_workflow_spec_status(
+    pub fn update_loop_spec_status(
         &self,
         spec_id: &str,
-        status: WorkflowSpecStatus,
+        status: LoopSpecStatus,
         started_at: Option<DateTime<Utc>>,
         completed_at: Option<DateTime<Utc>>,
     ) -> Result<bool> {
@@ -228,7 +228,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let rows = conn.execute(
-            "UPDATE workflow_specs
+            "UPDATE loop_specs
              SET status = ?1,
                  started_at = COALESCE(?2, started_at),
                  completed_at = COALESCE(?3, completed_at)
@@ -243,13 +243,13 @@ impl Database {
         Ok(rows > 0)
     }
 
-    pub fn insert_workflow_node(&self, node: &WorkflowNode) -> Result<()> {
+    pub fn insert_loop_node(&self, node: &LoopNode) -> Result<()> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         conn.execute(
-            "INSERT INTO workflow_nodes (id, spec_id, name, kind, config, position, created_at)
+            "INSERT INTO loop_nodes (id, spec_id, name, kind, config, position, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 &node.id,
@@ -264,40 +264,40 @@ impl Database {
         Ok(())
     }
 
-    pub fn list_workflow_nodes(&self, spec_id: &str) -> Result<Vec<WorkflowNode>> {
+    pub fn list_loop_nodes(&self, spec_id: &str) -> Result<Vec<LoopNode>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
             "SELECT id, spec_id, name, kind, config, position, created_at
-             FROM workflow_nodes WHERE spec_id = ?1 ORDER BY position ASC",
+             FROM loop_nodes WHERE spec_id = ?1 ORDER BY position ASC",
         )?;
-        let rows = stmt.query_map(params![spec_id], map_workflow_node_row)?;
+        let rows = stmt.query_map(params![spec_id], map_loop_node_row)?;
 
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
 
-    pub fn get_workflow_node(&self, node_id: &str) -> Result<Option<WorkflowNode>> {
+    pub fn get_loop_node(&self, node_id: &str) -> Result<Option<LoopNode>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
             "SELECT id, spec_id, name, kind, config, position, created_at
-             FROM workflow_nodes WHERE id = ?1",
+             FROM loop_nodes WHERE id = ?1",
         )?;
-        stmt.query_row(params![node_id], map_workflow_node_row)
+        stmt.query_row(params![node_id], map_loop_node_row)
             .optional()
             .map_err(Into::into)
     }
 
-    pub fn update_workflow_node_details(
+    pub fn update_loop_node_details(
         &self,
         node_id: &str,
         name: Option<&str>,
-        kind: Option<WorkflowNodeKind>,
+        kind: Option<LoopNodeKind>,
         config: Option<&Value>,
         position: Option<i64>,
     ) -> Result<bool> {
@@ -306,7 +306,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let rows = conn.execute(
-            "UPDATE workflow_nodes
+            "UPDATE loop_nodes
              SET name = COALESCE(?1, name),
                  kind = COALESCE(?2, kind),
                  config = COALESCE(?3, config),
@@ -323,13 +323,13 @@ impl Database {
         Ok(rows > 0)
     }
 
-    pub fn insert_workflow_edge(&self, edge: &WorkflowEdge) -> Result<()> {
+    pub fn insert_loop_edge(&self, edge: &LoopEdge) -> Result<()> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         conn.execute(
-            "INSERT INTO workflow_edges (id, spec_id, from_node, to_node, condition)
+            "INSERT INTO loop_edges (id, spec_id, from_node, to_node, condition)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 &edge.id,
@@ -342,46 +342,46 @@ impl Database {
         Ok(())
     }
 
-    pub fn list_workflow_edges(&self, spec_id: &str) -> Result<Vec<WorkflowEdge>> {
+    pub fn list_loop_edges(&self, spec_id: &str) -> Result<Vec<LoopEdge>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
             "SELECT id, spec_id, from_node, to_node, condition
-             FROM workflow_edges WHERE spec_id = ?1 ORDER BY rowid ASC",
+             FROM loop_edges WHERE spec_id = ?1 ORDER BY rowid ASC",
         )?;
-        let rows = stmt.query_map(params![spec_id], map_workflow_edge_row)?;
+        let rows = stmt.query_map(params![spec_id], map_loop_edge_row)?;
 
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
 
-    pub fn get_workflow_edge(&self, edge_id: &str) -> Result<Option<WorkflowEdge>> {
+    pub fn get_loop_edge(&self, edge_id: &str) -> Result<Option<LoopEdge>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
             "SELECT id, spec_id, from_node, to_node, condition
-             FROM workflow_edges WHERE id = ?1",
+             FROM loop_edges WHERE id = ?1",
         )?;
-        stmt.query_row(params![edge_id], map_workflow_edge_row)
+        stmt.query_row(params![edge_id], map_loop_edge_row)
             .optional()
             .map_err(Into::into)
     }
 
-    pub fn update_workflow_edge_condition(
+    pub fn update_loop_edge_condition(
         &self,
         edge_id: &str,
-        condition: WorkflowEdgeCondition,
+        condition: LoopEdgeCondition,
     ) -> Result<bool> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let rows = conn.execute(
-            "UPDATE workflow_edges
+            "UPDATE loop_edges
              SET condition = ?1
              WHERE id = ?2",
             params![condition.as_str(), edge_id],
@@ -389,17 +389,17 @@ impl Database {
         Ok(rows > 0)
     }
 
-    pub fn insert_workflow_run(&self, run: &WorkflowNodeRun) -> Result<()> {
+    pub fn insert_loop_run(&self, run: &LoopNodeRun) -> Result<()> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         conn.execute(
-            "INSERT INTO workflow_runs (id, workflow_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration)
+            "INSERT INTO loop_runs (id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 &run.id,
-                &run.workflow_id,
+                &run.loop_id,
                 &run.spec_id,
                 &run.node_id,
                 run.status.as_str(),
@@ -419,61 +419,61 @@ impl Database {
         Ok(())
     }
 
-    pub fn list_workflow_runs_for_spec(&self, spec_id: &str) -> Result<Vec<WorkflowNodeRun>> {
+    pub fn list_loop_runs_for_spec(&self, spec_id: &str) -> Result<Vec<LoopNodeRun>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, workflow_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration
-             FROM workflow_runs WHERE spec_id = ?1 ORDER BY started_at ASC, iteration ASC",
+            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration
+             FROM loop_runs WHERE spec_id = ?1 ORDER BY started_at ASC, iteration ASC",
         )?;
-        let rows = stmt.query_map(params![spec_id], map_workflow_run_row)?;
+        let rows = stmt.query_map(params![spec_id], map_loop_run_row)?;
 
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
 
-    pub fn get_workflow_run(&self, run_id: &str) -> Result<Option<WorkflowNodeRun>> {
+    pub fn get_loop_run(&self, run_id: &str) -> Result<Option<LoopNodeRun>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, workflow_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration
-             FROM workflow_runs WHERE id = ?1",
+            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration
+             FROM loop_runs WHERE id = ?1",
         )?;
 
-        stmt.query_row(params![run_id], map_workflow_run_row)
+        stmt.query_row(params![run_id], map_loop_run_row)
             .optional()
             .map_err(Into::into)
     }
 
-    pub fn get_active_workflow_run_for_node(
+    pub fn get_active_loop_run_for_node(
         &self,
         node_id: &str,
-    ) -> Result<Option<WorkflowNodeRun>> {
+    ) -> Result<Option<LoopNodeRun>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, workflow_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration
-             FROM workflow_runs
+            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration
+             FROM loop_runs
              WHERE node_id = ?1 AND status = 'running'
              ORDER BY started_at DESC
              LIMIT 1",
         )?;
 
-        stmt.query_row(params![node_id], map_workflow_run_row)
+        stmt.query_row(params![node_id], map_loop_run_row)
             .optional()
             .map_err(Into::into)
     }
 
-    pub fn update_workflow_run_result(
+    pub fn update_loop_run_result(
         &self,
         run_id: &str,
-        status: WorkflowRunStatus,
+        status: LoopRunStatus,
         output: Option<&Value>,
         completed_at: Option<DateTime<Utc>>,
     ) -> Result<bool> {
@@ -482,7 +482,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let rows = conn.execute(
-            "UPDATE workflow_runs
+            "UPDATE loop_runs
              SET status = ?1,
                  output = COALESCE(?2, output),
                  completed_at = COALESCE(?3, completed_at)
@@ -497,31 +497,31 @@ impl Database {
         Ok(rows > 0)
     }
 
-    pub fn get_workflow_details(&self, workflow_id: &str) -> Result<Option<WorkflowDetails>> {
-        let Some(workflow) = self.get_workflow(workflow_id)? else {
+    pub fn get_loop_details(&self, loop_id: &str) -> Result<Option<LoopDetails>> {
+        let Some(lp) = self.get_loop(loop_id)? else {
             return Ok(None);
         };
         let specs = self
-            .list_workflow_specs(workflow_id)?
+            .list_loop_specs(loop_id)?
             .into_iter()
             .map(|spec| {
-                let nodes = self.list_workflow_nodes(&spec.id)?;
-                let edges = self.list_workflow_edges(&spec.id)?;
-                Ok(WorkflowSpecDetails { spec, nodes, edges })
+                let nodes = self.list_loop_nodes(&spec.id)?;
+                let edges = self.list_loop_edges(&spec.id)?;
+                Ok(LoopSpecDetails { spec, nodes, edges })
             })
             .collect::<Result<Vec<_>>>()?;
 
-        Ok(Some(WorkflowDetails { workflow, specs }))
+        Ok(Some(LoopDetails { lp, specs }))
     }
 }
 
-fn map_workflow_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workflow> {
-    Ok(Workflow {
+fn map_loop_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Loop> {
+    Ok(Loop {
         id: row.get(0)?,
         name: row.get(1)?,
         description: row.get(2)?,
         workdir: row.get(3)?,
-        status: WorkflowStatus::from_str(&row.get::<_, String>(4)?),
+        status: LoopStatus::from_str(&row.get::<_, String>(4)?),
         created_at: from_timestamp(row.get(5)?)?,
         started_at: row
             .get::<_, Option<i64>>(6)?
@@ -534,15 +534,15 @@ fn map_workflow_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workflow> {
     })
 }
 
-fn map_workflow_spec_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowSpec> {
-    Ok(WorkflowSpec {
+fn map_loop_spec_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoopSpec> {
+    Ok(LoopSpec {
         id: row.get(0)?,
-        workflow_id: row.get(1)?,
+        loop_id: row.get(1)?,
         name: row.get(2)?,
         description: row.get(3)?,
         position: row.get(4)?,
         parallelizable: row.get(5)?,
-        status: WorkflowSpecStatus::from_str(&row.get::<_, String>(6)?),
+        status: LoopSpecStatus::from_str(&row.get::<_, String>(6)?),
         started_at: row
             .get::<_, Option<i64>>(7)?
             .map(from_timestamp)
@@ -554,21 +554,21 @@ fn map_workflow_spec_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowSp
     })
 }
 
-fn map_workflow_node_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowNode> {
-    let kind = WorkflowNodeKind::from_str(&row.get::<_, String>(3)?).ok_or_else(|| {
+fn map_loop_node_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoopNode> {
+    let kind = LoopNodeKind::from_str(&row.get::<_, String>(3)?).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
             3,
             rusqlite::types::Type::Text,
             Box::new(IoError::new(
                 ErrorKind::InvalidData,
-                "Invalid workflow node kind",
+                "Invalid loop node kind",
             )),
         )
     })?;
     let config_raw: String = row.get(4)?;
     let config = parse_json_value(&config_raw)?;
 
-    Ok(WorkflowNode {
+    Ok(LoopNode {
         id: row.get(0)?,
         spec_id: row.get(1)?,
         name: row.get(2)?,
@@ -579,20 +579,20 @@ fn map_workflow_node_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowNo
     })
 }
 
-fn map_workflow_edge_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowEdge> {
+fn map_loop_edge_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoopEdge> {
     let condition =
-        WorkflowEdgeCondition::from_str(&row.get::<_, String>(4)?).ok_or_else(|| {
+        LoopEdgeCondition::from_str(&row.get::<_, String>(4)?).ok_or_else(|| {
             rusqlite::Error::FromSqlConversionFailure(
                 4,
                 rusqlite::types::Type::Text,
                 Box::new(IoError::new(
                     ErrorKind::InvalidData,
-                    "Invalid workflow edge condition",
+                    "Invalid loop edge condition",
                 )),
             )
         })?;
 
-    Ok(WorkflowEdge {
+    Ok(LoopEdge {
         id: row.get(0)?,
         spec_id: row.get(1)?,
         from_node: row.get(2)?,
@@ -601,13 +601,13 @@ fn map_workflow_edge_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowEd
     })
 }
 
-fn map_workflow_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowNodeRun> {
-    Ok(WorkflowNodeRun {
+fn map_loop_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoopNodeRun> {
+    Ok(LoopNodeRun {
         id: row.get(0)?,
-        workflow_id: row.get(1)?,
+        loop_id: row.get(1)?,
         spec_id: row.get(2)?,
         node_id: row.get(3)?,
-        status: WorkflowRunStatus::from_str(&row.get::<_, String>(4)?),
+        status: LoopRunStatus::from_str(&row.get::<_, String>(4)?),
         input: row
             .get::<_, Option<String>>(5)?
             .as_deref()

@@ -28,30 +28,30 @@ impl Database {
         Ok(count)
     }
 
-    pub fn count_workflow_node_runs(&self) -> Result<i64> {
+    pub fn count_loop_node_runs(&self) -> Result<i64> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM workflow_runs", [], |r| r.get(0))?;
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM loop_runs", [], |r| r.get(0))?;
         Ok(count)
     }
 
-    pub fn count_completed_workflows(&self) -> Result<i64> {
+    pub fn count_completed_loops(&self) -> Result<i64> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM workflows WHERE status = 'completed'",
+            "SELECT COUNT(*) FROM loops WHERE status = 'completed'",
             [],
             |r| r.get(0),
         )?;
         Ok(count)
     }
 
-    pub fn max_workflow_nodes_in_any_workflow(&self) -> Result<usize> {
+    pub fn max_loop_nodes_in_any_loop(&self) -> Result<usize> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         let max: i64 = conn.query_row(
             "SELECT COALESCE(MAX(node_count), 0) FROM (
-                SELECT ws.workflow_id, COUNT(wn.id) AS node_count
-                FROM workflow_specs ws
-                JOIN workflow_nodes wn ON wn.spec_id = ws.id
-                GROUP BY ws.workflow_id
+                SELECT ws.loop_id, COUNT(wn.id) AS node_count
+                FROM loop_specs ws
+                JOIN loop_nodes wn ON wn.spec_id = ws.id
+                GROUP BY ws.loop_id
              )",
             [],
             |r| r.get(0),
@@ -59,12 +59,12 @@ impl Database {
         Ok(max.max(0) as usize)
     }
 
-    pub fn has_parallel_workflow_run(&self) -> Result<bool> {
+    pub fn has_parallel_loop_run(&self) -> Result<bool> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         let count: i64 = conn.query_row(
             "SELECT COUNT(*)
-             FROM workflow_runs wr
-             JOIN workflow_specs ws ON ws.id = wr.spec_id
+             FROM loop_runs wr
+             JOIN loop_specs ws ON ws.id = wr.spec_id
              WHERE ws.parallelizable = 1",
             [],
             |r| r.get(0),

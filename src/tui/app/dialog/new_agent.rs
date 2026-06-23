@@ -14,7 +14,7 @@ pub enum SeedOption {
     None,
     /// Bind to an existing seed identity.
     Seed { id: String, name: String },
-    /// Create a new seed via the Nursery workflow.
+    /// Create a new seed via the Nursery loop.
     PlantNewSeed,
 }
 

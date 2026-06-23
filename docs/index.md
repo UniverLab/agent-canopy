@@ -19,7 +19,7 @@ It turns a single machine into a small agent operations center:
 - **Remember** — a project-scoped knowledge graph that persists facts,
   patterns and session summaries across sessions.
 - **Search** your own documents with a local-first RAG pipeline.
-- **Automate** multi-step processes with a DAG workflow engine.
+- **Automate** multi-step processes with a DAG loop engine.
 
 Everything persists in an embedded SQLite database under `~/.canopy/` —
 no external services, no cloud account.
@@ -29,8 +29,8 @@ no external services, no cloud account.
 | Piece | What it does |
 |---|---|
 | **Daemon** | MCP server (Streamable HTTP + stdio), scheduler, watcher engine, database |
-| **Canopy Hub (TUI)** | Full-screen terminal UI for agents, workflows and system metrics |
-| **46 MCP tools** | Agent management, sync, intelligence, seeds, workflows, RAG, projects |
+| **Canopy Hub (TUI)** | Full-screen terminal UI for agents, loops and system metrics |
+| **46 MCP tools** | Agent management, sync, intelligence, seeds, loops, RAG, projects |
 | **Seed identities** | Persistent, evolvable agent personalities stored as TOML |
 
 ## How the documentation is organized
@@ -40,7 +40,7 @@ no external services, no cloud account.
 - [The TUI — Canopy Hub](tui.md) — the interactive terminal interface.
 - [Agents](agents.md) — interactive, background and terminal agents; seed identities.
 - [Intelligence & Sync](intelligence-and-sync.md) — knowledge graph and multi-agent coordination.
-- [Workflows](workflows.md) — the DAG workflow engine.
+- [Loops](loops.md) — the DAG loop engine.
 - [RAG Pipeline](rag.md) — personal document search.
 - [MCP Tools](mcp-tools.md) — all 46 tools by category.
 - [CLI Reference](cli-reference.md) — every `canopy` command.

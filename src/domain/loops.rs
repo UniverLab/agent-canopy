@@ -64,7 +64,7 @@ pub fn validate_spec_description_template(description: &str) -> Result<(), Strin
     let normalized = description.trim().to_lowercase();
     if normalized.is_empty() {
         return Err(format!(
-            "Workflow spec description must include sections for: {}.",
+            "Loop spec description must include sections for: {}.",
             required_spec_section_names()
         ));
     }
@@ -90,7 +90,7 @@ pub fn validate_spec_description_template(description: &str) -> Result<(), Strin
     }
 
     Err(format!(
-        "Workflow spec description is missing required sections: {}. Expected sections: {}.",
+        "Loop spec description is missing required sections: {}. Expected sections: {}.",
         missing.join(", "),
         required_spec_section_names()
     ))
@@ -106,7 +106,7 @@ fn required_spec_section_names() -> String {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum WorkflowStatus {
+pub enum LoopStatus {
     Draft,
     Running,
     Paused,
@@ -114,7 +114,7 @@ pub enum WorkflowStatus {
     Failed,
 }
 
-impl WorkflowStatus {
+impl LoopStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Draft => "draft",
@@ -138,7 +138,7 @@ impl WorkflowStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum WorkflowSpecStatus {
+pub enum LoopSpecStatus {
     Pending,
     Running,
     Completed,
@@ -146,7 +146,7 @@ pub enum WorkflowSpecStatus {
     Skipped,
 }
 
-impl WorkflowSpecStatus {
+impl LoopSpecStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
@@ -170,13 +170,13 @@ impl WorkflowSpecStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum WorkflowNodeKind {
+pub enum LoopNodeKind {
     Agent,
     Check,
     Gate,
 }
 
-impl WorkflowNodeKind {
+impl LoopNodeKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Agent => "agent",
@@ -197,13 +197,13 @@ impl WorkflowNodeKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum WorkflowEdgeCondition {
+pub enum LoopEdgeCondition {
     Pass,
     Fail,
     Always,
 }
 
-impl WorkflowEdgeCondition {
+impl LoopEdgeCondition {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pass => "pass",
@@ -224,13 +224,13 @@ impl WorkflowEdgeCondition {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum WorkflowRunStatus {
+pub enum LoopRunStatus {
     Running,
     Pass,
     Fail,
 }
 
-impl WorkflowRunStatus {
+impl LoopRunStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Running => "running",
@@ -249,57 +249,57 @@ impl WorkflowRunStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Workflow {
+pub struct Loop {
     pub id: String,
     pub name: String,
     pub description: Option<String>,
     pub workdir: String,
-    pub status: WorkflowStatus,
+    pub status: LoopStatus,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkflowSpec {
+pub struct LoopSpec {
     pub id: String,
-    pub workflow_id: String,
+    pub loop_id: String,
     pub name: String,
     pub description: Option<String>,
     pub position: i64,
     pub parallelizable: bool,
-    pub status: WorkflowSpecStatus,
+    pub status: LoopSpecStatus,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkflowNode {
+pub struct LoopNode {
     pub id: String,
     pub spec_id: String,
     pub name: String,
-    pub kind: WorkflowNodeKind,
+    pub kind: LoopNodeKind,
     pub config: Value,
     pub position: i64,
     pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkflowEdge {
+pub struct LoopEdge {
     pub id: String,
     pub spec_id: String,
     pub from_node: String,
     pub to_node: String,
-    pub condition: WorkflowEdgeCondition,
+    pub condition: LoopEdgeCondition,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkflowNodeRun {
+pub struct LoopNodeRun {
     pub id: String,
-    pub workflow_id: String,
+    pub loop_id: String,
     pub spec_id: String,
     pub node_id: String,
-    pub status: WorkflowRunStatus,
+    pub status: LoopRunStatus,
     pub input: Option<Value>,
     pub output: Option<Value>,
     pub started_at: DateTime<Utc>,
@@ -308,23 +308,23 @@ pub struct WorkflowNodeRun {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkflowSpecDetails {
-    pub spec: WorkflowSpec,
-    pub nodes: Vec<WorkflowNode>,
-    pub edges: Vec<WorkflowEdge>,
+pub struct LoopSpecDetails {
+    pub spec: LoopSpec,
+    pub nodes: Vec<LoopNode>,
+    pub edges: Vec<LoopEdge>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkflowDetails {
-    pub workflow: Workflow,
-    pub specs: Vec<WorkflowSpecDetails>,
+pub struct LoopDetails {
+    pub lp: Loop,
+    pub specs: Vec<LoopSpecDetails>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_spec_description_template, WorkflowEdgeCondition, WorkflowNodeKind,
-        WorkflowRunStatus, WorkflowSpecStatus, WorkflowStatus,
+        validate_spec_description_template, LoopEdgeCondition, LoopNodeKind,
+        LoopRunStatus, LoopSpecStatus, LoopStatus,
     };
 
     #[test]
@@ -346,7 +346,7 @@ Respect existing daemon architecture
 Reuse current MCP patterns
 
 ## In Scope
-Backend workflow tools
+Backend loop tools
 
 ## Out of Scope
 New TUI panel
@@ -403,121 +403,121 @@ Task:
     }
 
     #[test]
-    fn workflow_status_as_str_roundtrip() {
-        assert_eq!(WorkflowStatus::Draft.as_str(), "draft");
-        assert_eq!(WorkflowStatus::Running.as_str(), "running");
-        assert_eq!(WorkflowStatus::Paused.as_str(), "paused");
-        assert_eq!(WorkflowStatus::Completed.as_str(), "completed");
-        assert_eq!(WorkflowStatus::Failed.as_str(), "failed");
+    fn loop_status_as_str_roundtrip() {
+        assert_eq!(LoopStatus::Draft.as_str(), "draft");
+        assert_eq!(LoopStatus::Running.as_str(), "running");
+        assert_eq!(LoopStatus::Paused.as_str(), "paused");
+        assert_eq!(LoopStatus::Completed.as_str(), "completed");
+        assert_eq!(LoopStatus::Failed.as_str(), "failed");
     }
 
     #[test]
-    fn workflow_status_from_str() {
-        assert_eq!(WorkflowStatus::from_str("running"), WorkflowStatus::Running);
-        assert_eq!(WorkflowStatus::from_str("paused"), WorkflowStatus::Paused);
+    fn loop_status_from_str() {
+        assert_eq!(LoopStatus::from_str("running"), LoopStatus::Running);
+        assert_eq!(LoopStatus::from_str("paused"), LoopStatus::Paused);
         assert_eq!(
-            WorkflowStatus::from_str("completed"),
-            WorkflowStatus::Completed
+            LoopStatus::from_str("completed"),
+            LoopStatus::Completed
         );
-        assert_eq!(WorkflowStatus::from_str("failed"), WorkflowStatus::Failed);
-        assert_eq!(WorkflowStatus::from_str("invalid"), WorkflowStatus::Draft);
+        assert_eq!(LoopStatus::from_str("failed"), LoopStatus::Failed);
+        assert_eq!(LoopStatus::from_str("invalid"), LoopStatus::Draft);
     }
 
     #[test]
-    fn workflow_spec_status_as_str() {
-        assert_eq!(WorkflowSpecStatus::Pending.as_str(), "pending");
-        assert_eq!(WorkflowSpecStatus::Running.as_str(), "running");
-        assert_eq!(WorkflowSpecStatus::Completed.as_str(), "completed");
-        assert_eq!(WorkflowSpecStatus::Failed.as_str(), "failed");
-        assert_eq!(WorkflowSpecStatus::Skipped.as_str(), "skipped");
+    fn loop_spec_status_as_str() {
+        assert_eq!(LoopSpecStatus::Pending.as_str(), "pending");
+        assert_eq!(LoopSpecStatus::Running.as_str(), "running");
+        assert_eq!(LoopSpecStatus::Completed.as_str(), "completed");
+        assert_eq!(LoopSpecStatus::Failed.as_str(), "failed");
+        assert_eq!(LoopSpecStatus::Skipped.as_str(), "skipped");
     }
 
     #[test]
-    fn workflow_spec_status_from_str() {
+    fn loop_spec_status_from_str() {
         assert_eq!(
-            WorkflowSpecStatus::from_str("running"),
-            WorkflowSpecStatus::Running
+            LoopSpecStatus::from_str("running"),
+            LoopSpecStatus::Running
         );
         assert_eq!(
-            WorkflowSpecStatus::from_str("completed"),
-            WorkflowSpecStatus::Completed
+            LoopSpecStatus::from_str("completed"),
+            LoopSpecStatus::Completed
         );
         assert_eq!(
-            WorkflowSpecStatus::from_str("failed"),
-            WorkflowSpecStatus::Failed
+            LoopSpecStatus::from_str("failed"),
+            LoopSpecStatus::Failed
         );
         assert_eq!(
-            WorkflowSpecStatus::from_str("skipped"),
-            WorkflowSpecStatus::Skipped
+            LoopSpecStatus::from_str("skipped"),
+            LoopSpecStatus::Skipped
         );
         assert_eq!(
-            WorkflowSpecStatus::from_str("invalid"),
-            WorkflowSpecStatus::Pending
+            LoopSpecStatus::from_str("invalid"),
+            LoopSpecStatus::Pending
         );
     }
 
     #[test]
-    fn workflow_node_kind_as_str() {
-        assert_eq!(WorkflowNodeKind::Agent.as_str(), "agent");
-        assert_eq!(WorkflowNodeKind::Check.as_str(), "check");
-        assert_eq!(WorkflowNodeKind::Gate.as_str(), "gate");
+    fn loop_node_kind_as_str() {
+        assert_eq!(LoopNodeKind::Agent.as_str(), "agent");
+        assert_eq!(LoopNodeKind::Check.as_str(), "check");
+        assert_eq!(LoopNodeKind::Gate.as_str(), "gate");
     }
 
     #[test]
-    fn workflow_node_kind_from_str() {
+    fn loop_node_kind_from_str() {
         assert_eq!(
-            WorkflowNodeKind::from_str("agent"),
-            Some(WorkflowNodeKind::Agent)
+            LoopNodeKind::from_str("agent"),
+            Some(LoopNodeKind::Agent)
         );
         assert_eq!(
-            WorkflowNodeKind::from_str("check"),
-            Some(WorkflowNodeKind::Check)
+            LoopNodeKind::from_str("check"),
+            Some(LoopNodeKind::Check)
         );
         assert_eq!(
-            WorkflowNodeKind::from_str("gate"),
-            Some(WorkflowNodeKind::Gate)
+            LoopNodeKind::from_str("gate"),
+            Some(LoopNodeKind::Gate)
         );
-        assert!(WorkflowNodeKind::from_str("invalid").is_none());
+        assert!(LoopNodeKind::from_str("invalid").is_none());
     }
 
     #[test]
-    fn workflow_edge_condition_as_str() {
-        assert_eq!(WorkflowEdgeCondition::Pass.as_str(), "pass");
-        assert_eq!(WorkflowEdgeCondition::Fail.as_str(), "fail");
-        assert_eq!(WorkflowEdgeCondition::Always.as_str(), "always");
+    fn loop_edge_condition_as_str() {
+        assert_eq!(LoopEdgeCondition::Pass.as_str(), "pass");
+        assert_eq!(LoopEdgeCondition::Fail.as_str(), "fail");
+        assert_eq!(LoopEdgeCondition::Always.as_str(), "always");
     }
 
     #[test]
-    fn workflow_edge_condition_from_str() {
+    fn loop_edge_condition_from_str() {
         assert_eq!(
-            WorkflowEdgeCondition::from_str("pass"),
-            Some(WorkflowEdgeCondition::Pass)
+            LoopEdgeCondition::from_str("pass"),
+            Some(LoopEdgeCondition::Pass)
         );
         assert_eq!(
-            WorkflowEdgeCondition::from_str("fail"),
-            Some(WorkflowEdgeCondition::Fail)
+            LoopEdgeCondition::from_str("fail"),
+            Some(LoopEdgeCondition::Fail)
         );
         assert_eq!(
-            WorkflowEdgeCondition::from_str("always"),
-            Some(WorkflowEdgeCondition::Always)
+            LoopEdgeCondition::from_str("always"),
+            Some(LoopEdgeCondition::Always)
         );
-        assert!(WorkflowEdgeCondition::from_str("invalid").is_none());
+        assert!(LoopEdgeCondition::from_str("invalid").is_none());
     }
 
     #[test]
-    fn workflow_run_status_as_str() {
-        assert_eq!(WorkflowRunStatus::Running.as_str(), "running");
-        assert_eq!(WorkflowRunStatus::Pass.as_str(), "pass");
-        assert_eq!(WorkflowRunStatus::Fail.as_str(), "fail");
+    fn loop_run_status_as_str() {
+        assert_eq!(LoopRunStatus::Running.as_str(), "running");
+        assert_eq!(LoopRunStatus::Pass.as_str(), "pass");
+        assert_eq!(LoopRunStatus::Fail.as_str(), "fail");
     }
 
     #[test]
-    fn workflow_run_status_from_str() {
-        assert_eq!(WorkflowRunStatus::from_str("pass"), WorkflowRunStatus::Pass);
-        assert_eq!(WorkflowRunStatus::from_str("fail"), WorkflowRunStatus::Fail);
+    fn loop_run_status_from_str() {
+        assert_eq!(LoopRunStatus::from_str("pass"), LoopRunStatus::Pass);
+        assert_eq!(LoopRunStatus::from_str("fail"), LoopRunStatus::Fail);
         assert_eq!(
-            WorkflowRunStatus::from_str("invalid"),
-            WorkflowRunStatus::Running
+            LoopRunStatus::from_str("invalid"),
+            LoopRunStatus::Running
         );
     }
 }

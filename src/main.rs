@@ -25,7 +25,7 @@ mod sync_manager;
 mod system;
 mod tui;
 mod watchers;
-mod workflow_engine;
+mod loop_engine;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

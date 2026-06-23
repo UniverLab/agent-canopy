@@ -4,9 +4,9 @@ use crate::domain::models::{Agent, Cli, RunLog, RunStatus, Trigger, TriggerType,
 use crate::domain::sync::{
     IntentPayload, MessageKind, MissionImpact, StatusPayload, WorkspaceStatus,
 };
-use crate::domain::workflow::{
-    Workflow, WorkflowEdge, WorkflowEdgeCondition, WorkflowNode, WorkflowNodeKind, WorkflowNodeRun,
-    WorkflowRunStatus, WorkflowSpec, WorkflowSpecStatus, WorkflowStatus,
+use crate::domain::loops::{
+    Loop, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind, LoopNodeRun,
+    LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus,
 };
 use chrono::{Duration, Utc};
 use tempfile::{tempdir, NamedTempFile};
@@ -86,39 +86,39 @@ fn sample_manual_agent(id: &str) -> Agent {
     }
 }
 
-fn sample_workflow(id: &str) -> Workflow {
-    Workflow {
+fn sample_loop(id: &str) -> Loop {
+    Loop {
         id: id.to_string(),
-        name: "Auth workflow".to_string(),
+        name: "Auth loop".to_string(),
         description: Some("Implements auth in ordered specs".to_string()),
         workdir: "/tmp/project".to_string(),
-        status: WorkflowStatus::Draft,
+        status: LoopStatus::Draft,
         created_at: Utc::now(),
         started_at: None,
         completed_at: None,
     }
 }
 
-fn sample_workflow_spec(workflow_id: &str, id: &str, position: i64) -> WorkflowSpec {
-    WorkflowSpec {
+fn sample_loop_spec(loop_id: &str, id: &str, position: i64) -> LoopSpec {
+    LoopSpec {
         id: id.to_string(),
-        workflow_id: workflow_id.to_string(),
+        loop_id: loop_id.to_string(),
         name: format!("Spec {position}"),
         description: Some("Do a slice of the feature".to_string()),
         position,
         parallelizable: false,
-        status: WorkflowSpecStatus::Pending,
+        status: LoopSpecStatus::Pending,
         started_at: None,
         completed_at: None,
     }
 }
 
-fn sample_workflow_node(spec_id: &str, id: &str, position: i64) -> WorkflowNode {
-    WorkflowNode {
+fn sample_loop_node(spec_id: &str, id: &str, position: i64) -> LoopNode {
+    LoopNode {
         id: id.to_string(),
         spec_id: spec_id.to_string(),
         name: format!("Node {position}"),
-        kind: WorkflowNodeKind::Check,
+        kind: LoopNodeKind::Check,
         config: serde_json::json!({
             "command": "cargo test",
             "success_condition": "exit_code_0"
@@ -402,34 +402,34 @@ fn test_intelligence_upsert_search_and_graph_walk() {
     assert!(walk.edges.iter().any(|edge| edge.from_node_id == "node-a"));
 }
 
-// ── Workflow persistence ──────────────────────────────────────────
+// ── Loop persistence ──────────────────────────────────────────
 
 #[test]
-fn workflow_details_roundtrip_preserves_order_and_graph() {
+fn loop_details_roundtrip_preserves_order_and_graph() {
     let db = test_db();
-    let workflow = sample_workflow("wf-1");
-    let spec_one = sample_workflow_spec(&workflow.id, "spec-1", 1);
-    let spec_two = sample_workflow_spec(&workflow.id, "spec-2", 2);
-    let node_one = sample_workflow_node(&spec_one.id, "node-1", 1);
-    let node_two = sample_workflow_node(&spec_one.id, "node-2", 2);
-    let edge = WorkflowEdge {
+    let lp = sample_loop("wf-1");
+    let spec_one = sample_loop_spec(&lp.id, "spec-1", 1);
+    let spec_two = sample_loop_spec(&lp.id, "spec-2", 2);
+    let node_one = sample_loop_node(&spec_one.id, "node-1", 1);
+    let node_two = sample_loop_node(&spec_one.id, "node-2", 2);
+    let edge = LoopEdge {
         id: "edge-1".to_string(),
         spec_id: spec_one.id.clone(),
         from_node: node_one.id.clone(),
         to_node: node_two.id.clone(),
-        condition: WorkflowEdgeCondition::Pass,
+        condition: LoopEdgeCondition::Pass,
     };
 
-    db.insert_workflow(&workflow).unwrap();
-    db.insert_workflow_spec(&spec_two).unwrap();
-    db.insert_workflow_spec(&spec_one).unwrap();
-    db.insert_workflow_node(&node_two).unwrap();
-    db.insert_workflow_node(&node_one).unwrap();
-    db.insert_workflow_edge(&edge).unwrap();
+    db.insert_loop(&lp).unwrap();
+    db.insert_loop_spec(&spec_two).unwrap();
+    db.insert_loop_spec(&spec_one).unwrap();
+    db.insert_loop_node(&node_two).unwrap();
+    db.insert_loop_node(&node_one).unwrap();
+    db.insert_loop_edge(&edge).unwrap();
 
-    let details = db.get_workflow_details(&workflow.id).unwrap().unwrap();
+    let details = db.get_loop_details(&lp.id).unwrap().unwrap();
 
-    assert_eq!(details.workflow.id, workflow.id);
+    assert_eq!(details.lp.id, lp.id);
     assert_eq!(details.specs.len(), 2);
     assert_eq!(details.specs[0].spec.id, spec_one.id);
     assert_eq!(details.specs[0].nodes[0].id, node_one.id);
@@ -439,17 +439,17 @@ fn workflow_details_roundtrip_preserves_order_and_graph() {
 }
 
 #[test]
-fn workflow_run_roundtrip_preserves_json_payloads() {
+fn loop_run_roundtrip_preserves_json_payloads() {
     let db = test_db();
-    let workflow = sample_workflow("wf-2");
-    let spec = sample_workflow_spec(&workflow.id, "spec-run", 1);
-    let node = sample_workflow_node(&spec.id, "node-run", 1);
-    let run = WorkflowNodeRun {
+    let lp = sample_loop("wf-2");
+    let spec = sample_loop_spec(&lp.id, "spec-run", 1);
+    let node = sample_loop_node(&spec.id, "node-run", 1);
+    let run = LoopNodeRun {
         id: "run-1".to_string(),
-        workflow_id: workflow.id.clone(),
+        loop_id: lp.id.clone(),
         spec_id: spec.id.clone(),
         node_id: node.id.clone(),
-        status: WorkflowRunStatus::Pass,
+        status: LoopRunStatus::Pass,
         input: Some(serde_json::json!({"feedback": "previous"})),
         output: Some(serde_json::json!({"summary": "ok"})),
         started_at: Utc::now(),
@@ -457,16 +457,16 @@ fn workflow_run_roundtrip_preserves_json_payloads() {
         iteration: 2,
     };
 
-    db.insert_workflow(&workflow).unwrap();
-    db.insert_workflow_spec(&spec).unwrap();
-    db.insert_workflow_node(&node).unwrap();
-    db.insert_workflow_run(&run).unwrap();
+    db.insert_loop(&lp).unwrap();
+    db.insert_loop_spec(&spec).unwrap();
+    db.insert_loop_node(&node).unwrap();
+    db.insert_loop_run(&run).unwrap();
 
-    let runs = db.list_workflow_runs_for_spec(&spec.id).unwrap();
+    let runs = db.list_loop_runs_for_spec(&spec.id).unwrap();
 
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].iteration, 2);
-    assert_eq!(runs[0].status, WorkflowRunStatus::Pass);
+    assert_eq!(runs[0].status, LoopRunStatus::Pass);
     assert_eq!(
         runs[0]
             .input
@@ -484,32 +484,32 @@ fn workflow_run_roundtrip_preserves_json_payloads() {
 }
 
 #[test]
-fn workflow_updates_persist_metadata_and_positions() {
+fn loop_updates_persist_metadata_and_positions() {
     let db = test_db();
-    let workflow = sample_workflow("wf-update");
-    let spec = sample_workflow_spec(&workflow.id, "spec-update", 1);
-    let node = sample_workflow_node(&spec.id, "node-update", 1);
-    let edge = WorkflowEdge {
+    let lp = sample_loop("wf-update");
+    let spec = sample_loop_spec(&lp.id, "spec-update", 1);
+    let node = sample_loop_node(&spec.id, "node-update", 1);
+    let edge = LoopEdge {
         id: "edge-update".to_string(),
         spec_id: spec.id.clone(),
         from_node: node.id.clone(),
         to_node: node.id.clone(),
-        condition: WorkflowEdgeCondition::Always,
+        condition: LoopEdgeCondition::Always,
     };
 
-    db.insert_workflow(&workflow).unwrap();
-    db.insert_workflow_spec(&spec).unwrap();
-    db.insert_workflow_node(&node).unwrap();
-    db.insert_workflow_edge(&edge).unwrap();
+    db.insert_loop(&lp).unwrap();
+    db.insert_loop_spec(&spec).unwrap();
+    db.insert_loop_node(&node).unwrap();
+    db.insert_loop_edge(&edge).unwrap();
 
-    db.update_workflow_details(
-        &workflow.id,
-        Some("Auth refresh workflow"),
+    db.update_loop_details(
+        &lp.id,
+        Some("Auth refresh loop"),
         Some(Some("Updated description")),
         Some("/tmp/other-project"),
     )
     .unwrap();
-    db.update_workflow_spec_details(
+    db.update_loop_spec_details(
         &spec.id,
         Some("Spec updated"),
         Some("Functional Requirements:\n- A\n\nNon-Functional Requirements:\n- B\n\nObjective:\n- C\n\nConstraints:\n- D\n\nGuidelines:\n- E\n\nIn Scope:\n- F\n\nOut of Scope:\n- G"),
@@ -517,36 +517,36 @@ fn workflow_updates_persist_metadata_and_positions() {
         Some(true),
     )
     .unwrap();
-    db.update_workflow_node_details(
+    db.update_loop_node_details(
         &node.id,
         Some("Verification node"),
-        Some(WorkflowNodeKind::Gate),
+        Some(LoopNodeKind::Gate),
         Some(&serde_json::json!({"evaluate": "output_contains", "value": "APPROVED"})),
         Some(4),
     )
     .unwrap();
-    db.update_workflow_edge_condition(&edge.id, WorkflowEdgeCondition::Fail)
+    db.update_loop_edge_condition(&edge.id, LoopEdgeCondition::Fail)
         .unwrap();
 
-    let workflow = db.get_workflow(&workflow.id).unwrap().unwrap();
-    let spec = db.get_workflow_spec(&spec.id).unwrap().unwrap();
-    let node = db.get_workflow_node(&node.id).unwrap().unwrap();
-    let edge = db.get_workflow_edge(&edge.id).unwrap().unwrap();
+    let lp = db.get_loop(&lp.id).unwrap().unwrap();
+    let spec = db.get_loop_spec(&spec.id).unwrap().unwrap();
+    let node = db.get_loop_node(&node.id).unwrap().unwrap();
+    let edge = db.get_loop_edge(&edge.id).unwrap().unwrap();
 
-    assert_eq!(workflow.name, "Auth refresh workflow");
-    assert_eq!(workflow.description.as_deref(), Some("Updated description"));
-    assert_eq!(workflow.workdir, "/tmp/other-project");
+    assert_eq!(lp.name, "Auth refresh loop");
+    assert_eq!(lp.description.as_deref(), Some("Updated description"));
+    assert_eq!(lp.workdir, "/tmp/other-project");
     assert_eq!(spec.name, "Spec updated");
     assert_eq!(spec.position, 3);
     assert!(spec.parallelizable);
     assert_eq!(node.name, "Verification node");
-    assert_eq!(node.kind, WorkflowNodeKind::Gate);
+    assert_eq!(node.kind, LoopNodeKind::Gate);
     assert_eq!(node.position, 4);
     assert_eq!(
         node.config.get("evaluate"),
         Some(&serde_json::json!("output_contains"))
     );
-    assert_eq!(edge.condition, WorkflowEdgeCondition::Fail);
+    assert_eq!(edge.condition, LoopEdgeCondition::Fail);
 }
 
 #[test]

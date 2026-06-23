@@ -8,15 +8,15 @@ use tokio::process::Command;
 use crate::application::notification_service::NotificationService;
 use crate::db::Database;
 use crate::domain::models::Cli;
-use crate::domain::workflow::{
-    WorkflowEdge, WorkflowNode, WorkflowNodeKind, WorkflowNodeRun, WorkflowRunStatus, WorkflowSpec,
-    WorkflowSpecStatus, WorkflowStatus,
+use crate::domain::loops::{
+    LoopEdge, LoopNode, LoopNodeKind, LoopNodeRun, LoopRunStatus, LoopSpec,
+    LoopSpecStatus, LoopStatus,
 };
 
 const DEFAULT_MAX_ITERATIONS_PER_NODE: usize = 10;
 
 #[derive(Clone)]
-pub struct WorkflowEngine {
+pub struct LoopEngine {
     db: Arc<Database>,
     notification_service: Arc<dyn NotificationService>,
 }
@@ -28,12 +28,12 @@ enum SpecExecutionOutcome {
 }
 
 struct NodeExecution {
-    status: WorkflowRunStatus,
+    status: LoopRunStatus,
     output: Value,
     summary: String,
 }
 
-impl WorkflowEngine {
+impl LoopEngine {
     pub fn new(db: Arc<Database>, notification_service: Arc<dyn NotificationService>) -> Self {
         Self {
             db,
@@ -41,107 +41,107 @@ impl WorkflowEngine {
         }
     }
 
-    pub fn start_background(self: Arc<Self>, workflow_id: String) {
+    pub fn start_background(self: Arc<Self>, loop_id: String) {
         tokio::spawn(async move {
-            if let Err(error) = self.run_workflow(workflow_id.clone()).await {
-                tracing::error!("Workflow '{}' failed to run: {error:#}", workflow_id);
-                let _ = self.fail_workflow(&workflow_id, &error.to_string());
+            if let Err(error) = self.run_loop(loop_id.clone()).await {
+                tracing::error!("Loop '{}' failed to run: {error:#}", loop_id);
+                let _ = self.fail_loop(&loop_id, &error.to_string());
             }
         });
     }
 
-    pub fn request_pause(&self, workflow_id: &str) -> Result<bool> {
-        let Some(workflow) = self.db.get_workflow(workflow_id)? else {
+    pub fn request_pause(&self, loop_id: &str) -> Result<bool> {
+        let Some(lp) = self.db.get_loop(loop_id)? else {
             return Ok(false);
         };
 
-        match workflow.status {
-            WorkflowStatus::Running => {
+        match lp.status {
+            LoopStatus::Running => {
                 self.db
-                    .update_workflow_status(workflow_id, WorkflowStatus::Paused, None, None)
+                    .update_loop_status(loop_id, LoopStatus::Paused, None, None)
             }
-            WorkflowStatus::Paused => Ok(true),
+            LoopStatus::Paused => Ok(true),
             _ => Ok(false),
         }
     }
 
-    pub async fn run_workflow(&self, workflow_id: String) -> Result<()> {
-        let Some(workflow) = self.db.get_workflow(&workflow_id)? else {
-            bail!("Workflow '{}' not found.", workflow_id);
+    pub async fn run_loop(&self, loop_id: String) -> Result<()> {
+        let Some(lp) = self.db.get_loop(&loop_id)? else {
+            bail!("Loop '{}' not found.", loop_id);
         };
 
-        self.db.update_workflow_status(
-            &workflow_id,
-            WorkflowStatus::Running,
+        self.db.update_loop_status(
+            &loop_id,
+            LoopStatus::Running,
             Some(chrono::Utc::now()),
             None,
         )?;
 
-        let specs = self.db.list_workflow_specs(&workflow_id)?;
+        let specs = self.db.list_loop_specs(&loop_id)?;
         for spec in specs {
-            if self.is_paused(&workflow_id)? {
+            if self.is_paused(&loop_id)? {
                 return Ok(());
             }
             if matches!(
                 spec.status,
-                WorkflowSpecStatus::Completed | WorkflowSpecStatus::Skipped
+                LoopSpecStatus::Completed | LoopSpecStatus::Skipped
             ) {
                 continue;
             }
 
-            match self.run_spec(&workflow, &spec).await? {
+            match self.run_spec(&lp, &spec).await? {
                 SpecExecutionOutcome::Completed => continue,
                 SpecExecutionOutcome::Paused => return Ok(()),
                 SpecExecutionOutcome::Failed(summary) => {
-                    self.fail_workflow(&workflow_id, &summary)?;
+                    self.fail_loop(&loop_id, &summary)?;
                     return Ok(());
                 }
             }
         }
 
-        self.db.update_workflow_status(
-            &workflow_id,
-            WorkflowStatus::Completed,
+        self.db.update_loop_status(
+            &loop_id,
+            LoopStatus::Completed,
             None,
             Some(chrono::Utc::now()),
         )?;
         self.notification_service
-            .notify_task_completed(&workflow_id, true, Some(0));
+            .notify_task_completed(&loop_id, true, Some(0));
         Ok(())
     }
 
     async fn run_spec(
         &self,
-        workflow: &crate::domain::workflow::Workflow,
-        spec: &WorkflowSpec,
+        lp: &crate::domain::loops::Loop,
+        spec: &LoopSpec,
     ) -> Result<SpecExecutionOutcome> {
-        let Some(details) = self.db.get_workflow_details(&workflow.id)? else {
-            bail!("Workflow '{}' disappeared during execution.", workflow.id);
+        let Some(details) = self.db.get_loop_details(&lp.id)? else {
+            bail!("Loop '{}' disappeared during execution.", lp.id);
         };
         let spec_details = details
             .specs
             .into_iter()
             .find(|item| item.spec.id == spec.id)
-            .ok_or_else(|| anyhow!("Workflow spec '{}' not found.", spec.id))?;
+            .ok_or_else(|| anyhow!("Loop spec '{}' not found.", spec.id))?;
 
         let nodes_by_id = spec_details
             .nodes
             .iter()
             .map(|node| (node.id.as_str(), node))
             .collect::<HashMap<_, _>>();
-        let existing_runs = self.db.list_workflow_runs_for_spec(&spec.id)?;
+        let existing_runs = self.db.list_loop_runs_for_spec(&spec.id)?;
         let (mut current_node_id, mut previous_output, mut iterations) =
             resolve_spec_start(&spec_details, spec, &existing_runs)?;
 
-        self.db.update_workflow_spec_status(
+        self.db.update_loop_spec_status(
             &spec.id,
-            WorkflowSpecStatus::Running,
+            LoopSpecStatus::Running,
             Some(chrono::Utc::now()),
             None,
         )?;
 
         loop {
-            if self.is_paused(&workflow.id)? {
+            if self.is_paused(&lp.id)? {
                 return Ok(SpecExecutionOutcome::Paused);
             }
 
@@ -152,9 +152,9 @@ impl WorkflowEngine {
                     "Spec '{}' exceeded max iterations for node '{}'.",
                     spec.name, current_node_id
                 );
-                self.db.update_workflow_spec_status(
+                self.db.update_loop_spec_status(
                     &spec.id,
-                    WorkflowSpecStatus::Failed,
+                    LoopSpecStatus::Failed,
                     None,
                     Some(chrono::Utc::now()),
                 )?;
@@ -163,14 +163,14 @@ impl WorkflowEngine {
 
             let node = nodes_by_id
                 .get(current_node_id.as_str())
-                .ok_or_else(|| anyhow!("Workflow node '{}' not found.", current_node_id))?;
+                .ok_or_else(|| anyhow!("Loop node '{}' not found.", current_node_id))?;
             let run_id = uuid::Uuid::new_v4().to_string();
-            self.db.insert_workflow_run(&WorkflowNodeRun {
+            self.db.insert_loop_run(&LoopNodeRun {
                 id: run_id.clone(),
-                workflow_id: workflow.id.clone(),
+                loop_id: lp.id.clone(),
                 spec_id: spec.id.clone(),
                 node_id: node.id.clone(),
-                status: WorkflowRunStatus::Running,
+                status: LoopRunStatus::Running,
                 input: previous_output.clone(),
                 output: None,
                 started_at: chrono::Utc::now(),
@@ -178,14 +178,14 @@ impl WorkflowEngine {
                 iteration: *iteration as i64,
             })?;
             let execution = self
-                .execute_node(workflow, spec, node, previous_output.as_ref(), &run_id)
+                .execute_node(lp, spec, node, previous_output.as_ref(), &run_id)
                 .await?;
             let run = self
                 .db
-                .get_workflow_run(&run_id)?
-                .ok_or_else(|| anyhow!("Workflow run '{}' not found after execution.", run_id))?;
-            let final_execution = if run.status == WorkflowRunStatus::Running {
-                self.db.update_workflow_run_result(
+                .get_loop_run(&run_id)?
+                .ok_or_else(|| anyhow!("Loop run '{}' not found after execution.", run_id))?;
+            let final_execution = if run.status == LoopRunStatus::Running {
+                self.db.update_loop_run_result(
                     &run_id,
                     execution.status,
                     Some(&execution.output),
@@ -200,14 +200,14 @@ impl WorkflowEngine {
                 }
             };
 
-            if self.is_paused(&workflow.id)? {
+            if self.is_paused(&lp.id)? {
                 return Ok(SpecExecutionOutcome::Paused);
             }
 
             if should_advance_to_next_spec(node, final_execution.status) {
-                self.db.update_workflow_spec_status(
+                self.db.update_loop_spec_status(
                     &spec.id,
-                    WorkflowSpecStatus::Completed,
+                    LoopSpecStatus::Completed,
                     None,
                     Some(chrono::Utc::now()),
                 )?;
@@ -223,19 +223,19 @@ impl WorkflowEngine {
                     previous_output = Some(final_execution.output);
                     current_node_id = next_node_id;
                 }
-                None if final_execution.status == WorkflowRunStatus::Pass => {
-                    self.db.update_workflow_spec_status(
+                None if final_execution.status == LoopRunStatus::Pass => {
+                    self.db.update_loop_spec_status(
                         &spec.id,
-                        WorkflowSpecStatus::Completed,
+                        LoopSpecStatus::Completed,
                         None,
                         Some(chrono::Utc::now()),
                     )?;
                     return Ok(SpecExecutionOutcome::Completed);
                 }
                 None => {
-                    self.db.update_workflow_spec_status(
+                    self.db.update_loop_spec_status(
                         &spec.id,
-                        WorkflowSpecStatus::Failed,
+                        LoopSpecStatus::Failed,
                         None,
                         Some(chrono::Utc::now()),
                     )?;
@@ -247,45 +247,45 @@ impl WorkflowEngine {
 
     async fn execute_node(
         &self,
-        workflow: &crate::domain::workflow::Workflow,
-        spec: &WorkflowSpec,
-        node: &WorkflowNode,
+        lp: &crate::domain::loops::Loop,
+        spec: &LoopSpec,
+        node: &LoopNode,
         previous_output: Option<&Value>,
         run_id: &str,
     ) -> Result<NodeExecution> {
         match node.kind {
-            WorkflowNodeKind::Check => execute_check_node(workflow, spec, node).await,
-            WorkflowNodeKind::Gate => execute_gate_node(node, previous_output),
-            WorkflowNodeKind::Agent => {
-                execute_agent_node(&self.db, workflow, spec, node, previous_output, run_id).await
+            LoopNodeKind::Check => execute_check_node(lp, spec, node).await,
+            LoopNodeKind::Gate => execute_gate_node(node, previous_output),
+            LoopNodeKind::Agent => {
+                execute_agent_node(&self.db, lp, spec, node, previous_output, run_id).await
             }
         }
     }
 
-    fn is_paused(&self, workflow_id: &str) -> Result<bool> {
+    fn is_paused(&self, loop_id: &str) -> Result<bool> {
         Ok(self
             .db
-            .get_workflow(workflow_id)?
-            .is_some_and(|workflow| workflow.status == WorkflowStatus::Paused))
+            .get_loop(loop_id)?
+            .is_some_and(|lp| lp.status == LoopStatus::Paused))
     }
 
-    fn fail_workflow(&self, workflow_id: &str, summary: &str) -> Result<()> {
-        self.db.update_workflow_status(
-            workflow_id,
-            WorkflowStatus::Failed,
+    fn fail_loop(&self, loop_id: &str, summary: &str) -> Result<()> {
+        self.db.update_loop_status(
+            loop_id,
+            LoopStatus::Failed,
             None,
             Some(chrono::Utc::now()),
         )?;
         self.notification_service
-            .notify_task_failed(workflow_id, 1, summary);
+            .notify_task_failed(loop_id, 1, summary);
         Ok(())
     }
 }
 
 async fn execute_check_node(
-    workflow: &crate::domain::workflow::Workflow,
-    spec: &WorkflowSpec,
-    node: &WorkflowNode,
+    lp: &crate::domain::loops::Loop,
+    spec: &LoopSpec,
+    node: &LoopNode,
 ) -> Result<NodeExecution> {
     let command = node
         .config
@@ -306,7 +306,7 @@ async fn execute_check_node(
         .unwrap_or(120);
 
     let mut process = shell_command(command);
-    process.current_dir(&workflow.workdir);
+    process.current_dir(&lp.workdir);
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_seconds),
         process.output(),
@@ -328,13 +328,13 @@ async fn execute_check_node(
 
     Ok(NodeExecution {
         status: if passed {
-            WorkflowRunStatus::Pass
+            LoopRunStatus::Pass
         } else {
-            WorkflowRunStatus::Fail
+            LoopRunStatus::Fail
         },
         output: serde_json::json!({
             "kind": "check",
-            "workflow_id": workflow.id,
+            "loop_id": lp.id,
             "spec_id": spec.id,
             "node_id": node.id,
             "command": command,
@@ -354,9 +354,9 @@ async fn execute_check_node(
 
 async fn execute_agent_node(
     db: &Arc<Database>,
-    workflow: &crate::domain::workflow::Workflow,
-    spec: &WorkflowSpec,
-    node: &WorkflowNode,
+    lp: &crate::domain::loops::Loop,
+    spec: &LoopSpec,
+    node: &LoopNode,
     previous_output: Option<&Value>,
     run_id: &str,
 ) -> Result<NodeExecution> {
@@ -374,7 +374,7 @@ async fn execute_agent_node(
         .get("prompt_template")
         .and_then(Value::as_str)
         .unwrap_or("{{spec_content}}\n\n{{previous_feedback}}");
-    let prompt = render_agent_prompt(workflow, spec, node, prompt_template, previous_output);
+    let prompt = render_agent_prompt(lp, spec, node, prompt_template, previous_output);
     let model = node.config.get("model").and_then(Value::as_str);
     let timeout_minutes = node
         .config
@@ -384,7 +384,7 @@ async fn execute_agent_node(
 
     let mut command = cli
         .strategy()
-        .build_command(&prompt, model, Some(&workflow.workdir));
+        .build_command(&prompt, model, Some(&lp.workdir));
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_minutes * 60),
         command.output(),
@@ -392,8 +392,8 @@ async fn execute_agent_node(
     .await
     .with_context(|| format!("Agent node '{}' timed out.", node.name))??;
 
-    if let Some(run) = db.get_workflow_run(run_id)? {
-        if run.status != WorkflowRunStatus::Running {
+    if let Some(run) = db.get_loop_run(run_id)? {
+        if run.status != LoopRunStatus::Running {
             return Ok(NodeExecution {
                 status: run.status,
                 output: run.output.unwrap_or_else(|| serde_json::json!({})),
@@ -407,9 +407,9 @@ async fn execute_agent_node(
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     Ok(NodeExecution {
         status: if output.status.success() {
-            WorkflowRunStatus::Pass
+            LoopRunStatus::Pass
         } else {
-            WorkflowRunStatus::Fail
+            LoopRunStatus::Fail
         },
         output: serde_json::json!({
             "kind": "agent",
@@ -425,7 +425,7 @@ async fn execute_agent_node(
 }
 
 fn execute_gate_node(
-    node: &WorkflowNode,
+    node: &LoopNode,
     previous_output: Option<&Value>,
 ) -> Result<NodeExecution> {
     let previous_output = previous_output
@@ -449,9 +449,9 @@ fn execute_gate_node(
 
     Ok(NodeExecution {
         status: if passed {
-            WorkflowRunStatus::Pass
+            LoopRunStatus::Pass
         } else {
-            WorkflowRunStatus::Fail
+            LoopRunStatus::Fail
         },
         output: serde_json::json!({
             "kind": "gate",
@@ -484,7 +484,7 @@ fn evaluate_success_condition(condition: &str, exit_code: i32, output: &str) -> 
     bail!("Unsupported success condition '{}'.", condition)
 }
 
-fn find_entry_node(spec: &crate::domain::workflow::WorkflowSpecDetails) -> Result<String> {
+fn find_entry_node(spec: &crate::domain::loops::LoopSpecDetails) -> Result<String> {
     let incoming = spec
         .edges
         .iter()
@@ -504,23 +504,23 @@ fn find_entry_node(spec: &crate::domain::workflow::WorkflowSpecDetails) -> Resul
 }
 
 fn select_next_node<'a>(
-    edges: &'a [WorkflowEdge],
+    edges: &'a [LoopEdge],
     from_node: &str,
-    status: WorkflowRunStatus,
+    status: LoopRunStatus,
 ) -> Result<Option<&'a str>> {
     let matching = edges
         .iter()
         .filter(|edge| edge.from_node == from_node)
         .filter(|edge| match status {
-            WorkflowRunStatus::Pass => {
-                edge.condition == crate::domain::workflow::WorkflowEdgeCondition::Pass
-                    || edge.condition == crate::domain::workflow::WorkflowEdgeCondition::Always
+            LoopRunStatus::Pass => {
+                edge.condition == crate::domain::loops::LoopEdgeCondition::Pass
+                    || edge.condition == crate::domain::loops::LoopEdgeCondition::Always
             }
-            WorkflowRunStatus::Fail => {
-                edge.condition == crate::domain::workflow::WorkflowEdgeCondition::Fail
-                    || edge.condition == crate::domain::workflow::WorkflowEdgeCondition::Always
+            LoopRunStatus::Fail => {
+                edge.condition == crate::domain::loops::LoopEdgeCondition::Fail
+                    || edge.condition == crate::domain::loops::LoopEdgeCondition::Always
             }
-            WorkflowRunStatus::Running => false,
+            LoopRunStatus::Running => false,
         })
         .collect::<Vec<_>>();
 
@@ -531,14 +531,14 @@ fn select_next_node<'a>(
     }
 }
 
-fn should_advance_to_next_spec(node: &WorkflowNode, status: WorkflowRunStatus) -> bool {
+fn should_advance_to_next_spec(node: &LoopNode, status: LoopRunStatus) -> bool {
     let route_key = match status {
-        WorkflowRunStatus::Pass => "pass_route",
-        WorkflowRunStatus::Fail => "fail_route",
-        WorkflowRunStatus::Running => return false,
+        LoopRunStatus::Pass => "pass_route",
+        LoopRunStatus::Fail => "fail_route",
+        LoopRunStatus::Running => return false,
     };
 
-    node.kind == WorkflowNodeKind::Gate
+    node.kind == LoopNodeKind::Gate
         && node
             .config
             .get(route_key)
@@ -547,9 +547,9 @@ fn should_advance_to_next_spec(node: &WorkflowNode, status: WorkflowRunStatus) -
 }
 
 fn render_agent_prompt(
-    workflow: &crate::domain::workflow::Workflow,
-    spec: &WorkflowSpec,
-    node: &WorkflowNode,
+    lp: &crate::domain::loops::Loop,
+    spec: &LoopSpec,
+    node: &LoopNode,
     prompt_template: &str,
     previous_output: Option<&Value>,
 ) -> String {
@@ -558,8 +558,8 @@ fn render_agent_prompt(
         .unwrap_or_else(|| "(none)".to_string());
     let spec_content = spec.description.as_deref().unwrap_or(&spec.name);
     let prompt = prompt_template
-        .replace("{{workflow_name}}", &workflow.name)
-        .replace("{{workdir}}", &workflow.workdir)
+        .replace("{{loop_name}}", &lp.name)
+        .replace("{{workdir}}", &lp.workdir)
         .replace("{{spec_id}}", &spec.id)
         .replace("{{spec_name}}", &spec.name)
         .replace("{{spec_content}}", spec_content)
@@ -567,11 +567,11 @@ fn render_agent_prompt(
         .replace("{{previous_feedback}}", &previous_feedback);
 
     format!(
-        "# [WORKFLOW CONTEXT]\n<workflow>\n  <name>{}</name>\n  <spec>{}</spec>\n  <node>{}</node>\n  <workdir>{}</workdir>\n</workflow>\n\n# [SPEC]\n{}\n\n# [PREVIOUS FEEDBACK]\n{}\n\n# [REPORTING]\nWhen you finish this node, call workflow_complete_node with node_id=\"{}\", status=\"pass\"|\"fail\", a concise summary, and your output.\nIf you are blocked and need human intervention, call workflow_report_blocker with node_id=\"{}\" and the blocker description.\n",
-        workflow.name,
+        "# [LOOP CONTEXT]\n<loop>\n  <name>{}</name>\n  <spec>{}</spec>\n  <node>{}</node>\n  <workdir>{}</workdir>\n</loop>\n\n# [SPEC]\n{}\n\n# [PREVIOUS FEEDBACK]\n{}\n\n# [REPORTING]\nWhen you finish this node, call loop_complete_node with node_id=\"{}\", status=\"pass\"|\"fail\", a concise summary, and your output.\nIf you are blocked and need human intervention, call loop_report_blocker with node_id=\"{}\" and the blocker description.\n",
+        lp.name,
         spec.name,
         node.name,
-        workflow.workdir,
+        lp.workdir,
         prompt,
         previous_feedback,
         node.id,
@@ -580,16 +580,16 @@ fn render_agent_prompt(
 }
 
 fn resolve_spec_start(
-    spec_details: &crate::domain::workflow::WorkflowSpecDetails,
-    spec: &WorkflowSpec,
-    existing_runs: &[WorkflowNodeRun],
+    spec_details: &crate::domain::loops::LoopSpecDetails,
+    spec: &LoopSpec,
+    existing_runs: &[LoopNodeRun],
 ) -> Result<(String, Option<Value>, HashMap<String, usize>)> {
     let mut iterations = HashMap::<String, usize>::new();
     for run in existing_runs {
         *iterations.entry(run.node_id.clone()).or_insert(0) += 1;
     }
 
-    if spec.status == WorkflowSpecStatus::Running {
+    if spec.status == LoopSpecStatus::Running {
         if let Some(last_run) = existing_runs.last() {
             return Ok((last_run.node_id.clone(), last_run.input.clone(), iterations));
         }
@@ -618,53 +618,53 @@ mod tests {
     use crate::application::notification_service::DefaultNotificationService;
     use tempfile::{tempdir, TempDir};
 
-    fn workflow_fixture() -> Result<(TempDir, Arc<Database>, WorkflowEngine, String, String)> {
+    fn loop_fixture() -> Result<(TempDir, Arc<Database>, LoopEngine, String, String)> {
         let dir = tempdir()?;
         let db = Arc::new(Database::new(&dir.path().join("test.db"))?);
-        let workflow = crate::domain::workflow::Workflow {
+        let lp = crate::domain::loops::Loop {
             id: "wf-test".to_string(),
-            name: "Workflow".to_string(),
+            name: "Loop".to_string(),
             description: None,
             workdir: dir.path().to_string_lossy().to_string(),
-            status: WorkflowStatus::Draft,
+            status: LoopStatus::Draft,
             created_at: chrono::Utc::now(),
             started_at: None,
             completed_at: None,
         };
-        let spec = crate::domain::workflow::WorkflowSpec {
+        let spec = crate::domain::loops::LoopSpec {
             id: "spec-test".to_string(),
-            workflow_id: workflow.id.clone(),
+            loop_id: lp.id.clone(),
             name: "Spec".to_string(),
             description: Some(
                 "Functional Requirements:\n- A\n\nNon-Functional Requirements:\n- B\n\nObjective:\n- C\n\nConstraints:\n- D\n\nGuidelines:\n- E\n\nIn Scope:\n- F\n\nOut of Scope:\n- G".to_string(),
             ),
             position: 1,
             parallelizable: false,
-            status: WorkflowSpecStatus::Pending,
+            status: LoopSpecStatus::Pending,
             started_at: None,
             completed_at: None,
         };
 
-        db.insert_workflow(&workflow)?;
-        db.insert_workflow_spec(&spec)?;
+        db.insert_loop(&lp)?;
+        db.insert_loop_spec(&spec)?;
 
         Ok((
             dir,
             Arc::clone(&db),
-            WorkflowEngine::new(db, Arc::new(DefaultNotificationService)),
-            workflow.id,
+            LoopEngine::new(db, Arc::new(DefaultNotificationService)),
+            lp.id,
             spec.id,
         ))
     }
 
     #[tokio::test]
-    async fn workflow_engine_completes_check_and_gate_spec() {
-        let (_dir, db, engine, workflow_id, spec_id) = workflow_fixture().unwrap();
-        let check = WorkflowNode {
+    async fn loop_engine_completes_check_and_gate_spec() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        let check = LoopNode {
             id: "node-check".to_string(),
             spec_id: spec_id.clone(),
             name: "check".to_string(),
-            kind: WorkflowNodeKind::Check,
+            kind: LoopNodeKind::Check,
             config: serde_json::json!({
                 "command": "printf APPROVED",
                 "success_condition": "exit_code_0"
@@ -672,11 +672,11 @@ mod tests {
             position: 1,
             created_at: chrono::Utc::now(),
         };
-        let gate = WorkflowNode {
+        let gate = LoopNode {
             id: "node-gate".to_string(),
             spec_id: spec_id.clone(),
             name: "gate".to_string(),
-            kind: WorkflowNodeKind::Gate,
+            kind: LoopNodeKind::Gate,
             config: serde_json::json!({
                 "evaluate": "output_contains",
                 "value": "APPROVED",
@@ -686,36 +686,36 @@ mod tests {
             created_at: chrono::Utc::now(),
         };
 
-        db.insert_workflow_node(&check).unwrap();
-        db.insert_workflow_node(&gate).unwrap();
-        db.insert_workflow_edge(&WorkflowEdge {
+        db.insert_loop_node(&check).unwrap();
+        db.insert_loop_node(&gate).unwrap();
+        db.insert_loop_edge(&LoopEdge {
             id: "edge-pass".to_string(),
             spec_id: spec_id.clone(),
             from_node: check.id.clone(),
             to_node: gate.id.clone(),
-            condition: crate::domain::workflow::WorkflowEdgeCondition::Pass,
+            condition: crate::domain::loops::LoopEdgeCondition::Pass,
         })
         .unwrap();
 
-        engine.run_workflow(workflow_id.clone()).await.unwrap();
+        engine.run_loop(loop_id.clone()).await.unwrap();
 
-        let workflow = db.get_workflow(&workflow_id).unwrap().unwrap();
-        let spec = db.get_workflow_spec(&spec_id).unwrap().unwrap();
-        let runs = db.list_workflow_runs_for_spec(&spec_id).unwrap();
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
 
-        assert_eq!(workflow.status, WorkflowStatus::Completed);
-        assert_eq!(spec.status, WorkflowSpecStatus::Completed);
+        assert_eq!(lp.status, LoopStatus::Completed);
+        assert_eq!(spec.status, LoopSpecStatus::Completed);
         assert_eq!(runs.len(), 2);
     }
 
     #[tokio::test]
-    async fn workflow_engine_fails_spec_when_check_fails_without_route() {
-        let (_dir, db, engine, workflow_id, spec_id) = workflow_fixture().unwrap();
-        db.insert_workflow_node(&WorkflowNode {
+    async fn loop_engine_fails_spec_when_check_fails_without_route() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        db.insert_loop_node(&LoopNode {
             id: "node-check".to_string(),
             spec_id: spec_id.clone(),
             name: "check".to_string(),
-            kind: WorkflowNodeKind::Check,
+            kind: LoopNodeKind::Check,
             config: serde_json::json!({
                 "command": "exit 1",
                 "success_condition": "exit_code_0"
@@ -725,47 +725,47 @@ mod tests {
         })
         .unwrap();
 
-        engine.run_workflow(workflow_id.clone()).await.unwrap();
+        engine.run_loop(loop_id.clone()).await.unwrap();
 
-        let workflow = db.get_workflow(&workflow_id).unwrap().unwrap();
-        let spec = db.get_workflow_spec(&spec_id).unwrap().unwrap();
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
 
-        assert_eq!(workflow.status, WorkflowStatus::Failed);
-        assert_eq!(spec.status, WorkflowSpecStatus::Failed);
+        assert_eq!(lp.status, LoopStatus::Failed);
+        assert_eq!(spec.status, LoopSpecStatus::Failed);
     }
 
     #[test]
     fn resolve_spec_start_retries_last_running_node() {
-        let spec = WorkflowSpec {
+        let spec = LoopSpec {
             id: "spec".to_string(),
-            workflow_id: "wf".to_string(),
+            loop_id: "wf".to_string(),
             name: "Spec".to_string(),
             description: None,
             position: 1,
             parallelizable: false,
-            status: WorkflowSpecStatus::Running,
+            status: LoopSpecStatus::Running,
             started_at: None,
             completed_at: None,
         };
-        let details = crate::domain::workflow::WorkflowSpecDetails {
+        let details = crate::domain::loops::LoopSpecDetails {
             spec: spec.clone(),
-            nodes: vec![WorkflowNode {
+            nodes: vec![LoopNode {
                 id: "node-1".to_string(),
                 spec_id: spec.id.clone(),
                 name: "Node".to_string(),
-                kind: WorkflowNodeKind::Check,
+                kind: LoopNodeKind::Check,
                 config: serde_json::json!({"command": "true"}),
                 position: 1,
                 created_at: chrono::Utc::now(),
             }],
             edges: vec![],
         };
-        let runs = vec![WorkflowNodeRun {
+        let runs = vec![LoopNodeRun {
             id: "run".to_string(),
-            workflow_id: "wf".to_string(),
+            loop_id: "wf".to_string(),
             spec_id: spec.id.clone(),
             node_id: "node-1".to_string(),
-            status: WorkflowRunStatus::Fail,
+            status: LoopRunStatus::Fail,
             input: Some(serde_json::json!({"previous": "context"})),
             output: None,
             started_at: chrono::Utc::now(),
@@ -786,47 +786,47 @@ mod tests {
 
     #[test]
     fn render_agent_prompt_includes_reporting_contract() {
-        let workflow = crate::domain::workflow::Workflow {
+        let lp = crate::domain::loops::Loop {
             id: "wf".to_string(),
-            name: "Workflow".to_string(),
+            name: "Loop".to_string(),
             description: None,
             workdir: "/tmp/project".to_string(),
-            status: WorkflowStatus::Draft,
+            status: LoopStatus::Draft,
             created_at: chrono::Utc::now(),
             started_at: None,
             completed_at: None,
         };
-        let spec = WorkflowSpec {
+        let spec = LoopSpec {
             id: "spec".to_string(),
-            workflow_id: "wf".to_string(),
+            loop_id: "wf".to_string(),
             name: "Spec".to_string(),
             description: Some("Do the thing".to_string()),
             position: 1,
             parallelizable: false,
-            status: WorkflowSpecStatus::Pending,
+            status: LoopSpecStatus::Pending,
             started_at: None,
             completed_at: None,
         };
-        let node = WorkflowNode {
+        let node = LoopNode {
             id: "node-1".to_string(),
             spec_id: "spec".to_string(),
             name: "Agent".to_string(),
-            kind: WorkflowNodeKind::Agent,
+            kind: LoopNodeKind::Agent,
             config: serde_json::json!({}),
             position: 1,
             created_at: chrono::Utc::now(),
         };
 
         let prompt = render_agent_prompt(
-            &workflow,
+            &lp,
             &spec,
             &node,
             "{{spec_content}}",
             Some(&serde_json::json!({"feedback":"ok"})),
         );
 
-        assert!(prompt.contains("workflow_complete_node"));
-        assert!(prompt.contains("workflow_report_blocker"));
+        assert!(prompt.contains("loop_complete_node"));
+        assert!(prompt.contains("loop_report_blocker"));
         assert!(prompt.contains("Do the thing"));
         assert!(prompt.contains("\"feedback\": \"ok\""));
     }

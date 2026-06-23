@@ -245,60 +245,60 @@ pub struct RagSearchParams {
     pub limit: Option<usize>,
 }
 
-// ── Workflow tool parameter types ────────────────────────────────────────
+// ── Loop tool parameter types ────────────────────────────────────────
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct WorkflowCreateParams {
-    /// Human-readable workflow name.
+pub struct LoopCreateParams {
+    /// Human-readable loop name.
     pub name: String,
-    /// Optional workflow description.
+    /// Optional loop description.
     pub description: Option<String>,
-    /// Absolute working directory for the workflow.
+    /// Absolute working directory for the loop.
     pub workdir: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct WorkflowUpdateParams {
-    /// Workflow ID.
-    pub workflow_id: String,
-    /// New human-readable workflow name.
+pub struct LoopUpdateParams {
+    /// Loop ID.
+    pub loop_id: String,
+    /// New human-readable loop name.
     pub name: Option<String>,
-    /// New workflow description, or null to clear.
+    /// New loop description, or null to clear.
     pub description: Option<Option<String>>,
-    /// New absolute workdir for the workflow.
+    /// New absolute workdir for the loop.
     pub workdir: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct WorkflowAddSpecParams {
-    /// Existing workflow ID.
-    pub workflow_id: String,
+pub struct LoopAddSpecParams {
+    /// Existing loop ID.
+    pub loop_id: String,
     /// Human-readable spec name.
     pub name: String,
     /// Optional spec description.
     pub description: Option<String>,
-    /// Execution order within the workflow.
+    /// Execution order within the loop.
     pub position: i64,
     /// Whether the spec is allowed to run in parallel in future engine phases.
     pub parallelizable: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct WorkflowUpdateSpecParams {
+pub struct LoopUpdateSpecParams {
     /// Existing spec ID.
     pub spec_id: String,
     /// New human-readable spec name.
     pub name: Option<String>,
     /// New spec description following the required template.
     pub description: Option<String>,
-    /// New execution order within the workflow.
+    /// New execution order within the loop.
     pub position: Option<i64>,
     /// Whether the spec is allowed to run in parallel.
     pub parallelizable: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct WorkflowAddNodeParams {
+pub struct LoopAddNodeParams {
     /// Existing spec ID.
     pub spec_id: String,
     /// Human-readable node name.
@@ -310,7 +310,7 @@ pub struct WorkflowAddNodeParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct WorkflowUpdateNodeParams {
+pub struct LoopUpdateNodeParams {
     /// Existing node ID.
     pub node_id: String,
     /// New human-readable node name.
@@ -324,7 +324,7 @@ pub struct WorkflowUpdateNodeParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct WorkflowAddEdgeParams {
+pub struct LoopAddEdgeParams {
     /// Existing spec ID.
     pub spec_id: String,
     /// Source node ID.
@@ -336,7 +336,7 @@ pub struct WorkflowAddEdgeParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct WorkflowUpdateEdgeParams {
+pub struct LoopUpdateEdgeParams {
     /// Existing edge ID.
     pub edge_id: String,
     /// New routing condition: pass, fail, or always.
@@ -344,40 +344,40 @@ pub struct WorkflowUpdateEdgeParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct WorkflowGetParams {
-    /// Workflow ID.
-    pub workflow_id: String,
+pub struct LoopGetParams {
+    /// Loop ID.
+    pub loop_id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct WorkflowListParams {
+pub struct LoopListParams {
     /// Optional absolute workdir filter.
     pub workdir: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct WorkflowRunParams {
-    /// Workflow ID.
-    pub workflow_id: String,
+pub struct LoopRunParams {
+    /// Loop ID.
+    pub loop_id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct WorkflowPauseParams {
-    /// Workflow ID.
-    pub workflow_id: String,
+pub struct LoopPauseParams {
+    /// Loop ID.
+    pub loop_id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct WorkflowContinueParams {
-    /// Workflow ID.
-    pub workflow_id: String,
+pub struct LoopContinueParams {
+    /// Loop ID.
+    pub loop_id: String,
     /// Continue mode: retry_current_node or skip_next_spec.
     pub action: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct WorkflowCompleteNodeParams {
-    /// Workflow node ID.
+pub struct LoopCompleteNodeParams {
+    /// Loop node ID.
     pub node_id: String,
     /// pass or fail.
     pub status: String,
@@ -388,8 +388,8 @@ pub struct WorkflowCompleteNodeParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct WorkflowReportBlockerParams {
-    /// Workflow node ID.
+pub struct LoopReportBlockerParams {
+    /// Loop node ID.
     pub node_id: String,
     /// Human-readable blocker description.
     pub description: String,

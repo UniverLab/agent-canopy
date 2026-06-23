@@ -51,10 +51,10 @@ use crate::db::Database;
 use crate::domain::models::{Agent, Trigger};
 use crate::domain::sync::{MessageKind, MissionImpact, WorkspaceStatus};
 use crate::domain::validation::validate_id;
-use crate::domain::workflow::{
-    validate_spec_description_template, Workflow, WorkflowDetails, WorkflowEdge,
-    WorkflowEdgeCondition, WorkflowNode, WorkflowNodeKind, WorkflowRunStatus, WorkflowSpec,
-    WorkflowSpecStatus, WorkflowStatus,
+use crate::domain::loops::{
+    validate_spec_description_template, Loop, LoopDetails, LoopEdge,
+    LoopEdgeCondition, LoopNode, LoopNodeKind, LoopRunStatus, LoopSpec,
+    LoopSpecStatus, LoopStatus,
 };
 use crate::executor::Executor;
 use crate::rag::rate_limiter::RateLimiter;
@@ -64,7 +64,7 @@ use crate::shared::sync_identity::{
 };
 use crate::sync_manager::SyncManager;
 use crate::watchers::WatcherEngine;
-use crate::workflow_engine::WorkflowEngine;
+use crate::loop_engine::LoopEngine;
 
 const MISSING_SYNC_IDENTITY_MESSAGE: &str =
     "Missing Canopy session identity. Launch via `canopy bridge --id <AGENT_ID>` so requests include Canopy identity headers.";
@@ -84,54 +84,54 @@ fn validate_non_empty(value: &str, field: &str) -> Result<(), String> {
 fn validate_absolute_dir(path: &str) -> Result<(), String> {
     let p = std::path::Path::new(path);
     if !p.is_absolute() {
-        return Err("Workflow workdir must be an absolute path.".into());
+        return Err("Loop workdir must be an absolute path.".into());
     }
     if !p.is_dir() {
-        return Err("Workflow workdir must point to an existing directory.".into());
+        return Err("Loop workdir must point to an existing directory.".into());
     }
     Ok(())
 }
 
-fn validate_workflow_exists(db: &Database, workflow_id: &str) -> Result<(), String> {
-    db.get_workflow(workflow_id)
+fn validate_loop_exists(db: &Database, loop_id: &str) -> Result<(), String> {
+    db.get_loop(loop_id)
         .map_err(|e| e.to_string())?
         .is_some()
         .then_some(())
-        .ok_or_else(|| format!("Workflow '{workflow_id}' not found."))
+        .ok_or_else(|| format!("Loop '{loop_id}' not found."))
 }
 
-fn validate_spec_exists(db: &Database, spec_id: &str) -> Result<WorkflowSpec, String> {
-    db.get_workflow_spec(spec_id)
+fn validate_spec_exists(db: &Database, spec_id: &str) -> Result<LoopSpec, String> {
+    db.get_loop_spec(spec_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Spec '{spec_id}' not found."))
 }
 
-fn validate_node_exists(db: &Database, node_id: &str) -> Result<WorkflowNode, String> {
-    db.get_workflow_node(node_id)
+fn validate_node_exists(db: &Database, node_id: &str) -> Result<LoopNode, String> {
+    db.get_loop_node(node_id)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Workflow node '{node_id}' not found."))
+        .ok_or_else(|| format!("Loop node '{node_id}' not found."))
 }
 
-fn validate_edge_exists(db: &Database, edge_id: &str) -> Result<WorkflowEdge, String> {
-    db.get_workflow_edge(edge_id)
+fn validate_edge_exists(db: &Database, edge_id: &str) -> Result<LoopEdge, String> {
+    db.get_loop_edge(edge_id)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Workflow edge '{edge_id}' not found."))
+        .ok_or_else(|| format!("Loop edge '{edge_id}' not found."))
 }
 
 fn validate_position_conflict(
     db: &Database,
-    workflow_id: &str,
+    loop_id: &str,
     exclude_spec_id: &str,
     position: i64,
 ) -> Result<(), String> {
     let conflict = db
-        .list_workflow_specs(workflow_id)
+        .list_loop_specs(loop_id)
         .map_err(|e| e.to_string())?
         .into_iter()
         .any(|s| s.id != exclude_spec_id && s.position == position);
     if conflict {
         Err(format!(
-            "Workflow '{workflow_id}' already has a spec at position {position}."
+            "Loop '{loop_id}' already has a spec at position {position}."
         ))
     } else {
         Ok(())
@@ -145,7 +145,7 @@ fn validate_node_position_conflict(
     position: i64,
 ) -> Result<(), String> {
     let conflict = db
-        .list_workflow_nodes(spec_id)
+        .list_loop_nodes(spec_id)
         .map_err(|e| e.to_string())?
         .into_iter()
         .any(|n| n.id != exclude_node_id && n.position == position);
@@ -158,14 +158,14 @@ fn validate_node_position_conflict(
     }
 }
 
-fn validate_edge_condition(condition: &str) -> Result<WorkflowEdgeCondition, String> {
-    WorkflowEdgeCondition::from_str(condition.trim())
-        .ok_or_else(|| "Workflow edge condition must be one of: pass, fail, always.".to_string())
+fn validate_edge_condition(condition: &str) -> Result<LoopEdgeCondition, String> {
+    LoopEdgeCondition::from_str(condition.trim())
+        .ok_or_else(|| "Loop edge condition must be one of: pass, fail, always.".to_string())
 }
 
-fn validate_node_kind(kind: &str) -> Result<WorkflowNodeKind, String> {
-    WorkflowNodeKind::from_str(kind.trim())
-        .ok_or_else(|| "Workflow node kind must be one of: agent, check, gate.".to_string())
+fn validate_node_kind(kind: &str) -> Result<LoopNodeKind, String> {
+    LoopNodeKind::from_str(kind.trim())
+        .ok_or_else(|| "Loop node kind must be one of: agent, check, gate.".to_string())
 }
 
 fn validate_at_least_one_bool(updates: &[bool], field_name: &str) -> Result<(), String> {
@@ -178,16 +178,16 @@ fn validate_at_least_one_bool(updates: &[bool], field_name: &str) -> Result<(), 
     }
 }
 
-fn build_workflow_update_response(workflow_id: &str) -> CallToolResult {
-    success_result(&format!("Workflow '{workflow_id}' updated."))
+fn build_loop_update_response(loop_id: &str) -> CallToolResult {
+    success_result(&format!("Loop '{loop_id}' updated."))
 }
 
 fn build_spec_update_response(spec_id: &str) -> CallToolResult {
-    success_result(&format!("Workflow spec '{spec_id}' updated."))
+    success_result(&format!("Loop spec '{spec_id}' updated."))
 }
 
 fn build_node_update_response(node_id: &str) -> CallToolResult {
-    success_result(&format!("Workflow node '{node_id}' updated."))
+    success_result(&format!("Loop node '{node_id}' updated."))
 }
 
 fn build_id_result(id: &str, key: &str) -> CallToolResult {
@@ -204,17 +204,17 @@ struct SpecRunInfo {
     blocker: Option<String>,
 }
 
-fn build_spec_run_info(db: &Database, spec: &WorkflowSpec) -> Result<SpecRunInfo, McpError> {
+fn build_spec_run_info(db: &Database, spec: &LoopSpec) -> Result<SpecRunInfo, McpError> {
     let runs = db
-        .list_workflow_runs_for_spec(&spec.id)
+        .list_loop_runs_for_spec(&spec.id)
         .map_err(internal_error)?;
     let current_node = runs
         .iter()
         .rev()
-        .find(|run| run.status == WorkflowRunStatus::Running)
+        .find(|run| run.status == LoopRunStatus::Running)
         .or_else(|| runs.last())
         .map(|run| run.node_id.clone());
-    let blocker = runs.last().and_then(workflow_run_blocker);
+    let blocker = runs.last().and_then(loop_run_blocker);
     Ok(SpecRunInfo {
         name: spec.name.clone(),
         current_node,
@@ -222,44 +222,44 @@ fn build_spec_run_info(db: &Database, spec: &WorkflowSpec) -> Result<SpecRunInfo
     })
 }
 
-fn build_workflow_summary_json(
+fn build_loop_summary_json(
     db: &Database,
-    workflow: &Workflow,
+    lp: &Loop,
 ) -> Result<serde_json::Value, McpError> {
     let specs = db
-        .list_workflow_specs(&workflow.id)
+        .list_loop_specs(&lp.id)
         .map_err(internal_error)?;
     let current_spec = specs
         .into_iter()
         .find(|spec| {
             matches!(
                 spec.status,
-                WorkflowSpecStatus::Running | WorkflowSpecStatus::Pending
+                LoopSpecStatus::Running | LoopSpecStatus::Pending
             )
         })
         .map(|spec| build_spec_run_info(db, &spec))
         .transpose()?;
 
     Ok(serde_json::json!({
-        "id": workflow.id,
-        "name": workflow.name,
-        "status": workflow.status.as_str(),
+        "id": lp.id,
+        "name": lp.name,
+        "status": lp.status.as_str(),
         "current_spec": current_spec.as_ref().map(|v| &v.name),
         "current_node": current_spec.as_ref().and_then(|v| v.current_node.as_ref()),
         "blocked": current_spec.as_ref().is_some_and(|v| v.blocker.is_some()),
         "blocker": current_spec.and_then(|v| v.blocker),
-        "created_at": workflow.created_at.to_rfc3339(),
-        "workdir": workflow.workdir,
+        "created_at": lp.created_at.to_rfc3339(),
+        "workdir": lp.workdir,
     }))
 }
 
-fn build_workflow_list_json(
+fn build_loop_list_json(
     db: &Database,
-    workflows: &[Workflow],
+    loops: &[Loop],
 ) -> Result<Vec<serde_json::Value>, McpError> {
-    workflows
+    loops
         .iter()
-        .map(|workflow| build_workflow_summary_json(db, workflow))
+        .map(|lp| build_loop_summary_json(db, lp))
         .collect()
 }
 
@@ -360,7 +360,7 @@ pub struct TaskTriggerHandler {
     pub executor: Arc<Executor>,
     pub watcher_engine: Arc<WatcherEngine>,
     pub scheduler_notify: Arc<Notify>,
-    pub workflow_engine: Arc<WorkflowEngine>,
+    pub loop_engine: Arc<LoopEngine>,
     pub notification_service: Arc<dyn NotificationService>,
     pub sync_manager: Arc<SyncManager>,
     /// Rate limiters for rag_search (10 calls/min). Keyed by agent_id.
@@ -455,7 +455,7 @@ impl TaskTriggerHandler {
         executor: Arc<Executor>,
         watcher_engine: Arc<WatcherEngine>,
         scheduler_notify: Arc<Notify>,
-        workflow_engine: Arc<WorkflowEngine>,
+        loop_engine: Arc<LoopEngine>,
         notification_service: Arc<dyn NotificationService>,
         sync_manager: Arc<SyncManager>,
         port: u16,
@@ -465,7 +465,7 @@ impl TaskTriggerHandler {
             executor,
             watcher_engine,
             scheduler_notify,
-            workflow_engine,
+            loop_engine,
             notification_service,
             sync_manager,
             rag_limiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -1550,62 +1550,62 @@ impl TaskTriggerHandler {
     }
 
     #[tool(
-        name = "workflow_create",
-        description = "Create a workflow container for a background graph of specs and nodes."
+        name = "loop_create",
+        description = "Create a loop container for a background graph of specs and nodes."
     )]
-    async fn workflow_create(
+    async fn loop_create(
         &self,
-        Parameters(params): Parameters<WorkflowCreateParams>,
+        Parameters(params): Parameters<LoopCreateParams>,
     ) -> Result<CallToolResult, McpError> {
         let name = params.name.trim();
-        if let Err(e) = validate_non_empty(name, "Workflow name") {
+        if let Err(e) = validate_non_empty(name, "Loop name") {
             return Ok(error_result(&e));
         }
         let workdir = params.workdir.trim();
-        if let Err(e) = validate_non_empty(workdir, "Workflow workdir") {
+        if let Err(e) = validate_non_empty(workdir, "Loop workdir") {
             return Ok(error_result(&e));
         }
         if let Err(e) = validate_absolute_dir(workdir) {
             return Ok(error_result(&e));
         }
 
-        let workflow = Workflow {
+        let lp = Loop {
             id: uuid::Uuid::new_v4().to_string(),
             name: name.to_string(),
             description: params.description.filter(|value| !value.trim().is_empty()),
             workdir: workdir.to_string(),
-            status: WorkflowStatus::Draft,
+            status: LoopStatus::Draft,
             created_at: chrono::Utc::now(),
             started_at: None,
             completed_at: None,
         };
 
-        self.db.insert_workflow(&workflow).map_err(internal_error)?;
+        self.db.insert_loop(&lp).map_err(internal_error)?;
         if let Err(error) = self.db.register_project_path(std::path::Path::new(workdir)) {
-            tracing::debug!("Could not register workflow project at {workdir}: {error}");
+            tracing::debug!("Could not register loop project at {workdir}: {error}");
         }
 
-        Ok(build_id_result(&workflow.id, "workflow_id"))
+        Ok(build_id_result(&lp.id, "loop_id"))
     }
 
     #[tool(
-        name = "workflow_update",
-        description = "Update workflow metadata such as name, description, or workdir."
+        name = "loop_update",
+        description = "Update loop metadata such as name, description, or workdir."
     )]
-    async fn workflow_update(
+    async fn loop_update(
         &self,
-        Parameters(params): Parameters<WorkflowUpdateParams>,
+        Parameters(params): Parameters<LoopUpdateParams>,
     ) -> Result<CallToolResult, McpError> {
-        let workflow_id = params.workflow_id.trim();
-        if let Err(e) = validate_non_empty(workflow_id, "Workflow ID") {
+        let loop_id = params.loop_id.trim();
+        if let Err(e) = validate_non_empty(loop_id, "Loop ID") {
             return Ok(error_result(&e));
         }
-        if let Err(e) = validate_workflow_exists(&self.db, workflow_id) {
+        if let Err(e) = validate_loop_exists(&self.db, loop_id) {
             return Ok(error_result(&e));
         }
 
         let name = match params.name.as_deref().map(str::trim) {
-            Some("") => return Ok(error_result("Workflow name must not be empty.")),
+            Some("") => return Ok(error_result("Loop name must not be empty.")),
             Some(value) => Some(value),
             None => None,
         };
@@ -1616,7 +1616,7 @@ impl TaskTriggerHandler {
                 .filter(|description| !description.is_empty())
         });
         let workdir = match params.workdir.as_deref().map(str::trim) {
-            Some("") => return Ok(error_result("Workflow workdir must not be empty.")),
+            Some("") => return Ok(error_result("Loop workdir must not be empty.")),
             Some(value) => {
                 if let Err(e) = validate_absolute_dir(value) {
                     return Ok(error_result(&e));
@@ -1628,82 +1628,82 @@ impl TaskTriggerHandler {
 
         if let Err(e) = validate_at_least_one_bool(
             &[name.is_some(), description.is_some(), workdir.is_some()],
-            "workflow_update",
+            "loop_update",
         ) {
             return Ok(error_result(&e));
         }
 
         self.db
-            .update_workflow_details(workflow_id, name, description, workdir)
+            .update_loop_details(loop_id, name, description, workdir)
             .map_err(internal_error)?;
 
-        Ok(build_workflow_update_response(workflow_id))
+        Ok(build_loop_update_response(loop_id))
     }
 
     #[tool(
-        name = "workflow_add_spec",
-        description = "Add an ordered spec to an existing workflow."
+        name = "loop_add_spec",
+        description = "Add an ordered spec to an existing loop."
     )]
-    async fn workflow_add_spec(
+    async fn loop_add_spec(
         &self,
-        Parameters(params): Parameters<WorkflowAddSpecParams>,
+        Parameters(params): Parameters<LoopAddSpecParams>,
     ) -> Result<CallToolResult, McpError> {
         let name = params.name.trim();
-        if let Err(e) = validate_non_empty(name, "Workflow spec name") {
+        if let Err(e) = validate_non_empty(name, "Loop spec name") {
             return Ok(error_result(&e));
         }
-        let workflow_id = params.workflow_id.trim();
-        if let Err(e) = validate_workflow_exists(&self.db, workflow_id) {
+        let loop_id = params.loop_id.trim();
+        if let Err(e) = validate_loop_exists(&self.db, loop_id) {
             return Ok(error_result(&e));
         }
 
         let existing_specs = self
             .db
-            .list_workflow_specs(workflow_id)
+            .list_loop_specs(loop_id)
             .map_err(internal_error)?;
         if existing_specs
             .iter()
             .any(|spec| spec.position == params.position)
         {
             return Ok(error_result(&format!(
-                "Workflow '{workflow_id}' already has a spec at position {}.",
+                "Loop '{loop_id}' already has a spec at position {}.",
                 params.position
             )));
         }
         let Some(description) = params.description.as_deref().map(str::trim) else {
             return Ok(error_result(
-                "Workflow spec description is required and must follow the minimum template.",
+                "Loop spec description is required and must follow the minimum template.",
             ));
         };
         if let Err(error) = validate_spec_description_template(description) {
             return Ok(error_result(&error));
         }
 
-        let spec = WorkflowSpec {
+        let spec = LoopSpec {
             id: uuid::Uuid::new_v4().to_string(),
-            workflow_id: workflow_id.to_string(),
+            loop_id: loop_id.to_string(),
             name: name.to_string(),
             description: Some(description.to_string()),
             position: params.position,
             parallelizable: params.parallelizable,
-            status: WorkflowSpecStatus::Pending,
+            status: LoopSpecStatus::Pending,
             started_at: None,
             completed_at: None,
         };
         self.db
-            .insert_workflow_spec(&spec)
+            .insert_loop_spec(&spec)
             .map_err(internal_error)?;
 
         Ok(build_id_result(&spec.id, "spec_id"))
     }
 
     #[tool(
-        name = "workflow_update_spec",
-        description = "Update an existing workflow spec."
+        name = "loop_update_spec",
+        description = "Update an existing loop spec."
     )]
-    async fn workflow_update_spec(
+    async fn loop_update_spec(
         &self,
-        Parameters(params): Parameters<WorkflowUpdateSpecParams>,
+        Parameters(params): Parameters<LoopUpdateSpecParams>,
     ) -> Result<CallToolResult, McpError> {
         let spec_id = params.spec_id.trim();
         let spec = match validate_spec_exists(&self.db, spec_id) {
@@ -1712,14 +1712,14 @@ impl TaskTriggerHandler {
         };
 
         let name = match params.name.as_deref().map(str::trim) {
-            Some("") => return Ok(error_result("Workflow spec name must not be empty.")),
+            Some("") => return Ok(error_result("Loop spec name must not be empty.")),
             Some(value) => Some(value),
             None => None,
         };
         let description = match params.description.as_deref().map(str::trim) {
             Some("") => {
                 return Ok(error_result(
-                    "Workflow spec description must not be empty and must follow the template.",
+                    "Loop spec description must not be empty and must follow the template.",
                 ))
             }
             Some(value) => {
@@ -1733,7 +1733,7 @@ impl TaskTriggerHandler {
 
         if let Some(position) = params.position {
             if let Err(e) =
-                validate_position_conflict(&self.db, &spec.workflow_id, spec_id, position)
+                validate_position_conflict(&self.db, &spec.loop_id, spec_id, position)
             {
                 return Ok(error_result(&e));
             }
@@ -1746,13 +1746,13 @@ impl TaskTriggerHandler {
                 params.position.is_some(),
                 params.parallelizable.is_some(),
             ],
-            "workflow_update_spec",
+            "loop_update_spec",
         ) {
             return Ok(error_result(&e));
         }
 
         self.db
-            .update_workflow_spec_details(
+            .update_loop_spec_details(
                 spec_id,
                 name,
                 description,
@@ -1765,15 +1765,15 @@ impl TaskTriggerHandler {
     }
 
     #[tool(
-        name = "workflow_add_node",
-        description = "Add a graph node to an existing workflow spec."
+        name = "loop_add_node",
+        description = "Add a graph node to an existing loop spec."
     )]
-    async fn workflow_add_node(
+    async fn loop_add_node(
         &self,
-        Parameters(params): Parameters<WorkflowAddNodeParams>,
+        Parameters(params): Parameters<LoopAddNodeParams>,
     ) -> Result<CallToolResult, McpError> {
         let name = params.name.trim();
-        if let Err(e) = validate_non_empty(name, "Workflow node name") {
+        if let Err(e) = validate_non_empty(name, "Loop node name") {
             return Ok(error_result(&e));
         }
         let spec_id = params.spec_id.trim();
@@ -1788,13 +1788,13 @@ impl TaskTriggerHandler {
 
         let next_position = self
             .db
-            .list_workflow_nodes(spec_id)
+            .list_loop_nodes(spec_id)
             .map_err(internal_error)?
             .last()
             .map(|node| node.position + 1)
             .unwrap_or(1);
 
-        let node = WorkflowNode {
+        let node = LoopNode {
             id: uuid::Uuid::new_v4().to_string(),
             spec_id: spec_id.to_string(),
             name: name.to_string(),
@@ -1804,19 +1804,19 @@ impl TaskTriggerHandler {
             created_at: chrono::Utc::now(),
         };
         self.db
-            .insert_workflow_node(&node)
+            .insert_loop_node(&node)
             .map_err(internal_error)?;
 
         Ok(build_id_result(&node.id, "node_id"))
     }
 
     #[tool(
-        name = "workflow_update_node",
-        description = "Update an existing workflow node."
+        name = "loop_update_node",
+        description = "Update an existing loop node."
     )]
-    async fn workflow_update_node(
+    async fn loop_update_node(
         &self,
-        Parameters(params): Parameters<WorkflowUpdateNodeParams>,
+        Parameters(params): Parameters<LoopUpdateNodeParams>,
     ) -> Result<CallToolResult, McpError> {
         let node_id = params.node_id.trim();
         let node = match validate_node_exists(&self.db, node_id) {
@@ -1825,12 +1825,12 @@ impl TaskTriggerHandler {
         };
 
         let name = match params.name.as_deref().map(str::trim) {
-            Some("") => return Ok(error_result("Workflow node name must not be empty.")),
+            Some("") => return Ok(error_result("Loop node name must not be empty.")),
             Some(value) => Some(value),
             None => None,
         };
         let kind = match params.kind.as_deref().map(str::trim) {
-            Some("") => return Ok(error_result("Workflow node kind must not be empty.")),
+            Some("") => return Ok(error_result("Loop node kind must not be empty.")),
             Some(value) => match validate_node_kind(value) {
                 Ok(kind) => Some(kind),
                 Err(e) => return Ok(error_result(&e)),
@@ -1853,13 +1853,13 @@ impl TaskTriggerHandler {
                 params.config.is_some(),
                 params.position.is_some(),
             ],
-            "workflow_update_node",
+            "loop_update_node",
         ) {
             return Ok(error_result(&e));
         }
 
         self.db
-            .update_workflow_node_details(
+            .update_loop_node_details(
                 node_id,
                 name,
                 kind,
@@ -1872,12 +1872,12 @@ impl TaskTriggerHandler {
     }
 
     #[tool(
-        name = "workflow_add_edge",
-        description = "Connect two nodes inside a workflow spec with a routing condition."
+        name = "loop_add_edge",
+        description = "Connect two nodes inside a loop spec with a routing condition."
     )]
-    async fn workflow_add_edge(
+    async fn loop_add_edge(
         &self,
-        Parameters(params): Parameters<WorkflowAddEdgeParams>,
+        Parameters(params): Parameters<LoopAddEdgeParams>,
     ) -> Result<CallToolResult, McpError> {
         let condition = match validate_edge_condition(params.condition.trim()) {
             Ok(c) => c,
@@ -1886,7 +1886,7 @@ impl TaskTriggerHandler {
 
         let nodes = self
             .db
-            .list_workflow_nodes(&params.spec_id)
+            .list_loop_nodes(&params.spec_id)
             .map_err(internal_error)?;
         if nodes.is_empty() {
             return Ok(error_result(&format!(
@@ -1898,11 +1898,11 @@ impl TaskTriggerHandler {
         let has_to = nodes.iter().any(|node| node.id == params.to_node);
         if !has_from || !has_to {
             return Ok(error_result(
-                "Both workflow edge endpoints must belong to the provided spec.",
+                "Both loop edge endpoints must belong to the provided spec.",
             ));
         }
 
-        let edge = WorkflowEdge {
+        let edge = LoopEdge {
             id: uuid::Uuid::new_v4().to_string(),
             spec_id: params.spec_id,
             from_node: params.from_node,
@@ -1910,7 +1910,7 @@ impl TaskTriggerHandler {
             condition,
         };
         self.db
-            .insert_workflow_edge(&edge)
+            .insert_loop_edge(&edge)
             .map_err(internal_error)?;
 
         Ok(CallToolResult::success(vec![Content::text(
@@ -1919,12 +1919,12 @@ impl TaskTriggerHandler {
     }
 
     #[tool(
-        name = "workflow_update_edge",
-        description = "Update the routing condition of an existing workflow edge."
+        name = "loop_update_edge",
+        description = "Update the routing condition of an existing loop edge."
     )]
-    async fn workflow_update_edge(
+    async fn loop_update_edge(
         &self,
-        Parameters(params): Parameters<WorkflowUpdateEdgeParams>,
+        Parameters(params): Parameters<LoopUpdateEdgeParams>,
     ) -> Result<CallToolResult, McpError> {
         let edge = match validate_edge_exists(&self.db, params.edge_id.trim()) {
             Ok(e) => e,
@@ -1937,36 +1937,36 @@ impl TaskTriggerHandler {
 
         if edge.condition == condition {
             return Ok(success_result(&format!(
-                "Workflow edge '{}' already uses condition '{}'.",
+                "Loop edge '{}' already uses condition '{}'.",
                 edge.id,
                 condition.as_str()
             )));
         }
 
         self.db
-            .update_workflow_edge_condition(&edge.id, condition)
+            .update_loop_edge_condition(&edge.id, condition)
             .map_err(internal_error)?;
 
         Ok(success_result(&format!(
-            "Workflow edge '{}' updated.",
+            "Loop edge '{}' updated.",
             edge.id
         )))
     }
 
     #[tool(
-        name = "workflow_get",
-        description = "Return a workflow with its ordered specs, nodes, and edges."
+        name = "loop_get",
+        description = "Return a loop with its ordered specs, nodes, and edges."
     )]
-    async fn workflow_get(
+    async fn loop_get(
         &self,
-        Parameters(params): Parameters<WorkflowGetParams>,
+        Parameters(params): Parameters<LoopGetParams>,
     ) -> Result<CallToolResult, McpError> {
-        let workflow = match self.db.get_workflow_details(&params.workflow_id) {
+        let lp = match self.db.get_loop_details(&params.loop_id) {
             Ok(Some(w)) => w,
             Ok(None) => {
                 return Ok(error_result(&format!(
-                    "Workflow '{}' not found.",
-                    params.workflow_id
+                    "Loop '{}' not found.",
+                    params.loop_id
                 )))
             }
             Err(e) => return Err(internal_error(e.to_string())),
@@ -1974,26 +1974,26 @@ impl TaskTriggerHandler {
 
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(
-                &workflow_details_json(&self.db, &workflow).map_err(internal_error)?,
+                &loop_details_json(&self.db, &lp).map_err(internal_error)?,
             )
             .unwrap_or_default(),
         )]))
     }
 
     #[tool(
-        name = "workflow_list",
-        description = "List workflows, optionally filtered by workdir."
+        name = "loop_list",
+        description = "List loops, optionally filtered by workdir."
     )]
-    async fn workflow_list(
+    async fn loop_list(
         &self,
-        Parameters(params): Parameters<WorkflowListParams>,
+        Parameters(params): Parameters<LoopListParams>,
     ) -> Result<CallToolResult, McpError> {
-        let workflows = self
+        let loops = self
             .db
-            .list_workflows(params.workdir.as_deref())
+            .list_loops(params.workdir.as_deref())
             .map_err(internal_error)?;
 
-        let out = build_workflow_list_json(&self.db, &workflows)?;
+        let out = build_loop_list_json(&self.db, &loops)?;
 
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&out).unwrap_or_default(),
@@ -2001,140 +2001,140 @@ impl TaskTriggerHandler {
     }
 
     #[tool(
-        name = "workflow_run",
-        description = "Run a workflow in the background, spec by spec."
+        name = "loop_run",
+        description = "Run a loop in the background, spec by spec."
     )]
-    async fn workflow_run(
+    async fn loop_run(
         &self,
-        Parameters(params): Parameters<WorkflowRunParams>,
+        Parameters(params): Parameters<LoopRunParams>,
     ) -> Result<CallToolResult, McpError> {
-        let workflow = match self.db.get_workflow(&params.workflow_id) {
+        let lp = match self.db.get_loop(&params.loop_id) {
             Ok(Some(w)) => w,
             Ok(None) => {
                 return Ok(error_result(&format!(
-                    "Workflow '{}' not found.",
-                    params.workflow_id
+                    "Loop '{}' not found.",
+                    params.loop_id
                 )))
             }
             Err(e) => return Err(internal_error(e.to_string())),
         };
 
-        if workflow.status == WorkflowStatus::Running {
+        if lp.status == LoopStatus::Running {
             return Ok(error_result(&format!(
-                "Workflow '{}' is already running.",
-                params.workflow_id
+                "Loop '{}' is already running.",
+                params.loop_id
             )));
         }
         if matches!(
-            workflow.status,
-            WorkflowStatus::Completed | WorkflowStatus::Failed
+            lp.status,
+            LoopStatus::Completed | LoopStatus::Failed
         ) {
             return Ok(error_result(
-                "Completed or failed workflows cannot be resumed yet.",
+                "Completed or failed loops cannot be resumed yet.",
             ));
         }
 
-        Arc::clone(&self.workflow_engine).start_background(params.workflow_id.clone());
+        Arc::clone(&self.loop_engine).start_background(params.loop_id.clone());
         Ok(success_result(&format!(
-            "Workflow '{}' launched in background.",
-            params.workflow_id
+            "Loop '{}' launched in background.",
+            params.loop_id
         )))
     }
 
     #[tool(
-        name = "workflow_pause",
-        description = "Pause a running workflow after the current node finishes."
+        name = "loop_pause",
+        description = "Pause a running loop after the current node finishes."
     )]
-    async fn workflow_pause(
+    async fn loop_pause(
         &self,
-        Parameters(params): Parameters<WorkflowPauseParams>,
+        Parameters(params): Parameters<LoopPauseParams>,
     ) -> Result<CallToolResult, McpError> {
         let paused = self
-            .workflow_engine
-            .request_pause(&params.workflow_id)
+            .loop_engine
+            .request_pause(&params.loop_id)
             .map_err(internal_error)?;
         if paused {
             Ok(success_result(&format!(
-                "Workflow '{}' marked to pause.",
-                params.workflow_id
+                "Loop '{}' marked to pause.",
+                params.loop_id
             )))
         } else {
             Ok(error_result(&format!(
-                "Workflow '{}' is not running or does not exist.",
-                params.workflow_id
+                "Loop '{}' is not running or does not exist.",
+                params.loop_id
             )))
         }
     }
 
     #[tool(
-        name = "workflow_continue",
-        description = "Continue a paused workflow by retrying the current node or skipping to the next spec."
+        name = "loop_continue",
+        description = "Continue a paused loop by retrying the current node or skipping to the next spec."
     )]
-    async fn workflow_continue(
+    async fn loop_continue(
         &self,
-        Parameters(params): Parameters<WorkflowContinueParams>,
+        Parameters(params): Parameters<LoopContinueParams>,
     ) -> Result<CallToolResult, McpError> {
-        let workflow = match self.db.get_workflow(&params.workflow_id) {
+        let lp = match self.db.get_loop(&params.loop_id) {
             Ok(Some(w)) => w,
             Ok(None) => {
                 return Ok(error_result(&format!(
-                    "Workflow '{}' not found.",
-                    params.workflow_id
+                    "Loop '{}' not found.",
+                    params.loop_id
                 )))
             }
             Err(e) => return Err(internal_error(e.to_string())),
         };
-        if workflow.status != WorkflowStatus::Paused {
+        if lp.status != LoopStatus::Paused {
             return Ok(error_result(&format!(
-                "Workflow '{}' is not paused.",
-                params.workflow_id
+                "Loop '{}' is not paused.",
+                params.loop_id
             )));
         }
 
         match params.action.trim() {
             "retry_current_node" => {}
-            "skip_next_spec" => self.handle_skip_next_spec(&params.workflow_id)?,
+            "skip_next_spec" => self.handle_skip_next_spec(&params.loop_id)?,
             _ => {
                 return Ok(error_result(
-                    "workflow_continue action must be retry_current_node or skip_next_spec.",
+                    "loop_continue action must be retry_current_node or skip_next_spec.",
                 ));
             }
         }
 
         self.db
-            .update_workflow_status(&params.workflow_id, WorkflowStatus::Running, None, None)
+            .update_loop_status(&params.loop_id, LoopStatus::Running, None, None)
             .map_err(internal_error)?;
-        Arc::clone(&self.workflow_engine).start_background(params.workflow_id.clone());
+        Arc::clone(&self.loop_engine).start_background(params.loop_id.clone());
 
         Ok(success_result(&format!(
-            "Workflow '{}' resumed with action '{}'.",
-            params.workflow_id, params.action
+            "Loop '{}' resumed with action '{}'.",
+            params.loop_id, params.action
         )))
     }
 
     #[tool(
-        name = "workflow_complete_node",
-        description = "Mark the active run for a workflow node as pass or fail and attach its output."
+        name = "loop_complete_node",
+        description = "Mark the active run for a loop node as pass or fail and attach its output."
     )]
-    async fn workflow_complete_node(
+    async fn loop_complete_node(
         &self,
-        Parameters(params): Parameters<WorkflowCompleteNodeParams>,
+        Parameters(params): Parameters<LoopCompleteNodeParams>,
     ) -> Result<CallToolResult, McpError> {
         let status = match params.status.trim() {
-            "pass" => Some(WorkflowRunStatus::Pass),
-            "fail" => Some(WorkflowRunStatus::Fail),
+            "pass" => Some(LoopRunStatus::Pass),
+            "fail" => Some(LoopRunStatus::Fail),
             _ => None,
         };
         let Some(status) = status else {
             return Ok(error_result(
-                "workflow_complete_node status must be pass or fail.",
+                "loop_complete_node status must be pass or fail.",
             ));
         };
-        let run = match self.db.get_active_workflow_run_for_node(&params.node_id) {
+        let run = match self.db.get_active_loop_run_for_node(&params.node_id) {
             Ok(Some(r)) => r,
             Ok(None) => {
                 return Ok(error_result(&format!(
-                    "No active workflow run found for node '{}'.",
+                    "No active loop run found for node '{}'.",
                     params.node_id
                 )))
             }
@@ -2142,7 +2142,7 @@ impl TaskTriggerHandler {
         };
 
         self.db
-            .update_workflow_run_result(
+            .update_loop_run_result(
                 &run.id,
                 status,
                 Some(&serde_json::json!({
@@ -2153,22 +2153,22 @@ impl TaskTriggerHandler {
             )
             .map_err(internal_error)?;
 
-        Ok(success_result("Workflow node result recorded."))
+        Ok(success_result("Loop node result recorded."))
     }
 
     #[tool(
-        name = "workflow_report_blocker",
-        description = "Pause a workflow because the active node is blocked and needs human intervention."
+        name = "loop_report_blocker",
+        description = "Pause a loop because the active node is blocked and needs human intervention."
     )]
-    async fn workflow_report_blocker(
+    async fn loop_report_blocker(
         &self,
-        Parameters(params): Parameters<WorkflowReportBlockerParams>,
+        Parameters(params): Parameters<LoopReportBlockerParams>,
     ) -> Result<CallToolResult, McpError> {
-        let run = match self.db.get_active_workflow_run_for_node(&params.node_id) {
+        let run = match self.db.get_active_loop_run_for_node(&params.node_id) {
             Ok(Some(r)) => r,
             Ok(None) => {
                 return Ok(error_result(&format!(
-                    "No active workflow run found for node '{}'.",
+                    "No active loop run found for node '{}'.",
                     params.node_id
                 )))
             }
@@ -2176,9 +2176,9 @@ impl TaskTriggerHandler {
         };
 
         self.db
-            .update_workflow_run_result(
+            .update_loop_run_result(
                 &run.id,
-                WorkflowRunStatus::Fail,
+                LoopRunStatus::Fail,
                 Some(&serde_json::json!({
                     "blocker": params.description,
                 })),
@@ -2186,13 +2186,13 @@ impl TaskTriggerHandler {
             )
             .map_err(internal_error)?;
         self.db
-            .update_workflow_status(&run.workflow_id, WorkflowStatus::Paused, None, None)
+            .update_loop_status(&run.loop_id, LoopStatus::Paused, None, None)
             .map_err(internal_error)?;
         self.notification_service
-            .notify_task_failed(&run.workflow_id, 1, &params.description);
+            .notify_task_failed(&run.loop_id, 1, &params.description);
 
         Ok(success_result(
-            "Workflow blocker recorded and workflow paused.",
+            "Loop blocker recorded and loop paused.",
         ))
     }
 
@@ -2386,24 +2386,24 @@ impl TaskTriggerHandler {
 }
 
 impl TaskTriggerHandler {
-    fn handle_skip_next_spec(&self, workflow_id: &str) -> Result<(), McpError> {
+    fn handle_skip_next_spec(&self, loop_id: &str) -> Result<(), McpError> {
         let current_spec = self
             .db
-            .list_workflow_specs(workflow_id)
+            .list_loop_specs(loop_id)
             .map_err(internal_error)?
             .into_iter()
-            .find(|spec| spec.status == WorkflowSpecStatus::Running)
+            .find(|spec| spec.status == LoopSpecStatus::Running)
             .ok_or_else(|| {
                 McpError::invalid_params(
-                    "No running spec found to skip from this paused workflow.",
+                    "No running spec found to skip from this paused loop.",
                     None,
                 )
             })?;
 
         self.db
-            .update_workflow_spec_status(
+            .update_loop_spec_status(
                 &current_spec.id,
-                WorkflowSpecStatus::Skipped,
+                LoopSpecStatus::Skipped,
                 None,
                 Some(chrono::Utc::now()),
             )
@@ -2497,53 +2497,53 @@ fn sync_message_json(message: &crate::domain::sync::SyncMessage) -> serde_json::
     })
 }
 
-fn workflow_details_json(
+fn loop_details_json(
     db: &Database,
-    workflow: &WorkflowDetails,
+    lp: &LoopDetails,
 ) -> anyhow::Result<serde_json::Value> {
-    let specs = workflow
+    let specs = lp
         .specs
         .iter()
-        .map(|spec| workflow_spec_details_json(db, spec, workflow.workflow.status))
+        .map(|spec| loop_spec_details_json(db, spec, lp.lp.status))
         .collect::<anyhow::Result<Vec<_>>>()?;
 
     Ok(serde_json::json!({
-        "id": workflow.workflow.id,
-        "name": workflow.workflow.name,
-        "description": workflow.workflow.description,
-        "workdir": workflow.workflow.workdir,
-        "status": workflow.workflow.status.as_str(),
-        "created_at": workflow.workflow.created_at.to_rfc3339(),
-        "started_at": workflow.workflow.started_at.map(|value| value.to_rfc3339()),
-        "completed_at": workflow.workflow.completed_at.map(|value| value.to_rfc3339()),
+        "id": lp.lp.id,
+        "name": lp.lp.name,
+        "description": lp.lp.description,
+        "workdir": lp.lp.workdir,
+        "status": lp.lp.status.as_str(),
+        "created_at": lp.lp.created_at.to_rfc3339(),
+        "started_at": lp.lp.started_at.map(|value| value.to_rfc3339()),
+        "completed_at": lp.lp.completed_at.map(|value| value.to_rfc3339()),
         "specs": specs,
     }))
 }
 
-fn workflow_spec_details_json(
+fn loop_spec_details_json(
     db: &Database,
-    spec: &crate::domain::workflow::WorkflowSpecDetails,
-    workflow_status: WorkflowStatus,
+    spec: &crate::domain::loops::LoopSpecDetails,
+    loop_status: LoopStatus,
 ) -> anyhow::Result<serde_json::Value> {
-    let runs = db.list_workflow_runs_for_spec(&spec.spec.id)?;
+    let runs = db.list_loop_runs_for_spec(&spec.spec.id)?;
     let current_run = runs
         .iter()
         .rev()
-        .find(|run| run.status == WorkflowRunStatus::Running)
+        .find(|run| run.status == LoopRunStatus::Running)
         .or_else(|| runs.last());
-    let blocker = runs.last().and_then(workflow_run_blocker);
-    let resume_actions = if workflow_status == WorkflowStatus::Paused
-        && spec.spec.status == WorkflowSpecStatus::Running
+    let blocker = runs.last().and_then(loop_run_blocker);
+    let resume_actions = if loop_status == LoopStatus::Paused
+        && spec.spec.status == LoopSpecStatus::Running
     {
         vec!["retry_current_node", "skip_next_spec"]
     } else {
         Vec::new()
     };
-    let runs = runs.iter().map(workflow_run_json).collect::<Vec<_>>();
+    let runs = runs.iter().map(loop_run_json).collect::<Vec<_>>();
 
     Ok(serde_json::json!({
         "id": spec.spec.id,
-        "workflow_id": spec.spec.workflow_id,
+        "loop_id": spec.spec.loop_id,
         "name": spec.spec.name,
         "description": spec.spec.description,
         "position": spec.spec.position,
@@ -2555,13 +2555,13 @@ fn workflow_spec_details_json(
         "resume_actions": resume_actions,
         "started_at": spec.spec.started_at.map(|value| value.to_rfc3339()),
         "completed_at": spec.spec.completed_at.map(|value| value.to_rfc3339()),
-        "nodes": spec.nodes.iter().map(workflow_node_json).collect::<Vec<_>>(),
-        "edges": spec.edges.iter().map(workflow_edge_json).collect::<Vec<_>>(),
+        "nodes": spec.nodes.iter().map(loop_node_json).collect::<Vec<_>>(),
+        "edges": spec.edges.iter().map(loop_edge_json).collect::<Vec<_>>(),
         "runs": runs,
     }))
 }
 
-fn workflow_node_json(node: &WorkflowNode) -> serde_json::Value {
+fn loop_node_json(node: &LoopNode) -> serde_json::Value {
     serde_json::json!({
         "id": node.id,
         "spec_id": node.spec_id,
@@ -2573,7 +2573,7 @@ fn workflow_node_json(node: &WorkflowNode) -> serde_json::Value {
     })
 }
 
-fn workflow_edge_json(edge: &WorkflowEdge) -> serde_json::Value {
+fn loop_edge_json(edge: &LoopEdge) -> serde_json::Value {
     serde_json::json!({
         "id": edge.id,
         "spec_id": edge.spec_id,
@@ -2583,10 +2583,10 @@ fn workflow_edge_json(edge: &WorkflowEdge) -> serde_json::Value {
     })
 }
 
-fn workflow_run_json(run: &crate::domain::workflow::WorkflowNodeRun) -> serde_json::Value {
+fn loop_run_json(run: &crate::domain::loops::LoopNodeRun) -> serde_json::Value {
     serde_json::json!({
         "id": run.id,
-        "workflow_id": run.workflow_id,
+        "loop_id": run.loop_id,
         "spec_id": run.spec_id,
         "node_id": run.node_id,
         "status": run.status.as_str(),
@@ -2598,7 +2598,7 @@ fn workflow_run_json(run: &crate::domain::workflow::WorkflowNodeRun) -> serde_js
     })
 }
 
-fn workflow_run_blocker(run: &crate::domain::workflow::WorkflowNodeRun) -> Option<String> {
+fn loop_run_blocker(run: &crate::domain::loops::LoopNodeRun) -> Option<String> {
     run.output
         .as_ref()
         .and_then(|output| output.get("blocker"))

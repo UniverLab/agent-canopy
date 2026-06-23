@@ -197,7 +197,7 @@ fn show_home_fallback(app: &App) -> bool {
                 | Focus::ContextTransfer
                 | Focus::RagTransfer
                 | Focus::PromptTemplateDialog
-                | Focus::WorkflowEditorDialog
+                | Focus::LoopEditorDialog
                 | Focus::ProjectRelationDialog
         )
 }
@@ -227,7 +227,7 @@ fn draw_log_panel_focus(frame: &mut Frame, area: Rect, app: &mut App) -> bool {
         | Focus::ContextTransfer
         | Focus::RagTransfer
         | Focus::PromptTemplateDialog
-        | Focus::WorkflowEditorDialog => false,
+        | Focus::LoopEditorDialog => false,
         Focus::ProjectRelationDialog => {
             draw_projects_mode_panel(frame, area, app);
             true
@@ -620,7 +620,7 @@ fn draw_projects_mode_panel(frame: &mut Frame, area: Rect, app: &App) {
 
     match app.projects_panel_focus {
         ProjectsPanelFocus::Projects => draw_project_overview(frame, area, app),
-        ProjectsPanelFocus::Workflows => draw_workflow_overview(frame, area, app),
+        ProjectsPanelFocus::Loops => draw_loop_overview(frame, area, app),
         ProjectsPanelFocus::Knowledge => draw_knowledge_overview(frame, area, app),
         ProjectsPanelFocus::RagInfo => draw_rag_queue_overview(frame, area, app),
     }
@@ -676,24 +676,24 @@ fn draw_rag_queue_overview(frame: &mut Frame, area: Rect, app: &App) {
     draw_rag_info_overview(frame, area, app);
 }
 
-fn draw_workflow_overview(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(workflow) = app.selected_workflow() else {
+fn draw_loop_overview(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(lp) = app.selected_loop() else {
         frame.render_widget(
-            Paragraph::new("No workflows yet").style(Style::default().fg(DIM)),
+            Paragraph::new("No loops yet").style(Style::default().fg(DIM)),
             area,
         );
         return;
     };
-    let Some(details) = app.selected_workflow_details() else {
+    let Some(details) = app.selected_loop_details() else {
         frame.render_widget(
-            Paragraph::new("Workflow details are unavailable").style(Style::default().fg(DIM)),
+            Paragraph::new("Loop details are unavailable").style(Style::default().fg(DIM)),
             area,
         );
         return;
     };
-    let Some(spec) = app.selected_workflow_spec() else {
+    let Some(spec) = app.selected_loop_spec() else {
         frame.render_widget(
-            Paragraph::new("Workflow has no specs yet").style(Style::default().fg(DIM)),
+            Paragraph::new("Loop has no specs yet").style(Style::default().fg(DIM)),
             area,
         );
         return;
@@ -701,21 +701,21 @@ fn draw_workflow_overview(frame: &mut Frame, area: Rect, app: &App) {
 
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("Workflow ", Style::default().fg(DIM)),
+            Span::styled("Loop ", Style::default().fg(DIM)),
             Span::styled(
-                workflow.name.as_str(),
+                lp.name.as_str(),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
             Span::styled(
-                workflow.status.as_str().to_uppercase(),
+                lp.status.as_str().to_uppercase(),
                 Style::default().fg(Color::White),
             ),
         ]),
-        Line::from(format!("Workdir: {}", workflow.workdir)),
+        Line::from(format!("Workdir: {}", lp.workdir)),
         Line::from(format!(
             "Spec {}/{}: {} [{}]",
-            app.workflow_selected_spec + 1,
+            app.loop_selected_spec + 1,
             details.specs.len(),
             spec.spec.name,
             spec.spec.status.as_str()
@@ -737,20 +737,20 @@ fn draw_workflow_overview(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(DIM),
         )));
     } else {
-        lines.extend(workflow_graph_lines(
+        lines.extend(loop_graph_lines(
             spec,
-            app.workflow_selected_node,
+            app.loop_selected_node,
             area.width,
         ));
     }
 
-    if !app.workflow_runs.is_empty() {
+    if !app.loop_runs.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "Recent runs",
             Style::default().fg(DIM),
         )));
-        lines.extend(app.workflow_runs.iter().rev().take(4).map(|run| {
+        lines.extend(app.loop_runs.iter().rev().take(4).map(|run| {
             Line::from(format!(
                 "  iter {}  {}  {}",
                 run.iteration,
@@ -763,22 +763,22 @@ fn draw_workflow_overview(frame: &mut Frame, area: Rect, app: &App) {
     render_wrapped_paragraph(frame, area, lines);
 }
 
-fn workflow_node_summary(node: &crate::domain::workflow::WorkflowNode) -> String {
+fn loop_node_summary(node: &crate::domain::loops::LoopNode) -> String {
     match node.kind {
-        crate::domain::workflow::WorkflowNodeKind::Agent => node
+        crate::domain::loops::LoopNodeKind::Agent => node
             .config
             .get("prompt_template")
             .and_then(serde_json::Value::as_str)
             .map(|prompt| truncate_str(prompt, 72))
             .filter(|prompt| !prompt.is_empty())
             .unwrap_or_else(|| "prompt_template not set".to_string()),
-        crate::domain::workflow::WorkflowNodeKind::Check => node
+        crate::domain::loops::LoopNodeKind::Check => node
             .config
             .get("command")
             .and_then(serde_json::Value::as_str)
             .map(|command| format!("check: {}", truncate_str(command, 72)))
             .unwrap_or_else(|| "check config".to_string()),
-        crate::domain::workflow::WorkflowNodeKind::Gate => {
+        crate::domain::loops::LoopNodeKind::Gate => {
             let evaluate = node
                 .config
                 .get("evaluate")
@@ -794,7 +794,7 @@ fn workflow_node_summary(node: &crate::domain::workflow::WorkflowNode) -> String
     }
 }
 
-fn workflow_node_box_styles(selected: bool) -> (Style, Style) {
+fn loop_node_box_styles(selected: bool) -> (Style, Style) {
     if selected {
         (
             Style::default().fg(ACCENT),
@@ -805,12 +805,12 @@ fn workflow_node_box_styles(selected: bool) -> (Style, Style) {
     }
 }
 
-fn workflow_node_content_line(
-    node: &crate::domain::workflow::WorkflowNode,
+fn loop_node_content_line(
+    node: &crate::domain::loops::LoopNode,
     selected: bool,
     inner: usize,
 ) -> Option<Line<'static>> {
-    let summary = workflow_node_summary(node);
+    let summary = loop_node_summary(node);
     if summary.is_empty() {
         return None;
     }
@@ -828,12 +828,12 @@ fn workflow_node_content_line(
     )))
 }
 
-fn workflow_node_lines(
-    node: &crate::domain::workflow::WorkflowNode,
+fn loop_node_lines(
+    node: &crate::domain::loops::LoopNode,
     selected: bool,
     inner: usize,
 ) -> Vec<Line<'static>> {
-    let (border_style, text_style) = workflow_node_box_styles(selected);
+    let (border_style, text_style) = loop_node_box_styles(selected);
     let kind_tag = format!("[{}]", node.kind.as_str());
     let max_name = inner.saturating_sub(2 + kind_tag.len());
     let name_display = truncate_str(&node.name, max_name);
@@ -857,7 +857,7 @@ fn workflow_node_lines(
         )),
     ];
 
-    if let Some(content) = workflow_node_content_line(node, selected, inner) {
+    if let Some(content) = loop_node_content_line(node, selected, inner) {
         lines.push(content);
     }
 
@@ -869,9 +869,9 @@ fn workflow_node_lines(
     lines
 }
 
-fn workflow_edge_lines(
-    edges: &[(usize, crate::domain::workflow::WorkflowEdgeCondition)],
-    spec_nodes: &[crate::domain::workflow::WorkflowNode],
+fn loop_edge_lines(
+    edges: &[(usize, crate::domain::loops::LoopEdgeCondition)],
+    spec_nodes: &[crate::domain::loops::LoopNode],
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for (i, (target_idx, condition)) in edges.iter().enumerate() {
@@ -888,14 +888,14 @@ fn workflow_edge_lines(
     lines
 }
 
-fn workflow_graph_lines(
-    spec: &crate::domain::workflow::WorkflowSpecDetails,
+fn loop_graph_lines(
+    spec: &crate::domain::loops::LoopSpecDetails,
     selected_node_idx: usize,
     area_width: u16,
 ) -> Vec<Line<'static>> {
     use std::collections::HashMap;
 
-    let mut outgoing: HashMap<&str, Vec<(usize, crate::domain::workflow::WorkflowEdgeCondition)>> =
+    let mut outgoing: HashMap<&str, Vec<(usize, crate::domain::loops::LoopEdgeCondition)>> =
         HashMap::new();
     for edge in &spec.edges {
         if let Some(target_idx) = spec.nodes.iter().position(|n| n.id == edge.to_node) {
@@ -913,10 +913,10 @@ fn workflow_graph_lines(
 
     for (idx, node) in spec.nodes.iter().enumerate() {
         let selected = idx == selected_node_idx;
-        lines.extend(workflow_node_lines(node, selected, inner));
+        lines.extend(loop_node_lines(node, selected, inner));
 
         if let Some(edges) = outgoing.get(node.id.as_str()) {
-            lines.extend(workflow_edge_lines(edges, &spec.nodes));
+            lines.extend(loop_edge_lines(edges, &spec.nodes));
             lines.push(Line::from(""));
         } else if idx < spec.nodes.len() - 1 {
             lines.push(Line::from(""));

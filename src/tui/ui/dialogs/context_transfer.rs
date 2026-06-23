@@ -3,7 +3,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use super::{centered_rect, truncate_str, ACCENT, DIM};
+use super::{centered_rect, draw_dialog_left_wave, truncate_str, ACCENT, BG_SELECTED, DIM};
 use crate::tui::app::types::App;
 use crate::tui::context_transfer::ContextTransferStep;
 
@@ -53,6 +53,7 @@ fn draw_ctx_preview(frame: &mut Frame, app: &App) {
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    draw_dialog_left_wave(frame, area, app.animation_tick.into());
 
     let active_style = Style::default()
         .fg(Color::Black)
@@ -130,8 +131,14 @@ fn draw_ctx_picker(frame: &mut Frame, app: &App) {
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    draw_dialog_left_wave(frame, area, app.animation_tick.into());
 
     let mut lines = vec![Line::from("")];
+
+    // Full-width trailing filler so a selected row reads as a card spanning the
+    // whole dialog (like the sidebar), not just the background behind the text.
+    let row_fill =
+        |bg: Color| Span::styled(" ".repeat(inner.width as usize), Style::default().bg(bg));
 
     if agents.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -148,15 +155,17 @@ fn draw_ctx_picker(frame: &mut Frame, app: &App) {
 
             let bar_color = if is_src { DIM } else { agent.accent_color };
             let accent = agent.accent_color;
+            // Subtle selection (matches the sidebar): dark-gray background with
+            // the agent name in its accent color, instead of a full accent fill.
             let id_color = if is_sel {
-                Color::Black
+                accent
             } else if is_src {
                 DIM
             } else {
                 Color::White
             };
             let bg = if is_sel {
-                accent
+                BG_SELECTED
             } else {
                 Color::Rgb(15, 25, 15)
             };
@@ -176,6 +185,7 @@ fn draw_ctx_picker(frame: &mut Frame, app: &App) {
                         .bg(bg)
                         .add_modifier(Modifier::BOLD),
                 ),
+                row_fill(bg),
             ]));
 
             lines.push(Line::from(vec![
@@ -184,12 +194,14 @@ fn draw_ctx_picker(frame: &mut Frame, app: &App) {
                     format!("pty · {}", agent.cli.as_str()),
                     Style::default().fg(DIM).bg(bg),
                 ),
+                row_fill(bg),
             ]));
 
             let dir = truncate_path(&agent.working_dir, inner.width.saturating_sub(6) as usize);
             lines.push(Line::from(vec![
                 Span::styled("    ", Style::default().bg(bg)),
                 Span::styled(dir, Style::default().fg(Color::Cyan).bg(bg)),
+                row_fill(bg),
             ]));
         }
     }
