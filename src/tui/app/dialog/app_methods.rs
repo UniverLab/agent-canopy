@@ -142,60 +142,10 @@ impl App {
     fn build_system_content(&self, _is_solo: bool) -> String {
         let mut lines: Vec<String> = Vec::new();
 
-        let workdir = if let Some(state) = self.selected_activity_state() {
-            lines.push(format!(
-                "workspace: {} | agents: {} | vibe: {}",
-                state.workdir,
-                state.participant_count,
-                state.vibe.as_str()
-            ));
-            // Show active missions from panel state (already has full context).
-            let active_intents = &state.active_intents;
-            if !active_intents.is_empty() {
-                lines.push("active missions:".to_string());
-                for intent in active_intents {
-                    lines.push(format!(
-                        "  - {} [{}] {}: {}",
-                        intent.agent_name,
-                        intent.impact.as_str(),
-                        intent.mission,
-                        intent.description
-                    ));
-                }
-            }
-            let chatter: Vec<_> = state
-                .recent_messages
-                .iter()
-                .filter(|m| m.kind.is_chatter())
-                .take(5)
-                .collect();
-            if !chatter.is_empty() {
-                lines.push("recent messages:".to_string());
-                for msg in chatter {
-                    lines.push(format!("  - {}: {}", msg.agent_name, msg.message));
-                }
-            }
-            state.workdir.clone()
-        } else {
-            let workdir = self.current_workdir().to_string_lossy().to_string();
-            lines.push(format!("workspace: {workdir}"));
-            // Fetch missions without the ≥2 session gate so solo agents see them too.
-            let active_intents = self.active_missions_for_workdir(&workdir);
-            if !active_intents.is_empty() {
-                lines.push("active missions:".to_string());
-                for intent in &active_intents {
-                    lines.push(format!(
-                        "  - {} [{}] {}: {}",
-                        intent.agent_name,
-                        intent.impact.as_str(),
-                        intent.mission,
-                        intent.description
-                    ));
-                }
-            }
-            workdir
-        };
-        let _ = workdir;
+        let (workdir, intents, chatter) = self.build_system_context_parts();
+        lines.push(format!("workspace: {workdir}"));
+        Self::push_intents(&mut lines, &intents);
+        Self::push_chatter(&mut lines, &chatter);
 
         lines.push(String::new());
         lines.push(
@@ -251,6 +201,56 @@ impl App {
         );
 
         lines.join("\n")
+    }
+
+    /// Extract workdir, intents, and chatter from activity state or fallback.
+    fn build_system_context_parts(
+        &self,
+    ) -> (
+        String,
+        Vec<crate::domain::sync::ActiveIntent>,
+        Vec<crate::domain::sync::SyncMessage>,
+    ) {
+        if let Some(state) = self.selected_activity_state() {
+            let chatter = state
+                .recent_messages
+                .iter()
+                .filter(|m| m.kind.is_chatter())
+                .take(5)
+                .cloned()
+                .collect();
+            (state.workdir.clone(), state.active_intents, chatter)
+        } else {
+            let workdir = self.current_workdir().to_string_lossy().to_string();
+            let intents = self.active_missions_for_workdir(&workdir);
+            (workdir, intents, Vec::new())
+        }
+    }
+
+    fn push_intents(lines: &mut Vec<String>, intents: &[crate::domain::sync::ActiveIntent]) {
+        if intents.is_empty() {
+            return;
+        }
+        lines.push("active missions:".to_string());
+        for intent in intents {
+            lines.push(format!(
+                "  - {} [{}] {}: {}",
+                intent.agent_name,
+                intent.impact.as_str(),
+                intent.mission,
+                intent.description
+            ));
+        }
+    }
+
+    fn push_chatter(lines: &mut Vec<String>, chatter: &[crate::domain::sync::SyncMessage]) {
+        if chatter.is_empty() {
+            return;
+        }
+        lines.push("recent messages:".to_string());
+        for msg in chatter {
+            lines.push(format!("  - {}: {}", msg.agent_name, msg.message));
+        }
     }
 
     /// Build a compact sync context string from active intents and recent chatter.

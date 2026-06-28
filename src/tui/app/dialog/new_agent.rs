@@ -183,25 +183,36 @@ impl NewAgentDialog {
             .map(|h| crate::domain::usage_stats::CliUsage::load(&h.join(".canopy")))
             .unwrap_or_default();
 
-        if let Some(home) = dirs::home_dir() {
-            let canopy_dir = home.join(".canopy");
-            let config = crate::domain::canopy_config::CanopyConfig::load(&canopy_dir);
-            if !config.clis.is_empty() {
-                let mut pairs = Vec::new();
-                for c in &config.clis {
-                    if let Ok(cli) = Cli::resolve(Some(&c.name)) {
-                        pairs.push((cli, Some(c.clone())));
-                    }
-                }
-                if !pairs.is_empty() {
-                    return Self::sort_clis_by_usage(pairs, &usage);
-                }
-            }
+        // Try configured CLIs first; fall back to auto-detected ones.
+        let pairs = Self::configured_cli_pairs().unwrap_or_else(|| {
+            Cli::detect_available()
+                .into_iter()
+                .map(|cli| (cli, None))
+                .collect()
+        });
+        Self::sort_clis_by_usage(pairs, &usage)
+    }
+
+    fn configured_cli_pairs() -> Option<Vec<(Cli, Option<crate::domain::cli_config::CliConfig>)>> {
+        let home = dirs::home_dir()?;
+        let config = crate::domain::canopy_config::CanopyConfig::load(&home.join(".canopy"));
+        if config.clis.is_empty() {
+            return None;
         }
-        let detected = Cli::detect_available();
-        let pairs: Vec<_> = detected.into_iter().map(|cli| (cli, None)).collect();
-        let (clis, configs) = Self::sort_clis_by_usage(pairs, &usage);
-        (clis, configs)
+        let pairs: Vec<_> = config
+            .clis
+            .iter()
+            .filter_map(|c| {
+                Cli::resolve(Some(&c.name))
+                    .ok()
+                    .map(|cli| (cli, Some(c.clone())))
+            })
+            .collect();
+        if pairs.is_empty() {
+            None
+        } else {
+            Some(pairs)
+        }
     }
 
     /// Sort CLI-config pairs by usage count descending (most-used first).
@@ -233,27 +244,34 @@ impl NewAgentDialog {
             .filter(|s| !s.trim().is_empty())
             .map(|s| s.to_string());
 
-        match self.task_mode {
-            NewTaskMode::Resume => {
-                // If the user picked a specific session via the canopy session picker,
-                // use interactive_args + session_resume_cmd + id.
-                if let Some((ref id, _)) = self.selected_session {
-                    if let Some(ref cmd) = config.session_resume_cmd {
-                        return Some(match inter {
-                            Some(ref i) => format!("{i} {cmd} {id}"),
-                            None => format!("{cmd} {id}"),
-                        });
-                    }
-                }
-                // Build: interactive_args + resume_args (each optional).
-                match (inter, config.resume_args.clone()) {
-                    (Some(i), Some(r)) => Some(format!("{i} {r}")),
-                    (Some(i), None) => Some(i),
-                    (None, Some(r)) => Some(r),
-                    (None, None) => None,
-                }
+        self.build_resume_args(config, inter)
+    }
+
+    fn build_resume_args(
+        &self,
+        config: &crate::domain::cli_config::CliConfig,
+        inter: Option<String>,
+    ) -> Option<String> {
+        if !matches!(self.task_mode, NewTaskMode::Resume) {
+            return inter;
+        }
+
+        // Session-specific resume: interactive_args + session_resume_cmd + id.
+        if let Some((ref id, _)) = self.selected_session {
+            if let Some(ref cmd) = config.session_resume_cmd {
+                return Some(match inter {
+                    Some(ref i) => format!("{i} {cmd} {id}"),
+                    None => format!("{cmd} {id}"),
+                });
             }
-            NewTaskMode::Interactive => inter,
+        }
+
+        // Generic resume: interactive_args + resume_args (each optional).
+        match (inter, config.resume_args.clone()) {
+            (Some(i), Some(r)) => Some(format!("{i} {r}")),
+            (Some(i), None) => Some(i),
+            (None, Some(r)) => Some(r),
+            (None, None) => None,
         }
     }
 
@@ -689,16 +707,18 @@ fn collect_file_names(entries: &[std::fs::DirEntry], prefix: &str) -> Vec<String
 
 fn load_seed_options() -> Vec<SeedOption> {
     let mut options = vec![SeedOption::None];
-    if let Ok(seed_ids) = crate::domain::seeds::list_seeds() {
-        for seed_id in seed_ids {
-            if let Ok(identity) = crate::domain::seeds::load_seed(&seed_id) {
-                options.push(SeedOption::Seed {
-                    id: seed_id,
+    let seeds = crate::domain::seeds::list_seeds()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|id| {
+            crate::domain::seeds::load_seed(&id)
+                .ok()
+                .map(|identity| SeedOption::Seed {
+                    id,
                     name: identity.name,
-                });
-            }
-        }
-    }
+                })
+        });
+    options.extend(seeds);
     options.push(SeedOption::PlantNewSeed);
     options
 }
