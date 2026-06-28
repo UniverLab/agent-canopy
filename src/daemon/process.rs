@@ -21,24 +21,10 @@ pub(crate) fn kill_port_occupant(port: u16) {
 
         if let Ok(out) = output {
             let text = String::from_utf8_lossy(&out.stdout);
-            for line in text.lines() {
-                if let Some(pid_start) = line.find("pid=") {
-                    let rest = &line[pid_start + 4..];
-                    if let Some(end) = rest.find(|c: char| !c.is_ascii_digit()) {
-                        if let Ok(pid) = rest[..end].parse::<u32>() {
-                            let self_pid = std::process::id();
-                            if pid != self_pid && pid != 0 {
-                                eprintln!("Port {port} occupied by PID {pid} — sending SIGTERM");
-                                unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-                                std::thread::sleep(std::time::Duration::from_millis(500));
-                                if unsafe { libc::kill(pid as i32, 0) } == 0 {
-                                    eprintln!("PID {pid} did not exit — sending SIGKILL");
-                                    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-                                    std::thread::sleep(std::time::Duration::from_millis(200));
-                                }
-                            }
-                        }
-                    }
+            let self_pid = std::process::id();
+            for pid in parse_pids_from_ss(&text) {
+                if pid != self_pid && pid != 0 {
+                    terminate_process(pid, port);
                 }
             }
         }
@@ -46,6 +32,30 @@ pub(crate) fn kill_port_occupant(port: u16) {
     #[cfg(not(unix))]
     {
         let _ = port;
+    }
+}
+
+#[cfg(unix)]
+fn parse_pids_from_ss(text: &str) -> Vec<u32> {
+    text.lines()
+        .filter_map(|line| {
+            let pid_start = line.find("pid=")?;
+            let rest = &line[pid_start + 4..];
+            let end = rest.find(|c: char| !c.is_ascii_digit())?;
+            rest[..end].parse::<u32>().ok()
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn terminate_process(pid: u32, port: u16) {
+    eprintln!("Port {port} occupied by PID {pid} — sending SIGTERM");
+    unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    if unsafe { libc::kill(pid as i32, 0) } == 0 {
+        eprintln!("PID {pid} did not exit — sending SIGKILL");
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }
 

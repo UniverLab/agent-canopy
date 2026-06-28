@@ -23,11 +23,11 @@ use agent_focus::handle_agent_key;
 use context_transfer::handle_context_transfer_key;
 use home_preview::{handle_home_key, handle_preview_key};
 use launchpad::handle_launchpad_key;
+use loop_editor::handle_loop_editor_key;
 use new_agent_dialog::handle_dialog_key;
 use paste::handle_paste;
 use prompt_template::handle_prompt_template_key;
 use rag_transfer::handle_rag_transfer_key;
-use loop_editor::handle_loop_editor_key;
 
 type Terminal = ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
 

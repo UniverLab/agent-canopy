@@ -737,11 +737,7 @@ fn draw_loop_overview(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(DIM),
         )));
     } else {
-        lines.extend(loop_graph_lines(
-            spec,
-            app.loop_selected_node,
-            area.width,
-        ));
+        lines.extend(loop_graph_lines(spec, app.loop_selected_node, area.width));
     }
 
     if !app.loop_runs.is_empty() {

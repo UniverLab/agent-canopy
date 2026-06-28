@@ -73,37 +73,47 @@ WantedBy=default.target
     std::fs::write(&unit_path, unit_content)?;
     println!("Created {}", unit_path.display());
 
-    // Enable lingering so the service survives after logout/reboot
-    if let Ok(user) = std::env::var("USER") {
-        let linger_status = std::process::Command::new("loginctl")
-            .args(["show-user", &user, "-p", "Linger"])
-            .output();
-        let linger_enabled = linger_status
-            .as_ref()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "Linger=yes")
-            .unwrap_or(false);
+    ensure_linger_enabled();
+    reload_and_enable_service()?;
 
-        if !linger_enabled {
-            let linger = std::process::Command::new("loginctl")
-                .args(["enable-linger", &user])
-                .status();
-            match linger {
-                Ok(s) if s.success() => {
-                    println!("  Lingering enabled (service survives logout/reboot)");
-                }
-                _ => {
-                    println!("  ⚠ Could not enable lingering — service may stop on logout/reboot.");
-                    println!("    Run manually: sudo loginctl enable-linger {user}");
-                }
-            }
-        }
+    Ok(())
+}
+
+fn ensure_linger_enabled() {
+    let Some(user) = std::env::var("USER").ok() else {
+        return;
+    };
+
+    let linger_enabled = std::process::Command::new("loginctl")
+        .args(["show-user", &user, "-p", "Linger"])
+        .output()
+        .as_ref()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "Linger=yes")
+        .unwrap_or(false);
+
+    if linger_enabled {
+        return;
     }
 
-    let status = std::process::Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .status();
+    match std::process::Command::new("loginctl")
+        .args(["enable-linger", &user])
+        .status()
+    {
+        Ok(s) if s.success() => {
+            println!("  Lingering enabled (service survives logout/reboot)");
+        }
+        _ => {
+            println!("  ⚠ Could not enable lingering — service may stop on logout/reboot.");
+            println!("    Run manually: sudo loginctl enable-linger {user}");
+        }
+    }
+}
 
-    match status {
+fn reload_and_enable_service() -> Result<()> {
+    match std::process::Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status()
+    {
         Ok(s) if s.success() => {}
         _ => {
             println!("  ⚠ systemctl daemon-reload failed (systemd may not be fully available)");
@@ -113,11 +123,10 @@ WantedBy=default.target
         }
     }
 
-    let enable = std::process::Command::new("systemctl")
+    match std::process::Command::new("systemctl")
         .args(["--user", "enable", "--now", SYSTEMD_SERVICE_NAME])
-        .status();
-
-    match enable {
+        .status()
+    {
         Ok(s) if s.success() => {
             println!("  Service enabled and started");
             println!("    Check status: systemctl --user status {SYSTEMD_SERVICE_NAME}");

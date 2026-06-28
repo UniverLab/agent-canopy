@@ -205,54 +205,45 @@ impl VectorStore {
     /// Return every distinct `file_path` stored in the vector table.
     /// Used for orphan-chunk reconciliation at startup.
     pub async fn list_unique_paths(&self) -> Result<Vec<String>> {
-        let batches: Vec<RecordBatch> = self
-            .table
-            .query()
-            .select(Select::columns(&["file_path"]))
-            .execute()
-            .await
-            .context("Failed to query LanceDB for unique paths")?
-            .try_collect()
-            .await
-            .context("Failed to collect LanceDB path query results")?;
-
-        let mut paths = std::collections::HashSet::new();
-        for batch in &batches {
-            if let Some(col) = batch.column_by_name("file_path") {
-                if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-                    for i in 0..arr.len() {
-                        paths.insert(arr.value(i).to_string());
-                    }
-                }
-            }
-        }
+        let file_paths = self.query_file_paths().await?;
+        let paths: std::collections::HashSet<String> = file_paths.into_iter().collect();
         Ok(paths.into_iter().collect())
     }
 
     /// Return a map of `file_path → chunk_count` for every indexed file.
     pub async fn count_chunks_per_file(&self) -> Result<std::collections::HashMap<String, usize>> {
+        let file_paths = self.query_file_paths().await?;
+        let mut counts = std::collections::HashMap::new();
+        for path in file_paths {
+            *counts.entry(path).or_insert(0) += 1;
+        }
+        Ok(counts)
+    }
+
+    /// Query all `file_path` values from the vector table.
+    async fn query_file_paths(&self) -> Result<Vec<String>> {
         let batches: Vec<RecordBatch> = self
             .table
             .query()
             .select(Select::columns(&["file_path"]))
             .execute()
             .await
-            .context("Failed to query LanceDB for chunk counts")?
+            .context("Failed to query LanceDB for file paths")?
             .try_collect()
             .await
-            .context("Failed to collect LanceDB chunk-count results")?;
+            .context("Failed to collect LanceDB file path results")?;
 
-        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut paths = Vec::new();
         for batch in &batches {
             if let Some(col) = batch.column_by_name("file_path") {
                 if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
                     for i in 0..arr.len() {
-                        *counts.entry(arr.value(i).to_string()).or_insert(0) += 1;
+                        paths.push(arr.value(i).to_string());
                     }
                 }
             }
         }
-        Ok(counts)
+        Ok(paths)
     }
 
     pub fn path_for_tests(base_dir: &Path) -> PathBuf {

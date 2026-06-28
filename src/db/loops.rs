@@ -6,9 +6,8 @@ use std::io::{Error as IoError, ErrorKind};
 
 use crate::db::Database;
 use crate::domain::loops::{
-    Loop, LoopDetails, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind,
-    LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecDetails, LoopSpecStatus,
-    LoopStatus,
+    Loop, LoopDetails, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind, LoopNodeRun,
+    LoopRunStatus, LoopSpec, LoopSpecDetails, LoopSpecStatus, LoopStatus,
 };
 
 impl Database {
@@ -449,10 +448,7 @@ impl Database {
             .map_err(Into::into)
     }
 
-    pub fn get_active_loop_run_for_node(
-        &self,
-        node_id: &str,
-    ) -> Result<Option<LoopNodeRun>> {
+    pub fn get_active_loop_run_for_node(&self, node_id: &str) -> Result<Option<LoopNodeRun>> {
         let conn = self
             .conn
             .lock()
@@ -580,17 +576,16 @@ fn map_loop_node_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoopNode> {
 }
 
 fn map_loop_edge_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoopEdge> {
-    let condition =
-        LoopEdgeCondition::from_str(&row.get::<_, String>(4)?).ok_or_else(|| {
-            rusqlite::Error::FromSqlConversionFailure(
-                4,
-                rusqlite::types::Type::Text,
-                Box::new(IoError::new(
-                    ErrorKind::InvalidData,
-                    "Invalid loop edge condition",
-                )),
-            )
-        })?;
+    let condition = LoopEdgeCondition::from_str(&row.get::<_, String>(4)?).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            4,
+            rusqlite::types::Type::Text,
+            Box::new(IoError::new(
+                ErrorKind::InvalidData,
+                "Invalid loop edge condition",
+            )),
+        )
+    })?;
 
     Ok(LoopEdge {
         id: row.get(0)?,

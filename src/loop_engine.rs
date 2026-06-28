@@ -7,11 +7,11 @@ use tokio::process::Command;
 
 use crate::application::notification_service::NotificationService;
 use crate::db::Database;
-use crate::domain::models::Cli;
 use crate::domain::loops::{
-    LoopEdge, LoopNode, LoopNodeKind, LoopNodeRun, LoopRunStatus, LoopSpec,
-    LoopSpecStatus, LoopStatus,
+    LoopEdge, LoopNode, LoopNodeKind, LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus,
+    LoopStatus,
 };
+use crate::domain::models::Cli;
 
 const DEFAULT_MAX_ITERATIONS_PER_NODE: usize = 10;
 
@@ -270,12 +270,8 @@ impl LoopEngine {
     }
 
     fn fail_loop(&self, loop_id: &str, summary: &str) -> Result<()> {
-        self.db.update_loop_status(
-            loop_id,
-            LoopStatus::Failed,
-            None,
-            Some(chrono::Utc::now()),
-        )?;
+        self.db
+            .update_loop_status(loop_id, LoopStatus::Failed, None, Some(chrono::Utc::now()))?;
         self.notification_service
             .notify_task_failed(loop_id, 1, summary);
         Ok(())
@@ -424,10 +420,7 @@ async fn execute_agent_node(
     })
 }
 
-fn execute_gate_node(
-    node: &LoopNode,
-    previous_output: Option<&Value>,
-) -> Result<NodeExecution> {
+fn execute_gate_node(node: &LoopNode, previous_output: Option<&Value>) -> Result<NodeExecution> {
     let previous_output = previous_output
         .ok_or_else(|| anyhow!("Gate node '{}' requires previous node output.", node.name))?;
     let evaluate = node

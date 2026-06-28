@@ -252,14 +252,8 @@ fn draw_projects_sidebar(frame: &mut Frame, areas: SidebarContentAreas, app: &Ap
     let show_rag_info = app.rag_info.has_rag_activity() && areas.content.height >= 6;
     // ragInfo sits at the TOP of the projects sidebar so it's always visible.
     let (rag_info_area, content_below) = split_top_panel(areas.content, show_rag_info, 6);
-    let (
-        has_projects,
-        has_loops,
-        projects_needed,
-        loops_needed,
-        knowledge_needed,
-        rag_needed,
-    ) = projects_layout_requirements(app, loops.len(), rag_items, content_below.height);
+    let (has_projects, has_loops, projects_needed, loops_needed, knowledge_needed, rag_needed) =
+        projects_layout_requirements(app, loops.len(), rag_items, content_below.height);
     let layout = layout_projects_sections(
         content_below,
         has_projects,
@@ -843,11 +837,9 @@ fn draw_loops_list(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let selected_index = app.selected_loop().and_then(|lp| {
-        loops
-            .iter()
-            .position(|candidate| candidate.id == lp.id)
-    });
+    let selected_index = app
+        .selected_loop()
+        .and_then(|lp| loops.iter().position(|candidate| candidate.id == lp.id));
     let scroll = scroll_state(
         loops.len(),
         selected_index,

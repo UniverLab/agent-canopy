@@ -48,15 +48,15 @@ use crate::daemon::helpers::{data_dir, error_result, notify_run_result, success_
 use crate::daemon::params::*;
 use crate::db::intelligence::IntelligenceNodeRecord;
 use crate::db::Database;
+use crate::domain::loops::{
+    validate_spec_description_template, Loop, LoopDetails, LoopEdge, LoopEdgeCondition, LoopNode,
+    LoopNodeKind, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus,
+};
 use crate::domain::models::{Agent, Trigger};
 use crate::domain::sync::{MessageKind, MissionImpact, WorkspaceStatus};
 use crate::domain::validation::validate_id;
-use crate::domain::loops::{
-    validate_spec_description_template, Loop, LoopDetails, LoopEdge,
-    LoopEdgeCondition, LoopNode, LoopNodeKind, LoopRunStatus, LoopSpec,
-    LoopSpecStatus, LoopStatus,
-};
 use crate::executor::Executor;
+use crate::loop_engine::LoopEngine;
 use crate::rag::rate_limiter::RateLimiter;
 use crate::shared::sync_identity::{
     header_str, CANOPY_AGENT_ID_ENV, CANOPY_AGENT_ID_HEADER, CANOPY_CLIENT_NAME_ENV,
@@ -64,7 +64,6 @@ use crate::shared::sync_identity::{
 };
 use crate::sync_manager::SyncManager;
 use crate::watchers::WatcherEngine;
-use crate::loop_engine::LoopEngine;
 
 const MISSING_SYNC_IDENTITY_MESSAGE: &str =
     "Missing Canopy session identity. Launch via `canopy bridge --id <AGENT_ID>` so requests include Canopy identity headers.";
@@ -222,13 +221,8 @@ fn build_spec_run_info(db: &Database, spec: &LoopSpec) -> Result<SpecRunInfo, Mc
     })
 }
 
-fn build_loop_summary_json(
-    db: &Database,
-    lp: &Loop,
-) -> Result<serde_json::Value, McpError> {
-    let specs = db
-        .list_loop_specs(&lp.id)
-        .map_err(internal_error)?;
+fn build_loop_summary_json(db: &Database, lp: &Loop) -> Result<serde_json::Value, McpError> {
+    let specs = db.list_loop_specs(&lp.id).map_err(internal_error)?;
     let current_spec = specs
         .into_iter()
         .find(|spec| {
@@ -253,10 +247,7 @@ fn build_loop_summary_json(
     }))
 }
 
-fn build_loop_list_json(
-    db: &Database,
-    loops: &[Loop],
-) -> Result<Vec<serde_json::Value>, McpError> {
+fn build_loop_list_json(db: &Database, loops: &[Loop]) -> Result<Vec<serde_json::Value>, McpError> {
     loops
         .iter()
         .map(|lp| build_loop_summary_json(db, lp))
@@ -1657,10 +1648,7 @@ impl TaskTriggerHandler {
             return Ok(error_result(&e));
         }
 
-        let existing_specs = self
-            .db
-            .list_loop_specs(loop_id)
-            .map_err(internal_error)?;
+        let existing_specs = self.db.list_loop_specs(loop_id).map_err(internal_error)?;
         if existing_specs
             .iter()
             .any(|spec| spec.position == params.position)
@@ -1690,9 +1678,7 @@ impl TaskTriggerHandler {
             started_at: None,
             completed_at: None,
         };
-        self.db
-            .insert_loop_spec(&spec)
-            .map_err(internal_error)?;
+        self.db.insert_loop_spec(&spec).map_err(internal_error)?;
 
         Ok(build_id_result(&spec.id, "spec_id"))
     }
@@ -1732,9 +1718,7 @@ impl TaskTriggerHandler {
         };
 
         if let Some(position) = params.position {
-            if let Err(e) =
-                validate_position_conflict(&self.db, &spec.loop_id, spec_id, position)
-            {
+            if let Err(e) = validate_position_conflict(&self.db, &spec.loop_id, spec_id, position) {
                 return Ok(error_result(&e));
             }
         }
@@ -1803,9 +1787,7 @@ impl TaskTriggerHandler {
             position: next_position,
             created_at: chrono::Utc::now(),
         };
-        self.db
-            .insert_loop_node(&node)
-            .map_err(internal_error)?;
+        self.db.insert_loop_node(&node).map_err(internal_error)?;
 
         Ok(build_id_result(&node.id, "node_id"))
     }
@@ -1859,13 +1841,7 @@ impl TaskTriggerHandler {
         }
 
         self.db
-            .update_loop_node_details(
-                node_id,
-                name,
-                kind,
-                params.config.as_ref(),
-                params.position,
-            )
+            .update_loop_node_details(node_id, name, kind, params.config.as_ref(), params.position)
             .map_err(internal_error)?;
 
         Ok(build_node_update_response(node_id))
@@ -1909,9 +1885,7 @@ impl TaskTriggerHandler {
             to_node: params.to_node,
             condition,
         };
-        self.db
-            .insert_loop_edge(&edge)
-            .map_err(internal_error)?;
+        self.db.insert_loop_edge(&edge).map_err(internal_error)?;
 
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&serde_json::json!({ "ok": true })).unwrap_or_default(),
@@ -1947,10 +1921,7 @@ impl TaskTriggerHandler {
             .update_loop_edge_condition(&edge.id, condition)
             .map_err(internal_error)?;
 
-        Ok(success_result(&format!(
-            "Loop edge '{}' updated.",
-            edge.id
-        )))
+        Ok(success_result(&format!("Loop edge '{}' updated.", edge.id)))
     }
 
     #[tool(
@@ -2025,10 +1996,7 @@ impl TaskTriggerHandler {
                 params.loop_id
             )));
         }
-        if matches!(
-            lp.status,
-            LoopStatus::Completed | LoopStatus::Failed
-        ) {
+        if matches!(lp.status, LoopStatus::Completed | LoopStatus::Failed) {
             return Ok(error_result(
                 "Completed or failed loops cannot be resumed yet.",
             ));
@@ -2191,9 +2159,7 @@ impl TaskTriggerHandler {
         self.notification_service
             .notify_task_failed(&run.loop_id, 1, &params.description);
 
-        Ok(success_result(
-            "Loop blocker recorded and loop paused.",
-        ))
+        Ok(success_result("Loop blocker recorded and loop paused."))
     }
 
     /// Returns the recommended tools and step-by-step protocol for a given action scope.
@@ -2497,10 +2463,7 @@ fn sync_message_json(message: &crate::domain::sync::SyncMessage) -> serde_json::
     })
 }
 
-fn loop_details_json(
-    db: &Database,
-    lp: &LoopDetails,
-) -> anyhow::Result<serde_json::Value> {
+fn loop_details_json(db: &Database, lp: &LoopDetails) -> anyhow::Result<serde_json::Value> {
     let specs = lp
         .specs
         .iter()
@@ -2532,13 +2495,12 @@ fn loop_spec_details_json(
         .find(|run| run.status == LoopRunStatus::Running)
         .or_else(|| runs.last());
     let blocker = runs.last().and_then(loop_run_blocker);
-    let resume_actions = if loop_status == LoopStatus::Paused
-        && spec.spec.status == LoopSpecStatus::Running
-    {
-        vec!["retry_current_node", "skip_next_spec"]
-    } else {
-        Vec::new()
-    };
+    let resume_actions =
+        if loop_status == LoopStatus::Paused && spec.spec.status == LoopSpecStatus::Running {
+            vec!["retry_current_node", "skip_next_spec"]
+        } else {
+            Vec::new()
+        };
     let runs = runs.iter().map(loop_run_json).collect::<Vec<_>>();
 
     Ok(serde_json::json!({

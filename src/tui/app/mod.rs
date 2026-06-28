@@ -729,9 +729,7 @@ impl App {
 
     pub fn selected_loop(&self) -> Option<&crate::domain::loops::Loop> {
         let selected_id = self.selected_loop_id.as_ref()?;
-        self.loops
-            .iter()
-            .find(|lp| lp.id == *selected_id)
+        self.loops.iter().find(|lp| lp.id == *selected_id)
     }
 
     pub fn selected_loop_details(&self) -> Option<&crate::domain::loops::LoopDetails> {

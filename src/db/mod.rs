@@ -292,13 +292,13 @@ pub mod agent;
 pub mod gamification;
 pub mod group;
 pub mod intelligence;
+pub mod loops;
 pub mod project;
 pub mod run;
 pub mod seeds;
 pub mod session;
 pub mod state;
 pub mod sync;
-pub mod loops;
 
 #[cfg(test)]
 pub use crate::application::ports::{AgentRepository, RunRepository, StateRepository};

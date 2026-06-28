@@ -9,11 +9,11 @@ use crate::daemon::process::{kill_port_occupant, remove_pid_file, write_pid_file
 use crate::daemon::TaskTriggerHandler;
 use crate::db::Database;
 use crate::executor::Executor;
+use crate::loop_engine::LoopEngine;
 use crate::rag::ingestion::IngestionManager;
 use crate::scheduler::cron_scheduler::CronScheduler;
 use crate::sync_manager::SyncManager;
 use crate::watchers::WatcherEngine;
-use crate::loop_engine::LoopEngine;
 
 pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
     crate::domain::notification::register_aumid();

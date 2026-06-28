@@ -3,11 +3,7 @@ use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::tui::app::types::App;
 
-pub fn handle_loop_editor_key(
-    app: &mut App,
-    code: KeyCode,
-    modifiers: KeyModifiers,
-) -> Result<()> {
+pub fn handle_loop_editor_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
     match code {
         KeyCode::Esc => app.cancel_loop_editor_dialog(),
         KeyCode::Char('s') if modifiers.contains(KeyModifiers::CONTROL) => {

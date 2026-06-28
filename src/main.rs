@@ -15,6 +15,7 @@ mod daemon;
 mod db;
 mod domain;
 mod executor;
+mod loop_engine;
 mod mcp_wizard_module;
 mod rag;
 mod scheduler;
@@ -25,7 +26,6 @@ mod sync_manager;
 mod system;
 mod tui;
 mod watchers;
-mod loop_engine;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

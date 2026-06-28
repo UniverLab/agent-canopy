@@ -323,8 +323,8 @@ pub struct LoopDetails {
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_spec_description_template, LoopEdgeCondition, LoopNodeKind,
-        LoopRunStatus, LoopSpecStatus, LoopStatus,
+        validate_spec_description_template, LoopEdgeCondition, LoopNodeKind, LoopRunStatus,
+        LoopSpecStatus, LoopStatus,
     };
 
     #[test]
@@ -415,10 +415,7 @@ Task:
     fn loop_status_from_str() {
         assert_eq!(LoopStatus::from_str("running"), LoopStatus::Running);
         assert_eq!(LoopStatus::from_str("paused"), LoopStatus::Paused);
-        assert_eq!(
-            LoopStatus::from_str("completed"),
-            LoopStatus::Completed
-        );
+        assert_eq!(LoopStatus::from_str("completed"), LoopStatus::Completed);
         assert_eq!(LoopStatus::from_str("failed"), LoopStatus::Failed);
         assert_eq!(LoopStatus::from_str("invalid"), LoopStatus::Draft);
     }
@@ -434,26 +431,14 @@ Task:
 
     #[test]
     fn loop_spec_status_from_str() {
-        assert_eq!(
-            LoopSpecStatus::from_str("running"),
-            LoopSpecStatus::Running
-        );
+        assert_eq!(LoopSpecStatus::from_str("running"), LoopSpecStatus::Running);
         assert_eq!(
             LoopSpecStatus::from_str("completed"),
             LoopSpecStatus::Completed
         );
-        assert_eq!(
-            LoopSpecStatus::from_str("failed"),
-            LoopSpecStatus::Failed
-        );
-        assert_eq!(
-            LoopSpecStatus::from_str("skipped"),
-            LoopSpecStatus::Skipped
-        );
-        assert_eq!(
-            LoopSpecStatus::from_str("invalid"),
-            LoopSpecStatus::Pending
-        );
+        assert_eq!(LoopSpecStatus::from_str("failed"), LoopSpecStatus::Failed);
+        assert_eq!(LoopSpecStatus::from_str("skipped"), LoopSpecStatus::Skipped);
+        assert_eq!(LoopSpecStatus::from_str("invalid"), LoopSpecStatus::Pending);
     }
 
     #[test]
@@ -465,18 +450,9 @@ Task:
 
     #[test]
     fn loop_node_kind_from_str() {
-        assert_eq!(
-            LoopNodeKind::from_str("agent"),
-            Some(LoopNodeKind::Agent)
-        );
-        assert_eq!(
-            LoopNodeKind::from_str("check"),
-            Some(LoopNodeKind::Check)
-        );
-        assert_eq!(
-            LoopNodeKind::from_str("gate"),
-            Some(LoopNodeKind::Gate)
-        );
+        assert_eq!(LoopNodeKind::from_str("agent"), Some(LoopNodeKind::Agent));
+        assert_eq!(LoopNodeKind::from_str("check"), Some(LoopNodeKind::Check));
+        assert_eq!(LoopNodeKind::from_str("gate"), Some(LoopNodeKind::Gate));
         assert!(LoopNodeKind::from_str("invalid").is_none());
     }
 
@@ -515,9 +491,6 @@ Task:
     fn loop_run_status_from_str() {
         assert_eq!(LoopRunStatus::from_str("pass"), LoopRunStatus::Pass);
         assert_eq!(LoopRunStatus::from_str("fail"), LoopRunStatus::Fail);
-        assert_eq!(
-            LoopRunStatus::from_str("invalid"),
-            LoopRunStatus::Running
-        );
+        assert_eq!(LoopRunStatus::from_str("invalid"), LoopRunStatus::Running);
     }
 }

@@ -1,32 +1,19 @@
 use super::types::{AgentEntry, App, Focus};
 use crate::tui::agent::{AgentStatus, InteractiveAgent};
 use crate::tui::terminal_history::save_history;
+use regex::Regex;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 const SHADOW_SUMMARY_LINGER_SECS: u64 = 7;
 const SHADOW_SUMMARY_INSTRUCTION: &str = "Session terminated by user. Before exit, call intelligence_upsert with kind='session' and persist a concise summary including: mission outcome, key decisions, pending follow-ups, and any reusable facts/patterns.";
 
+static ANSI_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\x1b\[[0-9;]*[A-Za-z]").expect("invalid ANSI regex"));
+
 /// Strip ANSI escape sequences from a string for plain-text display.
 fn strip_ansi_codes(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            // Skip CSI sequences: ESC [ ... final_byte
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                while let Some(&next) = chars.peek() {
-                    chars.next();
-                    if next.is_ascii_alphabetic() || next == 'm' {
-                        break;
-                    }
-                }
-            }
-        } else {
-            result.push(c);
-        }
-    }
-    result
+    ANSI_RE.replace_all(s, "").into_owned()
 }
 
 fn recent_output_snippet(agent: &InteractiveAgent, n: usize) -> String {
