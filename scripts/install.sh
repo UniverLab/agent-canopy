@@ -1,9 +1,9 @@
 #!/bin/sh
 # install.sh — download and install canopy from GitHub Releases
-# Usage: curl -fsSL https://raw.githubusercontent.com/UniverLab/agent-canopy/main/scripts/install.sh | sh
+# Usage: curl -fsSL https://raw.githubusercontent.com/UniverLab/harness-canopy/main/scripts/install.sh | sh
 set -eu
 
-REPO="UniverLab/agent-canopy"
+REPO="UniverLab/harness-canopy"
 BINARY="canopy"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 
