@@ -1,3 +1,4 @@
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
@@ -94,6 +95,8 @@ pub fn draw_new_agent_dialog(frame: &mut Frame, app: &App) {
     frame.render_widget(Clear, area);
     draw_dialog_left_wave(frame, area, app.animation_tick.into());
 
+    let field_width = prompt_field_width(frame.area());
+
     let block = Block::default()
         .title(dialog_title(dialog))
         .borders(Borders::ALL)
@@ -103,7 +106,7 @@ pub fn draw_new_agent_dialog(frame: &mut Frame, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let lines = build_dialog_lines(dialog, accent, &filtered_clis);
+    let lines = build_dialog_lines(dialog, accent, &filtered_clis, field_width);
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -111,10 +114,16 @@ pub fn draw_new_agent_dialog(frame: &mut Frame, app: &App) {
 
 fn dialog_height(dialog: &NewAgentDialog, filtered_clis: &[usize]) -> u16 {
     let dir_rows = dir_browser_rows(dialog);
+    let prompt_rows = if matches!(dialog.task_type, NewTaskType::Background) {
+        // 1 label row + 3 visible prompt rows
+        1 + PROMPT_VISIBLE_ROWS as u16
+    } else {
+        0
+    };
     let base_height = match dialog.task_type {
         NewTaskType::Interactive => 14 + dir_rows,
         NewTaskType::Terminal => 10 + dir_rows,
-        NewTaskType::Background => 15 + dir_rows,
+        NewTaskType::Background => 15 + dir_rows + prompt_rows,
     };
 
     base_height + cli_picker_rows(dialog, filtered_clis.len()) + model_picker_rows(dialog)
@@ -219,17 +228,34 @@ fn build_dialog_lines(
     dialog: &NewAgentDialog,
     accent: Color,
     filtered_clis: &[usize],
+    field_width: usize,
 ) -> Vec<Line<'static>> {
     let layout = FieldLayout::for_task(dialog.task_type);
     let mut lines = dialog_header_lines(dialog, accent);
 
     match dialog.task_type {
         NewTaskType::Interactive => {
-            append_interactive_sections(&mut lines, dialog, accent, filtered_clis, layout);
+            append_interactive_sections(
+                &mut lines,
+                dialog,
+                accent,
+                filtered_clis,
+                layout,
+                field_width,
+            );
         }
-        NewTaskType::Terminal => append_terminal_sections(&mut lines, dialog, accent),
+        NewTaskType::Terminal => {
+            append_terminal_sections(&mut lines, dialog, accent, field_width);
+        }
         NewTaskType::Background => {
-            append_background_sections(&mut lines, dialog, accent, filtered_clis, layout);
+            append_background_sections(
+                &mut lines,
+                dialog,
+                accent,
+                filtered_clis,
+                layout,
+                field_width,
+            );
         }
     }
 
@@ -349,6 +375,7 @@ fn append_interactive_sections(
     accent: Color,
     filtered_clis: &[usize],
     layout: FieldLayout,
+    _field_width: usize,
 ) {
     if !dialog.is_edit_mode() {
         push_spaced_row(lines, interactive_mode_row(dialog, accent));
@@ -365,6 +392,7 @@ fn append_terminal_sections(
     lines: &mut Vec<Line<'static>>,
     dialog: &NewAgentDialog,
     accent: Color,
+    _field_width: usize,
 ) {
     append_directory_section(
         lines,
@@ -383,11 +411,12 @@ fn append_background_sections(
     accent: Color,
     filtered_clis: &[usize],
     layout: FieldLayout,
+    field_width: usize,
 ) {
     append_trigger_section(lines, dialog, accent);
     append_cli_section(lines, dialog, accent, filtered_clis, layout.cli);
     append_model_section(lines, dialog, accent, layout.model);
-    append_prompt_section(lines, dialog, accent, layout);
+    append_prompt_section(lines, dialog, accent, layout, field_width);
 
     let hide_dir = dialog.background_trigger == BackgroundTrigger::Watch;
     let browser_field = if hide_dir { layout.extra } else { layout.dir };
@@ -581,7 +610,7 @@ fn append_model_picker_rows(
 
     if total > MODEL_PICKER_VISIBLE {
         lines.push(Line::from(Span::styled(
-            format!("    … {total} models  ↑↓ scroll  → accept  Esc close"),
+            format!("    … {total} models  ↑↓ scroll  Enter accept  Esc close"),
             Style::default().fg(DIM),
         )));
     }
@@ -638,32 +667,198 @@ fn append_prompt_section(
     dialog: &NewAgentDialog,
     accent: Color,
     layout: FieldLayout,
+    field_width: usize,
 ) {
-    push_spaced_row(lines, background_prompt_row(dialog, accent, layout.prompt));
+    push_spaced_row(
+        lines,
+        background_prompt_label(dialog, accent, layout.prompt),
+    );
+    append_prompt_input_block(lines, dialog, accent, layout.prompt, field_width);
     push_spaced_row(lines, background_target_row(dialog, accent, layout.extra));
 }
 
-fn background_prompt_row(
+fn background_prompt_label(
     dialog: &NewAgentDialog,
     accent: Color,
     prompt_field: usize,
 ) -> Line<'static> {
+    let focus = focus_style(dialog.field, prompt_field, accent);
     Line::from(vec![
-        Span::styled("  Prompt:", Style::default().fg(DIM)),
+        Span::styled("  Prompt: ", Style::default().fg(DIM)),
         Span::styled(
-            prompt_value(dialog),
-            focus_style(dialog.field, prompt_field, accent),
+            format!(" {} rows ", PROMPT_VISIBLE_ROWS),
+            focus.add_modifier(Modifier::DIM),
         ),
     ])
 }
 
-fn prompt_value(dialog: &NewAgentDialog) -> String {
-    if dialog.prompt.is_empty() {
-        " enter agent prompt...".to_string()
+/// Wrap the prompt char-accurately at `field_width` and render `PROMPT_VISIBLE_ROWS`
+/// lines starting from `dialog.prompt_scroll`, drawing a block cursor at
+/// `dialog.prompt_cursor`. Mirrors the math in `prompt_visual_line_count` so
+/// scrolling, the input handler, and the render stay in lockstep.
+fn append_prompt_input_block(
+    lines: &mut Vec<Line<'static>>,
+    dialog: &NewAgentDialog,
+    accent: Color,
+    prompt_field: usize,
+    field_width: usize,
+) {
+    let field_width = field_width.max(1);
+    let indent = "  ";
+    let is_focused = dialog.field == prompt_field;
+    let placeholder = "enter agent prompt…";
+    let cursor_style = if is_focused {
+        Style::default()
+            .fg(Color::Black)
+            .bg(accent)
+            .add_modifier(Modifier::BOLD)
     } else {
-        format!(" {}▏", dialog.prompt)
+        Style::default().fg(DIM)
+    };
+    let base_style = if is_focused {
+        Style::default().fg(Color::White)
+    } else {
+        Style::default().fg(DIM)
+    };
+
+    for row in 0..PROMPT_VISIBLE_ROWS {
+        let line_index = dialog.prompt_scroll + row;
+        let mut spans: Vec<Span<'static>> = vec![Span::styled(indent, Style::default().fg(DIM))];
+        if dialog.prompt.is_empty() {
+            // Empty prompt: show placeholder only on the first row, otherwise
+            // leave a blank cell so the cursor still has a visible home.
+            if line_index == 0 {
+                if is_focused && dialog.prompt_cursor == 0 {
+                    spans.push(Span::styled(" ", cursor_style));
+                } else {
+                    spans.push(Span::styled(
+                        placeholder.chars().take(field_width).collect::<String>(),
+                        Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
+                    ));
+                }
+            } else if is_focused {
+                spans.push(Span::styled(" ", cursor_style));
+            }
+            lines.push(Line::from(spans));
+            continue;
+        }
+
+        let char_range = prompt_visual_line_range(dialog, line_index, field_width);
+        let chars_in_row: String = dialog
+            .prompt
+            .chars()
+            .skip(char_range.0)
+            .take(char_range.1 - char_range.0)
+            .collect();
+        let mut col = 0usize;
+        let mut char_pos = char_range.0;
+        for ch in chars_in_row.chars() {
+            if ch == '\n' {
+                char_pos += 1;
+                continue;
+            }
+            if col >= field_width {
+                break;
+            }
+            let style = if is_focused && char_pos == dialog.prompt_cursor {
+                cursor_style
+            } else {
+                base_style
+            };
+            spans.push(Span::styled(ch.to_string(), style));
+            col += 1;
+            char_pos += 1;
+        }
+        // Cursor at the end of the last row when it sits on a non-existent
+        // cell — draw a highlighted blank so the caret stays visible.
+        if is_focused
+            && dialog.prompt_cursor == char_pos
+            && line_index + 1 >= prompt_visual_line_count(dialog, field_width)
+        {
+            spans.push(Span::styled(" ", cursor_style));
+        }
+        lines.push(Line::from(spans));
     }
 }
+
+/// Char index range `[start, end)` that maps to `visual_line_index` when the
+/// prompt is wrapped at `field_width`. Hard newlines count as line breaks and
+/// are skipped by the renderer (which flushes the current line at `\n`).
+fn prompt_visual_line_range(
+    dialog: &NewAgentDialog,
+    visual_line_index: usize,
+    field_width: usize,
+) -> (usize, usize) {
+    let field_width = field_width.max(1);
+    let mut line_start = 0usize;
+    let mut line_index = 0usize;
+    let mut col = 0usize;
+    let iter = dialog.prompt.char_indices();
+    for (_, ch) in iter {
+        if ch == '\n' {
+            if line_index == visual_line_index {
+                return (line_start, line_start + col);
+            }
+            line_index += 1;
+            line_start += col + 1; // skip the '\n' itself
+            col = 0;
+            continue;
+        }
+        if col >= field_width {
+            if line_index == visual_line_index {
+                return (line_start, line_start + field_width);
+            }
+            line_index += 1;
+            line_start += field_width;
+            col = 0;
+        }
+        col += 1;
+    }
+    if line_index == visual_line_index {
+        return (line_start, line_start + col);
+    }
+    (dialog.prompt.chars().count(), dialog.prompt.chars().count())
+}
+
+/// Number of visual lines the prompt occupies at `field_width`. Empty prompts
+/// count as 1 line so the cursor / placeholder always have a home.
+pub(crate) fn prompt_visual_line_count(dialog: &NewAgentDialog, field_width: usize) -> usize {
+    if dialog.prompt.is_empty() {
+        return 1;
+    }
+    let field_width = field_width.max(1);
+    let mut lines = 1usize;
+    let mut col = 0usize;
+    for ch in dialog.prompt.chars() {
+        if ch == '\n' {
+            lines += 1;
+            col = 0;
+            continue;
+        }
+        if col >= field_width {
+            lines += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    lines
+}
+
+/// Mirrors the calculation in `event::prompt_template::prompt_field_width` so
+/// the renderer's wrap math, the cursor's visual line index, and the input
+/// handler's `Up`/`Down` row jumps all agree on narrow terminals.
+pub(crate) fn prompt_field_width(frame_area: Rect) -> usize {
+    let term_width = frame_area.width.max(1);
+    let max_dialog_w = term_width.saturating_sub(2).max(1);
+    let preferred_dialog_w = term_width.saturating_mul(65) / 100;
+    let min_dialog_w = 40u16.min(max_dialog_w);
+    let dialog_width = preferred_dialog_w.clamp(min_dialog_w, max_dialog_w);
+    // dialog borders (2) + content indent (2) + 1 cell breathing room
+    (dialog_width.saturating_sub(5) as usize).max(10)
+}
+
+pub(crate) const PROMPT_VISIBLE_ROWS: usize = 3;
 
 fn background_target_row(
     dialog: &NewAgentDialog,
@@ -690,9 +885,9 @@ fn background_target_row(
 
 fn cron_value(dialog: &NewAgentDialog) -> String {
     if dialog.cron_expr.is_empty() {
-        " * * * * *  (min hr dom mon dow)".to_string()
+        " * * * * *  (min hr dom mon dow · local time)".to_string()
     } else {
-        format!(" {}▏", dialog.cron_expr)
+        format!(" {}▏ (local time)", dialog.cron_expr)
     }
 }
 
@@ -844,4 +1039,88 @@ fn dir_browser_lines(dialog: &NewAgentDialog, accent: Color, focused: bool) -> V
     lines.push(Line::from(Span::styled(footer, Style::default().fg(DIM))));
     lines.push(Line::from(""));
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::app::dialog::new_agent::NewAgentDialog;
+
+    fn dialog_with(prompt: &str) -> NewAgentDialog {
+        let mut d = NewAgentDialog::new(Some("."));
+        d.prompt = prompt.to_string();
+        d.prompt_cursor = prompt.chars().count();
+        d
+    }
+
+    #[test]
+    fn empty_prompt_counts_as_one_visual_line() {
+        let d = dialog_with("");
+        assert_eq!(prompt_visual_line_count(&d, 30), 1);
+    }
+
+    #[test]
+    fn single_short_line_counts_as_one_visual_line() {
+        let d = dialog_with("hello world");
+        assert_eq!(prompt_visual_line_count(&d, 30), 1);
+    }
+
+    #[test]
+    fn hard_newline_breaks_visual_line() {
+        let d = dialog_with("first\nsecond");
+        assert_eq!(prompt_visual_line_count(&d, 30), 2);
+    }
+
+    #[test]
+    fn overflow_wraps_at_field_width() {
+        let d = dialog_with("abcdefghij"); // 10 chars
+        assert_eq!(prompt_visual_line_count(&d, 4), 3); // 4 + 4 + 2
+    }
+
+    #[test]
+    fn visual_line_range_respects_hard_newline_boundary() {
+        let d = dialog_with("abc\ndef");
+        assert_eq!(prompt_visual_line_range(&d, 0, 30), (0, 3));
+        assert_eq!(prompt_visual_line_range(&d, 1, 30), (4, 7));
+    }
+
+    #[test]
+    fn visual_line_range_respects_soft_wrap_boundary() {
+        let d = dialog_with("abcdefghij");
+        assert_eq!(prompt_visual_line_range(&d, 0, 4), (0, 4));
+        assert_eq!(prompt_visual_line_range(&d, 1, 4), (4, 8));
+        assert_eq!(prompt_visual_line_range(&d, 2, 4), (8, 10));
+    }
+
+    #[test]
+    fn out_of_range_line_returns_past_end() {
+        let d = dialog_with("abc");
+        assert_eq!(prompt_visual_line_range(&d, 5, 30), (3, 3));
+    }
+
+    #[test]
+    fn prompt_field_width_clamps_to_terminal_width() {
+        use ratatui::layout::Rect;
+        // Tiny terminal: 30 cols → preferred 19, min 30, clamp 30. minus 5 = 25.
+        let w = prompt_field_width(Rect::new(0, 0, 30, 20));
+        assert!(w <= 25);
+        assert!(w >= 10);
+    }
+
+    #[test]
+    fn prompt_field_width_grows_with_terminal() {
+        use ratatui::layout::Rect;
+        let w_small = prompt_field_width(Rect::new(0, 0, 80, 20));
+        let w_large = prompt_field_width(Rect::new(0, 0, 200, 20));
+        assert!(w_large > w_small);
+    }
+
+    #[test]
+    fn background_dialog_height_includes_prompt_block() {
+        let mut d = NewAgentDialog::new(Some("."));
+        d.task_type = NewTaskType::Background;
+        let h = dialog_height(&d, &[]);
+        // base 15 + 1 label row + 3 input rows = 19 when no pickers / no dir entries
+        assert!(h >= 19, "expected >= 19, got {h}");
+    }
 }

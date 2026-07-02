@@ -1,6 +1,6 @@
 //! UI rendering — sidebar with agent cards, log panel, header, footer, and dialogs.
 
-mod dialogs;
+pub(crate) mod dialogs;
 mod footer;
 mod header;
 mod panel;

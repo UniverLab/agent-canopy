@@ -335,9 +335,7 @@ pub(super) fn handle_playground_key(app: &mut App, code: KeyCode, modifiers: Key
     match code {
         KeyCode::F(10) => {
             app.deactivate_playground();
-            if app.focus != Focus::Agent {
-                app.focus = Focus::Preview;
-            }
+            app.focus = Focus::Preview;
         }
         KeyCode::Up if modifiers.contains(KeyModifiers::SHIFT) => {
             app.deactivate_playground();

@@ -202,7 +202,7 @@ fn dispatch_focus_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> 
     match app.focus {
         Focus::Home => handle_home_key(app, code, modifiers),
         Focus::Preview => handle_preview_key(app, code, modifiers),
-        Focus::NewAgentDialog => handle_dialog_key(app, code),
+        Focus::NewAgentDialog => handle_dialog_key(app, code, modifiers),
         Focus::LaunchpadDialog => handle_launchpad_key(app, code),
         Focus::KnowledgeDialog => handle_knowledge_dialog_key(app, code),
         Focus::Agent => handle_agent_key(app, code, modifiers),
