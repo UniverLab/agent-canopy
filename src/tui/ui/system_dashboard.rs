@@ -9,7 +9,7 @@ use ratatui::Frame;
 
 use super::DIM;
 use crate::domain::canopy_config::TemperatureUnit;
-use crate::system::SystemInfo;
+use crate::system::{PowerSource, SystemInfo};
 
 // ── Alert colors ────────────────────────────────────────────────
 
@@ -132,29 +132,38 @@ fn create_system_dashboard_lines(
     }
     let mut lines = vec![Line::from(cpu_spans)];
 
-    // GPU line right after CPU if available
+    // GPU line right after CPU if available. The power draw is folded
+    // into the same row when both are present — splitting "gpu usage" and
+    // "gpu watts" into two lines made the sysinfo taller than it needs to
+    // be, and the two values are conceptually one (the energy the chip is
+    // drawing right now).
     if let Some(gpu) = &system_info.gpu_info {
         let usage_pct = gpu.usage.unwrap_or(0.0);
         let gpu_usage_color = alert_color(usage_pct, 70.0, 90.0);
 
-        let vram_text = if let (Some(vram_used), Some(vram_total)) = (gpu.vram_used, gpu.vram_total)
-        {
-            if vram_total > 0 {
-                let vram_percent = (vram_used as f32 / vram_total as f32) * 100.0;
-                Some(format!(
-                    "{:.0}% {}",
-                    vram_percent,
-                    format_megabytes_smart(vram_used)
-                ))
-            } else {
-                None
-            }
-        } else {
-            None
+        // Show VRAM as a single size figure ("1.25GB"). The percentage
+        // version (`16% 1.25GB`) is dropped because the same info is
+        // already implicit in the size, and the percentage competes with
+        // the colored GPU usage percentage for attention at a glance.
+        let vram_size_text = match (gpu.vram_used, gpu.vram_total) {
+            (Some(used), Some(total)) if total > 0 => Some(format_megabytes_smart(used)),
+            _ => None,
+        };
+
+        // Power draw (watts), folded into this row only when the GPU
+        // itself is the source. Battery discharge is a system-wide number,
+        // not the GPU's, so it gets its own `pwr:` row below instead.
+        let power_watts = match system_info.power_source {
+            Some(PowerSource::Gpu) => system_info.power_watts,
+            _ => None,
         };
 
         // Only show GPU line if we have at least one piece of information
-        if gpu.usage.is_some() || gpu.temperature.is_some() || vram_text.is_some() {
+        if gpu.usage.is_some()
+            || gpu.temperature.is_some()
+            || vram_size_text.is_some()
+            || power_watts.is_some()
+        {
             let mut spans = vec![Span::styled("gpu: ", Style::default().fg(Color::White))];
 
             if let Some(usage) = gpu.usage {
@@ -170,11 +179,26 @@ fn create_system_dashboard_lines(
                     Style::default().fg(gpu_temp_alert_color(temp)),
                 ));
             }
-            if let Some(ref vram) = vram_text {
-                if gpu.usage.is_some() || gpu.temperature.is_some() {
+            // Layout: <usage>% <temp> · <vram> · <watts>W
+            // The " · " separator is only emitted when at least one of
+            // usage/temp has already been printed, so an empty start
+            // (rare, only watt data) doesn't show a leading separator.
+            let has_left = gpu.usage.is_some() || gpu.temperature.is_some();
+            if let Some(ref vram) = vram_size_text {
+                if has_left {
                     spans.push(Span::styled(" · ", Style::default().fg(Color::White)));
                 }
-                spans.push(Span::styled(vram.to_string(), Style::default().fg(DIM)));
+                spans.push(Span::styled(vram.clone(), Style::default().fg(DIM)));
+            }
+            if let Some(watts) = power_watts {
+                let any_left = has_left || vram_size_text.is_some();
+                if any_left {
+                    spans.push(Span::styled(" · ", Style::default().fg(Color::White)));
+                }
+                spans.push(Span::styled(
+                    format!("{watts:.0}W"),
+                    Style::default().fg(DIM),
+                ));
             }
 
             lines.push(Line::from(spans));
@@ -199,32 +223,33 @@ fn create_system_dashboard_lines(
         ),
     ]));
 
-    // Power line (battery discharge or GPU draw) — percentage of the enforced
-    // power cap plus the current draw, only when a source reports it.
-    if let Some(watts) = system_info.power_watts {
-        let pct = system_info
-            .power_limit_watts
-            .filter(|l| *l > 0.0)
-            .map(|l| (watts / l) * 100.0);
-        let mut spans = vec![Span::styled("pwr: ", Style::default().fg(Color::White))];
-        // Match the other lines: colored percentage first, then the raw value dimmed.
-        if let Some(p) = pct {
-            spans.push(Span::styled(
-                format!("{p:.0}%"),
-                Style::default().fg(alert_color(p, 70.0, 90.0)),
-            ));
-            spans.push(Span::styled(
-                format!(" {watts:.0}W"),
-                Style::default().fg(DIM),
-            ));
-        } else {
-            // No power cap reported — show the raw draw only.
-            spans.push(Span::styled(
-                format!("{watts:.0}W"),
-                Style::default().fg(DIM),
-            ));
+    // Battery discharge gets its own `pwr:` line — it's a system-wide
+    // number, not the GPU's, so it doesn't belong folded into the GPU row
+    // above (that row only folds in GPU-sourced power).
+    if system_info.power_source == Some(PowerSource::Battery) {
+        if let Some(watts) = system_info.power_watts {
+            let pct = system_info
+                .power_limit_watts
+                .filter(|l| *l > 0.0)
+                .map(|l| (watts / l) * 100.0);
+            let mut spans = vec![Span::styled("pwr: ", Style::default().fg(Color::White))];
+            if let Some(p) = pct {
+                spans.push(Span::styled(
+                    format!("{p:.0}%"),
+                    Style::default().fg(alert_color(p, 70.0, 90.0)),
+                ));
+                spans.push(Span::styled(
+                    format!(" {watts:.0}W"),
+                    Style::default().fg(DIM),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    format!("{watts:.0}W"),
+                    Style::default().fg(DIM),
+                ));
+            }
+            lines.push(Line::from(spans));
         }
-        lines.push(Line::from(spans));
     }
 
     // Swap line only if actually being used — always yellow, no percentage
@@ -310,5 +335,129 @@ mod tests {
         assert!(all_text.contains("cpu:"), "Missing cpu line");
         assert!(all_text.contains("mem:"), "Missing mem line");
         assert!(!all_text.contains("disk:"), "Disk line should be removed");
+        // Power draw used to live in its own `pwr:` line; that line is
+        // gone — power is folded into the GPU row (or omitted when no GPU
+        // is present, which is the default for `SystemInfo::new()`).
+        assert!(!all_text.contains("pwr:"), "pwr: line should be removed");
+    }
+
+    #[test]
+    fn gpu_line_folds_power_and_drops_vram_percent() {
+        let mut info = SystemInfo::new();
+        info.gpu_info = Some(crate::system::GpuInfo {
+            name: "Test GPU".to_string(),
+            vendor: "NVIDIA".to_string(),
+            usage: Some(6.0),
+            temperature: Some(41.0),
+            // nvidia-smi's memory.used reports MiB, which is the unit
+            // `format_megabytes_smart` expects. 1280 MiB = 1.25 GiB.
+            vram_used: Some(1280),
+            vram_total: Some(8192),
+            power_watts: Some(12.0),
+            power_limit_watts: Some(150.0),
+        });
+        info.power_watts = Some(12.0);
+        info.power_source = Some(crate::system::PowerSource::Gpu);
+
+        let lines = create_system_dashboard_lines(&info, TemperatureUnit::Celsius, 10);
+        let gpu_line = lines
+            .iter()
+            .map(|l| l.to_string())
+            .find(|s| s.starts_with("gpu:"))
+            .expect("expected a gpu line");
+
+        // Layout: <usage>% <temp> · <vram> · <watts>W
+        // No percentage in front of the vram size, no separate pwr: line.
+        assert!(gpu_line.contains("6%"), "got: {gpu_line}");
+        assert!(gpu_line.contains("41°C"), "got: {gpu_line}");
+        assert!(gpu_line.contains("1.25GB"), "got: {gpu_line}");
+        assert!(gpu_line.contains("12W"), "got: {gpu_line}");
+        assert!(
+            !gpu_line.contains("16%"),
+            "vram percentage should be gone, got: {gpu_line}"
+        );
+
+        // No standalone pwr: line.
+        let all = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!all.contains("pwr:"), "got:\n{all}");
+    }
+
+    #[test]
+    fn battery_power_gets_its_own_pwr_line_not_folded_into_gpu() {
+        let mut info = SystemInfo::new();
+        info.gpu_info = Some(crate::system::GpuInfo {
+            name: "Test GPU".to_string(),
+            vendor: "NVIDIA".to_string(),
+            usage: Some(6.0),
+            temperature: Some(41.0),
+            vram_used: Some(1280),
+            vram_total: Some(8192),
+            // GPU itself reports no power draw...
+            power_watts: None,
+            power_limit_watts: None,
+        });
+        // ...the system-wide number comes from battery discharge instead.
+        info.power_watts = Some(18.0);
+        info.power_limit_watts = None;
+        info.power_source = Some(crate::system::PowerSource::Battery);
+
+        let lines = create_system_dashboard_lines(&info, TemperatureUnit::Celsius, 10);
+        let gpu_line = lines
+            .iter()
+            .map(|l| l.to_string())
+            .find(|s| s.starts_with("gpu:"))
+            .expect("expected a gpu line");
+        assert!(
+            !gpu_line.contains("W"),
+            "battery watts must not fold into the gpu line, got: {gpu_line}"
+        );
+
+        let pwr_line = lines
+            .iter()
+            .map(|l| l.to_string())
+            .find(|s| s.starts_with("pwr:"))
+            .expect("expected a standalone pwr line for battery-sourced power");
+        assert!(pwr_line.contains("18W"), "got: {pwr_line}");
+    }
+
+    #[test]
+    fn gpu_line_omits_watts_when_no_power_data() {
+        let mut info = SystemInfo::new();
+        info.gpu_info = Some(crate::system::GpuInfo {
+            name: "Test GPU".to_string(),
+            vendor: "NVIDIA".to_string(),
+            usage: Some(6.0),
+            temperature: Some(41.0),
+            vram_used: Some(1280),
+            vram_total: Some(8192),
+            power_watts: None,
+            power_limit_watts: None,
+        });
+        // System-level power also missing.
+        info.power_watts = None;
+
+        let lines = create_system_dashboard_lines(&info, TemperatureUnit::Celsius, 10);
+        let gpu_line = lines
+            .iter()
+            .map(|l| l.to_string())
+            .find(|s| s.starts_with("gpu:"))
+            .expect("expected a gpu line");
+
+        assert!(gpu_line.contains("6%"));
+        assert!(gpu_line.contains("41°C"));
+        assert!(gpu_line.contains("1.25GB"));
+        assert!(
+            !gpu_line.contains("W"),
+            "no watts when power is unknown, got: {gpu_line}"
+        );
+        // Trailing separator must be elided too.
+        assert!(
+            !gpu_line.trim_end().ends_with("·"),
+            "trailing separator when no watts, got: {gpu_line}"
+        );
     }
 }
