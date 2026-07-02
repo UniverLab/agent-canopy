@@ -1,9 +1,21 @@
 use crate::tui::app::types::App;
+use crate::tui::terminal_history::SessionHistory;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
+
+fn ghost_for(
+    histories: &std::collections::HashMap<String, SessionHistory>,
+    session_name: &str,
+    input: &str,
+) -> Option<String> {
+    histories
+        .get(session_name)
+        .and_then(|h| h.ghost_suggestion(input))
+        .map(str::to_string)
+}
 
 pub fn draw_warp_input_box(frame: &mut Frame, area: Rect, app: &App, idx: usize) {
     let Some(agent) = app.terminal_agents.get(idx) else {
@@ -25,9 +37,12 @@ pub fn draw_warp_input_box(frame: &mut Frame, area: Rect, app: &App, idx: usize)
     let cursor_pos = agent.warp_cursor.min(input_text.len());
 
     let accent = agent.accent_color;
-    let block = Block::default()
-        .borders(Borders::TOP)
-        .border_style(Style::default().fg(accent));
+    // Field-style input box (no border, darkgray background — matches the
+    // opencode chat input look). The split layout already reserves 3 rows
+    // for this area; we use them all so the field has visible top/bottom
+    // padding around the single text row.
+    let input_bg = Color::Rgb(40, 40, 50);
+    let block = Block::default().style(Style::default().bg(input_bg));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -35,26 +50,35 @@ pub fn draw_warp_input_box(frame: &mut Frame, area: Rect, app: &App, idx: usize)
         return;
     }
 
+    // Every text span inside the field must carry the field's background
+    // explicitly, otherwise ratatui falls back to the terminal default
+    // and the text appears to float on the wrong color.
+    let bg = input_bg;
+    let prompt_style = |fg: Color, bold: bool| {
+        let mut s = Style::default().bg(bg).fg(fg);
+        if bold {
+            s = s.add_modifier(Modifier::BOLD);
+        }
+        s
+    };
+
     // Prompt indicator: compact cwd + chevron
     let prompt = format!("{} ❯ ", cwd);
     let prompt_len = prompt.chars().count() as u16;
     let available_width = inner.width.saturating_sub(prompt_len) as usize;
 
     // Build the line: [prompt] [input_text]
-    let mut spans = vec![Span::styled(
-        &prompt,
-        Style::default().fg(accent).add_modifier(Modifier::BOLD),
-    )];
+    let mut spans = vec![Span::styled(&prompt, prompt_style(accent, true))];
 
     if sensitive_input {
         spans.push(Span::styled(
             "[hidden input]",
-            Style::default().fg(Color::Rgb(180, 180, 120)),
+            prompt_style(Color::Rgb(180, 180, 120), false),
         ));
     } else if input_text.is_empty() {
         spans.push(Span::styled(
             "type a command…",
-            Style::default().fg(Color::Rgb(80, 80, 100)),
+            prompt_style(Color::Rgb(80, 80, 100), false),
         ));
     } else {
         // Horizontal scroll: keep cursor visible
@@ -102,8 +126,32 @@ pub fn draw_warp_input_box(frame: &mut Frame, area: Rect, app: &App, idx: usize)
 
         spans.push(Span::styled(
             visible_text,
-            Style::default().fg(Color::White),
+            prompt_style(Color::White, false),
         ));
+
+        // Inline ghost-text suggestion. The first history entry that
+        // starts with the current input (case-sensitive) is shown as a
+        // faint completion hint. Only when the cursor sits at the end of
+        // the input — otherwise accepting it would interleave with the
+        // current cursor position, which is surprising.
+        if cursor_pos == input_text.len() {
+            if let Some(ghost) = ghost_for(&app.terminal_histories, &agent.name, &input_text) {
+                let suffix = &ghost[input_text.len()..];
+                if !suffix.is_empty() {
+                    let suffix_chars: Vec<char> = suffix.chars().collect();
+                    let max_suffix = available_width.saturating_sub(input_text.chars().count());
+                    let visible_suffix: String =
+                        suffix_chars.into_iter().take(max_suffix).collect();
+                    if !visible_suffix.is_empty() {
+                        spans.push(Span::styled(
+                            visible_suffix,
+                            prompt_style(Color::Rgb(110, 110, 130), false)
+                                .add_modifier(Modifier::ITALIC),
+                        ));
+                    }
+                }
+            }
+        }
     }
 
     let line = Line::from(spans);
