@@ -52,6 +52,96 @@ fn style_collapsed_paste_blocks(
     result
 }
 
+/// Wrap styled content into visual lines with the exact char-based math of
+/// `SimplePromptDialog::visual_line_count`, so rendered text, box height, and
+/// cursor/scroll positions always agree. Hard newlines break lines (ratatui
+/// drops `\n` inside a `Line` as a control char, which visually glued words
+/// together), overflow wraps at `field_width`, and tabs expand to 4-col stops.
+/// The char at `cursor_idx` is drawn as a block cursor.
+fn wrap_styled_content(
+    styled_content: Vec<(String, Option<Color>)>,
+    cursor_idx: Option<usize>,
+    field_width: usize,
+    section_bg: Color,
+) -> Vec<Line<'static>> {
+    fn flush_run(spans: &mut Vec<Span<'static>>, run: &mut String, style: Style) {
+        if !run.is_empty() {
+            spans.push(Span::styled(std::mem::take(run), style));
+        }
+    }
+
+    let field_width = field_width.max(1);
+    let cursor_style = Style::default().fg(section_bg).bg(Color::White);
+
+    let mut lines: Vec<Line> = Vec::new();
+    let mut spans: Vec<Span> = Vec::new();
+    let mut run = String::new();
+    let mut run_style = Style::default().fg(Color::White).bg(section_bg);
+    let mut col = 0usize;
+    let mut char_pos = 0usize;
+
+    for (text, color) in styled_content {
+        let base_style = Style::default()
+            .fg(color.unwrap_or(Color::White))
+            .bg(section_bg);
+        for ch in text.chars() {
+            let style = if cursor_idx == Some(char_pos) {
+                cursor_style
+            } else {
+                base_style
+            };
+            match ch {
+                '\n' => {
+                    flush_run(&mut spans, &mut run, run_style);
+                    if style == cursor_style {
+                        spans.push(Span::styled(" ", cursor_style));
+                    }
+                    lines.push(Line::from(std::mem::take(&mut spans)));
+                    col = 0;
+                }
+                '\t' => {
+                    let tab = 4 - (col % 4);
+                    if col + tab > field_width {
+                        flush_run(&mut spans, &mut run, run_style);
+                        lines.push(Line::from(std::mem::take(&mut spans)));
+                        col = tab;
+                    } else {
+                        col += tab;
+                    }
+                    if style != run_style {
+                        flush_run(&mut spans, &mut run, run_style);
+                        run_style = style;
+                    }
+                    run.push_str(&" ".repeat(tab));
+                }
+                _ => {
+                    if col + 1 > field_width {
+                        flush_run(&mut spans, &mut run, run_style);
+                        lines.push(Line::from(std::mem::take(&mut spans)));
+                        col = 1;
+                    } else {
+                        col += 1;
+                    }
+                    if style != run_style {
+                        flush_run(&mut spans, &mut run, run_style);
+                        run_style = style;
+                    }
+                    run.push(ch);
+                }
+            }
+            char_pos += 1;
+        }
+    }
+
+    flush_run(&mut spans, &mut run, run_style);
+    // Cursor past the end of content: draw it as a highlighted blank cell.
+    if cursor_idx == Some(char_pos) {
+        spans.push(Span::styled(" ", cursor_style));
+    }
+    lines.push(Line::from(spans));
+    lines
+}
+
 // Old function removed - using simple prompt dialog instead
 fn generate_top_border(title: &str, width: u16, style: Style) -> Line<'static> {
     if width < 2 {
@@ -80,6 +170,9 @@ fn generate_top_border(title: &str, width: u16, style: Style) -> Line<'static> {
 
 /// Generate a bottom border line dynamically based on width
 fn generate_bottom_border(width: u16, style: Style) -> Line<'static> {
+    if width < 2 {
+        return Line::from(vec![Span::styled(String::new(), style)]);
+    }
     let border = format!("└{}┘", "─".repeat((width - 2) as usize));
     Line::from(vec![Span::styled(border, style)])
 }
@@ -373,61 +466,10 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) {
             // Use default file reference styling
             dialog.get_file_reference_with_styling(&render_text, accent)
         };
-        let mut spans = Vec::new();
-        if let Some(cursor_idx) = cursor_idx_opt {
-            // Block cursor: highlight the char under the cursor without shifting text
-            let mut char_count: usize = 0;
-            for (text, color) in styled_content {
-                let span_style = if let Some(c) = color {
-                    Style::default().fg(c).bg(section_bg)
-                } else {
-                    Style::default().fg(Color::White).bg(section_bg)
-                };
-                let text_chars = text.chars().count();
-                if cursor_idx >= char_count && cursor_idx < char_count + text_chars {
-                    let local_pos = cursor_idx - char_count;
-                    let before: String = text.chars().take(local_pos).collect();
-                    let cursor_ch: String = text
-                        .chars()
-                        .nth(local_pos)
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| " ".to_string());
-                    let after: String = text.chars().skip(local_pos + 1).collect();
-                    if !before.is_empty() {
-                        spans.push(Span::styled(before, span_style));
-                    }
-                    spans.push(Span::styled(
-                        cursor_ch,
-                        Style::default().fg(section_bg).bg(Color::White),
-                    ));
-                    if !after.is_empty() {
-                        spans.push(Span::styled(after, span_style));
-                    }
-                } else {
-                    spans.push(Span::styled(text, span_style));
-                }
-                char_count += text_chars;
-            }
-            if cursor_idx >= char_count {
-                spans.push(Span::styled(
-                    " ",
-                    Style::default().fg(section_bg).bg(Color::White),
-                ));
-            }
-        } else {
-            for (text, color) in styled_content {
-                let span_style = if let Some(c) = color {
-                    Style::default().fg(c).bg(section_bg)
-                } else {
-                    Style::default().fg(Color::White).bg(section_bg)
-                };
-                spans.push(Span::styled(text, span_style));
-            }
-        }
-
-        let content_paragraph = Paragraph::new(Line::from(spans))
-            .wrap(ratatui::widgets::Wrap { trim: false })
-            .scroll((scroll_offset, 0));
+        let wrapped_lines =
+            wrap_styled_content(styled_content, cursor_idx_opt, field_width, section_bg);
+        let content_paragraph =
+            Paragraph::new(ratatui::text::Text::from(wrapped_lines)).scroll((scroll_offset, 0));
 
         let content_area = ratatui::layout::Rect {
             x: inner.x + 1,
@@ -491,4 +533,44 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) {
 
     // Draw picker modal if open
     draw_section_picker_modal(frame, app, accent, &dialog.picker_mode);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line_text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn wrap_preserves_spaces_and_breaks_on_newline() {
+        let styled = vec![("hola mundo\nsegunda línea".to_string(), None)];
+        let lines = wrap_styled_content(styled, None, 40, Color::Black);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(texts, vec!["hola mundo", "segunda línea"]);
+    }
+
+    #[test]
+    fn wrap_matches_visual_line_count_on_overflow() {
+        use crate::tui::app::dialog::SimplePromptDialog;
+        let content = "una frase que se pasa del ancho del campo";
+        let width = 10;
+        let lines =
+            wrap_styled_content(vec![(content.to_string(), None)], None, width, Color::Black);
+        assert_eq!(
+            lines.len(),
+            SimplePromptDialog::visual_line_count(content, width)
+        );
+        // No characters are lost or altered by wrapping.
+        let joined: String = lines.iter().map(|l| line_text(l)).collect();
+        assert_eq!(joined, content.replace('\n', ""));
+    }
+
+    #[test]
+    fn wrap_renders_cursor_at_end_as_blank_cell() {
+        let styled = vec![("ab".to_string(), None)];
+        let lines = wrap_styled_content(styled, Some(2), 40, Color::Black);
+        assert_eq!(line_text(&lines[0]), "ab ");
+    }
 }

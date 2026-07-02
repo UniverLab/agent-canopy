@@ -109,7 +109,7 @@ pub(crate) fn draw_section_picker_modal(
             let input_area = ratatui::layout::Rect {
                 x: inner.x + 1,
                 y: inner.y + 1,
-                width: inner.width - 2,
+                width: inner.width.saturating_sub(2),
                 height: 1,
             };
             frame.render_widget(Paragraph::new(input_line), input_area);

@@ -15,7 +15,7 @@ use ratatui::crossterm::event::{
 use std::time::Duration;
 
 use crate::tui::agent::InteractiveAgent;
-use crate::tui::app::types::{AgentEntry, App, Focus};
+use crate::tui::app::types::{AgentEntry, App, Focus, TerminalSelection};
 use crate::tui::app::TerminalSearch;
 use crate::tui::ui;
 
@@ -217,7 +217,13 @@ fn dispatch_focus_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> 
 // ── Mouse: scroll wheel + Shift+Click to copy selection ─────────────
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
-    if try_forward_mouse_to_pty(app, &mouse) || handle_copy_click(app, &mouse) {
+    if try_forward_mouse_to_pty(app, &mouse) {
+        // The child program owns the mouse; any pending selection is stale.
+        app.terminal_selection = None;
+        return Ok(());
+    }
+
+    if handle_copy_click(app, &mouse) || handle_selection_mouse(app, &mouse) {
         return Ok(());
     }
 
@@ -231,6 +237,7 @@ fn handle_copy_click(app: &mut App, mouse: &MouseEvent) -> bool {
     }
 
     if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+        app.terminal_selection = None;
         handle_shift_click_copy(app);
         return true;
     }
@@ -238,10 +245,93 @@ fn handle_copy_click(app: &mut App, mouse: &MouseEvent) -> bool {
     false
 }
 
+// ── Mouse drag selection over the focused PTY pane ───────────────────
+//
+// Click+drag selects text cells linearly (like a terminal); on release the
+// selection is copied to the system clipboard without any TUI decoration.
+fn handle_selection_mouse(app: &mut App, mouse: &MouseEvent) -> bool {
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.terminal_selection = None;
+            // Split layouts route input per-session; pane-relative selection
+            // only tracks the single focused panel geometry.
+            if app.active_split_id.is_some() {
+                return false;
+            }
+            let Some(agent) = selected_terminal_like(app) else {
+                return false;
+            };
+            let Some((col, row)) = mouse_pty_position(app, mouse) else {
+                return false;
+            };
+            app.terminal_selection = Some(TerminalSelection {
+                agent,
+                start: (row, col),
+                end: (row, col),
+                dragging: true,
+            });
+            true
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let (col, row) = clamped_pty_position(app, mouse);
+            let Some(sel) = app.terminal_selection.as_mut() else {
+                return false;
+            };
+            if !sel.dragging {
+                return false;
+            }
+            sel.end = (row, col);
+            true
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let Some(sel) = app.terminal_selection.take() else {
+                return false;
+            };
+            if !sel.dragging || sel.start == sel.end {
+                return false;
+            }
+            let (start, end) = sel.normalized();
+            let text = with_terminal_like_agent(app, sel.agent.0, sel.agent.1, |agent| {
+                agent
+                    .screen_snapshot()
+                    .map(|snap| snap.selection_text(start, end))
+            })
+            .flatten()
+            .unwrap_or_default();
+            if text.trim().is_empty() {
+                return true;
+            }
+            crate::tui::clipboard::set_text(&text);
+            mark_copied(app);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Pane-relative (col, row) for drag events, clamped to the panel bounds so
+/// dragging past an edge extends the selection to that edge.
+fn clamped_pty_position(app: &App, mouse: &MouseEvent) -> (u16, u16) {
+    let sidebar = sidebar_width(app);
+    let (panel_w, panel_h) = app.last_panel_inner;
+    let col = mouse
+        .column
+        .saturating_sub(sidebar)
+        .min(panel_w.saturating_sub(1));
+    let row = mouse
+        .row
+        .saturating_sub(app.last_panel_y)
+        .min(panel_h.saturating_sub(1));
+    (col, row)
+}
+
 fn handle_mouse_scroll(app: &mut App, mouse: &MouseEvent) {
     let Some(dir) = scroll_direction(mouse.kind) else {
         return;
     };
+
+    // Scrolling shifts the pane content under a selection's coordinates.
+    app.terminal_selection = None;
 
     if app.show_legend {
         let unlocked_count = app.mission_manager.unlocked_count();

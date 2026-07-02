@@ -53,6 +53,28 @@ pub enum Focus {
     ProjectRelationDialog,
 }
 
+/// Mouse text selection over the focused agent's PTY pane. Coordinates are
+/// pane-relative `(row, col)` cells matching the rendered `ScreenSnapshot`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TerminalSelection {
+    /// Selected agent this selection belongs to: (is_terminal, index).
+    pub agent: (bool, usize),
+    pub start: (u16, u16),
+    pub end: (u16, u16),
+    pub dragging: bool,
+}
+
+impl TerminalSelection {
+    /// Selection endpoints in linear (reading) order: start ≤ end.
+    pub fn normalized(&self) -> ((u16, u16), (u16, u16)) {
+        if self.end < self.start {
+            (self.end, self.start)
+        } else {
+            (self.start, self.end)
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ProjectsPanelFocus {
     Projects,
@@ -284,6 +306,8 @@ pub struct App {
     pub(crate) last_scroll_at: std::time::Instant,
     pub(crate) last_panel_inner: (u16, u16),
     pub(crate) last_panel_y: u16,
+    /// Active mouse text selection over the focused agent's PTY pane.
+    pub(crate) terminal_selection: Option<TerminalSelection>,
     pub(crate) whimsg: crate::tui::whimsg::Whimsg,
     /// Hash of the last log chunk scanned for whimsg triggers — avoids re-firing
     /// on the same content every tick.

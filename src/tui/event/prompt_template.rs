@@ -64,15 +64,16 @@ pub fn handle_prompt_template_key(
     Ok(())
 }
 
-fn prompt_field_width(app: &App) -> usize {
-    // Approximate instruction field width from terminal width
-    // Must match the render calculation in dialogs.rs:
-    //   dialog_width = (term_width * 65/100).max(40)
-    //   inner_width  = dialog_width - 2 (borders)
-    //   field_width  = inner_width - 2 (padding)
-    ((app.term_width as usize * 65 / 100).max(40))
-        .saturating_sub(4)
-        .max(10)
+pub(crate) fn prompt_field_width(app: &App) -> usize {
+    // Must mirror the render calculation in ui/dialogs/simple_prompt.rs exactly,
+    // including the clamp to terminal width, or cursor/scroll math drifts from
+    // what is drawn on narrow terminals.
+    let term_width = app.term_width;
+    let max_dialog_w = term_width.saturating_sub(2).max(1);
+    let preferred_dialog_w = term_width.saturating_mul(65) / 100;
+    let min_dialog_w = 40u16.min(max_dialog_w);
+    let dialog_width = preferred_dialog_w.clamp(min_dialog_w, max_dialog_w);
+    (dialog_width.saturating_sub(4) as usize).max(10)
 }
 
 fn resolve_picker_workdir(app: &App) -> PathBuf {

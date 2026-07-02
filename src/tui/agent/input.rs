@@ -106,8 +106,50 @@ impl InteractiveAgent {
             .is_some_and(|text| line_looks_sensitive_prompt(&text))
     }
 
+    /// True when the PTY's foreground process group differs from the spawned
+    /// shell — an interactive child (wizard, editor, running command) owns the
+    /// terminal, so input must go straight to the PTY instead of the warp buffer.
+    pub fn foreground_app_active(&self) -> bool {
+        let Some(shell_pid) = self.child.try_lock().ok().and_then(|c| c.process_id()) else {
+            return false;
+        };
+        let Some(fg_group) = self
+            .master
+            .try_lock()
+            .ok()
+            .and_then(|m| m.process_group_leader())
+        else {
+            return false;
+        };
+        fg_group > 0 && fg_group as u32 != shell_pid
+    }
+
     pub fn should_bypass_warp_input(&self) -> bool {
-        self.in_alternate_screen() || self.is_sensitive_input_active()
+        self.in_alternate_screen() || self.is_sensitive_input_active() || {
+            // Only shells host foreground children worth bypassing for; AI-CLI
+            // sessions keep warp semantics untouched.
+            self.is_terminal && self.foreground_app_active()
+        }
+    }
+
+    /// Whether the child program switched the terminal into bracketed paste mode.
+    pub fn bracketed_paste_enabled(&self) -> bool {
+        self.vt
+            .try_lock()
+            .map(|vt| vt.screen().bracketed_paste())
+            .unwrap_or(false)
+    }
+
+    /// Paste text into the PTY, honoring the child's bracketed-paste mode.
+    /// Programs that never enabled mode 2004 (simple prompts, wizards) would
+    /// otherwise receive the literal `ESC[200~` markers as garbage input.
+    pub fn paste_to_pty(&self, text: &str) -> Result<()> {
+        if self.bracketed_paste_enabled() {
+            let wrapped = format!("\x1b[200~{text}\x1b[201~");
+            self.write_to_pty(wrapped.as_bytes())
+        } else {
+            self.write_to_pty(text.as_bytes())
+        }
     }
 
     pub fn sync_warp_input_from_pty(&self, wait: Duration) -> Option<String> {

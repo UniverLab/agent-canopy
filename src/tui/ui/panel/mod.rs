@@ -129,12 +129,19 @@ fn render_snapshot(
     app: &App,
     _mask_cursor_line: bool,
     show_cursor: bool,
+    selection: Option<vt100::PaneSelection>,
 ) {
-    render_vt_screen(frame, area, snap);
+    render_vt_screen(frame, area, snap, selection);
     if show_cursor {
         set_cursor_from_snapshot(frame, area, snap);
     }
     render_indicators(frame, area, snap, app);
+}
+
+/// The active mouse selection, if it belongs to the pane's agent.
+fn pane_selection(app: &App, is_terminal: bool, idx: usize) -> Option<vt100::PaneSelection> {
+    let sel = app.terminal_selection?;
+    (sel.agent == (is_terminal, idx)).then(|| sel.normalized())
 }
 
 fn split_warp_areas(area: Rect) -> (Rect, Rect) {
@@ -287,7 +294,7 @@ fn draw_interactive_preview(frame: &mut Frame, area: Rect, app: &App, idx: usize
         return false;
     };
 
-    render_snapshot(frame, area, &snap, app, false, false);
+    render_snapshot(frame, area, &snap, app, false, false, None);
     true
 }
 
@@ -299,7 +306,7 @@ fn draw_terminal_preview(frame: &mut Frame, area: Rect, app: &App, idx: usize) -
         return false;
     };
 
-    render_snapshot(frame, area, &snap, app, false, false);
+    render_snapshot(frame, area, &snap, app, false, false, None);
     render_command_chips(frame, area, app, &agent.name);
     true
 }
@@ -319,6 +326,7 @@ fn draw_focused_interactive_panel(frame: &mut Frame, area: Rect, app: &App, idx:
         app,
         agent.is_sensitive_input_active(),
         false,
+        pane_selection(app, false, idx),
     );
     set_focused_interactive_cursor(frame, area, &snap, agent);
     true
@@ -330,14 +338,24 @@ fn draw_focused_terminal_panel(frame: &mut Frame, area: Rect, app: &mut App, idx
     };
 
     let sensitive = agent.is_sensitive_input_active();
-    let warp_mode = agent.warp_mode;
+    // Warp input box only while the shell itself owns the terminal; when a
+    // wizard/TUI/foreground command is running the PTY gets the whole pane.
+    let warp_active = agent.warp_mode && !agent.should_bypass_warp_input();
     let snap = agent.screen_snapshot();
 
-    if !warp_mode {
+    if !warp_active {
         let Some(snap) = snap else {
             return false;
         };
-        render_snapshot(frame, area, &snap, app, sensitive, true);
+        render_snapshot(
+            frame,
+            area,
+            &snap,
+            app,
+            sensitive,
+            true,
+            pane_selection(app, true, idx),
+        );
         return true;
     }
 
@@ -370,7 +388,15 @@ fn draw_terminal_warp_mode(
 ) {
     let (pty_area, input_area) = split_warp_areas(area);
     if let Some(snap) = snap {
-        render_snapshot(frame, pty_area, snap, app, false, false);
+        render_snapshot(
+            frame,
+            pty_area,
+            snap,
+            app,
+            false,
+            false,
+            pane_selection(app, true, idx),
+        );
     }
     draw_warp_input_box(frame, input_area, app, idx);
     app.last_panel_inner = (pty_area.width, pty_area.height);
@@ -1414,6 +1440,7 @@ pub(super) fn draw_split_panel(
         app,
         false,
         focused && matches!(app.focus, Focus::Agent),
+        None,
     );
 }
 
@@ -1428,7 +1455,7 @@ fn draw_split_warp_panel(
     let (pty_area, input_area) = split_warp_areas(area);
 
     if let Some(snap) = snap {
-        render_snapshot(frame, pty_area, snap, app, false, false);
+        render_snapshot(frame, pty_area, snap, app, false, false, None);
     }
 
     if focused && matches!(app.focus, Focus::Agent) {
@@ -1470,7 +1497,12 @@ impl SessionRef {
 
     fn warp_terminal_idx(self, app: &App) -> Option<usize> {
         match self {
-            SessionRef::Terminal(idx) if app.terminal_agents[idx].warp_mode => Some(idx),
+            SessionRef::Terminal(idx)
+                if app.terminal_agents[idx].warp_mode
+                    && !app.terminal_agents[idx].should_bypass_warp_input() =>
+            {
+                Some(idx)
+            }
             _ => None,
         }
     }
@@ -1527,6 +1559,7 @@ mod tests {
             bold: false,
             underline: false,
             inverse: true,
+            wide_continuation: false,
         });
         let snap = ScreenSnapshot {
             cells: vec![row],

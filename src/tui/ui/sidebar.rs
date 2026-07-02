@@ -1126,7 +1126,7 @@ fn draw_scroll_indicators(frame: &mut Frame, area: Rect, has_up: bool, has_down:
             Paragraph::new("▼").style(Style::default().fg(DIM)),
             Rect::new(
                 area.x + area.width.saturating_sub(2),
-                area.y + area.height - 1,
+                (area.y + area.height).saturating_sub(1),
                 1,
                 1,
             ),
@@ -1415,7 +1415,7 @@ fn draw_project_graph(frame: &mut Frame, area: Rect, app: &App) {
         );
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                truncate_str(&label, (area.width - 2) as usize),
+                truncate_str(&label, area.width.saturating_sub(2) as usize),
                 Style::default().fg(Color::Cyan),
             ))),
             Rect::new(area.x, y, area.width, 1),
@@ -1444,7 +1444,12 @@ fn draw_project_relation_dialog(
         .border_style(Style::default().fg(ACCENT));
     frame.render_widget(block, area);
 
-    let inner = Rect::new(area.x + 1, area.y + 1, area.width - 2, area.height - 2);
+    let inner = Rect::new(
+        area.x + 1,
+        area.y + 1,
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    );
 
     // Relation type selector
     let rel_line = format!(
@@ -1500,7 +1505,7 @@ fn draw_project_relation_dialog(
             } else {
                 " "
             },
-            truncate_str(&project.title, (inner.width - 4) as usize),
+            truncate_str(&project.title, inner.width.saturating_sub(4) as usize),
         );
         let style = if i as usize == dialog.selected_idx {
             Style::default()
@@ -1526,7 +1531,7 @@ fn draw_project_relation_dialog(
     }
 
     // Footer
-    let footer_y = inner.y + inner.height - 1;
+    let footer_y = inner.y + inner.height.saturating_sub(1);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             " Enter confirm  ·  ←→ relation  ·  Esc cancel  ·  type filter ",

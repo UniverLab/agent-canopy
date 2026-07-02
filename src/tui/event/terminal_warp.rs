@@ -15,7 +15,7 @@ fn paste_clipboard_to_terminal(app: &mut App, idx: usize) {
     };
     let agent = &mut app.terminal_agents[idx];
     if agent.should_bypass_warp_input() || agent.warp_passthrough {
-        let _ = agent.write_to_pty(text.as_bytes());
+        let _ = agent.paste_to_pty(&text);
     } else if agent.warp_mode {
         if let Ok(mut buf) = agent.input_buffer.lock() {
             let pos = agent.warp_cursor.min(buf.len());

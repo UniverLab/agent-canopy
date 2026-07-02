@@ -29,35 +29,33 @@ pub fn handle_paste(app: &mut App, text: &str) {
                 app.interactive_agents.get_mut(idx)
             };
             if let Some(agent) = agent {
-                if agent.warp_mode && (agent.should_bypass_warp_input() || agent.warp_passthrough) {
-                    let _ = agent.write_to_pty(text.as_bytes());
-                    if !agent.should_bypass_warp_input() {
-                        sync_terminal_warp_buffer_from_pty(app, idx, 35);
-                    }
-                } else if agent.warp_mode {
-                    // Warp mode: insert into input buffer at cursor (preserves newlines)
+                let bypass = agent.should_bypass_warp_input();
+                if agent.warp_mode && !bypass && !agent.warp_passthrough {
+                    // Warp prompt editing: insert into input buffer at cursor
+                    // (preserves newlines until Enter submits the command).
                     if let Ok(mut buf) = agent.input_buffer.lock() {
                         let pos = agent.warp_cursor.min(buf.len());
                         buf.insert_str(pos, text);
                         agent.warp_cursor = pos + text.len();
                     }
                 } else {
-                    // Non-warp: use bracketed paste to preserve newlines without triggering Enter
-                    let bracketed = format!("\x1b[200~{}\x1b[201~", text);
-                    let _ = agent.write_to_pty(bracketed.as_bytes());
+                    // Direct to the PTY — wizards, passthrough, and non-warp
+                    // sessions alike. Bracketed markers only when the child
+                    // program actually enabled bracketed paste mode.
+                    let _ = agent.paste_to_pty(text);
+                    if agent.warp_mode && agent.warp_passthrough && !bypass {
+                        sync_terminal_warp_buffer_from_pty(app, idx, 35);
+                    }
                 }
             }
         }
         Focus::NewAgentDialog | Focus::PromptTemplateDialog => {
             // Insert pasted text into the SimplePromptDialog sections.
             // Multi-line pastes are collapsed to a placeholder while keeping the real text.
+            let field_width = super::prompt_template::prompt_field_width(app);
             if let Some(dialog) = &mut app.simple_prompt_dialog {
                 if dialog.enabled_sections.len() > dialog.focused_section {
                     let section_name = dialog.enabled_sections[dialog.focused_section].clone();
-                    // Must match render calculation in dialogs.rs
-                    let field_width = ((app.term_width as usize * 65 / 100).max(40))
-                        .saturating_sub(4)
-                        .max(10);
                     if text.contains('\n') || text.chars().count() > 200 {
                         // Preserve newlines for collapsed multi-line paste
                         let clean = text.replace('\r', "");

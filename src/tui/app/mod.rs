@@ -110,6 +110,7 @@ impl App {
             last_scroll_at: std::time::Instant::now() - std::time::Duration::from_secs(999),
             last_panel_inner: (0, 0),
             last_panel_y: 0,
+            terminal_selection: None,
             whimsg: super::whimsg::Whimsg::new(),
             whimsg_last_log_hash: 0,
             context_transfer_modal: None,

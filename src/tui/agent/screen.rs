@@ -135,6 +135,7 @@ impl InteractiveAgent {
                     bold: c.bold(),
                     underline: c.underline(),
                     inverse: c.inverse(),
+                    wide_continuation: c.is_wide_continuation(),
                 }));
             }
             cells.push(row_cells);
@@ -483,6 +484,44 @@ pub struct ScreenSnapshot {
     pub scrolled: bool,
 }
 
+impl ScreenSnapshot {
+    /// Extract the text covered by a linear selection from `start` to `end`
+    /// (inclusive, `(row, col)` cells in reading order). Rows between the
+    /// endpoints are taken whole; trailing whitespace is trimmed per line.
+    pub fn selection_text(&self, start: (u16, u16), end: (u16, u16)) -> String {
+        let (start, end) = if end < start {
+            (end, start)
+        } else {
+            (start, end)
+        };
+        let mut lines = Vec::new();
+        for row in start.0..=end.0 {
+            let Some(cells) = self.cells.get(row as usize) else {
+                break;
+            };
+            let from = if row == start.0 { start.1 as usize } else { 0 };
+            let to = if row == end.0 {
+                (end.1 as usize + 1).min(cells.len())
+            } else {
+                cells.len()
+            };
+            let mut line = String::new();
+            for cell in cells.iter().take(to).skip(from) {
+                match cell {
+                    // The leading half of a wide char already contributed the
+                    // full grapheme; its continuation cell adds nothing.
+                    Some(c) if c.wide_continuation => {}
+                    Some(c) if c.ch.is_empty() => line.push(' '),
+                    Some(c) => line.push_str(&c.ch),
+                    None => line.push(' '),
+                }
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        lines.join("\n")
+    }
+}
+
 /// A single cell from the virtual terminal.
 pub struct VtCell {
     pub ch: String,
@@ -491,6 +530,8 @@ pub struct VtCell {
     pub bold: bool,
     pub underline: bool,
     pub inverse: bool,
+    /// Trailing half of a double-width character (contributes no text).
+    pub wide_continuation: bool,
 }
 /// Convert vt100 color to ratatui color.
 ///
@@ -502,5 +543,81 @@ fn from_vt100(color: vt100::Color) -> ratatui::style::Color {
         vt100::Color::Default => Color::Reset,
         vt100::Color::Idx(i) => Color::Indexed(i),
         vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cell(ch: &str) -> Option<VtCell> {
+        Some(VtCell {
+            ch: ch.to_string(),
+            fg: ratatui::style::Color::Reset,
+            bg: ratatui::style::Color::Reset,
+            bold: false,
+            underline: false,
+            inverse: false,
+            wide_continuation: false,
+        })
+    }
+
+    fn row_from(text: &str, width: usize) -> Vec<Option<VtCell>> {
+        let mut row: Vec<Option<VtCell>> = text.chars().map(|c| cell(&c.to_string())).collect();
+        row.resize_with(width, || cell(""));
+        row
+    }
+
+    fn snapshot(rows: &[&str], width: usize) -> ScreenSnapshot {
+        ScreenSnapshot {
+            cells: rows.iter().map(|r| row_from(r, width)).collect(),
+            cursor_row: 0,
+            cursor_col: 0,
+            scrolled: false,
+        }
+    }
+
+    #[test]
+    fn selection_text_single_row_segment() {
+        let snap = snapshot(&["hello world"], 20);
+        assert_eq!(snap.selection_text((0, 6), (0, 10)), "world");
+    }
+
+    #[test]
+    fn selection_text_multi_row_takes_full_middle_rows() {
+        let snap = snapshot(&["first line", "middle", "last line"], 20);
+        assert_eq!(snap.selection_text((0, 6), (2, 3)), "line\nmiddle\nlast");
+    }
+
+    #[test]
+    fn selection_text_reversed_endpoints_and_blank_cells() {
+        let snap = snapshot(&["a b", ""], 10);
+        // Reversed (end before start) selects the same range; untouched cells
+        // read as spaces and trailing whitespace is trimmed per line.
+        assert_eq!(snap.selection_text((1, 5), (0, 0)), "a b\n");
+    }
+
+    #[test]
+    fn selection_text_skips_wide_continuation_cells() {
+        // "日" occupies two cells: the glyph plus a continuation cell.
+        let mut row = vec![cell("日")];
+        row.push(Some(VtCell {
+            ch: String::new(),
+            fg: ratatui::style::Color::Reset,
+            bg: ratatui::style::Color::Reset,
+            bold: false,
+            underline: false,
+            inverse: false,
+            wide_continuation: true,
+        }));
+        row.push(cell("x"));
+        row.resize_with(6, || cell(""));
+        let snap = ScreenSnapshot {
+            cells: vec![row],
+            cursor_row: 0,
+            cursor_col: 0,
+            scrolled: false,
+        };
+        assert_eq!(snap.selection_text((0, 0), (0, 2)), "日x");
     }
 }

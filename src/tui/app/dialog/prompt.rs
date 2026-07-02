@@ -881,52 +881,6 @@ impl SimplePromptDialog {
         lines.max(1)
     }
 
-    /// Distance from cursor position to the last word boundary (space or newline).
-    /// Returns 0 if cursor is at position 0 or no boundary found before cursor.
-    pub fn distance_to_last_space(text: &str, cursor_pos: usize) -> usize {
-        if cursor_pos == 0 {
-            return 0;
-        }
-        let prefix_chars: Vec<char> = text.chars().take(cursor_pos).collect();
-        // Find the last space or newline in the character slice
-        let last_boundary = prefix_chars
-            .iter()
-            .enumerate()
-            .rfind(|&(_, &c)| c == ' ' || c == '\n')
-            .map(|(idx, _)| idx);
-        match last_boundary {
-            Some(pos) => cursor_pos - pos - 1,
-            None => cursor_pos, // No boundary found, entire prefix is one word
-        }
-    }
-
-    /// Check if typing a character should trigger a newline (word-wrap at space boundary).
-    /// Returns true if the current word would overflow the available space.
-    pub fn should_wrap_at_word_boundary(
-        text: &str,
-        cursor_pos: usize,
-        field_width: usize,
-        new_chars: usize,
-    ) -> bool {
-        if field_width == 0 {
-            return false;
-        }
-        // Calculate current column position (accounting for existing newlines)
-        let prefix_chars: Vec<char> = text.chars().take(cursor_pos).collect();
-        let current_col = prefix_chars
-            .iter()
-            .enumerate()
-            .rfind(|&(_, &c)| c == '\n')
-            .map(|(idx, _)| cursor_pos - idx - 1)
-            .unwrap_or(cursor_pos);
-
-        // Distance from cursor to last space (current word length from last break)
-        let word_dist = Self::distance_to_last_space(text, cursor_pos);
-
-        // If adding new_chars would overflow the line
-        current_col + word_dist + new_chars > field_width
-    }
-
     /// Visual lines occupied by the first `char_idx` chars of text.
     fn visual_lines_to_cursor(text: &str, char_idx: usize, field_width: usize) -> usize {
         let prefix: String = text.chars().take(char_idx).collect();
@@ -984,52 +938,110 @@ impl SimplePromptDialog {
         }
     }
 
+    /// (visual line, column) for every cursor position 0..=len, using the same
+    /// wrapping math as `visual_line_count` so movement matches what is drawn.
+    fn visual_positions(text: &str, field_width: usize) -> Vec<(usize, usize)> {
+        let field_width = field_width.max(1);
+        let mut positions = Vec::with_capacity(text.chars().count() + 1);
+        let mut line = 0usize;
+        let mut col = 0usize;
+        positions.push((line, col));
+        for ch in text.chars() {
+            match ch {
+                '\n' => {
+                    line += 1;
+                    col = 0;
+                }
+                '\t' => {
+                    let tab = 4 - (col % 4);
+                    if col + tab > field_width {
+                        line += 1;
+                        col = tab;
+                    } else {
+                        col += tab;
+                    }
+                }
+                _ => {
+                    if col + 1 > field_width {
+                        line += 1;
+                        col = 1;
+                    } else {
+                        col += 1;
+                    }
+                }
+            }
+            positions.push((line, col));
+        }
+        positions
+    }
+
+    /// Move the cursor one visual line vertically, keeping the column as close
+    /// as possible. `delta` is -1 (up) or +1 (down).
+    fn move_cursor_vertical(&mut self, section_id: &str, field_width: usize, delta: isize) {
+        let text = self.get_section_content(section_id);
+        let positions = Self::visual_positions(&text, field_width);
+        let cur = self.cursor(section_id).min(positions.len() - 1);
+        let (cur_line, cur_col) = positions[cur];
+
+        let target = if delta < 0 {
+            match cur_line.checked_sub(1) {
+                Some(line) => line,
+                None => {
+                    // Already on the first visual line: jump to start.
+                    self.section_cursors.insert(section_id.to_string(), 0);
+                    self.update_section_scroll(section_id, field_width);
+                    return;
+                }
+            }
+        } else {
+            let last_line = positions.last().map(|&(line, _)| line).unwrap_or(0);
+            if cur_line >= last_line {
+                // Already on the last visual line: jump to end.
+                self.section_cursors
+                    .insert(section_id.to_string(), positions.len() - 1);
+                self.update_section_scroll(section_id, field_width);
+                return;
+            }
+            cur_line + 1
+        };
+
+        // Best index on the target line: largest column that doesn't pass cur_col,
+        // falling back to the line's last position.
+        let mut best = None;
+        for (idx, &(line, col)) in positions.iter().enumerate() {
+            if line != target {
+                continue;
+            }
+            if col <= cur_col || best.is_none() {
+                best = Some(idx);
+            }
+        }
+        if let Some(idx) = best {
+            self.section_cursors.insert(section_id.to_string(), idx);
+            self.update_section_scroll(section_id, field_width);
+        }
+    }
+
     /// Move cursor up one visual line in the given section.
     pub fn move_cursor_up(&mut self, section_id: &str, field_width: usize) {
-        let cur = self.cursor(section_id);
-        self.section_cursors
-            .insert(section_id.to_string(), cur.saturating_sub(field_width));
-        self.update_section_scroll(section_id, field_width);
+        self.move_cursor_vertical(section_id, field_width, -1);
     }
 
     /// Move cursor down one visual line in the given section.
     pub fn move_cursor_down(&mut self, section_id: &str, field_width: usize) {
-        let len = self
-            .sections
-            .get(section_id)
-            .map(|s| s.chars().count())
-            .unwrap_or(0);
-        let cur = self.cursor(section_id);
-        self.section_cursors
-            .insert(section_id.to_string(), (cur + field_width).min(len));
-        self.update_section_scroll(section_id, field_width);
+        self.move_cursor_vertical(section_id, field_width, 1);
     }
 
     /// Insert a character at cursor position in any section.
+    /// Content is stored exactly as typed; soft wrapping happens at render time.
     pub fn insert_char_at_cursor(&mut self, section_id: &str, ch: char, field_width: usize) {
         let content = self.get_section_content(section_id);
         let cur = self.cursor(section_id).min(content.chars().count());
 
-        let adjusted_cur = cur;
-        let mut modified_content = content.clone();
-
-        if ch != ' '
-            && ch != '\n'
-            && !content.is_empty()
-            && Self::should_wrap_at_word_boundary(&modified_content, adjusted_cur, field_width, 1)
-        {
-            let prefix_chars: Vec<char> = modified_content.chars().take(adjusted_cur).collect();
-            if let Some(space_char_idx) = prefix_chars.iter().rposition(|&c| c == ' ') {
-                let mut chars: Vec<char> = modified_content.chars().collect();
-                chars[space_char_idx] = '\n';
-                modified_content = chars.into_iter().collect();
-            }
-        }
-
-        let mut new_chars: Vec<char> = modified_content.chars().collect();
-        new_chars.insert(adjusted_cur, ch);
+        let mut new_chars: Vec<char> = content.chars().collect();
+        new_chars.insert(cur, ch);
         let new_content: String = new_chars.into_iter().collect();
-        self.set_content_and_cursor(section_id, new_content, adjusted_cur + 1, field_width);
+        self.set_content_and_cursor(section_id, new_content, cur + 1, field_width);
     }
 
     /// Delete the character before cursor in any section.
@@ -1309,106 +1321,66 @@ mod tests {
     }
 
     #[test]
-    fn distance_to_last_space_basic() {
-        assert_eq!(
-            SimplePromptDialog::distance_to_last_space("hello world", 11),
-            5
-        );
-        assert_eq!(
-            SimplePromptDialog::distance_to_last_space("hello world", 6),
-            0
-        );
-        assert_eq!(SimplePromptDialog::distance_to_last_space("hello", 5), 5);
-        assert_eq!(SimplePromptDialog::distance_to_last_space("", 0), 0);
+    fn move_cursor_vertical_respects_hard_newlines() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.set_section_content("instruction_1", "abc\ndefgh\nij".to_string());
+        // Cursor on "defgh" line, column 4 (after 'g': indices a=0..c=2,\n=3,d=4..h=8)
+        dialog
+            .section_cursors
+            .insert("instruction_1".to_string(), 8);
+
+        dialog.move_cursor_up("instruction_1", 40);
+        // First line only has 3 columns; cursor clamps to its end (index 3, col 3).
+        assert_eq!(dialog.cursor("instruction_1"), 3);
+
+        dialog.move_cursor_down("instruction_1", 40);
+        // Back down to "defgh" at column 3 → index 7.
+        assert_eq!(dialog.cursor("instruction_1"), 7);
+
+        dialog.move_cursor_down("instruction_1", 40);
+        // "ij" line, column 2 max → index 12 (end of text).
+        assert_eq!(dialog.cursor("instruction_1"), 12);
+
+        // Down on the last line jumps to end; up from the first line jumps to 0.
+        dialog.move_cursor_down("instruction_1", 40);
+        assert_eq!(dialog.cursor("instruction_1"), 12);
+        dialog
+            .section_cursors
+            .insert("instruction_1".to_string(), 1);
+        dialog.move_cursor_up("instruction_1", 40);
+        assert_eq!(dialog.cursor("instruction_1"), 0);
     }
 
     #[test]
-    fn distance_to_last_space_after_space() {
-        assert_eq!(SimplePromptDialog::distance_to_last_space("hello w", 7), 1);
-        assert_eq!(SimplePromptDialog::distance_to_last_space("a b c d", 7), 1);
-    }
+    fn move_cursor_vertical_handles_soft_wrap() {
+        let mut dialog = SimplePromptDialog::new();
+        // width 5: "aaaaa" | "bbbbb" as two visual lines, no '\n' present
+        dialog.set_section_content("instruction_1", "aaaaabbbbb".to_string());
+        dialog
+            .section_cursors
+            .insert("instruction_1".to_string(), 8);
 
-    #[test]
-    fn should_wrap_at_word_boundary_basic() {
-        // "hello " is 6 chars, adding "world" (5 chars) = 11 chars
-        // With field_width=10, should wrap
-        assert!(SimplePromptDialog::should_wrap_at_word_boundary(
-            "hello ", 6, 10, 5
-        ));
-        // With field_width=20, should not wrap
-        assert!(!SimplePromptDialog::should_wrap_at_word_boundary(
-            "hello ", 6, 20, 5
-        ));
-    }
+        dialog.move_cursor_up("instruction_1", 5);
+        // Same column (3) on the first visual line → index 3.
+        assert_eq!(dialog.cursor("instruction_1"), 3);
 
-    #[test]
-    fn should_wrap_at_word_boundary_with_newline() {
-        // After a newline, column resets to 0
-        assert!(!SimplePromptDialog::should_wrap_at_word_boundary(
-            "hello\n", 6, 10, 5
-        ));
-        assert!(SimplePromptDialog::should_wrap_at_word_boundary(
-            "hello\nworld ",
-            12,
-            10,
-            5
-        ));
-    }
-
-    #[test]
-    fn should_wrap_at_word_boundary_at_typing() {
-        // Typing one char at a time: "hello " + "w" = cursor at 7, word_dist = 1
-        // current_col = 7, word_dist = 1, new_chars = 1 → 7 + 1 + 1 = 9 < 10, no wrap
-        assert!(!SimplePromptDialog::should_wrap_at_word_boundary(
-            "hello w", 7, 10, 1
-        ));
-        assert!(SimplePromptDialog::should_wrap_at_word_boundary(
-            "hello worl",
-            10,
-            10,
-            1
-        ));
+        dialog.move_cursor_down("instruction_1", 5);
+        assert_eq!(dialog.cursor("instruction_1"), 8);
     }
 
     #[test]
     fn test_non_ascii_handling_does_not_panic() {
-        // Test non-ASCII in distance_to_last_space
-        // "áéíóú " is 5 non-ASCII characters + 1 space = 6 characters.
-        // In UTF-8, "áéíóú" is 10 bytes. The space is at char index 5 (byte index 10).
-        let dist = SimplePromptDialog::distance_to_last_space("áéíóú world", 11);
-        assert_eq!(dist, 5); // distance to last space from end of "world"
-
-        // Test non-ASCII wrapping
-        // "áéíóú w" + "orl" = "áéíóú worl" (10 characters).
-        // Adding "d" should wrap with field_width=10.
-        assert!(SimplePromptDialog::should_wrap_at_word_boundary(
-            "áéíóú worl",
-            10,
-            10,
-            1
-        ));
-
-        // Test insert_char_at_cursor with non-ASCII
+        // Typing past the field width must never mutate the stored content:
+        // soft wrapping is a render-time concern only.
         let mut dialog = SimplePromptDialog::new();
-        // Set section content with non-ASCII characters
         dialog.set_section_content("instruction_1", "áéíóú ".to_string());
         dialog
             .section_cursors
             .insert("instruction_1".to_string(), 6);
-        // This insert_char_at_cursor should trigger wrapping at the space.
-        // With field_width=10, "áéíóú " (6 chars) + "w" (1 char) doesn't wrap yet.
-        dialog.insert_char_at_cursor("instruction_1", 'w', 10);
-        assert_eq!(dialog.get_section_content("instruction_1"), "áéíóú w");
-        assert_eq!(dialog.cursor("instruction_1"), 7);
-
-        // Now if we insert 'o', 'r', 'l', 'd' one by one:
-        dialog.insert_char_at_cursor("instruction_1", 'o', 10); // "áéíóú wo"
-        dialog.insert_char_at_cursor("instruction_1", 'r', 10); // "áéíóú wor"
-        dialog.insert_char_at_cursor("instruction_1", 'l', 10); // "áéíóú worl"
-                                                                // At this point, length of word is 5 ("worl"), column is 10. Adding 'd' (1 char) overflows field_width=10.
-                                                                // The space at index 5 should be replaced with '\n'.
-        dialog.insert_char_at_cursor("instruction_1", 'd', 10);
-        assert_eq!(dialog.get_section_content("instruction_1"), "áéíóú\nworld");
+        for ch in "world".chars() {
+            dialog.insert_char_at_cursor("instruction_1", ch, 10);
+        }
+        assert_eq!(dialog.get_section_content("instruction_1"), "áéíóú world");
         assert_eq!(dialog.cursor("instruction_1"), 11);
     }
 
