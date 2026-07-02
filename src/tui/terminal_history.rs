@@ -102,6 +102,22 @@ impl SessionHistory {
         matches
     }
 
+    /// First history entry that starts with `prefix` and is longer than
+    /// `prefix` (i.e. has something to autocomplete), case-sensitive. Used
+    /// for the inline ghost-text suggestion in the warp input box.
+    pub fn ghost_suggestion<'a>(&'a self, prefix: &str) -> Option<&'a str> {
+        if prefix.is_empty() {
+            return None;
+        }
+        let mut matches: Vec<&CommandEntry> = self
+            .commands
+            .iter()
+            .filter(|e| e.cmd.starts_with(prefix) && e.cmd.len() > prefix.len())
+            .collect();
+        matches.sort_by(|a, b| b.count.cmp(&a.count).then(b.last_run.cmp(&a.last_run)));
+        matches.first().map(|e| e.cmd.as_str())
+    }
+
     /// Get unique CWD paths from the history (for cd picker).
     pub fn known_directories(&self) -> Vec<String> {
         let mut dirs: HashMap<&str, u32> = HashMap::new();
@@ -602,6 +618,59 @@ mod tests {
         hist.record("Cargo Build", "/tmp");
         let matches = hist.filter("cargo");
         assert_eq!(matches.len(), 1);
+    }
+
+    #[test]
+    fn ghost_suggestion_returns_most_recent_match() {
+        let mut hist = SessionHistory::default();
+        hist.record("cargo build --release", "/p");
+        hist.record("cargo build", "/p");
+        hist.record("cargo test", "/p");
+        // All three have count=1. Sort is (count desc, last_run desc), so
+        // the most recent run wins — that's "cargo test" (recorded last).
+        assert_eq!(hist.ghost_suggestion("cargo"), Some("cargo test"));
+    }
+
+    #[test]
+    fn ghost_suggestion_prefers_higher_count() {
+        let mut hist = SessionHistory::default();
+        hist.record("cargo build --release", "/p");
+        hist.record("cargo build", "/p");
+        hist.record("cargo build", "/p");
+        hist.record("cargo test", "/p");
+        // cargo build (count=2) beats cargo build --release and cargo
+        // test (both count=1) regardless of recency.
+        assert_eq!(hist.ghost_suggestion("cargo"), Some("cargo build"));
+    }
+
+    #[test]
+    fn ghost_suggestion_is_case_sensitive() {
+        let mut hist = SessionHistory::default();
+        hist.record("Cargo Build", "/tmp");
+        // Ghost is case-sensitive so we don't silently rewrite the user's
+        // capitalization. The user typed lower-case `cargo`; history has
+        // `Cargo Build` — no match.
+        assert_eq!(hist.ghost_suggestion("cargo"), None);
+        // The exact prefix matches.
+        assert_eq!(hist.ghost_suggestion("Cargo"), Some("Cargo Build"));
+    }
+
+    #[test]
+    fn ghost_suggestion_skips_exact_matches() {
+        let mut hist = SessionHistory::default();
+        hist.record("cargo", "/p");
+        // Input is already exactly the history entry — no suffix to
+        // complete, so no ghost.
+        assert_eq!(hist.ghost_suggestion("cargo"), None);
+    }
+
+    #[test]
+    fn ghost_suggestion_empty_input_returns_none() {
+        let mut hist = SessionHistory::default();
+        hist.record("cargo build", "/p");
+        // Empty input has no prefix to extend; surfacing a ghost with no
+        // prefix would be noise.
+        assert_eq!(hist.ghost_suggestion(""), None);
     }
 
     #[test]
