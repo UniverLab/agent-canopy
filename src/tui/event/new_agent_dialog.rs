@@ -1,15 +1,16 @@
 use anyhow::Result;
-use ratatui::crossterm::event::KeyCode;
+use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::tui::app::dialog::{BackgroundTrigger, NewAgentDialog, NewTaskMode, NewTaskType};
 use crate::tui::app::types::App;
+use crate::tui::ui::dialogs::new_agent_dialog::{prompt_visual_line_count, PROMPT_VISIBLE_ROWS};
 
 // ── Dialog: new agent creation ──────────────────────────────────────
 //
 // Flow: ↑↓ switch fields, ←→ choose CLI/type/mode, ↑↓ in dir browser,
 //       Space enter directory, Enter launch, Esc cancel.
 
-pub fn handle_dialog_key(app: &mut App, code: KeyCode) -> Result<()> {
+pub fn handle_dialog_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
     {
         let Some(dialog) = app.new_agent_dialog.as_mut() else {
             return Ok(());
@@ -22,12 +23,13 @@ pub fn handle_dialog_key(app: &mut App, code: KeyCode) -> Result<()> {
 
     match code {
         KeyCode::Esc => app.close_new_agent_dialog(),
-        KeyCode::Enter => handle_dialog_enter(app),
+        KeyCode::Enter if !modifiers.contains(KeyModifiers::SHIFT) => handle_dialog_enter(app),
         _ => {
+            let term_width = app.term_width;
             let Some(dialog) = app.new_agent_dialog.as_mut() else {
                 return Ok(());
             };
-            handle_dialog_field_key(dialog, code);
+            handle_dialog_field_key(term_width, dialog, code, modifiers);
         }
     }
 
@@ -195,7 +197,12 @@ fn should_open_session_picker(dialog: &NewAgentDialog) -> bool {
         && dialog.selected_session.is_none()
 }
 
-fn handle_dialog_field_key(dialog: &mut NewAgentDialog, code: KeyCode) {
+fn handle_dialog_field_key(
+    term_width: u16,
+    dialog: &mut NewAgentDialog,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+) {
     let fields = DialogFields::from(dialog);
 
     match dialog.field {
@@ -209,7 +216,9 @@ fn handle_dialog_field_key(dialog: &mut NewAgentDialog, code: KeyCode) {
         n if n == fields.model_field && fields.is_background => {
             handle_model_field(dialog, code, fields);
         }
-        4 if fields.is_background => handle_prompt_field(dialog, code, fields),
+        4 if fields.is_background => {
+            handle_prompt_field(term_width, dialog, code, fields, modifiers);
+        }
         5 if fields.is_background
             && matches!(dialog.background_trigger, BackgroundTrigger::Cron) =>
         {
@@ -329,7 +338,6 @@ fn handle_model_field(dialog: &mut NewAgentDialog, code: KeyCode, fields: Dialog
         }
         KeyCode::Down if dialog.model_picker_open => move_model_picker(dialog, true),
         KeyCode::Up if dialog.model_picker_open => move_model_picker(dialog, false),
-        KeyCode::Right if dialog.model_picker_open => dialog.accept_model_suggestion(),
         KeyCode::Enter if dialog.model_picker_open => confirm_model_picker(dialog),
         KeyCode::Esc | KeyCode::Left if dialog.model_picker_open => {
             dialog.model_picker_open = false;
@@ -368,16 +376,315 @@ fn confirm_model_picker(dialog: &mut NewAgentDialog) {
     dialog.model_picker_open = false;
 }
 
-fn handle_prompt_field(dialog: &mut NewAgentDialog, code: KeyCode, fields: DialogFields) {
+fn handle_prompt_field(
+    term_width: u16,
+    dialog: &mut NewAgentDialog,
+    code: KeyCode,
+    fields: DialogFields,
+    modifiers: KeyModifiers,
+) {
+    // The prompt input is now multi-line + responsive: cursor can sit anywhere
+    // in the string, scroll follows the cursor, and pasted multi-line text is
+    // kept verbatim (rendered with hard breaks by the wrap helper).
+    let field_width = prompt_field_width_for(term_width);
+    let max_lines = prompt_visual_line_count(dialog, field_width);
+    let char_len = dialog.prompt.chars().count();
+    let cursor = dialog.prompt_cursor.min(char_len);
+
     match code {
-        KeyCode::Char(c) => dialog.prompt.push(c),
-        KeyCode::Backspace => {
-            dialog.prompt.pop();
+        KeyCode::Char(c) => {
+            insert_prompt_text(dialog, &c.to_string());
         }
-        KeyCode::Up => dialog.field = fields.model_field,
-        KeyCode::Down => dialog.field = fields.extra_field,
-        _ => {}
+        KeyCode::Backspace => backspace_prompt(dialog),
+        KeyCode::Delete => delete_prompt_forward(dialog),
+        KeyCode::Left => {
+            if cursor > 0 {
+                dialog.prompt_cursor = cursor - 1;
+            }
+        }
+        KeyCode::Right => {
+            if cursor < char_len {
+                dialog.prompt_cursor = cursor + 1;
+            }
+        }
+        KeyCode::Home => {
+            dialog.prompt_cursor = start_of_visual_line(dialog, cursor, field_width);
+        }
+        KeyCode::End => {
+            dialog.prompt_cursor = end_of_visual_line(dialog, cursor, field_width, char_len);
+        }
+        KeyCode::Enter if modifiers.contains(KeyModifiers::SHIFT) => {
+            // Shift+Enter inserts a hard newline (Enter alone is reserved for
+            // submitting the dialog from the top-level handler).
+            insert_prompt_text(dialog, "\n");
+        }
+        KeyCode::Up => {
+            if let Some(new_cursor) = move_prompt_visual(dialog, cursor, field_width, false) {
+                dialog.prompt_cursor = new_cursor;
+            } else {
+                dialog.field = fields.model_field;
+                return;
+            }
+        }
+        KeyCode::Down => {
+            if let Some(new_cursor) = move_prompt_visual(dialog, cursor, field_width, true) {
+                dialog.prompt_cursor = new_cursor;
+            } else {
+                dialog.field = fields.extra_field;
+                return;
+            }
+        }
+        KeyCode::PageUp => {
+            dialog.prompt_scroll = dialog.prompt_scroll.saturating_sub(PROMPT_VISIBLE_ROWS);
+        }
+        KeyCode::PageDown => {
+            let max_scroll = max_lines.saturating_sub(PROMPT_VISIBLE_ROWS);
+            dialog.prompt_scroll = (dialog.prompt_scroll + PROMPT_VISIBLE_ROWS).min(max_scroll);
+        }
+        _ => return,
     }
+
+    // Recompute after mutation, then re-clamp the cursor and keep the
+    // containing visual line in view.
+    let char_len = dialog.prompt.chars().count();
+    let max_lines = prompt_visual_line_count(dialog, field_width);
+    dialog.prompt_cursor = dialog.prompt_cursor.min(char_len);
+    let cursor_line = visual_line_of_char(dialog, dialog.prompt_cursor, field_width);
+    let max_scroll = max_lines.saturating_sub(PROMPT_VISIBLE_ROWS);
+    if cursor_line < dialog.prompt_scroll {
+        dialog.prompt_scroll = cursor_line;
+    } else if cursor_line >= dialog.prompt_scroll + PROMPT_VISIBLE_ROWS {
+        dialog.prompt_scroll = cursor_line + 1 - PROMPT_VISIBLE_ROWS;
+    }
+    dialog.prompt_scroll = dialog.prompt_scroll.min(max_scroll);
+    let _ = max_lines; // recomputed for max_scroll above
+}
+
+/// Insert `text` at the current cursor. Newlines are kept as hard breaks
+/// (the renderer flushes the current line on `\n`); spaces are stored verbatim
+/// so a paste that ends with a trailing space survives.
+pub(crate) fn insert_prompt_text(dialog: &mut NewAgentDialog, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let byte_index = char_to_byte_index(&dialog.prompt, dialog.prompt_cursor);
+    dialog.prompt.insert_str(byte_index, text);
+    dialog.prompt_cursor += text.chars().count();
+}
+
+fn backspace_prompt(dialog: &mut NewAgentDialog) {
+    if dialog.prompt_cursor == 0 {
+        return;
+    }
+    let start = char_to_byte_index(&dialog.prompt, dialog.prompt_cursor - 1);
+    let end = char_to_byte_index(&dialog.prompt, dialog.prompt_cursor);
+    dialog.prompt.replace_range(start..end, "");
+    dialog.prompt_cursor -= 1;
+}
+
+fn delete_prompt_forward(dialog: &mut NewAgentDialog) {
+    let char_len = dialog.prompt.chars().count();
+    if dialog.prompt_cursor >= char_len {
+        return;
+    }
+    let start = char_to_byte_index(&dialog.prompt, dialog.prompt_cursor);
+    let end = char_to_byte_index(&dialog.prompt, dialog.prompt_cursor + 1);
+    dialog.prompt.replace_range(start..end, "");
+}
+
+fn char_to_byte_index(s: &str, char_index: usize) -> usize {
+    s.char_indices()
+        .nth(char_index)
+        .map(|(byte, _)| byte)
+        .unwrap_or_else(|| s.len())
+}
+
+fn visual_line_of_char(dialog: &NewAgentDialog, char_index: usize, field_width: usize) -> usize {
+    let field_width = field_width.max(1);
+    let mut line = 0usize;
+    let mut col = 0usize;
+    for (i, ch) in dialog.prompt.chars().enumerate() {
+        if i == char_index {
+            // The char at `i` is the first on its line; resolve the wrap
+            // that landed it on this line (if any) before returning.
+            if col >= field_width {
+                return line + 1;
+            }
+            return line;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 0;
+            continue;
+        }
+        if col >= field_width {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    line
+}
+
+fn start_of_visual_line(dialog: &NewAgentDialog, char_index: usize, field_width: usize) -> usize {
+    let field_width = field_width.max(1);
+    let mut line_start = 0usize;
+    let mut col = 0usize;
+    for (i, ch) in dialog.prompt.chars().enumerate() {
+        if i == char_index {
+            return line_start;
+        }
+        if ch == '\n' {
+            line_start = i + 1;
+            col = 0;
+            continue;
+        }
+        if col >= field_width {
+            line_start = i;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    line_start
+}
+
+fn end_of_visual_line(
+    dialog: &NewAgentDialog,
+    char_index: usize,
+    field_width: usize,
+    char_len: usize,
+) -> usize {
+    let field_width = field_width.max(1);
+    let mut line_end = char_len;
+    let mut col = 0usize;
+    for (i, ch) in dialog.prompt.chars().enumerate() {
+        if ch == '\n' {
+            line_end = i;
+            if i >= char_index {
+                return line_end;
+            }
+            col = 0;
+            line_end = char_len;
+            continue;
+        }
+        if col >= field_width {
+            line_end = i;
+            if i >= char_index {
+                return line_end;
+            }
+            col = 1;
+            line_end = char_len;
+        } else {
+            col += 1;
+        }
+    }
+    line_end
+}
+
+fn move_prompt_visual(
+    dialog: &NewAgentDialog,
+    cursor: usize,
+    field_width: usize,
+    forward: bool,
+) -> Option<usize> {
+    let char_len = dialog.prompt.chars().count();
+    let current_line = visual_line_of_char(dialog, cursor, field_width);
+    let total_lines = prompt_visual_line_count(dialog, field_width);
+    if !forward && current_line == 0 {
+        return None;
+    }
+    if forward && current_line + 1 >= total_lines {
+        return None;
+    }
+    let target_line = if forward {
+        current_line + 1
+    } else {
+        current_line - 1
+    };
+    let target_start = start_of_visual_line_at(dialog, target_line, field_width);
+    let target_end = end_of_visual_line_at(dialog, target_line, field_width, char_len);
+    let col_in_current =
+        cursor.saturating_sub(start_of_visual_line_at(dialog, current_line, field_width));
+    let target_width = target_end.saturating_sub(target_start);
+    Some(target_start + col_in_current.min(target_width))
+}
+
+fn start_of_visual_line_at(
+    dialog: &NewAgentDialog,
+    target_line: usize,
+    field_width: usize,
+) -> usize {
+    let field_width = field_width.max(1);
+    let mut line = 0usize;
+    let mut line_start = 0usize;
+    let mut col = 0usize;
+    for (i, ch) in dialog.prompt.chars().enumerate() {
+        if line == target_line {
+            return line_start;
+        }
+        if ch == '\n' {
+            line += 1;
+            line_start = i + 1;
+            col = 0;
+            continue;
+        }
+        if col >= field_width {
+            line += 1;
+            line_start = i;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    line_start
+}
+
+fn end_of_visual_line_at(
+    dialog: &NewAgentDialog,
+    target_line: usize,
+    field_width: usize,
+    char_len: usize,
+) -> usize {
+    let field_width = field_width.max(1);
+    let mut line = 0usize;
+    let mut line_end = char_len;
+    let mut col = 0usize;
+    for (i, ch) in dialog.prompt.chars().enumerate() {
+        if ch == '\n' {
+            if line == target_line {
+                return i;
+            }
+            line += 1;
+            col = 0;
+            line_end = char_len;
+            continue;
+        }
+        if col >= field_width {
+            if line == target_line {
+                return i;
+            }
+            line += 1;
+            col = 1;
+            line_end = char_len;
+        } else {
+            col += 1;
+        }
+    }
+    line_end
+}
+
+/// Mirrors the clamp the renderer uses (`prompt_field_width` in
+/// `ui/dialogs/new_agent_dialog.rs`) so the input handler's cursor / scroll
+/// math agrees with what the user sees on the screen.
+pub(crate) fn prompt_field_width_for(term_width: u16) -> usize {
+    let term_width = term_width.max(1);
+    let max_dialog_w = term_width.saturating_sub(2).max(1);
+    let preferred_dialog_w = term_width.saturating_mul(65) / 100;
+    let min_dialog_w = 40u16.min(max_dialog_w);
+    let dialog_width = preferred_dialog_w.clamp(min_dialog_w, max_dialog_w);
+    (dialog_width.saturating_sub(5) as usize).max(10)
 }
 
 fn handle_cron_field(dialog: &mut NewAgentDialog, code: KeyCode, fields: DialogFields) {
@@ -486,10 +793,128 @@ fn wrapped_index(current: usize, len: usize, forward: bool) -> Option<usize> {
     if len == 0 {
         return None;
     }
-
     Some(if forward {
         (current + 1) % len
     } else {
         current.checked_sub(1).unwrap_or(len - 1)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::app::dialog::new_agent::NewAgentDialog;
+
+    fn dialog_with(prompt: &str) -> NewAgentDialog {
+        let mut d = NewAgentDialog::new(Some("."));
+        d.prompt = prompt.to_string();
+        d.prompt_cursor = prompt.chars().count();
+        d
+    }
+
+    #[test]
+    fn insert_text_appends_and_moves_cursor() {
+        let mut d = dialog_with("foo");
+        insert_prompt_text(&mut d, "bar");
+        assert_eq!(d.prompt, "foobar");
+        assert_eq!(d.prompt_cursor, 6);
+    }
+
+    #[test]
+    fn insert_text_at_middle_splits_string() {
+        let mut d = dialog_with("fooo"); // cursor at end (4)
+        d.prompt_cursor = 2;
+        insert_prompt_text(&mut d, "X");
+        assert_eq!(d.prompt, "foXoo");
+        assert_eq!(d.prompt_cursor, 3);
+    }
+
+    #[test]
+    fn backspace_removes_previous_char() {
+        let mut d = dialog_with("foo");
+        backspace_prompt(&mut d);
+        assert_eq!(d.prompt, "fo");
+        assert_eq!(d.prompt_cursor, 2);
+    }
+
+    #[test]
+    fn backspace_at_start_is_noop() {
+        let mut d = dialog_with("foo");
+        d.prompt_cursor = 0;
+        backspace_prompt(&mut d);
+        assert_eq!(d.prompt, "foo");
+        assert_eq!(d.prompt_cursor, 0);
+    }
+
+    #[test]
+    fn delete_forward_removes_next_char() {
+        let mut d = dialog_with("foo");
+        d.prompt_cursor = 1;
+        delete_prompt_forward(&mut d);
+        assert_eq!(d.prompt, "fo");
+        assert_eq!(d.prompt_cursor, 1);
+    }
+
+    #[test]
+    fn paste_with_newlines_is_preserved() {
+        let mut d = dialog_with("");
+        insert_prompt_text(&mut d, "line1\nline2\nline3");
+        assert_eq!(d.prompt, "line1\nline2\nline3");
+        assert_eq!(d.prompt_cursor, 17);
+    }
+
+    #[test]
+    fn paste_with_trailing_space_is_preserved() {
+        let mut d = dialog_with("");
+        insert_prompt_text(&mut d, "hello ");
+        assert_eq!(d.prompt, "hello ");
+        assert_eq!(d.prompt_cursor, 6);
+    }
+
+    #[test]
+    fn visual_line_of_char_handles_soft_wrap() {
+        let d = dialog_with("abcdefghij");
+        assert_eq!(visual_line_of_char(&d, 0, 4), 0);
+        assert_eq!(visual_line_of_char(&d, 4, 4), 1);
+        assert_eq!(visual_line_of_char(&d, 9, 4), 2);
+    }
+
+    #[test]
+    fn visual_line_of_char_handles_hard_newline() {
+        let d = dialog_with("abc\ndef");
+        assert_eq!(visual_line_of_char(&d, 2, 30), 0); // 'c' on line 0
+        assert_eq!(visual_line_of_char(&d, 3, 30), 0); // '\n' position still on line 0
+        assert_eq!(visual_line_of_char(&d, 4, 30), 1); // 'd' on line 1
+    }
+
+    #[test]
+    fn move_visual_clamps_to_shorter_line() {
+        let d = dialog_with("abcdefghij\nab");
+        // cursor at 'j' on line 2 (pos 9, col 1 of line 2)
+        // moving down should clamp to col 2 of line 3 (end of "ab")
+        let new_cursor = move_prompt_visual(&d, 9, 4, true).expect("should move down");
+        assert_eq!(new_cursor, 12); // "ab" ends at char index 12
+    }
+
+    #[test]
+    fn move_visual_returns_none_at_first_line_up() {
+        let d = dialog_with("hello");
+        assert!(move_prompt_visual(&d, 3, 30, false).is_none());
+    }
+
+    #[test]
+    fn move_visual_returns_none_at_last_line_down() {
+        let d = dialog_with("hello");
+        assert!(move_prompt_visual(&d, 3, 30, true).is_none());
+    }
+
+    #[test]
+    fn home_and_end_jump_to_line_bounds() {
+        let d = dialog_with("abcdefghij");
+        // at pos 7, line 1, col 3
+        let start = start_of_visual_line(&d, 7, 4);
+        assert_eq!(start, 4);
+        let end = end_of_visual_line(&d, 7, 4, 10);
+        assert_eq!(end, 8);
+    }
 }
