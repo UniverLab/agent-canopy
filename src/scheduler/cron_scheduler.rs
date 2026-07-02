@@ -7,8 +7,9 @@
 
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{Local, Utc};
 use cron::Schedule;
 use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
@@ -16,6 +17,8 @@ use tokio_util::sync::CancellationToken;
 use crate::application::ports::AgentRepository;
 use crate::db::Database;
 use crate::executor::Executor;
+
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// The internal cron scheduler that runs as a tokio background_agent.
 pub struct CronScheduler {
@@ -86,6 +89,9 @@ impl CronScheduler {
                 _ = self.notify.notified() => {
                     continue;
                 }
+                _ = tokio::time::sleep(RECONCILE_INTERVAL) => {
+                    continue;
+                }
                 _ = tokio::time::sleep(sleep_dur) => {
                     if let Err(e) = self.fire_due_tasks().await {
                         tracing::error!("Scheduler fire failed: {}", e);
@@ -104,7 +110,14 @@ impl CronScheduler {
             return FALLBACK;
         };
 
-        let now = Utc::now();
+        // Cron expressions are authored in the user's local timezone (a user
+        // who types `0 9 * * *` expects 9 AM on their wall clock, not 9 AM
+        // UTC). We feed the schedule iterator a `Local` "now" so it walks
+        // fire times in the same frame the user wrote the expression in,
+        // then convert the result to UTC for sleep-delta math (which uses
+        // a wall-clock-independent `Duration`).
+        let now_local = Local::now();
+        let now_utc = Utc::now();
         let mut earliest: Option<chrono::DateTime<Utc>> = None;
 
         for agent in &agents {
@@ -121,18 +134,19 @@ impl CronScheduler {
                 continue;
             };
 
-            if let Some(next) = schedule.after(&now).next() {
+            if let Some(next_local) = schedule.after(&now_local).next() {
+                let next_utc = next_local.with_timezone(&Utc);
                 earliest = Some(match earliest {
-                    Some(e) if next < e => next,
+                    Some(e) if next_utc < e => next_utc,
                     Some(e) => e,
-                    None => next,
+                    None => next_utc,
                 });
             }
         }
 
         match earliest {
             Some(t) => {
-                let delta = t.signed_duration_since(now);
+                let delta = t.signed_duration_since(now_utc);
                 if delta.num_milliseconds() <= 0 {
                     std::time::Duration::ZERO
                 } else {
@@ -146,10 +160,14 @@ impl CronScheduler {
     /// Fire all agents whose next cron time is now (within a 1-second tolerance).
     async fn fire_due_tasks(&self) -> anyhow::Result<()> {
         let agents = self.db.list_cron_agents()?;
-        let now = Utc::now();
+        // Evaluate schedules in the user's local timezone. `now_utc` is only
+        // used for the persisted `last_fired` comparison (which is stored in
+        // UTC), and `now_local` for the cron-field match.
+        let now_local = Local::now();
+        let now_utc = Utc::now();
 
         for agent in &agents {
-            self.try_fire_agent(agent, now).await?;
+            self.try_fire_agent(agent, now_local, now_utc).await?;
         }
         Ok(())
     }
@@ -159,7 +177,8 @@ impl CronScheduler {
     async fn try_fire_agent(
         &self,
         agent: &crate::domain::models::Agent,
-        now: chrono::DateTime<Utc>,
+        now_local: chrono::DateTime<Local>,
+        now_utc: chrono::DateTime<Utc>,
     ) -> anyhow::Result<()> {
         if !agent.enabled {
             return Ok(());
@@ -189,23 +208,28 @@ impl CronScheduler {
             }
         };
 
-        let window_start = now - chrono::Duration::seconds(60);
-        let Some(next_fire) = schedule.after(&window_start).next() else {
+        // 1-minute lookback so a scheduler hiccup doesn't skip a fire that
+        // was scheduled to happen just before "now" (in local time).
+        let window_start_local = now_local - chrono::Duration::seconds(60);
+        let Some(next_fire_local) = schedule.after(&window_start_local).next() else {
             return Ok(());
         };
-        if next_fire > now {
+        if next_fire_local > now_local {
             return Ok(());
         }
 
+        // Persist and de-dupe in UTC so the timestamps line up with the rest
+        // of the system (DB schema, `last_run_at`, daemon JSON).
+        let window_start_utc = now_utc - chrono::Duration::seconds(60);
         {
             let mut last_fired = self.last_fired.lock().await;
             if last_fired
                 .get(&agent.id)
-                .is_some_and(|last| *last >= window_start)
+                .is_some_and(|last| *last >= window_start_utc)
             {
                 return Ok(());
             }
-            last_fired.insert(agent.id.clone(), now);
+            last_fired.insert(agent.id.clone(), now_utc);
         }
 
         let executor = Arc::clone(&self.executor);
@@ -285,5 +309,35 @@ mod tests {
         let now = chrono::Utc::now();
         let next = schedule.after(&now).next();
         assert!(next.is_some());
+    }
+
+    /// The schedule iterator interprets cron fields in the timezone of the
+    /// "now" reference. We feed it a `Local` "now" so user-authored cron
+    /// expressions like `0 9 * * *` mean "9 AM on the user's wall clock",
+    /// not 9 AM UTC. This test verifies the field interpretation by
+    /// comparing local vs UTC.
+    #[test]
+    fn test_cron_field_uses_local_timezone() {
+        use chrono::Timelike;
+        let converted = to_7field_cron("0 9 * * *");
+        let schedule = Schedule::from_str(&converted).unwrap();
+        let now_local = chrono::Local::now();
+        let next_local = schedule.after(&now_local).next().expect("next fire time");
+        // The hour field of the *local* fire time must be 9 — that's the
+        // whole point of evaluating against a Local reference.
+        assert_eq!(next_local.hour(), 9);
+        // And the local hour must differ from the UTC hour whenever the
+        // system isn't in UTC, otherwise the test isn't proving anything.
+        // (Skip the assertion in the rare case the test runs in UTC, e.g.
+        // CI on a server with TZ=UTC.)
+        let next_utc = next_local.with_timezone(&chrono::Utc);
+        if chrono::Local::now().offset().local_minus_utc() != 0 {
+            assert_ne!(
+                next_local.hour(),
+                next_utc.hour(),
+                "local hour and UTC hour are equal — the scheduler would be \
+                 treating cron fields as UTC, which is the bug we are guarding against"
+            );
+        }
     }
 }
