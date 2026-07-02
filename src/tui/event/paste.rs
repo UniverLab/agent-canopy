@@ -66,6 +66,13 @@ pub fn handle_paste(app: &mut App, text: &str) {
                     }
                 }
             }
+            // New-agent dialog has its own prompt input box; route pasted text
+            // there too. Newlines are preserved as hard breaks (the renderer
+            // wraps with `prompt_visual_line_count` math).
+            if let Some(dialog) = &mut app.new_agent_dialog {
+                let clean = text.replace('\r', "");
+                super::new_agent_dialog::insert_prompt_text(dialog, &clean);
+            }
         }
         _ => {
             // For other contexts, simulate typing each char (no newlines)
