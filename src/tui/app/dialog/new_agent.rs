@@ -55,6 +55,10 @@ pub struct NewAgentDialog {
     pub working_dir: String,
     pub model: String,
     pub prompt: String,
+    /// Cursor position (char index) inside `prompt`.
+    pub prompt_cursor: usize,
+    /// First visible visual line of the multi-line prompt input.
+    pub prompt_scroll: usize,
     pub cron_expr: String,
     pub watch_path: String,
     pub watch_events: Vec<String>,
@@ -123,6 +127,8 @@ impl NewAgentDialog {
             working_dir: cwd.clone(),
             model: String::new(),
             prompt: String::new(),
+            prompt_cursor: 0,
+            prompt_scroll: 0,
             cron_expr: "0 9 * * *".to_string(),
             watch_path: cwd.clone(),
             watch_events: vec!["create".to_string(), "modify".to_string()],

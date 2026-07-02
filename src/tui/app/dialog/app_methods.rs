@@ -841,6 +841,8 @@ fn populate_dialog_from_agent(dialog: &mut NewAgentDialog, a: &crate::domain::mo
     dialog.edit_id = Some(a.id.clone());
     dialog.task_type = NewTaskType::Background;
     dialog.prompt = a.prompt.clone();
+    dialog.prompt_cursor = a.prompt.chars().count();
+    dialog.prompt_scroll = 0;
     dialog.model = a.model.clone().unwrap_or_default();
     dialog.working_dir = a.working_dir.clone().unwrap_or_default();
     dialog.field = 2;
