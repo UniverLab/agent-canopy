@@ -36,6 +36,16 @@ pub struct SystemInfo {
     pub gpu_info: Option<GpuInfo>,
     pub power_watts: Option<f32>,
     pub power_limit_watts: Option<f32>,
+    pub power_source: Option<PowerSource>,
+}
+
+/// Where `SystemInfo::power_watts` was sourced from. The GPU dashboard row
+/// folds power in only when it's the GPU's own draw; battery discharge is
+/// system-wide and gets its own `pwr:` row instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerSource {
+    Battery,
+    Gpu,
 }
 
 /// GPU information.
@@ -156,11 +166,13 @@ impl SystemInfo {
             Some(watts) => {
                 self.power_watts = Some(watts);
                 self.power_limit_watts = None;
+                self.power_source = Some(PowerSource::Battery);
             }
             None => {
                 let gpu = self.gpu_info.as_ref();
                 self.power_watts = gpu.and_then(|g| g.power_watts);
                 self.power_limit_watts = gpu.and_then(|g| g.power_limit_watts);
+                self.power_source = self.power_watts.map(|_| PowerSource::Gpu);
             }
         }
     }

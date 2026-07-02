@@ -2151,6 +2151,7 @@ fn blend_system_info(
     current.gpu_info = blend_gpu_info(&current.gpu_info, &target.gpu_info, t);
     current.power_watts = blend_optional_f32(current.power_watts, target.power_watts, t);
     current.power_limit_watts = target.power_limit_watts;
+    current.power_source = target.power_source;
 }
 
 fn spawn_system_monitor(
