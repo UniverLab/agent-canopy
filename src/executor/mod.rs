@@ -446,15 +446,15 @@ fn rotate_log_if_needed(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Wrap the user's prompt with structured `task_report` instructions.
+/// Wrap the user's prompt with structured `agent_report` instructions.
 fn wrap_prompt(user_prompt: &str, agent_id: &str, run_id: &str) -> String {
     format!(
         "[SYSTEM INSTRUCTIONS]\n\
          You are executing a managed agent. You MUST follow these steps:\n\
-         1. IMMEDIATELY call the task_report tool: task_report(run_id=\"{run_id}\", status=\"in_progress\")\n\
+         1. IMMEDIATELY call the agent_report tool: agent_report(run_id=\"{run_id}\", status=\"in_progress\")\n\
          2. Execute the user's task below\n\
-         3. When finished, call: task_report(run_id=\"{run_id}\", status=\"success\", summary=\"<brief summary of what happened>\")\n\
-            If the task failed: task_report(run_id=\"{run_id}\", status=\"error\", summary=\"<what went wrong>\")\n\
+         3. When finished, call: agent_report(run_id=\"{run_id}\", status=\"success\", summary=\"<brief summary of what happened>\")\n\
+            If the task failed: agent_report(run_id=\"{run_id}\", status=\"error\", summary=\"<what went wrong>\")\n\
          \n\
          Agent ID: {agent_id}\n\
          Run ID: {run_id}\n\

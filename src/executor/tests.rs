@@ -30,3 +30,22 @@ fn test_notification_service_integration() {
     service.notify_task_completed("test-agent", true, Some(0));
     service.notify_nursery_failed("test nursery error");
 }
+
+#[test]
+fn wrap_prompt_uses_agent_report_tool_name() {
+    let out = super::wrap_prompt("do the thing", "agent-abc", "run-xyz");
+    assert!(
+        out.contains("agent_report(run_id=\"run-xyz\""),
+        "expected in_progress agent_report call, got:\n{out}"
+    );
+    assert!(out.contains("agent_report(run_id=\"run-xyz\", status=\"success\""));
+    assert!(out.contains("agent_report(run_id=\"run-xyz\", status=\"error\""));
+    assert!(
+        !out.contains("task_report"),
+        "wrap_prompt must not reference the old/incorrect task_report name"
+    );
+    assert!(out.contains("Agent ID: agent-abc"));
+    assert!(out.contains("Run ID: run-xyz"));
+    assert!(out.contains("[USER TASK]"));
+    assert!(out.contains("do the thing"));
+}
