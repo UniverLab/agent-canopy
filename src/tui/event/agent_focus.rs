@@ -100,7 +100,10 @@ fn handle_background_agent_key(app: &mut App, code: KeyCode) -> bool {
     }
 
     match code {
-        KeyCode::Esc | KeyCode::Char('h') => app.focus = Focus::Preview,
+        KeyCode::Esc | KeyCode::Char('h') | KeyCode::F(10) => {
+            app.active_split_id = None;
+            app.focus = Focus::Preview;
+        }
         KeyCode::Down | KeyCode::Char('j') => app.scroll_log_down(),
         KeyCode::Up | KeyCode::Char('k') => app.scroll_log_up(),
         KeyCode::Char('q') => app.running = false,
@@ -267,7 +270,10 @@ fn try_cycle_through_focusable(app: &mut App, forward: bool) -> bool {
         .filter(|(_, entry)| {
             matches!(
                 entry,
-                AgentEntry::Interactive(_) | AgentEntry::Terminal(_) | AgentEntry::Group(_)
+                AgentEntry::Interactive(_)
+                    | AgentEntry::Terminal(_)
+                    | AgentEntry::Group(_)
+                    | AgentEntry::Agent(_)
             )
         })
         .map(|(idx, _)| idx)

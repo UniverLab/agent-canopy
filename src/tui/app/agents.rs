@@ -162,6 +162,11 @@ impl App {
         }
     }
 
+    /// Indices of all agent entries the user can navigate to from focus mode:
+    /// interactive + terminal sessions, groups, and background agents. The
+    /// RAG-info panel is reached by walking past either end of this list, not
+    /// by a dedicated index. Order matches `app.agents`, which itself is
+    /// `[background..., interactive..., terminal..., groups...]`.
     fn focusable_agent_indices(&self) -> Vec<usize> {
         self.agents
             .iter()
@@ -169,7 +174,10 @@ impl App {
             .filter(|(_, entry)| {
                 matches!(
                     entry,
-                    AgentEntry::Interactive(_) | AgentEntry::Terminal(_) | AgentEntry::Group(_)
+                    AgentEntry::Interactive(_)
+                        | AgentEntry::Terminal(_)
+                        | AgentEntry::Group(_)
+                        | AgentEntry::Agent(_)
                 )
             })
             .map(|(idx, _)| idx)
