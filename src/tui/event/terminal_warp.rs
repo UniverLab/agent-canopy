@@ -124,7 +124,7 @@ pub fn handle_terminal_warp_key(
         KeyCode::Backspace => delete_before_cursor(&mut app.terminal_agents[idx]),
         KeyCode::Delete => delete_at_cursor(&mut app.terminal_agents[idx]),
         KeyCode::Left => move_cursor_left(&mut app.terminal_agents[idx]),
-        KeyCode::Right => move_cursor_right(&mut app.terminal_agents[idx]),
+        KeyCode::Right => handle_warp_right_key(app, idx),
         KeyCode::Home => app.terminal_agents[idx].warp_cursor = 0,
         KeyCode::End => move_cursor_to_end(&mut app.terminal_agents[idx]),
         KeyCode::Up => handle_warp_up_key(app, idx),
@@ -397,6 +397,34 @@ fn move_cursor_right(agent: &mut InteractiveAgent) {
     };
 
     agent.warp_cursor = new_pos;
+}
+
+/// Right arrow: if the cursor sits at the end of the input and there is
+/// a ghost-suggestion (the first history entry starting with the current
+/// input), accept the full completion in one go. Otherwise behave like a
+/// normal cursor-right.
+fn handle_warp_right_key(app: &mut App, idx: usize) {
+    let agent = &mut app.terminal_agents[idx];
+    let input_len = buffer_len(agent);
+    if agent.warp_cursor == input_len {
+        let current = input_text(agent);
+        if let Some(ghost) = app
+            .terminal_histories
+            .get(&agent.name)
+            .and_then(|h| h.ghost_suggestion(&current))
+        {
+            if ghost.len() > current.len() {
+                let suffix = &ghost[current.len()..];
+                let _ = with_input_buffer(agent, |buf| {
+                    buf.push_str(suffix);
+                });
+                agent.warp_cursor = buffer_len(agent);
+                agent.history_index = None;
+                return;
+            }
+        }
+    }
+    move_cursor_right(agent);
 }
 
 fn move_cursor_to_end(agent: &mut InteractiveAgent) {
