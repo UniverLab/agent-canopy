@@ -570,20 +570,113 @@ fn layout_agent_sections(content_area: Rect, heights: AgentSectionHeights) -> Ag
         return layout;
     }
 
-    let per_section = content_area.height / section_count;
-    if heights.background.is_some() {
-        layout.background = take_top(&mut remaining, per_section);
+    // Overflow: the sections don't all fit. Instead of an equal `height /
+    // section_count` slice for everyone — which hands small sections
+    // (background/terminal/groups) a fat slice they can't fill, leaving empty
+    // gaps while `interactive` scrolls — allocate with max-min fairness so no
+    // section ends up taller than its content.
+    let mut kinds: Vec<AgentSectionKind> = Vec::new();
+    let mut demands: Vec<u16> = Vec::new();
+    for (kind, height) in [
+        (AgentSectionKind::Background, heights.background),
+        (AgentSectionKind::Interactive, heights.interactive),
+        (AgentSectionKind::Terminal, heights.terminal),
+        (AgentSectionKind::Groups, heights.groups),
+    ] {
+        if let Some(height) = height {
+            kinds.push(kind);
+            demands.push(height);
+        }
     }
-    if heights.interactive.is_some() {
-        layout.interactive = take_top(&mut remaining, per_section);
-    }
-    if heights.terminal.is_some() {
-        layout.terminal = take_top(&mut remaining, per_section);
-    }
-    if heights.groups.is_some() && remaining.height > 0 {
-        layout.groups = Some(remaining);
+
+    let allocation = fair_section_heights(&demands, content_area.height);
+    for (kind, &height) in kinds.iter().zip(allocation.iter()) {
+        let rect = take_top(&mut remaining, height);
+        match kind {
+            AgentSectionKind::Background => layout.background = rect,
+            AgentSectionKind::Interactive => layout.interactive = rect,
+            AgentSectionKind::Terminal => layout.terminal = rect,
+            AgentSectionKind::Groups => layout.groups = rect,
+        }
     }
     layout
+}
+
+#[derive(Clone, Copy)]
+enum AgentSectionKind {
+    Background,
+    Interactive,
+    Terminal,
+    Groups,
+}
+
+/// Split `budget` rows across sections with the given `demands` using max-min
+/// fair capping. No section is allocated more than it needs; the surplus freed
+/// by sections that fit within an equal share is shared among the sections that
+/// still want more, proportional to their unsatisfied demand. Sections that end
+/// up below their demand scroll internally. Callers use this only when the
+/// sections can't all be shown at full height (`sum(demands) > budget`), but the
+/// function is correct for any input and always allocates at most `budget` rows.
+fn fair_section_heights(demands: &[u16], budget: u16) -> Vec<u16> {
+    let n = demands.len();
+    let mut alloc = vec![0u16; n];
+    let mut capped = vec![false; n];
+    let mut remaining_budget = budget;
+
+    loop {
+        let active: Vec<usize> = (0..n).filter(|&i| !capped[i]).collect();
+        if active.is_empty() || remaining_budget == 0 {
+            break;
+        }
+
+        // Cap every section whose full remaining demand fits within an equal
+        // share of the budget; the rows they don't take are freed for others.
+        let share = remaining_budget / active.len() as u16;
+        let mut capped_any = false;
+        for &i in &active {
+            let want = demands[i] - alloc[i];
+            if want <= share {
+                alloc[i] = demands[i];
+                remaining_budget -= want;
+                capped[i] = true;
+                capped_any = true;
+            }
+        }
+        if capped_any {
+            continue;
+        }
+
+        // Nobody fully fits: hand out what's left proportional to each still-
+        // hungry section's unsatisfied demand, then place the rounding remainder
+        // on the hungriest sections one row at a time.
+        let total_want: u32 = active.iter().map(|&i| (demands[i] - alloc[i]) as u32).sum();
+        if total_want == 0 {
+            break;
+        }
+        let budget_u32 = remaining_budget as u32;
+        let mut distributed = 0u16;
+        for &i in &active {
+            let want = (demands[i] - alloc[i]) as u32;
+            let give = (budget_u32 * want / total_want) as u16;
+            alloc[i] += give;
+            distributed += give;
+        }
+        let mut leftover = remaining_budget - distributed;
+        while leftover > 0 {
+            let Some(&i) = active
+                .iter()
+                .filter(|&&i| alloc[i] < demands[i])
+                .max_by_key(|&&i| demands[i] - alloc[i])
+            else {
+                break;
+            };
+            alloc[i] += 1;
+            leftover -= 1;
+        }
+        break;
+    }
+
+    alloc
 }
 
 fn render_agent_list_panel(
@@ -1539,4 +1632,113 @@ fn draw_project_relation_dialog(
         ))),
         Rect::new(inner.x, footer_y, inner.width, 1),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn needed_agents(count: u16) -> u16 {
+        count * 4 + 2
+    }
+
+    #[test]
+    fn fair_section_heights_caps_small_sections_at_their_demand() {
+        // background: 1 agent (6), interactive: 6 agents (26), terminal: 1 (6).
+        let demands = [needed_agents(1), needed_agents(6), needed_agents(1)];
+        let total: u16 = demands.iter().sum();
+        assert_eq!(total, 38);
+
+        let alloc = fair_section_heights(&demands, 30);
+
+        // No section is ever allocated more than it needs.
+        for (got, want) in alloc.iter().zip(demands.iter()) {
+            assert!(got <= want, "section {got} exceeded its demand {want}");
+        }
+        // The two small sections get exactly what they need (no empty gap).
+        assert_eq!(alloc[0], demands[0]);
+        assert_eq!(alloc[2], demands[2]);
+        // Interactive absorbs all the surplus and scrolls internally.
+        assert_eq!(alloc[1], 30 - demands[0] - demands[2]);
+        // The whole budget is used — no leftover rows leaking to a brain gap.
+        assert_eq!(alloc.iter().sum::<u16>(), 30);
+    }
+
+    #[test]
+    fn fair_section_heights_never_exceeds_demand_with_four_sections() {
+        let demands = [needed_agents(1), needed_agents(8), needed_agents(1), 4];
+        let budget = 24;
+        assert!(demands.iter().sum::<u16>() > budget);
+
+        let alloc = fair_section_heights(&demands, budget);
+
+        for (got, want) in alloc.iter().zip(demands.iter()) {
+            assert!(got <= want, "section {got} exceeded its demand {want}");
+        }
+        assert_eq!(alloc.iter().sum::<u16>(), budget);
+    }
+
+    #[test]
+    fn fair_section_heights_fits_everyone_when_budget_is_ample() {
+        let demands = [needed_agents(1), needed_agents(2)];
+        let alloc = fair_section_heights(&demands, 100);
+        assert_eq!(alloc[0], demands[0]);
+        assert_eq!(alloc[1], demands[1]);
+    }
+
+    #[test]
+    fn layout_agent_sections_overflow_keeps_small_sections_within_needed() {
+        let content = Rect::new(0, 0, 33, 30);
+        let heights = AgentSectionHeights {
+            background: Some(needed_agents(1)),
+            interactive: Some(needed_agents(6)),
+            terminal: Some(needed_agents(1)),
+            groups: None,
+        };
+        assert!(
+            heights.total() > content.height,
+            "test must exercise overflow"
+        );
+
+        let layout = layout_agent_sections(content, heights);
+
+        let background = layout.background.expect("background rect");
+        let interactive = layout.interactive.expect("interactive rect");
+        let terminal = layout.terminal.expect("terminal rect");
+
+        // Small sections never get a slice taller than their content.
+        assert!(background.height <= needed_agents(1));
+        assert!(terminal.height <= needed_agents(1));
+        // Interactive takes the bulk of the space and scrolls.
+        assert!(interactive.height > background.height);
+        assert!(interactive.height > terminal.height);
+        // Sections tile the content area top-to-bottom with no gaps.
+        assert_eq!(background.y, content.y);
+        assert_eq!(interactive.y, background.y + background.height);
+        assert_eq!(terminal.y, interactive.y + interactive.height);
+        assert_eq!(
+            background.height + interactive.height + terminal.height,
+            content.height
+        );
+    }
+
+    #[test]
+    fn layout_agent_sections_fits_all_when_room_available() {
+        let content = Rect::new(0, 0, 33, 60);
+        let heights = AgentSectionHeights {
+            background: Some(needed_agents(1)),
+            interactive: Some(needed_agents(2)),
+            terminal: Some(needed_agents(1)),
+            groups: None,
+        };
+        assert!(heights.total() <= content.height);
+
+        let layout = layout_agent_sections(content, heights);
+
+        assert_eq!(layout.background.unwrap().height, needed_agents(1));
+        assert_eq!(layout.interactive.unwrap().height, needed_agents(2));
+        assert_eq!(layout.terminal.unwrap().height, needed_agents(1));
+        // Leftover space becomes the brain panel.
+        assert!(layout.brain.is_some());
+    }
 }
