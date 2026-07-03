@@ -20,6 +20,59 @@ use crate::executor::Executor;
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
+/// How a failed scheduled run is retried, independently of the cron slot.
+///
+/// A cron miss/failure (e.g. a CLI hitting its quota) used to wait for the
+/// next scheduled slot — hours away. With retry enabled, a failing run is
+/// re-attempted after `delay_minutes`, up to `max_retries` times, without
+/// disturbing the regular cron schedule.
+///
+/// Configurable via environment (read once at scheduler construction):
+/// - `CANOPY_RETRY_ENABLED`      (bool, default true)
+/// - `CANOPY_RETRY_DELAY_MINUTES` (u64,  default 60)
+/// - `CANOPY_RETRY_MAX`          (u32,  default 3)
+#[derive(Debug, Clone, Copy)]
+pub struct RetryPolicy {
+    pub enabled: bool,
+    pub delay_minutes: u64,
+    pub max_retries: u32,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            delay_minutes: 60,
+            max_retries: 3,
+        }
+    }
+}
+
+impl RetryPolicy {
+    /// Build from environment variables, falling back to defaults.
+    pub fn from_env() -> Self {
+        let d = Self::default();
+        Self {
+            enabled: std::env::var("CANOPY_RETRY_ENABLED")
+                .ok()
+                .and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
+                    "1" | "true" | "yes" | "on" => Some(true),
+                    "0" | "false" | "no" | "off" => Some(false),
+                    _ => None,
+                })
+                .unwrap_or(d.enabled),
+            delay_minutes: std::env::var("CANOPY_RETRY_DELAY_MINUTES")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(d.delay_minutes),
+            max_retries: std::env::var("CANOPY_RETRY_MAX")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(d.max_retries),
+        }
+    }
+}
+
 /// The internal cron scheduler that runs as a tokio background_agent.
 pub struct CronScheduler {
     db: Arc<Database>,
@@ -29,6 +82,8 @@ pub struct CronScheduler {
     notify: Arc<Notify>,
     /// Track last execution time per agent to avoid double-firing.
     last_fired: Arc<Mutex<std::collections::HashMap<String, chrono::DateTime<Utc>>>>,
+    /// Failure-retry policy applied to scheduled runs.
+    retry: RetryPolicy,
 }
 
 impl CronScheduler {
@@ -39,6 +94,7 @@ impl CronScheduler {
             cancel: CancellationToken::new(),
             notify: Arc::new(Notify::new()),
             last_fired: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            retry: RetryPolicy::from_env(),
         }
     }
 
@@ -229,15 +285,10 @@ impl CronScheduler {
 
         let executor = Arc::clone(&self.executor);
         let agent = agent.clone();
+        let retry = self.retry;
+        let cancel = self.cancel.clone();
         tokio::spawn(async move {
-            match executor.execute_agent(&agent, false).await {
-                Ok(code) => tracing::info!(
-                    "Scheduled agent '{}' completed (exit code: {})",
-                    agent.id,
-                    code
-                ),
-                Err(e) => tracing::error!("Scheduled agent '{}' failed: {}", agent.id, e),
-            }
+            run_with_retry(executor, agent, retry, cancel).await;
         });
 
         Ok(())
@@ -246,6 +297,92 @@ impl CronScheduler {
     /// Stop the scheduler.
     pub fn stop(&self) {
         self.cancel.cancel();
+    }
+}
+
+/// Whether a run outcome counts as a failure eligible for retry.
+///
+/// An `Err` (spawn/IO failure) and any non-zero exit code are failures.
+/// A clean exit (code 0) is a success. Callers treat lock-skips — which
+/// surface as an `Ok` with the process's own code — like any other run.
+fn run_outcome_is_failure(outcome: &anyhow::Result<i32>) -> bool {
+    !matches!(outcome, Ok(0))
+}
+
+/// Given a failed run, decide whether another attempt is warranted.
+/// `attempt` is the 0-based index of the attempt that just failed.
+fn should_retry(retry: &RetryPolicy, attempt: u32) -> bool {
+    retry.enabled && attempt < retry.max_retries
+}
+
+/// Run a scheduled agent, retrying on failure per [`RetryPolicy`].
+///
+/// The first attempt runs immediately (the cron slot fired). On failure,
+/// waits `delay_minutes` and re-runs, up to `max_retries` extra attempts.
+/// The wait is cancellation-aware, so a stopping daemon does not leave a
+/// pending retry sleeping.
+async fn run_with_retry(
+    executor: Arc<Executor>,
+    agent: crate::domain::models::Agent,
+    retry: RetryPolicy,
+    cancel: CancellationToken,
+) {
+    let mut attempt: u32 = 0;
+    loop {
+        let outcome = executor.execute_agent(&agent, false).await;
+        if !run_outcome_is_failure(&outcome) {
+            if let Ok(code) = outcome {
+                tracing::info!(
+                    "Scheduled agent '{}' completed (exit code: {})",
+                    agent.id,
+                    code
+                );
+            }
+            return;
+        }
+
+        match &outcome {
+            Ok(code) => tracing::warn!(
+                "Scheduled agent '{}' failed (exit code: {}), attempt {}",
+                agent.id,
+                code,
+                attempt + 1
+            ),
+            Err(e) => tracing::error!(
+                "Scheduled agent '{}' failed: {}, attempt {}",
+                agent.id,
+                e,
+                attempt + 1
+            ),
+        }
+
+        if !should_retry(&retry, attempt) {
+            if retry.enabled {
+                tracing::warn!(
+                    "Scheduled agent '{}' exhausted {} retries; waiting for next cron slot",
+                    agent.id,
+                    retry.max_retries
+                );
+            }
+            return;
+        }
+
+        attempt += 1;
+        tracing::info!(
+            "Scheduled agent '{}' will retry ({}/{}) in {} min",
+            agent.id,
+            attempt,
+            retry.max_retries,
+            retry.delay_minutes
+        );
+        let wait = Duration::from_secs(retry.delay_minutes.saturating_mul(60));
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = cancel.cancelled() => {
+                tracing::info!("Retry for agent '{}' cancelled (daemon stopping)", agent.id);
+                return;
+            }
+        }
     }
 }
 
@@ -301,6 +438,43 @@ mod tests {
         assert_eq!(to_7field_cron("*/5 * * * *"), "0 */5 * * * * *");
         assert_eq!(to_7field_cron("0 9 * * *"), "0 0 9 * * * *");
         assert_eq!(to_7field_cron("0 9 * * 1-5"), "0 0 9 * * 1-5 *");
+    }
+
+    #[test]
+    fn test_retry_policy_defaults() {
+        let d = RetryPolicy::default();
+        assert!(d.enabled);
+        assert_eq!(d.delay_minutes, 60);
+        assert_eq!(d.max_retries, 3);
+    }
+
+    #[test]
+    fn test_run_outcome_is_failure() {
+        assert!(!run_outcome_is_failure(&Ok(0)), "clean exit is success");
+        assert!(run_outcome_is_failure(&Ok(1)), "non-zero exit is failure");
+        assert!(
+            run_outcome_is_failure(&Err(anyhow::anyhow!("spawn failed"))),
+            "spawn error is failure"
+        );
+    }
+
+    #[test]
+    fn test_should_retry_respects_enabled_and_cap() {
+        let on = RetryPolicy {
+            enabled: true,
+            delay_minutes: 60,
+            max_retries: 3,
+        };
+        // attempts 0,1,2 retry; the 3rd failed attempt (index 3) does not.
+        assert!(should_retry(&on, 0));
+        assert!(should_retry(&on, 2));
+        assert!(!should_retry(&on, 3));
+
+        let off = RetryPolicy {
+            enabled: false,
+            ..on
+        };
+        assert!(!should_retry(&off, 0), "disabled policy never retries");
     }
 
     #[test]
