@@ -134,8 +134,7 @@ impl CronScheduler {
                 continue;
             };
 
-            if let Some(next_local) = schedule.after(&now_local).next() {
-                let next_utc = next_local.with_timezone(&Utc);
+            if let Some(next_utc) = next_fire_utc(&schedule, now_local) {
                 earliest = Some(match earliest {
                     Some(e) if next_utc < e => next_utc,
                     Some(e) => e,
@@ -210,11 +209,7 @@ impl CronScheduler {
 
         // 1-minute lookback so a scheduler hiccup doesn't skip a fire that
         // was scheduled to happen just before "now" (in local time).
-        let window_start_local = now_local - chrono::Duration::seconds(60);
-        let Some(next_fire_local) = schedule.after(&window_start_local).next() else {
-            return Ok(());
-        };
-        if next_fire_local > now_local {
+        if due_fire_local(&schedule, now_local).is_none() {
             return Ok(());
         }
 
@@ -252,6 +247,40 @@ impl CronScheduler {
     pub fn stop(&self) {
         self.cancel.cancel();
     }
+}
+
+/// Compute the next fire instant (in UTC) for a cron schedule, evaluated
+/// against the user's local wall clock.
+///
+/// Cron expressions are authored in the user's local timezone (someone who
+/// types `0 9 * * *` expects 9 AM on their wall clock, not 9 AM UTC), so we
+/// feed the schedule iterator a `Local` reference and only convert the
+/// resulting instant to UTC for wall-clock-independent delta math. Returns
+/// `None` if the schedule has no future occurrence.
+fn next_fire_utc(
+    schedule: &Schedule,
+    now_local: chrono::DateTime<Local>,
+) -> Option<chrono::DateTime<Utc>> {
+    schedule
+        .after(&now_local)
+        .next()
+        .map(|next_local| next_local.with_timezone(&Utc))
+}
+
+/// Decide whether a cron schedule is due at `now_local`, using a 60-second
+/// lookback so a scheduler hiccup doesn't skip a fire scheduled just before
+/// "now". Returns the matched fire time (in local wall-clock time) when due,
+/// or `None` otherwise.
+///
+/// Like [`next_fire_utc`], the schedule is evaluated in the local frame so
+/// the cron fields mean local wall-clock times.
+fn due_fire_local(
+    schedule: &Schedule,
+    now_local: chrono::DateTime<Local>,
+) -> Option<chrono::DateTime<Local>> {
+    let window_start = now_local - chrono::Duration::seconds(60);
+    let candidate = schedule.after(&window_start).next()?;
+    (candidate <= now_local).then_some(candidate)
 }
 
 /// Convert a standard 5-field cron expression to the 7-field format
@@ -339,5 +368,51 @@ mod tests {
                  treating cron fields as UTC, which is the bug we are guarding against"
             );
         }
+    }
+
+    /// `next_fire_utc` must land the fire at the local wall-clock time named
+    /// in the cron expression. For `30 8 * * *` the next fire, converted back
+    /// to local, must read 08:30 — regardless of the machine's UTC offset.
+    #[test]
+    fn test_next_fire_utc_lands_at_local_wall_clock() {
+        use chrono::Timelike;
+        let schedule = Schedule::from_str(&to_7field_cron("30 8 * * *")).unwrap();
+        let next_utc = next_fire_utc(&schedule, chrono::Local::now()).expect("next fire time");
+        let next_local = next_utc.with_timezone(&chrono::Local);
+        assert_eq!(next_local.hour(), 8, "fire must be at 08:xx local");
+        assert_eq!(next_local.minute(), 30, "fire must be at xx:30 local");
+    }
+
+    /// `due_fire_local` fires within the local minute the cron field names and
+    /// only within the 60-second lookback window — never for a future minute.
+    #[test]
+    fn test_due_fire_local_window() {
+        use chrono::{TimeZone, Timelike};
+        let schedule = Schedule::from_str(&to_7field_cron("30 8 * * *")).unwrap();
+
+        // A few seconds past 08:30 local → due (matched fire is 08:30 local).
+        let just_after = Local.with_ymd_and_hms(2026, 7, 3, 8, 30, 20).unwrap();
+        let fired = due_fire_local(&schedule, just_after).expect("should be due");
+        assert_eq!(
+            (fired.hour(), fired.minute()),
+            (8, 30),
+            "matched fire must be the 08:30 local occurrence"
+        );
+
+        // 08:00 local → the next occurrence after 07:59 is 08:30, which is in
+        // the future, so it must not be due yet.
+        let before = Local.with_ymd_and_hms(2026, 7, 3, 8, 0, 0).unwrap();
+        assert!(
+            due_fire_local(&schedule, before).is_none(),
+            "08:00 must not fire the 08:30 schedule"
+        );
+
+        // Just over a minute past 08:30 → outside the lookback window; the
+        // next occurrence after 08:30:30 is tomorrow's 08:30, in the future.
+        let stale = Local.with_ymd_and_hms(2026, 7, 3, 8, 31, 30).unwrap();
+        assert!(
+            due_fire_local(&schedule, stale).is_none(),
+            "08:31:30 is past the 60s lookback and must not re-fire"
+        );
     }
 }
