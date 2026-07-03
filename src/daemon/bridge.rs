@@ -33,19 +33,99 @@ pub(crate) async fn run_bridge(
     port_arg: Option<u16>,
     workdir_arg: Option<PathBuf>,
 ) -> Result<()> {
-    let agent_id = resolve_agent_id(agent_id_arg)?;
+    let identity = resolve_agent_identity(agent_id_arg);
     let workdir = resolve_workdir(workdir_arg)?;
     let port = resolve_bridge_port(port_arg);
 
-    if daemon_reachable(port).await {
-        return run_proxy_loop(port, &agent_id).await;
+    if identity.is_standalone {
+        register_standalone_session(&identity.agent_id, &workdir);
     }
 
-    eprintln!(
-        "canopy bridge: daemon not reachable on port {port}; \
-         falling back to embedded stdio server (no daemon-side coordination)"
-    );
-    run_embedded_stdio(&agent_id, &workdir).await
+    let result = if daemon_reachable(port).await {
+        run_proxy_loop(port, &identity.agent_id).await
+    } else {
+        eprintln!(
+            "canopy bridge: daemon not reachable on port {port}; \
+             falling back to embedded stdio server (no daemon-side coordination)"
+        );
+        run_embedded_stdio(&identity.agent_id, &workdir).await
+    };
+
+    if identity.is_standalone {
+        finish_standalone_session(&identity.agent_id, result.is_ok());
+    }
+
+    result
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct BridgeIdentity {
+    agent_id: String,
+    is_standalone: bool,
+}
+
+fn resolve_agent_identity(agent_id_arg: Option<String>) -> BridgeIdentity {
+    resolve_agent_identity_from_values(
+        agent_id_arg,
+        non_empty_env(CANOPY_AGENT_ID_ENV),
+        format!("standalone-{}", uuid::Uuid::new_v4()),
+    )
+}
+
+fn resolve_agent_identity_from_values(
+    agent_id_arg: Option<String>,
+    env_agent_id: Option<String>,
+    fallback_agent_id: String,
+) -> BridgeIdentity {
+    let env_agent_id = env_agent_id
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+
+    if let Some(agent_id) = agent_id_arg
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or(env_agent_id)
+    {
+        return BridgeIdentity {
+            agent_id,
+            is_standalone: false,
+        };
+    }
+
+    BridgeIdentity {
+        agent_id: fallback_agent_id,
+        is_standalone: true,
+    }
+}
+
+fn register_standalone_session(agent_id: &str, workdir: &str) {
+    let result = crate::ensure_data_dir()
+        .and_then(|data_dir| Database::new(&data_dir.join("background_agents.db")))
+        .and_then(|db| {
+            db.insert_interactive_session(
+                agent_id,
+                "standalone",
+                "bridge",
+                workdir,
+                Some("canopy bridge"),
+                "interactive",
+            )
+        });
+
+    if let Err(err) = result {
+        eprintln!("canopy bridge: could not register standalone session: {err}");
+    }
+}
+
+fn finish_standalone_session(agent_id: &str, success: bool) {
+    let exit_code = if success { 0 } else { 1 };
+    let result = crate::ensure_data_dir()
+        .and_then(|data_dir| Database::new(&data_dir.join("background_agents.db")))
+        .and_then(|db| db.finish_interactive_session(agent_id, exit_code));
+
+    if let Err(err) = result {
+        eprintln!("canopy bridge: could not finish standalone session: {err}");
+    }
 }
 
 // ── Proxy mode (daemon available) ────────────────────────────────────────────
@@ -312,20 +392,6 @@ fn non_empty_env(name: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-fn resolve_agent_id(agent_id_arg: Option<String>) -> Result<String> {
-    if let Some(id) = agent_id_arg
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .or_else(|| non_empty_env(CANOPY_AGENT_ID_ENV))
-    {
-        return Ok(id);
-    }
-
-    anyhow::bail!(
-        "missing agent id; pass --id <AGENT_ID> or set {CANOPY_AGENT_ID_ENV} in the environment"
-    );
-}
-
 fn resolve_workdir(workdir_arg: Option<PathBuf>) -> Result<String> {
     let workdir = match workdir_arg {
         Some(path) => path,
@@ -406,6 +472,70 @@ mod tests {
         let body = "data: {\"id\":7}";
         let messages = parse_sse_messages(body);
         assert_eq!(messages, vec!["{\"id\":7}"]);
+    }
+
+    #[test]
+    fn resolve_agent_identity_prefers_explicit_arg() {
+        let identity = resolve_agent_identity_from_values(
+            Some(" explicit-id ".to_string()),
+            Some("env-id".to_string()),
+            "fallback-id".to_string(),
+        );
+
+        assert_eq!(
+            identity,
+            BridgeIdentity {
+                agent_id: "explicit-id".to_string(),
+                is_standalone: false,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_agent_identity_uses_env_when_arg_is_missing() {
+        let identity = resolve_agent_identity_from_values(
+            None,
+            Some("env-id".to_string()),
+            "fallback-id".to_string(),
+        );
+
+        assert_eq!(
+            identity,
+            BridgeIdentity {
+                agent_id: "env-id".to_string(),
+                is_standalone: false,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_agent_identity_generates_standalone_when_no_identity_exists() {
+        let identity = resolve_agent_identity_from_values(None, None, "fallback-id".to_string());
+
+        assert_eq!(
+            identity,
+            BridgeIdentity {
+                agent_id: "fallback-id".to_string(),
+                is_standalone: true,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_agent_identity_ignores_blank_env_identity() {
+        let identity = resolve_agent_identity_from_values(
+            None,
+            Some("   ".to_string()),
+            "fallback-id".to_string(),
+        );
+
+        assert_eq!(
+            identity,
+            BridgeIdentity {
+                agent_id: "fallback-id".to_string(),
+                is_standalone: true,
+            }
+        );
     }
 
     #[test]
