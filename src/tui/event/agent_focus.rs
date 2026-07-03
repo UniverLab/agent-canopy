@@ -25,7 +25,7 @@ pub fn handle_agent_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -
     }
 
     if handle_split_picker_key(app, code)
-        || handle_background_agent_key(app, code)
+        || handle_background_agent_key(app, code, modifiers)
         || handle_focus_shortcuts(app, code, modifiers)
     {
         return Ok(());
@@ -89,13 +89,20 @@ fn toggle_split_orientation(app: &mut App) {
     };
 }
 
-fn handle_background_agent_key(app: &mut App, code: KeyCode) -> bool {
+fn handle_background_agent_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> bool {
     if matches!(
         app.selected_agent(),
         Some(AgentEntry::Interactive(_))
             | Some(AgentEntry::Terminal(_))
             | Some(AgentEntry::Group(_))
     ) {
+        return false;
+    }
+
+    // Let cross-section focus navigation fall through to the agent-cycle
+    // shortcut; otherwise the cursor gets stuck on the background section
+    // because `Shift+Up`/`Shift+Down` would be swallowed as log scrolling.
+    if is_focus_cycle_key(code, modifiers) {
         return false;
     }
 
@@ -112,6 +119,13 @@ fn handle_background_agent_key(app: &mut App, code: KeyCode) -> bool {
     }
 
     true
+}
+
+/// Cross-section focus navigation (`Shift+Up`/`Shift+Down`), handled by
+/// [`handle_agent_cycle_shortcut`]. Kept as a pure predicate so the background
+/// key handler can defer these keys instead of consuming them as log scrolling.
+fn is_focus_cycle_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    modifiers.contains(KeyModifiers::SHIFT) && matches!(code, KeyCode::Up | KeyCode::Down)
 }
 
 fn handle_focus_shortcuts(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> bool {
@@ -677,4 +691,31 @@ fn forward_key_to_focused_agent(
         return;
     };
     let _ = agent.write_to_pty(&bytes);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shift_arrows_are_focus_cycle_keys() {
+        // These must reach the agent-cycle shortcut so navigation can leave the
+        // background section in both directions instead of getting stuck.
+        assert!(is_focus_cycle_key(KeyCode::Down, KeyModifiers::SHIFT));
+        assert!(is_focus_cycle_key(KeyCode::Up, KeyModifiers::SHIFT));
+    }
+
+    #[test]
+    fn plain_arrows_are_not_focus_cycle_keys() {
+        // Without SHIFT the background handler keeps scrolling the agent log.
+        assert!(!is_focus_cycle_key(KeyCode::Down, KeyModifiers::NONE));
+        assert!(!is_focus_cycle_key(KeyCode::Up, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn shift_non_arrows_are_not_focus_cycle_keys() {
+        assert!(!is_focus_cycle_key(KeyCode::Char('j'), KeyModifiers::SHIFT));
+        assert!(!is_focus_cycle_key(KeyCode::Left, KeyModifiers::SHIFT));
+        assert!(!is_focus_cycle_key(KeyCode::PageDown, KeyModifiers::SHIFT));
+    }
 }
