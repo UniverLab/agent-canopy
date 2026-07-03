@@ -209,8 +209,15 @@ fn enforce_canopy_bridge_transport(adapted: &mut JsonMap, platform: &Platform, s
         return;
     }
 
+    // The canopy server always runs as a local stdio sidecar (`canopy
+    // bridge`), which injects identity headers itself. HTTP-transport-only
+    // keys are therefore meaningless here and some CLIs actively reject
+    // them: Codex fails to load config.toml with "http_headers is not
+    // supported for stdio" when these tables are present on a stdio server.
     adapted.remove("url");
     adapted.remove("headers");
+    adapted.remove("http_headers");
+    adapted.remove("env_http_headers");
 
     if platform.command_format == "merged" {
         adapted.insert(
@@ -666,6 +673,34 @@ mod tests {
             "canopy",
         );
         assert_eq!(adapted.get("type"), Some(&serde_json::json!("local")));
+    }
+
+    #[test]
+    fn adapt_config_strips_http_only_keys_from_canopy_stdio_bridge() {
+        // The canopy server is always migrated to the stdio bridge, so
+        // HTTP-transport-only keys must not survive — Codex rejects
+        // `http_headers`/`env_http_headers` on a stdio server.
+        let platform = test_platform();
+        let adapted = adapt_config(
+            &serde_json::json!({
+                "command": "canopy",
+                "args": ["bridge"],
+                "url": "http://localhost:7755/mcp",
+                "headers": {"x-canopy-client-name": "codex"},
+                "http_headers": {"x-canopy-client-name": "codex"},
+                "env_http_headers": {"x-canopy-agent-id": "CANOPY_AGENT_ID"},
+            }),
+            &platform,
+            "canopy",
+        );
+        for key in ["url", "headers", "http_headers", "env_http_headers"] {
+            assert!(
+                adapted.get(key).is_none(),
+                "canopy stdio bridge must not carry '{key}'"
+            );
+        }
+        assert_eq!(adapted.get("command"), Some(&serde_json::json!("canopy")));
+        assert_eq!(adapted.get("args"), Some(&serde_json::json!(["bridge"])));
     }
 
     #[test]
