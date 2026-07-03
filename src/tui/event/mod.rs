@@ -425,7 +425,7 @@ fn mouse_pty_position(app: &App, mouse: &MouseEvent) -> Option<(u16, u16)> {
 
 fn sidebar_width(app: &App) -> u16 {
     if app.sidebar_visible {
-        30
+        crate::tui::ui::SIDEBAR_WIDTH
     } else {
         0
     }

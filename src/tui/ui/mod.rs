@@ -27,6 +27,12 @@ pub(crate) const STATUS_FAIL: Color = Color::Rgb(229, 57, 53);
 pub(crate) const STATUS_WAIT_ON: Color = Color::Rgb(255, 255, 0);
 pub(crate) const STATUS_WAIT_OFF: Color = Color::Rgb(30, 30, 30);
 
+// ── Layout ──────────────────────────────────────────────────────
+
+/// Width in columns of the agent sidebar when visible. Shared by the layout
+/// split here and the mouse hit-testing in `tui::event` so both stay in sync.
+pub(crate) const SIDEBAR_WIDTH: u16 = 33;
+
 // ── Main draw entry point ───────────────────────────────────────
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -45,7 +51,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     let body_area = if app.sidebar_visible {
         let [sidebar, content] =
-            Layout::horizontal([Constraint::Length(30), Constraint::Min(0)]).areas(body);
+            Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)]).areas(body);
         header::draw_header(frame, header_area, app);
         sidebar::draw_sidebar(frame, sidebar, app);
         content
@@ -262,4 +268,25 @@ pub(crate) fn last_two_segments(path: &str) -> String {
         return trimmed.to_string();
     }
     format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sidebar_layout_uses_sidebar_width_constant() {
+        assert_eq!(SIDEBAR_WIDTH, 33);
+
+        let body = Rect::new(0, 1, 120, 40);
+        let [sidebar, content] =
+            Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)]).areas(body);
+
+        // The sidebar consumes exactly SIDEBAR_WIDTH columns and the content
+        // takes the remaining width, starting immediately after it.
+        assert_eq!(sidebar.width, SIDEBAR_WIDTH);
+        assert_eq!(sidebar.x, 0);
+        assert_eq!(content.x, SIDEBAR_WIDTH);
+        assert_eq!(content.width, body.width - SIDEBAR_WIDTH);
+    }
 }
