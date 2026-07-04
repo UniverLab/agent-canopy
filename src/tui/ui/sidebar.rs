@@ -135,18 +135,14 @@ fn agent_indices_by_kind(app: &App) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
 }
 
 fn dashboard_height(app: &App) -> u16 {
-    let mut content_lines = 4u16;
-    let gpu_will_show = app.system_info.gpu_info.as_ref().is_some_and(|gpu| {
-        let has_vram =
-            matches!((gpu.vram_used, gpu.vram_total), (Some(_), Some(total)) if total > 0);
-        gpu.usage.is_some() || gpu.temperature.is_some() || has_vram
-    });
-    if gpu_will_show {
-        content_lines += 1;
-    }
-    if app.system_info.swap_used > 0 {
-        content_lines += 1;
-    }
+    // Ask the dashboard how many rows it will actually draw (cpu/mem/load are
+    // always present; gpu/pwr/swap only when their data is). Reserving a fixed
+    // slot for optional rows — as an earlier version did for the now
+    // battery-only `pwr:` row — left a blank line when the row was absent.
+    let content_lines = crate::tui::ui::system_dashboard::dashboard_content_line_count(
+        &app.system_info,
+        app.temperature_unit,
+    ) as u16;
     content_lines + 2
 }
 

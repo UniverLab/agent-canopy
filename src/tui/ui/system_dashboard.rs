@@ -300,6 +300,19 @@ fn create_system_dashboard_lines(
     lines
 }
 
+/// Number of content rows the dashboard will actually render for
+/// `system_info` (excludes the two border rows). The sidebar layout uses
+/// this to size the sysInfo box so it shrinks to exactly the rows present —
+/// optional rows (gpu / pwr / swap) that are absent must not leave a blank
+/// line. Deriving the count from the same builder that renders the rows
+/// keeps the two in lockstep instead of duplicating the row conditions.
+pub(super) fn dashboard_content_line_count(
+    system_info: &SystemInfo,
+    temperature_unit: TemperatureUnit,
+) -> usize {
+    create_system_dashboard_lines(system_info, temperature_unit, usize::MAX).len()
+}
+
 fn format_temperature(temp_celsius: f32, unit: TemperatureUnit) -> String {
     match unit {
         TemperatureUnit::Celsius => format!("{temp_celsius:.0}°C"),
@@ -422,6 +435,72 @@ mod tests {
             .find(|s| s.starts_with("pwr:"))
             .expect("expected a standalone pwr line for battery-sourced power");
         assert!(pwr_line.contains("18W"), "got: {pwr_line}");
+    }
+
+    #[test]
+    fn content_line_count_matches_rendered_rows_and_has_no_phantom_pwr() {
+        // A blank system (no gpu, no battery, no swap, no load) → exactly the
+        // three always-present rows (cpu, mem, procs). The height helper must
+        // report that, with no reserved slot for the absent `pwr:` row.
+        // `default()` (not `new()`) keeps the count deterministic: `new()`
+        // probes real hardware, which varies per machine.
+        let info = SystemInfo::default();
+        let count = dashboard_content_line_count(&info, TemperatureUnit::Celsius);
+        let rendered = create_system_dashboard_lines(&info, TemperatureUnit::Celsius, usize::MAX);
+
+        assert_eq!(
+            count,
+            rendered.len(),
+            "height count must equal the rows actually rendered"
+        );
+        assert_eq!(
+            count, 3,
+            "no gpu/pwr/swap → only cpu/mem/load rows, got {count}"
+        );
+        assert!(
+            !rendered.iter().any(|l| l.to_string().starts_with("pwr:")),
+            "no battery → no pwr row and no blank line reserved for it"
+        );
+    }
+
+    #[test]
+    fn battery_pwr_row_adds_exactly_one_line_of_height() {
+        let mut info = SystemInfo::default();
+        let base_count = dashboard_content_line_count(&info, TemperatureUnit::Celsius);
+
+        info.power_source = Some(PowerSource::Battery);
+        info.power_watts = Some(18.0);
+        let pwr_count = dashboard_content_line_count(&info, TemperatureUnit::Celsius);
+
+        assert_eq!(
+            pwr_count,
+            base_count + 1,
+            "battery pwr row must add one line, not be pre-reserved into the base height"
+        );
+    }
+
+    #[test]
+    fn gpu_row_adds_exactly_one_line_of_height() {
+        let mut info = SystemInfo::default();
+        let base_count = dashboard_content_line_count(&info, TemperatureUnit::Celsius);
+
+        info.gpu_info = Some(crate::system::GpuInfo {
+            name: "Test GPU".to_string(),
+            vendor: "NVIDIA".to_string(),
+            usage: Some(6.0),
+            temperature: Some(41.0),
+            vram_used: Some(1280),
+            vram_total: Some(8192),
+            power_watts: None,
+            power_limit_watts: None,
+        });
+        let gpu_count = dashboard_content_line_count(&info, TemperatureUnit::Celsius);
+
+        assert_eq!(
+            gpu_count,
+            base_count + 1,
+            "gpu row must add one line when gpu data is present"
+        );
     }
 
     #[test]
