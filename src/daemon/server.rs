@@ -28,11 +28,15 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
         Arc::clone(&db),
         Arc::clone(&notification_service),
     ));
-    let watcher_engine = Arc::new(WatcherEngine::new(Arc::clone(&db), Arc::clone(&executor)));
     let sync_manager = Arc::new(SyncManager::new(Arc::clone(&db)));
     let loop_engine = Arc::new(LoopEngine::new(
         Arc::clone(&db),
         Arc::clone(&notification_service),
+    ));
+    let watcher_engine = Arc::new(WatcherEngine::new(
+        Arc::clone(&db),
+        Arc::clone(&executor),
+        Arc::clone(&loop_engine),
     ));
 
     let ingestion = Arc::new(IngestionManager::new(Arc::clone(&db), data_dir.clone()));
@@ -56,7 +60,11 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
 
     startup_personal_rag(Arc::clone(&ingestion), &data_dir).await;
 
-    let cron_scheduler = Arc::new(CronScheduler::new(Arc::clone(&db), Arc::clone(&executor)));
+    let cron_scheduler = Arc::new(CronScheduler::with_loops(
+        Arc::clone(&db),
+        Arc::clone(&executor),
+        Arc::clone(&loop_engine),
+    ));
     let scheduler_notify = cron_scheduler.notifier();
     let scheduler_cancel = Arc::clone(&cron_scheduler).start();
 
@@ -139,11 +147,15 @@ pub(crate) async fn run_stdio_server() -> Result<()> {
         Arc::clone(&db),
         Arc::clone(&notification_service),
     ));
-    let watcher_engine = Arc::new(WatcherEngine::new(Arc::clone(&db), Arc::clone(&executor)));
     let sync_manager = Arc::new(SyncManager::new(Arc::clone(&db)));
     let loop_engine = Arc::new(LoopEngine::new(
         Arc::clone(&db),
         Arc::clone(&notification_service),
+    ));
+    let watcher_engine = Arc::new(WatcherEngine::new(
+        Arc::clone(&db),
+        Arc::clone(&executor),
+        Arc::clone(&loop_engine),
     ));
 
     let ingestion = Arc::new(IngestionManager::new(Arc::clone(&db), data_dir.clone()));
@@ -155,7 +167,11 @@ pub(crate) async fn run_stdio_server() -> Result<()> {
         tracing::error!("Failed to reload watchers: {}", e);
     }
 
-    let cron_scheduler = Arc::new(CronScheduler::new(Arc::clone(&db), Arc::clone(&executor)));
+    let cron_scheduler = Arc::new(CronScheduler::with_loops(
+        Arc::clone(&db),
+        Arc::clone(&executor),
+        Arc::clone(&loop_engine),
+    ));
     let scheduler_notify = cron_scheduler.notifier();
     let _scheduler_cancel = Arc::clone(&cron_scheduler).start();
 

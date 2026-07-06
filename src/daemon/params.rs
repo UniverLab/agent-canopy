@@ -247,6 +247,25 @@ pub struct RagSearchParams {
 
 // ── Loop tool parameter types ────────────────────────────────────────
 
+/// Optional automatic trigger for a loop, mirroring agent triggers. A loop can
+/// fire on a cron schedule or a file-system watch instead of only `loop_run`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopTriggerParams {
+    /// Trigger kind: "cron", "watch", or "manual". "manual" (the default)
+    /// clears any existing trigger, so the loop only runs via loop_run.
+    pub kind: String,
+    /// 5-field cron expression (required when kind = "cron").
+    pub schedule: Option<String>,
+    /// Absolute path to a file or directory to watch (required when kind = "watch").
+    pub path: Option<String>,
+    /// Events to watch: "create", "modify", "delete", "move", or "all" (watch only).
+    pub events: Option<Vec<String>>,
+    /// Debounce window in seconds (watch only, default: 2).
+    pub debounce_seconds: Option<u64>,
+    /// Watch subdirectories recursively (watch only, default: false).
+    pub recursive: Option<bool>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LoopCreateParams {
     /// Human-readable loop name.
@@ -255,6 +274,8 @@ pub struct LoopCreateParams {
     pub description: Option<String>,
     /// Absolute working directory for the loop.
     pub workdir: String,
+    /// Optional automatic trigger (cron/watch). Omit for a manual loop.
+    pub trigger: Option<LoopTriggerParams>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -267,6 +288,9 @@ pub struct LoopUpdateParams {
     pub description: Option<Option<String>>,
     /// New absolute workdir for the loop.
     pub workdir: Option<String>,
+    /// New automatic trigger. Provide kind = "manual" to clear it. Omit to
+    /// leave the current trigger unchanged.
+    pub trigger: Option<LoopTriggerParams>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

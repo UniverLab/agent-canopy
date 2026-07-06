@@ -91,6 +91,59 @@ fn validate_absolute_dir(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Build a loop [`Trigger`] from MCP parameters, reusing the same cron/watch
+/// validation as agents. Returns `Ok(None)` for a manual loop (no trigger or
+/// `kind = "manual"`), and an `Err(message)` for invalid input.
+fn build_loop_trigger(params: &Option<LoopTriggerParams>) -> Result<Option<Trigger>, String> {
+    let Some(params) = params else {
+        return Ok(None);
+    };
+
+    match params.kind.trim().to_ascii_lowercase().as_str() {
+        "" | "manual" => Ok(None),
+        "cron" => {
+            let schedule = params
+                .schedule
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or("A cron trigger requires a 'schedule' expression.")?;
+            if !crate::scheduler::validate_cron(schedule) {
+                return Err(format!("Invalid cron expression: '{schedule}'."));
+            }
+            Ok(Some(Trigger::Cron {
+                schedule_expr: schedule.to_string(),
+            }))
+        }
+        "watch" => {
+            let path = params
+                .path
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or("A watch trigger requires a 'path'.")?;
+            if !std::path::Path::new(path).is_absolute() {
+                return Err("Watch trigger 'path' must be absolute.".into());
+            }
+            let event_strs = params
+                .events
+                .clone()
+                .filter(|events| !events.is_empty())
+                .ok_or("A watch trigger requires at least one event.")?;
+            let events = crate::domain::models::WatchEvent::parse_list(&event_strs)?;
+            Ok(Some(Trigger::Watch {
+                path: path.to_string(),
+                events,
+                debounce_seconds: params.debounce_seconds.unwrap_or(2),
+                recursive: params.recursive.unwrap_or(false),
+            }))
+        }
+        other => Err(format!(
+            "Unknown trigger kind '{other}'. Use 'cron', 'watch', or 'manual'."
+        )),
+    }
+}
+
 fn validate_loop_exists(db: &Database, loop_id: &str) -> Result<(), String> {
     db.get_loop(loop_id)
         .map_err(|e| e.to_string())?
@@ -238,6 +291,7 @@ fn build_loop_summary_json(db: &Database, lp: &Loop) -> Result<serde_json::Value
         "id": lp.id,
         "name": lp.name,
         "status": lp.status.as_str(),
+        "trigger": loop_trigger_json(lp),
         "current_spec": current_spec.as_ref().map(|v| &v.name),
         "current_node": current_spec.as_ref().and_then(|v| v.current_node.as_ref()),
         "blocked": current_spec.as_ref().is_some_and(|v| v.blocker.is_some()),
@@ -245,6 +299,23 @@ fn build_loop_summary_json(db: &Database, lp: &Loop) -> Result<serde_json::Value
         "created_at": lp.created_at.to_rfc3339(),
         "workdir": lp.workdir,
     }))
+}
+
+/// Serialize a loop's trigger for MCP responses: always a `type` label, plus
+/// the cron schedule or watch path/events when applicable.
+fn loop_trigger_json(lp: &Loop) -> serde_json::Value {
+    let mut out = serde_json::json!({ "type": lp.trigger_type_label() });
+    if let Some(schedule) = lp.schedule_expr() {
+        out["schedule"] = serde_json::json!(schedule);
+    }
+    if let Some(path) = lp.watch_path() {
+        out["path"] = serde_json::json!(path);
+        if let Some(events) = lp.watch_events() {
+            out["events"] =
+                serde_json::json!(events.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+        }
+    }
+    out
 }
 
 fn build_loop_list_json(db: &Database, loops: &[Loop]) -> Result<Vec<serde_json::Value>, McpError> {
@@ -1560,12 +1631,18 @@ impl TaskTriggerHandler {
             return Ok(error_result(&e));
         }
 
+        let trigger = match build_loop_trigger(&params.trigger) {
+            Ok(trigger) => trigger,
+            Err(e) => return Ok(error_result(&e)),
+        };
+
         let lp = Loop {
             id: uuid::Uuid::new_v4().to_string(),
             name: name.to_string(),
             description: params.description.filter(|value| !value.trim().is_empty()),
             workdir: workdir.to_string(),
             status: LoopStatus::Draft,
+            trigger,
             created_at: chrono::Utc::now(),
             started_at: None,
             completed_at: None,
@@ -1575,6 +1652,7 @@ impl TaskTriggerHandler {
         if let Err(error) = self.db.register_project_path(std::path::Path::new(workdir)) {
             tracing::debug!("Could not register loop project at {workdir}: {error}");
         }
+        self.activate_loop_trigger(&lp).await;
 
         Ok(build_id_result(&lp.id, "loop_id"))
     }
@@ -1617,8 +1695,23 @@ impl TaskTriggerHandler {
             None => None,
         };
 
+        // A provided `trigger` param (even kind = "manual") counts as an update.
+        let new_trigger = if params.trigger.is_some() {
+            match build_loop_trigger(&params.trigger) {
+                Ok(trigger) => Some(trigger),
+                Err(e) => return Ok(error_result(&e)),
+            }
+        } else {
+            None
+        };
+
         if let Err(e) = validate_at_least_one_bool(
-            &[name.is_some(), description.is_some(), workdir.is_some()],
+            &[
+                name.is_some(),
+                description.is_some(),
+                workdir.is_some(),
+                new_trigger.is_some(),
+            ],
             "loop_update",
         ) {
             return Ok(error_result(&e));
@@ -1628,7 +1721,31 @@ impl TaskTriggerHandler {
             .update_loop_details(loop_id, name, description, workdir)
             .map_err(internal_error)?;
 
+        if let Some(trigger) = new_trigger {
+            self.db
+                .update_loop_trigger(loop_id, trigger.as_ref())
+                .map_err(internal_error)?;
+            // Tear down any live watcher, then re-activate from the new trigger.
+            let _ = self.watcher_engine.stop_loop_watcher(loop_id).await;
+            if let Ok(Some(lp)) = self.db.get_loop(loop_id) {
+                self.activate_loop_trigger(&lp).await;
+            }
+        }
+
         Ok(build_loop_update_response(loop_id))
+    }
+
+    /// Reconcile a loop's live trigger wiring after create/update: wake the
+    /// cron scheduler for cron loops, and start the file watcher for watch
+    /// loops. Manual loops need no wiring.
+    async fn activate_loop_trigger(&self, lp: &Loop) {
+        if lp.is_cron() {
+            self.scheduler_notify.notify_one();
+        } else if lp.is_watch() {
+            if let Err(e) = self.watcher_engine.start_loop_watcher(lp).await {
+                tracing::warn!("Loop '{}' saved but watcher failed to start: {}", lp.id, e);
+            }
+        }
     }
 
     #[tool(
@@ -2476,6 +2593,7 @@ fn loop_details_json(db: &Database, lp: &LoopDetails) -> anyhow::Result<serde_js
         "description": lp.lp.description,
         "workdir": lp.lp.workdir,
         "status": lp.lp.status.as_str(),
+        "trigger": loop_trigger_json(&lp.lp),
         "created_at": lp.lp.created_at.to_rfc3339(),
         "started_at": lp.lp.started_at.map(|value| value.to_rfc3339()),
         "completed_at": lp.lp.completed_at.map(|value| value.to_rfc3339()),

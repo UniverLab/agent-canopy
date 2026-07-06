@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::application::ports::AgentRepository;
 use crate::db::Database;
 use crate::executor::Executor;
+use crate::loop_engine::LoopEngine;
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
@@ -80,10 +81,20 @@ pub struct CronScheduler {
     cancel: CancellationToken,
     /// Wakes the scheduler to recalculate the next fire time.
     notify: Arc<Notify>,
-    /// Track last execution time per agent to avoid double-firing.
+    /// Optional loop engine — when set, the scheduler also evaluates loops
+    /// whose trigger is `Cron` and launches them alongside agents.
+    loop_engine: Option<Arc<LoopEngine>>,
+    /// Track last execution time per schedulable to avoid double-firing.
+    /// Agents are keyed by their id; loops by [`loop_key`] to avoid colliding
+    /// with an agent that happens to share the same id.
     last_fired: Arc<Mutex<std::collections::HashMap<String, chrono::DateTime<Utc>>>>,
     /// Failure-retry policy applied to scheduled runs.
     retry: RetryPolicy,
+}
+
+/// Namespace a loop id in the shared `last_fired` map.
+fn loop_key(loop_id: &str) -> String {
+    format!("loop:{loop_id}")
 }
 
 impl CronScheduler {
@@ -93,8 +104,21 @@ impl CronScheduler {
             executor,
             cancel: CancellationToken::new(),
             notify: Arc::new(Notify::new()),
+            loop_engine: None,
             last_fired: Arc::new(Mutex::new(std::collections::HashMap::new())),
             retry: RetryPolicy::from_env(),
+        }
+    }
+
+    /// Build a scheduler that also fires cron-triggered loops via `loop_engine`.
+    pub fn with_loops(
+        db: Arc<Database>,
+        executor: Arc<Executor>,
+        loop_engine: Arc<LoopEngine>,
+    ) -> Self {
+        Self {
+            loop_engine: Some(loop_engine),
+            ..Self::new(db, executor)
         }
     }
 
@@ -180,22 +204,18 @@ impl CronScheduler {
             if !agent.enabled || agent.is_expired() {
                 continue;
             }
+            fold_earliest(&mut earliest, agent.schedule_expr(), now_local);
+        }
 
-            let Some(schedule_expr) = agent.schedule_expr() else {
-                continue;
-            };
-
-            let cron_7field = to_7field_cron(schedule_expr);
-            let Ok(schedule) = Schedule::from_str(&cron_7field) else {
-                continue;
-            };
-
-            if let Some(next_utc) = next_fire_utc(&schedule, now_local) {
-                earliest = Some(match earliest {
-                    Some(e) if next_utc < e => next_utc,
-                    Some(e) => e,
-                    None => next_utc,
-                });
+        // Cron-triggered loops share the same sleep math as agents.
+        if self.loop_engine.is_some() {
+            if let Ok(loops) = self.db.list_cron_loops() {
+                for lp in &loops {
+                    if !lp.is_fireable() {
+                        continue;
+                    }
+                    fold_earliest(&mut earliest, lp.schedule_expr(), now_local);
+                }
             }
         }
 
@@ -224,6 +244,71 @@ impl CronScheduler {
         for agent in &agents {
             self.try_fire_agent(agent, now_local, now_utc).await?;
         }
+
+        // Cron-triggered loops are evaluated in the same local frame.
+        if self.loop_engine.is_some() {
+            let loops = self.db.list_cron_loops()?;
+            for lp in &loops {
+                self.try_fire_loop(lp, now_local, now_utc).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Evaluate a single cron loop and launch it via the loop engine if due.
+    async fn try_fire_loop(
+        &self,
+        lp: &crate::domain::loops::Loop,
+        now_local: chrono::DateTime<Local>,
+        now_utc: chrono::DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        let Some(loop_engine) = self.loop_engine.as_ref() else {
+            return Ok(());
+        };
+        // A loop already running/paused must not be relaunched by its trigger.
+        if !lp.is_fireable() {
+            return Ok(());
+        }
+
+        let Some(schedule_expr) = lp.schedule_expr() else {
+            return Ok(());
+        };
+        let schedule = match Schedule::from_str(&to_7field_cron(schedule_expr)) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    "Loop '{}' has invalid cron expression '{}': {}",
+                    lp.id,
+                    schedule_expr,
+                    e
+                );
+                return Ok(());
+            }
+        };
+
+        if due_fire_local(&schedule, now_local).is_none() {
+            return Ok(());
+        }
+
+        // De-dupe in UTC using a loop-namespaced key.
+        let key = loop_key(&lp.id);
+        let window_start_utc = now_utc - chrono::Duration::seconds(60);
+        {
+            let mut last_fired = self.last_fired.lock().await;
+            if last_fired
+                .get(&key)
+                .is_some_and(|last| *last >= window_start_utc)
+            {
+                return Ok(());
+            }
+            last_fired.insert(key, now_utc);
+        }
+
+        tracing::info!("Cron loop '{}' is due; launching", lp.id);
+        // Loops are launched fire-and-forget: the loop engine drives the graph
+        // and owns its own failure handling, so the agent RetryPolicy does not
+        // apply here.
+        Arc::clone(loop_engine).start_background(lp.id.clone());
         Ok(())
     }
 
@@ -404,6 +489,31 @@ fn next_fire_utc(
         .map(|next_local| next_local.with_timezone(&Utc))
 }
 
+/// Parse `schedule_expr` and, if it yields a nearer next fire than `earliest`,
+/// update `earliest`. A `None` expression or an unparseable one is skipped.
+/// Shared by agents and cron loops so both walk fire times identically.
+fn fold_earliest(
+    earliest: &mut Option<chrono::DateTime<Utc>>,
+    schedule_expr: Option<&str>,
+    now_local: chrono::DateTime<Local>,
+) {
+    let Some(schedule_expr) = schedule_expr else {
+        return;
+    };
+    let Ok(schedule) = Schedule::from_str(&to_7field_cron(schedule_expr)) else {
+        return;
+    };
+    if let Some(next_utc) = next_fire_utc(&schedule, now_local) {
+        let nearer = match earliest {
+            Some(e) => next_utc < *e,
+            None => true,
+        };
+        if nearer {
+            *earliest = Some(next_utc);
+        }
+    }
+}
+
 /// Decide whether a cron schedule is due at `now_local`, using a 60-second
 /// lookback so a scheduler hiccup doesn't skip a fire scheduled just before
 /// "now". Returns the matched fire time (in local wall-clock time) when due,
@@ -555,6 +665,39 @@ mod tests {
         let next_local = next_utc.with_timezone(&chrono::Local);
         assert_eq!(next_local.hour(), 8, "fire must be at 08:xx local");
         assert_eq!(next_local.minute(), 30, "fire must be at xx:30 local");
+    }
+
+    /// A cron loop shares the agents' fire math: `fold_earliest` on a loop's
+    /// schedule lands the next fire at the local wall-clock time the expression
+    /// names (08:30 local for `30 8 * * *`), not 08:30 UTC.
+    #[test]
+    fn fold_earliest_lands_loop_cron_at_local_wall_clock() {
+        use chrono::Timelike;
+        let mut earliest: Option<chrono::DateTime<Utc>> = None;
+        fold_earliest(&mut earliest, Some("30 8 * * *"), chrono::Local::now());
+        let next_local = earliest
+            .expect("cron loop yields a fire time")
+            .with_timezone(&Local);
+        assert_eq!(next_local.hour(), 8, "loop fire must be at 08:xx local");
+        assert_eq!(next_local.minute(), 30, "loop fire must be at xx:30 local");
+    }
+
+    /// A manual loop (no schedule) never contributes a fire time, so the
+    /// scheduler never launches it on its own — it only runs via `loop_run`.
+    #[test]
+    fn fold_earliest_ignores_manual_loop() {
+        let mut earliest: Option<chrono::DateTime<Utc>> = Some(Utc::now());
+        let before = earliest;
+        fold_earliest(&mut earliest, None, chrono::Local::now());
+        assert_eq!(
+            earliest, before,
+            "a manual loop must not change the nearest fire time"
+        );
+    }
+
+    #[test]
+    fn loop_key_namespaces_ids() {
+        assert_eq!(loop_key("abc"), "loop:abc");
     }
 
     /// `due_fire_local` fires within the local minute the cron field names and

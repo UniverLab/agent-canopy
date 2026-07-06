@@ -9,6 +9,7 @@ use crate::domain::loops::{
     Loop, LoopDetails, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind, LoopNodeRun,
     LoopRunStatus, LoopSpec, LoopSpecDetails, LoopSpecStatus, LoopStatus,
 };
+use crate::domain::models::Trigger;
 
 impl Database {
     pub fn delete_loop(&self, loop_id: &str) -> Result<()> {
@@ -25,21 +26,63 @@ impl Database {
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let (trigger_type, trigger_config) = encode_loop_trigger(lp.trigger.as_ref())?;
         conn.execute(
-            "INSERT INTO loops (id, name, description, workdir, status, created_at, started_at, completed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO loops (id, name, description, workdir, status, trigger_type, trigger_config, created_at, started_at, completed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 &lp.id,
                 &lp.name,
                 &lp.description,
                 &lp.workdir,
                 lp.status.as_str(),
+                trigger_type,
+                trigger_config,
                 lp.created_at.timestamp(),
                 lp.started_at.map(|value| value.timestamp()),
                 lp.completed_at.map(|value| value.timestamp()),
             ],
         )?;
         Ok(())
+    }
+
+    /// Replace a loop's trigger (cron/watch/manual). Passing `None` clears any
+    /// existing trigger, making the loop manual-only.
+    pub fn update_loop_trigger(&self, loop_id: &str, trigger: Option<&Trigger>) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let (trigger_type, trigger_config) = encode_loop_trigger(trigger)?;
+        let rows = conn.execute(
+            "UPDATE loops SET trigger_type = ?1, trigger_config = ?2 WHERE id = ?3",
+            params![trigger_type, trigger_config, loop_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Loops that fire on a cron schedule (their trigger is `Cron`).
+    pub fn list_cron_loops(&self) -> Result<Vec<Loop>> {
+        self.list_loops_where_trigger("cron")
+    }
+
+    /// Loops that fire on a file-system watch (their trigger is `Watch`).
+    pub fn list_watch_loops(&self) -> Result<Vec<Loop>> {
+        self.list_loops_where_trigger("watch")
+    }
+
+    fn list_loops_where_trigger(&self, trigger_type: &str) -> Result<Vec<Loop>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at
+             FROM loops WHERE trigger_type = ?1 ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![trigger_type], map_loop_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn update_loop_details(
@@ -79,7 +122,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, created_at, started_at, completed_at
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at
              FROM loops WHERE id = ?1",
         )?;
 
@@ -94,10 +137,10 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let sql = if workdir.is_some() {
-            "SELECT id, name, description, workdir, status, created_at, started_at, completed_at
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at
              FROM loops WHERE workdir = ?1 ORDER BY created_at DESC"
         } else {
-            "SELECT id, name, description, workdir, status, created_at, started_at, completed_at
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at
              FROM loops ORDER BY created_at DESC"
         };
         let mut stmt = conn.prepare(sql)?;
@@ -512,21 +555,47 @@ impl Database {
 }
 
 fn map_loop_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Loop> {
+    let trigger = row
+        .get::<_, Option<String>>(5)?
+        .as_deref()
+        .map(decode_loop_trigger)
+        .transpose()?;
     Ok(Loop {
         id: row.get(0)?,
         name: row.get(1)?,
         description: row.get(2)?,
         workdir: row.get(3)?,
         status: LoopStatus::from_str(&row.get::<_, String>(4)?),
-        created_at: from_timestamp(row.get(5)?)?,
+        trigger,
+        created_at: from_timestamp(row.get(6)?)?,
         started_at: row
-            .get::<_, Option<i64>>(6)?
-            .map(from_timestamp)
-            .transpose()?,
-        completed_at: row
             .get::<_, Option<i64>>(7)?
             .map(from_timestamp)
             .transpose()?,
+        completed_at: row
+            .get::<_, Option<i64>>(8)?
+            .map(from_timestamp)
+            .transpose()?,
+    })
+}
+
+/// Encode a loop trigger into the `(trigger_type, trigger_config)` column pair,
+/// mirroring how agents persist their trigger: a short type label plus the full
+/// trigger serialized as JSON.
+fn encode_loop_trigger(trigger: Option<&Trigger>) -> Result<(Option<String>, Option<String>)> {
+    match trigger {
+        Some(trigger) => Ok((
+            Some(trigger.type_str().to_string()),
+            Some(serde_json::to_string(trigger)?),
+        )),
+        None => Ok((None, None)),
+    }
+}
+
+/// Decode the `trigger_config` JSON back into a [`Trigger`].
+fn decode_loop_trigger(raw: &str) -> rusqlite::Result<Trigger> {
+    serde_json::from_str(raw).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(error))
     })
 }
 

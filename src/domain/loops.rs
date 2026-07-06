@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::domain::models::{Trigger, WatchEvent};
+
 const REQUIRED_SPEC_SECTIONS: &[(&str, &[&str])] = &[
     (
         "functional requirements",
@@ -255,9 +257,67 @@ pub struct Loop {
     pub description: Option<String>,
     pub workdir: String,
     pub status: LoopStatus,
+    /// Optional automatic trigger. Reuses the agent [`Trigger`] model so a loop
+    /// can fire on a cron schedule or a file-system watch, exactly like an
+    /// agent. `None` means the loop is manual-only (`loop_run`).
+    #[serde(default)]
+    pub trigger: Option<Trigger>,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+}
+
+impl Loop {
+    /// Short label for the loop's trigger: `"cron"`, `"watch"`, or `"manual"`.
+    pub fn trigger_type_label(&self) -> &'static str {
+        match &self.trigger {
+            Some(Trigger::Cron { .. }) => "cron",
+            Some(Trigger::Watch { .. }) => "watch",
+            None => "manual",
+        }
+    }
+
+    /// The cron expression when this loop is cron-triggered.
+    pub fn schedule_expr(&self) -> Option<&str> {
+        match &self.trigger {
+            Some(Trigger::Cron { schedule_expr }) => Some(schedule_expr),
+            _ => None,
+        }
+    }
+
+    /// The watched path when this loop is watch-triggered.
+    pub fn watch_path(&self) -> Option<&str> {
+        match &self.trigger {
+            Some(Trigger::Watch { path, .. }) => Some(path),
+            _ => None,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn watch_events(&self) -> Option<&[WatchEvent]> {
+        match &self.trigger {
+            Some(Trigger::Watch { events, .. }) => Some(events),
+            _ => None,
+        }
+    }
+
+    pub fn is_cron(&self) -> bool {
+        matches!(&self.trigger, Some(Trigger::Cron { .. }))
+    }
+
+    pub fn is_watch(&self) -> bool {
+        matches!(&self.trigger, Some(Trigger::Watch { .. }))
+    }
+
+    /// Whether a triggered loop is currently eligible to start a fresh run.
+    ///
+    /// A loop that is already `Running` or `Paused` must not be re-launched by
+    /// its trigger — that would spawn a duplicate execution over the same
+    /// graph. Draft/Completed/Failed loops are fireable (a scheduled loop
+    /// re-runs its graph on each cron slot / watch event).
+    pub fn is_fireable(&self) -> bool {
+        !matches!(self.status, LoopStatus::Running | LoopStatus::Paused)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -492,5 +552,70 @@ Task:
         assert_eq!(LoopRunStatus::from_str("pass"), LoopRunStatus::Pass);
         assert_eq!(LoopRunStatus::from_str("fail"), LoopRunStatus::Fail);
         assert_eq!(LoopRunStatus::from_str("invalid"), LoopRunStatus::Running);
+    }
+
+    fn loop_with_trigger(status: LoopStatus, trigger: Option<super::Trigger>) -> super::Loop {
+        super::Loop {
+            id: "wf".to_string(),
+            name: "Loop".to_string(),
+            description: None,
+            workdir: "/tmp".to_string(),
+            status,
+            trigger,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+        }
+    }
+
+    #[test]
+    fn manual_loop_has_no_schedule_and_is_not_cron_or_watch() {
+        let lp = loop_with_trigger(LoopStatus::Draft, None);
+        assert_eq!(lp.trigger_type_label(), "manual");
+        assert_eq!(lp.schedule_expr(), None);
+        assert!(!lp.is_cron());
+        assert!(!lp.is_watch());
+        assert_eq!(lp.watch_path(), None);
+    }
+
+    #[test]
+    fn cron_loop_exposes_schedule_expr() {
+        let lp = loop_with_trigger(
+            LoopStatus::Draft,
+            Some(super::Trigger::Cron {
+                schedule_expr: "30 8 * * *".to_string(),
+            }),
+        );
+        assert_eq!(lp.trigger_type_label(), "cron");
+        assert_eq!(lp.schedule_expr(), Some("30 8 * * *"));
+        assert!(lp.is_cron());
+        assert!(!lp.is_watch());
+    }
+
+    #[test]
+    fn watch_loop_exposes_path_and_events() {
+        let lp = loop_with_trigger(
+            LoopStatus::Draft,
+            Some(super::Trigger::Watch {
+                path: "/tmp/watch".to_string(),
+                events: vec![super::WatchEvent::Create],
+                debounce_seconds: 2,
+                recursive: false,
+            }),
+        );
+        assert_eq!(lp.trigger_type_label(), "watch");
+        assert!(lp.is_watch());
+        assert_eq!(lp.watch_path(), Some("/tmp/watch"));
+        assert_eq!(lp.watch_events(), Some(&[super::WatchEvent::Create][..]));
+    }
+
+    #[test]
+    fn running_or_paused_loop_is_not_fireable() {
+        // A trigger must not relaunch a loop that is already executing.
+        assert!(!loop_with_trigger(LoopStatus::Running, None).is_fireable());
+        assert!(!loop_with_trigger(LoopStatus::Paused, None).is_fireable());
+        assert!(loop_with_trigger(LoopStatus::Draft, None).is_fireable());
+        assert!(loop_with_trigger(LoopStatus::Completed, None).is_fireable());
+        assert!(loop_with_trigger(LoopStatus::Failed, None).is_fireable());
     }
 }

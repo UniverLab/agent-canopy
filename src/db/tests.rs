@@ -93,6 +93,7 @@ fn sample_loop(id: &str) -> Loop {
         description: Some("Implements auth in ordered specs".to_string()),
         workdir: "/tmp/project".to_string(),
         status: LoopStatus::Draft,
+        trigger: None,
         created_at: Utc::now(),
         started_at: None,
         completed_at: None,
@@ -547,6 +548,98 @@ fn loop_updates_persist_metadata_and_positions() {
         Some(&serde_json::json!("output_contains"))
     );
     assert_eq!(edge.condition, LoopEdgeCondition::Fail);
+}
+
+fn loop_with_trigger(id: &str, trigger: Option<Trigger>) -> Loop {
+    Loop {
+        trigger,
+        ..sample_loop(id)
+    }
+}
+
+#[test]
+fn loop_trigger_round_trips_through_insert_and_get() {
+    let db = test_db();
+    let cron = loop_with_trigger(
+        "wf-cron",
+        Some(Trigger::Cron {
+            schedule_expr: "30 8 * * *".to_string(),
+        }),
+    );
+    db.insert_loop(&cron).unwrap();
+
+    let fetched = db.get_loop("wf-cron").unwrap().unwrap();
+    assert_eq!(fetched.schedule_expr(), Some("30 8 * * *"));
+    assert!(fetched.is_cron());
+}
+
+#[test]
+fn list_cron_and_watch_loops_filter_by_trigger_type() {
+    let db = test_db();
+    let cron = loop_with_trigger(
+        "wf-cron",
+        Some(Trigger::Cron {
+            schedule_expr: "0 9 * * *".to_string(),
+        }),
+    );
+    let watch = loop_with_trigger(
+        "wf-watch",
+        Some(Trigger::Watch {
+            path: "/tmp/watch".to_string(),
+            events: vec![WatchEvent::Create],
+            debounce_seconds: 2,
+            recursive: false,
+        }),
+    );
+    let manual = loop_with_trigger("wf-manual", None);
+
+    db.insert_loop(&cron).unwrap();
+    db.insert_loop(&watch).unwrap();
+    db.insert_loop(&manual).unwrap();
+
+    let cron_loops = db.list_cron_loops().unwrap();
+    assert_eq!(cron_loops.len(), 1);
+    assert_eq!(cron_loops[0].id, "wf-cron");
+
+    let watch_loops = db.list_watch_loops().unwrap();
+    assert_eq!(watch_loops.len(), 1);
+    assert_eq!(watch_loops[0].id, "wf-watch");
+    assert_eq!(watch_loops[0].watch_path(), Some("/tmp/watch"));
+
+    // A manual loop appears in neither trigger list — it never self-fires.
+    assert!(!cron_loops.iter().any(|lp| lp.id == "wf-manual"));
+    assert!(!watch_loops.iter().any(|lp| lp.id == "wf-manual"));
+}
+
+#[test]
+fn update_loop_trigger_sets_and_clears() {
+    let db = test_db();
+    let manual = loop_with_trigger("wf-swap", None);
+    db.insert_loop(&manual).unwrap();
+    assert!(db.list_cron_loops().unwrap().is_empty());
+
+    // Set a cron trigger.
+    db.update_loop_trigger(
+        "wf-swap",
+        Some(&Trigger::Cron {
+            schedule_expr: "15 6 * * *".to_string(),
+        }),
+    )
+    .unwrap();
+    let cron_loops = db.list_cron_loops().unwrap();
+    assert_eq!(cron_loops.len(), 1);
+    assert_eq!(cron_loops[0].schedule_expr(), Some("15 6 * * *"));
+
+    // Clear it back to manual.
+    db.update_loop_trigger("wf-swap", None).unwrap();
+    assert!(db.list_cron_loops().unwrap().is_empty());
+    assert_eq!(
+        db.get_loop("wf-swap")
+            .unwrap()
+            .unwrap()
+            .trigger_type_label(),
+        "manual"
+    );
 }
 
 #[test]

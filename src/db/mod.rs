@@ -191,6 +191,8 @@ impl Database {
                 description TEXT,
                 workdir TEXT NOT NULL,
                 status TEXT NOT NULL,
+                trigger_type TEXT,
+                trigger_config TEXT,
                 created_at INTEGER NOT NULL,
                 started_at INTEGER,
                 completed_at INTEGER
@@ -281,6 +283,23 @@ impl Database {
                 [],
             )
             .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // Loops gained optional cron/watch triggers; older databases predate the
+        // columns. Add them if missing (both nullable, so existing rows stay
+        // manual-only).
+        for column in ["trigger_type", "trigger_config"] {
+            let has_column: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('loops') WHERE name = ?1",
+                    [column],
+                    |row| Ok(row.get::<_, i32>(0)? > 0),
+                )
+                .unwrap_or(false);
+            if !has_column {
+                conn.execute(&format!("ALTER TABLE loops ADD COLUMN {column} TEXT"), [])
+                    .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+            }
         }
 
         Ok(())
