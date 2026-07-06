@@ -569,17 +569,7 @@ impl App {
         let Some(mut agent) = self.db.get_agent(id)? else {
             return Ok(());
         };
-        agent.prompt = dialog.prompt.clone();
-        if let Some(Trigger::Cron { schedule_expr }) = &mut agent.trigger {
-            *schedule_expr = dialog.cron_expr.clone();
-        }
-        agent.cli = dialog.selected_cli();
-        agent.model = model.map(String::from);
-        agent.working_dir = if dialog.working_dir.is_empty() {
-            None
-        } else {
-            Some(dialog.working_dir.clone())
-        };
+        apply_scheduled_edit(&mut agent, dialog, model);
         self.db.upsert_agent(&agent)?;
         Ok(())
     }
@@ -596,14 +586,7 @@ impl App {
         let Some(mut agent) = self.db.get_agent(id)? else {
             return Ok(());
         };
-        agent.prompt = dialog.prompt.clone();
-        agent.cli = dialog.selected_cli();
-        agent.model = model.map(String::from);
-        if let Some(Trigger::Watch { path, events, .. }) = &mut agent.trigger {
-            *path = dialog.watch_path.clone();
-            *events = crate::domain::models::WatchEvent::parse_list(&dialog.watch_events)
-                .unwrap_or_default();
-        }
+        apply_watcher_edit(&mut agent, dialog, model);
         self.db.upsert_agent(&agent)?;
         Ok(())
     }
@@ -836,6 +819,45 @@ fn agent_log_path(id: &str) -> String {
         .to_string()
 }
 
+/// Apply a cron-agent edit dialog's fields onto an existing agent in place.
+/// Pure (no I/O) so the mapping can be unit-tested without a `Database`.
+fn apply_scheduled_edit(
+    agent: &mut crate::domain::models::Agent,
+    dialog: &NewAgentDialog,
+    model: Option<&str>,
+) {
+    agent.prompt = dialog.prompt.clone();
+    if let Some(Trigger::Cron { schedule_expr }) = &mut agent.trigger {
+        *schedule_expr = dialog.cron_expr.clone();
+    }
+    agent.cli = dialog.selected_cli();
+    agent.model = model.map(String::from);
+    agent.working_dir = if dialog.working_dir.is_empty() {
+        None
+    } else {
+        Some(dialog.working_dir.clone())
+    };
+}
+
+/// Apply a watch-agent edit dialog's fields onto an existing agent in place.
+/// Leaves `debounce_seconds`/`recursive` untouched — the dialog does not
+/// expose them for editing (yet), so the agent keeps its prior values.
+/// Pure (no I/O) so the mapping can be unit-tested without a `Database`.
+fn apply_watcher_edit(
+    agent: &mut crate::domain::models::Agent,
+    dialog: &NewAgentDialog,
+    model: Option<&str>,
+) {
+    agent.prompt = dialog.prompt.clone();
+    agent.cli = dialog.selected_cli();
+    agent.model = model.map(String::from);
+    if let Some(Trigger::Watch { path, events, .. }) = &mut agent.trigger {
+        *path = dialog.watch_path.clone();
+        *events =
+            crate::domain::models::WatchEvent::parse_list(&dialog.watch_events).unwrap_or_default();
+    }
+}
+
 /// Populate a `NewAgentDialog` from an existing agent's fields.
 fn populate_dialog_from_agent(dialog: &mut NewAgentDialog, a: &crate::domain::models::Agent) {
     dialog.edit_id = Some(a.id.clone());
@@ -881,4 +903,237 @@ fn pty_dimensions(last_panel_inner: (u16, u16)) -> (u16, u16) {
     }
     let (tw, th) = ratatui::crossterm::terminal::size().unwrap_or((120, 40));
     (tw.saturating_sub(28), th.saturating_sub(4))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+    use crate::domain::models::{Agent, Cli, Trigger, WatchEvent};
+    use crate::tui::app::types::Focus;
+    use chrono::Utc;
+    use std::sync::Arc;
+    use tempfile::{tempdir, NamedTempFile};
+
+    fn test_db() -> Arc<Database> {
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        Arc::new(Database::new(&path).expect("create test db"))
+    }
+
+    fn cron_agent(id: &str) -> Agent {
+        Agent {
+            id: id.to_string(),
+            prompt: "original prompt".to_string(),
+            trigger: Some(Trigger::Cron {
+                schedule_expr: "0 9 * * *".to_string(),
+            }),
+            cli: Cli::new("claude"),
+            model: Some("original-model".to_string()),
+            working_dir: Some("/original/dir".to_string()),
+            enabled: true,
+            created_at: Utc::now(),
+            log_path: "/tmp/test-cron.log".to_string(),
+            timeout_minutes: 15,
+            expires_at: None,
+            last_run_at: None,
+            last_run_ok: None,
+            last_triggered_at: None,
+            trigger_count: 3,
+        }
+    }
+
+    fn watch_agent(id: &str) -> Agent {
+        Agent {
+            id: id.to_string(),
+            prompt: "original prompt".to_string(),
+            trigger: Some(Trigger::Watch {
+                path: "/original/watch".to_string(),
+                events: vec![WatchEvent::Create],
+                debounce_seconds: 42,
+                recursive: true,
+            }),
+            cli: Cli::new("claude"),
+            model: Some("original-model".to_string()),
+            working_dir: None,
+            enabled: true,
+            created_at: Utc::now(),
+            log_path: "/tmp/test-watch.log".to_string(),
+            timeout_minutes: 15,
+            expires_at: None,
+            last_run_at: None,
+            last_run_ok: None,
+            last_triggered_at: None,
+            trigger_count: 7,
+        }
+    }
+
+    fn dialog_with_clis(agent: &Agent) -> NewAgentDialog {
+        let mut dialog = NewAgentDialog::new(Some("/tmp"));
+        dialog.available_clis = vec![Cli::new("opencode"), agent.cli.clone(), Cli::new("codex")];
+        dialog.cli_configs = vec![None, None, None];
+        dialog
+    }
+
+    #[test]
+    fn populate_dialog_from_agent_prefills_cron_agent_fields() {
+        let agent = cron_agent("cron-1");
+        let mut dialog = dialog_with_clis(&agent);
+
+        populate_dialog_from_agent(&mut dialog, &agent);
+
+        assert_eq!(dialog.edit_id.as_deref(), Some("cron-1"));
+        assert!(dialog.is_edit_mode());
+        assert!(matches!(dialog.task_type, NewTaskType::Background));
+        assert!(matches!(dialog.background_trigger, BackgroundTrigger::Cron));
+        assert_eq!(dialog.prompt, "original prompt");
+        assert_eq!(dialog.model, "original-model");
+        assert_eq!(dialog.working_dir, "/original/dir");
+        assert_eq!(dialog.cron_expr, "0 9 * * *");
+        assert_eq!(dialog.selected_cli().as_str(), "claude");
+    }
+
+    #[test]
+    fn populate_dialog_from_agent_prefills_watch_agent_fields() {
+        let agent = watch_agent("watch-1");
+        let mut dialog = dialog_with_clis(&agent);
+
+        populate_dialog_from_agent(&mut dialog, &agent);
+
+        assert_eq!(dialog.edit_id.as_deref(), Some("watch-1"));
+        assert!(matches!(
+            dialog.background_trigger,
+            BackgroundTrigger::Watch
+        ));
+        assert_eq!(dialog.watch_path, "/original/watch");
+        assert_eq!(dialog.watch_events, vec!["create".to_string()]);
+    }
+
+    #[test]
+    fn apply_scheduled_edit_updates_editable_fields_without_touching_the_rest() {
+        let mut agent = cron_agent("cron-1");
+        let mut dialog = dialog_with_clis(&agent);
+        dialog.prompt = "updated prompt".to_string();
+        dialog.cron_expr = "5 6 * * *".to_string();
+        dialog.working_dir = "/updated/dir".to_string();
+        dialog.set_cli_index(2); // "codex"
+
+        apply_scheduled_edit(&mut agent, &dialog, Some("updated-model"));
+
+        assert_eq!(agent.prompt, "updated prompt");
+        assert_eq!(agent.model.as_deref(), Some("updated-model"));
+        assert_eq!(agent.working_dir.as_deref(), Some("/updated/dir"));
+        assert_eq!(agent.cli.as_str(), "codex");
+        assert!(
+            matches!(&agent.trigger, Some(Trigger::Cron { schedule_expr }) if schedule_expr == "5 6 * * *")
+        );
+        // Fields the dialog never touches must survive the edit untouched.
+        assert_eq!(agent.id, "cron-1");
+        assert_eq!(agent.trigger_count, 3);
+    }
+
+    #[test]
+    fn apply_scheduled_edit_clears_working_dir_when_dialog_field_is_empty() {
+        let mut agent = cron_agent("cron-1");
+        let mut dialog = dialog_with_clis(&agent);
+        dialog.prompt = "still needed".to_string();
+        dialog.working_dir = String::new();
+
+        apply_scheduled_edit(&mut agent, &dialog, None);
+
+        assert_eq!(agent.working_dir, None);
+    }
+
+    #[test]
+    fn apply_watcher_edit_updates_path_and_events_but_preserves_debounce_and_recursive() {
+        let mut agent = watch_agent("watch-1");
+        let mut dialog = dialog_with_clis(&agent);
+        dialog.prompt = "updated prompt".to_string();
+        dialog.watch_path = "/updated/watch".to_string();
+        dialog.watch_events = vec!["modify".to_string(), "delete".to_string()];
+
+        apply_watcher_edit(&mut agent, &dialog, Some("updated-model"));
+
+        let Some(Trigger::Watch {
+            path,
+            events,
+            debounce_seconds,
+            recursive,
+        }) = &agent.trigger
+        else {
+            panic!("expected a Watch trigger");
+        };
+        assert_eq!(path, "/updated/watch");
+        assert_eq!(events, &vec![WatchEvent::Modify, WatchEvent::Delete]);
+        // Not exposed by the dialog yet — must survive the edit unchanged.
+        assert_eq!(*debounce_seconds, 42);
+        assert!(*recursive);
+        assert_eq!(agent.prompt, "updated prompt");
+        assert_eq!(agent.model.as_deref(), Some("updated-model"));
+    }
+
+    #[test]
+    fn open_edit_dialog_prefills_from_the_selected_background_agent() {
+        let db = test_db();
+        let agent = cron_agent("cron-1");
+        db.upsert_agent(&agent).expect("seed agent");
+
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.agents = vec![AgentEntry::Agent(agent)];
+        app.selected = 0;
+
+        app.open_edit_dialog();
+
+        let dialog = app.new_agent_dialog.as_ref().expect("dialog should open");
+        assert_eq!(dialog.edit_id.as_deref(), Some("cron-1"));
+        assert_eq!(dialog.prompt, "original prompt");
+        assert!(matches!(app.focus, Focus::NewAgentDialog));
+    }
+
+    #[test]
+    fn cancelling_the_edit_dialog_does_not_persist_changes() {
+        let db = test_db();
+        let agent = cron_agent("cron-1");
+        db.upsert_agent(&agent).expect("seed agent");
+
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.agents = vec![AgentEntry::Agent(agent)];
+        app.selected = 0;
+
+        app.open_edit_dialog();
+        app.new_agent_dialog.as_mut().unwrap().prompt = "mutated but never saved".to_string();
+        app.close_new_agent_dialog();
+
+        assert!(app.new_agent_dialog.is_none());
+        let stored = db.get_agent("cron-1").unwrap().expect("agent still exists");
+        assert_eq!(stored.prompt, "original prompt");
+    }
+
+    #[test]
+    fn confirming_the_edit_dialog_persists_prompt_and_model_changes() {
+        let db = test_db();
+        let agent = cron_agent("cron-1");
+        db.upsert_agent(&agent).expect("seed agent");
+
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.agents = vec![AgentEntry::Agent(agent)];
+        app.selected = 0;
+
+        app.open_edit_dialog();
+        {
+            let dialog = app.new_agent_dialog.as_mut().unwrap();
+            dialog.prompt = "updated prompt".to_string();
+            dialog.model = "updated-model".to_string();
+        }
+        app.launch_new_agent().expect("save edit");
+
+        assert!(app.new_agent_dialog.is_none());
+        let stored = db.get_agent("cron-1").unwrap().expect("agent still exists");
+        assert_eq!(stored.prompt, "updated prompt");
+        assert_eq!(stored.model.as_deref(), Some("updated-model"));
+    }
 }
