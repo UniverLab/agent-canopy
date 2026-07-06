@@ -298,7 +298,25 @@ impl Executor {
 
     /// Core CLI execution: resolve binary, build command, spawn, capture output, write log.
     async fn run_cli_process(&self, params: &CliRunParams<'_>) -> Result<CliRunResult> {
-        let cli_path = resolve_cli_binary(params.cli)?;
+        let cli_path = match resolve_cli_binary(params.cli) {
+            Ok(path) => path,
+            Err(e) => {
+                tracing::error!("Failed to resolve CLI binary for '{}': {}", params.id, e);
+                append_to_log(
+                    &params.log_path,
+                    params.id,
+                    &params.trigger,
+                    &Utc::now(),
+                    -1,
+                    &[],
+                    e.to_string().as_bytes(),
+                )?;
+                return Ok(CliRunResult {
+                    exit_code: -1,
+                    success: false,
+                });
+            }
+        };
         let mut cmd = build_cli_command(
             &cli_path,
             params.cli,

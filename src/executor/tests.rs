@@ -1,10 +1,33 @@
 //! Unit tests for executor module
 
 use crate::application::notification_service::{DefaultNotificationService, NotificationService};
-use crate::application::ports::StateRepository;
+use crate::application::ports::{AgentRepository, RunRepository, StateRepository};
 use crate::db::Database;
+use crate::domain::models::{Agent, Cli};
+use crate::executor::Executor;
+use chrono::Utc;
 use std::sync::Arc;
 use tempfile::tempdir;
+
+fn agent_with_unresolvable_cli(id: &str, log_path: &std::path::Path) -> Agent {
+    Agent {
+        id: id.to_string(),
+        prompt: "do nothing".to_string(),
+        trigger: None,
+        cli: Cli::new("definitely-not-a-real-cli-binary-xyz"),
+        model: None,
+        working_dir: None,
+        enabled: true,
+        created_at: Utc::now(),
+        log_path: log_path.to_string_lossy().to_string(),
+        timeout_minutes: 15,
+        expires_at: None,
+        last_run_at: None,
+        last_run_ok: None,
+        last_triggered_at: None,
+        trigger_count: 0,
+    }
+}
 
 #[test]
 fn test_database_state_operations() {
@@ -48,4 +71,31 @@ fn wrap_prompt_uses_agent_report_tool_name() {
     assert!(out.contains("Run ID: run-xyz"));
     assert!(out.contains("[USER TASK]"));
     assert!(out.contains("do the thing"));
+}
+
+#[tokio::test]
+async fn unresolvable_cli_binary_does_not_leave_run_locked_forever() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
+    let agent = agent_with_unresolvable_cli("missing-cli-agent", &dir.path().join("agent.log"));
+    db.upsert_agent(&agent).unwrap();
+
+    let executor = Executor::new(db.clone(), Arc::new(DefaultNotificationService));
+
+    let exit_code = executor.execute_agent(&agent, true).await.unwrap();
+    assert_eq!(
+        exit_code, -1,
+        "unresolvable CLI must report a failed run, not hang mid-flight"
+    );
+
+    let active = db.get_active_run(&agent.id).unwrap();
+    assert!(
+        active.is_none(),
+        "run must be finalized (not left pending/in_progress) when the CLI binary can't be resolved"
+    );
+
+    // A subsequent run must acquire the lock normally, with no manual disable/enable needed.
+    let exit_code_2 = executor.execute_agent(&agent, true).await.unwrap();
+    assert_eq!(exit_code_2, -1);
+    assert!(db.get_active_run(&agent.id).unwrap().is_none());
 }
