@@ -347,7 +347,7 @@ fn row_to_rag_queue_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<RagQueueIt
 pub struct RagFileEvent {
     pub id: i64,
     pub file_path: String,
-    /// `"indexed"` | `"deleted"` | `"error"`
+    /// `"indexed"` | `"deleted"` | `"error"` | `"failed"` (permanent give-up)
     pub event_type: String,
     pub detail: Option<String>,
     pub occurred_at: i64,
@@ -463,6 +463,51 @@ impl Database {
             map.insert(path, ts);
         }
         Ok(map)
+    }
+
+    /// Count of `"error"` events recorded for a given file path.
+    pub fn rag_error_count(&self, file_path: &str) -> Result<i64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM rag_file_events WHERE file_path = ?1 AND event_type = 'error'",
+            rusqlite::params![file_path],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Return the set of file paths that have been permanently given up on:
+    /// at least one `"failed"` event with no later `"indexed"` event. A
+    /// successful re-index (e.g. after a manual re-add) clears the file from
+    /// this set, mirroring how `indexed_files_timestamps` treats `"deleted"`.
+    pub fn permanently_failed_rag_files(&self) -> Result<std::collections::HashSet<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT file_path
+               FROM (
+                   SELECT
+                       file_path,
+                       MAX(CASE WHEN event_type = 'failed' THEN occurred_at END) AS last_failed_at,
+                       MAX(CASE WHEN event_type = 'indexed' THEN occurred_at END) AS last_indexed_at
+                   FROM rag_file_events
+                   GROUP BY file_path
+               ) s
+              WHERE s.last_failed_at IS NOT NULL
+                AND (s.last_indexed_at IS NULL OR s.last_failed_at > s.last_indexed_at)",
+        )?;
+        let mut set = std::collections::HashSet::new();
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            set.insert(path);
+        }
+        Ok(set)
     }
 }
 

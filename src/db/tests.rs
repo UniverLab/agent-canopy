@@ -827,6 +827,53 @@ fn test_indexed_files_timestamps_uses_last_success_unless_deleted() {
     assert!(!timestamps.contains_key("/tmp/d.md"));
 }
 
+#[test]
+fn test_rag_error_count_and_permanently_failed_files() {
+    let db = test_db();
+
+    db.log_rag_event("/tmp/bad.pdf", "error", Some("attempt 1"), 100)
+        .unwrap();
+    db.log_rag_event("/tmp/bad.pdf", "error", Some("attempt 2"), 110)
+        .unwrap();
+    db.log_rag_event("/tmp/bad.pdf", "error", Some("attempt 3"), 120)
+        .unwrap();
+    db.log_rag_event("/tmp/bad.pdf", "failed", Some("giving up"), 120)
+        .unwrap();
+
+    db.log_rag_event("/tmp/ok.md", "indexed", None, 50).unwrap();
+    db.log_rag_event("/tmp/ok.md", "error", Some("transient"), 60)
+        .unwrap();
+
+    assert_eq!(db.rag_error_count("/tmp/bad.pdf").unwrap(), 3);
+    assert_eq!(db.rag_error_count("/tmp/ok.md").unwrap(), 1);
+    assert_eq!(db.rag_error_count("/tmp/unknown.md").unwrap(), 0);
+
+    let failed = db.permanently_failed_rag_files().unwrap();
+    assert!(failed.contains("/tmp/bad.pdf"));
+    assert!(!failed.contains("/tmp/ok.md"));
+}
+
+#[test]
+fn test_permanently_failed_rag_files_cleared_by_later_index() {
+    let db = test_db();
+
+    db.log_rag_event("/tmp/retry.pdf", "error", Some("attempt 1"), 100)
+        .unwrap();
+    db.log_rag_event("/tmp/retry.pdf", "failed", Some("giving up"), 100)
+        .unwrap();
+
+    let failed = db.permanently_failed_rag_files().unwrap();
+    assert!(failed.contains("/tmp/retry.pdf"));
+
+    // A manual re-add later succeeds — the file should no longer be
+    // considered permanently failed.
+    db.log_rag_event("/tmp/retry.pdf", "indexed", None, 200)
+        .unwrap();
+
+    let failed = db.permanently_failed_rag_files().unwrap();
+    assert!(!failed.contains("/tmp/retry.pdf"));
+}
+
 // ── Agent CRUD ─────────────────────────────────────────────────────
 
 #[test]

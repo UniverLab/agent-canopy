@@ -298,15 +298,26 @@ async fn startup_personal_rag(ingestion: Arc<IngestionManager>, data_dir: &std::
         );
     }
 
+    // Files that have permanently failed indexing should not be silently
+    // re-queued by the automatic startup rescan/reload; an explicit user
+    // Modify/Create event via the filesystem watcher still gives them a
+    // fresh chance.
+    let failed = ingestion
+        .db()
+        .permanently_failed_rag_files()
+        .unwrap_or_default();
+
     if let Ok(pending) = ingestion.db_pending_queue() {
+        let mut reloaded = 0usize;
         for path in &pending {
+            if failed.contains(path) {
+                continue;
+            }
             ingestion.enqueue(path).await;
+            reloaded += 1;
         }
-        if !pending.is_empty() {
-            tracing::info!(
-                "startup_personal_rag: reloaded {} pending queue items",
-                pending.len()
-            );
+        if reloaded > 0 {
+            tracing::info!("startup_personal_rag: reloaded {reloaded} pending queue items");
         }
     }
 
@@ -346,6 +357,9 @@ async fn startup_personal_rag(ingestion: Arc<IngestionManager>, data_dir: &std::
                 if mtime <= indexed_at {
                     continue;
                 }
+            }
+            if failed.contains(&path_str) {
+                continue;
             }
             ingestion.enqueue(&path_str).await;
             queued += 1;

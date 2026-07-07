@@ -21,6 +21,19 @@ use crate::rag::vector_store::{VectorChunk, VectorStore};
 
 const QUEUE_MAX: usize = 10_000;
 const FILE_MAX_BYTES: u64 = 5 * 1024 * 1024; // 5 MB
+/// Max number of recorded `"error"` events before a file is given up on
+/// permanently, even if the error message doesn't match a known-fatal pattern.
+const MAX_RAG_ATTEMPTS: i64 = 3;
+
+/// Returns true when an indexing error is non-transient (retrying will never help).
+fn is_permanent_rag_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("overflowed its stack")
+        || m.contains("stack overflow")
+        || m.contains("invalidcontentstream")
+        || m.contains("not a valid pdf")
+        || m.contains("no extractable text")
+}
 
 struct Queue {
     order: VecDeque<String>,
@@ -368,22 +381,43 @@ impl IngestionManager {
                     skipped += 1;
                     let _ = self.db.remove_rag_item(&source_path);
                     let error_detail = format!("{e:#}");
-                    let _ = self.db.log_rag_event(
-                        &source_path,
-                        "error",
-                        Some(&error_detail),
-                        chrono::Utc::now().timestamp(),
-                    );
-                    // Immediate per-file error notification so the user knows right away.
+                    let now = chrono::Utc::now().timestamp();
+                    let _ = self
+                        .db
+                        .log_rag_event(&source_path, "error", Some(&error_detail), now);
+
+                    let prior_errors = self.db.rag_error_count(&source_path).unwrap_or(0);
+                    let attempt = prior_errors + 1;
+                    let permanent =
+                        is_permanent_rag_error(&error_detail) || attempt >= MAX_RAG_ATTEMPTS;
+
                     let filename = std::path::Path::new(&source_path)
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| source_path.clone());
-                    crate::domain::notification::send_notification(
-                        "RAG indexing",
-                        &format!("{filename} could not be indexed\nCause: {error_detail}"),
-                        crate::domain::notification::NotificationLevel::Error,
-                    );
+
+                    if permanent {
+                        let _ =
+                            self.db
+                                .log_rag_event(&source_path, "failed", Some(&error_detail), now);
+                        tracing::warn!(
+                            "RAG index permanent failure {source_path}: giving up after {attempt} attempt(s)"
+                        );
+                        crate::domain::notification::send_notification(
+                            "RAG indexing",
+                            &format!(
+                                "{filename} permanently failed after {attempt} attempt(s) — giving up\nCause: {error_detail}"
+                            ),
+                            crate::domain::notification::NotificationLevel::Error,
+                        );
+                    } else {
+                        // Immediate per-file error notification so the user knows right away.
+                        crate::domain::notification::send_notification(
+                            "RAG indexing",
+                            &format!("{filename} could not be indexed\nCause: {error_detail}"),
+                            crate::domain::notification::NotificationLevel::Error,
+                        );
+                    }
                 }
             }
         }
@@ -738,11 +772,14 @@ pub fn run_internal_pdf_extract(path: &Path) -> anyhow::Result<()> {
 
 fn extract_pdf_text(path: &Path) -> anyhow::Result<String> {
     let exe = std::env::current_exe()?;
-    let output = std::process::Command::new(exe)
+    let exe_display = exe.display().to_string();
+    let output = std::process::Command::new(&exe)
         .arg("internal-pdf-extract")
         .arg(path)
         .output()
-        .map_err(|e| anyhow::anyhow!("Failed to launch PDF extraction subprocess: {e}"))?;
+        .map_err(|e| {
+            anyhow::anyhow!("Failed to launch PDF extraction subprocess ({exe_display}): {e}")
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -1060,4 +1097,59 @@ pub async fn wipe_lancedb(db: &Database) -> anyhow::Result<()> {
     let _ = db.set_state("rag_total_chunks", "0");
     let _ = db.set_state("rag_indexed_files", "0");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_permanent_rag_error_detects_known_fatal_patterns() {
+        assert!(is_permanent_rag_error(
+            "thread 'main' has overflowed its stack"
+        ));
+        assert!(is_permanent_rag_error("Stack overflow detected"));
+        assert!(is_permanent_rag_error(
+            "PDF text extraction failed for foo.pdf: InvalidContentStream"
+        ));
+        assert!(is_permanent_rag_error(
+            "Could not extract text from 'foo.pdf': not a valid PDF or recognisable text file"
+        ));
+        assert!(is_permanent_rag_error(
+            "File 'foo.html' appears to be HTML but contains no extractable text"
+        ));
+    }
+
+    #[test]
+    fn is_permanent_rag_error_allows_transient_messages() {
+        assert!(!is_permanent_rag_error("connection reset by peer"));
+        assert!(!is_permanent_rag_error("embedding request timed out"));
+        assert!(!is_permanent_rag_error(
+            "Failed to launch PDF extraction subprocess (/usr/bin/canopy): No such file or directory"
+        ));
+    }
+
+    /// Mirrors the permanence decision made in `drain_queue`'s `Err` branch:
+    /// a file is given up on once it has accumulated `MAX_RAG_ATTEMPTS`
+    /// total attempts (prior errors + the current one), even for otherwise
+    /// generic/transient-looking error messages.
+    fn is_permanent(error_detail: &str, prior_errors: i64) -> bool {
+        let attempt = prior_errors + 1;
+        is_permanent_rag_error(error_detail) || attempt >= MAX_RAG_ATTEMPTS
+    }
+
+    #[test]
+    fn permanence_decision_respects_attempt_threshold() {
+        let transient = "embedding request timed out";
+        assert!(!is_permanent(transient, 0)); // attempt 1
+        assert!(!is_permanent(transient, 1)); // attempt 2
+        assert!(is_permanent(transient, 2)); // attempt 3 == MAX_RAG_ATTEMPTS
+        assert!(is_permanent(transient, 5)); // well past the threshold
+    }
+
+    #[test]
+    fn permanence_decision_short_circuits_on_fatal_message() {
+        // A known-fatal message is permanent immediately, regardless of attempt count.
+        assert!(is_permanent("document overflowed its stack", 0));
+    }
 }
