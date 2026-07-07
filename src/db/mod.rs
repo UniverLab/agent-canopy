@@ -80,7 +80,8 @@ impl Database {
                 exited_at TEXT,
                 exit_code INTEGER,
                 status TEXT NOT NULL DEFAULT 'active',
-                session_type TEXT NOT NULL DEFAULT 'interactive'
+                session_type TEXT NOT NULL DEFAULT 'interactive',
+                pid INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS terminal_sessions (
@@ -280,6 +281,21 @@ impl Database {
         if !has_session_type {
             conn.execute(
                 "ALTER TABLE interactive_sessions ADD COLUMN session_type TEXT NOT NULL DEFAULT 'interactive'",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        let has_pid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('interactive_sessions') WHERE name = 'pid'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_pid {
+            conn.execute(
+                "ALTER TABLE interactive_sessions ADD COLUMN pid INTEGER",
                 [],
             )
             .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;

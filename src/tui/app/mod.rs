@@ -1898,7 +1898,7 @@ impl App {
     ) {
         let cli = crate::domain::models::Cli::from_str(&session.cli);
         let cli_config = canopy_config.get_cli(cli.as_str());
-        let args = build_resumed_session_args(
+        let resume_args = build_resumed_session_args(
             session,
             cli_config.and_then(|config| config.interactive_args.as_deref()),
             cli_config.and_then(|config| config.resume_args.as_deref()),
@@ -1907,12 +1907,13 @@ impl App {
         );
         let existing_ids = self.interactive_agent_names();
 
+        let mut used_args = resume_args.clone();
         let agent = match InteractiveAgent::spawn(
             cli.clone(),
             &session.working_dir,
             cols,
             rows,
-            args.as_deref(),
+            resume_args.as_deref(),
             cli_config.and_then(|config| config.fallback_interactive_args.as_deref()),
             Self::resume_session_accent(cli_config),
             Some(&session.name),
@@ -1923,8 +1924,42 @@ impl App {
         ) {
             Ok(agent) => agent,
             Err(e) => {
-                tracing::warn!("Failed to auto-resume session '{}': {e}", session.name);
-                return;
+                // The old CLI session lock may still be held by a dead-but-not-reaped
+                // process, or the resume flags themselves may be stale. Fall back to a
+                // plain fresh session rather than leaving the user with nothing.
+                tracing::warn!(
+                    "Failed to auto-resume session '{}': {e}; retrying as a fresh session",
+                    session.name
+                );
+                let fresh_args = cli_config
+                    .and_then(|config| config.interactive_args.as_deref())
+                    .map(str::to_string);
+                match InteractiveAgent::spawn(
+                    cli.clone(),
+                    &session.working_dir,
+                    cols,
+                    rows,
+                    fresh_args.as_deref(),
+                    cli_config.and_then(|config| config.fallback_interactive_args.as_deref()),
+                    Self::resume_session_accent(cli_config),
+                    Some(&session.name),
+                    &existing_ids,
+                    None,
+                    cli_config.and_then(|config| config.model_flag.as_deref()),
+                    None,
+                ) {
+                    Ok(agent) => {
+                        used_args = fresh_args;
+                        agent
+                    }
+                    Err(e2) => {
+                        tracing::warn!(
+                            "Fresh-session fallback also failed for '{}': {e2}",
+                            session.name
+                        );
+                        return;
+                    }
+                }
             }
         };
 
@@ -1933,7 +1968,8 @@ impl App {
             &agent.name,
             cli.as_str(),
             &session.working_dir,
-            args.as_deref(),
+            used_args.as_deref(),
+            agent.pid(),
             &session.session_type,
         );
         self.interactive_agents.push(agent);
@@ -1993,6 +2029,14 @@ impl App {
         let (cols, rows) = Self::session_panel_size();
 
         for session in &sessions {
+            if !should_resume_session(session.pid) {
+                tracing::warn!(
+                    "Skipping auto-resume of session '{}': old process (pid {:?}) is still alive",
+                    session.name,
+                    session.pid
+                );
+                continue;
+            }
             self.resume_interactive_session(session, &canopy_config, cols, rows);
         }
 
@@ -2021,6 +2065,39 @@ impl App {
         if !self.terminal_agents.is_empty() {
             let _ = self.refresh_agents();
         }
+    }
+}
+
+/// Check whether a process with the given pid is still alive.
+///
+/// Uses `kill(pid, 0)`: a `0` return means the process exists and is ours;
+/// `EPERM` means it exists but is owned by someone else (still alive from our
+/// point of view); `ESRCH` means it's gone.
+#[cfg(unix)]
+fn process_is_alive(pid: i64) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_pid: i64) -> bool {
+    false
+}
+
+/// Whether an interactive session should be auto-resumed on startup.
+///
+/// A session with no recorded pid is always safe to resume (older rows, or
+/// sessions that predate PID tracking). A session whose recorded pid still
+/// belongs to a live process is skipped — resuming it would fight the old
+/// process for the CLI's own session lock ("Session is active in another
+/// process").
+fn should_resume_session(pid: Option<i64>) -> bool {
+    match pid {
+        Some(pid) => !process_is_alive(pid),
+        None => true,
     }
 }
 
@@ -2265,7 +2342,7 @@ fn log_contains_spawn(log_up: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::build_resumed_session_args;
+    use super::{build_resumed_session_args, process_is_alive, should_resume_session};
     use crate::db::session::InteractiveSession;
 
     #[test]
@@ -2279,6 +2356,7 @@ mod tests {
             started_at: "2023-01-01T00:00:00Z".to_string(),
             status: "active".to_string(),
             session_type: "interactive".to_string(),
+            pid: None,
         };
 
         assert!(
@@ -2299,6 +2377,7 @@ mod tests {
             started_at: "2023-01-01T00:00:00Z".to_string(),
             status: "active".to_string(),
             session_type: "interactive".to_string(),
+            pid: None,
         };
 
         let args = build_resumed_session_args(&session, None, None, None, Some("--yolo")).unwrap();
@@ -2316,6 +2395,7 @@ mod tests {
             started_at: "2023-01-01T00:00:00Z".to_string(),
             status: "active".to_string(),
             session_type: "interactive".to_string(),
+            pid: None,
         };
 
         let args = build_resumed_session_args(
@@ -2342,6 +2422,7 @@ mod tests {
             started_at: "2023-01-01T00:00:00Z".to_string(),
             status: "active".to_string(),
             session_type: "interactive".to_string(),
+            pid: None,
         };
 
         let args =
@@ -2362,6 +2443,7 @@ mod tests {
             started_at: "2023-01-01T00:00:00Z".to_string(),
             status: "active".to_string(),
             session_type: "interactive".to_string(),
+            pid: None,
         };
 
         let args = build_resumed_session_args(
@@ -2375,5 +2457,30 @@ mod tests {
         assert!(args.contains("chat"));
         assert!(args.contains("--resume-picker"));
         assert_eq!(args.matches("--trust-all-tools").count(), 1);
+    }
+
+    #[test]
+    fn test_process_is_alive_for_own_pid() {
+        assert!(process_is_alive(std::process::id() as i64));
+    }
+
+    #[test]
+    fn test_process_is_alive_false_for_implausible_pid() {
+        assert!(!process_is_alive(999_999_999));
+    }
+
+    #[test]
+    fn test_should_resume_session_with_no_pid_always_resumes() {
+        assert!(should_resume_session(None));
+    }
+
+    #[test]
+    fn test_should_resume_session_skips_when_owner_process_is_alive() {
+        assert!(!should_resume_session(Some(std::process::id() as i64)));
+    }
+
+    #[test]
+    fn test_should_resume_session_resumes_when_pid_is_gone() {
+        assert!(should_resume_session(Some(999_999_999)));
     }
 }

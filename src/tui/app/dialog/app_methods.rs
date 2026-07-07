@@ -673,6 +673,7 @@ impl App {
             agent.cli.as_str(),
             &dir,
             args.as_deref(),
+            agent.pid(),
             session_type,
         );
         // Don't register nursery temp dir as a project — it's ephemeral

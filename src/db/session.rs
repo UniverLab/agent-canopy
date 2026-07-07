@@ -15,6 +15,7 @@ pub struct InteractiveSession {
     pub started_at: String,
     pub status: String,
     pub session_type: String,
+    pub pid: Option<i64>,
 }
 
 #[allow(dead_code)]
@@ -28,6 +29,7 @@ pub struct TerminalSession {
 
 impl Database {
     /// Insert a new interactive session as active.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_interactive_session(
         &self,
         id: &str,
@@ -35,13 +37,14 @@ impl Database {
         cli: &str,
         working_dir: &str,
         args: Option<&str>,
+        pid: Option<i64>,
         session_type: &str,
     ) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         conn.execute(
-            "INSERT OR REPLACE INTO interactive_sessions (id, name, cli, working_dir, args, started_at, status, session_type)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7)",
-            params![id, name, cli, working_dir, args, Utc::now().to_rfc3339(), session_type],
+            "INSERT OR REPLACE INTO interactive_sessions (id, name, cli, working_dir, args, started_at, status, session_type, pid)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8)",
+            params![id, name, cli, working_dir, args, Utc::now().to_rfc3339(), session_type, pid],
         )?;
         Ok(())
     }
@@ -78,7 +81,7 @@ impl Database {
     pub fn get_active_sessions(&self) -> Result<Vec<InteractiveSession>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, cli, working_dir, args, started_at, status, session_type
+            "SELECT id, name, cli, working_dir, args, started_at, status, session_type, pid
              FROM interactive_sessions WHERE status = 'active' ORDER BY started_at DESC",
         )?;
         let rows = stmt
@@ -92,6 +95,7 @@ impl Database {
                     started_at: row.get(5)?,
                     status: row.get(6)?,
                     session_type: row.get(7)?,
+                    pid: row.get(8)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

@@ -420,6 +420,15 @@ impl InteractiveAgent {
         }
     }
 
+    /// The OS process id of the underlying CLI child, if the PTY exposes it.
+    pub fn pid(&self) -> Option<i64> {
+        self.child
+            .lock()
+            .ok()
+            .and_then(|c| c.process_id())
+            .map(|p| p as i64)
+    }
+
     /// Send raw bytes to the agent's PTY stdin.
     pub fn write_to_pty(&self, data: &[u8]) -> Result<()> {
         if let Ok(mut w) = self.writer.lock() {

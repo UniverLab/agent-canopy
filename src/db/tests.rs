@@ -198,6 +198,7 @@ fn test_list_active_sync_agent_ids_includes_live_sessions_and_running_background
         "copilot",
         "/tmp/project",
         None,
+        None,
         "interactive",
     )
     .unwrap();
@@ -312,6 +313,7 @@ fn test_resolve_sync_actor_name_prefers_interactive_session_name() {
         "violet-river",
         "copilot",
         "/tmp/project",
+        None,
         None,
         "interactive",
     )
@@ -1490,6 +1492,7 @@ fn seed_bind_and_resolve() {
         "opencode",
         "/tmp",
         None,
+        None,
         "interactive",
     )
     .unwrap();
@@ -1516,6 +1519,7 @@ fn seed_bind_replaces_existing() {
         "opencode",
         "/tmp",
         None,
+        None,
         "interactive",
     )
     .unwrap();
@@ -1535,6 +1539,7 @@ fn seed_unbind_removes_binding() {
         "test-session",
         "opencode",
         "/tmp",
+        None,
         None,
         "interactive",
     )
@@ -1566,12 +1571,36 @@ fn seed_get_sessions_for_seed_empty() {
 #[test]
 fn seed_multiple_sessions_for_same_seed() {
     let db = test_db();
-    db.insert_interactive_session("session-1", "s1", "opencode", "/tmp", None, "interactive")
-        .unwrap();
-    db.insert_interactive_session("session-2", "s2", "opencode", "/tmp", None, "interactive")
-        .unwrap();
-    db.insert_interactive_session("session-3", "s3", "opencode", "/tmp", None, "interactive")
-        .unwrap();
+    db.insert_interactive_session(
+        "session-1",
+        "s1",
+        "opencode",
+        "/tmp",
+        None,
+        None,
+        "interactive",
+    )
+    .unwrap();
+    db.insert_interactive_session(
+        "session-2",
+        "s2",
+        "opencode",
+        "/tmp",
+        None,
+        None,
+        "interactive",
+    )
+    .unwrap();
+    db.insert_interactive_session(
+        "session-3",
+        "s3",
+        "opencode",
+        "/tmp",
+        None,
+        None,
+        "interactive",
+    )
+    .unwrap();
 
     db.bind_session_to_seed("session-1", "seed-oak").unwrap();
     db.bind_session_to_seed("session-2", "seed-oak").unwrap();
@@ -1581,6 +1610,45 @@ fn seed_multiple_sessions_for_same_seed() {
     assert!(db.resolve_session_seed("session-1").unwrap().is_some());
     assert!(db.resolve_session_seed("session-2").unwrap().is_some());
     assert!(db.resolve_session_seed("session-3").unwrap().is_some());
+}
+
+#[test]
+fn interactive_session_pid_round_trips_through_get_active_sessions() {
+    let db = test_db();
+    db.insert_interactive_session(
+        "session-with-pid",
+        "with-pid",
+        "opencode",
+        "/tmp",
+        None,
+        Some(4321),
+        "interactive",
+    )
+    .unwrap();
+    db.insert_interactive_session(
+        "session-without-pid",
+        "without-pid",
+        "opencode",
+        "/tmp",
+        None,
+        None,
+        "interactive",
+    )
+    .unwrap();
+
+    let sessions = db.get_active_sessions().unwrap();
+
+    let with_pid = sessions
+        .iter()
+        .find(|s| s.id == "session-with-pid")
+        .expect("session-with-pid present");
+    assert_eq!(with_pid.pid, Some(4321));
+
+    let without_pid = sessions
+        .iter()
+        .find(|s| s.id == "session-without-pid")
+        .expect("session-without-pid present");
+    assert_eq!(without_pid.pid, None);
 }
 
 #[test]
