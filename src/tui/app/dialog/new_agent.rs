@@ -303,7 +303,12 @@ impl NewAgentDialog {
                 .cli_configs
                 .get(self.cli_index)
                 .and_then(|c| c.as_ref())
-                .map(|c| c.session_list_cmd.is_some())
+                .map(|c| {
+                    c.session_list_cmd
+                        .as_ref()
+                        .map(|cmd| !cmd.trim().is_empty())
+                        .unwrap_or(false)
+                })
                 .unwrap_or(false)
     }
 
@@ -319,6 +324,11 @@ impl NewAgentDialog {
         let Some(ref list_cmd) = config.session_list_cmd.clone() else {
             return;
         };
+        // Defense in depth: an empty/whitespace command must never spawn the
+        // CLI binary with zero args (it would block on a REPL prompt forever).
+        if list_cmd.trim().is_empty() {
+            return;
+        }
         let binary = config.binary.clone();
 
         let args: Vec<&str> = list_cmd.split_whitespace().collect();
@@ -901,6 +911,84 @@ mod tests {
         let input = "ses_abc123   First\n\n   \nses_def456   Second";
         let result = parse_session_list(input);
         assert_eq!(result.len(), 2);
+    }
+
+    fn cli_config_with_session_list(cmd: Option<&str>) -> crate::domain::cli_config::CliConfig {
+        crate::domain::cli_config::CliConfig {
+            name: "antigravity".into(),
+            binary: "agy".into(),
+            headless_mode: String::new(),
+            model_flag: None,
+            supports_working_dir: false,
+            working_dir_flag: None,
+            env_vars: std::collections::HashMap::new(),
+            interactive_args: None,
+            fallback_interactive_args: None,
+            resume_args: Some("--continue".into()),
+            session_list_cmd: cmd.map(|s| s.to_string()),
+            session_resume_cmd: Some("--conversation".into()),
+            accent_color: None,
+            yolo_flag: None,
+            instruction_file: None,
+        }
+    }
+
+    #[test]
+    fn has_session_picker_false_for_empty_session_list_cmd() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.task_mode = NewTaskMode::Resume;
+        dialog.available_clis = vec![Cli::new("antigravity")];
+        dialog.cli_configs = vec![Some(cli_config_with_session_list(Some("")))];
+        dialog.cli_index = 0;
+
+        assert!(!dialog.has_session_picker());
+    }
+
+    #[test]
+    fn has_session_picker_false_for_whitespace_session_list_cmd() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.task_mode = NewTaskMode::Resume;
+        dialog.available_clis = vec![Cli::new("antigravity")];
+        dialog.cli_configs = vec![Some(cli_config_with_session_list(Some("   ")))];
+        dialog.cli_index = 0;
+
+        assert!(!dialog.has_session_picker());
+    }
+
+    #[test]
+    fn has_session_picker_true_for_real_session_list_cmd() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.task_mode = NewTaskMode::Resume;
+        dialog.available_clis = vec![Cli::new("antigravity")];
+        dialog.cli_configs = vec![Some(cli_config_with_session_list(Some("session list")))];
+        dialog.cli_index = 0;
+
+        assert!(dialog.has_session_picker());
+    }
+
+    #[test]
+    fn has_session_picker_false_for_none_session_list_cmd() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.task_mode = NewTaskMode::Resume;
+        dialog.available_clis = vec![Cli::new("antigravity")];
+        dialog.cli_configs = vec![Some(cli_config_with_session_list(None))];
+        dialog.cli_index = 0;
+
+        assert!(!dialog.has_session_picker());
+    }
+
+    #[test]
+    fn load_sessions_does_not_spawn_for_empty_session_list_cmd() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.task_mode = NewTaskMode::Resume;
+        dialog.available_clis = vec![Cli::new("antigravity")];
+        dialog.cli_configs = vec![Some(cli_config_with_session_list(Some("")))];
+        dialog.cli_index = 0;
+
+        // Must return immediately without attempting to spawn `agy` with no
+        // args (which would otherwise block on a REPL prompt).
+        dialog.load_sessions();
+        assert!(dialog.session_entries.is_empty());
     }
 
     #[test]
