@@ -1,5 +1,5 @@
 use rmcp::schemars;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 // ── Legacy MCP tool parameter types (used by backward-compatible tools) ──
 
@@ -249,7 +249,8 @@ pub struct RagSearchParams {
 
 /// Optional automatic trigger for a loop, mirroring agent triggers. A loop can
 /// fire on a cron schedule or a file-system watch instead of only `loop_run`.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+/// Also `Serialize` so the TUI's loop form can send it over MCP verbatim.
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct LoopTriggerParams {
     /// Trigger kind: "cron", "watch", or "manual". "manual" (the default)
     /// clears any existing trigger, so the loop only runs via loop_run.

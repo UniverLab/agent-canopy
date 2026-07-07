@@ -12,6 +12,7 @@ mod clipboard;
 pub(crate) mod context_transfer;
 mod event;
 mod gamification;
+pub(crate) mod mcp_client;
 pub(crate) mod prompt_templates;
 pub(crate) mod terminal_history;
 mod ui;

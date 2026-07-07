@@ -1,0 +1,146 @@
+//! Renderer for [`LoopFormDialog`] — create/edit a loop's metadata and
+//! trigger (T9). Mirrors the loop node editor's visual style.
+
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::Frame;
+
+use super::{centered_rect, ACCENT, DIM};
+use crate::tui::app::dialog::loop_form::{
+    LoopFormDialog, LoopTriggerChoice, FIELD_DESCRIPTION, FIELD_NAME, FIELD_TRIGGER_KIND,
+    FIELD_TRIGGER_VALUE, FIELD_WORKDIR,
+};
+use crate::tui::app::types::App;
+
+pub fn draw_loop_form_dialog(frame: &mut Frame, app: &App) {
+    let Some(dialog) = &app.loop_form_dialog else {
+        return;
+    };
+
+    let has_error = dialog.error.is_some();
+    let height = 12 + if has_error { 2 } else { 0 };
+    let area = centered_rect(64, height, frame.area());
+    frame.render_widget(Clear, area);
+
+    let title = if dialog.is_edit_mode() {
+        " Edit Loop "
+    } else {
+        " New Loop "
+    };
+    let border_color = if has_error { Color::Red } else { ACCENT };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .style(Style::default().bg(Color::Rgb(15, 25, 15)));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines = vec![
+        text_field_line(dialog, FIELD_NAME, "Name", &dialog.name),
+        text_field_line(
+            dialog,
+            FIELD_DESCRIPTION,
+            "Description",
+            &dialog.description,
+        ),
+        text_field_line(dialog, FIELD_WORKDIR, "Workdir", &dialog.workdir),
+        trigger_kind_line(dialog),
+    ];
+    match dialog.trigger_choice {
+        LoopTriggerChoice::Manual => {}
+        LoopTriggerChoice::Cron => {
+            lines.push(text_field_line(
+                dialog,
+                FIELD_TRIGGER_VALUE,
+                "Cron expr",
+                &dialog.cron_expr,
+            ));
+        }
+        LoopTriggerChoice::Watch => {
+            lines.push(text_field_line(
+                dialog,
+                FIELD_TRIGGER_VALUE,
+                "Watch path",
+                &dialog.watch_path,
+            ));
+            lines.push(Line::from(vec![
+                Span::styled("  Events      ", Style::default().fg(DIM)),
+                Span::styled(dialog.watch_events.join(", "), Style::default().fg(DIM)),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Tab/↑↓ field · ←→ trigger · Enter save · Esc cancel",
+        Style::default().fg(DIM),
+    )));
+    if let Some(err) = &dialog.error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            err.as_str(),
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect::new(inner.x, inner.y + 1, inner.width, inner.height),
+    );
+}
+
+fn text_field_line<'a>(
+    dialog: &LoopFormDialog,
+    field: usize,
+    label: &'a str,
+    value: &'a str,
+) -> Line<'a> {
+    let focused = dialog.field == field;
+    let marker = if focused { "▸ " } else { "  " };
+    let label_style = if focused {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(DIM)
+    };
+    let value_style = if focused {
+        Style::default().fg(Color::White)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    let cursor = if focused { "▏" } else { "" };
+    Line::from(vec![
+        Span::styled(format!("{marker}{label:<12}"), label_style),
+        Span::styled(value.to_string(), value_style),
+        Span::styled(cursor, Style::default().fg(ACCENT)),
+    ])
+}
+
+fn trigger_kind_line(dialog: &LoopFormDialog) -> Line<'_> {
+    let focused = dialog.field == FIELD_TRIGGER_KIND;
+    let marker = if focused { "▸ " } else { "  " };
+    let label_style = if focused {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(DIM)
+    };
+    let spans = vec![
+        Span::styled(format!("{marker}{:<12}", "Trigger"), label_style),
+        Span::styled(
+            if focused { "◂ " } else { "  " },
+            Style::default().fg(ACCENT),
+        ),
+        Span::styled(
+            dialog.trigger_choice.label(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            if focused { " ▸" } else { "  " },
+            Style::default().fg(ACCENT),
+        ),
+    ];
+    Line::from(spans)
+}

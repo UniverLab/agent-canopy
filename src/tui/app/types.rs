@@ -12,7 +12,9 @@ use crate::domain::project::Project;
 use crate::domain::sync::{ActiveIntent, SyncMessage, WorkspaceStatus};
 use crate::rag::vector_store::SearchResult;
 use crate::tui::agent::InteractiveAgent;
-use crate::tui::app::dialog::{LaunchpadDialog, NewAgentDialog, SimplePromptDialog};
+use crate::tui::app::dialog::{
+    LaunchpadDialog, LoopFormDialog, NewAgentDialog, SimplePromptDialog,
+};
 use crate::tui::app::terminal_search::TerminalSearch;
 /// Unified entry in the sidebar.
 #[allow(clippy::large_enum_variant)]
@@ -50,6 +52,7 @@ pub enum Focus {
     RagTransfer,
     PromptTemplateDialog,
     LoopEditorDialog,
+    LoopFormDialog,
     ProjectRelationDialog,
 }
 
@@ -285,6 +288,7 @@ pub struct App {
     pub(crate) loop_selected_spec: usize,
     pub(crate) loop_selected_node: usize,
     pub(crate) loop_editor_dialog: Option<LoopEditorDialog>,
+    pub(crate) loop_form_dialog: Option<LoopFormDialog>,
     pub(crate) global_rag_queue: Vec<RagQueueItem>,
     pub(crate) selected_rag_queue: usize,
     pub(crate) rag_info: RagInfoSummary,

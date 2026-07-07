@@ -46,6 +46,10 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                     if app.projects_panel_focus == crate::tui::app::ProjectsPanelFocus::RagInfo {
                         h.push(("p", "pause rag"));
                     }
+                    if app.projects_panel_focus == crate::tui::app::ProjectsPanelFocus::Loops {
+                        h.push(("n", "new loop"));
+                        h.push(("E", "loop settings"));
+                    }
                     h.push(("Esc", "home"));
                     h
                 }
@@ -148,6 +152,12 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("←→", "cursor"),
             ("Enter", "newline"),
             ("Ctrl+S", "save"),
+            ("Esc", "cancel"),
+        ],
+        Focus::LoopFormDialog => vec![
+            ("Tab/↑↓", "field"),
+            ("←→", "trigger"),
+            ("Enter", "save"),
             ("Esc", "cancel"),
         ],
         Focus::ProjectRelationDialog => vec![

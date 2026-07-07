@@ -24,6 +24,7 @@ use context_transfer::handle_context_transfer_key;
 use home_preview::{handle_home_key, handle_preview_key};
 use launchpad::handle_launchpad_key;
 use loop_editor::handle_loop_editor_key;
+use loop_form::handle_loop_form_key;
 use new_agent_dialog::handle_dialog_key;
 use paste::handle_paste;
 use prompt_template::handle_prompt_template_key;
@@ -56,7 +57,8 @@ fn tick_duration(app: &App) -> Duration {
         | Focus::ContextTransfer
         | Focus::RagTransfer
         | Focus::PromptTemplateDialog
-        | Focus::LoopEditorDialog => Duration::from_millis(50),
+        | Focus::LoopEditorDialog
+        | Focus::LoopFormDialog => Duration::from_millis(50),
         Focus::ProjectRelationDialog => Duration::from_millis(50),
         Focus::Preview => Duration::from_millis(100),
         Focus::Home if app.home_brain.is_some() => Duration::from_millis(50),
@@ -123,6 +125,7 @@ mod terminal_warp;
 
 use knowledge_dialog::handle_knowledge_dialog_key;
 mod loop_editor;
+mod loop_form;
 
 pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
     if dismiss_legend(app, code) || handle_global_key(app, code, modifiers) {
@@ -210,6 +213,7 @@ fn dispatch_focus_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> 
         Focus::RagTransfer => handle_rag_transfer_key(app, code),
         Focus::PromptTemplateDialog => handle_prompt_template_key(app, code, modifiers),
         Focus::LoopEditorDialog => handle_loop_editor_key(app, code, modifiers),
+        Focus::LoopFormDialog => handle_loop_form_key(app, code, modifiers),
         Focus::ProjectRelationDialog => handle_preview_key(app, code, modifiers),
     }
 }
@@ -499,7 +503,8 @@ fn handle_scroll(app: &mut App, dir: i32) {
         | Focus::ContextTransfer
         | Focus::RagTransfer
         | Focus::PromptTemplateDialog
-        | Focus::LoopEditorDialog => {}
+        | Focus::LoopEditorDialog
+        | Focus::LoopFormDialog => {}
         Focus::ProjectRelationDialog => {}
     }
 }

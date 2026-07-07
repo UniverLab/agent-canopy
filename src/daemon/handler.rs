@@ -72,7 +72,7 @@ fn missing_sync_identity_error() -> McpError {
     McpError::invalid_params(MISSING_SYNC_IDENTITY_MESSAGE.to_string(), None)
 }
 
-fn validate_non_empty(value: &str, field: &str) -> Result<(), String> {
+pub(crate) fn validate_non_empty(value: &str, field: &str) -> Result<(), String> {
     if value.trim().is_empty() {
         Err(format!("{field} must not be empty."))
     } else {
@@ -80,7 +80,7 @@ fn validate_non_empty(value: &str, field: &str) -> Result<(), String> {
     }
 }
 
-fn validate_absolute_dir(path: &str) -> Result<(), String> {
+pub(crate) fn validate_absolute_dir(path: &str) -> Result<(), String> {
     let p = std::path::Path::new(path);
     if !p.is_absolute() {
         return Err("Loop workdir must be an absolute path.".into());
@@ -94,7 +94,9 @@ fn validate_absolute_dir(path: &str) -> Result<(), String> {
 /// Build a loop [`Trigger`] from MCP parameters, reusing the same cron/watch
 /// validation as agents. Returns `Ok(None)` for a manual loop (no trigger or
 /// `kind = "manual"`), and an `Err(message)` for invalid input.
-fn build_loop_trigger(params: &Option<LoopTriggerParams>) -> Result<Option<Trigger>, String> {
+pub(crate) fn build_loop_trigger(
+    params: &Option<LoopTriggerParams>,
+) -> Result<Option<Trigger>, String> {
     let Some(params) = params else {
         return Ok(None);
     };

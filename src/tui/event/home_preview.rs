@@ -252,9 +252,19 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
                 && app.projects_panel_focus == ProjectsPanelFocus::Knowledge
             {
                 open_knowledge_dialog(app);
+            } else if app.sidebar_mode == SidebarMode::Projects
+                && app.projects_panel_focus == ProjectsPanelFocus::Loops
+            {
+                app.open_new_loop_dialog();
             } else {
                 app.open_new_agent_dialog();
             }
+        }
+        KeyCode::Char('E')
+            if app.sidebar_mode == SidebarMode::Projects
+                && app.projects_panel_focus == ProjectsPanelFocus::Loops =>
+        {
+            app.open_edit_loop_dialog();
         }
         KeyCode::Char('/')
             if app.sidebar_mode == SidebarMode::Projects

@@ -177,39 +177,3 @@ impl App {
         }
     }
 }
-
-pub(crate) fn send_mcp_task_run(port: &str, agent_id: &str) -> Result<()> {
-    use std::io::{Read, Write};
-    use std::net::TcpStream;
-    use std::time::Duration;
-
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "agent_run",
-            "arguments": { "id": agent_id }
-        }
-    })
-    .to_string();
-
-    let request = format!(
-        "POST /mcp HTTP/1.1\r\n\
-         Host: 127.0.0.1:{port}\r\n\
-         Content-Type: application/json\r\n\
-         Accept: application/json\r\n\
-         Content-Length: {}\r\n\
-         \r\n\
-         {body}",
-        body.len()
-    );
-
-    let addr = format!("127.0.0.1:{port}");
-    let mut stream = TcpStream::connect_timeout(&addr.parse()?, Duration::from_secs(3))?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.write_all(request.as_bytes())?;
-    let mut buf = [0u8; 4096];
-    let _ = stream.read(&mut buf);
-    Ok(())
-}

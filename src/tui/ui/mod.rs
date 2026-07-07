@@ -147,6 +147,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         dialogs::draw_loop_editor_dialog(frame, app);
     }
 
+    if app.loop_form_dialog.is_some() {
+        dialogs::draw_loop_form_dialog(frame, app);
+    }
+
     if app.knowledge_dialog.is_some() {
         dialogs::draw_knowledge_dialog(frame, app);
     }

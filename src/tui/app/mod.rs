@@ -25,7 +25,7 @@ use super::context_transfer::{
 use crate::domain::loops::{LoopNodeKind, LoopSpecStatus};
 use crate::tui::prompt_templates::PromptTemplates;
 
-pub(crate) use data::send_mcp_task_run;
+pub(crate) use crate::tui::mcp_client::send_mcp_task_run;
 
 // ── Types ───────────────────────────────────────────────────────
 
@@ -95,6 +95,7 @@ impl App {
             loop_selected_spec: 0,
             loop_selected_node: 0,
             loop_editor_dialog: None,
+            loop_form_dialog: None,
             global_rag_queue: Vec::new(),
             selected_rag_queue: 0,
             rag_info: crate::db::project::RagInfoSummary::default(),
