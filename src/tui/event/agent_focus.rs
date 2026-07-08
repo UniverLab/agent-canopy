@@ -115,6 +115,7 @@ fn handle_background_agent_key(app: &mut App, code: KeyCode, modifiers: KeyModif
         KeyCode::Up | KeyCode::Char('k') => app.scroll_log_up(),
         KeyCode::Char('q') => app.running = false,
         KeyCode::F(1) => app.show_legend = !app.show_legend,
+        KeyCode::Char('e') if !app.agents_rag_focused => app.open_edit_dialog(),
         _ => {}
     }
 
@@ -696,6 +697,77 @@ fn forward_key_to_focused_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::ports::AgentRepository;
+    use crate::db::Database;
+    use crate::domain::models::{Agent, Cli, Trigger};
+    use chrono::Utc;
+    use std::sync::Arc;
+    use tempfile::{tempdir, NamedTempFile};
+
+    fn test_db() -> Arc<Database> {
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        Arc::new(Database::new(&path).expect("create test db"))
+    }
+
+    fn cron_agent(id: &str) -> Agent {
+        Agent {
+            id: id.to_string(),
+            prompt: "original prompt".to_string(),
+            trigger: Some(Trigger::Cron {
+                schedule_expr: "0 9 * * *".to_string(),
+            }),
+            cli: Cli::new("claude"),
+            model: Some("original-model".to_string()),
+            working_dir: Some("/original/dir".to_string()),
+            enabled: true,
+            created_at: Utc::now(),
+            log_path: "/tmp/test-cron.log".to_string(),
+            timeout_minutes: 15,
+            expires_at: None,
+            last_run_at: None,
+            last_run_ok: None,
+            last_triggered_at: None,
+            trigger_count: 3,
+        }
+    }
+
+    fn app_with_background_agent() -> App {
+        let db = test_db();
+        let agent = cron_agent("cron-1");
+        db.upsert_agent(&agent).expect("seed agent");
+
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.agents = vec![AgentEntry::Agent(agent)];
+        app.selected = 0;
+        app.focus = Focus::Agent;
+        app
+    }
+
+    #[test]
+    fn e_key_opens_edit_dialog_for_focused_background_agent() {
+        let mut app = app_with_background_agent();
+
+        let handled = handle_background_agent_key(&mut app, KeyCode::Char('e'), KeyModifiers::NONE);
+
+        assert!(handled);
+        assert!(matches!(app.focus, Focus::NewAgentDialog));
+        assert!(app.new_agent_dialog.is_some());
+    }
+
+    #[test]
+    fn e_key_does_not_open_edit_dialog_when_rag_info_is_focused() {
+        let mut app = app_with_background_agent();
+        app.agents_rag_focused = true;
+
+        let handled = handle_background_agent_key(&mut app, KeyCode::Char('e'), KeyModifiers::NONE);
+
+        assert!(handled);
+        assert!(matches!(app.focus, Focus::Agent));
+        assert!(app.new_agent_dialog.is_none());
+    }
 
     #[test]
     fn shift_arrows_are_focus_cycle_keys() {

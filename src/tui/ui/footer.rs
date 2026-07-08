@@ -125,7 +125,11 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                 h.push(("F1", "legend"));
                 h
             } else {
-                let mut h = vec![("F10", "preview"), ("Esc", "home"), ("F2", "projects")];
+                let mut h = vec![("F10", "preview"), ("Esc", "home")];
+                if !app.agents_rag_focused {
+                    h.push(("e", "edit"));
+                }
+                h.push(("F2", "projects"));
                 if activity_available {
                     h.push(("F3", "activity"));
                 }
