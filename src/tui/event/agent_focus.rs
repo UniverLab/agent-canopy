@@ -133,10 +133,30 @@ fn handle_focus_shortcuts(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
     handle_context_transfer_shortcut(app, code, modifiers)
         || handle_split_picker_shortcut(app, code, modifiers)
         || handle_split_panel_focus_shortcut(app, code, modifiers)
+        || handle_dismiss_exited_session(app, code)
         || handle_preview_shortcut(app, code)
         || handle_termination_shortcut(app, code, modifiers)
         || handle_legend_shortcut(app, code)
         || handle_agent_cycle_shortcut(app, code, modifiers)
+}
+
+/// Whether an Esc/F10 press should dismiss a finished session instead of exiting
+/// focus or reaching the PTY. Only applies to a single (non-split) selected
+/// session that has already exited. Pure for testability.
+fn dismisses_exited_session(code: KeyCode, in_split: bool, selected_exited: bool) -> bool {
+    matches!(code, KeyCode::Esc | KeyCode::F(10)) && !in_split && selected_exited
+}
+
+fn handle_dismiss_exited_session(app: &mut App, code: KeyCode) -> bool {
+    if !dismisses_exited_session(
+        code,
+        app.active_split_id.is_some(),
+        app.selected_session_is_exited(),
+    ) {
+        return false;
+    }
+    app.dismiss_selected_exited_session();
+    true
 }
 
 fn handle_context_transfer_shortcut(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> bool {
@@ -831,5 +851,30 @@ mod tests {
         assert!(!is_focus_cycle_key(KeyCode::Char('j'), KeyModifiers::SHIFT));
         assert!(!is_focus_cycle_key(KeyCode::Left, KeyModifiers::SHIFT));
         assert!(!is_focus_cycle_key(KeyCode::PageDown, KeyModifiers::SHIFT));
+    }
+
+    #[test]
+    fn esc_dismisses_exited_session() {
+        assert!(dismisses_exited_session(KeyCode::Esc, false, true));
+    }
+
+    #[test]
+    fn f10_dismisses_exited_session() {
+        assert!(dismisses_exited_session(KeyCode::F(10), false, true));
+    }
+
+    #[test]
+    fn split_active_does_not_dismiss_exited_session() {
+        assert!(!dismisses_exited_session(KeyCode::Esc, true, true));
+    }
+
+    #[test]
+    fn running_session_is_not_dismissed() {
+        assert!(!dismisses_exited_session(KeyCode::Esc, false, false));
+    }
+
+    #[test]
+    fn other_key_does_not_dismiss_exited_session() {
+        assert!(!dismisses_exited_session(KeyCode::Char('x'), false, true));
     }
 }

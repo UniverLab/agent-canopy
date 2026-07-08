@@ -43,6 +43,25 @@ fn reverse_sorted_indices(mut indices: Vec<usize>) -> Vec<usize> {
     indices
 }
 
+/// Selection index after a session-list mutation: keep the previously-selected
+/// entry by identity when it survived the mutation, otherwise clamp into range.
+/// Pure so the "navigate Down over a reaped session" fix is unit-testable.
+fn selection_after_mutation(
+    entry_ids: &[&str],
+    anchor: Option<&str>,
+    prev_selected: usize,
+) -> usize {
+    if entry_ids.is_empty() {
+        return 0;
+    }
+    if let Some(anchor) = anchor {
+        if let Some(pos) = entry_ids.iter().position(|id| *id == anchor) {
+            return pos;
+        }
+    }
+    prev_selected.min(entry_ids.len() - 1)
+}
+
 fn poll_agents(agents: &mut [InteractiveAgent]) {
     for agent in agents {
         agent.poll();
@@ -650,8 +669,9 @@ impl App {
             return;
         }
 
+        let anchor = self.selected_entry_identity();
         self.remove_interactive_sessions(removed_indices);
-        self.finish_session_mutation();
+        self.finish_session_mutation_preserving(anchor.as_deref());
     }
 
     pub fn rerun_selected(&self) -> anyhow::Result<()> {
@@ -769,6 +789,24 @@ impl App {
         self.reset_focus_after_session_mutation();
     }
 
+    fn selected_entry_identity(&self) -> Option<String> {
+        self.agents
+            .get(self.selected)
+            .map(|entry| entry.id(self).to_string())
+    }
+
+    fn finish_session_mutation_preserving(&mut self, anchor: Option<&str>) {
+        let _ = self.refresh_agents();
+        let ids: Vec<String> = self
+            .agents
+            .iter()
+            .map(|entry| entry.id(self).to_string())
+            .collect();
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        self.selected = selection_after_mutation(&id_refs, anchor, self.selected);
+        self.reset_focus_after_session_mutation();
+    }
+
     fn close_interactive_session_at(&mut self, idx: usize, exit_code: i32) -> bool {
         let Some(agent_id) = self
             .interactive_agents
@@ -826,6 +864,31 @@ impl App {
         self.dissolve_groups_for_session(&agent_name);
         true
     }
+
+    pub(crate) fn selected_session_is_exited(&self) -> bool {
+        match self.selected_session_target() {
+            Some(SessionTarget::Interactive(idx)) => self
+                .interactive_agents
+                .get(idx)
+                .is_some_and(|agent| matches!(agent.status, AgentStatus::Exited(_))),
+            Some(SessionTarget::Terminal(idx)) => self
+                .terminal_agents
+                .get(idx)
+                .is_some_and(|agent| matches!(agent.status, AgentStatus::Exited(_))),
+            None => false,
+        }
+    }
+
+    pub(crate) fn dismiss_selected_exited_session(&mut self) {
+        // The session already exited (DB was finalized in handle_*_exit); just drop
+        // it from the list and let the selection clamp to a neighbour.
+        let Some(target) = self.selected_session_target() else {
+            return;
+        };
+        if self.remove_session_target(target) {
+            self.finish_session_mutation();
+        }
+    }
 }
 
 // ── Brain helpers ─────────────────────────────────────────────────
@@ -857,4 +920,36 @@ fn effective_brain_dims(panel: (u16, u16)) -> (usize, usize) {
     let cols = (tw / 2).saturating_sub(2) as usize;
     let rows = th.saturating_sub(3) as usize;
     (cols, rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selection_after_mutation_follows_anchor_shifted_up() {
+        // "Down jump" scenario: B was reaped while cursor had moved to C (old
+        // index 2); C is now at index 1 and must remain selected.
+        assert_eq!(selection_after_mutation(&["A", "C", "D"], Some("C"), 2), 1);
+    }
+
+    #[test]
+    fn selection_after_mutation_up_navigation_unaffected() {
+        assert_eq!(selection_after_mutation(&["A", "C", "D"], Some("A"), 0), 0);
+    }
+
+    #[test]
+    fn selection_after_mutation_clamps_when_anchor_missing() {
+        assert_eq!(selection_after_mutation(&["A", "C", "D"], Some("B"), 2), 2);
+    }
+
+    #[test]
+    fn selection_after_mutation_clamps_to_last_when_prev_out_of_range() {
+        assert_eq!(selection_after_mutation(&["A", "C"], Some("Z"), 5), 1);
+    }
+
+    #[test]
+    fn selection_after_mutation_empty_list_is_zero() {
+        assert_eq!(selection_after_mutation(&[], Some("A"), 3), 0);
+    }
 }
