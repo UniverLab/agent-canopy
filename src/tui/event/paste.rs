@@ -1,6 +1,6 @@
 use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
-use super::context_transfer::resolve_session;
+use super::context_transfer::{active_split_session_name, resolve_session};
 use super::handle_key;
 use super::terminal_warp::sync_terminal_warp_buffer_from_pty;
 use crate::tui::app::types::{AgentEntry, App, Focus};
@@ -12,9 +12,14 @@ use crate::tui::app::types::{AgentEntry, App, Focus};
 pub fn handle_paste(app: &mut App, text: &str) {
     match app.focus {
         Focus::Agent => {
-            let (vec, idx) = if let Some(split_id) = &app.active_split_id {
-                let id = split_id.clone();
-                resolve_session(app, &id)
+            let (vec, idx) = if app.active_split_id.is_some() {
+                // Split layouts route paste to whichever panel (session)
+                // currently has focus, not the split group itself.
+                let Some(name) = active_split_session_name(app) else {
+                    return;
+                };
+                let name = name.to_string();
+                resolve_session(app, &name)
             } else {
                 match app.selected_agent() {
                     Some(AgentEntry::Interactive(idx)) => ("interactive", *idx),
@@ -22,6 +27,9 @@ pub fn handle_paste(app: &mut App, text: &str) {
                     _ => return,
                 }
             };
+            if idx == usize::MAX {
+                return;
+            }
 
             let agent = if vec == "terminal" {
                 app.terminal_agents.get_mut(idx)
@@ -81,5 +89,103 @@ pub fn handle_paste(app: &mut App, text: &str) {
                 let _ = handle_key(app, KeyCode::Char(c), KeyModifiers::NONE);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+    use crate::domain::models::{SplitGroup, SplitOrientation};
+    use crate::tui::agent::InteractiveAgent;
+    use chrono::Utc;
+    use std::sync::Arc;
+    use tempfile::{tempdir, NamedTempFile};
+
+    fn test_db() -> Arc<Database> {
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        Arc::new(Database::new(&path).expect("create test db"))
+    }
+
+    /// `cat` is used as a stand-in shell: it never touches the alternate
+    /// screen or looks like a sensitive prompt, so pasted text lands in the
+    /// warp input buffer instead of going straight to the PTY.
+    fn spawn_test_terminal(name: &str) -> InteractiveAgent {
+        InteractiveAgent::spawn_terminal(
+            "cat",
+            "/tmp",
+            80,
+            24,
+            Some(name),
+            &[],
+            ratatui::style::Color::White,
+        )
+        .expect("spawn terminal")
+    }
+
+    fn app_with_split(session_a: &str, session_b: &str, right_focused: bool) -> App {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.terminal_agents.push(spawn_test_terminal(session_a));
+        app.terminal_agents.push(spawn_test_terminal(session_b));
+        app.split_groups.push(SplitGroup {
+            id: "split-1".to_string(),
+            orientation: SplitOrientation::Horizontal,
+            session_a: session_a.to_string(),
+            session_b: session_b.to_string(),
+            created_at: Utc::now(),
+        });
+        app.active_split_id = Some("split-1".to_string());
+        app.split_right_focused = right_focused;
+        app.focus = Focus::Agent;
+        app
+    }
+
+    fn input_buffer_text(agent: &InteractiveAgent) -> String {
+        agent
+            .input_buffer
+            .lock()
+            .expect("lock input buffer")
+            .clone()
+    }
+
+    #[test]
+    fn bracketed_paste_routes_to_left_panel_when_left_focused() {
+        let mut app = app_with_split("left-term", "right-term", false);
+
+        handle_paste(&mut app, "hello");
+
+        assert_eq!(input_buffer_text(&app.terminal_agents[0]), "hello");
+        assert_eq!(input_buffer_text(&app.terminal_agents[1]), "");
+    }
+
+    #[test]
+    fn bracketed_paste_routes_to_right_panel_when_right_focused() {
+        let mut app = app_with_split("left-term", "right-term", true);
+
+        handle_paste(&mut app, "world");
+
+        assert_eq!(input_buffer_text(&app.terminal_agents[0]), "");
+        assert_eq!(input_buffer_text(&app.terminal_agents[1]), "world");
+    }
+
+    #[test]
+    fn bracketed_paste_in_split_is_a_noop_when_session_is_stale() {
+        // Regression guard: previously this branch called
+        // `resolve_session(app, split_id)`, treating the split's own ID as a
+        // session name — it never matched, so paste silently no-opped for
+        // every split. Confirm the still-broken/missing-session case stays a
+        // clean no-op (not a panic) now that resolution goes through the
+        // focused session name.
+        let mut app = app_with_split("left-term", "right-term", false);
+        app.split_groups[0].session_a = "gone".to_string();
+
+        handle_paste(&mut app, "text");
+
+        assert_eq!(input_buffer_text(&app.terminal_agents[0]), "");
+        assert_eq!(input_buffer_text(&app.terminal_agents[1]), "");
     }
 }

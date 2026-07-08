@@ -1,7 +1,7 @@
 use anyhow::Result;
 use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
-use super::context_transfer::resolve_session;
+use super::context_transfer::{active_split_session_name, resolve_session};
 use super::home_preview::handle_playground_key;
 use super::search_picker::handle_suggestion_picker_key;
 use super::terminal_warp::{
@@ -402,20 +402,10 @@ fn resolve_split_focused_agent(app: &mut App) -> Option<FocusedAgent> {
         app.focus = Focus::Preview;
         return None;
     };
+    let session_name = session_name.to_string();
 
-    let (agent_vec, idx) = resolve_session(app, session_name);
+    let (agent_vec, idx) = resolve_session(app, &session_name);
     resolve_agent_target(app, agent_vec, idx, Focus::Preview)
-}
-
-fn active_split_session_name(app: &App) -> Option<&str> {
-    let split_id = app.active_split_id.as_deref()?;
-    let group = app.split_groups.iter().find(|group| group.id == split_id)?;
-
-    Some(if app.split_right_focused {
-        group.session_b.as_str()
-    } else {
-        group.session_a.as_str()
-    })
 }
 
 fn resolve_selected_focused_agent(app: &mut App) -> Option<FocusedAgent> {

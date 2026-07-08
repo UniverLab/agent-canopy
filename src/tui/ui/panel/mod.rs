@@ -430,6 +430,7 @@ fn draw_terminal_warp_mode(
     }
     draw_warp_input_box(frame, input_area, app, idx);
     app.last_panel_inner = (pty_area.width, pty_area.height);
+    app.last_panel_x = pty_area.x;
     app.last_panel_y = pty_area.y;
 }
 
@@ -506,6 +507,7 @@ pub(super) fn draw_log_panel(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 
     app.last_panel_inner = (inner.width, inner.height);
+    app.last_panel_x = inner.x;
     app.last_panel_y = inner.y;
 
     if show_home_fallback(app) {
@@ -1445,6 +1447,7 @@ pub(super) fn draw_split_panel(
 
     if focused {
         app.last_panel_inner = (inner.width, inner.height);
+        app.last_panel_x = inner.x;
         app.last_panel_y = inner.y;
     }
 
@@ -1494,6 +1497,7 @@ fn draw_split_warp_panel(
 
     if focused {
         app.last_panel_inner = (pty_area.width, pty_area.height);
+        app.last_panel_x = pty_area.x;
         app.last_panel_y = pty_area.y;
     }
 }
