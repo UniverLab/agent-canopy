@@ -40,6 +40,9 @@ pub struct AtEntry {
     pub name: String,
     pub path: PathBuf,
     pub is_dir: bool,
+    /// BFS depth relative to the search root (0 = root's direct children).
+    /// Always 0 in flat browse mode.
+    pub depth: usize,
 }
 
 /// Inline `@`-file picker state for `SimplePromptDialog`.
@@ -124,12 +127,14 @@ impl AtPicker {
                             name,
                             path,
                             is_dir: true,
+                            depth: 0,
                         });
                     } else {
                         files.push(AtEntry {
                             name,
                             path,
                             is_dir: false,
+                            depth: 0,
                         });
                     }
                 }
@@ -140,8 +145,8 @@ impl AtPicker {
             Self::breadth_first_search(&self.current_dir, &q, &mut dirs, &mut files);
         }
 
-        dirs.sort_by(|a, b| a.name.cmp(&b.name));
-        files.sort_by(|a, b| a.name.cmp(&b.name));
+        dirs.sort_by(|a, b| a.depth.cmp(&b.depth).then_with(|| a.name.cmp(&b.name)));
+        files.sort_by(|a, b| a.depth.cmp(&b.depth).then_with(|| a.name.cmp(&b.name)));
         dirs.extend(files);
         self.entries = dirs;
         self.selected = 0;
@@ -190,6 +195,7 @@ impl AtPicker {
                             name,
                             path: path.clone(),
                             is_dir: true,
+                            depth,
                         });
                     }
                     // Enqueue for a later level instead of recursing now (BFS).
@@ -201,6 +207,7 @@ impl AtPicker {
                         name,
                         path,
                         is_dir: false,
+                        depth,
                     });
                 }
             }
@@ -293,6 +300,32 @@ mod tests {
         assert!(names.contains(&"alpha_match.txt"));
         assert!(names.contains(&"beta_match.txt"));
         assert!(names.contains(&"gamma_match.txt"));
+
+        let alpha = files.iter().find(|f| f.name == "alpha_match.txt").unwrap();
+        let beta = files.iter().find(|f| f.name == "beta_match.txt").unwrap();
+        let gamma = files.iter().find(|f| f.name == "gamma_match.txt").unwrap();
+        assert!(alpha.depth < beta.depth);
+        assert!(beta.depth < gamma.depth);
+    }
+
+    #[test]
+    fn refresh_sorts_shallowest_first_for_same_name() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("target_match.txt"), "").unwrap();
+        let sub = root.join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("target_match.txt"), "").unwrap();
+
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+        AtPicker::breadth_first_search(root, "target_match", &mut dirs, &mut files);
+        files.sort_by(|a, b| a.depth.cmp(&b.depth).then_with(|| a.name.cmp(&b.name)));
+
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, root.join("target_match.txt"));
+        assert_eq!(files[1].path, sub.join("target_match.txt"));
+        assert!(files[0].depth < files[1].depth);
     }
 
     #[test]
