@@ -785,9 +785,18 @@ impl SimplePromptDialog {
 
         // The `@` is at trigger_pos; cursor is currently at trigger_pos + 1
         // (we never insert query chars into the text, only into picker.query).
+        // A leftover manual `@` can sit right before it (e.g. the user typed
+        // `@`, dismissed the picker with Esc, then typed `@` again) — absorb
+        // that one too so the result is `@path`, not `@@path`.
+        let chars: Vec<char> = self.get_section_content(section_id).chars().collect();
+        let start = if trigger_pos > 0 && chars.get(trigger_pos - 1) == Some(&'@') {
+            trigger_pos - 1
+        } else {
+            trigger_pos
+        };
         self.replace_char_range(
             section_id,
-            trigger_pos,
+            start,
             trigger_pos + 1,
             &format!("@{rel_path}"),
             field_width,
@@ -1433,6 +1442,45 @@ mod tests {
         assert_eq!(dialog.get_section_content("instruction_1"), "áéíóú  extra");
         // Cursor should be at 6 (the start of deleted placeholder)
         assert_eq!(dialog.cursor("instruction_1"), 6);
+    }
+
+    #[test]
+    fn insert_collapsed_paste_at_cursor_collapses_multiline_paste() {
+        let mut dialog = SimplePromptDialog::new();
+        let pasted = "line one\nline two\nline three";
+
+        dialog.insert_collapsed_paste_at_cursor("instruction_1", pasted, 80);
+
+        let displayed = dialog.get_section_content("instruction_1");
+        assert!(displayed.contains("[Pasted ~3 lines]"));
+        assert!(!displayed.contains("line one"));
+        // The full pasted text (all 3 lines) is still what gets sent to the CLI.
+        assert_eq!(
+            dialog.section_content_for_build("instruction_1"),
+            Some(pasted)
+        );
+    }
+
+    #[test]
+    fn insert_at_completion_removes_leftover_manual_at_before_trigger() {
+        let temp = tempdir().unwrap();
+        let workdir = temp.path().to_path_buf();
+
+        let mut dialog = SimplePromptDialog::new();
+        // Simulate: user typed "@" (left over from a dismissed picker), then
+        // typed "@" again right after it — trigger_pos points at the second "@".
+        dialog.set_section_content("instruction_1", "look @@".to_string());
+        dialog
+            .section_cursors
+            .insert("instruction_1".to_string(), 7);
+        dialog.at_picker = Some(AtPicker::new(workdir, 6));
+
+        dialog.insert_at_completion("instruction_1", "src/lib.rs", "/abs/src/lib.rs", 80);
+
+        assert_eq!(
+            dialog.get_section_content("instruction_1"),
+            "look @src/lib.rs"
+        );
     }
 }
 

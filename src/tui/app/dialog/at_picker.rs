@@ -56,6 +56,10 @@ pub struct AtPicker {
     pub query: String,
     /// Char-index of the `@` character in the section text.
     pub trigger_pos: usize,
+    /// Selected index at each level of the directory walk, pushed on
+    /// `enter_dir` and popped on `go_up` so back-navigation restores the
+    /// cursor to the directory that was entered.
+    nav_stack: Vec<usize>,
     /// When `Some`, a query edit is waiting for the debounce window (measured
     /// from this instant) to elapse before searching. Resets on each keystroke.
     pending_since: Option<Instant>,
@@ -71,6 +75,7 @@ impl AtPicker {
             selected: 0,
             query: String::new(),
             trigger_pos,
+            nav_stack: Vec::new(),
             pending_since: None,
         };
         p.refresh();
@@ -206,6 +211,7 @@ impl AtPicker {
     pub fn enter_dir(&mut self) {
         if let Some(e) = self.entries.get(self.selected) {
             if e.is_dir {
+                self.nav_stack.push(self.selected);
                 self.current_dir = e.path.clone();
                 self.query.clear();
                 self.refresh();
@@ -214,11 +220,18 @@ impl AtPicker {
     }
 
     /// Navigate one level up — no upper limit, allows going above `workdir`.
+    /// Restores the cursor to the directory just left, if it was reached via
+    /// `enter_dir` (i.e. there is a matching entry on `nav_stack`).
     pub fn go_up(&mut self) {
         if let Some(parent) = self.current_dir.parent() {
             self.current_dir = parent.to_path_buf();
             self.query.clear();
             self.refresh();
+            if let Some(prev_selected) = self.nav_stack.pop() {
+                if prev_selected < self.entries.len() {
+                    self.selected = prev_selected;
+                }
+            }
         }
     }
 
@@ -296,5 +309,25 @@ mod tests {
 
         assert!(dirs.is_empty());
         assert!(files.is_empty());
+    }
+
+    #[test]
+    fn go_up_restores_cursor_to_the_directory_just_entered() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("alpha")).unwrap();
+        fs::create_dir(root.join("tui")).unwrap();
+
+        let mut picker = AtPicker::new(root.to_path_buf(), 0);
+        // Flat browse mode sorts dirs alphabetically: "alpha" (0), "tui" (1).
+        assert_eq!(picker.entries[1].name, "tui");
+
+        picker.selected = 1;
+        picker.enter_dir();
+        assert_eq!(picker.current_dir, root.join("tui"));
+
+        picker.go_up();
+        assert_eq!(picker.current_dir, root);
+        assert_eq!(picker.entries[picker.selected].name, "tui");
     }
 }
