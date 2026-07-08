@@ -16,6 +16,7 @@ use crate::tui::agent::ScreenSnapshot;
 use crate::tui::app::types::{AgentEntry, App, Focus, ProjectsPanelFocus};
 use crate::tui::app::SidebarMode;
 
+pub mod background_agent;
 pub mod details;
 pub mod home;
 pub mod log_fallback;
@@ -23,6 +24,7 @@ pub mod sync;
 pub mod vt100;
 pub mod warp;
 
+pub(crate) use background_agent::draw_background_agent_panel;
 pub use details::{draw_agent_details, draw_group_details};
 pub(crate) use home::draw_brians_brain;
 pub use log_fallback::draw_log_text;
@@ -307,7 +309,10 @@ fn draw_agent_panel(frame: &mut Frame, area: Rect, app: &mut App) -> bool {
             draw_group_details(frame, area, app, *idx);
             true
         }
-        _ => false,
+        AgentEntry::Agent(agent) => {
+            draw_background_agent_panel(frame, area, agent, app);
+            true
+        }
     }
 }
 

@@ -45,7 +45,7 @@ pub fn draw_log_text(frame: &mut Frame, area: Rect, inner: Rect, app: &App) {
 
 /// Returns (content_length, position, viewport_content_length) for the log
 /// scrollbar, or None when all lines fit and no scrollbar is needed.
-fn log_scrollbar_geometry(
+pub(super) fn log_scrollbar_geometry(
     line_count: u16,
     inner_height: u16,
     scroll: u16,
