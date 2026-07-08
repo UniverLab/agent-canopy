@@ -491,7 +491,15 @@ fn find_entry_node(spec: &crate::domain::loops::LoopSpecDetails) -> Result<Strin
 
     match entry_nodes.as_slice() {
         [entry] => Ok(entry.id.clone()),
-        [] => bail!("Spec '{}' has no entry node.", spec.spec.name),
+        // Every node has an incoming edge: the graph is a retry cycle (e.g.
+        // implement <-> review). There is no source node, so fall back to the
+        // designated start — the node with the lowest position.
+        [] => spec
+            .nodes
+            .iter()
+            .min_by_key(|node| node.position)
+            .map(|node| node.id.clone())
+            .ok_or_else(|| anyhow!("Spec '{}' has no nodes.", spec.spec.name)),
         _ => bail!("Spec '{}' has multiple entry nodes.", spec.spec.name),
     }
 }
@@ -776,6 +784,62 @@ mod tests {
             previous_output.and_then(|value| value.get("previous").cloned()),
             Some(serde_json::json!("context"))
         );
+    }
+
+    #[test]
+    fn find_entry_node_picks_lowest_position_in_retry_cycle() {
+        // implement (pos 1) <-> review (pos 2): every node has an incoming
+        // edge, so there is no source node. The entry must be the designated
+        // start (lowest position), not an error.
+        let spec = LoopSpec {
+            id: "spec".to_string(),
+            loop_id: "wf".to_string(),
+            name: "Spec".to_string(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+        };
+        let node = |id: &str, position: i64| LoopNode {
+            id: id.to_string(),
+            spec_id: spec.id.clone(),
+            name: id.to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position,
+            created_at: chrono::Utc::now(),
+        };
+        let edge = |id: &str, from: &str, to: &str, condition| LoopEdge {
+            id: id.to_string(),
+            spec_id: spec.id.clone(),
+            from_node: from.to_string(),
+            to_node: to.to_string(),
+            condition,
+        };
+        let details = crate::domain::loops::LoopSpecDetails {
+            spec: spec.clone(),
+            // Insert review before implement so the result cannot depend on
+            // node ordering — only on position.
+            nodes: vec![node("review", 2), node("implement", 1)],
+            edges: vec![
+                edge(
+                    "e1",
+                    "implement",
+                    "review",
+                    crate::domain::loops::LoopEdgeCondition::Always,
+                ),
+                edge(
+                    "e2",
+                    "review",
+                    "implement",
+                    crate::domain::loops::LoopEdgeCondition::Fail,
+                ),
+            ],
+        };
+
+        assert_eq!(find_entry_node(&details).unwrap(), "implement");
     }
 
     #[test]
