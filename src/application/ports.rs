@@ -12,6 +12,7 @@ pub trait AgentRepository {
     fn list_cron_agents(&self) -> Result<Vec<Agent>>;
     fn list_watch_agents(&self) -> Result<Vec<Agent>>;
     fn delete_agent(&self, id: &str) -> Result<()>;
+    fn rename_agent(&self, old_id: &str, new_id: &str, new_log_path: &str) -> Result<()>;
     fn update_agent_enabled(&self, id: &str, enabled: bool) -> Result<()>;
     fn update_agent_last_run(&self, id: &str, success: bool) -> Result<()>;
     fn update_agent_triggered(&self, id: &str) -> Result<()>;

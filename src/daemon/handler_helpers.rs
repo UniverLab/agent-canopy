@@ -434,6 +434,7 @@ mod tests {
     fn watcher_restart_needed_true() {
         let mut params = TaskUpdateParams {
             id: "test".to_string(),
+            new_id: None,
             prompt: None,
             cli: None,
             model: None,
@@ -536,6 +537,7 @@ mod tests {
 
         let params = TaskUpdateParams {
             id: "test".to_string(),
+            new_id: None,
             prompt: Some("new prompt".to_string()),
             cli: None,
             model: None,
@@ -575,6 +577,7 @@ mod tests {
 
         let params = TaskUpdateParams {
             id: "test".to_string(),
+            new_id: None,
             prompt: None,
             cli: None,
             model: None,
@@ -614,6 +617,7 @@ mod tests {
 
         let params = TaskUpdateParams {
             id: "test".to_string(),
+            new_id: None,
             prompt: None,
             cli: None,
             model: None,
@@ -792,6 +796,7 @@ mod tests {
 
         let params = TaskUpdateParams {
             id: "cron-agent".to_string(),
+            new_id: None,
             prompt: None,
             cli: None,
             model: None,

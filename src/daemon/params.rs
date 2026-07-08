@@ -49,6 +49,10 @@ pub struct TaskWatchParams {
 pub struct TaskUpdateParams {
     /// ID of the agent to update.
     pub id: String,
+    /// New agent ID to rename this agent to. Must be unique and valid
+    /// (lowercase alphanumerics, hyphens, underscores). Updates the agent
+    /// row, its log path, and all run references atomically.
+    pub new_id: Option<String>,
     /// New prompt/instruction.
     pub prompt: Option<String>,
     /// New CLI platform name.

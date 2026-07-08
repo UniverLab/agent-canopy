@@ -963,6 +963,26 @@ impl TaskTriggerHandler {
             )));
         };
 
+        if let Some(new_id) = params.new_id.as_deref() {
+            if new_id != params.id {
+                if let Err(e) = validate_id(new_id) {
+                    return Ok(error_result(&e));
+                }
+                let new_log_path = make_log_path(new_id)?;
+
+                if agent.is_watch() {
+                    let _ = self.watcher_engine.stop_watcher(&params.id).await;
+                }
+
+                if let Err(e) = self.db.rename_agent(&params.id, new_id, &new_log_path) {
+                    return Ok(error_result(&e.to_string()));
+                }
+
+                agent.id = new_id.to_string();
+                agent.log_path = new_log_path;
+            }
+        }
+
         if let Err(e) = apply_scalar_updates(&mut agent, &params) {
             return Ok(error_result(&e));
         }
@@ -981,7 +1001,7 @@ impl TaskTriggerHandler {
 
         Ok(success_result(&format!(
             "Agent '{}' updated successfully.",
-            params.id
+            agent.id
         )))
     }
 
@@ -2501,10 +2521,16 @@ impl TaskTriggerHandler {
         params: &TaskUpdateParams,
         agent: &Agent,
     ) -> Result<Option<CallToolResult>, McpError> {
-        if !agent.is_watch() || !watcher_restart_needed(params) {
+        // A rename always needs the watcher to end up running under the new
+        // id, even if no other watch-related field changed.
+        let renamed = agent.id != params.id;
+        if !agent.is_watch() || (!watcher_restart_needed(params) && !renamed) {
             return Ok(None);
         }
 
+        // The watcher for a renamed agent may already have been stopped
+        // under the old id before the rename; stopping it again here is a
+        // harmless no-op.
         let _ = self.watcher_engine.stop_watcher(&params.id).await;
         if !agent.enabled {
             return Ok(None);
@@ -2513,13 +2539,13 @@ impl TaskTriggerHandler {
         let Err(e) = self.watcher_engine.start_watcher(agent).await else {
             return Ok(Some(success_result(&format!(
                 "Agent '{}' updated successfully. Watcher restarted with new configuration.",
-                params.id
+                agent.id
             ))));
         };
 
         Ok(Some(CallToolResult::success(vec![Content::text(format!(
             "Agent '{}' updated but watcher failed to restart: {}. It will be retried on daemon restart.",
-            params.id, e
+            agent.id, e
         ))])))
     }
 

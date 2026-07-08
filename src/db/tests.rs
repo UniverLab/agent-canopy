@@ -1062,6 +1062,61 @@ fn test_manual_agent_roundtrip() {
     assert_eq!(retrieved.trigger_type_label(), "manual");
 }
 
+#[test]
+fn test_rename_agent_updates_agent_and_run_references() {
+    let db = test_db();
+    db.upsert_agent(&sample_cron_agent("old-name")).unwrap();
+    let run = RunLog {
+        id: uuid::Uuid::new_v4().to_string(),
+        background_agent_id: "old-name".to_string(),
+        status: RunStatus::Success,
+        trigger_type: TriggerType::Scheduled,
+        summary: None,
+        started_at: Utc::now(),
+        finished_at: Some(Utc::now()),
+        exit_code: Some(0),
+        timeout_at: None,
+    };
+    db.insert_run(&run).unwrap();
+
+    db.rename_agent("old-name", "new-name", "/tmp/new-name.log")
+        .unwrap();
+
+    assert!(db.get_agent("old-name").unwrap().is_none());
+    let renamed = db
+        .get_agent("new-name")
+        .unwrap()
+        .expect("renamed agent exists under new id");
+    assert_eq!(renamed.log_path, "/tmp/new-name.log");
+
+    let runs = db.list_runs("new-name", 10).unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].id, run.id);
+    assert!(db.list_runs("old-name", 10).unwrap().is_empty());
+}
+
+#[test]
+fn test_rename_agent_fails_when_new_id_already_exists() {
+    let db = test_db();
+    db.upsert_agent(&sample_cron_agent("agent-a")).unwrap();
+    db.upsert_agent(&sample_cron_agent("agent-b")).unwrap();
+
+    let result = db.rename_agent("agent-a", "agent-b", "/tmp/agent-b.log");
+    assert!(result.is_err());
+
+    // Neither agent should have been touched by the rejected rename.
+    assert!(db.get_agent("agent-a").unwrap().is_some());
+    let b = db.get_agent("agent-b").unwrap().unwrap();
+    assert_eq!(b.log_path, "/tmp/test.log");
+}
+
+#[test]
+fn test_rename_agent_fails_when_old_id_missing() {
+    let db = test_db();
+    let result = db.rename_agent("does-not-exist", "new-id", "/tmp/new-id.log");
+    assert!(result.is_err());
+}
+
 // ── Run log operations ────────────────────────────────────────────
 
 #[test]

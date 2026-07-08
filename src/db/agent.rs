@@ -111,6 +111,45 @@ impl AgentRepository for Database {
         Ok(())
     }
 
+    fn rename_agent(&self, old_id: &str, new_id: &str, new_log_path: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
+        let tx = conn.unchecked_transaction()?;
+
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1)",
+            params![old_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            anyhow::bail!("No agent found with ID '{old_id}'");
+        }
+
+        let taken: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1)",
+            params![new_id],
+            |row| row.get(0),
+        )?;
+        if taken {
+            anyhow::bail!("An agent with ID '{new_id}' already exists");
+        }
+
+        tx.execute(
+            "UPDATE agents SET id = ?1, log_path = ?2 WHERE id = ?3",
+            params![new_id, new_log_path, old_id],
+        )?;
+        tx.execute(
+            "UPDATE runs SET background_agent_id = ?1 WHERE background_agent_id = ?2",
+            params![new_id, old_id],
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
     fn update_agent_enabled(&self, id: &str, enabled: bool) -> Result<()> {
         let conn = self
             .conn
