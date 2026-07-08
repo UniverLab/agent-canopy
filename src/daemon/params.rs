@@ -55,7 +55,10 @@ pub struct TaskUpdateParams {
     pub cli: Option<String>,
     /// New provider/model string, or null to clear.
     pub model: Option<Option<String>>,
-    /// New 5-field cron expression (cron agents only).
+    /// New 5-field cron expression (cron agents only), e.g. `"30 * * * *"`
+    /// (top of every hour at :30). Standard cron syntax: minute hour day
+    /// month weekday, where `*` means "any value". Pass the value as a
+    /// normal JSON string — no shell quoting or escaping is needed.
     pub schedule: Option<String>,
     /// New working directory, or null to clear.
     pub working_dir: Option<Option<String>>,
@@ -466,4 +469,37 @@ pub struct IntelligenceLinkProjectsParams {
     pub relation: Option<String>,
     /// Optional edge weight (default: 1.0).
     pub weight: Option<f64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for T22: `agent_update` (MCP tool `agent_update`)
+    /// previously appeared to fail on cron schedules containing `*`
+    /// (e.g. "30 * * * *") with "JSON Parse error: Unexpected EOF". This
+    /// pins that `TaskUpdateParams` deserializes such a schedule string
+    /// correctly — `*` is an ordinary JSON string character and requires
+    /// no special handling in serde.
+    #[test]
+    fn task_update_params_deserializes_cron_schedule_with_asterisks() {
+        let value = serde_json::json!({
+            "id": "x",
+            "schedule": "30 * * * *"
+        });
+
+        let params: TaskUpdateParams = serde_json::from_value(value).expect("should deserialize");
+
+        assert_eq!(params.id, "x");
+        assert_eq!(params.schedule, Some("30 * * * *".to_string()));
+    }
+
+    #[test]
+    fn task_update_params_deserializes_cron_schedule_with_asterisks_from_str() {
+        let raw = r#"{"id":"x","schedule":"*/5 * * * *"}"#;
+
+        let params: TaskUpdateParams = serde_json::from_str(raw).expect("should deserialize");
+
+        assert_eq!(params.schedule, Some("*/5 * * * *".to_string()));
+    }
 }

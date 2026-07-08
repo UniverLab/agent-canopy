@@ -763,4 +763,55 @@ mod tests {
         let result = prepare_watch_task(&params);
         assert!(result.is_err());
     }
+
+    /// Regression test for T22: `agent_update` on a cron agent with a
+    /// schedule containing `*` (e.g. "30 * * * *") must apply cleanly.
+    /// Uses the real `crate::scheduler::validate_cron` validator, matching
+    /// the scheduler module's own tests for `*`-bearing expressions.
+    #[test]
+    fn apply_trigger_updates_cron_schedule_with_asterisks() {
+        let mut agent = Agent {
+            id: "cron-agent".to_string(),
+            prompt: "run".to_string(),
+            trigger: Some(Trigger::Cron {
+                schedule_expr: "0 9 * * *".to_string(),
+            }),
+            cli: Cli::new("opencode"),
+            model: None,
+            working_dir: None,
+            enabled: true,
+            created_at: Utc::now(),
+            log_path: "/tmp/test.log".to_string(),
+            timeout_minutes: 15,
+            expires_at: None,
+            last_run_at: None,
+            last_run_ok: None,
+            last_triggered_at: None,
+            trigger_count: 0,
+        };
+
+        let params = TaskUpdateParams {
+            id: "cron-agent".to_string(),
+            prompt: None,
+            cli: None,
+            model: None,
+            schedule: Some("30 * * * *".to_string()),
+            working_dir: None,
+            duration_minutes: None,
+            path: None,
+            events: None,
+            debounce_seconds: None,
+            recursive: None,
+            enabled: None,
+        };
+
+        let result = apply_trigger_updates(&mut agent, &params, &crate::scheduler::validate_cron);
+        assert!(result.is_ok());
+        match agent.trigger {
+            Some(Trigger::Cron { schedule_expr }) => {
+                assert_eq!(schedule_expr, "30 * * * *");
+            }
+            other => panic!("expected Trigger::Cron, got {other:?}"),
+        }
+    }
 }

@@ -553,4 +553,20 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&error).unwrap();
         assert!(value["id"].is_null());
     }
+
+    /// Regression test for T22: a daemon SSE response whose JSON payload
+    /// contains a cron schedule string with asterisks (e.g. from an
+    /// `agent_update` success message echoing "30 * * * *") must survive
+    /// `parse_sse_messages` byte-for-byte. This pins that the SSE parser
+    /// does not truncate or mangle the payload at `*` characters.
+    #[test]
+    fn parse_sse_preserves_cron_asterisks_in_payload() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"Agent 'x' updated successfully. schedule: 30 * * * *\"}]}}\n\n";
+        let messages = parse_sse_messages(body);
+
+        assert_eq!(messages.len(), 1);
+        let value: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+        let text = value["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text, "Agent 'x' updated successfully. schedule: 30 * * * *");
+    }
 }
