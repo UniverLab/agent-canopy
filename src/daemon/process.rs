@@ -1,5 +1,53 @@
 use anyhow::Result;
 
+/// Advisory singleton lock held for the lifetime of a running daemon.
+///
+/// The lock is acquired via `flock(2)` on a dedicated `daemon.lock` file
+/// (never on `background_agents.db`, which the TUI opens directly as a
+/// co-equal writer). Holding the `File` open keeps the OS-level flock in
+/// place; dropping this guard — including implicitly when the process exits
+/// or crashes — closes the fd and the kernel releases the lock immediately.
+/// This means a crashed daemon can never leave a stale lock behind.
+#[derive(Debug)]
+pub(crate) struct DaemonLock {
+    #[allow(dead_code)]
+    lock_file: std::fs::File,
+}
+
+/// Acquire the daemon singleton lock in `data_dir`, failing fast if another
+/// `canopy serve` process already holds it.
+pub(crate) fn acquire_daemon_lock(data_dir: &std::path::Path) -> Result<DaemonLock> {
+    let path = data_dir.join("daemon.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+
+        let ret = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            // On Linux, EWOULDBLOCK and EAGAIN are the same errno value; both
+            // are matched here for portability across platforms where they
+            // may differ.
+            if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                anyhow::bail!(
+                    "another canopy daemon is already running (lock held on {})",
+                    path.display()
+                );
+            }
+            return Err(err.into());
+        }
+    }
+
+    Ok(DaemonLock { lock_file })
+}
+
 pub(crate) fn is_process_running(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -119,4 +167,45 @@ pub(crate) fn print_last_n_lines(path: &std::path::Path, n: usize) -> Result<()>
         println!("{line}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn acquire_daemon_lock_succeeds_on_fresh_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lock = acquire_daemon_lock(dir.path());
+        assert!(lock.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn second_acquire_fails_while_first_held() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _first = acquire_daemon_lock(dir.path()).expect("first acquire should succeed");
+
+        let second = acquire_daemon_lock(dir.path());
+        let err = second.expect_err("second acquire should fail while first is held");
+        assert!(
+            err.to_string().contains("already running"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acquire_succeeds_again_after_guard_dropped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = acquire_daemon_lock(dir.path()).expect("first acquire should succeed");
+        drop(first);
+
+        let second = acquire_daemon_lock(dir.path());
+        assert!(
+            second.is_ok(),
+            "reacquiring after drop should succeed: {:?}",
+            second.err()
+        );
+    }
 }

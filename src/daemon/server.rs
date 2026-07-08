@@ -5,7 +5,9 @@ use rmcp::ServiceExt;
 
 use crate::application::notification_service::{DefaultNotificationService, NotificationService};
 use crate::application::ports::StateRepository;
-use crate::daemon::process::{kill_port_occupant, remove_pid_file, write_pid_file};
+use crate::daemon::process::{
+    acquire_daemon_lock, kill_port_occupant, remove_pid_file, write_pid_file,
+};
 use crate::daemon::TaskTriggerHandler;
 use crate::db::Database;
 use crate::executor::Executor;
@@ -22,6 +24,7 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
 
     let port = crate::resolve_port(port_override);
     let data_dir = crate::ensure_data_dir()?;
+    let _daemon_lock = acquire_daemon_lock(&data_dir)?;
     let db = Arc::new(Database::new(&data_dir.join("background_agents.db"))?);
     let notification_service: Arc<dyn NotificationService> = Arc::new(DefaultNotificationService);
     let executor = Arc::new(Executor::new(
