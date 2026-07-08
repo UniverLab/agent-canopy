@@ -711,15 +711,24 @@ fn print_mcp_banner() {
     // Removed duplicate line - banner function already prints the separator line
 }
 
-// ── Matrix table ───────────────────────────────────────────────────────────
+// ── Matrix table / cards ────────────────────────────────────────────────────
 
-/// Print a table: platforms as columns, MCP servers as rows, ✓/✗ cells.
+/// Fallback terminal width used when the real size can't be detected (e.g.
+/// non-interactive test runs), matching the convention used across the TUI.
+const DEFAULT_TERM_WIDTH: usize = 120;
+
+/// Print platforms-vs-MCPs as a matrix table (columns = platforms) when it
+/// fits the terminal width, or as one card per platform otherwise. The matrix
+/// layout grows a column per platform, so past a handful of platforms it
+/// wraps and misaligns; the card view scales to any number of platforms.
 fn print_mcp_table(detected: &[&Platform], all_configs: &PlatformConfigs) {
+    print!("{}", render_mcp_table(detected, all_configs));
+}
+
+fn render_mcp_table(detected: &[&Platform], all_configs: &PlatformConfigs) -> String {
     let all_servers = collect_all_server_names(all_configs);
     if all_servers.is_empty() {
-        println!("  \x1b[90mNo MCP servers configured.\x1b[0m");
-        println!();
-        return;
+        return "  \x1b[90mNo MCP servers configured.\x1b[0m\n\n".to_string();
     }
 
     let name_col = all_servers
@@ -735,41 +744,86 @@ fn print_mcp_table(detected: &[&Platform], all_configs: &PlatformConfigs) {
         .unwrap_or(4)
         .max(4);
 
-    print_mcp_table_header(detected, name_col, plat_col);
+    let matrix_width = 2 + name_col + detected.len() * (plat_col + 2);
+    let term_width = ratatui::crossterm::terminal::size()
+        .map(|(w, _)| w as usize)
+        .unwrap_or(DEFAULT_TERM_WIDTH);
 
-    for server in &all_servers {
-        print_mcp_table_row(server, detected, all_configs, name_col, plat_col);
+    if matrix_width > term_width.max(DEFAULT_TERM_WIDTH) {
+        render_mcp_cards(&all_servers, detected, all_configs, name_col)
+    } else {
+        render_mcp_matrix(&all_servers, detected, all_configs, name_col, plat_col)
     }
-    println!();
 }
 
-fn print_mcp_table_header(detected: &[&Platform], name_col: usize, plat_col: usize) {
-    print!("  {:<name_col$}", "Server");
-    for platform in detected {
-        print!("  {:>plat_col$}", platform.name);
-    }
-    println!();
-
-    let total_w = name_col + detected.len() * (plat_col + 2);
-    println!("  {:─<total_w$}", "");
-}
-
-fn print_mcp_table_row(
-    server: &str,
+fn render_mcp_matrix(
+    all_servers: &BTreeSet<String>,
     detected: &[&Platform],
     all_configs: &PlatformConfigs,
     name_col: usize,
     plat_col: usize,
-) {
-    print!("  {:<name_col$}", server);
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    write!(out, "  {:<name_col$}", "Server").unwrap();
     for platform in detected {
-        let has_server = all_configs
-            .get(&platform.name)
-            .is_some_and(|servers| servers.contains_key(server));
-        let pad = plat_col.saturating_sub(1);
-        print!("  {}{}", " ".repeat(pad), server_presence_icon(has_server));
+        write!(out, "  {:>plat_col$}", platform.name).unwrap();
     }
-    println!();
+    out.push('\n');
+
+    let total_w = name_col + detected.len() * (plat_col + 2);
+    writeln!(out, "  {:─<total_w$}", "").unwrap();
+
+    for server in all_servers {
+        write!(out, "  {server:<name_col$}").unwrap();
+        for platform in detected {
+            let has_server = all_configs
+                .get(&platform.name)
+                .is_some_and(|servers| servers.contains_key(server));
+            let pad = plat_col.saturating_sub(1);
+            write!(
+                out,
+                "  {}{}",
+                " ".repeat(pad),
+                server_presence_icon(has_server)
+            )
+            .unwrap();
+        }
+        out.push('\n');
+    }
+    out.push('\n');
+    out
+}
+
+/// One section per platform listing every known MCP server with its ✓/✗,
+/// used instead of the matrix when there are too many platforms to fit as
+/// columns.
+fn render_mcp_cards(
+    all_servers: &BTreeSet<String>,
+    detected: &[&Platform],
+    all_configs: &PlatformConfigs,
+    name_col: usize,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    for platform in detected {
+        writeln!(out, "  \x1b[1m{}\x1b[0m", platform.name).unwrap();
+        let empty = BTreeMap::new();
+        let servers = all_configs.get(&platform.name).unwrap_or(&empty);
+        for server in all_servers {
+            let has_server = servers.contains_key(server);
+            writeln!(
+                out,
+                "    {server:<name_col$}  {}",
+                server_presence_icon(has_server)
+            )
+            .unwrap();
+        }
+        out.push('\n');
+    }
+    out
 }
 
 fn server_presence_icon(has_server: bool) -> &'static str {
@@ -777,5 +831,126 @@ fn server_presence_icon(has_server: bool) -> &'static str {
         "\x1b[32m ✓\x1b[0m"
     } else {
         "\x1b[31m ✗\x1b[0m"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::setup_module::Platform;
+
+    fn test_platform(name: &str) -> Platform {
+        Platform {
+            name: name.to_string(),
+            config_path: format!("{name}.json"),
+            config_format: Some("json".to_string()),
+            toml_array_format: false,
+            command_format: "separate".to_string(),
+            mcp_servers_key: vec!["mcpServers".to_string()],
+            deprecated_keys: Vec::new(),
+            unsupported_keys: Vec::new(),
+            fields_mapping: std::collections::HashMap::new(),
+            required_fields: std::collections::HashMap::new(),
+            server_extras: std::collections::HashMap::new(),
+            skills_dir: None,
+            instruction_file: None,
+            cli: None,
+        }
+    }
+
+    /// 8 platforms with reasonably long names and 10 MCP servers: the matrix
+    /// layout would need well over 120 columns, so this must render as cards.
+    #[test]
+    fn render_mcp_table_switches_to_cards_for_many_platforms() {
+        let platforms: Vec<Platform> = (1..=8)
+            .map(|i| test_platform(&format!("platform-name-{i:02}")))
+            .collect();
+        let detected: Vec<&Platform> = platforms.iter().collect();
+
+        let server_names: Vec<String> = (1..=10).map(|i| format!("mcp-server-{i:02}")).collect();
+
+        let mut all_configs: PlatformConfigs = BTreeMap::new();
+        for (p_idx, platform) in platforms.iter().enumerate() {
+            let mut servers = BTreeMap::new();
+            for (s_idx, server) in server_names.iter().enumerate() {
+                // Deterministic, mixed presence pattern.
+                if (p_idx + s_idx) % 2 == 0 {
+                    servers.insert(server.clone(), serde_json::json!({}));
+                }
+            }
+            all_configs.insert(platform.name.clone(), servers);
+        }
+
+        let rendered = render_mcp_table(&detected, &all_configs);
+
+        for line in rendered.lines() {
+            let visible_len = strip_ansi(line).chars().count();
+            assert!(
+                visible_len <= 120,
+                "line exceeds 120 visible chars ({visible_len}): {line:?}"
+            );
+        }
+
+        for (p_idx, platform) in platforms.iter().enumerate() {
+            assert!(
+                rendered.contains(&platform.name),
+                "missing platform section for {}",
+                platform.name
+            );
+            for (s_idx, server) in server_names.iter().enumerate() {
+                let expects_present = (p_idx + s_idx) % 2 == 0;
+                let icon = if expects_present { '✓' } else { '✗' };
+                let needle = server.to_string();
+                let section_start = rendered.find(&platform.name).unwrap();
+                let next_section = platforms
+                    .get(p_idx + 1)
+                    .and_then(|next| rendered.find(&next.name))
+                    .unwrap_or(rendered.len());
+                let section = &rendered[section_start..next_section];
+                let line = section
+                    .lines()
+                    .find(|l| l.contains(&needle))
+                    .unwrap_or_else(|| panic!("missing {server} in section for {}", platform.name));
+                assert!(
+                    line.contains(icon),
+                    "expected {icon} for {server} in {}, got: {line:?}",
+                    platform.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn render_mcp_table_uses_matrix_for_few_platforms() {
+        let platforms = [test_platform("cursor"), test_platform("claude")];
+        let detected: Vec<&Platform> = platforms.iter().collect();
+
+        let mut all_configs: PlatformConfigs = BTreeMap::new();
+        let mut cursor_servers = BTreeMap::new();
+        cursor_servers.insert("fs".to_string(), serde_json::json!({}));
+        all_configs.insert("cursor".to_string(), cursor_servers);
+        all_configs.insert("claude".to_string(), BTreeMap::new());
+
+        let rendered = render_mcp_table(&detected, &all_configs);
+        assert!(rendered.contains("Server"));
+        assert!(rendered.contains('✓'));
+        assert!(rendered.contains('✗'));
+    }
+
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for esc in chars.by_ref() {
+                    if esc == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
     }
 }
