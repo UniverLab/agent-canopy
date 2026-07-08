@@ -6,7 +6,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use super::{last_two_segments, truncate_str, ACCENT, BG_SELECTED, DIM, INTERACTIVE_COLOR};
+use super::{
+    last_two_segments, truncate_str, ACCENT, BG_HOVER, BG_SELECTED, DIM, INTERACTIVE_COLOR,
+};
 use super::{STATUS_DISABLED, STATUS_FAIL, STATUS_OK, STATUS_RUNNING};
 use crate::tui::agent::AgentStatus;
 use crate::tui::app::types::{
@@ -16,6 +18,7 @@ use ratatui::style::Color;
 
 pub(super) fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App) {
     app.sidebar_click_map.clear();
+    app.sidebar_visible_capacity = 0;
 
     let (background_indices, interactive_indices, terminal_indices) = agent_indices_by_kind(app);
     let areas = split_sidebar_content(area, app);
@@ -204,13 +207,27 @@ fn take_top(area: &mut Rect, height: u16) -> Option<Rect> {
 }
 
 fn scroll_state(total_items: usize, selected: Option<usize>, max_visible: usize) -> ScrollState {
-    let start = selected.map_or(0, |selected| {
+    scroll_state_with_offset(total_items, selected, max_visible, 0)
+}
+
+/// Like [`scroll_state`], but shifts the auto-follow-selection start further
+/// down by `manual_offset` rows (mouse-wheel scrolling), clamped so the list
+/// never scrolls past its last page.
+fn scroll_state_with_offset(
+    total_items: usize,
+    selected: Option<usize>,
+    max_visible: usize,
+    manual_offset: usize,
+) -> ScrollState {
+    let auto_start = selected.map_or(0, |selected| {
         if selected >= max_visible {
             selected.saturating_sub(max_visible - 1)
         } else {
             0
         }
     });
+    let max_start = total_items.saturating_sub(max_visible);
+    let start = (auto_start + manual_offset).min(max_start);
 
     ScrollState {
         start,
@@ -1182,7 +1199,13 @@ fn draw_agent_list(frame: &mut Frame, area: Rect, indices: &[usize], app: &mut A
 
     let max_visible = ((area.height.saturating_sub(card_h)) / row_h + 1) as usize;
     let selected_local = indices.iter().position(|&idx| idx == app.selected);
-    let scroll = scroll_state(indices.len(), selected_local, max_visible);
+    let scroll = scroll_state_with_offset(
+        indices.len(),
+        selected_local,
+        max_visible,
+        app.sidebar_scroll_offset,
+    );
+    app.sidebar_visible_capacity += scroll.max_visible;
     let mut y = area.y;
     let end = indices.len().min(scroll.start + scroll.max_visible + 1);
 
@@ -1193,7 +1216,16 @@ fn draw_agent_list(frame: &mut Frame, area: Rect, indices: &[usize], app: &mut A
 
         let card_area = Rect::new(area.x, y, area.width, card_h);
         let selected = idx == app.selected && !app.agents_rag_focused;
-        draw_sidebar_card(frame, card_area, &app.agents[idx], app, selected, accent);
+        let hovered = app.hovered_row == Some(idx) && !selected;
+        draw_sidebar_card(
+            frame,
+            card_area,
+            &app.agents[idx],
+            app,
+            selected,
+            hovered,
+            accent,
+        );
         app.sidebar_click_map.push((idx, y, y + card_h));
 
         let is_last_visible = scroll.start + rel_i >= indices.len() - 1;
@@ -1229,11 +1261,18 @@ fn draw_sidebar_card(
     agent: &AgentEntry,
     app: &App,
     selected: bool,
+    hovered: bool,
     _accent: Color,
 ) {
     let meta = agent_card_meta(agent, app);
     let status_color = effective_status_color(meta.status_color, agent, app, selected);
-    let bg = if selected { BG_SELECTED } else { Color::Reset };
+    let bg = if selected {
+        BG_SELECTED
+    } else if hovered {
+        BG_HOVER
+    } else {
+        Color::Reset
+    };
     let name = agent.id(app);
 
     let mut name_spans = vec![Span::styled(

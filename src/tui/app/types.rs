@@ -277,6 +277,14 @@ pub struct App {
 
     // Layout state
     pub(crate) sidebar_click_map: Vec<(usize, u16, u16)>,
+    /// Agent index under the mouse cursor in the sidebar (hover highlight).
+    pub(crate) hovered_row: Option<usize>,
+    /// Manual mouse-wheel scroll adjustment applied on top of the
+    /// selection-follow scroll in the agent sidebar sections.
+    pub(crate) sidebar_scroll_offset: usize,
+    /// Total visible agent rows across the rendered sidebar sections on the
+    /// last frame; used to clamp mouse-wheel scrolling.
+    pub(crate) sidebar_visible_capacity: usize,
     pub(crate) projects: Vec<Project>,
     pub(crate) selected_project: usize,
     pub(crate) projects_panel_focus: ProjectsPanelFocus,

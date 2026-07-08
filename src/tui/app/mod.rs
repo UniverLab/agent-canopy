@@ -84,6 +84,9 @@ impl App {
             sidebar_brain: None,
             home_brain: None,
             sidebar_click_map: Vec::new(),
+            hovered_row: None,
+            sidebar_scroll_offset: 0,
+            sidebar_visible_capacity: 0,
             projects: Vec::new(),
             selected_project: 0,
             projects_panel_focus: ProjectsPanelFocus::Projects,
@@ -571,6 +574,21 @@ impl App {
 
     fn reset_log_scroll(&mut self) {
         self.log_scroll = 0;
+        self.sidebar_scroll_offset = 0;
+    }
+
+    /// Select an agent by its flat index into `self.agents`, mirroring the
+    /// bookkeeping arrow-key navigation performs (section focus, RAG focus,
+    /// scroll reset). Used by sidebar mouse clicks.
+    pub(crate) fn select_agent_at(&mut self, idx: usize) {
+        if idx >= self.agents.len() {
+            return;
+        }
+        let prev = self.selected;
+        self.selected = idx;
+        self.agents_rag_focused = false;
+        self.update_agent_section_focus_on_change(prev);
+        self.reset_log_scroll();
     }
 
     pub fn scroll_log_down(&mut self) {

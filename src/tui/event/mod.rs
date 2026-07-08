@@ -15,7 +15,7 @@ use ratatui::crossterm::event::{
 use std::time::Duration;
 
 use crate::tui::agent::InteractiveAgent;
-use crate::tui::app::types::{AgentEntry, App, Focus, TerminalSelection};
+use crate::tui::app::types::{AgentEntry, App, Focus, SidebarMode, TerminalSelection};
 use crate::tui::app::TerminalSearch;
 use crate::tui::ui;
 
@@ -178,10 +178,7 @@ fn handle_global_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> b
     }
 
     if code == KeyCode::F(2) {
-        app.toggle_sidebar_mode();
-        if matches!(app.focus, Focus::Agent) {
-            app.focus = Focus::Preview;
-        }
+        toggle_sidebar_and_normalize_focus(app);
         return true;
     }
 
@@ -199,6 +196,14 @@ fn handle_global_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> b
     }
 
     false
+}
+
+/// Shared by the F2 key and a sidebar right-click.
+fn toggle_sidebar_and_normalize_focus(app: &mut App) {
+    app.toggle_sidebar_mode();
+    if matches!(app.focus, Focus::Agent) {
+        app.focus = Focus::Preview;
+    }
 }
 
 fn dispatch_focus_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
@@ -221,6 +226,10 @@ fn dispatch_focus_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> 
 // ── Mouse: scroll wheel + Shift+Click to copy selection ─────────────
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
+    if handle_sidebar_mouse(app, &mouse) {
+        return Ok(());
+    }
+
     if try_forward_mouse_to_pty(app, &mouse) {
         // The child program owns the mouse; any pending selection is stale.
         app.terminal_selection = None;
@@ -233,6 +242,85 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
 
     handle_mouse_scroll(app, &mouse);
     Ok(())
+}
+
+// ── Mouse: agent sidebar (hover, click, scroll, right-click) ────────
+
+/// Handle a mouse event landing on the agent sidebar: hover highlight,
+/// left-click to select/enter an agent, scroll to page the list, and
+/// right-click as a shortcut for F2. Returns `true` if the event was
+/// consumed and no further mouse handling should run.
+fn handle_sidebar_mouse(app: &mut App, mouse: &MouseEvent) -> bool {
+    let in_sidebar = app.sidebar_visible
+        && app.sidebar_mode == SidebarMode::Agents
+        && mouse.column < sidebar_width(app);
+
+    if !in_sidebar {
+        if app.hovered_row.is_some() {
+            app.hovered_row = None;
+        }
+        return false;
+    }
+
+    match mouse.kind {
+        MouseEventKind::Moved => {
+            app.hovered_row = sidebar_agent_at(app, mouse.row);
+            true
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(idx) = sidebar_agent_at(app, mouse.row) {
+                let reenter = app.selected == idx && !app.agents_rag_focused;
+                app.select_agent_at(idx);
+                app.focus = if reenter {
+                    Focus::Agent
+                } else {
+                    Focus::Preview
+                };
+            }
+            true
+        }
+        MouseEventKind::Down(MouseButton::Right) => {
+            toggle_sidebar_and_normalize_focus(app);
+            true
+        }
+        MouseEventKind::ScrollUp => {
+            scroll_sidebar(app, 1);
+            true
+        }
+        MouseEventKind::ScrollDown => {
+            scroll_sidebar(app, -1);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Map a sidebar row (terminal row coordinate) to the agent index rendered
+/// there on the last frame, via the click map populated during draw.
+fn sidebar_agent_at(app: &App, row: u16) -> Option<usize> {
+    app.sidebar_click_map
+        .iter()
+        .find(|&&(_, start, end)| row >= start && row < end)
+        .map(|&(idx, _, _)| idx)
+}
+
+fn scroll_sidebar(app: &mut App, dir: i32) {
+    let total = app.sidebar_click_map.len();
+    let max_visible = app.sidebar_visible_capacity.max(1);
+    app.sidebar_scroll_offset =
+        clamp_sidebar_scroll(app.sidebar_scroll_offset, total, max_visible, dir);
+}
+
+/// Pure clamped increment/decrement for the sidebar's manual scroll offset:
+/// scrolling down moves further into the list (up to the last page),
+/// scrolling up retreats back toward the top.
+fn clamp_sidebar_scroll(offset: usize, total_items: usize, max_visible: usize, dir: i32) -> usize {
+    let max_offset = total_items.saturating_sub(max_visible);
+    if dir < 0 {
+        (offset + 1).min(max_offset)
+    } else {
+        offset.saturating_sub(1)
+    }
 }
 
 fn handle_copy_click(app: &mut App, mouse: &MouseEvent) -> bool {
@@ -708,5 +796,166 @@ mod tests {
 
         let resolved = resolve_cd_picker_selection(&picker).unwrap();
         assert_eq!(resolved, "alpha");
+    }
+}
+
+#[cfg(test)]
+mod sidebar_mouse_tests {
+    use super::*;
+    use crate::db::Database;
+    use crate::domain::models::{Agent, Cli, Trigger};
+    use chrono::Utc;
+    use std::sync::Arc;
+    use tempfile::{tempdir, NamedTempFile};
+
+    fn test_db() -> Arc<Database> {
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        Arc::new(Database::new(&path).expect("create test db"))
+    }
+
+    fn cron_agent(id: &str) -> Agent {
+        Agent {
+            id: id.to_string(),
+            prompt: "prompt".to_string(),
+            trigger: Some(Trigger::Cron {
+                schedule_expr: "0 9 * * *".to_string(),
+            }),
+            cli: Cli::new("claude"),
+            model: None,
+            working_dir: None,
+            enabled: true,
+            created_at: Utc::now(),
+            log_path: "/tmp/test-sidebar-mouse.log".to_string(),
+            timeout_minutes: 15,
+            expires_at: None,
+            last_run_at: None,
+            last_run_ok: None,
+            last_triggered_at: None,
+            trigger_count: 0,
+        }
+    }
+
+    /// Builds an App with `count` background agents and a `sidebar_click_map`
+    /// matching the row layout `draw_agent_list` produces (3-row cards, 1-row
+    /// gap): agent `i` occupies rows `[i*4, i*4+3)`.
+    fn app_with_agents(count: usize) -> App {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.agents = (0..count)
+            .map(|i| AgentEntry::Agent(cron_agent(&format!("agent-{i}"))))
+            .collect();
+        app.sidebar_visible = true;
+        app.sidebar_mode = SidebarMode::Agents;
+        app.sidebar_click_map = (0..count)
+            .map(|i| (i, (i * 4) as u16, (i * 4 + 3) as u16))
+            .collect();
+        app.selected = 0;
+        app.focus = Focus::Preview;
+        app
+    }
+
+    #[test]
+    fn moved_updates_hovered_row_without_changing_selection() {
+        let mut app = app_with_agents(3);
+        assert_eq!(app.hovered_row, None);
+
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 5,
+            row: 5, // falls in agent #1's rows [4, 7)
+            modifiers: KeyModifiers::NONE,
+        };
+        let consumed = handle_sidebar_mouse(&mut app, &mouse);
+
+        assert!(consumed);
+        assert_eq!(app.hovered_row, Some(1));
+        assert_eq!(app.selected, 0, "hover must not change selection");
+    }
+
+    #[test]
+    fn left_click_selects_agent_under_cursor() {
+        let mut app = app_with_agents(3);
+
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 9, // falls in agent #2's rows [8, 11)
+            modifiers: KeyModifiers::NONE,
+        };
+        let consumed = handle_sidebar_mouse(&mut app, &mouse);
+
+        assert!(consumed);
+        assert_eq!(app.selected, 2);
+        assert!(matches!(app.focus, Focus::Preview));
+    }
+
+    #[test]
+    fn left_click_on_already_selected_agent_enters_it() {
+        let mut app = app_with_agents(3);
+        app.selected = 2;
+
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 9, // agent #2 again
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_sidebar_mouse(&mut app, &mouse);
+
+        assert_eq!(app.selected, 2);
+        assert!(matches!(app.focus, Focus::Agent));
+    }
+
+    #[test]
+    fn scroll_down_increments_offset_within_bounds() {
+        // 20 agents, 8 rows visible per the last render.
+        let mut app = app_with_agents(20);
+        app.sidebar_visible_capacity = 8;
+        assert_eq!(app.sidebar_scroll_offset, 0);
+
+        let mouse = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_sidebar_mouse(&mut app, &mouse);
+
+        assert_eq!(app.sidebar_scroll_offset, 1);
+    }
+
+    #[test]
+    fn clamp_sidebar_scroll_never_exceeds_max_offset() {
+        // total=20, max_visible=8 → max_offset=12.
+        assert_eq!(clamp_sidebar_scroll(0, 20, 8, -1), 1);
+        assert_eq!(clamp_sidebar_scroll(12, 20, 8, -1), 12);
+        assert_eq!(clamp_sidebar_scroll(1, 20, 8, 1), 0);
+        assert_eq!(clamp_sidebar_scroll(0, 20, 8, 1), 0);
+    }
+
+    #[test]
+    fn right_click_behaves_like_f2() {
+        let mut via_key = app_with_agents(3);
+        via_key.focus = Focus::Agent;
+        let key_handled = handle_global_key(&mut via_key, KeyCode::F(2), KeyModifiers::NONE);
+
+        let mut via_click = app_with_agents(3);
+        via_click.focus = Focus::Agent;
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        let click_handled = handle_sidebar_mouse(&mut via_click, &mouse);
+
+        assert!(key_handled);
+        assert!(click_handled);
+        assert!(via_key.sidebar_mode == via_click.sidebar_mode);
+        assert!(matches!(via_key.focus, Focus::Preview));
+        assert!(matches!(via_click.focus, Focus::Preview));
     }
 }

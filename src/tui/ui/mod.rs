@@ -19,6 +19,7 @@ pub(crate) const ACCENT: Color = Color::Rgb(76, 175, 80);
 pub(crate) const DIM: Color = Color::Rgb(150, 150, 170);
 pub(crate) const ERROR_COLOR: Color = Color::Rgb(229, 57, 53);
 pub(crate) const BG_SELECTED: Color = Color::Rgb(45, 45, 45);
+pub(crate) const BG_HOVER: Color = Color::Rgb(30, 30, 30);
 pub(crate) const INTERACTIVE_COLOR: Color = Color::Rgb(102, 187, 106);
 pub(crate) const STATUS_DISABLED: Color = Color::Rgb(120, 120, 120);
 pub(crate) const STATUS_RUNNING: Color = Color::Rgb(76, 175, 80);
