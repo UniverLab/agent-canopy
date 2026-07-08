@@ -1,7 +1,7 @@
 //! Right panel rendering — PTY output, brain automaton, banner, background_agent/watcher details, log.
 
 use chrono::{Local, TimeZone};
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Color;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -144,12 +144,35 @@ fn pane_selection(app: &App, is_terminal: bool, idx: usize) -> Option<vt100::Pan
     (sel.agent == (is_terminal, idx)).then(|| sel.normalized())
 }
 
-fn split_warp_areas(area: Rect) -> (Rect, Rect) {
-    let input_height = 4;
-    let pty_height = area.height.saturating_sub(input_height);
-    let pty_area = Rect::new(area.x, area.y, area.width, pty_height);
-    let input_area = Rect::new(area.x, area.y + pty_height, area.width, input_height);
-    (pty_area, input_area)
+/// Splits the terminal-warp panel into the PTY output area and the input
+/// box, with a 1-row gap between them. `input_text` is the current buffer
+/// contents (used to size the input box for wrapped/multiline content).
+fn split_warp_areas(area: Rect, input_text: &str) -> (Rect, Rect) {
+    let input_height = warp::input_height(input_text, area.width);
+    let chunks = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(input_height),
+    ])
+    .split(area);
+    (chunks[0], chunks[2])
+}
+
+fn warp_input_text(app: &App, idx: usize) -> String {
+    app.terminal_agents
+        .get(idx)
+        .map(|agent| {
+            if agent.is_sensitive_input_active() {
+                String::new()
+            } else {
+                agent
+                    .input_buffer
+                    .lock()
+                    .map(|b| b.clone())
+                    .unwrap_or_default()
+            }
+        })
+        .unwrap_or_default()
 }
 
 fn labeled_value_line<'a>(label: &'static str, value: Span<'a>) -> Line<'a> {
@@ -388,7 +411,7 @@ fn draw_terminal_warp_mode(
     snap: Option<&crate::tui::agent::ScreenSnapshot>,
     _sensitive: bool,
 ) {
-    let (pty_area, input_area) = split_warp_areas(area);
+    let (pty_area, input_area) = split_warp_areas(area, &warp_input_text(app, idx));
     if let Some(snap) = snap {
         render_snapshot(
             frame,
@@ -1454,7 +1477,7 @@ fn draw_split_warp_panel(
     snap: Option<&ScreenSnapshot>,
     focused: bool,
 ) {
-    let (pty_area, input_area) = split_warp_areas(area);
+    let (pty_area, input_area) = split_warp_areas(area, &warp_input_text(app, terminal_idx));
 
     if let Some(snap) = snap {
         render_snapshot(frame, pty_area, snap, app, false, false, None);
@@ -1532,6 +1555,7 @@ fn find_session_by_name(app: &App, name: &str) -> Option<SessionRef> {
 mod tests {
     use super::adjusted_interactive_cursor_col;
     use super::split_warp_areas;
+    use super::warp;
     use crate::tui::agent::screen::VtCell;
     use crate::tui::agent::ScreenSnapshot;
     use ratatui::layout::Rect;
@@ -1586,10 +1610,46 @@ mod tests {
     }
 
     #[test]
-    fn split_warp_areas_reserves_four_rows_for_input() {
+    fn split_warp_areas_reserves_four_rows_for_empty_input() {
         let area = Rect::new(0, 0, 80, 20);
-        let (pty_area, input_area) = split_warp_areas(area);
+        let (pty_area, input_area) = split_warp_areas(area, "");
         assert_eq!(input_area.height, 4);
-        assert_eq!(pty_area.height, 16);
+        // 1 row gap + 4 row input box.
+        assert_eq!(pty_area.height, 15);
+    }
+
+    #[test]
+    fn split_warp_areas_leaves_one_row_gap_above_input() {
+        let area = Rect::new(0, 0, 80, 20);
+        let (pty_area, input_area) = split_warp_areas(area, "hello");
+        assert_eq!(input_area.y, pty_area.y + pty_area.height + 1);
+    }
+
+    #[test]
+    fn warp_input_height_short_text_stays_at_base() {
+        // 100 chars at 40 cols wraps to 3 lines, which fits within the
+        // base box without growing it.
+        let text = "a".repeat(100);
+        assert_eq!(warp::input_height(&text, 40), 4);
+    }
+
+    #[test]
+    fn warp_input_height_long_text_grows() {
+        // 200 chars at 40 cols wraps to 5 lines: 2 lines beyond the
+        // 3-line base capacity, so the box grows from 4 to 6 rows.
+        let text = "a".repeat(200);
+        let height = warp::input_height(&text, 40);
+        assert!((5..=6).contains(&height), "height was {height}");
+    }
+
+    #[test]
+    fn warp_input_height_explicit_newlines_grow_and_cap_at_max() {
+        let text = "a\nb\nc\nd\ne\nf\ng"; // 7 lines
+        assert_eq!(warp::input_height(text, 40), 8);
+    }
+
+    #[test]
+    fn warp_input_height_empty_is_base() {
+        assert_eq!(warp::input_height("", 40), 4);
     }
 }
