@@ -11,6 +11,8 @@
 .agents/
 .codex/
 .codex
+.mimocode/
+.cargo/
 skills-lock.json
 
 ### Rust ###

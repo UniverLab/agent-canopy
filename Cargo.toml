@@ -144,6 +144,12 @@ semicolon_if_nothing_returned = "warn"
 inconsistent_struct_constructor = "warn"
 doc_markdown = "warn"
 
+[profile.dev]
+# Reduce debug info from level 2 to 1 (keeps line tables, drops full type info)
+debug = 1
+# More codegen units for faster parallel compilation
+codegen-units = 16
+
 [profile.release]
 opt-level = 3
 lto = true
