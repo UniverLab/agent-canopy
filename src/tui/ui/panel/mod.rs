@@ -145,7 +145,7 @@ fn pane_selection(app: &App, is_terminal: bool, idx: usize) -> Option<vt100::Pan
 }
 
 fn split_warp_areas(area: Rect) -> (Rect, Rect) {
-    let input_height = 3;
+    let input_height = 4;
     let pty_height = area.height.saturating_sub(input_height);
     let pty_area = Rect::new(area.x, area.y, area.width, pty_height);
     let input_area = Rect::new(area.x, area.y + pty_height, area.width, input_height);
@@ -1531,8 +1531,10 @@ fn find_session_by_name(app: &App, name: &str) -> Option<SessionRef> {
 #[cfg(test)]
 mod tests {
     use super::adjusted_interactive_cursor_col;
+    use super::split_warp_areas;
     use crate::tui::agent::screen::VtCell;
     use crate::tui::agent::ScreenSnapshot;
+    use ratatui::layout::Rect;
     use ratatui::style::Color;
 
     #[test]
@@ -1581,5 +1583,13 @@ mod tests {
             scrolled: false,
         };
         assert_eq!(adjusted_interactive_cursor_col("opencode", &snap), 5);
+    }
+
+    #[test]
+    fn split_warp_areas_reserves_four_rows_for_input() {
+        let area = Rect::new(0, 0, 80, 20);
+        let (pty_area, input_area) = split_warp_areas(area);
+        assert_eq!(input_area.height, 4);
+        assert_eq!(pty_area.height, 16);
     }
 }

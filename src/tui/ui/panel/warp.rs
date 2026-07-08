@@ -41,7 +41,7 @@ pub fn draw_warp_input_box(frame: &mut Frame, area: Rect, app: &App, idx: usize)
     // opencode chat input look). The split layout already reserves 3 rows
     // for this area; we use them all so the field has visible top/bottom
     // padding around the single text row.
-    let input_bg = Color::Rgb(40, 40, 50);
+    let input_bg = Color::Rgb(20, 20, 28);
     let block = Block::default().style(Style::default().bg(input_bg));
     let inner = block.inner(area);
     frame.render_widget(block, area);
