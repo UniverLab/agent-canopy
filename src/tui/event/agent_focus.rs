@@ -770,6 +770,48 @@ mod tests {
     }
 
     #[test]
+    fn esc_exits_background_agent_focus_to_preview() {
+        // Regression guard for T26: ESC must leave the background agent focus
+        // and return to the preview pane, matching the panel's "Esc → back" hint.
+        let mut app = app_with_background_agent();
+        app.active_split_id = Some("split-1".to_string());
+
+        let handled = handle_background_agent_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(handled);
+        assert!(app.active_split_id.is_none());
+        assert!(matches!(app.focus, Focus::Preview));
+    }
+
+    #[test]
+    fn f10_exits_background_agent_focus_to_preview() {
+        // Regression guard for T26: F10 is an alternate exit key for the
+        // background agent focus and must behave the same as ESC.
+        let mut app = app_with_background_agent();
+        app.active_split_id = Some("split-1".to_string());
+
+        let handled = handle_background_agent_key(&mut app, KeyCode::F(10), KeyModifiers::NONE);
+
+        assert!(handled);
+        assert!(app.active_split_id.is_none());
+        assert!(matches!(app.focus, Focus::Preview));
+    }
+
+    #[test]
+    fn h_exits_background_agent_focus_to_preview() {
+        // Regression guard for T26: 'h' is an alternate exit key for the
+        // background agent focus and must behave the same as ESC.
+        let mut app = app_with_background_agent();
+        app.active_split_id = Some("split-1".to_string());
+
+        let handled = handle_background_agent_key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+
+        assert!(handled);
+        assert!(app.active_split_id.is_none());
+        assert!(matches!(app.focus, Focus::Preview));
+    }
+
+    #[test]
     fn shift_arrows_are_focus_cycle_keys() {
         // These must reach the agent-cycle shortcut so navigation can leave the
         // background section in both directions instead of getting stuck.
