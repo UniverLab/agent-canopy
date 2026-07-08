@@ -17,6 +17,9 @@ use super::app::types::App;
 
 pub(crate) const ACCENT: Color = Color::Rgb(76, 175, 80);
 pub(crate) const DIM: Color = Color::Rgb(150, 150, 170);
+/// Unfocused box-drawing borders. Darker than [`DIM`] so borders recede
+/// instead of competing with panel content.
+pub(crate) const BORDER_COLOR: Color = Color::Rgb(50, 50, 50);
 pub(crate) const ERROR_COLOR: Color = Color::Rgb(229, 57, 53);
 pub(crate) const BG_SELECTED: Color = Color::Rgb(45, 45, 45);
 pub(crate) const BG_HOVER: Color = Color::Rgb(30, 30, 30);

@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use super::DIM;
+use super::{BORDER_COLOR, DIM};
 use crate::domain::canopy_config::TemperatureUnit;
 use crate::system::{PowerSource, SystemInfo};
 
@@ -93,7 +93,7 @@ pub fn render_system_dashboard(
                             .alignment(ratatui::layout::Alignment::Right),
                     )
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(DIM)),
+                    .border_style(Style::default().fg(BORDER_COLOR)),
             )
             .style(Style::default().fg(DIM)),
         area,

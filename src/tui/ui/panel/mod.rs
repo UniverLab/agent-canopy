@@ -9,8 +9,8 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::{
-    truncate_str, truncate_str_keep_tail, ACCENT, DIM, INTERACTIVE_COLOR, STATUS_DISABLED,
-    STATUS_FAIL, STATUS_OK, STATUS_RUNNING,
+    truncate_str, truncate_str_keep_tail, ACCENT, BORDER_COLOR, DIM, INTERACTIVE_COLOR,
+    STATUS_DISABLED, STATUS_FAIL, STATUS_OK, STATUS_RUNNING,
 };
 use crate::tui::agent::ScreenSnapshot;
 use crate::tui::app::types::{AgentEntry, App, Focus, ProjectsPanelFocus};
@@ -206,8 +206,8 @@ fn selected_agent_accent(app: &App) -> Option<Color> {
 
 fn log_panel_border_color(app: &App) -> Color {
     match app.focus {
-        Focus::Agent | Focus::Preview => selected_agent_accent(app).unwrap_or(DIM),
-        _ => DIM,
+        Focus::Agent | Focus::Preview => selected_agent_accent(app).unwrap_or(BORDER_COLOR),
+        _ => BORDER_COLOR,
     }
 }
 
@@ -855,7 +855,10 @@ fn loop_node_box_styles(selected: bool) -> (Style, Style) {
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )
     } else {
-        (Style::default().fg(DIM), Style::default().fg(Color::White))
+        (
+            Style::default().fg(BORDER_COLOR),
+            Style::default().fg(Color::White),
+        )
     }
 }
 
@@ -1425,9 +1428,9 @@ pub(super) fn draw_split_panel(
 
     let found = find_session_by_name(app, session_name);
     let border_color = if focused {
-        found.map_or(DIM, |session| session.accent(app))
+        found.map_or(BORDER_COLOR, |session| session.accent(app))
     } else {
-        DIM
+        BORDER_COLOR
     };
     let title = Span::styled(
         if focused {

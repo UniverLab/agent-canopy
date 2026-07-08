@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::Frame;
 
-use super::{centered_rect, ACCENT, DIM};
+use super::{centered_rect, ACCENT, BORDER_COLOR, DIM};
 use crate::tui::app::types::App;
 
 pub fn draw_split_picker(frame: &mut Frame, app: &App) {
@@ -144,7 +144,7 @@ pub fn draw_suggestion_picker(frame: &mut Frame, app: &App, panel_area: ratatui:
         frame.render_widget(Clear, area);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(DIM))
+            .border_style(Style::default().fg(BORDER_COLOR))
             .style(Style::default().bg(Color::Rgb(15, 15, 25)));
         let inner = block.inner(area);
         frame.render_widget(block, area);

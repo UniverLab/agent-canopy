@@ -7,7 +7,8 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use super::{
-    last_two_segments, truncate_str, ACCENT, BG_HOVER, BG_SELECTED, DIM, INTERACTIVE_COLOR,
+    last_two_segments, truncate_str, ACCENT, BG_HOVER, BG_SELECTED, BORDER_COLOR, DIM,
+    INTERACTIVE_COLOR,
 };
 use super::{STATUS_DISABLED, STATUS_FAIL, STATUS_OK, STATUS_RUNNING};
 use crate::tui::agent::AgentStatus;
@@ -1133,7 +1134,7 @@ fn agents_rag_info_border_style(app: &App) -> Style {
     Style::default().fg(if is_agents_rag_info_focused(app) {
         ACCENT
     } else {
-        DIM
+        BORDER_COLOR
     })
 }
 
@@ -1162,7 +1163,7 @@ fn projects_panel_border_style(app: &App, panel: ProjectsPanelFocus) -> Style {
         && matches!(app.focus, Focus::Home | Focus::Preview)
         && app.projects_panel_focus == panel
         && !app.playground_active;
-    Style::default().fg(if focused { ACCENT } else { DIM })
+    Style::default().fg(if focused { ACCENT } else { BORDER_COLOR })
 }
 
 fn agent_section_border_style(app: &App, section: AgentSectionFocus) -> Style {
@@ -1186,7 +1187,7 @@ fn agent_section_border_style(app: &App, section: AgentSectionFocus) -> Style {
         false
     };
 
-    Style::default().fg(if focused { ACCENT } else { DIM })
+    Style::default().fg(if focused { ACCENT } else { BORDER_COLOR })
 }
 
 fn draw_agent_list(frame: &mut Frame, area: Rect, indices: &[usize], app: &mut App, accent: Color) {

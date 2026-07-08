@@ -7,7 +7,7 @@ use ratatui::Frame;
 
 use crate::domain::sync::{MessageKind, MissionImpact, SyncMessage, WorkspaceStatus};
 use crate::tui::app::types::SyncPanelState;
-use crate::tui::ui::{last_two_segments, ACCENT, DIM, ERROR_COLOR, STATUS_OK};
+use crate::tui::ui::{last_two_segments, ACCENT, BORDER_COLOR, DIM, ERROR_COLOR, STATUS_OK};
 
 pub(crate) fn draw_activity_panel(
     frame: &mut Frame,
@@ -21,7 +21,7 @@ pub(crate) fn draw_activity_panel(
                 .alignment(ratatui::layout::Alignment::Right),
         )
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(DIM));
+        .border_style(Style::default().fg(BORDER_COLOR));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     draw_sync_section(frame, inner, state, scroll_offset);

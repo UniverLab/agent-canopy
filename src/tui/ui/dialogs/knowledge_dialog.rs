@@ -5,6 +5,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::tui::app::types::App;
+use crate::tui::ui::BORDER_COLOR;
 
 const ACCENT: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
@@ -83,7 +84,7 @@ pub fn draw_knowledge_dialog(frame: &mut Frame, app: &App) {
 }
 
 fn draw_field(frame: &mut Frame, area: Rect, label: &str, value: &str, focused: bool) {
-    let border_color = if focused { ACCENT } else { DIM };
+    let border_color = if focused { ACCENT } else { BORDER_COLOR };
     let block = Block::default()
         .title(format!(" {} ", label))
         .borders(Borders::ALL)
@@ -102,7 +103,7 @@ fn draw_field(frame: &mut Frame, area: Rect, label: &str, value: &str, focused: 
 }
 
 fn draw_multiline_field(frame: &mut Frame, area: Rect, label: &str, value: &str, focused: bool) {
-    let border_color = if focused { ACCENT } else { DIM };
+    let border_color = if focused { ACCENT } else { BORDER_COLOR };
     let block = Block::default()
         .title(format!(" {} ", label))
         .borders(Borders::ALL)
