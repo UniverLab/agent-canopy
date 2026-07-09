@@ -222,6 +222,69 @@ fn validate_node_kind(kind: &str) -> Result<LoopNodeKind, String> {
         .ok_or_else(|| "Loop node kind must be one of: agent, check, gate.".to_string())
 }
 
+fn json_value_kind_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a JSON-encoded string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// Validate that a loop node's config is a JSON object with the fields its
+/// kind needs at execution time. This exists because a double-encoded config
+/// (e.g. `"{\"platform\": \"mimo\"}"` instead of `{"platform": "mimo"}`) used
+/// to be accepted at creation time and only surfaced as an engine crash
+/// ("Agent node ... is missing a platform/cli") mid-run, long after the node
+/// was saved.
+fn validate_node_config(kind: LoopNodeKind, config: &serde_json::Value) -> Result<(), String> {
+    let Some(map) = config.as_object() else {
+        return Err(format!(
+            "Loop node config must be a JSON object, not {}. Pass an object (e.g. {{\"platform\": \"claude\"}}) rather than a JSON-encoded string.",
+            json_value_kind_name(config)
+        ));
+    };
+
+    let has_non_empty_str = |field: &str| {
+        map.get(field)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+    };
+
+    match kind {
+        LoopNodeKind::Agent => {
+            if !has_non_empty_str("platform") && !has_non_empty_str("cli") {
+                return Err(
+                    "Loop node config for kind 'agent' must include a non-empty 'platform' (or 'cli') field.".to_string(),
+                );
+            }
+        }
+        LoopNodeKind::Check => {
+            if !has_non_empty_str("command") {
+                return Err(
+                    "Loop node config for kind 'check' must include a non-empty 'command' field."
+                        .to_string(),
+                );
+            }
+        }
+        LoopNodeKind::Gate => {
+            let evaluate = map
+                .get("evaluate")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("output_contains");
+            if evaluate == "output_contains" && !has_non_empty_str("value") {
+                return Err(
+                    "Loop node config for kind 'gate' must include a non-empty 'value' field when 'evaluate' is 'output_contains'.".to_string(),
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn validate_at_least_one_bool(updates: &[bool], field_name: &str) -> Result<(), String> {
     if updates.iter().all(|&b| !b) {
         Err(format!(
@@ -1908,6 +1971,9 @@ impl TaskTriggerHandler {
             Ok(kind) => kind,
             Err(e) => return Ok(error_result(&e)),
         };
+        if let Err(e) = validate_node_config(kind, &params.config) {
+            return Ok(error_result(&e));
+        }
 
         let next_position = self
             .db
@@ -1977,6 +2043,14 @@ impl TaskTriggerHandler {
             "loop_update_node",
         ) {
             return Ok(error_result(&e));
+        }
+
+        if kind.is_some() || params.config.is_some() {
+            let effective_kind = kind.unwrap_or(node.kind);
+            let effective_config = params.config.as_ref().unwrap_or(&node.config);
+            if let Err(e) = validate_node_config(effective_kind, effective_config) {
+                return Ok(error_result(&e));
+            }
         }
 
         self.db
@@ -2851,8 +2925,70 @@ impl ServerHandler for TaskTriggerHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{header_str, missing_sync_identity_error, MISSING_SYNC_IDENTITY_MESSAGE};
+    use super::{
+        header_str, missing_sync_identity_error, validate_node_config,
+        MISSING_SYNC_IDENTITY_MESSAGE,
+    };
+    use crate::domain::loops::LoopNodeKind;
     use crate::shared::sync_identity::CANOPY_AGENT_ID_HEADER;
+
+    #[test]
+    fn validate_node_config_rejects_double_encoded_string() {
+        let config = serde_json::json!("{\"platform\": \"mimo\"}");
+        let error = validate_node_config(LoopNodeKind::Agent, &config).unwrap_err();
+        assert!(error.contains("must be a JSON object"), "{error}");
+    }
+
+    #[test]
+    fn validate_node_config_agent_requires_platform_or_cli() {
+        let config = serde_json::json!({ "model": "opus" });
+        let error = validate_node_config(LoopNodeKind::Agent, &config).unwrap_err();
+        assert!(error.contains("'agent'"), "{error}");
+        assert!(error.contains("platform"), "{error}");
+    }
+
+    #[test]
+    fn validate_node_config_check_requires_command() {
+        let config = serde_json::json!({ "timeout_seconds": 30 });
+        let error = validate_node_config(LoopNodeKind::Check, &config).unwrap_err();
+        assert!(error.contains("'check'"), "{error}");
+        assert!(error.contains("command"), "{error}");
+    }
+
+    #[test]
+    fn validate_node_config_gate_requires_value_for_output_contains() {
+        let config = serde_json::json!({ "evaluate": "output_contains" });
+        let error = validate_node_config(LoopNodeKind::Gate, &config).unwrap_err();
+        assert!(error.contains("'gate'"), "{error}");
+        assert!(error.contains("value"), "{error}");
+
+        let config_without_evaluate = serde_json::json!({});
+        let error = validate_node_config(LoopNodeKind::Gate, &config_without_evaluate).unwrap_err();
+        assert!(error.contains("value"), "{error}");
+    }
+
+    #[test]
+    fn validate_node_config_accepts_valid_configs() {
+        assert!(validate_node_config(
+            LoopNodeKind::Agent,
+            &serde_json::json!({ "platform": "claude" })
+        )
+        .is_ok());
+        assert!(
+            validate_node_config(LoopNodeKind::Agent, &serde_json::json!({ "cli": "codex" }))
+                .is_ok()
+        );
+        assert!(validate_node_config(
+            LoopNodeKind::Check,
+            &serde_json::json!({ "command": "cargo test" })
+        )
+        .is_ok());
+        assert!(validate_node_config(
+            LoopNodeKind::Gate,
+            &serde_json::json!({ "evaluate": "output_contains", "value": "ok" })
+        )
+        .is_ok());
+    }
 
     #[test]
     fn resolve_sync_agent_id_reads_canopy_header() {
