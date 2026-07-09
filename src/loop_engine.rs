@@ -528,7 +528,16 @@ fn select_next_node<'a>(
     match matching.as_slice() {
         [] => Ok(None),
         [edge] => Ok(Some(edge.to_node.as_str())),
-        _ => bail!("Node '{}' has ambiguous outgoing edges.", from_node),
+        _ => {
+            let distinct_targets = matching
+                .iter()
+                .map(|edge| edge.to_node.as_str())
+                .collect::<HashSet<_>>();
+            match distinct_targets.into_iter().collect::<Vec<_>>().as_slice() {
+                [to_node] => Ok(Some(*to_node)),
+                _ => bail!("Node '{}' has ambiguous outgoing edges.", from_node),
+            }
+        }
     }
 }
 
@@ -888,5 +897,59 @@ mod tests {
         assert!(prompt.contains("loop_report_blocker"));
         assert!(prompt.contains("Do the thing"));
         assert!(prompt.contains("\"feedback\": \"ok\""));
+    }
+
+    #[test]
+    fn select_next_node_dedupes_identical_edges_to_same_target() {
+        let edge = |id: &str, to: &str, condition| LoopEdge {
+            id: id.to_string(),
+            spec_id: "spec".to_string(),
+            from_node: "implement".to_string(),
+            to_node: to.to_string(),
+            condition,
+        };
+        let edges = vec![
+            edge(
+                "e1",
+                "review",
+                crate::domain::loops::LoopEdgeCondition::Always,
+            ),
+            edge(
+                "e2",
+                "review",
+                crate::domain::loops::LoopEdgeCondition::Always,
+            ),
+        ];
+
+        let next = select_next_node(&edges, "implement", LoopRunStatus::Pass).unwrap();
+
+        assert_eq!(next, Some("review"));
+    }
+
+    #[test]
+    fn select_next_node_errors_on_distinct_targets() {
+        let edge = |id: &str, to: &str, condition| LoopEdge {
+            id: id.to_string(),
+            spec_id: "spec".to_string(),
+            from_node: "implement".to_string(),
+            to_node: to.to_string(),
+            condition,
+        };
+        let edges = vec![
+            edge(
+                "e1",
+                "review",
+                crate::domain::loops::LoopEdgeCondition::Always,
+            ),
+            edge(
+                "e2",
+                "deploy",
+                crate::domain::loops::LoopEdgeCondition::Always,
+            ),
+        ];
+
+        let err = select_next_node(&edges, "implement", LoopRunStatus::Pass).unwrap_err();
+
+        assert!(err.to_string().contains("ambiguous outgoing edges"));
     }
 }
