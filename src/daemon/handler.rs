@@ -2012,7 +2012,8 @@ impl TaskTriggerHandler {
             Ok(kind) => kind,
             Err(e) => return Ok(error_result(&e)),
         };
-        if let Err(e) = validate_node_config(kind, &params.config) {
+        let config = serde_json::Value::Object(params.config);
+        if let Err(e) = validate_node_config(kind, &config) {
             return Ok(error_result(&e));
         }
 
@@ -2029,7 +2030,7 @@ impl TaskTriggerHandler {
             spec_id: spec_id.to_string(),
             name: name.to_string(),
             kind,
-            config: params.config,
+            config,
             position: next_position,
             created_at: chrono::Utc::now(),
         };
@@ -2086,16 +2087,17 @@ impl TaskTriggerHandler {
             return Ok(error_result(&e));
         }
 
-        if kind.is_some() || params.config.is_some() {
+        let config = params.config.map(serde_json::Value::Object);
+        if kind.is_some() || config.is_some() {
             let effective_kind = kind.unwrap_or(node.kind);
-            let effective_config = params.config.as_ref().unwrap_or(&node.config);
+            let effective_config = config.as_ref().unwrap_or(&node.config);
             if let Err(e) = validate_node_config(effective_kind, effective_config) {
                 return Ok(error_result(&e));
             }
         }
 
         self.db
-            .update_loop_node_details(node_id, name, kind, params.config.as_ref(), params.position)
+            .update_loop_node_details(node_id, name, kind, config.as_ref(), params.position)
             .map_err(internal_error)?;
 
         Ok(build_node_update_response(node_id))

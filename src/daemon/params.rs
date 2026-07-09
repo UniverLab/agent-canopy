@@ -347,7 +347,7 @@ pub struct LoopAddNodeParams {
     /// Node kind: agent, check, or gate.
     pub kind: String,
     /// Kind-specific configuration object.
-    pub config: serde_json::Value,
+    pub config: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -359,7 +359,7 @@ pub struct LoopUpdateNodeParams {
     /// New node kind: agent, check, or gate.
     pub kind: Option<String>,
     /// Replacement node config payload.
-    pub config: Option<serde_json::Value>,
+    pub config: Option<serde_json::Map<String, serde_json::Value>>,
     /// New visual position within the spec.
     pub position: Option<i64>,
 }
@@ -523,5 +523,80 @@ mod tests {
         let params: TaskUpdateParams = serde_json::from_str(raw).expect("should deserialize");
 
         assert_eq!(params.schedule, Some("*/5 * * * *".to_string()));
+    }
+
+    /// Regression test for bug D: the JSON Schema for `config` used to omit
+    /// "type", so MCP clients would serialize it as a JSON-encoded string
+    /// instead of an object. Pin that the generated schema now declares
+    /// `config` as an object.
+    #[test]
+    fn loop_add_node_params_schema_declares_config_as_object() {
+        let schema = schemars::schema_for!(LoopAddNodeParams);
+        let value = serde_json::to_value(&schema).expect("schema should serialize");
+        let config_type = value["properties"]["config"]["type"]
+            .as_str()
+            .expect("config schema should have a \"type\" field");
+        assert_eq!(config_type, "object");
+    }
+
+    #[test]
+    fn loop_update_node_params_schema_declares_config_as_object() {
+        let schema = schemars::schema_for!(LoopUpdateNodeParams);
+        let value = serde_json::to_value(&schema).expect("schema should serialize");
+        let config_schema = &value["properties"]["config"];
+        // Optional fields are wrapped, so the "object" type may appear either
+        // directly or nested under a $ref/anyOf produced for `Option<..>`.
+        let type_str = config_schema["type"].as_str();
+        assert!(
+            type_str == Some("object") || config_schema.to_string().contains("\"object\""),
+            "expected config schema to declare an object type, got {config_schema}"
+        );
+    }
+
+    #[test]
+    fn loop_add_node_params_rejects_string_config() {
+        let value = serde_json::json!({
+            "spec_id": "spec-1",
+            "name": "n",
+            "kind": "agent",
+            "config": "{\"platform\": \"claude\"}"
+        });
+
+        let error = serde_json::from_value::<LoopAddNodeParams>(value).unwrap_err();
+        assert!(
+            error.to_string().contains("invalid type"),
+            "expected a type error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn loop_add_node_params_accepts_object_config() {
+        let value = serde_json::json!({
+            "spec_id": "spec-1",
+            "name": "n",
+            "kind": "agent",
+            "config": { "platform": "claude" }
+        });
+
+        let params: LoopAddNodeParams =
+            serde_json::from_value(value).expect("object config should deserialize");
+        assert_eq!(
+            params.config.get("platform").and_then(|v| v.as_str()),
+            Some("claude")
+        );
+    }
+
+    #[test]
+    fn loop_update_node_params_rejects_string_config() {
+        let value = serde_json::json!({
+            "node_id": "node-1",
+            "config": "{\"platform\": \"claude\"}"
+        });
+
+        let error = serde_json::from_value::<LoopUpdateNodeParams>(value).unwrap_err();
+        assert!(
+            error.to_string().contains("invalid type"),
+            "expected a type error, got: {error}"
+        );
     }
 }
