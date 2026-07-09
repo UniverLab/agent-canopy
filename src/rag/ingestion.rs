@@ -1078,7 +1078,7 @@ async fn open_vector_store(
 
 /// Delete the entire LanceDB directory so the next `open_vector_store` starts fresh.
 /// Used when the embeddings model is changed so stale vectors don't pollute results.
-pub async fn wipe_lancedb(db: &Database) -> anyhow::Result<()> {
+pub async fn wipe_lancedb(db: &Database, reason: &str) -> anyhow::Result<()> {
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home dir"))?;
     let lancedb_path = home.join(".canopy/rag/vectors.lancedb");
     if lancedb_path.exists() {
@@ -1088,7 +1088,7 @@ pub async fn wipe_lancedb(db: &Database) -> anyhow::Result<()> {
                 anyhow::anyhow!("Failed to wipe LanceDB at {}: {e}", lancedb_path.display())
             })?;
         tracing::info!(
-            "RAG: wiped LanceDB at {} (model change)",
+            "RAG: wiped LanceDB at {} ({reason})",
             lancedb_path.display()
         );
     }

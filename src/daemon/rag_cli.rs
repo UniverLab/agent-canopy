@@ -6,7 +6,7 @@ use clap::Subcommand;
 use crate::application::ports::StateRepository;
 use crate::db::Database;
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 pub(crate) enum RagAction {
     /// Start or stop automatic file indexing.
     AutoIndex {
@@ -15,9 +15,15 @@ pub(crate) enum RagAction {
     },
     /// Show a detailed per-file RAG indexing report.
     Report,
+    /// Delete the entire vector store and reset all RAG state.
+    Purge {
+        /// Skip the interactive confirmation prompt.
+        #[arg(long, short)]
+        yes: bool,
+    },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 pub(crate) enum AutoIndexAction {
     /// Resume automatic indexing (default state).
     Start,
@@ -44,6 +50,41 @@ pub(crate) async fn handle_rag_action(action: RagAction) -> Result<()> {
             println!("     Run \x1b[1mcanopy rag auto-index start\x1b[0m to resume.");
         }
         RagAction::Report => handle_rag_report(&data_dir, &db).await?,
+        RagAction::Purge { yes } => {
+            if !yes {
+                eprintln!(
+                    "\x1b[33m⚠\x1b[0m  This will \x1b[1mdelete the entire RAG vector store\x1b[0m \
+                     and reset all indexing state."
+                );
+                eprint!("Are you sure? [y/N] ");
+                use std::io::Write;
+                std::io::stderr().flush()?;
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                if !input.trim().eq_ignore_ascii_case("y") {
+                    println!("Aborted.");
+                    return Ok(());
+                }
+            }
+            let lancedb_path = dirs::home_dir()
+                .ok_or_else(|| anyhow::anyhow!("Cannot determine home dir"))?
+                .join(".canopy/rag/vectors.lancedb");
+            let existed = lancedb_path.exists();
+            crate::rag::ingestion::wipe_lancedb(&db, "manual purge").await?;
+            if existed {
+                println!("\x1b[32m✓\x1b[0m  RAG vector store purged and state reset.");
+            } else {
+                println!("\x1b[32m✓\x1b[0m  RAG state reset (no vector store was present).");
+            }
+            if crate::daemon::process::read_pid(&data_dir)
+                .is_some_and(crate::daemon::process::is_process_running)
+            {
+                eprintln!(
+                    "     Note: the daemon is running and may still hold the old store open. \
+                     It will recreate the store on next use."
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -208,4 +249,60 @@ fn format_ts(ts: i64) -> String {
     let d = UNIX_EPOCH + Duration::from_secs(ts as u64);
     let dt: chrono::DateTime<chrono::Local> = d.into();
     dt.format("%Y-%m-%d %H:%M").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::{CommandFactory, Parser};
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        action: RagAction,
+    }
+
+    #[test]
+    fn purge_yes_flag_parsed() {
+        let cli =
+            TestCli::try_parse_from(["test", "purge", "--yes"]).expect("purge --yes should parse");
+        match cli.action {
+            RagAction::Purge { yes } => assert!(yes),
+            other => panic!("expected Purge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn purge_without_yes_defaults_false() {
+        let cli =
+            TestCli::try_parse_from(["test", "purge"]).expect("purge should parse without --yes");
+        match cli.action {
+            RagAction::Purge { yes } => assert!(!yes),
+            other => panic!("expected Purge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn purge_appears_in_help_with_description() {
+        let mut cmd = <TestCli as CommandFactory>::command();
+        let help = cmd.render_help().to_string();
+        assert!(help.contains("purge"), "help should mention purge:\n{help}");
+        assert!(
+            help.contains("Delete the entire vector store"),
+            "purge should have description:\n{help}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wipe_lancedb_resets_db_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        db.set_state("rag_total_chunks", "42").unwrap();
+        db.set_state("rag_indexed_files", "5").unwrap();
+        // wipe_lancedb will skip the actual rm if the dir doesn't exist,
+        // but it still resets DB state.
+        let _ = crate::rag::ingestion::wipe_lancedb(&db, "test").await;
+        assert_eq!(db.get_state("rag_total_chunks").unwrap(), Some("0".into()));
+        assert_eq!(db.get_state("rag_indexed_files").unwrap(), Some("0".into()));
+    }
 }

@@ -251,7 +251,9 @@ async fn startup_personal_rag(ingestion: Arc<IngestionManager>, data_dir: &std::
                 last_model,
                 current_model
             );
-            if let Err(e) = crate::rag::ingestion::wipe_lancedb(ingestion.db()).await {
+            if let Err(e) =
+                crate::rag::ingestion::wipe_lancedb(ingestion.db(), "model change").await
+            {
                 tracing::error!("startup_personal_rag: LanceDB wipe failed: {e:#}");
             }
             ingestion.clear_queue().await;
@@ -281,7 +283,9 @@ async fn startup_personal_rag(ingestion: Arc<IngestionManager>, data_dir: &std::
             },
             RAG_CHUNKING_VERSION
         );
-        if let Err(e) = crate::rag::ingestion::wipe_lancedb(ingestion.db()).await {
+        if let Err(e) =
+            crate::rag::ingestion::wipe_lancedb(ingestion.db(), "chunking version change").await
+        {
             tracing::error!("startup_personal_rag: LanceDB wipe failed: {e:#}");
         }
         ingestion.clear_queue().await;
