@@ -640,6 +640,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             started_at: None,
             completed_at: None,
+            autorun_at: None,
         };
         let spec = crate::domain::loops::LoopSpec {
             id: "spec-test".to_string(),
@@ -913,6 +914,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             started_at: None,
             completed_at: None,
+            autorun_at: None,
         };
         let spec = LoopSpec {
             id: "spec".to_string(),

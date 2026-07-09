@@ -235,6 +235,24 @@ impl CronScheduler {
             }
         }
 
+        // One-shot `autorun_at` loop schedules need a wakeup too, independent
+        // of any cron trigger on the loop.
+        if self.loop_engine.is_some() {
+            if let Ok(pending) = self.db.list_pending_autorun_loops() {
+                for lp in &pending {
+                    if let Some(autorun_at) = lp.autorun_at {
+                        let nearer = match earliest {
+                            Some(e) => autorun_at < e,
+                            None => true,
+                        };
+                        if nearer {
+                            earliest = Some(autorun_at);
+                        }
+                    }
+                }
+            }
+        }
+
         match earliest {
             Some(t) => {
                 let delta = t.signed_duration_since(now_utc);
@@ -270,6 +288,7 @@ impl CronScheduler {
         }
 
         self.fire_due_enable_at(now_utc)?;
+        self.fire_due_autorun_loops(now_utc)?;
 
         Ok(())
     }
@@ -285,6 +304,26 @@ impl CronScheduler {
                 tracing::info!("Agent '{}' reached its enable_at time; enabling", agent.id);
                 self.db.activate_scheduled_enable(&agent.id)?;
             }
+        }
+        Ok(())
+    }
+
+    /// One-shot `autorun_at`: for each loop with a pending `autorun_at` in
+    /// the past that is still fireable (not `Running`/`Paused`), clear the
+    /// schedule and launch it once via the loop engine. Unlike cron loops,
+    /// this never repeats — see [`crate::domain::loops::Loop::is_autorun_due`].
+    fn fire_due_autorun_loops(&self, now_utc: chrono::DateTime<Utc>) -> anyhow::Result<()> {
+        let Some(loop_engine) = self.loop_engine.as_ref() else {
+            return Ok(());
+        };
+        let pending = self.db.list_pending_autorun_loops()?;
+        for lp in &pending {
+            if !lp.is_autorun_due(now_utc) {
+                continue;
+            }
+            tracing::info!("Loop '{}' reached its autorun_at time; launching", lp.id);
+            self.db.clear_loop_autorun(&lp.id)?;
+            Arc::clone(loop_engine).start_background(lp.id.clone());
         }
         Ok(())
     }
@@ -611,6 +650,116 @@ mod tests {
         ));
         let scheduler = CronScheduler::new(db.clone(), executor);
         (db, scheduler)
+    }
+
+    fn test_scheduler_with_loops() -> (Arc<Database>, CronScheduler) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
+        std::mem::forget(dir);
+        let executor = Arc::new(Executor::new(
+            db.clone(),
+            Arc::new(DefaultNotificationService),
+        ));
+        let loop_engine = Arc::new(crate::loop_engine::LoopEngine::new(
+            db.clone(),
+            Arc::new(DefaultNotificationService),
+        ));
+        let scheduler = CronScheduler::with_loops(db.clone(), executor, loop_engine);
+        (db, scheduler)
+    }
+
+    fn sample_loop(
+        id: &str,
+        status: crate::domain::loops::LoopStatus,
+    ) -> crate::domain::loops::Loop {
+        crate::domain::loops::Loop {
+            id: id.to_string(),
+            name: "Autorun test loop".to_string(),
+            description: None,
+            workdir: "/tmp/loop-autorun-test".to_string(),
+            status,
+            trigger: None,
+            created_at: Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+        }
+    }
+
+    /// A future `autorun_at` must not launch the loop — it's a schedule, not
+    /// an immediate action.
+    #[tokio::test]
+    async fn fire_due_autorun_loops_ignores_future_schedule() {
+        use crate::domain::loops::LoopStatus;
+
+        let (db, scheduler) = test_scheduler_with_loops();
+        db.insert_loop(&sample_loop("future-autorun", LoopStatus::Failed))
+            .unwrap();
+        db.schedule_loop_autorun("future-autorun", Utc::now() + chrono::Duration::hours(1))
+            .unwrap();
+
+        scheduler.fire_due_autorun_loops(Utc::now()).unwrap();
+
+        let lp = db.get_loop("future-autorun").unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Failed, "must not launch yet");
+        assert!(
+            lp.autorun_at.is_some(),
+            "future autorun_at must remain pending"
+        );
+    }
+
+    /// A past-due `autorun_at` on a fireable (`failed`) loop must launch it
+    /// once and clear the schedule — the one-shot semantics from the spec.
+    #[tokio::test]
+    async fn fire_due_autorun_loops_fires_past_schedule_once_and_clears_it() {
+        use crate::domain::loops::LoopStatus;
+
+        let (db, scheduler) = test_scheduler_with_loops();
+        db.insert_loop(&sample_loop("past-autorun", LoopStatus::Failed))
+            .unwrap();
+        db.schedule_loop_autorun("past-autorun", Utc::now() - chrono::Duration::minutes(1))
+            .unwrap();
+
+        scheduler.fire_due_autorun_loops(Utc::now()).unwrap();
+
+        let lp = db.get_loop("past-autorun").unwrap().unwrap();
+        assert!(
+            lp.autorun_at.is_none(),
+            "firing must clear autorun_at (one-shot)"
+        );
+
+        // Firing again must be a no-op: the schedule is already cleared, so
+        // it must not appear among pending autorun loops anymore.
+        let pending = db.list_pending_autorun_loops().unwrap();
+        assert!(
+            pending.iter().all(|l| l.id != "past-autorun"),
+            "loop must not remain pending after firing once"
+        );
+    }
+
+    /// A `Running`/`Paused` loop must not be relaunched by its own
+    /// `autorun_at`, even if it's past due — that would spawn a duplicate
+    /// execution over the same graph.
+    #[tokio::test]
+    async fn fire_due_autorun_loops_skips_running_and_paused_loops() {
+        use crate::domain::loops::LoopStatus;
+
+        for status in [LoopStatus::Running, LoopStatus::Paused] {
+            let (db, scheduler) = test_scheduler_with_loops();
+            let id = format!("busy-autorun-{}", status.as_str());
+            db.insert_loop(&sample_loop(&id, status)).unwrap();
+            db.schedule_loop_autorun(&id, Utc::now() - chrono::Duration::minutes(1))
+                .unwrap();
+
+            scheduler.fire_due_autorun_loops(Utc::now()).unwrap();
+
+            let lp = db.get_loop(&id).unwrap().unwrap();
+            assert_eq!(lp.status, status, "status must be untouched");
+            assert!(
+                lp.autorun_at.is_some(),
+                "{status:?} loop must not have its autorun_at cleared"
+            );
+        }
     }
 
     /// A future `enable_at` must not flip the agent to enabled — it's a

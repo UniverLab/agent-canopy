@@ -265,6 +265,13 @@ pub struct Loop {
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+    /// One-shot resume schedule: when set and reached, the scheduler starts
+    /// this loop once (e.g. `run_loop`) and clears the field. Unlike
+    /// `trigger`'s cron, this never repeats — it exists so a loop that fails
+    /// on a quota can reschedule its own resumption at the exact reset time
+    /// instead of relying on a blindly polling cron.
+    #[serde(default)]
+    pub autorun_at: Option<DateTime<Utc>>,
 }
 
 impl Loop {
@@ -317,6 +324,15 @@ impl Loop {
     /// re-runs its graph on each cron slot / watch event).
     pub fn is_fireable(&self) -> bool {
         !matches!(self.status, LoopStatus::Running | LoopStatus::Paused)
+    }
+
+    /// Whether this loop's one-shot `autorun_at` schedule is due at `now`.
+    ///
+    /// True only when `autorun_at` is set, `now` has reached it, and the loop
+    /// isn't already `Running`/`Paused`. Firing must clear `autorun_at` so it
+    /// never fires twice.
+    pub fn is_autorun_due(&self, now: DateTime<Utc>) -> bool {
+        self.autorun_at.is_some_and(|at| now >= at) && self.is_fireable()
     }
 }
 
@@ -565,6 +581,7 @@ Task:
             created_at: chrono::Utc::now(),
             started_at: None,
             completed_at: None,
+            autorun_at: None,
         }
     }
 
@@ -617,5 +634,37 @@ Task:
         assert!(loop_with_trigger(LoopStatus::Draft, None).is_fireable());
         assert!(loop_with_trigger(LoopStatus::Completed, None).is_fireable());
         assert!(loop_with_trigger(LoopStatus::Failed, None).is_fireable());
+    }
+
+    #[test]
+    fn future_autorun_at_is_not_due() {
+        let mut lp = loop_with_trigger(LoopStatus::Failed, None);
+        lp.autorun_at = Some(chrono::Utc::now() + chrono::Duration::hours(1));
+        assert!(!lp.is_autorun_due(chrono::Utc::now()));
+    }
+
+    #[test]
+    fn past_autorun_at_is_due_on_a_fireable_loop() {
+        let mut lp = loop_with_trigger(LoopStatus::Failed, None);
+        lp.autorun_at = Some(chrono::Utc::now() - chrono::Duration::minutes(1));
+        assert!(lp.is_autorun_due(chrono::Utc::now()));
+    }
+
+    #[test]
+    fn no_autorun_at_is_never_due() {
+        let lp = loop_with_trigger(LoopStatus::Failed, None);
+        assert!(!lp.is_autorun_due(chrono::Utc::now()));
+    }
+
+    #[test]
+    fn past_autorun_at_is_not_due_while_running_or_paused() {
+        for status in [LoopStatus::Running, LoopStatus::Paused] {
+            let mut lp = loop_with_trigger(status, None);
+            lp.autorun_at = Some(chrono::Utc::now() - chrono::Duration::minutes(1));
+            assert!(
+                !lp.is_autorun_due(chrono::Utc::now()),
+                "{status:?} loop must not fire autorun_at"
+            );
+        }
     }
 }

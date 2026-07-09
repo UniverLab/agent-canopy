@@ -197,7 +197,8 @@ impl Database {
                 trigger_config TEXT,
                 created_at INTEGER NOT NULL,
                 started_at INTEGER,
-                completed_at INTEGER
+                completed_at INTEGER,
+                autorun_at INTEGER
             );
 
             CREATE INDEX IF NOT EXISTS idx_loops_workdir_created
@@ -342,6 +343,20 @@ impl Database {
                 conn.execute(&format!("ALTER TABLE loops ADD COLUMN {column} TEXT"), [])
                     .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
             }
+        }
+
+        // One-shot resume schedule for loops (mirrors agents' `enable_at`);
+        // older databases predate the column.
+        let has_autorun_at: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loops') WHERE name = 'autorun_at'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_autorun_at {
+            conn.execute("ALTER TABLE loops ADD COLUMN autorun_at INTEGER", [])
+                .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
         }
 
         Ok(())

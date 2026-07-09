@@ -417,6 +417,15 @@ pub struct LoopContinueParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopScheduleAutorunParams {
+    /// Loop ID.
+    pub loop_id: String,
+    /// ISO 8601 timestamp at which the loop should resume, e.g.
+    /// "2026-07-10T09:00:00Z". Fires once, then the schedule is cleared.
+    pub at: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LoopCompleteNodeParams {
     /// Loop node ID.
     pub node_id: String,

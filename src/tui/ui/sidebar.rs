@@ -1729,6 +1729,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             started_at: None,
             completed_at: None,
+            autorun_at: None,
         })
         .unwrap();
 

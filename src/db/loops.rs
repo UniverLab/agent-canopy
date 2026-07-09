@@ -28,8 +28,8 @@ impl Database {
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let (trigger_type, trigger_config) = encode_loop_trigger(lp.trigger.as_ref())?;
         conn.execute(
-            "INSERT INTO loops (id, name, description, workdir, status, trigger_type, trigger_config, created_at, started_at, completed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO loops (id, name, description, workdir, status, trigger_type, trigger_config, created_at, started_at, completed_at, autorun_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 &lp.id,
                 &lp.name,
@@ -41,9 +41,53 @@ impl Database {
                 lp.created_at.timestamp(),
                 lp.started_at.map(|value| value.timestamp()),
                 lp.completed_at.map(|value| value.timestamp()),
+                lp.autorun_at.map(|value| value.timestamp()),
             ],
         )?;
         Ok(())
+    }
+
+    /// Schedule a one-shot resume for a loop at `at`. The scheduler fires it
+    /// once `at` is reached (if the loop is fireable) and clears the field —
+    /// see [`crate::domain::loops::Loop::is_autorun_due`].
+    pub fn schedule_loop_autorun(&self, loop_id: &str, at: DateTime<Utc>) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE loops SET autorun_at = ?1 WHERE id = ?2",
+            params![at.timestamp(), loop_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Clear a loop's pending one-shot autorun schedule, without touching status.
+    pub fn clear_loop_autorun(&self, loop_id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE loops SET autorun_at = NULL WHERE id = ?1",
+            params![loop_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Loops with a pending one-shot autorun schedule (regardless of trigger).
+    pub fn list_pending_autorun_loops(&self) -> Result<Vec<Loop>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at
+             FROM loops WHERE autorun_at IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], map_loop_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     /// Replace a loop's trigger (cron/watch/manual). Passing `None` clears any
@@ -77,7 +121,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at
              FROM loops WHERE trigger_type = ?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![trigger_type], map_loop_row)?;
@@ -122,7 +166,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at
              FROM loops WHERE id = ?1",
         )?;
 
@@ -137,10 +181,10 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let sql = if workdir.is_some() {
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at
              FROM loops WHERE workdir = ?1 ORDER BY created_at DESC"
         } else {
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at
              FROM loops ORDER BY created_at DESC"
         };
         let mut stmt = conn.prepare(sql)?;
@@ -574,6 +618,10 @@ fn map_loop_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Loop> {
             .transpose()?,
         completed_at: row
             .get::<_, Option<i64>>(8)?
+            .map(from_timestamp)
+            .transpose()?,
+        autorun_at: row
+            .get::<_, Option<i64>>(9)?
             .map(from_timestamp)
             .transpose()?,
     })

@@ -1771,6 +1771,7 @@ impl TaskTriggerHandler {
             created_at: chrono::Utc::now(),
             started_at: None,
             completed_at: None,
+            autorun_at: None,
         };
 
         self.db.insert_loop(&lp).map_err(internal_error)?;
@@ -2259,6 +2260,54 @@ impl TaskTriggerHandler {
         Ok(success_result(&format!(
             "Loop '{}' launched in background.",
             params.loop_id
+        )))
+    }
+
+    /// Schedule a one-shot future resume for a loop (e.g. a loop that failed
+    /// on a quota can reschedule itself at the exact reset time instead of
+    /// relying on a blindly polling cron). The scheduler fires it once the
+    /// time is reached and the loop is fireable, then clears the schedule.
+    #[tool(
+        name = "loop_schedule_autorun",
+        description = "Schedule a one-shot resume for a loop at a future ISO 8601 time — the scheduler launches it once that time is reached and clears the schedule. Useful for a loop that failed on a quota to reschedule its own resumption at the exact reset time."
+    )]
+    async fn loop_schedule_autorun(
+        &self,
+        Parameters(LoopScheduleAutorunParams { loop_id, at }): Parameters<
+            LoopScheduleAutorunParams,
+        >,
+    ) -> Result<CallToolResult, McpError> {
+        let Some(_existing) = self
+            .db
+            .get_loop(&loop_id)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        else {
+            return Ok(error_result(&format!(
+                "No loop found with ID '{}'",
+                loop_id
+            )));
+        };
+
+        let at = match chrono::DateTime::parse_from_rfc3339(&at) {
+            Ok(dt) => dt.with_timezone(&chrono::Utc),
+            Err(e) => {
+                return Ok(error_result(&format!(
+                    "Invalid ISO 8601 timestamp '{}': {}",
+                    at, e
+                )));
+            }
+        };
+
+        self.db
+            .schedule_loop_autorun(&loop_id, at)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        self.scheduler_notify.notify_one();
+
+        Ok(success_result(&format!(
+            "Loop '{}' scheduled to autorun at {}",
+            loop_id,
+            at.to_rfc3339()
         )))
     }
 
