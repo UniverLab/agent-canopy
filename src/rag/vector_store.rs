@@ -110,8 +110,8 @@ impl VectorStore {
                 }
             }
             Err(open_error) => {
-                tracing::info!(
-                    "RAG VectorStore: table not found ({}), creating fresh with {} dims",
+                tracing::warn!(
+                    "RAG VectorStore: table open failed ({}), creating fresh with {} dims",
                     open_error,
                     embedding_dimensions
                 );
@@ -503,6 +503,77 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].content, first_content);
         assert_eq!(results[0].file_path, "/docs/guide.md");
+    }
+
+    /// Truncate all regular files under `dir` to 0 bytes (simulates corruption).
+    fn corrupt_all_files(dir: &std::path::Path) {
+        let entries = std::fs::read_dir(dir).unwrap();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                std::fs::write(&path, []).unwrap();
+            } else if path.is_dir() {
+                corrupt_all_files(&path);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupted_store_fails_to_open() {
+        let temp_dir = TempDir::new().unwrap();
+        let lancedb_path = VectorStore::path_for_tests(temp_dir.path());
+
+        // Create a valid store with data.
+        let store = VectorStore::open_at(&lancedb_path, 4).await.unwrap();
+        store
+            .insert_chunk(&chunk("a", "/test.md", "hello", vec![1.0, 0.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        drop(store);
+
+        // Corrupt the store by truncating all files to 0 bytes.
+        corrupt_all_files(&lancedb_path);
+
+        // Opening the corrupted store should fail.
+        let result = VectorStore::open_at(&lancedb_path, 4).await;
+        assert!(result.is_err(), "corrupted store should fail to open");
+    }
+
+    #[tokio::test]
+    async fn corrupted_store_recovers_after_purge() {
+        let temp_dir = TempDir::new().unwrap();
+        let lancedb_path = VectorStore::path_for_tests(temp_dir.path());
+
+        // Create a valid store with data.
+        let store = VectorStore::open_at(&lancedb_path, 4).await.unwrap();
+        store
+            .insert_chunk(&chunk("a", "/test.md", "hello", vec![1.0, 0.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        drop(store);
+
+        // Corrupt the store by truncating all files to 0 bytes.
+        corrupt_all_files(&lancedb_path);
+
+        // Opening the corrupted store should fail.
+        assert!(VectorStore::open_at(&lancedb_path, 4).await.is_err());
+
+        // Purge (delete) the corrupted directory — simulates wipe_lancedb_dir.
+        std::fs::remove_dir_all(&lancedb_path).unwrap();
+
+        // Opening after purge should succeed with a fresh (empty) table.
+        let store = VectorStore::open_at(&lancedb_path, 4).await.unwrap();
+        assert_eq!(store.count_chunks().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn missing_directory_creates_fresh_table() {
+        let temp_dir = TempDir::new().unwrap();
+        let lancedb_path = temp_dir.path().join("nonexistent").join("vectors.lancedb");
+
+        // open_at should create the directory and table from scratch.
+        let store = VectorStore::open_at(&lancedb_path, 4).await.unwrap();
+        assert_eq!(store.count_chunks().await.unwrap(), 0);
     }
 
     #[tokio::test]

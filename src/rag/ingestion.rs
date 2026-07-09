@@ -7,6 +7,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -244,7 +245,7 @@ impl IngestionManager {
     ///  - a previous RAG root path that the user changed via `canopy setup`.
     pub async fn reconcile_orphan_chunks(&self) {
         let config = crate::domain::canopy_config::CanopyConfig::load(&self.data_dir);
-        let Some(store) = open_vector_store(&config).await else {
+        let Some(store) = open_vector_store(&config, &self.db).await else {
             return;
         };
         let paths = match store.list_unique_paths().await {
@@ -646,7 +647,7 @@ async fn sync_vector_store(
         model
     );
 
-    let Some(store) = open_vector_store(config).await else {
+    let Some(store) = open_vector_store(config, db).await else {
         anyhow::bail!("RAG vector store unavailable — check model config");
     };
 
@@ -683,7 +684,7 @@ async fn sync_vector_store(
 
 async fn purge_vector_chunks(data_dir: &Path, source_path: &str, db: Option<&crate::db::Database>) {
     let config = crate::domain::canopy_config::CanopyConfig::load(data_dir);
-    let Some(store) = open_vector_store(&config).await else {
+    let Some(store) = open_vector_store(&config, db.unwrap()).await else {
         tracing::warn!(
             "RAG purge: vector store unavailable — chunks for '{}' may be orphaned",
             source_path
@@ -715,7 +716,7 @@ async fn purge_vector_chunks(data_dir: &Path, source_path: &str, db: Option<&cra
 
 async fn refresh_rag_snapshot(db: &Database, data_dir: &Path) {
     let config = crate::domain::canopy_config::CanopyConfig::load(data_dir);
-    let Some(store) = open_vector_store(&config).await else {
+    let Some(store) = open_vector_store(&config, db).await else {
         let _ = db.set_state("rag_total_chunks", "0");
         let _ = db.set_state("rag_indexed_files", "0");
         return;
@@ -1045,8 +1046,12 @@ fn salvage_printable_text(bytes: &[u8]) -> String {
     runs.join(" ")
 }
 
+/// Gate: at most one corruption-driven purge per process lifetime.
+static LANCEDB_PURGE_DONE: AtomicBool = AtomicBool::new(false);
+
 async fn open_vector_store(
     config: &crate::domain::canopy_config::CanopyConfig,
+    db: &Database,
 ) -> Option<VectorStore> {
     let model = config.embeddings_model.trim();
     if model.is_empty() {
@@ -1070,7 +1075,32 @@ async fn open_vector_store(
             Some(store)
         }
         Err(error) => {
-            tracing::warn!("RAG vector store open error: {error:#}");
+            // If the store genuinely fails to open AND we haven't purged yet this
+            // process, remove the corrupted directory and retry exactly once.
+            // A missing directory is NOT an error — VectorStore::new creates it
+            // fresh — so any Err means the store is genuinely corrupted.
+            if !LANCEDB_PURGE_DONE.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "RAG vector store is corrupted ({error:#}); \
+                     purging directory and retrying once"
+                );
+                if let Err(e) = wipe_lancedb(db, "corrupt store recovery").await {
+                    tracing::warn!("RAG: failed to purge corrupt store: {e:#}");
+                }
+                match VectorStore::new(dimensions).await {
+                    Ok(store) => {
+                        tracing::warn!("RAG open_vector_store: recovered after purge");
+                        return Some(store);
+                    }
+                    Err(retry_err) => {
+                        tracing::warn!(
+                            "RAG open_vector_store: retry after purge also failed: {retry_err:#}"
+                        );
+                    }
+                }
+            } else {
+                tracing::warn!("RAG vector store open error (purge already used): {error:#}");
+            }
             None
         }
     }
@@ -1151,5 +1181,26 @@ mod tests {
     fn permanence_decision_short_circuits_on_fatal_message() {
         // A known-fatal message is permanent immediately, regardless of attempt count.
         assert!(is_permanent("document overflowed its stack", 0));
+    }
+
+    #[test]
+    fn lancedb_purge_flag_prevents_double_purge() {
+        // Reset the flag so this test is deterministic.
+        LANCEDB_PURGE_DONE.store(false, Ordering::SeqCst);
+
+        // First swap should return false (not yet purged) and set the flag.
+        assert!(
+            !LANCEDB_PURGE_DONE.swap(true, Ordering::SeqCst),
+            "first purge check should return false"
+        );
+
+        // Second swap should return true (already purged) — no second purge.
+        assert!(
+            LANCEDB_PURGE_DONE.swap(true, Ordering::SeqCst),
+            "second purge check should return true (already purged)"
+        );
+
+        // Reset for other tests.
+        LANCEDB_PURGE_DONE.store(false, Ordering::SeqCst);
     }
 }
