@@ -109,7 +109,7 @@ fn register_standalone_session(agent_id: &str, workdir: &str) {
                 workdir,
                 Some("canopy bridge"),
                 Some(std::process::id() as i64),
-                "interactive",
+                "bridge",
             )
         });
 

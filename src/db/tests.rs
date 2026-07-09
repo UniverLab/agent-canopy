@@ -1707,6 +1707,102 @@ fn interactive_session_pid_round_trips_through_get_active_sessions() {
 }
 
 #[test]
+fn get_active_sessions_excludes_bridge_sessions() {
+    let db = test_db();
+    db.insert_interactive_session(
+        "bridge-session",
+        "standalone",
+        "bridge",
+        "/tmp",
+        Some("canopy bridge"),
+        Some(4321),
+        "bridge",
+    )
+    .unwrap();
+    db.insert_interactive_session(
+        "chat-session",
+        "chat",
+        "opencode",
+        "/tmp",
+        None,
+        Some(1234),
+        "interactive",
+    )
+    .unwrap();
+
+    let sessions = db.get_active_sessions().unwrap();
+
+    assert!(sessions.iter().all(|s| s.id != "bridge-session"));
+    assert!(sessions.iter().any(|s| s.id == "chat-session"));
+}
+
+#[test]
+fn get_active_sessions_by_type_returns_only_matching_bridge_rows() {
+    let db = test_db();
+    db.insert_interactive_session(
+        "bridge-session",
+        "standalone",
+        "bridge",
+        "/tmp",
+        Some("canopy bridge"),
+        Some(4321),
+        "bridge",
+    )
+    .unwrap();
+    db.insert_interactive_session(
+        "chat-session",
+        "chat",
+        "opencode",
+        "/tmp",
+        None,
+        Some(1234),
+        "interactive",
+    )
+    .unwrap();
+
+    let bridges = db.get_active_sessions_by_type("bridge").unwrap();
+
+    assert_eq!(bridges.len(), 1);
+    assert_eq!(bridges[0].id, "bridge-session");
+}
+
+#[test]
+fn legacy_bridge_rows_are_reclassified_by_migration() {
+    // Simulate a row left over from before session_type = 'bridge' existed:
+    // old builds stored the bridge sidecar with session_type = 'interactive'.
+    let tmp = NamedTempFile::new().expect("create temp file");
+    let path = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+    let db = Database::new(&path).expect("create test db");
+    db.insert_interactive_session(
+        "legacy-bridge",
+        "standalone",
+        "bridge",
+        "/tmp",
+        Some("canopy bridge"),
+        Some(4321),
+        "interactive",
+    )
+    .unwrap();
+    drop(db);
+
+    // Re-running the migration (as happens on every Database::new) must
+    // reclassify the legacy row, and running it again must be a no-op.
+    drop(Database::new(&path).expect("reopen test db"));
+    let db = Database::new(&path).expect("reopen test db again after no-op migration");
+
+    assert_eq!(
+        db.get_session_type("legacy-bridge").unwrap().as_deref(),
+        Some("bridge")
+    );
+    assert!(db
+        .get_active_sessions()
+        .unwrap()
+        .iter()
+        .all(|s| s.id != "legacy-bridge"));
+}
+
+#[test]
 fn registering_project_creates_intelligence_root_node() {
     let db = test_db();
     let dir_a = tempdir().expect("tempdir a");

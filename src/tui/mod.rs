@@ -62,6 +62,8 @@ pub fn run_tui() -> Result<()> {
     let db = Arc::new(Database::new(&db_path).context("Failed to open database")?);
     let mut app = App::new(Arc::clone(&db), &data_dir)?;
 
+    // Reap bridge sidecars whose owning process died without cleaning up
+    app.reconcile_bridge_sessions();
     // Auto-resume previously active interactive sessions
     app.auto_resume_sessions();
     // Auto-resume previously active terminal sessions

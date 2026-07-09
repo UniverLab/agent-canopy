@@ -301,6 +301,19 @@ impl Database {
             .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
         }
 
+        // Older builds registered `canopy bridge` sidecars with
+        // session_type = 'interactive' (a bug — see daemon::bridge), which made
+        // auto_resume_sessions try to relaunch them as chat CLIs on every TUI
+        // startup. Reclassify any such rows so they're excluded from
+        // get_active_sessions() going forward. Idempotent: once reclassified,
+        // the WHERE clause no longer matches them.
+        conn.execute(
+            "UPDATE interactive_sessions SET session_type = 'bridge'
+             WHERE cli = 'bridge' AND session_type != 'bridge'",
+            [],
+        )
+        .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+
         // Loops gained optional cron/watch triggers; older databases predate the
         // columns. Add them if missing (both nullable, so existing rows stay
         // manual-only).

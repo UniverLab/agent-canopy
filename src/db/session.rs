@@ -77,15 +77,54 @@ impl Database {
         Ok(())
     }
 
-    /// Get all sessions with status = 'active'.
+    /// Get all sessions with status = 'active', excluding bridge sidecars.
+    ///
+    /// Bridge sessions (`canopy bridge`, see `daemon::bridge`) are proxy
+    /// processes for an MCP harness, not resumable interactive CLIs — they
+    /// must never be handed to `auto_resume_sessions`, which would try to
+    /// relaunch `canopy bridge` as if it were a chat session.
     pub fn get_active_sessions(&self) -> Result<Vec<InteractiveSession>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut stmt = conn.prepare(
             "SELECT id, name, cli, working_dir, args, started_at, status, session_type, pid
-             FROM interactive_sessions WHERE status = 'active' ORDER BY started_at DESC",
+             FROM interactive_sessions WHERE status = 'active' AND session_type != 'bridge'
+             ORDER BY started_at DESC",
         )?;
         let rows = stmt
             .query_map([], |row| {
+                Ok(InteractiveSession {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    cli: row.get(2)?,
+                    working_dir: row.get(3)?,
+                    args: row.get(4)?,
+                    started_at: row.get(5)?,
+                    status: row.get(6)?,
+                    session_type: row.get(7)?,
+                    pid: row.get(8)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Get active sessions of a specific `session_type` (e.g. "bridge").
+    ///
+    /// Used at startup to reconcile bridge sidecars whose owning process
+    /// died without calling `finish_standalone_session` — those rows would
+    /// otherwise stay `active` forever.
+    pub fn get_active_sessions_by_type(
+        &self,
+        session_type: &str,
+    ) -> Result<Vec<InteractiveSession>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, cli, working_dir, args, started_at, status, session_type, pid
+             FROM interactive_sessions WHERE status = 'active' AND session_type = ?1
+             ORDER BY started_at DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![session_type], |row| {
                 Ok(InteractiveSession {
                     id: row.get(0)?,
                     name: row.get(1)?,

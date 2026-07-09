@@ -2032,6 +2032,22 @@ impl App {
         self.terminal_agents.push(agent);
     }
 
+    /// Reap bridge sidecar rows left `active` by a process that died without
+    /// calling `finish_standalone_session` (daemon restart, MCP client
+    /// killed). Bridge sessions are never auto-resumed (see
+    /// `get_active_sessions`), so without this their rows accumulate as
+    /// `active` forever instead of just going stale.
+    pub fn reconcile_bridge_sessions(&self) {
+        let Ok(sessions) = self.db.get_active_sessions_by_type("bridge") else {
+            return;
+        };
+        for session in &sessions {
+            if should_resume_session(session.pid) {
+                let _ = self.db.finish_interactive_session(&session.id, 1);
+            }
+        }
+    }
+
     pub fn auto_resume_sessions(&mut self) {
         let Ok(sessions) = self.db.get_active_sessions() else {
             return;
@@ -2363,6 +2379,50 @@ fn log_contains_spawn(log_up: &str) -> bool {
 mod tests {
     use super::{build_resumed_session_args, process_is_alive, should_resume_session};
     use crate::db::session::InteractiveSession;
+    use crate::db::Database;
+    use crate::tui::app::types::App;
+    use std::sync::Arc;
+    use tempfile::{tempdir, NamedTempFile};
+
+    fn test_db() -> Arc<Database> {
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        Arc::new(Database::new(&path).expect("create test db"))
+    }
+
+    #[test]
+    fn reconcile_bridge_sessions_reaps_dead_pid_but_leaves_live_bridge_active() {
+        let db = test_db();
+        db.insert_interactive_session(
+            "dead-bridge",
+            "standalone",
+            "bridge",
+            "/tmp",
+            Some("canopy bridge"),
+            Some(999_999_999),
+            "bridge",
+        )
+        .unwrap();
+        db.insert_interactive_session(
+            "live-bridge",
+            "standalone",
+            "bridge",
+            "/tmp",
+            Some("canopy bridge"),
+            Some(std::process::id() as i64),
+            "bridge",
+        )
+        .unwrap();
+
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.reconcile_bridge_sessions();
+
+        let still_active = db.get_active_sessions_by_type("bridge").unwrap();
+        assert_eq!(still_active.len(), 1);
+        assert_eq!(still_active[0].id, "live-bridge");
+    }
 
     #[test]
     fn test_yolo_mode_preservation_in_session_relaunch() {
