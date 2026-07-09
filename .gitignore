@@ -37,4 +37,4 @@ bisect_results.txt
 run_output.txt
 
 # Demo capture artifacts
-demo/
+*.mp4
