@@ -17,6 +17,10 @@ use crate::tui::app::types::{
 };
 use ratatui::style::Color;
 
+/// Minimum rows reserved for the `loops` section when the projects sidebar
+/// overflows and sections must be shrunk to fit.
+const MIN_LOOPS_HEIGHT: u16 = 4;
+
 pub(super) fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App) {
     app.sidebar_click_map.clear();
     app.sidebar_visible_capacity = 0;
@@ -456,10 +460,18 @@ fn layout_projects_sections(
     }
 
     if has_projects || has_loops {
+        // Not enough room for everyone. `projects` is taken first (it's drawn
+        // on top), but a naive sequential take_top can let it swallow the
+        // whole budget via its own clamping, leaving 0 rows — and thus no
+        // visible section — for `loops`. Reserve loops a minimum slice first
+        // and shrink projects to fit around it.
         let mut remaining = content_top;
+        let loops_reserved = loops_needed.max(MIN_LOOPS_HEIGHT).min(remaining.height);
+        let projects_budget = remaining.height.saturating_sub(loops_reserved);
         return ProjectsLayout {
-            projects: take_top(&mut remaining, projects_needed),
-            loops: take_top(&mut remaining, loops_needed).or(Some(remaining)),
+            projects: take_top(&mut remaining, projects_needed.min(projects_budget)),
+            loops: take_top(&mut remaining, loops_needed)
+                .or_else(|| (remaining.height > 0).then_some(remaining)),
             knowledge: None,
             ..ProjectsLayout::default()
         };
@@ -1676,6 +1688,94 @@ mod tests {
 
     fn needed_agents(count: u16) -> u16 {
         count * 4 + 2
+    }
+
+    /// Builds an App backed by a fresh temp DB with `project_count` registered
+    /// projects and one loop named "Probe Loop", then renders the sidebar in
+    /// Projects mode into a `width`x`height` TestBackend and returns the
+    /// screen contents as a flat string for substring assertions.
+    fn render_projects_sidebar_text(project_count: usize, width: u16, height: u16) -> String {
+        use crate::db::Database;
+        use crate::domain::loops::{Loop, LoopStatus};
+        use crate::domain::project::Project;
+        use crate::tui::app::App;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::sync::Arc;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        for i in 0..project_count {
+            db.upsert_project(&Project {
+                hash: format!("hash{i}"),
+                path: format!("/tmp/project{i}"),
+                name: format!("project{i}"),
+                description: None,
+                tags: None,
+                indexed_at: None,
+                created_at: 0,
+            })
+            .unwrap();
+        }
+        db.insert_loop(&Loop {
+            id: "wf-probe".to_string(),
+            name: "Probe Loop".to_string(),
+            description: None,
+            workdir: "/tmp/probe".to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+        })
+        .unwrap();
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
+        app.toggle_sidebar_mode();
+        assert!(matches!(app.sidebar_mode, SidebarMode::Projects));
+        assert!(
+            !app.visible_loops().is_empty(),
+            "loop should be loaded from db"
+        );
+
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_sidebar(frame, area, &mut app);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn loops_section_renders_in_projects_mode_with_ample_room() {
+        let text = render_projects_sidebar_text(2, 34, 34);
+        assert!(text.contains("loops"), "expected loops section title");
+        assert!(text.contains("Probe Loop"), "expected loop name visible");
+    }
+
+    #[test]
+    fn loops_section_still_renders_when_projects_overflow_the_sidebar() {
+        // Regression test: many projects in a short sidebar used to let the
+        // `projects` section swallow the entire content area, leaving 0 rows
+        // for `loops` — the loop existed in the DB but was never drawn.
+        let text = render_projects_sidebar_text(20, 34, 20);
+        assert!(text.contains("loops"), "expected loops section title");
+        assert!(text.contains("Probe Loop"), "expected loop name visible");
     }
 
     #[test]

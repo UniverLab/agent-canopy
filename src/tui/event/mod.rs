@@ -963,6 +963,26 @@ mod sidebar_mouse_tests {
         assert!(matches!(via_key.focus, Focus::Preview));
         assert!(matches!(via_click.focus, Focus::Preview));
     }
+
+    #[test]
+    fn f2_toggles_sidebar_mode_between_agents_and_projects() {
+        let mut app = app_with_agents(3);
+        assert!(matches!(app.sidebar_mode, SidebarMode::Agents));
+
+        assert!(handle_global_key(
+            &mut app,
+            KeyCode::F(2),
+            KeyModifiers::NONE
+        ));
+        assert!(matches!(app.sidebar_mode, SidebarMode::Projects));
+
+        assert!(handle_global_key(
+            &mut app,
+            KeyCode::F(2),
+            KeyModifiers::NONE
+        ));
+        assert!(matches!(app.sidebar_mode, SidebarMode::Agents));
+    }
 }
 
 #[cfg(test)]
