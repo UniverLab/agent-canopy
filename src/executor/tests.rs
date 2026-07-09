@@ -18,6 +18,7 @@ fn agent_with_unresolvable_cli(id: &str, log_path: &std::path::Path) -> Agent {
         model: None,
         working_dir: None,
         enabled: true,
+        enable_at: None,
         created_at: Utc::now(),
         log_path: log_path.to_string_lossy().to_string(),
         timeout_minutes: 15,

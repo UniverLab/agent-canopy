@@ -146,6 +146,7 @@ mod tests {
             model: Some("gpt-5".to_string()),
             working_dir: Some("/tmp/project".to_string()),
             enabled: true,
+            enable_at: None,
             created_at: Utc::now(),
             log_path: "/tmp/agent-1.log".to_string(),
             timeout_minutes: 15,

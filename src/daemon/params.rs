@@ -99,6 +99,15 @@ pub struct IdParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AgentScheduleEnableParams {
+    /// Agent ID.
+    pub id: String,
+    /// ISO 8601 timestamp at which the agent should be enabled, e.g.
+    /// "2026-07-10T09:00:00Z". The agent stays disabled until then.
+    pub at: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TaskReportParams {
     /// The run ID (UUID) provided in the agent execution prompt.
     pub run_id: String,

@@ -831,6 +831,7 @@ mod sidebar_mouse_tests {
             model: None,
             working_dir: None,
             enabled: true,
+            enable_at: None,
             created_at: Utc::now(),
             log_path: "/tmp/test-sidebar-mouse.log".to_string(),
             timeout_minutes: 15,

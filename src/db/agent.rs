@@ -7,7 +7,7 @@ use crate::db::Database;
 use crate::domain::models::{Agent, Cli, Trigger};
 
 const AGENT_COLUMNS: &str = "id, prompt, trigger_type, trigger_config, cli, model, working_dir, \
-                             enabled, created_at, log_path, timeout_minutes, expires_at, last_run_at, \
+                             enabled, enable_at, created_at, log_path, timeout_minutes, expires_at, last_run_at, \
                              last_run_ok, last_triggered_at, trigger_count";
 
 impl AgentRepository for Database {
@@ -26,7 +26,7 @@ impl AgentRepository for Database {
         };
 
         conn.execute(
-            &format!("INSERT OR REPLACE INTO agents ({AGENT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"),
+            &format!("INSERT OR REPLACE INTO agents ({AGENT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"),
             params![
                 &agent.id,
                 &agent.prompt,
@@ -36,6 +36,7 @@ impl AgentRepository for Database {
                 &agent.model,
                 &agent.working_dir,
                 agent.enabled,
+                agent.enable_at.map(|t| t.to_rfc3339()),
                 agent.created_at.to_rfc3339(),
                 &agent.log_path,
                 agent.timeout_minutes as i64,
@@ -68,14 +69,15 @@ impl AgentRepository for Database {
                     model: row.get(5)?,
                     working_dir: row.get(6)?,
                     enabled: row.get(7)?,
-                    created_at_str: row.get(8)?,
-                    log_path: row.get(9)?,
-                    timeout_minutes: row.get(10)?,
-                    expires_at_str: row.get(11)?,
-                    last_run_at_str: row.get(12)?,
-                    last_run_ok: row.get(13)?,
-                    last_triggered_at_str: row.get(14)?,
-                    trigger_count: row.get(15)?,
+                    enable_at_str: row.get(8)?,
+                    created_at_str: row.get(9)?,
+                    log_path: row.get(10)?,
+                    timeout_minutes: row.get(11)?,
+                    expires_at_str: row.get(12)?,
+                    last_run_at_str: row.get(13)?,
+                    last_run_ok: row.get(14)?,
+                    last_triggered_at_str: row.get(15)?,
+                    trigger_count: row.get(16)?,
                 })
             })
             .optional()?;
@@ -96,6 +98,10 @@ impl AgentRepository for Database {
 
     fn list_watch_agents(&self) -> Result<Vec<Agent>> {
         self.list_agents_where("WHERE trigger_type = 'watch' AND enabled = 1")
+    }
+
+    fn list_pending_enable_agents(&self) -> Result<Vec<Agent>> {
+        self.list_agents_where("WHERE enabled = 0 AND enable_at IS NOT NULL")
     }
 
     fn delete_agent(&self, id: &str) -> Result<()> {
@@ -162,6 +168,30 @@ impl AgentRepository for Database {
         Ok(())
     }
 
+    fn schedule_agent_enable(&self, id: &str, at: chrono::DateTime<Utc>) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        conn.execute(
+            "UPDATE agents SET enabled = 0, enable_at = ?1 WHERE id = ?2",
+            params![at.to_rfc3339(), id],
+        )?;
+        Ok(())
+    }
+
+    fn activate_scheduled_enable(&self, id: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        conn.execute(
+            "UPDATE agents SET enabled = 1, enable_at = NULL WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
     fn update_agent_last_run(&self, id: &str, success: bool) -> Result<()> {
         let conn = self
             .conn
@@ -207,14 +237,15 @@ impl Database {
                 model: row.get(5)?,
                 working_dir: row.get(6)?,
                 enabled: row.get(7)?,
-                created_at_str: row.get(8)?,
-                log_path: row.get(9)?,
-                timeout_minutes: row.get(10)?,
-                expires_at_str: row.get(11)?,
-                last_run_at_str: row.get(12)?,
-                last_run_ok: row.get(13)?,
-                last_triggered_at_str: row.get(14)?,
-                trigger_count: row.get(15)?,
+                enable_at_str: row.get(8)?,
+                created_at_str: row.get(9)?,
+                log_path: row.get(10)?,
+                timeout_minutes: row.get(11)?,
+                expires_at_str: row.get(12)?,
+                last_run_at_str: row.get(13)?,
+                last_run_ok: row.get(14)?,
+                last_triggered_at_str: row.get(15)?,
+                trigger_count: row.get(16)?,
             })
         })?;
 
@@ -236,6 +267,7 @@ struct AgentRow {
     model: Option<String>,
     working_dir: Option<String>,
     enabled: bool,
+    enable_at_str: Option<String>,
     created_at_str: String,
     log_path: String,
     timeout_minutes: i64,
@@ -266,6 +298,11 @@ impl AgentRow {
             .as_ref()
             .map(|s| chrono::DateTime::parse_from_rfc3339(s).map(|dt| dt.with_timezone(&Utc)))
             .transpose()?;
+        let enable_at = self
+            .enable_at_str
+            .as_ref()
+            .map(|s| chrono::DateTime::parse_from_rfc3339(s).map(|dt| dt.with_timezone(&Utc)))
+            .transpose()?;
 
         let trigger = self
             .trigger_config
@@ -281,6 +318,7 @@ impl AgentRow {
             model: self.model,
             working_dir: self.working_dir,
             enabled: self.enabled,
+            enable_at,
             created_at,
             log_path: self.log_path,
             timeout_minutes: self.timeout_minutes as u32,

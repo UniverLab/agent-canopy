@@ -63,6 +63,10 @@ pub struct Agent {
     pub model: Option<String>,
     pub working_dir: Option<String>,
     pub enabled: bool,
+    /// One-shot scheduled enable time. When set and `enabled` is `false`,
+    /// the scheduler enables the agent (and clears this field) once
+    /// `Utc::now() >= enable_at`.
+    pub enable_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     /// Log file path.
     pub log_path: String,

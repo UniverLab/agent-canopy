@@ -11,6 +11,7 @@ fn sample_agent(id: &str, trigger: Option<Trigger>) -> Agent {
         model: None,
         working_dir: Some("/tmp/project".to_string()),
         enabled: true,
+        enable_at: None,
         created_at: Utc::now(),
         log_path: "/tmp/test.log".to_string(),
         timeout_minutes: 15,

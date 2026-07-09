@@ -818,6 +818,46 @@ impl TaskTriggerHandler {
         Ok(success_result(&format!("Agent '{}' enabled", id)))
     }
 
+    /// Schedule a one-shot future enable for a disabled agent.
+    #[tool(
+        name = "agent_schedule_enable",
+        description = "Schedule a one-shot enable for an agent at a future ISO 8601 time — the agent stays disabled until then, when the scheduler enables it and clears the schedule"
+    )]
+    async fn task_schedule_enable(
+        &self,
+        Parameters(AgentScheduleEnableParams { id, at }): Parameters<AgentScheduleEnableParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let Some(_existing) = self
+            .db
+            .get_agent(&id)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        else {
+            return Ok(error_result(&format!("No agent found with ID '{}'", id)));
+        };
+
+        let at = match chrono::DateTime::parse_from_rfc3339(&at) {
+            Ok(dt) => dt.with_timezone(&chrono::Utc),
+            Err(e) => {
+                return Ok(error_result(&format!(
+                    "Invalid ISO 8601 timestamp '{}': {}",
+                    at, e
+                )));
+            }
+        };
+
+        self.db
+            .schedule_agent_enable(&id, at)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        self.scheduler_notify.notify_one();
+
+        Ok(success_result(&format!(
+            "Agent '{}' scheduled to enable at {}",
+            id,
+            at.to_rfc3339()
+        )))
+    }
+
     /// Disable an agent without removing it.
     #[tool(
         name = "agent_disable",

@@ -30,6 +30,7 @@ fn sample_cron_agent(id: &str) -> Agent {
         model: None,
         working_dir: Some("/tmp/project".to_string()),
         enabled: true,
+        enable_at: None,
         created_at: Utc::now(),
         log_path: "/tmp/test.log".to_string(),
         timeout_minutes: 15,
@@ -55,6 +56,7 @@ fn sample_watch_agent(id: &str) -> Agent {
         model: Some("claude-4".to_string()),
         working_dir: None,
         enabled: true,
+        enable_at: None,
         created_at: Utc::now(),
         log_path: format!("/tmp/{}.log", id),
         timeout_minutes: 15,
@@ -75,6 +77,7 @@ fn sample_manual_agent(id: &str) -> Agent {
         model: None,
         working_dir: None,
         enabled: true,
+        enable_at: None,
         created_at: Utc::now(),
         log_path: "/tmp/manual.log".to_string(),
         timeout_minutes: 15,
@@ -1004,6 +1007,64 @@ fn test_update_agent_enabled() {
     db.update_agent_enabled("toggle-me", true).unwrap();
     let agent = db.get_agent("toggle-me").unwrap().unwrap();
     assert!(agent.enabled);
+}
+
+#[test]
+fn test_schedule_agent_enable_persists_enable_at_and_stays_disabled() {
+    let db = test_db();
+    let mut agent = sample_cron_agent("wake-me");
+    agent.enabled = false;
+    db.upsert_agent(&agent).unwrap();
+
+    let at = Utc::now() + Duration::hours(1);
+    db.schedule_agent_enable("wake-me", at).unwrap();
+
+    let agent = db.get_agent("wake-me").unwrap().unwrap();
+    assert!(
+        !agent.enabled,
+        "scheduling enable must not enable immediately"
+    );
+    assert_eq!(agent.enable_at.map(|t| t.timestamp()), Some(at.timestamp()));
+}
+
+#[test]
+fn test_activate_scheduled_enable_enables_and_clears_enable_at() {
+    let db = test_db();
+    let mut agent = sample_cron_agent("wake-me-2");
+    agent.enabled = false;
+    db.upsert_agent(&agent).unwrap();
+    db.schedule_agent_enable("wake-me-2", Utc::now() - Duration::minutes(5))
+        .unwrap();
+
+    db.activate_scheduled_enable("wake-me-2").unwrap();
+
+    let agent = db.get_agent("wake-me-2").unwrap().unwrap();
+    assert!(agent.enabled, "activation must enable the agent");
+    assert!(agent.enable_at.is_none(), "activation must clear enable_at");
+}
+
+#[test]
+fn test_list_pending_enable_agents_filters_correctly() {
+    let db = test_db();
+
+    let mut pending = sample_cron_agent("pending-1");
+    pending.enabled = false;
+    db.upsert_agent(&pending).unwrap();
+    db.schedule_agent_enable("pending-1", Utc::now() + Duration::hours(1))
+        .unwrap();
+
+    // Enabled agent with no enable_at — must not show up.
+    db.upsert_agent(&sample_cron_agent("already-enabled"))
+        .unwrap();
+
+    // Disabled agent with no enable_at set — must not show up.
+    let mut disabled_only = sample_cron_agent("disabled-only");
+    disabled_only.enabled = false;
+    db.upsert_agent(&disabled_only).unwrap();
+
+    let results = db.list_pending_enable_agents().unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, "pending-1");
 }
 
 #[test]

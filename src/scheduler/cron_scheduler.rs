@@ -219,6 +219,22 @@ impl CronScheduler {
             }
         }
 
+        // One-shot `enable_at` schedules also need a wakeup, independent of
+        // any cron expression on the agent.
+        if let Ok(pending) = self.db.list_pending_enable_agents() {
+            for agent in &pending {
+                if let Some(enable_at) = agent.enable_at {
+                    let nearer = match earliest {
+                        Some(e) => enable_at < e,
+                        None => true,
+                    };
+                    if nearer {
+                        earliest = Some(enable_at);
+                    }
+                }
+            }
+        }
+
         match earliest {
             Some(t) => {
                 let delta = t.signed_duration_since(now_utc);
@@ -250,6 +266,24 @@ impl CronScheduler {
             let loops = self.db.list_cron_loops()?;
             for lp in &loops {
                 self.try_fire_loop(lp, now_local, now_utc).await?;
+            }
+        }
+
+        self.fire_due_enable_at(now_utc)?;
+
+        Ok(())
+    }
+
+    /// One-shot `enable_at`: for each disabled agent with a pending
+    /// `enable_at` in the past, enable it and clear the schedule. Unlike
+    /// cron agents (`list_cron_agents` filters `enabled = 1`), these are
+    /// disabled by definition, hence the dedicated query.
+    fn fire_due_enable_at(&self, now_utc: chrono::DateTime<Utc>) -> anyhow::Result<()> {
+        let pending = self.db.list_pending_enable_agents()?;
+        for agent in &pending {
+            if agent.enable_at.is_some_and(|at| now_utc >= at) {
+                tracing::info!("Agent '{}' reached its enable_at time; enabling", agent.id);
+                self.db.activate_scheduled_enable(&agent.id)?;
             }
         }
         Ok(())
@@ -542,6 +576,100 @@ fn to_7field_cron(expr: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::notification_service::DefaultNotificationService;
+    use crate::application::ports::AgentRepository;
+    use crate::domain::models::{Agent, Cli};
+
+    fn manual_agent(id: &str, enabled: bool) -> Agent {
+        Agent {
+            id: id.to_string(),
+            prompt: "do nothing".to_string(),
+            trigger: None,
+            cli: Cli::new("opencode"),
+            model: None,
+            working_dir: None,
+            enabled,
+            enable_at: None,
+            created_at: Utc::now(),
+            log_path: "/tmp/enable-at-test.log".to_string(),
+            timeout_minutes: 15,
+            expires_at: None,
+            last_run_at: None,
+            last_run_ok: None,
+            last_triggered_at: None,
+            trigger_count: 0,
+        }
+    }
+
+    fn test_scheduler() -> (Arc<Database>, CronScheduler) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
+        std::mem::forget(dir);
+        let executor = Arc::new(Executor::new(
+            db.clone(),
+            Arc::new(DefaultNotificationService),
+        ));
+        let scheduler = CronScheduler::new(db.clone(), executor);
+        (db, scheduler)
+    }
+
+    /// A future `enable_at` must not flip the agent to enabled — it's a
+    /// schedule, not an immediate action.
+    #[test]
+    fn fire_due_enable_at_ignores_future_schedule() {
+        let (db, scheduler) = test_scheduler();
+        db.upsert_agent(&manual_agent("future-wake", false))
+            .unwrap();
+        db.schedule_agent_enable("future-wake", Utc::now() + chrono::Duration::hours(1))
+            .unwrap();
+
+        scheduler.fire_due_enable_at(Utc::now()).unwrap();
+
+        let agent = db.get_agent("future-wake").unwrap().unwrap();
+        assert!(!agent.enabled, "future enable_at must not enable yet");
+        assert!(
+            agent.enable_at.is_some(),
+            "future enable_at must remain pending"
+        );
+    }
+
+    /// A past-due `enable_at` must enable the agent and clear the field —
+    /// the one-shot semantics from the spec.
+    #[test]
+    fn fire_due_enable_at_activates_past_schedule_and_clears_it() {
+        let (db, scheduler) = test_scheduler();
+        db.upsert_agent(&manual_agent("past-wake", false)).unwrap();
+        db.schedule_agent_enable("past-wake", Utc::now() - chrono::Duration::minutes(1))
+            .unwrap();
+
+        scheduler.fire_due_enable_at(Utc::now()).unwrap();
+
+        let agent = db.get_agent("past-wake").unwrap().unwrap();
+        assert!(agent.enabled, "past-due enable_at must enable the agent");
+        assert!(
+            agent.enable_at.is_none(),
+            "activation must clear enable_at (one-shot)"
+        );
+    }
+
+    /// `next_sleep_duration` must wake the scheduler for a pending
+    /// `enable_at`, not just cron expressions — otherwise the one-shot
+    /// enable would rely on the 60s reconcile fallback instead of firing on
+    /// time.
+    #[test]
+    fn next_sleep_duration_wakes_for_pending_enable_at() {
+        let (db, scheduler) = test_scheduler();
+        db.upsert_agent(&manual_agent("soon-wake", false)).unwrap();
+        db.schedule_agent_enable("soon-wake", Utc::now() + chrono::Duration::seconds(5))
+            .unwrap();
+
+        let dur = scheduler.next_sleep_duration();
+        assert!(
+            dur <= std::time::Duration::from_secs(6),
+            "expected to wake in ~5s for the pending enable_at, got {:?}",
+            dur
+        );
+    }
 
     #[test]
     fn test_to_7field_cron() {

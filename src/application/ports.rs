@@ -1,4 +1,5 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 
 use crate::domain::models::{Agent, RunLog, RunStatus};
 
@@ -11,9 +12,15 @@ pub trait AgentRepository {
     fn list_agents(&self) -> Result<Vec<Agent>>;
     fn list_cron_agents(&self) -> Result<Vec<Agent>>;
     fn list_watch_agents(&self) -> Result<Vec<Agent>>;
+    /// Agents currently disabled with a pending one-shot `enable_at`.
+    fn list_pending_enable_agents(&self) -> Result<Vec<Agent>>;
     fn delete_agent(&self, id: &str) -> Result<()>;
     fn rename_agent(&self, old_id: &str, new_id: &str, new_log_path: &str) -> Result<()>;
     fn update_agent_enabled(&self, id: &str, enabled: bool) -> Result<()>;
+    /// Leave the agent disabled but set a one-shot `enable_at` time.
+    fn schedule_agent_enable(&self, id: &str, at: DateTime<Utc>) -> Result<()>;
+    /// Enable the agent and clear its `enable_at`, firing the one-shot schedule.
+    fn activate_scheduled_enable(&self, id: &str) -> Result<()>;
     fn update_agent_last_run(&self, id: &str, success: bool) -> Result<()>;
     fn update_agent_triggered(&self, id: &str) -> Result<()>;
 }

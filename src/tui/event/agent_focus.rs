@@ -732,6 +732,7 @@ mod tests {
             model: Some("original-model".to_string()),
             working_dir: Some("/original/dir".to_string()),
             enabled: true,
+            enable_at: None,
             created_at: Utc::now(),
             log_path: "/tmp/test-cron.log".to_string(),
             timeout_minutes: 15,

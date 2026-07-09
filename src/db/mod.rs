@@ -43,6 +43,7 @@ impl Database {
                 model TEXT,
                 working_dir TEXT,
                 enabled BOOLEAN NOT NULL DEFAULT 1,
+                enable_at TEXT,
                 created_at TEXT NOT NULL,
                 log_path TEXT NOT NULL,
                 timeout_minutes INTEGER NOT NULL DEFAULT 15,
@@ -313,6 +314,18 @@ impl Database {
             [],
         )
         .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+
+        let has_enable_at: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('agents') WHERE name = 'enable_at'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_enable_at {
+            conn.execute("ALTER TABLE agents ADD COLUMN enable_at TEXT", [])
+                .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
 
         // Loops gained optional cron/watch triggers; older databases predate the
         // columns. Add them if missing (both nullable, so existing rows stay

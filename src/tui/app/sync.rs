@@ -194,6 +194,7 @@ mod tests {
             model: None,
             working_dir: Some(workdir.to_string()),
             enabled: true,
+            enable_at: None,
             created_at: Utc::now(),
             log_path: "/tmp/test.log".to_string(),
             timeout_minutes: 15,
