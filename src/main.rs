@@ -48,18 +48,23 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Start, stop, or manage the background daemon.
     Daemon {
         #[command(subcommand)]
         action: DaemonAction,
     },
+    /// Run a health check diagnosing common issues.
     Doctor,
+    /// Run the MCP server over stdio transport.
     Stdio,
+    /// First-run setup wizard to configure agents and directories.
     Setup {
         /// Use a local registry directory instead of fetching from GitHub.
         /// Useful for development and testing registry changes before publishing.
         #[arg(long = "local-registry", value_name = "PATH")]
         local_registry: Option<PathBuf>,
     },
+    /// Interactive wizard to configure MCP in your AI client.
     Mcp,
     /// RAG indexing management.
     Rag {
@@ -78,10 +83,10 @@ enum Commands {
         #[arg(long)]
         workdir: Option<PathBuf>,
     },
+    /// Extract text content from a PDF file (internal use).
     #[command(hide = true)]
-    InternalPdfExtract {
-        path: PathBuf,
-    },
+    InternalPdfExtract { path: PathBuf },
+    /// Start the HTTP API server (used by the daemon).
     #[command(hide = true)]
     Serve,
 }
@@ -146,4 +151,33 @@ pub(crate) fn ensure_data_dir() -> Result<std::path::PathBuf> {
     std::fs::create_dir_all(&data_dir)?;
     std::fs::create_dir_all(data_dir.join("logs"))?;
     Ok(data_dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn assert_all_subcommands_have_about(cmd: &clap::Command, prefix: &str) {
+        for sub in cmd.get_subcommands() {
+            let name = sub.get_name();
+            let full = if prefix.is_empty() {
+                name.to_string()
+            } else {
+                format!("{prefix} {name}")
+            };
+            assert!(
+                sub.get_about()
+                    .is_some_and(|a| !a.to_string().trim().is_empty()),
+                "Subcommand '{full}' has no doc comment (about is empty). Add a `///` doc comment."
+            );
+            assert_all_subcommands_have_about(sub, &full);
+        }
+    }
+
+    #[test]
+    fn all_subcommands_have_help_text() {
+        let cmd = <Cli as CommandFactory>::command();
+        assert_all_subcommands_have_about(&cmd, "");
+    }
 }
