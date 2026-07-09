@@ -594,18 +594,17 @@ fn resolve_spec_start(
     spec: &LoopSpec,
     existing_runs: &[LoopNodeRun],
 ) -> Result<(String, Option<Value>, HashMap<String, usize>)> {
-    let mut iterations = HashMap::<String, usize>::new();
-    for run in existing_runs {
-        *iterations.entry(run.node_id.clone()).or_insert(0) += 1;
-    }
-
     if spec.status == LoopSpecStatus::Running {
         if let Some(last_run) = existing_runs.last() {
+            let mut iterations = HashMap::<String, usize>::new();
+            for run in existing_runs {
+                *iterations.entry(run.node_id.clone()).or_insert(0) += 1;
+            }
             return Ok((last_run.node_id.clone(), last_run.input.clone(), iterations));
         }
     }
 
-    Ok((find_entry_node(spec_details)?, None, iterations))
+    Ok((find_entry_node(spec_details)?, None, HashMap::new()))
 }
 
 #[cfg(unix)]
@@ -793,6 +792,57 @@ mod tests {
             previous_output.and_then(|value| value.get("previous").cloned()),
             Some(serde_json::json!("context"))
         );
+    }
+
+    #[test]
+    fn resolve_spec_start_resets_iterations_for_fresh_spec() {
+        let spec = LoopSpec {
+            id: "spec".to_string(),
+            loop_id: "wf".to_string(),
+            name: "Spec".to_string(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+        };
+        let details = crate::domain::loops::LoopSpecDetails {
+            spec: spec.clone(),
+            nodes: vec![LoopNode {
+                id: "node-1".to_string(),
+                spec_id: spec.id.clone(),
+                name: "Node".to_string(),
+                kind: LoopNodeKind::Check,
+                config: serde_json::json!({"command": "true"}),
+                position: 1,
+                created_at: chrono::Utc::now(),
+            }],
+            edges: vec![],
+        };
+        // Historical runs from a previous attempt at this spec: 10 failed
+        // iterations that exhausted the budget last time around.
+        let runs: Vec<LoopNodeRun> = (0..10)
+            .map(|i| LoopNodeRun {
+                id: format!("run-{i}"),
+                loop_id: "wf".to_string(),
+                spec_id: spec.id.clone(),
+                node_id: "node-1".to_string(),
+                status: LoopRunStatus::Fail,
+                input: None,
+                output: None,
+                started_at: chrono::Utc::now(),
+                completed_at: Some(chrono::Utc::now()),
+                iteration: i + 1,
+            })
+            .collect();
+
+        let (node_id, previous_output, iterations) =
+            resolve_spec_start(&details, &spec, &runs).unwrap();
+
+        assert_eq!(node_id, "node-1");
+        assert!(previous_output.is_none());
+        assert!(iterations.is_empty());
     }
 
     #[test]
