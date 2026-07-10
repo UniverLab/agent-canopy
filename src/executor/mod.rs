@@ -317,13 +317,31 @@ impl Executor {
                 });
             }
         };
-        let mut cmd = build_cli_command(
+        let mut cmd = match build_cli_command(
             &cli_path,
             params.cli,
             &params.prompt,
             params.model,
             params.working_dir,
-        );
+        ) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                tracing::error!("Failed to build command for '{}': {}", params.id, e);
+                append_to_log(
+                    &params.log_path,
+                    params.id,
+                    &params.trigger,
+                    &Utc::now(),
+                    -1,
+                    &[],
+                    e.to_string().as_bytes(),
+                )?;
+                return Ok(CliRunResult {
+                    exit_code: -1,
+                    success: false,
+                });
+            }
+        };
 
         tracing::info!(
             "Executing '{}' with {} (trigger: {})",
@@ -370,15 +388,13 @@ impl Executor {
 }
 
 /// Resolve the full path to a CLI binary.
+///
+/// Delegates to `cli_strategy::resolve_binary`, which handles absolute
+/// paths, PATH lookup, and the `~/.<binary>/bin/<binary>` fallback for
+/// CLIs installed outside a PATH-minimal systemd user environment.
 fn resolve_cli_binary(cli: &Cli) -> Result<PathBuf> {
     let cmd_name = cli.command_name();
-    which::which(&cmd_name).map_err(|e| {
-        anyhow::anyhow!(
-            "CLI binary '{}' not found in PATH: {}. Make sure it is installed.",
-            cmd_name,
-            e
-        )
-    })
+    crate::domain::cli_strategy::resolve_binary(&cmd_name)
 }
 
 /// Build the CLI command with appropriate flags.
@@ -388,9 +404,9 @@ fn build_cli_command(
     prompt: &str,
     model: Option<&str>,
     working_dir: Option<&str>,
-) -> Command {
+) -> Result<Command> {
     let strategy = cli.strategy();
-    let mut cmd = strategy.build_command(prompt, model, working_dir);
+    let mut cmd = strategy.build_command(prompt, model, working_dir)?;
 
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
@@ -400,7 +416,7 @@ fn build_cli_command(
         cmd.current_dir(dir);
     }
 
-    cmd
+    Ok(cmd)
 }
 
 /// Append execution output to an agent's log file with rotation.

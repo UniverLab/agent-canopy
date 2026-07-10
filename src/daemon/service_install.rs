@@ -49,9 +49,29 @@ fn install_systemd_service(exe: &std::path::Path, port: u16) -> Result<()> {
     std::fs::create_dir_all(&unit_dir)?;
 
     let unit_path = unit_dir.join(SYSTEMD_SERVICE_NAME);
-    let exe_str = exe.display();
+    let exe_str = exe.display().to_string();
 
-    let unit_content = format!(
+    let current_path = std::env::var("PATH").unwrap_or_default();
+    let path_value = reconcile_path(unit_path.as_path(), &current_path);
+
+    let unit_content = render_unit_content(&exe_str, port, &path_value);
+
+    std::fs::write(&unit_path, unit_content)?;
+    println!("Created {}", unit_path.display());
+
+    ensure_linger_enabled();
+    reload_and_enable_service()?;
+
+    Ok(())
+}
+
+/// Render the systemd unit file contents.
+///
+/// Includes `Environment=PATH=` so CLI binaries installed under a user's
+/// home directory (e.g. `~/.opencode/bin`) resolve under the daemon's
+/// minimal systemd PATH, not just when the daemon inherits a shell's PATH.
+fn render_unit_content(exe_str: &str, port: u16, path_value: &str) -> String {
+    format!(
         r#"[Unit]
 Description=canopy daemon
 After=network.target
@@ -64,19 +84,61 @@ RestartSec=5
 StartLimitIntervalSec=60
 StartLimitBurst=5
 Environment=RUST_LOG=info
+Environment=PATH={path_value}
 
 [Install]
 WantedBy=default.target
 "#
+    )
+}
+
+/// Compute the `PATH` to write into the unit, preserving any custom entries
+/// from an existing unit's `Environment=PATH=` line that aren't present in
+/// `new_path`.
+///
+/// Reinstalling used to silently overwrite the whole unit file, wiping out
+/// any hand-added `Environment=PATH=` (e.g. one including `~/.opencode/bin`
+/// or `~/.grok/bin`). Rather than clobber it again, entries that would be
+/// lost are appended to the new PATH and reported on stdout.
+fn reconcile_path(unit_path: &std::path::Path, new_path: &str) -> String {
+    let Ok(existing) = std::fs::read_to_string(unit_path) else {
+        return new_path.to_string();
+    };
+
+    let Some(old_path) = existing
+        .lines()
+        .find_map(|line| line.strip_prefix("Environment=PATH="))
+    else {
+        return new_path.to_string();
+    };
+
+    if old_path == new_path {
+        return new_path.to_string();
+    }
+
+    let new_entries: std::collections::HashSet<&str> = new_path.split(':').collect();
+    let preserved: Vec<&str> = old_path
+        .split(':')
+        .filter(|entry| !entry.is_empty() && !new_entries.contains(entry))
+        .collect();
+
+    if preserved.is_empty() {
+        return new_path.to_string();
+    }
+
+    println!(
+        "  Existing {} has PATH entries not in the new PATH: {}",
+        SYSTEMD_SERVICE_NAME,
+        preserved.join(":")
     );
+    println!("  Keeping them appended so previously working CLIs don't break.");
 
-    std::fs::write(&unit_path, unit_content)?;
-    println!("Created {}", unit_path.display());
-
-    ensure_linger_enabled();
-    reload_and_enable_service()?;
-
-    Ok(())
+    let mut merged = new_path.to_string();
+    for entry in preserved {
+        merged.push(':');
+        merged.push_str(entry);
+    }
+    merged
 }
 
 fn ensure_linger_enabled() {
@@ -271,4 +333,51 @@ fn uninstall_launchd_service() -> Result<()> {
     println!("Removed {}", plist_path.display());
     println!("Service stopped and uninstalled");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Does not touch the user's real `~/.config/systemd/user/canopy.service`
+    /// — exercises the pure content-generation function directly.
+    #[test]
+    fn unit_template_includes_nonempty_path_environment() {
+        let content = render_unit_content("/usr/bin/canopy", 4177, "/usr/bin:/bin");
+
+        let path_line = content
+            .lines()
+            .find(|line| line.starts_with("Environment=PATH="))
+            .expect("unit must declare Environment=PATH=");
+        let value = path_line.trim_start_matches("Environment=PATH=");
+
+        assert!(!value.is_empty());
+    }
+
+    #[test]
+    fn reconcile_path_returns_new_path_when_no_existing_unit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit_path = tmp.path().join("canopy.service");
+
+        let result = reconcile_path(&unit_path, "/usr/bin:/bin");
+
+        assert_eq!(result, "/usr/bin:/bin");
+    }
+
+    #[test]
+    fn reconcile_path_preserves_custom_entries_missing_from_new_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit_path = tmp.path().join("canopy.service");
+        std::fs::write(
+            &unit_path,
+            "[Service]\nEnvironment=PATH=/home/u/.opencode/bin:/usr/bin:/bin\n",
+        )
+        .unwrap();
+
+        let result = reconcile_path(&unit_path, "/usr/bin:/bin");
+
+        assert!(result.contains("/home/u/.opencode/bin"));
+        assert!(result.contains("/usr/bin"));
+        assert!(result.contains("/bin"));
+    }
 }

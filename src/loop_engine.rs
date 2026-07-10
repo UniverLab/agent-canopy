@@ -404,7 +404,8 @@ async fn execute_agent_node(
 
     let mut command = cli
         .strategy()
-        .build_command(&prompt, model, Some(&lp.workdir));
+        .build_command(&prompt, model, Some(&lp.workdir))
+        .with_context(|| format!("Agent node '{}' failed to start.", node.name))?;
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_minutes * 60),
         command.output(),
