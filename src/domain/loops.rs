@@ -388,7 +388,10 @@ pub struct SpecPool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopSpec {
     pub id: String,
-    pub loop_id: String,
+    /// The loop this spec has been assigned to. `None` means the spec is a
+    /// standalone backlog item — authored ahead of time, not yet queued into
+    /// any loop's run.
+    pub loop_id: Option<String>,
     pub name: String,
     pub description: Option<String>,
     pub position: i64,
@@ -404,6 +407,11 @@ pub struct LoopSpec {
     /// isn't a git repo or the spec hasn't started yet.
     #[serde(default)]
     pub spec_start_head: Option<String>,
+    /// Optional workdir tag for backlog filtering only (`spec_list`). It does
+    /// not drive execution — the run that eventually assigns this spec to a
+    /// loop decides the actual workdir.
+    #[serde(default)]
+    pub workdir: Option<String>,
 }
 
 /// A node in either a spec's graph or a loop's top-level graph.

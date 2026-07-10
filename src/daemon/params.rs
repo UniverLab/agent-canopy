@@ -339,6 +339,47 @@ pub struct LoopUpdateSpecParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SpecCreateParams {
+    /// Human-readable spec name.
+    pub name: String,
+    /// Spec description, following the same required template as
+    /// `loop_add_spec` (functional/non-functional requirements, objective,
+    /// constraints, guidelines, in/out of scope).
+    pub description: String,
+    /// Optional absolute workdir tag, for backlog filtering only — it does
+    /// not drive execution.
+    pub workdir: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SpecListParams {
+    /// Filter to specs tagged with this absolute workdir.
+    pub workdir: Option<String>,
+    /// Filter to specs in this status (pending, running, completed, failed, skipped).
+    pub status: Option<String>,
+    /// Only return specs not yet assigned to any loop.
+    pub unassigned_only: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SpecUpdateParams {
+    /// Existing spec ID.
+    pub spec_id: String,
+    /// New human-readable spec name.
+    pub name: Option<String>,
+    /// New spec description, following the required template.
+    pub description: Option<String>,
+    /// New absolute workdir tag, or null to clear it.
+    pub workdir: Option<Option<String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SpecDeleteParams {
+    /// Existing spec ID.
+    pub spec_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LoopAddNodeParams {
     /// Existing spec ID. Provide exactly one of `spec_id`/`loop_id`.
     pub spec_id: Option<String>,

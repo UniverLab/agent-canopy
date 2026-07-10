@@ -91,6 +91,17 @@ pub(crate) fn validate_absolute_dir(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Unlike [`validate_absolute_dir`], a spec's `workdir` tag doesn't require
+/// the directory to exist yet — a backlog spec can be authored for a workdir
+/// before that project is cloned or a loop targeting it is created. It's
+/// only ever used for filtering (`spec_list`), never to drive execution.
+fn validate_spec_workdir(path: &str) -> Result<(), String> {
+    if !std::path::Path::new(path).is_absolute() {
+        return Err("Spec workdir must be an absolute path.".into());
+    }
+    Ok(())
+}
+
 /// Build a loop [`Trigger`] from MCP parameters, reusing the same cron/watch
 /// validation as agents. Returns `Ok(None)` for a manual loop (no trigger or
 /// `kind = "manual"`), and an `Err(message)` for invalid input.
@@ -215,10 +226,15 @@ fn resolve_graph_target(
 
 fn validate_position_conflict(
     db: &Database,
-    loop_id: &str,
+    loop_id: Option<&str>,
     exclude_spec_id: &str,
     position: i64,
 ) -> Result<(), String> {
+    // A standalone spec (no loop yet) has no sibling positions to conflict
+    // with — position only matters once it's ordered within a loop.
+    let Some(loop_id) = loop_id else {
+        return Ok(());
+    };
     let conflict = db
         .list_loop_specs(loop_id)
         .map_err(|e| e.to_string())?
@@ -231,6 +247,24 @@ fn validate_position_conflict(
     } else {
         Ok(())
     }
+}
+
+/// Refuse to delete a spec that's still bound to a loop, with an actionable
+/// message pointing at the fix (detach it, or delete the loop instead).
+///
+/// Note: a loop's `spec_pool` (see `loop_pool_add`) is a template of
+/// node/edge shapes keyed by name — it never references a standalone spec's
+/// `id`, so there is currently no way for a spec to be "referenced by a
+/// pool" the way it can be "bound to a loop". If pools gain that ability
+/// later, extend this check then.
+fn validate_spec_deletable(spec: &LoopSpec) -> Result<(), String> {
+    if let Some(loop_id) = &spec.loop_id {
+        return Err(format!(
+            "Spec '{}' is bound to loop '{loop_id}'; remove it from the loop (or delete the loop) before deleting the spec.",
+            spec.id
+        ));
+    }
+    Ok(())
 }
 
 /// Check a node's sibling graph — its spec's nodes, or its loop's top-level
@@ -276,6 +310,23 @@ fn validate_edge_condition(condition: &str) -> Result<LoopEdgeCondition, String>
 fn validate_node_kind(kind: &str) -> Result<LoopNodeKind, String> {
     LoopNodeKind::from_str(kind.trim())
         .ok_or_else(|| "Loop node kind must be one of: agent, check, gate.".to_string())
+}
+
+/// Unlike [`LoopSpecStatus::from_str`] (infallible, defaults to `Pending`
+/// for callers that already trust the value came from the DB), a
+/// `spec_list` status filter comes from the caller — an unrecognized value
+/// should be rejected, not silently reinterpreted as "pending".
+fn validate_spec_status(status: &str) -> Result<LoopSpecStatus, String> {
+    match status.trim().to_lowercase().as_str() {
+        "pending" => Ok(LoopSpecStatus::Pending),
+        "running" => Ok(LoopSpecStatus::Running),
+        "completed" => Ok(LoopSpecStatus::Completed),
+        "failed" => Ok(LoopSpecStatus::Failed),
+        "skipped" => Ok(LoopSpecStatus::Skipped),
+        _ => Err(
+            "Spec status must be one of: pending, running, completed, failed, skipped.".to_string(),
+        ),
+    }
 }
 
 fn json_value_kind_name(value: &serde_json::Value) -> &'static str {
@@ -517,6 +568,22 @@ fn perform_loop_reset(
 
 fn build_spec_update_response(spec_id: &str) -> CallToolResult {
     success_result(&format!("Loop spec '{spec_id}' updated."))
+}
+
+/// Summary JSON for `spec_list` — no run/blocker info, since a standalone
+/// (unassigned) spec has never run. Compare [`loop_spec_details_json`],
+/// which adds that runtime detail for specs already inside a loop.
+fn spec_summary_json(spec: &LoopSpec) -> serde_json::Value {
+    serde_json::json!({
+        "id": spec.id,
+        "loop_id": spec.loop_id,
+        "name": spec.name,
+        "description": spec.description,
+        "workdir": spec.workdir,
+        "position": spec.position,
+        "parallelizable": spec.parallelizable,
+        "status": spec.status.as_str(),
+    })
 }
 
 fn build_node_update_response(node_id: &str) -> CallToolResult {
@@ -2129,7 +2196,7 @@ impl TaskTriggerHandler {
 
         let spec = LoopSpec {
             id: uuid::Uuid::new_v4().to_string(),
-            loop_id: loop_id.to_string(),
+            loop_id: Some(loop_id.to_string()),
             name: name.to_string(),
             description: Some(description.to_string()),
             position: params.position,
@@ -2138,6 +2205,7 @@ impl TaskTriggerHandler {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            workdir: None,
         };
         self.db.insert_loop_spec(&spec).map_err(internal_error)?;
 
@@ -2179,7 +2247,9 @@ impl TaskTriggerHandler {
         };
 
         if let Some(position) = params.position {
-            if let Err(e) = validate_position_conflict(&self.db, &spec.loop_id, spec_id, position) {
+            if let Err(e) =
+                validate_position_conflict(&self.db, spec.loop_id.as_deref(), spec_id, position)
+            {
                 return Ok(error_result(&e));
             }
         }
@@ -2207,6 +2277,166 @@ impl TaskTriggerHandler {
             .map_err(internal_error)?;
 
         Ok(build_spec_update_response(spec_id))
+    }
+
+    #[tool(
+        name = "spec_create",
+        description = "Create a standalone spec (a backlog item) not yet assigned to any loop. Optionally tag it to a workdir for later filtering."
+    )]
+    async fn spec_create(
+        &self,
+        Parameters(params): Parameters<SpecCreateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let name = params.name.trim();
+        if let Err(e) = validate_non_empty(name, "Spec name") {
+            return Ok(error_result(&e));
+        }
+        let description = params.description.trim();
+        if let Err(e) = validate_non_empty(description, "Spec description") {
+            return Ok(error_result(&e));
+        }
+        if let Err(error) = validate_spec_description_template(description) {
+            return Ok(error_result(&error));
+        }
+        let workdir = match params.workdir.as_deref().map(str::trim) {
+            Some("") | None => None,
+            Some(value) => {
+                if let Err(e) = validate_spec_workdir(value) {
+                    return Ok(error_result(&e));
+                }
+                Some(value.to_string())
+            }
+        };
+
+        let spec = LoopSpec {
+            id: uuid::Uuid::new_v4().to_string(),
+            loop_id: None,
+            name: name.to_string(),
+            description: Some(description.to_string()),
+            position: 0,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir,
+        };
+        self.db.insert_loop_spec(&spec).map_err(internal_error)?;
+
+        Ok(build_id_result(&spec.id, "spec_id"))
+    }
+
+    #[tool(
+        name = "spec_list",
+        description = "List standalone/backlog specs, optionally filtered by workdir tag, status, or unassigned-only."
+    )]
+    async fn spec_list(
+        &self,
+        Parameters(params): Parameters<SpecListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let status = match params.status.as_deref().map(str::trim) {
+            Some(value) => match validate_spec_status(value) {
+                Ok(status) => Some(status),
+                Err(e) => return Ok(error_result(&e)),
+            },
+            None => None,
+        };
+
+        let specs = self
+            .db
+            .list_specs(
+                params.workdir.as_deref(),
+                status,
+                params.unassigned_only.unwrap_or(false),
+            )
+            .map_err(internal_error)?;
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&serde_json::json!({
+                "specs": specs.iter().map(spec_summary_json).collect::<Vec<_>>(),
+            }))
+            .unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        name = "spec_update",
+        description = "Update a standalone spec's name, description, and/or workdir tag."
+    )]
+    async fn spec_update(
+        &self,
+        Parameters(params): Parameters<SpecUpdateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let spec_id = params.spec_id.trim();
+        if let Err(e) = validate_spec_exists(&self.db, spec_id) {
+            return Ok(error_result(&e));
+        }
+
+        let name = match params.name.as_deref().map(str::trim) {
+            Some("") => return Ok(error_result("Spec name must not be empty.")),
+            Some(value) => Some(value),
+            None => None,
+        };
+        let description = match params.description.as_deref().map(str::trim) {
+            Some("") => {
+                return Ok(error_result(
+                    "Spec description must not be empty and must follow the template.",
+                ))
+            }
+            Some(value) => {
+                if let Err(error) = validate_spec_description_template(value) {
+                    return Ok(error_result(&error));
+                }
+                Some(value)
+            }
+            None => None,
+        };
+        let workdir = match &params.workdir {
+            Some(Some(value)) => {
+                let trimmed = value.trim();
+                if let Err(e) = validate_spec_workdir(trimmed) {
+                    return Ok(error_result(&e));
+                }
+                Some(Some(trimmed))
+            }
+            Some(None) => Some(None),
+            None => None,
+        };
+
+        if let Err(e) = validate_at_least_one_bool(
+            &[name.is_some(), description.is_some(), workdir.is_some()],
+            "spec_update",
+        ) {
+            return Ok(error_result(&e));
+        }
+
+        self.db
+            .update_spec_tag_details(spec_id, name, description, workdir)
+            .map_err(internal_error)?;
+
+        Ok(build_spec_update_response(spec_id))
+    }
+
+    #[tool(
+        name = "spec_delete",
+        description = "Delete a standalone spec. Refuses to delete a spec that's bound to a loop."
+    )]
+    async fn spec_delete(
+        &self,
+        Parameters(params): Parameters<SpecDeleteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let spec_id = params.spec_id.trim();
+        let spec = match validate_spec_exists(&self.db, spec_id) {
+            Ok(spec) => spec,
+            Err(e) => return Ok(error_result(&e)),
+        };
+        if let Err(e) = validate_spec_deletable(&spec) {
+            return Ok(error_result(&e));
+        }
+
+        self.db.delete_loop_spec(spec_id).map_err(internal_error)?;
+
+        Ok(success_result(&format!("Spec '{spec_id}' deleted.")))
     }
 
     #[tool(
@@ -3421,7 +3651,8 @@ mod tests {
         append_pool_node, header_str, loop_details_json, missing_sync_identity_error,
         next_pool_position, perform_loop_reset, pool_nodes_json, remove_pool_node,
         reorder_pool_nodes, resolve_graph_target, validate_node_config, validate_pool_has_name,
-        validate_pool_name_unique, validate_pool_reorder, MISSING_SYNC_IDENTITY_MESSAGE,
+        validate_pool_name_unique, validate_pool_reorder, validate_spec_deletable,
+        MISSING_SYNC_IDENTITY_MESSAGE,
     };
     use crate::db::Database;
     use crate::domain::loops::{
@@ -3438,7 +3669,7 @@ mod tests {
     ) -> LoopSpec {
         LoopSpec {
             id: id.to_string(),
-            loop_id: loop_id.to_string(),
+            loop_id: Some(loop_id.to_string()),
             name: id.to_string(),
             description: None,
             position,
@@ -3447,7 +3678,36 @@ mod tests {
             started_at: None,
             completed_at: Some(chrono::Utc::now()),
             spec_start_head: None,
+            workdir: None,
         }
+    }
+
+    #[test]
+    fn spec_delete_refuses_loop_bound_spec_with_actionable_error() {
+        let spec = spec_with_status("loop-1", "spec-1", 1, LoopSpecStatus::Pending);
+
+        let error = validate_spec_deletable(&spec).unwrap_err();
+
+        assert!(
+            error.contains("spec-1"),
+            "error should name the spec: {error}"
+        );
+        assert!(
+            error.contains("loop-1"),
+            "error should name the loop: {error}"
+        );
+        assert!(
+            error.contains("remove it from the loop") || error.contains("delete the loop"),
+            "error should be actionable: {error}"
+        );
+    }
+
+    #[test]
+    fn spec_delete_allows_standalone_spec() {
+        let mut spec = spec_with_status("loop-1", "spec-1", 1, LoopSpecStatus::Pending);
+        spec.loop_id = None;
+
+        assert!(validate_spec_deletable(&spec).is_ok());
     }
 
     fn loop_reset_fixture(status: LoopStatus) -> (tempfile::TempDir, Database, String) {

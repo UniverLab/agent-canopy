@@ -207,7 +207,7 @@ impl Database {
 
             CREATE TABLE IF NOT EXISTS loop_specs (
                 id TEXT PRIMARY KEY,
-                loop_id TEXT NOT NULL REFERENCES loops(id) ON DELETE CASCADE,
+                loop_id TEXT REFERENCES loops(id) ON DELETE CASCADE,
                 name TEXT NOT NULL,
                 description TEXT,
                 position INTEGER NOT NULL,
@@ -215,7 +215,8 @@ impl Database {
                 status TEXT NOT NULL,
                 started_at INTEGER,
                 completed_at INTEGER,
-                spec_start_head TEXT
+                spec_start_head TEXT,
+                workdir TEXT
             );
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_loop_specs_position
@@ -393,6 +394,66 @@ impl Database {
             .unwrap_or(false);
         if !has_spec_start_head {
             conn.execute("ALTER TABLE loop_specs ADD COLUMN spec_start_head TEXT", [])
+                .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // Standalone specs (R3): a spec no longer must belong to a loop — it
+        // can exist as a backlog item (optionally tagged to a workdir)
+        // before being assigned. Older databases have `loop_id NOT NULL`,
+        // which `ALTER TABLE ... ADD COLUMN` cannot relax, so rebuild the
+        // table via SQLite's documented copy-and-rename procedure. Every
+        // existing row keeps its `loop_id`; only new rows may leave it NULL.
+        let loop_specs_loop_id_nullable: bool = conn
+            .query_row(
+                "SELECT \"notnull\" FROM pragma_table_info('loop_specs') WHERE name = 'loop_id'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|notnull| notnull == 0)
+            .unwrap_or(false);
+        if !loop_specs_loop_id_nullable {
+            conn.execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 BEGIN TRANSACTION;
+
+                 CREATE TABLE loop_specs_new (
+                     id TEXT PRIMARY KEY,
+                     loop_id TEXT REFERENCES loops(id) ON DELETE CASCADE,
+                     name TEXT NOT NULL,
+                     description TEXT,
+                     position INTEGER NOT NULL,
+                     parallelizable INTEGER NOT NULL DEFAULT 0,
+                     status TEXT NOT NULL,
+                     started_at INTEGER,
+                     completed_at INTEGER,
+                     spec_start_head TEXT
+                 );
+                 INSERT INTO loop_specs_new (id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head)
+                     SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head FROM loop_specs;
+                 DROP TABLE loop_specs;
+                 ALTER TABLE loop_specs_new RENAME TO loop_specs;
+
+                 CREATE UNIQUE INDEX IF NOT EXISTS idx_loop_specs_position
+                     ON loop_specs(loop_id, position);
+
+                 COMMIT;
+                 PRAGMA foreign_keys=ON;",
+            )
+            .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // Optional workdir tag on specs (R3), for backlog filtering only —
+        // it never drives execution. Nullable, so existing (loop-bound)
+        // specs are unaffected; older databases predate the column.
+        let has_spec_workdir: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loop_specs') WHERE name = 'workdir'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_spec_workdir {
+            conn.execute("ALTER TABLE loop_specs ADD COLUMN workdir TEXT", [])
                 .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
         }
 

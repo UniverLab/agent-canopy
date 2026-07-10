@@ -281,8 +281,8 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         conn.execute(
-            "INSERT INTO loop_specs (id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO loop_specs (id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head, workdir)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 &spec.id,
                 &spec.loop_id,
@@ -294,6 +294,7 @@ impl Database {
                 spec.started_at.map(|value| value.timestamp()),
                 spec.completed_at.map(|value| value.timestamp()),
                 &spec.spec_start_head,
+                &spec.workdir,
             ],
         )?;
         Ok(())
@@ -305,7 +306,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head
+            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head, workdir
              FROM loop_specs WHERE loop_id = ?1 ORDER BY position ASC",
         )?;
         let rows = stmt.query_map(params![loop_id], map_loop_spec_row)?;
@@ -320,13 +321,88 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head
+            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head, workdir
              FROM loop_specs WHERE id = ?1",
         )?;
 
         stmt.query_row(params![spec_id], map_loop_spec_row)
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Standalone specs, i.e. the backlog: specs not (yet) assigned to any
+    /// loop, optionally filtered by their `workdir` tag and/or status.
+    /// `unassigned_only` additionally filters to `loop_id IS NULL` — set it
+    /// to `false` to see every spec regardless of loop assignment.
+    pub fn list_specs(
+        &self,
+        workdir: Option<&str>,
+        status: Option<LoopSpecStatus>,
+        unassigned_only: bool,
+    ) -> Result<Vec<LoopSpec>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head, workdir
+             FROM loop_specs
+             WHERE (?1 IS NULL OR workdir = ?1)
+               AND (?2 IS NULL OR status = ?2)
+               AND (?3 = 0 OR loop_id IS NULL)
+             ORDER BY rowid ASC",
+        )?;
+        let rows = stmt.query_map(
+            params![workdir, status.map(LoopSpecStatus::as_str), unassigned_only],
+            map_loop_spec_row,
+        )?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Update a standalone/backlog spec's name, description, and/or workdir
+    /// tag. Unlike [`Self::update_loop_spec_details`] (position/parallelizable,
+    /// used by `loop_update_spec`), this is for `spec_update` and never
+    /// touches loop assignment or ordering.
+    pub fn update_spec_tag_details(
+        &self,
+        spec_id: &str,
+        name: Option<&str>,
+        description: Option<&str>,
+        workdir: Option<Option<&str>>,
+    ) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE loop_specs
+             SET name = COALESCE(?1, name),
+                 description = COALESCE(?2, description),
+                 workdir = CASE WHEN ?3 IS NULL THEN workdir ELSE ?4 END
+             WHERE id = ?5",
+            params![
+                name,
+                description,
+                workdir.map(|_| 1),
+                workdir.flatten(),
+                spec_id
+            ],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Delete a spec outright. Callers must enforce the loop-binding guard
+    /// (see `spec_delete`'s handler) before calling this — this function
+    /// performs no such check itself.
+    pub fn delete_loop_spec(&self, spec_id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute("DELETE FROM loop_specs WHERE id = ?1", params![spec_id])?;
+        Ok(rows > 0)
     }
 
     /// Record the workdir's git HEAD at the moment a spec starts running.
@@ -876,6 +952,7 @@ fn map_loop_spec_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoopSpec> {
             .map(from_timestamp)
             .transpose()?,
         spec_start_head: row.get(9)?,
+        workdir: row.get(10)?,
     })
 }
 

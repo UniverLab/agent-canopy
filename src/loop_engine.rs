@@ -711,7 +711,7 @@ mod tests {
         };
         let spec = crate::domain::loops::LoopSpec {
             id: "spec-test".to_string(),
-            loop_id: lp.id.clone(),
+            loop_id: Some(lp.id.clone()),
             name: "Spec".to_string(),
             description: Some(
                 "Functional Requirements:\n- A\n\nNon-Functional Requirements:\n- B\n\nObjective:\n- C\n\nConstraints:\n- D\n\nGuidelines:\n- E\n\nIn Scope:\n- F\n\nOut of Scope:\n- G".to_string(),
@@ -722,6 +722,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            workdir: None,
         };
 
         db.insert_loop(&lp)?;
@@ -936,7 +937,7 @@ mod tests {
     fn resolve_spec_start_retries_last_running_node() {
         let spec = LoopSpec {
             id: "spec".to_string(),
-            loop_id: "wf".to_string(),
+            loop_id: Some("wf".to_string()),
             name: "Spec".to_string(),
             description: None,
             position: 1,
@@ -945,6 +946,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            workdir: None,
         };
         let details = crate::domain::loops::LoopSpecDetails {
             spec: spec.clone(),
@@ -988,7 +990,7 @@ mod tests {
     fn resolve_spec_start_resets_iterations_for_fresh_spec() {
         let spec = LoopSpec {
             id: "spec".to_string(),
-            loop_id: "wf".to_string(),
+            loop_id: Some("wf".to_string()),
             name: "Spec".to_string(),
             description: None,
             position: 1,
@@ -997,6 +999,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            workdir: None,
         };
         let details = crate::domain::loops::LoopSpecDetails {
             spec: spec.clone(),
@@ -1044,7 +1047,7 @@ mod tests {
         // start (lowest position), not an error.
         let spec = LoopSpec {
             id: "spec".to_string(),
-            loop_id: "wf".to_string(),
+            loop_id: Some("wf".to_string()),
             name: "Spec".to_string(),
             description: None,
             position: 1,
@@ -1053,6 +1056,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            workdir: None,
         };
         let node = |id: &str, position: i64| LoopNode {
             id: id.to_string(),
@@ -1116,7 +1120,7 @@ mod tests {
         };
         let spec = LoopSpec {
             id: "spec".to_string(),
-            loop_id: "wf".to_string(),
+            loop_id: Some("wf".to_string()),
             name: "Spec".to_string(),
             description: Some("Do the thing".to_string()),
             position: 1,
@@ -1125,6 +1129,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            workdir: None,
         };
         let node = LoopNode {
             id: "node-1".to_string(),
@@ -1210,7 +1215,7 @@ mod tests {
     fn second_spec(loop_id: &str, id: &str, position: i64) -> LoopSpec {
         LoopSpec {
             id: id.to_string(),
-            loop_id: loop_id.to_string(),
+            loop_id: Some(loop_id.to_string()),
             name: format!("Spec {id}"),
             description: Some(
                 "Functional Requirements:\n- A\n\nNon-Functional Requirements:\n- B\n\nObjective:\n- C\n\nConstraints:\n- D\n\nGuidelines:\n- E\n\nIn Scope:\n- F\n\nOut of Scope:\n- G".to_string(),
@@ -1221,6 +1226,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            workdir: None,
         }
     }
 

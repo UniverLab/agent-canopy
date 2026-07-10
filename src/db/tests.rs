@@ -108,7 +108,7 @@ fn sample_loop(id: &str) -> Loop {
 fn sample_loop_spec(loop_id: &str, id: &str, position: i64) -> LoopSpec {
     LoopSpec {
         id: id.to_string(),
-        loop_id: loop_id.to_string(),
+        loop_id: Some(loop_id.to_string()),
         name: format!("Spec {position}"),
         description: Some("Do a slice of the feature".to_string()),
         position,
@@ -117,6 +117,7 @@ fn sample_loop_spec(loop_id: &str, id: &str, position: i64) -> LoopSpec {
         started_at: None,
         completed_at: None,
         spec_start_head: None,
+        workdir: None,
     }
 }
 
@@ -707,6 +708,179 @@ fn loop_graph_migration_adds_loop_id_and_is_idempotent_across_reopen() {
     })
     .unwrap();
     assert_eq!(db.list_loop_nodes_for_loop("legacy-loop").unwrap().len(), 1);
+}
+
+#[test]
+fn loop_specs_migration_relaxes_loop_id_and_adds_workdir_and_is_idempotent() {
+    // Simulate a pre-R3 database: `loop_specs` with `loop_id NOT NULL` and
+    // no `workdir` column — the real shape of databases in the field before
+    // this migration. The migration must rebuild the table (SQLite can't
+    // relax NOT NULL via ALTER TABLE ADD COLUMN) without losing existing
+    // (loop-bound) rows, and running it again on an already-migrated
+    // database must be a no-op.
+    let tmp = NamedTempFile::new().expect("create temp file");
+    let path = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+
+    {
+        let conn = rusqlite::Connection::open(&path).expect("open raw legacy db");
+        conn.execute_batch(
+            "CREATE TABLE loops (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                workdir TEXT NOT NULL,
+                status TEXT NOT NULL,
+                trigger_type TEXT,
+                trigger_config TEXT,
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER,
+                autorun_at INTEGER
+             );
+             CREATE TABLE loop_specs (
+                id TEXT PRIMARY KEY,
+                loop_id TEXT NOT NULL REFERENCES loops(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                description TEXT,
+                position INTEGER NOT NULL,
+                parallelizable INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER
+             );
+             INSERT INTO loops (id, name, workdir, status, created_at)
+                 VALUES ('legacy-loop', 'Legacy', '/tmp', 'draft', 0);
+             INSERT INTO loop_specs (id, loop_id, name, position, status)
+                 VALUES ('legacy-spec', 'legacy-loop', 'Spec', 1, 'pending');",
+        )
+        .expect("seed legacy schema");
+    }
+
+    // Opening the DB (Database::new runs the migration) must rebuild the
+    // table without losing the pre-existing, loop-bound row.
+    let db = Database::new(&path).expect("open db, running migration");
+    let spec = db.get_loop_spec("legacy-spec").unwrap().unwrap();
+    assert_eq!(spec.loop_id.as_deref(), Some("legacy-loop"));
+    assert_eq!(spec.workdir, None);
+    drop(db);
+
+    // Reopening after the migration already ran must be a no-op: same data,
+    // no error (idempotent).
+    let db = Database::new(&path).expect("reopen db after migration already applied");
+    let spec = db.get_loop_spec("legacy-spec").unwrap().unwrap();
+    assert_eq!(spec.loop_id.as_deref(), Some("legacy-loop"));
+    assert_eq!(
+        db.list_loop_specs("legacy-loop").unwrap().len(),
+        1,
+        "loop-bound spec must survive the rebuild"
+    );
+
+    // The rebuilt table now supports standalone specs (no loop) too.
+    db.insert_loop_spec(&LoopSpec {
+        id: "standalone-spec".to_string(),
+        loop_id: None,
+        name: "Backlog item".to_string(),
+        description: Some("Do a thing".to_string()),
+        position: 0,
+        parallelizable: false,
+        status: LoopSpecStatus::Pending,
+        started_at: None,
+        completed_at: None,
+        spec_start_head: None,
+        workdir: Some("/tmp/project".to_string()),
+    })
+    .unwrap();
+    let standalone = db.get_loop_spec("standalone-spec").unwrap().unwrap();
+    assert_eq!(standalone.loop_id, None);
+    assert_eq!(standalone.workdir.as_deref(), Some("/tmp/project"));
+}
+
+fn sample_standalone_spec(id: &str, workdir: Option<&str>) -> LoopSpec {
+    LoopSpec {
+        id: id.to_string(),
+        loop_id: None,
+        name: format!("Backlog {id}"),
+        description: Some(
+            "Functional Requirements:\n- A\n\nNon-Functional Requirements:\n- B\n\nObjective:\n- C\n\nConstraints:\n- D\n\nGuidelines:\n- E\n\nIn Scope:\n- F\n\nOut of Scope:\n- G".to_string(),
+        ),
+        position: 0,
+        parallelizable: false,
+        status: LoopSpecStatus::Pending,
+        started_at: None,
+        completed_at: None,
+        spec_start_head: None,
+        workdir: workdir.map(str::to_string),
+    }
+}
+
+#[test]
+fn standalone_spec_crud_round_trip() {
+    let db = test_db();
+    let spec = sample_standalone_spec("backlog-1", Some("/tmp/project-a"));
+    db.insert_loop_spec(&spec).unwrap();
+
+    let fetched = db.get_loop_spec("backlog-1").unwrap().unwrap();
+    assert_eq!(fetched.loop_id, None);
+    assert_eq!(fetched.workdir.as_deref(), Some("/tmp/project-a"));
+    assert_eq!(fetched.name, "Backlog backlog-1");
+
+    let updated = db
+        .update_spec_tag_details(
+            "backlog-1",
+            Some("Renamed"),
+            None,
+            Some(Some("/tmp/project-b")),
+        )
+        .unwrap();
+    assert!(updated);
+    let fetched = db.get_loop_spec("backlog-1").unwrap().unwrap();
+    assert_eq!(fetched.name, "Renamed");
+    assert_eq!(fetched.workdir.as_deref(), Some("/tmp/project-b"));
+
+    let deleted = db.delete_loop_spec("backlog-1").unwrap();
+    assert!(deleted);
+    assert!(db.get_loop_spec("backlog-1").unwrap().is_none());
+}
+
+#[test]
+fn list_specs_filters_by_workdir_and_unassigned_only() {
+    let db = test_db();
+    let lp = sample_loop("wf-backlog");
+    db.insert_loop(&lp).unwrap();
+    let bound_spec = sample_loop_spec(&lp.id, "bound-spec", 1);
+    db.insert_loop_spec(&bound_spec).unwrap();
+
+    let standalone_a = sample_standalone_spec("standalone-a", Some("/tmp/project-a"));
+    let standalone_b = sample_standalone_spec("standalone-b", Some("/tmp/project-b"));
+    db.insert_loop_spec(&standalone_a).unwrap();
+    db.insert_loop_spec(&standalone_b).unwrap();
+
+    // No filters: every spec, bound or not.
+    let all = db.list_specs(None, None, false).unwrap();
+    assert_eq!(all.len(), 3);
+
+    // Filter by workdir: only the matching standalone spec.
+    let by_workdir = db.list_specs(Some("/tmp/project-a"), None, false).unwrap();
+    assert_eq!(by_workdir.len(), 1);
+    assert_eq!(by_workdir[0].id, "standalone-a");
+
+    // unassigned_only excludes the loop-bound spec.
+    let unassigned = db.list_specs(None, None, true).unwrap();
+    assert_eq!(unassigned.len(), 2);
+    assert!(unassigned.iter().all(|s| s.loop_id.is_none()));
+    assert!(unassigned.iter().any(|s| s.id == "standalone-a"));
+    assert!(unassigned.iter().any(|s| s.id == "standalone-b"));
+
+    // Filter by status: none of these are running.
+    let running = db
+        .list_specs(None, Some(LoopSpecStatus::Running), false)
+        .unwrap();
+    assert!(running.is_empty());
+    let pending = db
+        .list_specs(None, Some(LoopSpecStatus::Pending), false)
+        .unwrap();
+    assert_eq!(pending.len(), 3);
 }
 
 #[test]
