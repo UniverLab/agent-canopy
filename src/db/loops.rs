@@ -255,7 +255,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let rows = conn.execute(
-            "UPDATE loop_specs SET status = ?1, started_at = NULL, completed_at = NULL WHERE id = ?2",
+            "UPDATE loop_specs SET status = ?1, started_at = NULL, completed_at = NULL, spec_start_head = NULL WHERE id = ?2",
             params![LoopSpecStatus::Pending.as_str(), spec_id],
         )?;
         Ok(rows > 0)
@@ -281,8 +281,8 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         conn.execute(
-            "INSERT INTO loop_specs (id, loop_id, name, description, position, parallelizable, status, started_at, completed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO loop_specs (id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 &spec.id,
                 &spec.loop_id,
@@ -293,6 +293,7 @@ impl Database {
                 spec.status.as_str(),
                 spec.started_at.map(|value| value.timestamp()),
                 spec.completed_at.map(|value| value.timestamp()),
+                &spec.spec_start_head,
             ],
         )?;
         Ok(())
@@ -304,7 +305,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at
+            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head
              FROM loop_specs WHERE loop_id = ?1 ORDER BY position ASC",
         )?;
         let rows = stmt.query_map(params![loop_id], map_loop_spec_row)?;
@@ -319,13 +320,29 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at
+            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head
              FROM loop_specs WHERE id = ?1",
         )?;
 
         stmt.query_row(params![spec_id], map_loop_spec_row)
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Record the workdir's git HEAD at the moment a spec starts running.
+    /// Called once per spec (not per node) — see [`crate::loop_engine`]'s
+    /// `{{spec_start_head}}` placeholder. `head = None` means the workdir
+    /// isn't a git repo; the column is cleared rather than left stale.
+    pub fn set_loop_spec_start_head(&self, spec_id: &str, head: Option<&str>) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE loop_specs SET spec_start_head = ?1 WHERE id = ?2",
+            params![head, spec_id],
+        )?;
+        Ok(rows > 0)
     }
 
     pub fn update_loop_spec_details(
@@ -796,6 +813,7 @@ fn map_loop_spec_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoopSpec> {
             .get::<_, Option<i64>>(8)?
             .map(from_timestamp)
             .transpose()?,
+        spec_start_head: row.get(9)?,
     })
 }
 

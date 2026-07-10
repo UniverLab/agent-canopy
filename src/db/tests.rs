@@ -116,6 +116,7 @@ fn sample_loop_spec(loop_id: &str, id: &str, position: i64) -> LoopSpec {
         status: LoopSpecStatus::Pending,
         started_at: None,
         completed_at: None,
+        spec_start_head: None,
     }
 }
 
@@ -591,6 +592,40 @@ fn loop_updates_persist_metadata_and_positions() {
         Some(&serde_json::json!("output_contains"))
     );
     assert_eq!(edge.condition, LoopEdgeCondition::Fail);
+}
+
+#[test]
+fn loop_spec_start_head_persists_through_reread() {
+    // G4: spec_start_head must survive a fresh read from the DB (e.g. after a
+    // daemon restart), not just live on the in-memory LoopSpec that set it.
+    let db = test_db();
+    let lp = sample_loop("wf-start-head");
+    let spec = sample_loop_spec(&lp.id, "spec-start-head", 1);
+
+    db.insert_loop(&lp).unwrap();
+    db.insert_loop_spec(&spec).unwrap();
+
+    let fresh = db.get_loop_spec(&spec.id).unwrap().unwrap();
+    assert_eq!(fresh.spec_start_head, None);
+
+    assert!(db
+        .set_loop_spec_start_head(&spec.id, Some("e1c134b"))
+        .unwrap());
+
+    let reread = db.get_loop_spec(&spec.id).unwrap().unwrap();
+    assert_eq!(reread.spec_start_head.as_deref(), Some("e1c134b"));
+
+    let listed = db
+        .list_loop_specs(&lp.id)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.id == spec.id)
+        .unwrap();
+    assert_eq!(listed.spec_start_head.as_deref(), Some("e1c134b"));
+
+    assert!(db.set_loop_spec_start_head(&spec.id, None).unwrap());
+    let cleared = db.get_loop_spec(&spec.id).unwrap().unwrap();
+    assert_eq!(cleared.spec_start_head, None);
 }
 
 #[test]

@@ -396,6 +396,14 @@ pub struct LoopSpec {
     pub status: LoopSpecStatus,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+    /// The loop's workdir `git rev-parse HEAD`, captured once when this spec
+    /// starts running (not per node). Lets `check` nodes verify "did this
+    /// spec commit anything?" via `{{spec_start_head}}` without relying on
+    /// state outside the spec row (e.g. a file marker) that would survive a
+    /// daemon restart and produce false positives. `None` when the workdir
+    /// isn't a git repo or the spec hasn't started yet.
+    #[serde(default)]
+    pub spec_start_head: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

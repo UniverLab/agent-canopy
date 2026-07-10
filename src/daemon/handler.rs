@@ -2087,6 +2087,7 @@ impl TaskTriggerHandler {
             status: LoopSpecStatus::Pending,
             started_at: None,
             completed_at: None,
+            spec_start_head: None,
         };
         self.db.insert_loop_spec(&spec).map_err(internal_error)?;
 
@@ -3359,6 +3360,7 @@ mod tests {
             status,
             started_at: None,
             completed_at: Some(chrono::Utc::now()),
+            spec_start_head: None,
         }
     }
 

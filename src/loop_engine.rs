@@ -133,6 +133,20 @@ impl LoopEngine {
         let (mut current_node_id, mut previous_output, mut iterations) =
             resolve_spec_start(&spec_details, spec, &existing_runs)?;
 
+        // Capture the workdir's git HEAD once, at the moment the spec starts
+        // running — not on every node. A resumed spec (interrupted mid-run
+        // by e.g. a daemon restart, then continued) reuses the value it
+        // already persisted instead of re-capturing, so `{{spec_start_head}}`
+        // always means "HEAD when this spec began", never "HEAD right now".
+        let spec_start_head = if spec.status == LoopSpecStatus::Running {
+            spec_details.spec.spec_start_head.clone()
+        } else {
+            let head = capture_workdir_head(&lp.workdir).await;
+            self.db
+                .set_loop_spec_start_head(&spec.id, head.as_deref())?;
+            head
+        };
+
         self.db.update_loop_spec_status(
             &spec.id,
             LoopSpecStatus::Running,
@@ -178,7 +192,14 @@ impl LoopEngine {
                 iteration: *iteration as i64,
             })?;
             let execution = self
-                .execute_node(lp, spec, node, previous_output.as_ref(), &run_id)
+                .execute_node(
+                    lp,
+                    spec,
+                    node,
+                    previous_output.as_ref(),
+                    spec_start_head.as_deref(),
+                    &run_id,
+                )
                 .await?;
             let run = self
                 .db
@@ -251,10 +272,11 @@ impl LoopEngine {
         spec: &LoopSpec,
         node: &LoopNode,
         previous_output: Option<&Value>,
+        spec_start_head: Option<&str>,
         run_id: &str,
     ) -> Result<NodeExecution> {
         match node.kind {
-            LoopNodeKind::Check => execute_check_node(lp, spec, node).await,
+            LoopNodeKind::Check => execute_check_node(lp, spec, node, spec_start_head).await,
             LoopNodeKind::Gate => execute_gate_node(node, previous_output),
             LoopNodeKind::Agent => {
                 execute_agent_node(&self.db, lp, spec, node, previous_output, run_id).await
@@ -282,14 +304,16 @@ async fn execute_check_node(
     lp: &crate::domain::loops::Loop,
     spec: &LoopSpec,
     node: &LoopNode,
+    spec_start_head: Option<&str>,
 ) -> Result<NodeExecution> {
-    let command = node
+    let raw_command = node
         .config
         .get("command")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("Check node '{}' is missing a command.", node.name))?;
+    let command = raw_command.replace("{{spec_start_head}}", spec_start_head.unwrap_or(""));
     let success_condition = node
         .config
         .get("success_condition")
@@ -301,7 +325,7 @@ async fn execute_check_node(
         .and_then(Value::as_u64)
         .unwrap_or(120);
 
-    let mut process = shell_command(command);
+    let mut process = shell_command(&command);
     process.current_dir(&lp.workdir);
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_seconds),
@@ -589,6 +613,25 @@ fn render_agent_prompt(
     )
 }
 
+/// The workdir's current `git rev-parse HEAD`, or `None` if it isn't a git
+/// repo (or the command otherwise fails). Never errors the caller — a check
+/// node that references `{{spec_start_head}}` in a non-git workdir just sees
+/// an empty string and decides for itself, per `execute_check_node`.
+async fn capture_workdir_head(workdir: &str) -> Option<String> {
+    let output = Command::new("git")
+        .arg("rev-parse")
+        .arg("HEAD")
+        .current_dir(workdir)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let head = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!head.is_empty()).then_some(head)
+}
+
 fn resolve_spec_start(
     spec_details: &crate::domain::loops::LoopSpecDetails,
     spec: &LoopSpec,
@@ -655,6 +698,7 @@ mod tests {
             status: LoopSpecStatus::Pending,
             started_at: None,
             completed_at: None,
+            spec_start_head: None,
         };
 
         db.insert_loop(&lp)?;
@@ -667,6 +711,118 @@ mod tests {
             lp.id,
             spec.id,
         ))
+    }
+
+    fn init_git_repo(path: &std::path::Path) {
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .status()
+                .expect("git command failed to run");
+            assert!(status.success(), "git {:?} failed", args);
+        };
+        run(&["init", "-q"]);
+        std::fs::write(path.join("README.md"), "test").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+    }
+
+    fn git_head(path: &std::path::Path) -> String {
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(path)
+            .output()
+            .expect("git rev-parse failed to run");
+        assert!(output.status.success(), "git rev-parse HEAD failed");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn loop_engine_captures_spec_start_head_for_git_workdir() {
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        init_git_repo(dir.path());
+        let expected_head = git_head(dir.path());
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: spec_id.clone(),
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id).await.unwrap();
+
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(
+            spec.spec_start_head.as_deref(),
+            Some(expected_head.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_engine_substitutes_spec_start_head_in_check_command() {
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        init_git_repo(dir.path());
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: spec_id.clone(),
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "test \"$(git rev-parse HEAD)\" = \"{{spec_start_head}}\"",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id.clone()).await.unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Completed);
+        assert_eq!(spec.status, LoopSpecStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn loop_engine_substitutes_empty_spec_start_head_for_non_git_workdir() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: spec_id.clone(),
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "test -z \"{{spec_start_head}}\"",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id.clone()).await.unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Completed);
+        assert_eq!(spec.status, LoopSpecStatus::Completed);
+        assert_eq!(spec.spec_start_head, None);
     }
 
     #[tokio::test]
@@ -758,6 +914,7 @@ mod tests {
             status: LoopSpecStatus::Running,
             started_at: None,
             completed_at: None,
+            spec_start_head: None,
         };
         let details = crate::domain::loops::LoopSpecDetails {
             spec: spec.clone(),
@@ -808,6 +965,7 @@ mod tests {
             status: LoopSpecStatus::Pending,
             started_at: None,
             completed_at: None,
+            spec_start_head: None,
         };
         let details = crate::domain::loops::LoopSpecDetails {
             spec: spec.clone(),
@@ -862,6 +1020,7 @@ mod tests {
             status: LoopSpecStatus::Pending,
             started_at: None,
             completed_at: None,
+            spec_start_head: None,
         };
         let node = |id: &str, position: i64| LoopNode {
             id: id.to_string(),
@@ -928,6 +1087,7 @@ mod tests {
             status: LoopSpecStatus::Pending,
             started_at: None,
             completed_at: None,
+            spec_start_head: None,
         };
         let node = LoopNode {
             id: "node-1".to_string(),

@@ -214,7 +214,8 @@ impl Database {
                 parallelizable INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL,
                 started_at INTEGER,
-                completed_at INTEGER
+                completed_at INTEGER,
+                spec_start_head TEXT
             );
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_loop_specs_position
@@ -372,6 +373,22 @@ impl Database {
             .unwrap_or(false);
         if !has_spec_pool {
             conn.execute("ALTER TABLE loops ADD COLUMN spec_pool TEXT", [])
+                .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // `spec_start_head` records the workdir's git HEAD when a spec starts
+        // running, so `check` nodes can verify a spec actually committed
+        // without relying on a file marker outside the spec row. Older
+        // databases predate the column.
+        let has_spec_start_head: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loop_specs') WHERE name = 'spec_start_head'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_spec_start_head {
+            conn.execute("ALTER TABLE loop_specs ADD COLUMN spec_start_head TEXT", [])
                 .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
         }
 
