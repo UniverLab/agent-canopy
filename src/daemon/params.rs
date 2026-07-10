@@ -340,8 +340,11 @@ pub struct LoopUpdateSpecParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LoopAddNodeParams {
-    /// Existing spec ID.
-    pub spec_id: String,
+    /// Existing spec ID. Provide exactly one of `spec_id`/`loop_id`.
+    pub spec_id: Option<String>,
+    /// Existing loop ID, to add this node to the loop's top-level graph
+    /// instead of a spec's graph. Provide exactly one of `spec_id`/`loop_id`.
+    pub loop_id: Option<String>,
     /// Human-readable node name.
     pub name: String,
     /// Node kind: agent, check, or gate.
@@ -366,8 +369,11 @@ pub struct LoopUpdateNodeParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LoopAddEdgeParams {
-    /// Existing spec ID.
-    pub spec_id: String,
+    /// Existing spec ID. Provide exactly one of `spec_id`/`loop_id`.
+    pub spec_id: Option<String>,
+    /// Existing loop ID, to add this edge to the loop's top-level graph
+    /// instead of a spec's graph. Provide exactly one of `spec_id`/`loop_id`.
+    pub loop_id: Option<String>,
     /// Source node ID.
     pub from_node: String,
     /// Destination node ID.

@@ -223,12 +223,14 @@ impl Database {
 
             CREATE TABLE IF NOT EXISTS loop_nodes (
                 id TEXT PRIMARY KEY,
-                spec_id TEXT NOT NULL REFERENCES loop_specs(id) ON DELETE CASCADE,
+                spec_id TEXT REFERENCES loop_specs(id) ON DELETE CASCADE,
+                loop_id TEXT REFERENCES loops(id) ON DELETE CASCADE,
                 name TEXT NOT NULL,
                 kind TEXT NOT NULL,
                 config TEXT NOT NULL,
                 position INTEGER NOT NULL,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                CHECK ((spec_id IS NULL) <> (loop_id IS NULL))
             );
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_loop_nodes_position
@@ -236,10 +238,12 @@ impl Database {
 
             CREATE TABLE IF NOT EXISTS loop_edges (
                 id TEXT PRIMARY KEY,
-                spec_id TEXT NOT NULL REFERENCES loop_specs(id) ON DELETE CASCADE,
+                spec_id TEXT REFERENCES loop_specs(id) ON DELETE CASCADE,
+                loop_id TEXT REFERENCES loops(id) ON DELETE CASCADE,
                 from_node TEXT NOT NULL REFERENCES loop_nodes(id) ON DELETE CASCADE,
                 to_node TEXT NOT NULL REFERENCES loop_nodes(id) ON DELETE CASCADE,
-                condition TEXT NOT NULL
+                condition TEXT NOT NULL,
+                CHECK ((spec_id IS NULL) <> (loop_id IS NULL))
             );
 
             CREATE INDEX IF NOT EXISTS idx_loop_edges_spec_from
@@ -391,6 +395,83 @@ impl Database {
             conn.execute("ALTER TABLE loop_specs ADD COLUMN spec_start_head TEXT", [])
                 .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
         }
+
+        // Loop-level graphs (R1): a node/edge may now target a loop directly
+        // (`loop_id`) instead of a spec, so it can be defined once per loop
+        // instead of being repeated across every spec. Older databases have
+        // `spec_id NOT NULL` on both tables, which `ALTER TABLE ... ADD
+        // COLUMN` cannot relax, so rebuild the tables via SQLite's documented
+        // copy-and-rename procedure ("Making Other Kinds Of Table Schema
+        // Changes"). Every existing row keeps its `spec_id`; `loop_id` starts
+        // NULL for all of them, so nothing already saved changes meaning.
+        let has_loop_nodes_loop_id: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loop_nodes') WHERE name = 'loop_id'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_loop_nodes_loop_id {
+            conn.execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 BEGIN TRANSACTION;
+
+                 CREATE TABLE loop_nodes_new (
+                     id TEXT PRIMARY KEY,
+                     spec_id TEXT REFERENCES loop_specs(id) ON DELETE CASCADE,
+                     loop_id TEXT REFERENCES loops(id) ON DELETE CASCADE,
+                     name TEXT NOT NULL,
+                     kind TEXT NOT NULL,
+                     config TEXT NOT NULL,
+                     position INTEGER NOT NULL,
+                     created_at INTEGER NOT NULL,
+                     CHECK ((spec_id IS NULL) <> (loop_id IS NULL))
+                 );
+                 INSERT INTO loop_nodes_new (id, spec_id, loop_id, name, kind, config, position, created_at)
+                     SELECT id, spec_id, NULL, name, kind, config, position, created_at FROM loop_nodes;
+                 DROP TABLE loop_nodes;
+                 ALTER TABLE loop_nodes_new RENAME TO loop_nodes;
+
+                 CREATE UNIQUE INDEX IF NOT EXISTS idx_loop_nodes_position
+                     ON loop_nodes(spec_id, position);
+                 CREATE UNIQUE INDEX IF NOT EXISTS idx_loop_nodes_loop_position
+                     ON loop_nodes(loop_id, position);
+
+                 CREATE TABLE loop_edges_new (
+                     id TEXT PRIMARY KEY,
+                     spec_id TEXT REFERENCES loop_specs(id) ON DELETE CASCADE,
+                     loop_id TEXT REFERENCES loops(id) ON DELETE CASCADE,
+                     from_node TEXT NOT NULL REFERENCES loop_nodes(id) ON DELETE CASCADE,
+                     to_node TEXT NOT NULL REFERENCES loop_nodes(id) ON DELETE CASCADE,
+                     condition TEXT NOT NULL,
+                     CHECK ((spec_id IS NULL) <> (loop_id IS NULL))
+                 );
+                 INSERT INTO loop_edges_new (id, spec_id, loop_id, from_node, to_node, condition)
+                     SELECT id, spec_id, NULL, from_node, to_node, condition FROM loop_edges;
+                 DROP TABLE loop_edges;
+                 ALTER TABLE loop_edges_new RENAME TO loop_edges;
+
+                 CREATE INDEX IF NOT EXISTS idx_loop_edges_spec_from
+                     ON loop_edges(spec_id, from_node);
+                 CREATE INDEX IF NOT EXISTS idx_loop_edges_loop_from
+                     ON loop_edges(loop_id, from_node);
+
+                 COMMIT;
+                 PRAGMA foreign_keys=ON;",
+            )
+            .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // These reference `loop_id`, so they can only be created once the
+        // column is guaranteed to exist — either from the fresh CREATE TABLE
+        // above (new databases) or the rebuild just above (migrated ones).
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_loop_nodes_loop_position
+                 ON loop_nodes(loop_id, position);
+             CREATE INDEX IF NOT EXISTS idx_loop_edges_loop_from
+                 ON loop_edges(loop_id, from_node);",
+        )
+        .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
 
         Ok(())
     }

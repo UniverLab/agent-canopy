@@ -406,10 +406,16 @@ pub struct LoopSpec {
     pub spec_start_head: Option<String>,
 }
 
+/// A node in either a spec's graph or a loop's top-level graph.
+///
+/// Exactly one of `spec_id`/`loop_id` is set — enforced by the DB layer (see
+/// [`crate::db::Database::insert_loop_node`]) rather than by this type, since
+/// callers build a `LoopNode` before it has been validated against the DB.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopNode {
     pub id: String,
-    pub spec_id: String,
+    pub spec_id: Option<String>,
+    pub loop_id: Option<String>,
     pub name: String,
     pub kind: LoopNodeKind,
     pub config: Value,
@@ -417,10 +423,15 @@ pub struct LoopNode {
     pub created_at: DateTime<Utc>,
 }
 
+/// An edge in either a spec's graph or a loop's top-level graph.
+///
+/// Exactly one of `spec_id`/`loop_id` is set — same invariant as
+/// [`LoopNode`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopEdge {
     pub id: String,
-    pub spec_id: String,
+    pub spec_id: Option<String>,
+    pub loop_id: Option<String>,
     pub from_node: String,
     pub to_node: String,
     pub condition: LoopEdgeCondition,
@@ -450,6 +461,11 @@ pub struct LoopSpecDetails {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopDetails {
     pub lp: Loop,
+    /// The loop-level graph: nodes/edges that target the loop directly
+    /// (`loop_id`) rather than any one spec. Defined once per loop instead of
+    /// being repeated across every spec.
+    pub graph_nodes: Vec<LoopNode>,
+    pub graph_edges: Vec<LoopEdge>,
     pub specs: Vec<LoopSpecDetails>,
 }
 

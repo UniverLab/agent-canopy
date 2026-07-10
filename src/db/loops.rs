@@ -397,16 +397,18 @@ impl Database {
     }
 
     pub fn insert_loop_node(&self, node: &LoopNode) -> Result<()> {
+        validate_single_target(node.spec_id.as_deref(), node.loop_id.as_deref())?;
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         conn.execute(
-            "INSERT INTO loop_nodes (id, spec_id, name, kind, config, position, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO loop_nodes (id, spec_id, loop_id, name, kind, config, position, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 &node.id,
                 &node.spec_id,
+                &node.loop_id,
                 &node.name,
                 node.kind.as_str(),
                 serde_json::to_string(&node.config)?,
@@ -423,10 +425,27 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, spec_id, name, kind, config, position, created_at
+            "SELECT id, spec_id, loop_id, name, kind, config, position, created_at
              FROM loop_nodes WHERE spec_id = ?1 ORDER BY position ASC",
         )?;
         let rows = stmt.query_map(params![spec_id], map_loop_node_row)?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Nodes belonging to a loop's top-level graph (as opposed to any one
+    /// spec's graph).
+    pub fn list_loop_nodes_for_loop(&self, loop_id: &str) -> Result<Vec<LoopNode>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, spec_id, loop_id, name, kind, config, position, created_at
+             FROM loop_nodes WHERE loop_id = ?1 ORDER BY position ASC",
+        )?;
+        let rows = stmt.query_map(params![loop_id], map_loop_node_row)?;
 
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
@@ -438,7 +457,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, spec_id, name, kind, config, position, created_at
+            "SELECT id, spec_id, loop_id, name, kind, config, position, created_at
              FROM loop_nodes WHERE id = ?1",
         )?;
         stmt.query_row(params![node_id], map_loop_node_row)
@@ -477,16 +496,18 @@ impl Database {
     }
 
     pub fn insert_loop_edge(&self, edge: &LoopEdge) -> Result<()> {
+        validate_single_target(edge.spec_id.as_deref(), edge.loop_id.as_deref())?;
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         conn.execute(
-            "INSERT INTO loop_edges (id, spec_id, from_node, to_node, condition)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO loop_edges (id, spec_id, loop_id, from_node, to_node, condition)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 &edge.id,
                 &edge.spec_id,
+                &edge.loop_id,
                 &edge.from_node,
                 &edge.to_node,
                 edge.condition.as_str(),
@@ -501,10 +522,27 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, spec_id, from_node, to_node, condition
+            "SELECT id, spec_id, loop_id, from_node, to_node, condition
              FROM loop_edges WHERE spec_id = ?1 ORDER BY rowid ASC",
         )?;
         let rows = stmt.query_map(params![spec_id], map_loop_edge_row)?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Edges belonging to a loop's top-level graph (as opposed to any one
+    /// spec's graph).
+    pub fn list_loop_edges_for_loop(&self, loop_id: &str) -> Result<Vec<LoopEdge>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, spec_id, loop_id, from_node, to_node, condition
+             FROM loop_edges WHERE loop_id = ?1 ORDER BY rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![loop_id], map_loop_edge_row)?;
 
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
@@ -516,7 +554,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, spec_id, from_node, to_node, condition
+            "SELECT id, spec_id, loop_id, from_node, to_node, condition
              FROM loop_edges WHERE id = ?1",
         )?;
         stmt.query_row(params![edge_id], map_loop_edge_row)
@@ -721,6 +759,8 @@ impl Database {
         let Some(lp) = self.get_loop(loop_id)? else {
             return Ok(None);
         };
+        let graph_nodes = self.list_loop_nodes_for_loop(loop_id)?;
+        let graph_edges = self.list_loop_edges_for_loop(loop_id)?;
         let specs = self
             .list_loop_specs(loop_id)?
             .into_iter()
@@ -731,7 +771,29 @@ impl Database {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        Ok(Some(LoopDetails { lp, specs }))
+        Ok(Some(LoopDetails {
+            lp,
+            graph_nodes,
+            graph_edges,
+            specs,
+        }))
+    }
+}
+
+/// A loop node/edge must target exactly one of `spec_id`/`loop_id` — never
+/// both (ambiguous ownership) and never neither (orphaned row no graph
+/// would ever load). Checked here, before the row ever reaches the DB, so
+/// callers get an actionable message instead of a raw `CHECK constraint
+/// failed` from SQLite.
+fn validate_single_target(spec_id: Option<&str>, loop_id: Option<&str>) -> Result<()> {
+    match (spec_id, loop_id) {
+        (Some(_), Some(_)) => Err(anyhow!(
+            "Loop node/edge must target exactly one of spec_id or loop_id, not both."
+        )),
+        (None, None) => Err(anyhow!(
+            "Loop node/edge must target exactly one of spec_id or loop_id."
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -818,9 +880,9 @@ fn map_loop_spec_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoopSpec> {
 }
 
 fn map_loop_node_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoopNode> {
-    let kind = LoopNodeKind::from_str(&row.get::<_, String>(3)?).ok_or_else(|| {
+    let kind = LoopNodeKind::from_str(&row.get::<_, String>(4)?).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
-            3,
+            4,
             rusqlite::types::Type::Text,
             Box::new(IoError::new(
                 ErrorKind::InvalidData,
@@ -828,24 +890,25 @@ fn map_loop_node_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoopNode> {
             )),
         )
     })?;
-    let config_raw: String = row.get(4)?;
+    let config_raw: String = row.get(5)?;
     let config = parse_json_value(&config_raw)?;
 
     Ok(LoopNode {
         id: row.get(0)?,
         spec_id: row.get(1)?,
-        name: row.get(2)?,
+        loop_id: row.get(2)?,
+        name: row.get(3)?,
         kind,
         config,
-        position: row.get(5)?,
-        created_at: from_timestamp(row.get(6)?)?,
+        position: row.get(6)?,
+        created_at: from_timestamp(row.get(7)?)?,
     })
 }
 
 fn map_loop_edge_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoopEdge> {
-    let condition = LoopEdgeCondition::from_str(&row.get::<_, String>(4)?).ok_or_else(|| {
+    let condition = LoopEdgeCondition::from_str(&row.get::<_, String>(5)?).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
-            4,
+            5,
             rusqlite::types::Type::Text,
             Box::new(IoError::new(
                 ErrorKind::InvalidData,
@@ -857,8 +920,9 @@ fn map_loop_edge_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoopEdge> {
     Ok(LoopEdge {
         id: row.get(0)?,
         spec_id: row.get(1)?,
-        from_node: row.get(2)?,
-        to_node: row.get(3)?,
+        loop_id: row.get(2)?,
+        from_node: row.get(3)?,
+        to_node: row.get(4)?,
         condition,
     })
 }

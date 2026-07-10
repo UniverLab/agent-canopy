@@ -178,6 +178,41 @@ fn validate_edge_exists(db: &Database, edge_id: &str) -> Result<LoopEdge, String
         .ok_or_else(|| format!("Loop edge '{edge_id}' not found."))
 }
 
+/// Where a graph node/edge belongs: a spec's own graph, or a loop's
+/// top-level graph (shared across every spec in that loop).
+#[derive(Debug)]
+enum GraphTarget {
+    Spec(String),
+    Loop(String),
+}
+
+/// Resolve `spec_id`/`loop_id` MCP params into exactly one validated
+/// [`GraphTarget`]. Empty/whitespace-only strings are treated as absent, so
+/// a client that always sends both fields (one blank) still gets a clean
+/// "provide exactly one" error instead of a confusing "not found".
+fn resolve_graph_target(
+    db: &Database,
+    spec_id: Option<&str>,
+    loop_id: Option<&str>,
+) -> Result<GraphTarget, String> {
+    let spec_id = spec_id.map(str::trim).filter(|s| !s.is_empty());
+    let loop_id = loop_id.map(str::trim).filter(|s| !s.is_empty());
+    match (spec_id, loop_id) {
+        (Some(_), Some(_)) => {
+            Err("Provide exactly one of spec_id or loop_id, not both.".to_string())
+        }
+        (None, None) => Err("Provide exactly one of spec_id or loop_id.".to_string()),
+        (Some(spec_id), None) => {
+            validate_spec_exists(db, spec_id)?;
+            Ok(GraphTarget::Spec(spec_id.to_string()))
+        }
+        (None, Some(loop_id)) => {
+            validate_loop_exists(db, loop_id)?;
+            Ok(GraphTarget::Loop(loop_id.to_string()))
+        }
+    }
+}
+
 fn validate_position_conflict(
     db: &Database,
     loop_id: &str,
@@ -198,20 +233,35 @@ fn validate_position_conflict(
     }
 }
 
+/// Check a node's sibling graph — its spec's nodes, or its loop's top-level
+/// graph nodes — for a position conflict. `node` targets exactly one of
+/// `spec_id`/`loop_id` (the DB layer enforces it), so exactly one branch runs.
 fn validate_node_position_conflict(
     db: &Database,
-    spec_id: &str,
+    node: &LoopNode,
     exclude_node_id: &str,
     position: i64,
 ) -> Result<(), String> {
-    let conflict = db
-        .list_loop_nodes(spec_id)
-        .map_err(|e| e.to_string())?
-        .into_iter()
+    let (siblings, owner) = if let Some(spec_id) = &node.spec_id {
+        (
+            db.list_loop_nodes(spec_id).map_err(|e| e.to_string())?,
+            format!("Spec '{spec_id}'"),
+        )
+    } else if let Some(loop_id) = &node.loop_id {
+        (
+            db.list_loop_nodes_for_loop(loop_id)
+                .map_err(|e| e.to_string())?,
+            format!("Loop '{loop_id}'"),
+        )
+    } else {
+        return Ok(());
+    };
+    let conflict = siblings
+        .iter()
         .any(|n| n.id != exclude_node_id && n.position == position);
     if conflict {
         Err(format!(
-            "Spec '{spec_id}' already has a node at position {position}."
+            "{owner} already has a node at position {position}."
         ))
     } else {
         Ok(())
@@ -2161,7 +2211,7 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "loop_add_node",
-        description = "Add a graph node to an existing loop spec."
+        description = "Add a graph node to an existing loop spec, or (via loop_id instead of spec_id) to the loop's top-level graph."
     )]
     async fn loop_add_node(
         &self,
@@ -2171,10 +2221,14 @@ impl TaskTriggerHandler {
         if let Err(e) = validate_non_empty(name, "Loop node name") {
             return Ok(error_result(&e));
         }
-        let spec_id = params.spec_id.trim();
-        if let Err(e) = validate_spec_exists(&self.db, spec_id) {
-            return Ok(error_result(&e));
-        }
+        let target = match resolve_graph_target(
+            &self.db,
+            params.spec_id.as_deref(),
+            params.loop_id.as_deref(),
+        ) {
+            Ok(target) => target,
+            Err(e) => return Ok(error_result(&e)),
+        };
 
         let kind = match validate_node_kind(params.kind.trim()) {
             Ok(kind) => kind,
@@ -2185,17 +2239,33 @@ impl TaskTriggerHandler {
             return Ok(error_result(&e));
         }
 
-        let next_position = self
-            .db
-            .list_loop_nodes(spec_id)
-            .map_err(internal_error)?
-            .last()
-            .map(|node| node.position + 1)
-            .unwrap_or(1);
+        let (spec_id, loop_id, next_position) = match &target {
+            GraphTarget::Spec(spec_id) => {
+                let next_position = self
+                    .db
+                    .list_loop_nodes(spec_id)
+                    .map_err(internal_error)?
+                    .last()
+                    .map(|node| node.position + 1)
+                    .unwrap_or(1);
+                (Some(spec_id.clone()), None, next_position)
+            }
+            GraphTarget::Loop(loop_id) => {
+                let next_position = self
+                    .db
+                    .list_loop_nodes_for_loop(loop_id)
+                    .map_err(internal_error)?
+                    .last()
+                    .map(|node| node.position + 1)
+                    .unwrap_or(1);
+                (None, Some(loop_id.clone()), next_position)
+            }
+        };
 
         let node = LoopNode {
             id: uuid::Uuid::new_v4().to_string(),
-            spec_id: spec_id.to_string(),
+            spec_id,
+            loop_id,
             name: name.to_string(),
             kind,
             config,
@@ -2236,9 +2306,7 @@ impl TaskTriggerHandler {
         };
 
         if let Some(position) = params.position {
-            if let Err(e) =
-                validate_node_position_conflict(&self.db, &node.spec_id, node_id, position)
-            {
+            if let Err(e) = validate_node_position_conflict(&self.db, &node, node_id, position) {
                 return Ok(error_result(&e));
             }
         }
@@ -2273,7 +2341,7 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "loop_add_edge",
-        description = "Connect two nodes inside a loop spec with a routing condition."
+        description = "Connect two nodes with a routing condition, inside a loop spec's graph or (via loop_id instead of spec_id) the loop's top-level graph."
     )]
     async fn loop_add_edge(
         &self,
@@ -2283,28 +2351,40 @@ impl TaskTriggerHandler {
             Ok(c) => c,
             Err(e) => return Ok(error_result(&e)),
         };
+        let target = match resolve_graph_target(
+            &self.db,
+            params.spec_id.as_deref(),
+            params.loop_id.as_deref(),
+        ) {
+            Ok(target) => target,
+            Err(e) => return Ok(error_result(&e)),
+        };
 
-        let nodes = self
-            .db
-            .list_loop_nodes(&params.spec_id)
-            .map_err(internal_error)?;
-        if nodes.is_empty() {
-            return Ok(error_result(&format!(
-                "Spec '{}' not found.",
-                params.spec_id
-            )));
-        }
+        let nodes = match &target {
+            GraphTarget::Spec(spec_id) => {
+                self.db.list_loop_nodes(spec_id).map_err(internal_error)?
+            }
+            GraphTarget::Loop(loop_id) => self
+                .db
+                .list_loop_nodes_for_loop(loop_id)
+                .map_err(internal_error)?,
+        };
         let has_from = nodes.iter().any(|node| node.id == params.from_node);
         let has_to = nodes.iter().any(|node| node.id == params.to_node);
         if !has_from || !has_to {
             return Ok(error_result(
-                "Both loop edge endpoints must belong to the provided spec.",
+                "Both loop edge endpoints must belong to the same spec or loop graph as the edge.",
             ));
         }
 
+        let (spec_id, loop_id) = match target {
+            GraphTarget::Spec(spec_id) => (Some(spec_id), None),
+            GraphTarget::Loop(loop_id) => (None, Some(loop_id)),
+        };
         let edge = LoopEdge {
             id: uuid::Uuid::new_v4().to_string(),
-            spec_id: params.spec_id,
+            spec_id,
+            loop_id,
             from_node: params.from_node,
             to_node: params.to_node,
             condition,
@@ -3105,6 +3185,10 @@ fn loop_details_json(db: &Database, lp: &LoopDetails) -> anyhow::Result<serde_js
         "created_at": lp.lp.created_at.to_rfc3339(),
         "started_at": lp.lp.started_at.map(|value| value.to_rfc3339()),
         "completed_at": lp.lp.completed_at.map(|value| value.to_rfc3339()),
+        "graph": {
+            "nodes": lp.graph_nodes.iter().map(loop_node_json).collect::<Vec<_>>(),
+            "edges": lp.graph_edges.iter().map(loop_edge_json).collect::<Vec<_>>(),
+        },
         "specs": specs,
     }))
 }
@@ -3153,6 +3237,7 @@ fn loop_node_json(node: &LoopNode) -> serde_json::Value {
     serde_json::json!({
         "id": node.id,
         "spec_id": node.spec_id,
+        "loop_id": node.loop_id,
         "name": node.name,
         "kind": node.kind.as_str(),
         "config": node.config,
@@ -3165,6 +3250,7 @@ fn loop_edge_json(edge: &LoopEdge) -> serde_json::Value {
     serde_json::json!({
         "id": edge.id,
         "spec_id": edge.spec_id,
+        "loop_id": edge.loop_id,
         "from_node": edge.from_node,
         "to_node": edge.to_node,
         "condition": edge.condition.as_str(),
@@ -3332,14 +3418,14 @@ impl ServerHandler for TaskTriggerHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_pool_node, header_str, missing_sync_identity_error, next_pool_position,
-        perform_loop_reset, pool_nodes_json, remove_pool_node, reorder_pool_nodes,
-        validate_node_config, validate_pool_has_name, validate_pool_name_unique,
-        validate_pool_reorder, MISSING_SYNC_IDENTITY_MESSAGE,
+        append_pool_node, header_str, loop_details_json, missing_sync_identity_error,
+        next_pool_position, perform_loop_reset, pool_nodes_json, remove_pool_node,
+        reorder_pool_nodes, resolve_graph_target, validate_node_config, validate_pool_has_name,
+        validate_pool_name_unique, validate_pool_reorder, MISSING_SYNC_IDENTITY_MESSAGE,
     };
     use crate::db::Database;
     use crate::domain::loops::{
-        Loop, LoopNodeKind, LoopSpec, LoopSpecStatus, LoopStatus, SpecPoolNode,
+        Loop, LoopNode, LoopNodeKind, LoopSpec, LoopSpecStatus, LoopStatus, SpecPoolNode,
     };
     use crate::shared::sync_identity::CANOPY_AGENT_ID_HEADER;
     use tempfile::tempdir;
@@ -3738,5 +3824,68 @@ mod tests {
 
         let error = validate_pool_reorder(&pool, &order).unwrap_err();
         assert!(error.contains("more than once"), "{error}");
+    }
+
+    #[test]
+    fn resolve_graph_target_requires_exactly_one_of_spec_or_loop() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+
+        let neither = resolve_graph_target(&db, None, None).unwrap_err();
+        assert!(neither.contains("exactly one"), "{neither}");
+
+        let both = resolve_graph_target(&db, Some("spec-x"), Some("loop-x")).unwrap_err();
+        assert!(both.contains("exactly one"), "{both}");
+    }
+
+    #[test]
+    fn resolve_graph_target_rejects_unknown_loop_id() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+
+        let error = resolve_graph_target(&db, None, Some("does-not-exist")).unwrap_err();
+        assert!(error.contains("not found"), "{error}");
+    }
+
+    #[test]
+    fn loop_get_response_includes_loop_level_graph_alongside_specs() {
+        // R1: `loop_get` (via `loop_details_json`) must surface the
+        // loop-level graph, not just each spec's own nodes/edges.
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let loop_id = "loop-with-graph".to_string();
+        db.insert_loop(&Loop {
+            id: loop_id.clone(),
+            name: "Loop".to_string(),
+            description: None,
+            workdir: dir.path().to_string_lossy().to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            spec_pool: None,
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "graph-node".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "implement".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "claude"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let details = db.get_loop_details(&loop_id).unwrap().unwrap();
+        let json = loop_details_json(&db, &details).unwrap();
+
+        assert_eq!(json["graph"]["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(json["graph"]["nodes"][0]["id"], "graph-node");
+        assert_eq!(json["graph"]["nodes"][0]["loop_id"], loop_id);
+        assert!(json["specs"].as_array().unwrap().is_empty());
     }
 }

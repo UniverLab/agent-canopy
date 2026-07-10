@@ -751,7 +751,8 @@ mod tests {
 
         db.insert_loop_node(&LoopNode {
             id: "node-check".to_string(),
-            spec_id: spec_id.clone(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
             name: "check".to_string(),
             kind: LoopNodeKind::Check,
             config: serde_json::json!({
@@ -779,7 +780,8 @@ mod tests {
 
         db.insert_loop_node(&LoopNode {
             id: "node-check".to_string(),
-            spec_id: spec_id.clone(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
             name: "check".to_string(),
             kind: LoopNodeKind::Check,
             config: serde_json::json!({
@@ -805,7 +807,8 @@ mod tests {
 
         db.insert_loop_node(&LoopNode {
             id: "node-check".to_string(),
-            spec_id: spec_id.clone(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
             name: "check".to_string(),
             kind: LoopNodeKind::Check,
             config: serde_json::json!({
@@ -831,7 +834,8 @@ mod tests {
         let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
         let check = LoopNode {
             id: "node-check".to_string(),
-            spec_id: spec_id.clone(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
             name: "check".to_string(),
             kind: LoopNodeKind::Check,
             config: serde_json::json!({
@@ -843,7 +847,8 @@ mod tests {
         };
         let gate = LoopNode {
             id: "node-gate".to_string(),
-            spec_id: spec_id.clone(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
             name: "gate".to_string(),
             kind: LoopNodeKind::Gate,
             config: serde_json::json!({
@@ -859,7 +864,8 @@ mod tests {
         db.insert_loop_node(&gate).unwrap();
         db.insert_loop_edge(&LoopEdge {
             id: "edge-pass".to_string(),
-            spec_id: spec_id.clone(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
             from_node: check.id.clone(),
             to_node: gate.id.clone(),
             condition: crate::domain::loops::LoopEdgeCondition::Pass,
@@ -882,7 +888,8 @@ mod tests {
         let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
         db.insert_loop_node(&LoopNode {
             id: "node-check".to_string(),
-            spec_id: spec_id.clone(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
             name: "check".to_string(),
             kind: LoopNodeKind::Check,
             config: serde_json::json!({
@@ -921,7 +928,8 @@ mod tests {
             spec: spec.clone(),
             nodes: vec![LoopNode {
                 id: "node-1".to_string(),
-                spec_id: spec.id.clone(),
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
                 name: "Node".to_string(),
                 kind: LoopNodeKind::Check,
                 config: serde_json::json!({"command": "true"}),
@@ -972,7 +980,8 @@ mod tests {
             spec: spec.clone(),
             nodes: vec![LoopNode {
                 id: "node-1".to_string(),
-                spec_id: spec.id.clone(),
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
                 name: "Node".to_string(),
                 kind: LoopNodeKind::Check,
                 config: serde_json::json!({"command": "true"}),
@@ -1025,7 +1034,8 @@ mod tests {
         };
         let node = |id: &str, position: i64| LoopNode {
             id: id.to_string(),
-            spec_id: spec.id.clone(),
+            spec_id: Some(spec.id.clone()),
+            loop_id: None,
             name: id.to_string(),
             kind: LoopNodeKind::Agent,
             config: serde_json::json!({}),
@@ -1034,7 +1044,8 @@ mod tests {
         };
         let edge = |id: &str, from: &str, to: &str, condition| LoopEdge {
             id: id.to_string(),
-            spec_id: spec.id.clone(),
+            spec_id: Some(spec.id.clone()),
+            loop_id: None,
             from_node: from.to_string(),
             to_node: to.to_string(),
             condition,
@@ -1092,7 +1103,8 @@ mod tests {
         };
         let node = LoopNode {
             id: "node-1".to_string(),
-            spec_id: "spec".to_string(),
+            spec_id: Some("spec".to_string()),
+            loop_id: None,
             name: "Agent".to_string(),
             kind: LoopNodeKind::Agent,
             config: serde_json::json!({}),
@@ -1118,7 +1130,8 @@ mod tests {
     fn select_next_node_dedupes_identical_edges_to_same_target() {
         let edge = |id: &str, to: &str, condition| LoopEdge {
             id: id.to_string(),
-            spec_id: "spec".to_string(),
+            spec_id: Some("spec".to_string()),
+            loop_id: None,
             from_node: "implement".to_string(),
             to_node: to.to_string(),
             condition,
@@ -1145,7 +1158,8 @@ mod tests {
     fn select_next_node_errors_on_distinct_targets() {
         let edge = |id: &str, to: &str, condition| LoopEdge {
             id: id.to_string(),
-            spec_id: "spec".to_string(),
+            spec_id: Some("spec".to_string()),
+            loop_id: None,
             from_node: "implement".to_string(),
             to_node: to.to_string(),
             condition,

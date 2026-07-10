@@ -123,7 +123,8 @@ fn sample_loop_spec(loop_id: &str, id: &str, position: i64) -> LoopSpec {
 fn sample_loop_node(spec_id: &str, id: &str, position: i64) -> LoopNode {
     LoopNode {
         id: id.to_string(),
-        spec_id: spec_id.to_string(),
+        spec_id: Some(spec_id.to_string()),
+        loop_id: None,
         name: format!("Node {position}"),
         kind: LoopNodeKind::Check,
         config: serde_json::json!({
@@ -459,7 +460,8 @@ fn loop_details_roundtrip_preserves_order_and_graph() {
     let node_two = sample_loop_node(&spec_one.id, "node-2", 2);
     let edge = LoopEdge {
         id: "edge-1".to_string(),
-        spec_id: spec_one.id.clone(),
+        spec_id: Some(spec_one.id.clone()),
+        loop_id: None,
         from_node: node_one.id.clone(),
         to_node: node_two.id.clone(),
         condition: LoopEdgeCondition::Pass,
@@ -481,6 +483,230 @@ fn loop_details_roundtrip_preserves_order_and_graph() {
     assert_eq!(details.specs[0].nodes[1].id, node_two.id);
     assert_eq!(details.specs[0].edges[0].id, edge.id);
     assert_eq!(details.specs[1].spec.id, spec_two.id);
+    // Spec-level graph must be untouched by the loop-level graph work: no
+    // loop-level nodes/edges were defined for this loop.
+    assert!(details.graph_nodes.is_empty());
+    assert!(details.graph_edges.is_empty());
+}
+
+#[test]
+fn loop_level_graph_round_trips_through_insert_and_get_loop_details() {
+    // R1: a loop can define its graph once, at the loop level, instead of
+    // repeating the same nodes/edges in every spec. `get_loop_details` is
+    // exactly what the `loop_get` MCP tool returns.
+    let db = test_db();
+    let lp = sample_loop("wf-graph");
+    let node_one = LoopNode {
+        id: "graph-node-1".to_string(),
+        spec_id: None,
+        loop_id: Some(lp.id.clone()),
+        name: "implement".to_string(),
+        kind: LoopNodeKind::Agent,
+        config: serde_json::json!({"platform": "claude"}),
+        position: 1,
+        created_at: Utc::now(),
+    };
+    let node_two = LoopNode {
+        id: "graph-node-2".to_string(),
+        spec_id: None,
+        loop_id: Some(lp.id.clone()),
+        name: "review".to_string(),
+        kind: LoopNodeKind::Gate,
+        config: serde_json::json!({}),
+        position: 2,
+        created_at: Utc::now(),
+    };
+    let edge = LoopEdge {
+        id: "graph-edge-1".to_string(),
+        spec_id: None,
+        loop_id: Some(lp.id.clone()),
+        from_node: node_one.id.clone(),
+        to_node: node_two.id.clone(),
+        condition: LoopEdgeCondition::Always,
+    };
+
+    db.insert_loop(&lp).unwrap();
+    db.insert_loop_node(&node_one).unwrap();
+    db.insert_loop_node(&node_two).unwrap();
+    db.insert_loop_edge(&edge).unwrap();
+
+    let details = db.get_loop_details(&lp.id).unwrap().unwrap();
+
+    assert_eq!(details.graph_nodes.len(), 2);
+    assert_eq!(details.graph_nodes[0].id, node_one.id);
+    assert_eq!(
+        details.graph_nodes[0].loop_id.as_deref(),
+        Some(lp.id.as_str())
+    );
+    assert_eq!(details.graph_nodes[0].spec_id, None);
+    assert_eq!(details.graph_edges.len(), 1);
+    assert_eq!(details.graph_edges[0].id, edge.id);
+    assert_eq!(
+        details.graph_edges[0].loop_id.as_deref(),
+        Some(lp.id.as_str())
+    );
+    // A loop with no specs at all still round-trips a graph-only loop.
+    assert!(details.specs.is_empty());
+}
+
+#[test]
+fn loop_node_and_edge_require_exactly_one_target() {
+    // R1: every node/edge must target exactly one of (spec_id, loop_id).
+    // Enforced in the DB layer with an actionable error, not a raw SQLite
+    // CHECK constraint failure.
+    let db = test_db();
+    let lp = sample_loop("wf-target-validation");
+    let spec = sample_loop_spec(&lp.id, "spec-target-validation", 1);
+    db.insert_loop(&lp).unwrap();
+    db.insert_loop_spec(&spec).unwrap();
+
+    let base_node = LoopNode {
+        id: "node-both-or-neither".to_string(),
+        spec_id: None,
+        loop_id: None,
+        name: "n".to_string(),
+        kind: LoopNodeKind::Check,
+        config: serde_json::json!({"command": "true"}),
+        position: 1,
+        created_at: Utc::now(),
+    };
+
+    let neither_err = db.insert_loop_node(&base_node).unwrap_err().to_string();
+    assert!(
+        neither_err.contains("exactly one"),
+        "expected actionable message, got: {neither_err}"
+    );
+
+    let mut both_node = base_node;
+    both_node.spec_id = Some(spec.id.clone());
+    both_node.loop_id = Some(lp.id.clone());
+    let both_err = db.insert_loop_node(&both_node).unwrap_err().to_string();
+    assert!(
+        both_err.contains("exactly one"),
+        "expected actionable message, got: {both_err}"
+    );
+
+    let base_edge = LoopEdge {
+        id: "edge-both-or-neither".to_string(),
+        spec_id: None,
+        loop_id: None,
+        from_node: "a".to_string(),
+        to_node: "b".to_string(),
+        condition: LoopEdgeCondition::Always,
+    };
+    let neither_edge_err = db.insert_loop_edge(&base_edge).unwrap_err().to_string();
+    assert!(neither_edge_err.contains("exactly one"));
+
+    let mut both_edge = base_edge;
+    both_edge.spec_id = Some(spec.id);
+    both_edge.loop_id = Some(lp.id);
+    let both_edge_err = db.insert_loop_edge(&both_edge).unwrap_err().to_string();
+    assert!(both_edge_err.contains("exactly one"));
+}
+
+#[test]
+fn loop_graph_migration_adds_loop_id_and_is_idempotent_across_reopen() {
+    // Simulate a pre-R1 database: `loop_nodes`/`loop_edges` with `spec_id
+    // NOT NULL` and no `loop_id` column — the real shape of databases in the
+    // field before this migration. The migration must rebuild both tables
+    // (SQLite can't relax NOT NULL via ALTER TABLE ADD COLUMN) without
+    // losing the existing rows, and running it again on an already-migrated
+    // database must be a no-op.
+    let tmp = NamedTempFile::new().expect("create temp file");
+    let path = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+
+    {
+        let conn = rusqlite::Connection::open(&path).expect("open raw legacy db");
+        conn.execute_batch(
+            "CREATE TABLE loops (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                workdir TEXT NOT NULL,
+                status TEXT NOT NULL,
+                trigger_type TEXT,
+                trigger_config TEXT,
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER,
+                autorun_at INTEGER
+             );
+             CREATE TABLE loop_specs (
+                id TEXT PRIMARY KEY,
+                loop_id TEXT NOT NULL REFERENCES loops(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                description TEXT,
+                position INTEGER NOT NULL,
+                parallelizable INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER
+             );
+             CREATE TABLE loop_nodes (
+                id TEXT PRIMARY KEY,
+                spec_id TEXT NOT NULL REFERENCES loop_specs(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                config TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+             );
+             CREATE UNIQUE INDEX idx_loop_nodes_position ON loop_nodes(spec_id, position);
+             CREATE TABLE loop_edges (
+                id TEXT PRIMARY KEY,
+                spec_id TEXT NOT NULL REFERENCES loop_specs(id) ON DELETE CASCADE,
+                from_node TEXT NOT NULL REFERENCES loop_nodes(id) ON DELETE CASCADE,
+                to_node TEXT NOT NULL REFERENCES loop_nodes(id) ON DELETE CASCADE,
+                condition TEXT NOT NULL
+             );
+             INSERT INTO loops (id, name, workdir, status, created_at)
+                 VALUES ('legacy-loop', 'Legacy', '/tmp', 'draft', 0);
+             INSERT INTO loop_specs (id, loop_id, name, position, status)
+                 VALUES ('legacy-spec', 'legacy-loop', 'Spec', 1, 'pending');
+             INSERT INTO loop_nodes (id, spec_id, name, kind, config, position, created_at)
+                 VALUES ('legacy-node', 'legacy-spec', 'Node', 'check', '{\"command\":\"true\"}', 1, 0);
+             INSERT INTO loop_edges (id, spec_id, from_node, to_node, condition)
+                 VALUES ('legacy-edge', 'legacy-spec', 'legacy-node', 'legacy-node', 'always');",
+        )
+        .expect("seed legacy schema");
+    }
+
+    // Opening the DB (Database::new runs the migration) must rebuild both
+    // tables without losing the pre-existing rows.
+    let db = Database::new(&path).expect("open db, running migration");
+    let node = db.get_loop_node("legacy-node").unwrap().unwrap();
+    assert_eq!(node.spec_id.as_deref(), Some("legacy-spec"));
+    assert_eq!(node.loop_id, None);
+    let edge = db.get_loop_edge("legacy-edge").unwrap().unwrap();
+    assert_eq!(edge.spec_id.as_deref(), Some("legacy-spec"));
+    assert_eq!(edge.loop_id, None);
+    drop(db);
+
+    // Reopening after the migration already ran must be a no-op: same data,
+    // no error (idempotent).
+    let db = Database::new(&path).expect("reopen db after migration already applied");
+    let node = db.get_loop_node("legacy-node").unwrap().unwrap();
+    assert_eq!(node.spec_id.as_deref(), Some("legacy-spec"));
+    assert_eq!(
+        db.list_loop_edges("legacy-spec").unwrap().len(),
+        1,
+        "spec-level edge must survive the rebuild"
+    );
+
+    // The rebuilt table now supports loop-level nodes/edges too.
+    db.insert_loop_node(&LoopNode {
+        id: "graph-node".to_string(),
+        spec_id: None,
+        loop_id: Some("legacy-loop".to_string()),
+        name: "Graph node".to_string(),
+        kind: LoopNodeKind::Agent,
+        config: serde_json::json!({}),
+        position: 1,
+        created_at: Utc::now(),
+    })
+    .unwrap();
+    assert_eq!(db.list_loop_nodes_for_loop("legacy-loop").unwrap().len(), 1);
 }
 
 #[test]
@@ -536,7 +762,8 @@ fn loop_updates_persist_metadata_and_positions() {
     let node = sample_loop_node(&spec.id, "node-update", 1);
     let edge = LoopEdge {
         id: "edge-update".to_string(),
-        spec_id: spec.id.clone(),
+        spec_id: Some(spec.id.clone()),
+        loop_id: None,
         from_node: node.id.clone(),
         to_node: node.id.clone(),
         condition: LoopEdgeCondition::Always,
