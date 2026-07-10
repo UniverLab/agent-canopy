@@ -231,6 +231,20 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Replace a loop's `spec_pool` with `pool` (serialized as JSON).
+    pub fn update_loop_spec_pool(&self, loop_id: &str, pool: &SpecPool) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let encoded = serde_json::to_string(pool)?;
+        let rows = conn.execute(
+            "UPDATE loops SET spec_pool = ?1 WHERE id = ?2",
+            params![encoded, loop_id],
+        )?;
+        Ok(rows > 0)
+    }
+
     pub fn insert_loop_spec(&self, spec: &LoopSpec) -> Result<()> {
         let conn = self
             .conn

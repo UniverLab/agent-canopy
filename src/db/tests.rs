@@ -626,6 +626,53 @@ fn loop_without_spec_pool_round_trips_as_none() {
 }
 
 #[test]
+fn update_loop_spec_pool_adds_a_spec_to_an_empty_pool() {
+    let db = test_db();
+    let lp = sample_loop("wf-pool-add");
+    db.insert_loop(&lp).unwrap();
+    assert!(db
+        .get_loop("wf-pool-add")
+        .unwrap()
+        .unwrap()
+        .spec_pool
+        .is_none());
+
+    let pool = SpecPool {
+        id: "pool-1".to_string(),
+        name: "wf-pool-add spec pool".to_string(),
+        description: None,
+        nodes: vec![SpecPoolNode {
+            name: "review".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "claude"}),
+            position: 1,
+        }],
+        edges: vec![],
+    };
+    let updated = db.update_loop_spec_pool("wf-pool-add", &pool).unwrap();
+    assert!(updated);
+
+    let fetched = db.get_loop("wf-pool-add").unwrap().unwrap();
+    let fetched_pool = fetched.spec_pool.expect("pool should now be set");
+    assert_eq!(fetched_pool.nodes.len(), 1);
+    assert_eq!(fetched_pool.nodes[0].name, "review");
+}
+
+#[test]
+fn update_loop_spec_pool_returns_false_for_missing_loop() {
+    let db = test_db();
+    let pool = SpecPool {
+        id: "pool-1".to_string(),
+        name: "pool".to_string(),
+        description: None,
+        nodes: vec![],
+        edges: vec![],
+    };
+    let updated = db.update_loop_spec_pool("does-not-exist", &pool).unwrap();
+    assert!(!updated);
+}
+
+#[test]
 fn list_cron_and_watch_loops_filter_by_trigger_type() {
     let db = test_db();
     let cron = loop_with_trigger(

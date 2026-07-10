@@ -50,7 +50,7 @@ use crate::db::intelligence::IntelligenceNodeRecord;
 use crate::db::Database;
 use crate::domain::loops::{
     validate_spec_description_template, Loop, LoopDetails, LoopEdge, LoopEdgeCondition, LoopNode,
-    LoopNodeKind, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus,
+    LoopNodeKind, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus, SpecPool, SpecPoolNode,
 };
 use crate::domain::models::{Agent, Trigger};
 use crate::domain::sync::{MessageKind, MissionImpact, WorkspaceStatus};
@@ -151,6 +151,12 @@ fn validate_loop_exists(db: &Database, loop_id: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .is_some()
         .then_some(())
+        .ok_or_else(|| format!("Loop '{loop_id}' not found."))
+}
+
+fn validate_loop_and_get(db: &Database, loop_id: &str) -> Result<Loop, String> {
+    db.get_loop(loop_id)
+        .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Loop '{loop_id}' not found."))
 }
 
@@ -283,6 +289,57 @@ fn validate_node_config(kind: LoopNodeKind, config: &serde_json::Value) -> Resul
     }
 
     Ok(())
+}
+
+fn validate_pool_name_unique(pool: Option<&SpecPool>, name: &str) -> Result<(), String> {
+    if pool.is_some_and(|p| p.nodes.iter().any(|n| n.name == name)) {
+        Err(format!("Pool already has a spec named '{name}'."))
+    } else {
+        Ok(())
+    }
+}
+
+/// Next 1-based position for a new pool entry: one past the highest existing
+/// position, or 1 for an empty/missing pool.
+fn next_pool_position(pool: Option<&SpecPool>) -> i64 {
+    pool.and_then(|p| p.nodes.iter().map(|n| n.position).max())
+        .map(|max| max + 1)
+        .unwrap_or(1)
+}
+
+/// Append `node` to `existing`, creating a fresh (empty-edges) pool for the
+/// loop if it doesn't have one yet.
+fn append_pool_node(existing: Option<SpecPool>, loop_id: &str, node: SpecPoolNode) -> SpecPool {
+    match existing {
+        Some(mut pool) => {
+            pool.nodes.push(node);
+            pool
+        }
+        None => SpecPool {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: format!("{loop_id} spec pool"),
+            description: None,
+            nodes: vec![node],
+            edges: Vec::new(),
+        },
+    }
+}
+
+fn pool_nodes_json(pool: Option<&SpecPool>) -> Vec<serde_json::Value> {
+    pool.map(|p| {
+        p.nodes
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "name": n.name,
+                    "kind": n.kind.as_str(),
+                    "config": n.config,
+                    "position": n.position,
+                })
+            })
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 fn validate_at_least_one_bool(updates: &[bool], field_name: &str) -> Result<(), String> {
@@ -2182,6 +2239,75 @@ impl TaskTriggerHandler {
     }
 
     #[tool(
+        name = "loop_pool_add",
+        description = "Add a reusable spec to a loop's spec pool (a node template for building specs)."
+    )]
+    async fn loop_pool_add(
+        &self,
+        Parameters(params): Parameters<LoopPoolAddParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let name = params.name.trim();
+        if let Err(e) = validate_non_empty(name, "Pool spec name") {
+            return Ok(error_result(&e));
+        }
+        let loop_id = params.loop_id.trim();
+        let lp = match validate_loop_and_get(&self.db, loop_id) {
+            Ok(lp) => lp,
+            Err(e) => return Ok(error_result(&e)),
+        };
+
+        let kind = match validate_node_kind(params.kind.trim()) {
+            Ok(kind) => kind,
+            Err(e) => return Ok(error_result(&e)),
+        };
+        let config = serde_json::Value::Object(params.config);
+        if let Err(e) = validate_node_config(kind, &config) {
+            return Ok(error_result(&e));
+        }
+        if let Err(e) = validate_pool_name_unique(lp.spec_pool.as_ref(), name) {
+            return Ok(error_result(&e));
+        }
+
+        let node = SpecPoolNode {
+            name: name.to_string(),
+            kind,
+            config,
+            position: next_pool_position(lp.spec_pool.as_ref()),
+        };
+        let pool = append_pool_node(lp.spec_pool, loop_id, node);
+        self.db
+            .update_loop_spec_pool(loop_id, &pool)
+            .map_err(internal_error)?;
+
+        Ok(success_result(&format!(
+            "Spec '{name}' added to pool for loop '{loop_id}'."
+        )))
+    }
+
+    #[tool(
+        name = "loop_pool_list",
+        description = "List the specs in a loop's spec pool."
+    )]
+    async fn loop_pool_list(
+        &self,
+        Parameters(params): Parameters<LoopPoolListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let loop_id = params.loop_id.trim();
+        let lp = match validate_loop_and_get(&self.db, loop_id) {
+            Ok(lp) => lp,
+            Err(e) => return Ok(error_result(&e)),
+        };
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&serde_json::json!({
+                "loop_id": loop_id,
+                "specs": pool_nodes_json(lp.spec_pool.as_ref()),
+            }))
+            .unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
         name = "loop_get",
         description = "Return a loop with its ordered specs, nodes, and edges."
     )]
@@ -3018,10 +3144,11 @@ impl ServerHandler for TaskTriggerHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        header_str, missing_sync_identity_error, validate_node_config,
+        append_pool_node, header_str, missing_sync_identity_error, next_pool_position,
+        pool_nodes_json, validate_node_config, validate_pool_name_unique,
         MISSING_SYNC_IDENTITY_MESSAGE,
     };
-    use crate::domain::loops::LoopNodeKind;
+    use crate::domain::loops::{LoopNodeKind, SpecPoolNode};
     use crate::shared::sync_identity::CANOPY_AGENT_ID_HEADER;
 
     #[test]
@@ -3109,5 +3236,72 @@ mod tests {
 
         let error = missing_sync_identity_error();
         assert_eq!(error.message, MISSING_SYNC_IDENTITY_MESSAGE);
+    }
+
+    #[test]
+    fn pool_add_then_list_returns_the_added_spec() {
+        let node = SpecPoolNode {
+            name: "review".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({ "platform": "claude" }),
+            position: next_pool_position(None),
+        };
+        let pool = append_pool_node(None, "loop-1", node);
+
+        let specs = pool_nodes_json(Some(&pool));
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0]["name"], "review");
+        assert_eq!(specs[0]["kind"], "agent");
+        assert_eq!(specs[0]["position"], 1);
+    }
+
+    #[test]
+    fn pool_list_on_empty_pool_returns_no_specs() {
+        assert!(pool_nodes_json(None).is_empty());
+    }
+
+    #[test]
+    fn pool_position_increments_across_adds() {
+        let first = SpecPoolNode {
+            name: "implement".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({ "cli": "claude" }),
+            position: next_pool_position(None),
+        };
+        let pool = append_pool_node(None, "loop-1", first);
+
+        let second_position = next_pool_position(Some(&pool));
+        assert_eq!(second_position, 2);
+
+        let second = SpecPoolNode {
+            name: "verify".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({ "command": "cargo test" }),
+            position: second_position,
+        };
+        let pool = append_pool_node(Some(pool), "loop-1", second);
+
+        let specs = pool_nodes_json(Some(&pool));
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[1]["name"], "verify");
+        assert_eq!(specs[1]["position"], 2);
+    }
+
+    #[test]
+    fn pool_rejects_duplicate_spec_names() {
+        let node = SpecPoolNode {
+            name: "review".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({ "platform": "claude" }),
+            position: 1,
+        };
+        let pool = append_pool_node(None, "loop-1", node);
+
+        let error = validate_pool_name_unique(Some(&pool), "review").unwrap_err();
+        assert!(
+            error.contains("already has a spec named 'review'"),
+            "{error}"
+        );
     }
 }

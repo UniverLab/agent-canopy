@@ -385,6 +385,24 @@ pub struct LoopUpdateEdgeParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopPoolAddParams {
+    /// Existing loop ID.
+    pub loop_id: String,
+    /// Human-readable name for the pool entry (unique within the pool).
+    pub name: String,
+    /// Node kind: agent, check, or gate.
+    pub kind: String,
+    /// Kind-specific configuration object.
+    pub config: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopPoolListParams {
+    /// Existing loop ID.
+    pub loop_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LoopGetParams {
     /// Loop ID.
     pub loop_id: String,
