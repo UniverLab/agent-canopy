@@ -2,7 +2,7 @@ use super::*;
 use crate::db::intelligence::{IntelligenceNodeInput, IntelligenceRelationInput};
 use crate::domain::loops::{
     Loop, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind, LoopNodeRun, LoopRunStatus,
-    LoopSpec, LoopSpecStatus, LoopStatus,
+    LoopSpec, LoopSpecStatus, LoopStatus, SpecPool, SpecPoolEdge, SpecPoolNode,
 };
 use crate::domain::models::{Agent, Cli, RunLog, RunStatus, Trigger, TriggerType, WatchEvent};
 use crate::domain::sync::{
@@ -101,6 +101,7 @@ fn sample_loop(id: &str) -> Loop {
         started_at: None,
         completed_at: None,
         autorun_at: None,
+        spec_pool: None,
     }
 }
 
@@ -577,6 +578,51 @@ fn loop_trigger_round_trips_through_insert_and_get() {
     let fetched = db.get_loop("wf-cron").unwrap().unwrap();
     assert_eq!(fetched.schedule_expr(), Some("30 8 * * *"));
     assert!(fetched.is_cron());
+}
+
+#[test]
+fn loop_spec_pool_round_trips_through_insert_and_get() {
+    let db = test_db();
+    let pool = SpecPool {
+        id: "pool-1".to_string(),
+        name: "Agent review gate".to_string(),
+        description: Some("agent -> check -> gate".to_string()),
+        nodes: vec![
+            SpecPoolNode {
+                name: "implement".to_string(),
+                kind: LoopNodeKind::Agent,
+                config: serde_json::json!({"cli": "claude"}),
+                position: 0,
+            },
+            SpecPoolNode {
+                name: "reviewer-gate".to_string(),
+                kind: LoopNodeKind::Gate,
+                config: serde_json::json!({}),
+                position: 1,
+            },
+        ],
+        edges: vec![SpecPoolEdge {
+            from_node: "implement".to_string(),
+            to_node: "reviewer-gate".to_string(),
+            condition: LoopEdgeCondition::Pass,
+        }],
+    };
+    let mut lp = sample_loop("wf-spec-pool");
+    lp.spec_pool = Some(pool.clone());
+    db.insert_loop(&lp).unwrap();
+
+    let fetched = db.get_loop("wf-spec-pool").unwrap().unwrap();
+    assert_eq!(fetched.spec_pool, Some(pool));
+}
+
+#[test]
+fn loop_without_spec_pool_round_trips_as_none() {
+    let db = test_db();
+    let lp = sample_loop("wf-no-pool");
+    db.insert_loop(&lp).unwrap();
+
+    let fetched = db.get_loop("wf-no-pool").unwrap().unwrap();
+    assert_eq!(fetched.spec_pool, None);
 }
 
 #[test]

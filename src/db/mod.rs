@@ -198,7 +198,8 @@ impl Database {
                 created_at INTEGER NOT NULL,
                 started_at INTEGER,
                 completed_at INTEGER,
-                autorun_at INTEGER
+                autorun_at INTEGER,
+                spec_pool TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_loops_workdir_created
@@ -356,6 +357,21 @@ impl Database {
             .unwrap_or(false);
         if !has_autorun_at {
             conn.execute("ALTER TABLE loops ADD COLUMN autorun_at INTEGER", [])
+                .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // Spec pools (reusable node/edge templates for building loop specs)
+        // are a newer addition; older databases predate the column. Nullable,
+        // so existing loops are unaffected.
+        let has_spec_pool: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loops') WHERE name = 'spec_pool'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_spec_pool {
+            conn.execute("ALTER TABLE loops ADD COLUMN spec_pool TEXT", [])
                 .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
         }
 

@@ -7,7 +7,7 @@ use std::io::{Error as IoError, ErrorKind};
 use crate::db::Database;
 use crate::domain::loops::{
     Loop, LoopDetails, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind, LoopNodeRun,
-    LoopRunStatus, LoopSpec, LoopSpecDetails, LoopSpecStatus, LoopStatus,
+    LoopRunStatus, LoopSpec, LoopSpecDetails, LoopSpecStatus, LoopStatus, SpecPool,
 };
 use crate::domain::models::Trigger;
 
@@ -27,9 +27,14 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let (trigger_type, trigger_config) = encode_loop_trigger(lp.trigger.as_ref())?;
+        let spec_pool = lp
+            .spec_pool
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         conn.execute(
-            "INSERT INTO loops (id, name, description, workdir, status, trigger_type, trigger_config, created_at, started_at, completed_at, autorun_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO loops (id, name, description, workdir, status, trigger_type, trigger_config, created_at, started_at, completed_at, autorun_at, spec_pool)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 &lp.id,
                 &lp.name,
@@ -42,6 +47,7 @@ impl Database {
                 lp.started_at.map(|value| value.timestamp()),
                 lp.completed_at.map(|value| value.timestamp()),
                 lp.autorun_at.map(|value| value.timestamp()),
+                spec_pool,
             ],
         )?;
         Ok(())
@@ -82,7 +88,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, spec_pool
              FROM loops WHERE autorun_at IS NOT NULL",
         )?;
         let rows = stmt.query_map([], map_loop_row)?;
@@ -121,7 +127,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, spec_pool
              FROM loops WHERE trigger_type = ?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![trigger_type], map_loop_row)?;
@@ -166,7 +172,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, spec_pool
              FROM loops WHERE id = ?1",
         )?;
 
@@ -181,10 +187,10 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let sql = if workdir.is_some() {
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, spec_pool
              FROM loops WHERE workdir = ?1 ORDER BY created_at DESC"
         } else {
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, spec_pool
              FROM loops ORDER BY created_at DESC"
         };
         let mut stmt = conn.prepare(sql)?;
@@ -624,6 +630,18 @@ fn map_loop_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Loop> {
             .get::<_, Option<i64>>(9)?
             .map(from_timestamp)
             .transpose()?,
+        spec_pool: row
+            .get::<_, Option<String>>(10)?
+            .as_deref()
+            .map(decode_spec_pool)
+            .transpose()?,
+    })
+}
+
+/// Decode the `spec_pool` JSON column back into a [`SpecPool`].
+fn decode_spec_pool(raw: &str) -> rusqlite::Result<SpecPool> {
+    serde_json::from_str(raw).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(error))
     })
 }
 
