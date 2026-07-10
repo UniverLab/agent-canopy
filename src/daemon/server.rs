@@ -57,6 +57,17 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
     db.set_state("version", env!("CARGO_PKG_VERSION"))?;
     db.set_state("last_start", &chrono::Utc::now().to_rfc3339())?;
 
+    match db.reconcile_orphaned_loops() {
+        Ok(count) if count > 0 => {
+            tracing::warn!(
+                "Reconciled {} loop(s) left running by a previous daemon",
+                count
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::error!("Failed to reconcile orphaned loops: {}", e),
+    }
+
     if let Err(e) = watcher_engine.reload_from_db().await {
         tracing::error!("Failed to reload watchers: {}", e);
     }
@@ -163,6 +174,17 @@ pub(crate) async fn run_stdio_server() -> Result<()> {
 
     let ingestion = Arc::new(IngestionManager::new(Arc::clone(&db), data_dir.clone()));
     let _ingestion_cancel = Arc::clone(&ingestion).start();
+
+    match db.reconcile_orphaned_loops() {
+        Ok(count) if count > 0 => {
+            tracing::warn!(
+                "Reconciled {} loop(s) left running by a previous daemon",
+                count
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::error!("Failed to reconcile orphaned loops: {}", e),
+    }
 
     startup_personal_rag(Arc::clone(&ingestion), &data_dir).await;
 

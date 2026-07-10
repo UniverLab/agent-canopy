@@ -600,6 +600,76 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Loops left `Running` when the daemon starts.
+    pub fn list_running_loops(&self) -> Result<Vec<Loop>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, spec_pool
+             FROM loops WHERE status = ?1",
+        )?;
+        let rows = stmt.query_map(params![LoopStatus::Running.as_str()], map_loop_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Node runs still `running` for a loop.
+    fn running_loop_runs(&self, loop_id: &str) -> Result<Vec<LoopNodeRun>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration
+             FROM loop_runs WHERE loop_id = ?1 AND status = 'running'",
+        )?;
+        let rows = stmt.query_map(params![loop_id], map_loop_run_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Reconcile loops orphaned by a daemon restart.
+    ///
+    /// No loop run survives the process that spawned it, so any loop still
+    /// `Running` at startup was interrupted mid-execution by the previous
+    /// daemon. Pause it — its spec keeps its `Running` status so
+    /// `resolve_spec_start` resumes at the same node — and mark its dangling
+    /// node runs as failed/interrupted, so `loop_continue` alone is enough to
+    /// resume it (no `loop_pause` detour needed). Idempotent: a loop already
+    /// `Paused` isn't touched by a later call.
+    pub fn reconcile_orphaned_loops(&self) -> Result<usize> {
+        let orphaned = self.list_running_loops()?;
+        for lp in &orphaned {
+            let dangling_runs = self.running_loop_runs(&lp.id)?;
+            if dangling_runs.is_empty() {
+                tracing::warn!(
+                    "Reconciling orphaned loop '{}': no active node run found; pausing.",
+                    lp.id
+                );
+            }
+            for run in &dangling_runs {
+                tracing::warn!(
+                    "Reconciling orphaned loop '{}': was running node '{}' when the daemon last stopped; pausing loop and marking its run as interrupted.",
+                    lp.id,
+                    run.node_id
+                );
+                self.update_loop_run_result(
+                    &run.id,
+                    LoopRunStatus::Fail,
+                    Some(&serde_json::json!({
+                        "interrupted": true,
+                        "reason": "daemon restarted while this node was running"
+                    })),
+                    Some(Utc::now()),
+                )?;
+            }
+            self.update_loop_status(&lp.id, LoopStatus::Paused, None, None)?;
+        }
+        Ok(orphaned.len())
+    }
+
     pub fn get_loop_details(&self, loop_id: &str) -> Result<Option<LoopDetails>> {
         let Some(lp) = self.get_loop(loop_id)? else {
             return Ok(None);

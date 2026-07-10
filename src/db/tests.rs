@@ -593,6 +593,110 @@ fn loop_updates_persist_metadata_and_positions() {
     assert_eq!(edge.condition, LoopEdgeCondition::Fail);
 }
 
+#[test]
+fn reconcile_orphaned_loops_pauses_running_loop_and_interrupts_its_run() {
+    let db = test_db();
+    let mut lp = sample_loop("wf-orphan");
+    lp.status = LoopStatus::Running;
+    let mut spec = sample_loop_spec(&lp.id, "spec-orphan", 1);
+    spec.status = LoopSpecStatus::Running;
+    let node = sample_loop_node(&spec.id, "node-orphan", 1);
+    let run = LoopNodeRun {
+        id: "run-orphan".to_string(),
+        loop_id: lp.id.clone(),
+        spec_id: spec.id.clone(),
+        node_id: node.id.clone(),
+        status: LoopRunStatus::Running,
+        input: None,
+        output: None,
+        started_at: Utc::now(),
+        completed_at: None,
+        iteration: 1,
+    };
+
+    db.insert_loop(&lp).unwrap();
+    db.insert_loop_spec(&spec).unwrap();
+    db.insert_loop_node(&node).unwrap();
+    db.insert_loop_run(&run).unwrap();
+
+    let reconciled = db.reconcile_orphaned_loops().unwrap();
+    assert_eq!(reconciled, 1);
+
+    // Test 1: the loop is paused, and its dangling run is no longer `running`.
+    let lp_after = db.get_loop(&lp.id).unwrap().unwrap();
+    assert_eq!(lp_after.status, LoopStatus::Paused);
+    let run_after = db.get_loop_run(&run.id).unwrap().unwrap();
+    assert_ne!(run_after.status, LoopRunStatus::Running);
+    assert_eq!(
+        run_after
+            .output
+            .as_ref()
+            .and_then(|value| value.get("interrupted")),
+        Some(&serde_json::json!(true))
+    );
+
+    // Test 2: the spec keeps its `Running` status so `resolve_spec_start`
+    // resumes at the same node.
+    let spec_after = db.get_loop_spec(&spec.id).unwrap().unwrap();
+    assert_eq!(spec_after.status, LoopSpecStatus::Running);
+}
+
+#[test]
+fn reconcile_orphaned_loops_is_idempotent() {
+    let db = test_db();
+    let mut lp = sample_loop("wf-orphan-idempotent");
+    lp.status = LoopStatus::Running;
+    let mut spec = sample_loop_spec(&lp.id, "spec-orphan-idempotent", 1);
+    spec.status = LoopSpecStatus::Running;
+    let node = sample_loop_node(&spec.id, "node-orphan-idempotent", 1);
+    let run = LoopNodeRun {
+        id: "run-orphan-idempotent".to_string(),
+        loop_id: lp.id.clone(),
+        spec_id: spec.id.clone(),
+        node_id: node.id.clone(),
+        status: LoopRunStatus::Running,
+        input: None,
+        output: None,
+        started_at: Utc::now(),
+        completed_at: None,
+        iteration: 1,
+    };
+
+    db.insert_loop(&lp).unwrap();
+    db.insert_loop_spec(&spec).unwrap();
+    db.insert_loop_node(&node).unwrap();
+    db.insert_loop_run(&run).unwrap();
+
+    let first_pass = db.reconcile_orphaned_loops().unwrap();
+    assert_eq!(first_pass, 1);
+    let lp_after_first = db.get_loop(&lp.id).unwrap().unwrap();
+    let run_after_first = db.get_loop_run(&run.id).unwrap().unwrap();
+
+    // Test 3: a second reconcile pass finds nothing left to reconcile, and
+    // leaves the already-paused loop/run untouched.
+    let second_pass = db.reconcile_orphaned_loops().unwrap();
+    assert_eq!(second_pass, 0);
+    let lp_after_second = db.get_loop(&lp.id).unwrap().unwrap();
+    let run_after_second = db.get_loop_run(&run.id).unwrap().unwrap();
+    assert_eq!(lp_after_second.status, lp_after_first.status);
+    assert_eq!(run_after_second.status, run_after_first.status);
+    assert_eq!(run_after_second.completed_at, run_after_first.completed_at);
+}
+
+#[test]
+fn reconcile_orphaned_loops_leaves_completed_loop_untouched() {
+    let db = test_db();
+    let mut lp = sample_loop("wf-completed");
+    lp.status = LoopStatus::Completed;
+    db.insert_loop(&lp).unwrap();
+
+    // Test 4: a `Completed` loop is not reconciled.
+    let reconciled = db.reconcile_orphaned_loops().unwrap();
+    assert_eq!(reconciled, 0);
+    let lp_after = db.get_loop(&lp.id).unwrap().unwrap();
+    assert_eq!(lp_after.status, LoopStatus::Completed);
+}
+
 fn loop_with_trigger(id: &str, trigger: Option<Trigger>) -> Loop {
     Loop {
         trigger,
