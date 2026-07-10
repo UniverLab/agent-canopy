@@ -99,12 +99,16 @@ fn resolve_agent_identity_from_values(
 }
 
 fn register_standalone_session(agent_id: &str, workdir: &str) {
+    // `agent_id` is the generated "standalone-<uuid>" fallback, so reusing it as
+    // the session name keeps `sync_messages.agent_name` distinguishable from a
+    // real session's codename (e.g. "boletus") instead of the bare, collidable
+    // literal "standalone".
     let result = crate::ensure_data_dir()
         .and_then(|data_dir| Database::new(&data_dir.join("background_agents.db")))
         .and_then(|db| {
             db.insert_interactive_session(
                 agent_id,
-                "standalone",
+                agent_id,
                 "bridge",
                 workdir,
                 Some("canopy bridge"),

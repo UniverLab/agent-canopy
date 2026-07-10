@@ -215,3 +215,98 @@ impl SyncManager {
             .clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_manager() -> (SyncManager, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db_path = dir.path().join("sync_manager_test.db");
+        let db = Database::new(&db_path).expect("create test db");
+        (SyncManager::new(Arc::new(db)), dir)
+    }
+
+    /// A bridge session that resolved a real identity (mirrors what
+    /// `daemon::bridge::run_bridge` registers for a known `agent_id`) must
+    /// have its actual session name land in `sync_messages.agent_name`.
+    #[tokio::test]
+    async fn report_status_uses_real_session_name_not_standalone() {
+        let (manager, _dir) = test_manager();
+        let workdir = "/tmp/known-workdir";
+        let agent_id = "sess-boletus";
+
+        manager
+            .db
+            .insert_interactive_session(
+                agent_id,
+                "boletus",
+                "claude",
+                workdir,
+                None,
+                Some(4242),
+                "interactive",
+            )
+            .expect("seed known session");
+
+        let message = manager
+            .report_status(
+                workdir,
+                agent_id,
+                None,
+                WorkspaceStatus::Stable,
+                "all green",
+            )
+            .await
+            .expect("report_status");
+
+        assert_eq!(message.agent_name, "boletus · claude");
+        assert_ne!(message.agent_name, "standalone");
+    }
+
+    /// A bridge with no resolvable identity (mirrors
+    /// `daemon::bridge::register_standalone_session` after the fix) must
+    /// still be distinguishable from a real session and must not collapse
+    /// to the bare, collidable literal "standalone".
+    #[tokio::test]
+    async fn broadcast_from_unidentified_bridge_is_explicit_and_distinguishable() {
+        let (manager, _dir) = test_manager();
+        let workdir = "/tmp/unknown-workdir";
+        let fallback_agent_id = format!("standalone-{}", uuid::Uuid::new_v4());
+
+        // Mirrors `register_standalone_session`: the fallback agent_id is
+        // reused as the session name so it stays unique per bridge instance.
+        manager
+            .db
+            .insert_interactive_session(
+                &fallback_agent_id,
+                &fallback_agent_id,
+                "bridge",
+                workdir,
+                Some("canopy bridge"),
+                Some(4343),
+                "bridge",
+            )
+            .expect("seed standalone session");
+
+        let message = manager
+            .broadcast(
+                workdir,
+                &fallback_agent_id,
+                None,
+                MessageKind::Info,
+                "hello",
+                None,
+            )
+            .await
+            .expect("broadcast");
+
+        assert_ne!(message.agent_name, "standalone");
+        assert!(
+            message.agent_name.starts_with("standalone-"),
+            "expected an explicit, distinguishable fallback name, got {:?}",
+            message.agent_name
+        );
+        assert_eq!(message.agent_name, format!("{fallback_agent_id} · bridge"));
+    }
+}
