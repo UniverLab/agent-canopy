@@ -342,6 +342,65 @@ fn pool_nodes_json(pool: Option<&SpecPool>) -> Vec<serde_json::Value> {
     .unwrap_or_default()
 }
 
+fn validate_pool_has_name(pool: Option<&SpecPool>, name: &str) -> Result<(), String> {
+    if pool.is_some_and(|p| p.nodes.iter().any(|n| n.name == name)) {
+        Ok(())
+    } else {
+        Err(format!("Pool has no spec named '{name}'."))
+    }
+}
+
+/// Remove the pool entry named `name`, along with any edges that referenced
+/// it by name — a dangling edge to a removed node would break the template.
+fn remove_pool_node(mut pool: SpecPool, name: &str) -> SpecPool {
+    pool.nodes.retain(|n| n.name != name);
+    pool.edges
+        .retain(|e| e.from_node != name && e.to_node != name);
+    pool
+}
+
+/// Validate that `order` is a total permutation of `pool`'s current spec
+/// names: same length, same set, no duplicates, no unknown names. This
+/// rejects any partial reorder (a subset, or a list with an unrecognized
+/// name) so the operation is always "here is the whole new order," never a
+/// swap of two entries applied on top of unknown existing state.
+fn validate_pool_reorder(pool: &SpecPool, order: &[String]) -> Result<(), String> {
+    if order.len() != pool.nodes.len() {
+        return Err(format!(
+            "Reorder must list all {} pool spec(s) exactly once; got {}.",
+            pool.nodes.len(),
+            order.len()
+        ));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for name in order {
+        if !seen.insert(name.as_str()) {
+            return Err(format!("Reorder lists spec '{name}' more than once."));
+        }
+        if !pool.nodes.iter().any(|n| &n.name == name) {
+            return Err(format!("Pool has no spec named '{name}'."));
+        }
+    }
+    Ok(())
+}
+
+/// Reassign each pool node's `position` to its 1-based index in `order`.
+/// Callers must run [`validate_pool_reorder`] first so `order` is known to
+/// be a full permutation of `pool`'s node names.
+fn reorder_pool_nodes(mut pool: SpecPool, order: &[String]) -> SpecPool {
+    pool.nodes.sort_by_key(|n| {
+        order
+            .iter()
+            .position(|name| name == &n.name)
+            .unwrap_or(usize::MAX)
+    });
+    for (index, node) in pool.nodes.iter_mut().enumerate() {
+        node.position = (index + 1) as i64;
+    }
+    pool
+}
+
 fn validate_at_least_one_bool(updates: &[bool], field_name: &str) -> Result<(), String> {
     if updates.iter().all(|&b| !b) {
         Err(format!(
@@ -2308,6 +2367,70 @@ impl TaskTriggerHandler {
     }
 
     #[tool(
+        name = "loop_pool_remove",
+        description = "Remove a spec from a loop's spec pool by name."
+    )]
+    async fn loop_pool_remove(
+        &self,
+        Parameters(params): Parameters<LoopPoolRemoveParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let loop_id = params.loop_id.trim();
+        let lp = match validate_loop_and_get(&self.db, loop_id) {
+            Ok(lp) => lp,
+            Err(e) => return Ok(error_result(&e)),
+        };
+        let name = params.name.trim();
+        if let Err(e) = validate_pool_has_name(lp.spec_pool.as_ref(), name) {
+            return Ok(error_result(&e));
+        }
+
+        let pool = remove_pool_node(
+            lp.spec_pool
+                .expect("validate_pool_has_name confirmed a pool exists"),
+            name,
+        );
+        self.db
+            .update_loop_spec_pool(loop_id, &pool)
+            .map_err(internal_error)?;
+
+        Ok(success_result(&format!(
+            "Spec '{name}' removed from pool for loop '{loop_id}'."
+        )))
+    }
+
+    #[tool(
+        name = "loop_pool_reorder",
+        description = "Reorder a loop's spec pool. `order` must list every pool spec name exactly once, in the desired order — a total replacement, not a partial swap."
+    )]
+    async fn loop_pool_reorder(
+        &self,
+        Parameters(params): Parameters<LoopPoolReorderParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let loop_id = params.loop_id.trim();
+        let lp = match validate_loop_and_get(&self.db, loop_id) {
+            Ok(lp) => lp,
+            Err(e) => return Ok(error_result(&e)),
+        };
+        let Some(existing_pool) = lp.spec_pool else {
+            return Ok(error_result(&format!(
+                "Loop '{loop_id}' has no spec pool to reorder."
+            )));
+        };
+        if let Err(e) = validate_pool_reorder(&existing_pool, &params.order) {
+            return Ok(error_result(&e));
+        }
+
+        let pool = reorder_pool_nodes(existing_pool, &params.order);
+        self.db
+            .update_loop_spec_pool(loop_id, &pool)
+            .map_err(internal_error)?;
+
+        Ok(success_result(&format!(
+            "Pool for loop '{loop_id}' reordered."
+        )))
+    }
+
+    #[tool(
         name = "loop_get",
         description = "Return a loop with its ordered specs, nodes, and edges."
     )]
@@ -3145,7 +3268,8 @@ impl ServerHandler for TaskTriggerHandler {
 mod tests {
     use super::{
         append_pool_node, header_str, missing_sync_identity_error, next_pool_position,
-        pool_nodes_json, validate_node_config, validate_pool_name_unique,
+        pool_nodes_json, remove_pool_node, reorder_pool_nodes, validate_node_config,
+        validate_pool_has_name, validate_pool_name_unique, validate_pool_reorder,
         MISSING_SYNC_IDENTITY_MESSAGE,
     };
     use crate::domain::loops::{LoopNodeKind, SpecPoolNode};
@@ -3303,5 +3427,128 @@ mod tests {
             error.contains("already has a spec named 'review'"),
             "{error}"
         );
+    }
+
+    fn sample_pool_of_three() -> crate::domain::loops::SpecPool {
+        let pool = append_pool_node(
+            None,
+            "loop-1",
+            SpecPoolNode {
+                name: "implement".to_string(),
+                kind: LoopNodeKind::Agent,
+                config: serde_json::json!({ "cli": "claude" }),
+                position: 1,
+            },
+        );
+        let pool = append_pool_node(
+            Some(pool),
+            "loop-1",
+            SpecPoolNode {
+                name: "verify".to_string(),
+                kind: LoopNodeKind::Check,
+                config: serde_json::json!({ "command": "cargo test" }),
+                position: 2,
+            },
+        );
+        append_pool_node(
+            Some(pool),
+            "loop-1",
+            SpecPoolNode {
+                name: "review".to_string(),
+                kind: LoopNodeKind::Gate,
+                config: serde_json::json!({ "evaluate": "output_contains", "value": "ok" }),
+                position: 3,
+            },
+        )
+    }
+
+    #[test]
+    fn pool_remove_deletes_existing_spec() {
+        let pool = sample_pool_of_three();
+        assert!(validate_pool_has_name(Some(&pool), "verify").is_ok());
+
+        let pool = remove_pool_node(pool, "verify");
+
+        let specs = pool_nodes_json(Some(&pool));
+        assert_eq!(specs.len(), 2);
+        assert!(specs.iter().all(|s| s["name"] != "verify"));
+    }
+
+    #[test]
+    fn pool_remove_drops_edges_referencing_removed_node() {
+        let mut pool = sample_pool_of_three();
+        pool.edges.push(crate::domain::loops::SpecPoolEdge {
+            from_node: "implement".to_string(),
+            to_node: "verify".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Always,
+        });
+
+        let pool = remove_pool_node(pool, "verify");
+
+        assert!(pool.edges.is_empty());
+    }
+
+    #[test]
+    fn pool_remove_missing_spec_errors() {
+        let pool = sample_pool_of_three();
+
+        let error = validate_pool_has_name(Some(&pool), "ghost").unwrap_err();
+        assert!(error.contains("no spec named 'ghost'"), "{error}");
+    }
+
+    #[test]
+    fn pool_reorder_changes_position_order() {
+        let pool = sample_pool_of_three();
+        let order = vec![
+            "review".to_string(),
+            "implement".to_string(),
+            "verify".to_string(),
+        ];
+        assert!(validate_pool_reorder(&pool, &order).is_ok());
+
+        let pool = reorder_pool_nodes(pool, &order);
+
+        let specs = pool_nodes_json(Some(&pool));
+        assert_eq!(specs[0]["name"], "review");
+        assert_eq!(specs[0]["position"], 1);
+        assert_eq!(specs[1]["name"], "implement");
+        assert_eq!(specs[1]["position"], 2);
+        assert_eq!(specs[2]["name"], "verify");
+        assert_eq!(specs[2]["position"], 3);
+    }
+
+    #[test]
+    fn pool_reorder_rejects_wrong_count() {
+        let pool = sample_pool_of_three();
+        let order = vec!["review".to_string(), "implement".to_string()];
+
+        let error = validate_pool_reorder(&pool, &order).unwrap_err();
+        assert!(error.contains("exactly once; got 2"), "{error}");
+    }
+
+    #[test]
+    fn pool_reorder_rejects_unknown_name() {
+        let pool = sample_pool_of_three();
+        let order = vec![
+            "review".to_string(),
+            "implement".to_string(),
+            "ghost".to_string(),
+        ];
+
+        let error = validate_pool_reorder(&pool, &order).unwrap_err();
+        assert!(error.contains("no spec named 'ghost'"), "{error}");
+    }
+
+    #[test]
+    fn pool_reorder_rejects_duplicate_name() {
+        let pool = sample_pool_of_three();
+        let order = vec![
+            "review".to_string(),
+            "review".to_string(),
+            "verify".to_string(),
+        ];
+
+        let error = validate_pool_reorder(&pool, &order).unwrap_err();
+        assert!(error.contains("more than once"), "{error}");
     }
 }

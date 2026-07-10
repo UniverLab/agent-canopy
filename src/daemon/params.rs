@@ -403,6 +403,23 @@ pub struct LoopPoolListParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopPoolRemoveParams {
+    /// Existing loop ID.
+    pub loop_id: String,
+    /// Name of the pool entry to remove.
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopPoolReorderParams {
+    /// Existing loop ID.
+    pub loop_id: String,
+    /// Full list of pool spec names in the desired final order. Must be a
+    /// permutation of the pool's current names — every name exactly once.
+    pub order: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LoopGetParams {
     /// Loop ID.
     pub loop_id: String,
