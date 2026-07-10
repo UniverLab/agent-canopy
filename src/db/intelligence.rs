@@ -215,34 +215,50 @@ impl Database {
         kind: Option<&str>,
         limit: usize,
     ) -> Result<Vec<IntelligenceNodeRecord>> {
-        let query = query.trim();
-        if query.is_empty() {
+        let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+        if terms.is_empty() {
             return Ok(Vec::new());
         }
 
-        let needle = query.to_lowercase();
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
-        let mut stmt = conn.prepare(
+
+        // ?1 is reserved for kind and the final placeholder is the limit; each
+        // term gets its own placeholder in between, reused across all indexed
+        // fields so terms are ANDed together and fields are ORed.
+        let term_clauses: Vec<String> = (0..terms.len())
+            .map(|i| {
+                let p = i + 2;
+                format!(
+                    "(instr(lower(id), ?{p}) > 0 OR instr(lower(kind), ?{p}) > 0 OR \
+                     instr(lower(title), ?{p}) > 0 OR instr(lower(body), ?{p}) > 0 OR \
+                     instr(lower(coalesce(metadata, '')), ?{p}) > 0)"
+                )
+            })
+            .collect();
+        let limit_placeholder = terms.len() + 2;
+        let sql = format!(
             "SELECT id, kind, title, body, metadata, project_hash, session_id, created_at, updated_at
              FROM intelligence_nodes
-             WHERE (?2 IS NULL OR kind = ?2)
-               AND (
-                   instr(lower(id), ?1) > 0 OR
-                   instr(lower(kind), ?1) > 0 OR
-                   instr(lower(title), ?1) > 0 OR
-                   instr(lower(body), ?1) > 0 OR
-                   instr(lower(coalesce(metadata, '')), ?1) > 0
-               )
+             WHERE (?1 IS NULL OR kind = ?1)
+               AND {}
              ORDER BY updated_at DESC
-             LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(
-            rusqlite::params![needle, kind, limit as i64],
-            Self::read_intelligence_node,
-        )?;
+             LIMIT ?{limit_placeholder}",
+            term_clauses.join(" AND ")
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(terms.len() + 2);
+        params.push(Box::new(kind.map(str::to_string)));
+        for term in &terms {
+            params.push(Box::new(term.clone()));
+        }
+        params.push(Box::new(limit as i64));
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(Box::as_ref).collect();
+
+        let rows = stmt.query_map(param_refs.as_slice(), Self::read_intelligence_node)?;
         Ok(rows.filter_map(|row| row.ok()).collect())
     }
 

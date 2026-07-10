@@ -410,6 +410,42 @@ fn test_intelligence_upsert_search_and_graph_walk() {
     assert!(walk.edges.iter().any(|edge| edge.from_node_id == "node-a"));
 }
 
+#[test]
+fn test_intelligence_search_tokenizes_multi_term_queries() {
+    let db = test_db();
+    db.upsert_intelligence_node(IntelligenceNodeInput {
+        id: Some("node-multi".to_string()),
+        kind: "fact".to_string(),
+        title: "Alpha overview".to_string(),
+        body: "This section covers alpha in detail. Later on we discuss beta too.".to_string(),
+        metadata: None,
+        project_hash: Some("project-1".to_string()),
+        session_id: None,
+        relations: None,
+    })
+    .unwrap();
+
+    // 1. Terms in different places of the body both match with AND semantics.
+    let both = db
+        .search_intelligence_nodes("alpha beta", None, 10)
+        .unwrap();
+    assert_eq!(both.len(), 1);
+    assert_eq!(both[0].id, "node-multi");
+
+    // 2. A query with one absent term should not match.
+    let missing = db.search_intelligence_nodes("alpha zzz", None, 10).unwrap();
+    assert!(missing.is_empty());
+
+    // 3. Single-term queries keep working as before.
+    let single = db.search_intelligence_nodes("beta", None, 10).unwrap();
+    assert_eq!(single.len(), 1);
+    assert_eq!(single[0].id, "node-multi");
+
+    // 4. Empty/whitespace-only queries return an empty list.
+    let empty = db.search_intelligence_nodes("   ", None, 10).unwrap();
+    assert!(empty.is_empty());
+}
+
 // ── Loop persistence ──────────────────────────────────────────
 
 #[test]
