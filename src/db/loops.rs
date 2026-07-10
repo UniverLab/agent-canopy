@@ -231,6 +231,36 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Reset a loop back to `Draft` (the status `loop_run` accepts) and clear
+    /// `completed_at`, so a `failed` or `completed` loop can be relaunched via
+    /// `loop_reset` + `loop_run` instead of being stuck forever.
+    pub fn reset_loop_status(&self, loop_id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE loops SET status = ?1, completed_at = NULL WHERE id = ?2",
+            params![LoopStatus::Draft.as_str(), loop_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Reset a loop spec back to `Pending`, clearing `started_at` and
+    /// `completed_at` unconditionally (unlike [`Self::update_loop_spec_status`],
+    /// which only overwrites when a new value is given). Used by `loop_reset`.
+    pub fn reset_loop_spec_status(&self, spec_id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE loop_specs SET status = ?1, started_at = NULL, completed_at = NULL WHERE id = ?2",
+            params![LoopSpecStatus::Pending.as_str(), spec_id],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// Replace a loop's `spec_pool` with `pool` (serialized as JSON).
     pub fn update_loop_spec_pool(&self, loop_id: &str, pool: &SpecPool) -> Result<bool> {
         let conn = self

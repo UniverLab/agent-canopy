@@ -444,6 +444,16 @@ pub struct LoopPauseParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopResetParams {
+    /// Loop ID.
+    pub loop_id: String,
+    /// Specific spec IDs to reset to pending, even if already completed.
+    /// Omit to reset every spec that isn't already completed, leaving
+    /// completed specs untouched so loop_run resumes at the first pending one.
+    pub specs: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LoopContinueParams {
     /// Loop ID.
     pub loop_id: String,

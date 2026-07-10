@@ -415,6 +415,56 @@ fn build_loop_update_response(loop_id: &str) -> CallToolResult {
     success_result(&format!("Loop '{loop_id}' updated."))
 }
 
+/// Core logic for `loop_reset`, factored out of the tool method so it only
+/// needs `&Database` (no engine/executor) and can be unit-tested directly.
+fn perform_loop_reset(
+    db: &Database,
+    loop_id: &str,
+    specs: Option<&[String]>,
+) -> Result<CallToolResult, McpError> {
+    let Some(lp) = db.get_loop(loop_id).map_err(internal_error)? else {
+        return Ok(error_result(&format!("Loop '{loop_id}' not found.")));
+    };
+
+    if lp.status == LoopStatus::Running {
+        return Ok(error_result(&format!(
+            "Loop '{loop_id}' is running; call loop_pause first, then loop_reset."
+        )));
+    }
+
+    let loop_specs = db.list_loop_specs(loop_id).map_err(internal_error)?;
+    let valid_ids: std::collections::HashSet<&str> =
+        loop_specs.iter().map(|spec| spec.id.as_str()).collect();
+
+    let target_ids: Vec<String> = match specs {
+        Some(ids) => {
+            for id in ids {
+                if !valid_ids.contains(id.as_str()) {
+                    return Ok(error_result(&format!(
+                        "Spec '{id}' does not belong to loop '{loop_id}'."
+                    )));
+                }
+            }
+            ids.to_vec()
+        }
+        None => loop_specs
+            .iter()
+            .filter(|spec| spec.status != LoopSpecStatus::Completed)
+            .map(|spec| spec.id.clone())
+            .collect(),
+    };
+
+    for spec_id in &target_ids {
+        db.reset_loop_spec_status(spec_id).map_err(internal_error)?;
+    }
+    db.reset_loop_status(loop_id).map_err(internal_error)?;
+
+    Ok(success_result(&format!(
+        "Loop '{loop_id}' reset to pending; {} spec(s) reset.",
+        target_ids.len()
+    )))
+}
+
 fn build_spec_update_response(spec_id: &str) -> CallToolResult {
     success_result(&format!("Loop spec '{spec_id}' updated."))
 }
@@ -2515,6 +2565,20 @@ impl TaskTriggerHandler {
         )))
     }
 
+    /// Reset a `completed`/`failed` (or otherwise stalled) loop back to
+    /// `pending` so it can be relaunched via `loop_run`, which otherwise
+    /// refuses to resume a completed or failed loop.
+    #[tool(
+        name = "loop_reset",
+        description = "Reset a completed/failed loop back to pending so loop_run can relaunch it. Without `specs`, resets every non-completed spec, leaving already-completed ones untouched so loop_run resumes at the first pending spec. With `specs`, resets exactly those spec IDs, even if they were completed. Rejects a `running` loop — call loop_pause first."
+    )]
+    async fn loop_reset(
+        &self,
+        Parameters(params): Parameters<LoopResetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        perform_loop_reset(&self.db, &params.loop_id, params.specs.as_deref())
+    }
+
     /// Schedule a one-shot future resume for a loop (e.g. a loop that failed
     /// on a quota can reschedule itself at the exact reset time instead of
     /// relying on a blindly polling cron). The scheduler fires it once the
@@ -3268,12 +3332,134 @@ impl ServerHandler for TaskTriggerHandler {
 mod tests {
     use super::{
         append_pool_node, header_str, missing_sync_identity_error, next_pool_position,
-        pool_nodes_json, remove_pool_node, reorder_pool_nodes, validate_node_config,
-        validate_pool_has_name, validate_pool_name_unique, validate_pool_reorder,
-        MISSING_SYNC_IDENTITY_MESSAGE,
+        perform_loop_reset, pool_nodes_json, remove_pool_node, reorder_pool_nodes,
+        validate_node_config, validate_pool_has_name, validate_pool_name_unique,
+        validate_pool_reorder, MISSING_SYNC_IDENTITY_MESSAGE,
     };
-    use crate::domain::loops::{LoopNodeKind, SpecPoolNode};
+    use crate::db::Database;
+    use crate::domain::loops::{
+        Loop, LoopNodeKind, LoopSpec, LoopSpecStatus, LoopStatus, SpecPoolNode,
+    };
     use crate::shared::sync_identity::CANOPY_AGENT_ID_HEADER;
+    use tempfile::tempdir;
+
+    fn spec_with_status(
+        loop_id: &str,
+        id: &str,
+        position: i64,
+        status: LoopSpecStatus,
+    ) -> LoopSpec {
+        LoopSpec {
+            id: id.to_string(),
+            loop_id: loop_id.to_string(),
+            name: id.to_string(),
+            description: None,
+            position,
+            parallelizable: false,
+            status,
+            started_at: None,
+            completed_at: Some(chrono::Utc::now()),
+        }
+    }
+
+    fn loop_reset_fixture(status: LoopStatus) -> (tempfile::TempDir, Database, String) {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let loop_id = "loop-reset-test".to_string();
+        db.insert_loop(&Loop {
+            id: loop_id.clone(),
+            name: "Loop".to_string(),
+            description: None,
+            workdir: dir.path().to_string_lossy().to_string(),
+            status,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: Some(chrono::Utc::now()),
+            autorun_at: None,
+            spec_pool: None,
+        })
+        .unwrap();
+        (dir, db, loop_id)
+    }
+
+    #[test]
+    fn loop_reset_failed_loop_resets_incomplete_specs_to_pending() {
+        let (_dir, db, loop_id) = loop_reset_fixture(LoopStatus::Failed);
+        db.insert_loop_spec(&spec_with_status(
+            &loop_id,
+            "spec-done",
+            1,
+            LoopSpecStatus::Completed,
+        ))
+        .unwrap();
+        db.insert_loop_spec(&spec_with_status(
+            &loop_id,
+            "spec-failed",
+            2,
+            LoopSpecStatus::Failed,
+        ))
+        .unwrap();
+
+        let result = perform_loop_reset(&db, &loop_id, None).unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Draft);
+        assert!(lp.completed_at.is_none());
+
+        let specs = db.list_loop_specs(&loop_id).unwrap();
+        let done = specs.iter().find(|s| s.id == "spec-done").unwrap();
+        let failed = specs.iter().find(|s| s.id == "spec-failed").unwrap();
+        assert_eq!(failed.status, LoopSpecStatus::Pending);
+        assert!(failed.completed_at.is_none());
+        // Completed specs are preserved when `specs` isn't given explicitly.
+        assert_eq!(done.status, LoopSpecStatus::Completed);
+    }
+
+    #[test]
+    fn loop_reset_with_explicit_specs_resets_completed_spec_too() {
+        let (_dir, db, loop_id) = loop_reset_fixture(LoopStatus::Failed);
+        db.insert_loop_spec(&spec_with_status(
+            &loop_id,
+            "spec-done",
+            1,
+            LoopSpecStatus::Completed,
+        ))
+        .unwrap();
+
+        let result = perform_loop_reset(&db, &loop_id, Some(&["spec-done".to_string()])).unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+
+        let spec = db.get_loop_spec("spec-done").unwrap().unwrap();
+        assert_eq!(spec.status, LoopSpecStatus::Pending);
+        assert!(spec.completed_at.is_none());
+    }
+
+    #[test]
+    fn loop_reset_rejects_running_loop_with_actionable_error() {
+        let (_dir, db, loop_id) = loop_reset_fixture(LoopStatus::Running);
+
+        let result = perform_loop_reset(&db, &loop_id, None).unwrap();
+        assert!(result.is_error.unwrap_or(false));
+        let text = format!("{:?}", result.content);
+        assert!(text.contains("loop_pause"), "{text}");
+
+        // Status untouched.
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Running);
+    }
+
+    #[test]
+    fn loop_reset_missing_loop_returns_not_found_error() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+
+        let result = perform_loop_reset(&db, "does-not-exist", None).unwrap();
+        assert!(result.is_error.unwrap_or(false));
+        let text = format!("{:?}", result.content);
+        assert!(text.contains("not found"), "{text}");
+    }
 
     #[test]
     fn validate_node_config_rejects_double_encoded_string() {
