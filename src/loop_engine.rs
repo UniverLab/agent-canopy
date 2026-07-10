@@ -120,18 +120,39 @@ impl LoopEngine {
         };
         let spec_details = details
             .specs
-            .into_iter()
+            .iter()
             .find(|item| item.spec.id == spec.id)
             .ok_or_else(|| anyhow!("Loop spec '{}' not found.", spec.id))?;
 
-        let nodes_by_id = spec_details
-            .nodes
+        // A spec with its own graph always uses it (full backwards
+        // compatibility). Only a spec with no nodes of its own falls back to
+        // the loop-level graph, so the same graph can drive every spec in
+        // the loop without repeating it per spec.
+        let (nodes, edges): (&[LoopNode], &[LoopEdge]) = if !spec_details.nodes.is_empty() {
+            (&spec_details.nodes, &spec_details.edges)
+        } else if !details.graph_nodes.is_empty() {
+            (&details.graph_nodes, &details.graph_edges)
+        } else {
+            let summary = format!(
+                "Spec '{}' has no nodes of its own and loop '{}' has no loop-level graph to fall back to.",
+                spec.name, lp.name
+            );
+            self.db.update_loop_spec_status(
+                &spec.id,
+                LoopSpecStatus::Failed,
+                Some(chrono::Utc::now()),
+                Some(chrono::Utc::now()),
+            )?;
+            return Ok(SpecExecutionOutcome::Failed(summary));
+        };
+
+        let nodes_by_id = nodes
             .iter()
             .map(|node| (node.id.as_str(), node))
             .collect::<HashMap<_, _>>();
         let existing_runs = self.db.list_loop_runs_for_spec(&spec.id)?;
         let (mut current_node_id, mut previous_output, mut iterations) =
-            resolve_spec_start(&spec_details, spec, &existing_runs)?;
+            resolve_spec_start(nodes, edges, spec, &existing_runs)?;
 
         // Capture the workdir's git HEAD once, at the moment the spec starts
         // running — not on every node. A resumed spec (interrupted mid-run
@@ -236,8 +257,7 @@ impl LoopEngine {
             }
 
             let next_node_id =
-                select_next_node(&spec_details.edges, &node.id, final_execution.status)?
-                    .map(str::to_owned);
+                select_next_node(edges, &node.id, final_execution.status)?.map(str::to_owned);
 
             match next_node_id {
                 Some(next_node_id) => {
@@ -502,14 +522,12 @@ fn evaluate_success_condition(condition: &str, exit_code: i32, output: &str) -> 
     bail!("Unsupported success condition '{}'.", condition)
 }
 
-fn find_entry_node(spec: &crate::domain::loops::LoopSpecDetails) -> Result<String> {
-    let incoming = spec
-        .edges
+fn find_entry_node(nodes: &[LoopNode], edges: &[LoopEdge], spec_name: &str) -> Result<String> {
+    let incoming = edges
         .iter()
         .map(|edge| edge.to_node.as_str())
         .collect::<HashSet<_>>();
-    let entry_nodes = spec
-        .nodes
+    let entry_nodes = nodes
         .iter()
         .filter(|node| !incoming.contains(node.id.as_str()))
         .collect::<Vec<_>>();
@@ -519,13 +537,12 @@ fn find_entry_node(spec: &crate::domain::loops::LoopSpecDetails) -> Result<Strin
         // Every node has an incoming edge: the graph is a retry cycle (e.g.
         // implement <-> review). There is no source node, so fall back to the
         // designated start — the node with the lowest position.
-        [] => spec
-            .nodes
+        [] => nodes
             .iter()
             .min_by_key(|node| node.position)
             .map(|node| node.id.clone())
-            .ok_or_else(|| anyhow!("Spec '{}' has no nodes.", spec.spec.name)),
-        _ => bail!("Spec '{}' has multiple entry nodes.", spec.spec.name),
+            .ok_or_else(|| anyhow!("Spec '{}' has no nodes.", spec_name)),
+        _ => bail!("Spec '{}' has multiple entry nodes.", spec_name),
     }
 }
 
@@ -634,7 +651,8 @@ async fn capture_workdir_head(workdir: &str) -> Option<String> {
 }
 
 fn resolve_spec_start(
-    spec_details: &crate::domain::loops::LoopSpecDetails,
+    nodes: &[LoopNode],
+    edges: &[LoopEdge],
     spec: &LoopSpec,
     existing_runs: &[LoopNodeRun],
 ) -> Result<(String, Option<Value>, HashMap<String, usize>)> {
@@ -648,7 +666,11 @@ fn resolve_spec_start(
         }
     }
 
-    Ok((find_entry_node(spec_details)?, None, HashMap::new()))
+    Ok((
+        find_entry_node(nodes, edges, &spec.name)?,
+        None,
+        HashMap::new(),
+    ))
 }
 
 #[cfg(unix)]
@@ -952,7 +974,7 @@ mod tests {
         }];
 
         let (node_id, previous_output, iterations) =
-            resolve_spec_start(&details, &spec, &runs).unwrap();
+            resolve_spec_start(&details.nodes, &details.edges, &spec, &runs).unwrap();
 
         assert_eq!(node_id, "node-1");
         assert_eq!(iterations.get("node-1"), Some(&1));
@@ -1008,7 +1030,7 @@ mod tests {
             .collect();
 
         let (node_id, previous_output, iterations) =
-            resolve_spec_start(&details, &spec, &runs).unwrap();
+            resolve_spec_start(&details.nodes, &details.edges, &spec, &runs).unwrap();
 
         assert_eq!(node_id, "node-1");
         assert!(previous_output.is_none());
@@ -1071,7 +1093,10 @@ mod tests {
             ],
         };
 
-        assert_eq!(find_entry_node(&details).unwrap(), "implement");
+        assert_eq!(
+            find_entry_node(&details.nodes, &details.edges, &details.spec.name).unwrap(),
+            "implement"
+        );
     }
 
     #[test]
@@ -1180,5 +1205,276 @@ mod tests {
         let err = select_next_node(&edges, "implement", LoopRunStatus::Pass).unwrap_err();
 
         assert!(err.to_string().contains("ambiguous outgoing edges"));
+    }
+
+    fn second_spec(loop_id: &str, id: &str, position: i64) -> LoopSpec {
+        LoopSpec {
+            id: id.to_string(),
+            loop_id: loop_id.to_string(),
+            name: format!("Spec {id}"),
+            description: Some(
+                "Functional Requirements:\n- A\n\nNon-Functional Requirements:\n- B\n\nObjective:\n- C\n\nConstraints:\n- D\n\nGuidelines:\n- E\n\nIn Scope:\n- F\n\nOut of Scope:\n- G".to_string(),
+            ),
+            position,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_engine_runs_loop_level_graph_across_two_specs() {
+        // Neither spec has nodes of its own; both walk the loop's shared
+        // top-level graph. A loop defined once should drive every spec.
+        let (_dir, db, engine, loop_id, spec1_id) = loop_fixture().unwrap();
+        let spec2 = second_spec(&loop_id, "spec-2", 2);
+        db.insert_loop_spec(&spec2).unwrap();
+
+        let check = LoopNode {
+            id: "loop-check".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+        let gate = LoopNode {
+            id: "loop-gate".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "gate".to_string(),
+            kind: LoopNodeKind::Gate,
+            config: serde_json::json!({
+                "evaluate": "output_contains",
+                "value": "APPROVED",
+                "pass_route": "next_spec"
+            }),
+            position: 2,
+            created_at: chrono::Utc::now(),
+        };
+        db.insert_loop_node(&check).unwrap();
+        db.insert_loop_node(&gate).unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "loop-edge-pass".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            from_node: check.id.clone(),
+            to_node: gate.id.clone(),
+            condition: crate::domain::loops::LoopEdgeCondition::Pass,
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id.clone()).await.unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Completed);
+
+        for spec_id in [spec1_id.as_str(), spec2.id.as_str()] {
+            let spec = db.get_loop_spec(spec_id).unwrap().unwrap();
+            assert_eq!(spec.status, LoopSpecStatus::Completed);
+            let runs = db.list_loop_runs_for_spec(spec_id).unwrap();
+            assert_eq!(runs.len(), 2);
+            assert!(runs.iter().all(|run| run.spec_id == spec_id));
+            assert!(runs.iter().any(|run| run.node_id == "loop-check"));
+            assert!(runs.iter().any(|run| run.node_id == "loop-gate"));
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_engine_spec_with_own_graph_ignores_loop_level_graph() {
+        // The loop-level graph always fails; if it were used, the spec would
+        // fail. The spec's own graph always passes, and precedence must
+        // favor it — full backwards compatibility.
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "loop-check".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "loop-check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "exit 1",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "spec-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "spec-check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id.clone()).await.unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+
+        assert_eq!(lp.status, LoopStatus::Completed);
+        assert_eq!(spec.status, LoopSpecStatus::Completed);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].node_id, "spec-check");
+    }
+
+    #[tokio::test]
+    async fn loop_engine_iteration_budget_resets_between_specs_on_loop_graph() {
+        // A single loop-level node that self-loops on failure, gated by a
+        // counter file shared across the whole run. It fails 9 times then
+        // passes on the 10th call — exactly the per-node iteration cap. If
+        // spec 2's budget carried over from spec 1 instead of resetting, its
+        // first attempt would already read as iteration 11 and the spec
+        // would fail before the check command ever runs again.
+        let (_dir, db, engine, loop_id, spec1_id) = loop_fixture().unwrap();
+        let spec2 = second_spec(&loop_id, "spec-2", 2);
+        db.insert_loop_spec(&spec2).unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "flaky".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "flaky".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "n=$(cat counter.txt 2>/dev/null || echo 0); n=$((n+1)); echo $n > counter.txt; test $n -ge 10",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "self-loop".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            from_node: "flaky".to_string(),
+            to_node: "flaky".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Fail,
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id.clone()).await.unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Completed);
+
+        let spec1 = db.get_loop_spec(&spec1_id).unwrap().unwrap();
+        let spec1_runs = db.list_loop_runs_for_spec(&spec1_id).unwrap();
+        assert_eq!(spec1.status, LoopSpecStatus::Completed);
+        assert_eq!(spec1_runs.len(), 10);
+
+        let spec2_saved = db.get_loop_spec(&spec2.id).unwrap().unwrap();
+        let spec2_runs = db.list_loop_runs_for_spec(&spec2.id).unwrap();
+        assert_eq!(spec2_saved.status, LoopSpecStatus::Completed);
+        // Fresh budget: the counter file is already at 10 from spec 1, so
+        // spec 2's first (and only) fresh-budget attempt passes immediately.
+        assert_eq!(spec2_runs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn loop_engine_loop_level_entry_fallback_by_lowest_position() {
+        // Retry cycle (implement <-> review): every node has an incoming
+        // edge, so there is no source node and the engine must fall back to
+        // the lowest-position node as the entry point.
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        let implement = LoopNode {
+            id: "implement".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "implement".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf IMPLEMENT",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+        let review = LoopNode {
+            id: "review".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "review".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf REVIEW",
+                "success_condition": "exit_code_0"
+            }),
+            position: 2,
+            created_at: chrono::Utc::now(),
+        };
+        db.insert_loop_node(&implement).unwrap();
+        db.insert_loop_node(&review).unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "e1".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            from_node: "implement".to_string(),
+            to_node: "review".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Always,
+        })
+        .unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "e2".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            from_node: "review".to_string(),
+            to_node: "implement".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Fail,
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id.clone()).await.unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+
+        assert_eq!(lp.status, LoopStatus::Completed);
+        assert_eq!(spec.status, LoopSpecStatus::Completed);
+        assert_eq!(runs.len(), 2);
+        // "implement" must be the entry: it ran with no previous-node input.
+        // "review" ran second, fed by implement's output — proving the walk
+        // started at the lowest-position node, not an arbitrary one.
+        let implement_run = runs.iter().find(|run| run.node_id == "implement").unwrap();
+        let review_run = runs.iter().find(|run| run.node_id == "review").unwrap();
+        assert!(implement_run.input.is_none());
+        assert!(review_run.input.is_some());
+    }
+
+    #[tokio::test]
+    async fn loop_engine_fails_spec_with_no_graph_anywhere_and_loop_moves_on() {
+        // Neither the spec nor the loop has a graph: the spec must fail with
+        // an actionable error instead of the engine erroring out before the
+        // spec is even marked failed.
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        engine.run_loop(loop_id.clone()).await.unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+
+        assert_eq!(lp.status, LoopStatus::Failed);
+        assert_eq!(spec.status, LoopSpecStatus::Failed);
     }
 }
