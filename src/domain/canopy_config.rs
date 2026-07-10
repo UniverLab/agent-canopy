@@ -49,6 +49,11 @@ pub struct CanopyConfig {
     /// Root path used to discover or group related projects.
     #[serde(default = "default_projects_root")]
     pub projects_root: String,
+
+    /// Seconds of inactivity after which the (lazily-loaded) embedding model
+    /// is dropped from memory. Reloaded transparently on next use.
+    #[serde(default = "default_embeddings_idle_unload_secs")]
+    pub embeddings_idle_unload_secs: u64,
 }
 
 /// Preferred unit for temperature display.
@@ -68,6 +73,10 @@ fn default_mcp_root() -> String {
 
 fn default_similarity_threshold() -> f32 {
     0.25
+}
+
+fn default_embeddings_idle_unload_secs() -> u64 {
+    600
 }
 
 fn default_projects_root() -> String {
@@ -138,6 +147,7 @@ impl Default for CanopyConfig {
             rag_personal_dirs: Vec::new(),
             rag_personal_root: String::new(),
             projects_root: default_projects_root(),
+            embeddings_idle_unload_secs: default_embeddings_idle_unload_secs(),
         }
     }
 }
@@ -193,6 +203,19 @@ mod tests {
 
         let loaded = CanopyConfig::load(&canopy_dir);
         assert_eq!(loaded.rag_personal_dirs, vec!["/old/rag"]);
+    }
+
+    #[test]
+    fn test_config_without_idle_unload_field_uses_default() {
+        let dir = TempDir::new().unwrap();
+        let canopy_dir = dir.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        // Simulates a config written before `embeddings_idle_unload_secs` existed.
+        let toml = r#"embeddings_model = "intfloat/multilingual-e5-base""#;
+        std::fs::write(canopy_dir.join("config.toml"), toml).unwrap();
+
+        let loaded = CanopyConfig::load(&canopy_dir);
+        assert_eq!(loaded.embeddings_idle_unload_secs, 600);
     }
 
     #[test]

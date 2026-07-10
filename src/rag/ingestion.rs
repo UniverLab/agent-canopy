@@ -9,6 +9,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::{Mutex, Notify};
@@ -21,6 +22,9 @@ use crate::rag::embedding_client::{client_from_config, model_dimensions, Embeddi
 use crate::rag::vector_store::{VectorChunk, VectorStore};
 
 const QUEUE_MAX: usize = 10_000;
+/// How often the background task checks whether the cached embedding client
+/// has been idle long enough to unload.
+const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 const FILE_MAX_BYTES: u64 = 5 * 1024 * 1024; // 5 MB
 /// Max number of recorded `"error"` events before a file is given up on
 /// permanently, even if the error message doesn't match a known-fatal pattern.
@@ -73,6 +77,14 @@ impl Queue {
     }
 }
 
+/// A lazily-loaded embedding client plus enough bookkeeping to unload it
+/// after it has sat idle, without racing an in-flight indexing operation.
+struct CachedClient {
+    model: String,
+    client: Arc<dyn EmbeddingClient>,
+    last_used: Instant,
+}
+
 pub struct IngestionManager {
     db: Arc<Database>,
     data_dir: PathBuf,
@@ -80,7 +92,9 @@ pub struct IngestionManager {
     notify: Arc<Notify>,
     _personal_watcher: std::sync::Mutex<Option<RecommendedWatcher>>,
     /// Cached embedding client keyed by model id so we load the ONNX model once.
-    cached_client: Mutex<Option<(String, Arc<dyn EmbeddingClient>)>>,
+    /// Dropped after `embeddings_idle_unload_secs` of inactivity (see
+    /// `idle_unload_loop`) and reloaded transparently on next use.
+    cached_client: Mutex<Option<CachedClient>>,
 }
 
 impl IngestionManager {
@@ -231,11 +245,82 @@ impl IngestionManager {
 
     pub fn start(self: Arc<Self>) -> tokio_util::sync::CancellationToken {
         let ct = tokio_util::sync::CancellationToken::new();
-        let ct_child = ct.child_token();
+
+        let ct_run = ct.child_token();
+        let mgr_run = Arc::clone(&self);
         tokio::spawn(async move {
-            self.run(ct_child).await;
+            mgr_run.run(ct_run).await;
         });
+
+        let ct_idle = ct.child_token();
+        let mgr_idle = Arc::clone(&self);
+        tokio::spawn(async move {
+            mgr_idle.idle_unload_loop(ct_idle).await;
+        });
+
         ct
+    }
+
+    /// Periodically checks whether the cached embedding client has been idle
+    /// long enough to drop, freeing the model's RAM until it's needed again.
+    async fn idle_unload_loop(&self, ct: tokio_util::sync::CancellationToken) {
+        loop {
+            tokio::select! {
+                _ = ct.cancelled() => break,
+                _ = tokio::time::sleep(IDLE_CHECK_INTERVAL) => {
+                    let idle_timeout = std::time::Duration::from_secs(
+                        crate::domain::canopy_config::CanopyConfig::load(&self.data_dir)
+                            .embeddings_idle_unload_secs,
+                    );
+                    self.maybe_unload_idle_client(idle_timeout).await;
+                }
+            }
+        }
+    }
+
+    /// Drops the cached embedding client if it has been idle for at least
+    /// `idle_timeout` and nothing else currently holds a reference to it.
+    async fn maybe_unload_idle_client(&self, idle_timeout: Duration) {
+        if let Some((model, idle_for)) = self
+            .maybe_unload_idle_client_at(idle_timeout, Instant::now())
+            .await
+        {
+            tracing::info!(
+                "RAG: unloaded embedding client for model '{model}' after {:.0}s idle",
+                idle_for.as_secs_f64()
+            );
+        }
+    }
+
+    /// Testable core of `maybe_unload_idle_client`: takes `now` explicitly so
+    /// tests can simulate an idle timeout without sleeping in real time.
+    /// Never unloads while another clone of the `Arc` is still in flight
+    /// (e.g. mid-indexing) — that's read straight off the strong count, not
+    /// a separately-tracked "busy" flag, so it can't drift out of sync.
+    /// Returns the unloaded model id plus how long it actually sat idle.
+    async fn maybe_unload_idle_client_at(
+        &self,
+        idle_timeout: Duration,
+        now: Instant,
+    ) -> Option<(String, Duration)> {
+        if idle_timeout.is_zero() {
+            return None;
+        }
+
+        let mut guard = self.cached_client.lock().await;
+        let cached = guard.as_ref()?;
+
+        let idle_for = now.saturating_duration_since(cached.last_used);
+        if idle_for < idle_timeout {
+            return None;
+        }
+        if Arc::strong_count(&cached.client) > 1 {
+            return None;
+        }
+
+        let model = cached.model.clone();
+        *guard = None;
+        Some((model, idle_for))
     }
 
     /// Scan the vector store for chunks whose source file no longer exists on disk
@@ -449,28 +534,54 @@ impl IngestionManager {
 
     /// Return a cached embedding client, creating it (in a blocking task) if needed.
     /// If the configured model changed since last call, the client is recreated.
+    /// This is the sole load point: the model is never loaded eagerly at
+    /// startup, only here, on the first query or indexing pass that needs it.
     async fn get_embedding_client(
         &self,
         config: &crate::domain::canopy_config::CanopyConfig,
     ) -> anyhow::Result<Arc<dyn EmbeddingClient>> {
         let model_id = config.embeddings_model.trim().to_string();
+        let config_clone = config.clone();
+        self.get_or_load_client(model_id, move || async move {
+            // Load the model (potentially heavy for local ONNX models) off the async executor.
+            tokio::task::spawn_blocking(move || client_from_config(&config_clone).map(Arc::from))
+                .await
+                .map_err(|e| anyhow::anyhow!("Embedding client task panicked: {e}"))?
+        })
+        .await
+    }
+
+    /// Cache-lookup-or-load core shared by `get_embedding_client` and tests: returns
+    /// the cached client for `model_id` if present and refreshes its idle timer,
+    /// otherwise runs `loader` and caches the result. Kept generic over `loader` so
+    /// tests can exercise the caching/idle-tracking behavior with a lightweight mock
+    /// client instead of a real (network- or ONNX-backed) `EmbeddingClient`.
+    async fn get_or_load_client<F, Fut>(
+        &self,
+        model_id: String,
+        loader: F,
+    ) -> anyhow::Result<Arc<dyn EmbeddingClient>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<Arc<dyn EmbeddingClient>>>,
+    {
         let mut guard = self.cached_client.lock().await;
 
-        if let Some((cached_model, client)) = guard.as_ref() {
-            if *cached_model == model_id {
-                return Ok(Arc::clone(client));
+        if let Some(cached) = guard.as_mut() {
+            if cached.model == model_id {
+                cached.last_used = Instant::now();
+                return Ok(Arc::clone(&cached.client));
             }
         }
 
-        // Load the model (potentially heavy for local ONNX models) off the async executor.
         tracing::info!("RAG: loading embedding client for model '{model_id}'");
-        let config_clone = config.clone();
-        let client: Arc<dyn EmbeddingClient> =
-            tokio::task::spawn_blocking(move || client_from_config(&config_clone).map(Arc::from))
-                .await
-                .map_err(|e| anyhow::anyhow!("Embedding client task panicked: {e}"))??;
+        let client = loader().await?;
 
-        *guard = Some((model_id.clone(), Arc::clone(&client)));
+        *guard = Some(CachedClient {
+            model: model_id.clone(),
+            client: Arc::clone(&client),
+            last_used: Instant::now(),
+        });
         tracing::info!("RAG: embedding client loaded and cached for model '{model_id}'");
         Ok(client)
     }
@@ -1202,5 +1313,101 @@ mod tests {
 
         // Reset for other tests.
         LANCEDB_PURGE_DONE.store(false, Ordering::SeqCst);
+    }
+
+    use crate::rag::embedding_client::MockEmbeddingClient;
+
+    fn test_manager() -> (IngestionManager, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
+        let mgr = IngestionManager::new(db, dir.path().to_path_buf());
+        (mgr, dir)
+    }
+
+    fn mock_client() -> Arc<dyn EmbeddingClient> {
+        Arc::new(MockEmbeddingClient::new(4))
+    }
+
+    /// (1) After startup with an empty queue, the embedding client is not loaded.
+    #[tokio::test]
+    async fn embedding_client_not_loaded_on_startup() {
+        let (mgr, _dir) = test_manager();
+        assert!(mgr.cached_client.lock().await.is_none());
+    }
+
+    /// (2) A query (via `get_or_load_client`, the shared core behind
+    /// `get_embedding_client`) loads and caches the client on first use.
+    #[tokio::test]
+    async fn query_loads_embedding_client() {
+        let (mgr, _dir) = test_manager();
+        assert!(mgr.cached_client.lock().await.is_none());
+
+        let client = mgr
+            .get_or_load_client("mock-model".to_string(), || async { Ok(mock_client()) })
+            .await
+            .expect("load should succeed");
+        assert_eq!(client.embed("hello").unwrap().len(), 4);
+
+        let guard = mgr.cached_client.lock().await;
+        let cached = guard.as_ref().expect("client should now be cached");
+        assert_eq!(cached.model, "mock-model");
+    }
+
+    /// (3) Simulated idle timeout releases the cached client.
+    #[tokio::test]
+    async fn idle_timeout_unloads_cached_client() {
+        let (mgr, _dir) = test_manager();
+        mgr.get_or_load_client("mock-model".to_string(), || async { Ok(mock_client()) })
+            .await
+            .unwrap();
+        assert!(mgr.cached_client.lock().await.is_some());
+
+        let idle_timeout = Duration::from_secs(600);
+        let long_after = Instant::now() + Duration::from_secs(700);
+        let unloaded = mgr
+            .maybe_unload_idle_client_at(idle_timeout, long_after)
+            .await;
+
+        assert_eq!(
+            unloaded.map(|(model, _)| model),
+            Some("mock-model".to_string())
+        );
+        assert!(mgr.cached_client.lock().await.is_none());
+    }
+
+    /// (4) The client is not released while an in-progress use still holds the Arc,
+    /// even past the idle timeout — checked via the strong count, not a busy flag.
+    #[tokio::test]
+    async fn idle_unload_skipped_while_client_in_use() {
+        let (mgr, _dir) = test_manager();
+        // Simulates an in-flight indexing/query call still holding the Arc it
+        // got back from `get_or_load_client` (the cache itself holds a second
+        // strong reference, so the count is 2 while `held` is alive).
+        let held = mgr
+            .get_or_load_client("mock-model".to_string(), || async { Ok(mock_client()) })
+            .await
+            .unwrap();
+
+        let idle_timeout = Duration::from_secs(600);
+        let long_after = Instant::now() + Duration::from_secs(700);
+        let unloaded = mgr
+            .maybe_unload_idle_client_at(idle_timeout, long_after)
+            .await;
+
+        assert!(
+            unloaded.is_none(),
+            "must not unload while a use is in flight"
+        );
+        assert!(mgr.cached_client.lock().await.is_some());
+
+        drop(held);
+        let unloaded = mgr
+            .maybe_unload_idle_client_at(idle_timeout, long_after)
+            .await;
+        assert!(
+            unloaded.is_some(),
+            "should unload once the in-flight use ends"
+        );
+        assert!(mgr.cached_client.lock().await.is_none());
     }
 }
