@@ -2603,6 +2603,128 @@ fn get_active_sessions_by_type_returns_only_matching_bridge_rows() {
 }
 
 #[test]
+fn session_marking_is_per_row_not_a_mass_pre_pass() {
+    // Simulates a crash partway through the auto-resume loop: two active
+    // sessions exist, but only the first gets handled (marked orphaned)
+    // before the "crash". The old `mark_orphaned_sessions` mass pre-pass
+    // would have flipped both to 'orphaned' up front; the per-session
+    // primitives must leave the untouched second session 'active'.
+    let db = test_db();
+    db.insert_interactive_session(
+        "session-1",
+        "first",
+        "opencode",
+        "/tmp",
+        None,
+        Some(111),
+        "interactive",
+        None,
+    )
+    .unwrap();
+    db.insert_interactive_session(
+        "session-2",
+        "second",
+        "opencode",
+        "/tmp",
+        None,
+        Some(222),
+        "interactive",
+        None,
+    )
+    .unwrap();
+
+    // Only the first session is handled before the simulated crash.
+    db.mark_session_orphaned("session-1").unwrap();
+
+    let active = db.get_active_sessions().unwrap();
+    assert!(active.iter().all(|s| s.id != "session-1"));
+    assert!(
+        active.iter().any(|s| s.id == "session-2"),
+        "untouched second session must still be 'active', not orphaned"
+    );
+
+    let orphaned = db.get_orphaned_sessions().unwrap();
+    assert!(orphaned.iter().any(|s| s.id == "session-1"));
+    assert!(orphaned.iter().all(|s| s.id != "session-2"));
+}
+
+#[test]
+fn mark_session_orphaned_is_a_noop_once_already_resumed() {
+    // Guards the "only transitions rows that are still 'active'" contract:
+    // once a session has been marked 'resumed' it must not be flippable
+    // back to 'orphaned' by a stray call.
+    let db = test_db();
+    db.insert_interactive_session(
+        "session-1",
+        "first",
+        "opencode",
+        "/tmp",
+        None,
+        Some(111),
+        "interactive",
+        None,
+    )
+    .unwrap();
+
+    db.mark_session_resumed("session-1").unwrap();
+    db.mark_session_orphaned("session-1").unwrap();
+
+    let orphaned = db.get_orphaned_sessions().unwrap();
+    assert!(orphaned.iter().all(|s| s.id != "session-1"));
+}
+
+#[test]
+fn boot_id_migration_is_idempotent_and_a_pre_boot_id_database_opens_cleanly() {
+    // Simulate a database written before the boot_id column existed:
+    // interactive_sessions has `pid` but no `boot_id`.
+    let tmp = NamedTempFile::new().expect("create temp file");
+    let path = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+
+    {
+        let conn = rusqlite::Connection::open(&path).expect("open raw legacy db");
+        conn.execute_batch(
+            "CREATE TABLE interactive_sessions (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                cli TEXT NOT NULL,
+                working_dir TEXT NOT NULL,
+                args TEXT,
+                started_at TEXT NOT NULL,
+                exited_at TEXT,
+                exit_code INTEGER,
+                status TEXT NOT NULL DEFAULT 'active',
+                session_type TEXT NOT NULL DEFAULT 'interactive',
+                pid INTEGER
+             );
+             INSERT INTO interactive_sessions
+                 (id, name, cli, working_dir, started_at, status, session_type, pid)
+                 VALUES ('legacy-session', 'legacy', 'opencode', '/tmp', '2023-01-01T00:00:00Z', 'active', 'interactive', 4242);",
+        )
+        .expect("seed legacy schema");
+    }
+
+    // Opening the DB (Database::new runs the migration) must succeed, add
+    // the boot_id column, and leave the existing row queryable with a NULL
+    // boot_id (legacy rows are always safe to resume — see should_resume_session).
+    let db = Database::new(&path).expect("open pre-boot_id db, running migration");
+    let sessions = db.get_active_sessions().unwrap();
+    let legacy = sessions
+        .iter()
+        .find(|s| s.id == "legacy-session")
+        .expect("legacy row still present after migration");
+    assert_eq!(legacy.boot_id, None);
+    assert_eq!(legacy.pid, Some(4242));
+    drop(db);
+
+    // Reopening after the migration already ran must be a no-op: same data,
+    // no error (idempotent).
+    let db = Database::new(&path).expect("reopen db after migration already applied");
+    let sessions = db.get_active_sessions().unwrap();
+    assert!(sessions.iter().any(|s| s.id == "legacy-session"));
+}
+
+#[test]
 fn legacy_bridge_rows_are_reclassified_by_migration() {
     // Simulate a row left over from before session_type = 'bridge' existed:
     // old builds stored the bridge sidecar with session_type = 'interactive'.

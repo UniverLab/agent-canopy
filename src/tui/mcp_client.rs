@@ -495,9 +495,21 @@ mod tests {
 
     #[test]
     fn call_daemon_tool_fails_when_daemon_unreachable() {
-        let port = unused_port();
-        let err = call_daemon_tool(&port, "loop_create", &serde_json::json!({})).unwrap_err();
-        assert!(err.to_string().contains("not reachable"));
+        // `unused_port()` frees the port before returning it, which leaves a
+        // brief window where another test's fake daemon (also bound via
+        // port 0) could claim the same port before we connect. Retry with a
+        // fresh port on the rare miss instead of flaking the whole suite.
+        for _ in 0..5 {
+            let port = unused_port();
+            match call_daemon_tool(&port, "loop_create", &serde_json::json!({})) {
+                Err(err) => {
+                    assert!(err.to_string().contains("not reachable"));
+                    return;
+                }
+                Ok(_) => continue,
+            }
+        }
+        panic!("port kept getting claimed by another test after 5 attempts");
     }
 
     #[test]

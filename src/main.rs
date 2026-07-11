@@ -32,6 +32,7 @@ use clap::{Parser, Subcommand};
 use daemon::bridge::run_bridge;
 use daemon::cli::{handle_daemon_action, DaemonAction};
 use daemon::doctor::run_doctor;
+use daemon::loop_cli::{handle_loop_action, LoopAction};
 use daemon::rag_cli::{handle_rag_action, RagAction};
 use daemon::server::{run_http_server, run_stdio_server};
 use std::path::PathBuf;
@@ -75,6 +76,11 @@ enum Commands {
     Rag {
         #[command(subcommand)]
         action: RagAction,
+    },
+    /// Inspect loop state (read-only).
+    Loop {
+        #[command(subcommand)]
+        action: LoopAction,
     },
     /// Run a stdio sidecar proxy that injects canopy identity headers.
     Bridge {
@@ -120,6 +126,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(Commands::Rag { action }) => handle_rag_action(action).await,
+        Some(Commands::Loop { action }) => handle_loop_action(action).await,
         Some(Commands::Bridge {
             agent_id,
             port,

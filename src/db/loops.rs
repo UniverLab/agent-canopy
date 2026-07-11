@@ -738,6 +738,27 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// All node runs recorded against `loop_id`, regardless of whether the
+    /// spec they belong to is bound (`loop_specs.loop_id`) or was picked up
+    /// live from a pool (pool members always keep `loop_id: None` on their
+    /// own row — see `LoopEngine::run_loop`). `loop_runs.loop_id` is set on
+    /// every insert either way, so this is the only reliable way to find a
+    /// pool-driven loop's current/recent activity without a pool id in hand.
+    pub fn list_loop_runs_for_loop(&self, loop_id: &str) -> Result<Vec<LoopNodeRun>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration
+             FROM loop_runs WHERE loop_id = ?1 ORDER BY started_at ASC, iteration ASC",
+        )?;
+        let rows = stmt.query_map(params![loop_id], map_loop_run_row)?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn get_loop_run(&self, run_id: &str) -> Result<Option<LoopNodeRun>> {
         let conn = self
             .conn

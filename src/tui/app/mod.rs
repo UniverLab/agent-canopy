@@ -1977,9 +1977,16 @@ impl App {
                     }
                     Err(e2) => {
                         tracing::warn!(
-                            "Fresh-session fallback also failed for '{}': {e2}",
+                            "Fresh-session fallback also failed for '{}': {e2}; marking orphaned",
                             session.name
                         );
+                        // Neither the resume nor the fresh-launch attempt could
+                        // start this CLI (binary missing, no resume flag and the
+                        // original args no longer work, etc.) — leaving the row
+                        // 'active' would strand it invisibly forever. Orphan it
+                        // so the TUI's orphaned-sessions view can revive or
+                        // dismiss it, preserving its workdir and CLI.
+                        let _ = self.db.mark_session_orphaned(&session.id);
                         return;
                     }
                 }
