@@ -392,6 +392,44 @@ fn validate_pool_exists(db: &Database, pool_id: &str) -> Result<Pool, String> {
         .ok_or_else(|| format!("Pool '{pool_id}' not found."))
 }
 
+/// Refuse to start a pool run when one of the pool's specs is already
+/// `running` under a different loop. A pool spec's own `loop_id` stays
+/// `None` (pool membership never binds it), so ownership is read off the
+/// spec's most recent `loop_runs` row instead — the loop that most recently
+/// touched the spec is the only one that could have set it `running`.
+///
+/// This is a start-time check, not a lock: two `loop_run` calls issued in
+/// the same instant, before either has run a single node, can still race.
+fn validate_pool_not_consumed(
+    db: &Database,
+    pool_id: &str,
+    requesting_loop_id: &str,
+) -> Result<(), String> {
+    for spec_id in db
+        .list_pool_member_spec_ids(pool_id)
+        .map_err(|e| e.to_string())?
+    {
+        let Some(spec) = db.get_loop_spec(&spec_id).map_err(|e| e.to_string())? else {
+            continue;
+        };
+        if spec.status != LoopSpecStatus::Running {
+            continue;
+        }
+
+        let runs = db
+            .list_loop_runs_for_spec(&spec_id)
+            .map_err(|e| e.to_string())?;
+        let owner_loop_id = runs.last().map(|run| run.loop_id.clone());
+        if owner_loop_id.as_deref() != Some(requesting_loop_id) {
+            let owner = owner_loop_id.unwrap_or_else(|| "another loop".to_string());
+            return Err(format!(
+                "Pool '{pool_id}' spec '{spec_id}' is already running under loop '{owner}'; wait for it to finish, or pause that loop, before starting a new run against this pool."
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Validate that `spec_ids` is a total permutation of `current`: same
 /// length, same set, no duplicates, no unknown ids. This rejects any partial
 /// reorder (a subset, or a list with an unrecognized id) so the operation is
@@ -2794,7 +2832,7 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "loop_run",
-        description = "Run a loop in the background, spec by spec."
+        description = "Run a loop in the background, spec by spec. With `pool_id`, runs the pool's pending specs (in queue order) through the loop's graph instead of the loop's own bound specs. `workdir` overrides the loop's workdir for this run only."
     )]
     async fn loop_run(
         &self,
@@ -2823,7 +2861,36 @@ impl TaskTriggerHandler {
             ));
         }
 
-        Arc::clone(&self.loop_engine).start_background(params.loop_id.clone());
+        let pool_id = params
+            .pool_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if let Some(pool_id) = pool_id {
+            if let Err(e) = validate_pool_exists(&self.db, pool_id) {
+                return Ok(error_result(&e));
+            }
+            if let Err(e) = validate_pool_not_consumed(&self.db, pool_id, &params.loop_id) {
+                return Ok(error_result(&e));
+            }
+        }
+
+        let workdir = params
+            .workdir
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if let Some(workdir) = workdir {
+            if let Err(e) = validate_absolute_dir(workdir) {
+                return Ok(error_result(&e));
+            }
+        }
+
+        Arc::clone(&self.loop_engine).start_background_run(
+            params.loop_id.clone(),
+            pool_id.map(str::to_string),
+            workdir.map(str::to_string),
+        );
         Ok(success_result(&format!(
             "Loop '{}' launched in background.",
             params.loop_id
@@ -3603,12 +3670,14 @@ impl ServerHandler for TaskTriggerHandler {
 mod tests {
     use super::{
         header_str, loop_details_json, missing_sync_identity_error, perform_loop_reset,
-        resolve_graph_target, validate_node_config, validate_pool_exists, validate_pool_reorder,
-        validate_spec_deletable, validate_spec_exists, MISSING_SYNC_IDENTITY_MESSAGE,
+        resolve_graph_target, validate_node_config, validate_pool_exists,
+        validate_pool_not_consumed, validate_pool_reorder, validate_spec_deletable,
+        validate_spec_exists, MISSING_SYNC_IDENTITY_MESSAGE,
     };
     use crate::db::Database;
     use crate::domain::loops::{
-        Loop, LoopNode, LoopNodeKind, LoopSpec, LoopSpecStatus, LoopStatus,
+        Loop, LoopNode, LoopNodeKind, LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus,
+        LoopStatus,
     };
     use crate::domain::pools::Pool;
     use crate::shared::sync_identity::CANOPY_AGENT_ID_HEADER;
@@ -3968,6 +4037,115 @@ mod tests {
 
         let error = validate_pool_reorder(&current, &order).unwrap_err();
         assert!(error.contains("no spec 'ghost'"), "{error}");
+    }
+
+    fn running_spec(id: &str) -> LoopSpec {
+        let mut spec = standalone_spec(id);
+        spec.status = LoopSpecStatus::Running;
+        spec
+    }
+
+    /// A minimal loop row, needed only to satisfy `loop_runs.loop_id`'s FK.
+    fn insert_test_loop(db: &Database, id: &str) {
+        db.insert_loop(&Loop {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: None,
+            workdir: "/tmp".to_string(),
+            status: LoopStatus::Running,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+        })
+        .unwrap();
+    }
+
+    /// A minimal node row, needed only to satisfy `loop_runs.node_id`'s FK.
+    fn insert_test_node(db: &Database, id: &str, spec_id: &str) {
+        db.insert_loop_node(&LoopNode {
+            id: id.to_string(),
+            spec_id: Some(spec_id.to_string()),
+            loop_id: None,
+            name: id.to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "true"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+    }
+
+    fn loop_run_row(id: &str, loop_id: &str, spec_id: &str, status: LoopRunStatus) -> LoopNodeRun {
+        LoopNodeRun {
+            id: id.to_string(),
+            loop_id: loop_id.to_string(),
+            spec_id: spec_id.to_string(),
+            node_id: "node-1".to_string(),
+            status,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: (status != LoopRunStatus::Running).then(chrono::Utc::now),
+            iteration: 1,
+        }
+    }
+
+    #[test]
+    fn pool_not_consumed_allows_start_when_every_member_is_pending() {
+        let (_dir, db) = pool_test_db();
+        db.insert_loop_spec(&standalone_spec("spec-a")).unwrap();
+        db.insert_loop_spec(&standalone_spec("spec-b")).unwrap();
+        insert_pool(&db, "pool-1");
+        db.append_pool_member("pool-1", "spec-a").unwrap();
+        db.append_pool_member("pool-1", "spec-b").unwrap();
+
+        assert!(validate_pool_not_consumed(&db, "pool-1", "loop-requesting").is_ok());
+    }
+
+    #[test]
+    fn pool_not_consumed_blocks_when_a_member_runs_under_another_loop() {
+        let (_dir, db) = pool_test_db();
+        db.insert_loop_spec(&running_spec("spec-a")).unwrap();
+        insert_pool(&db, "pool-1");
+        db.append_pool_member("pool-1", "spec-a").unwrap();
+        insert_test_loop(&db, "loop-other");
+        insert_test_node(&db, "node-1", "spec-a");
+        db.insert_loop_run(&loop_run_row(
+            "run-1",
+            "loop-other",
+            "spec-a",
+            LoopRunStatus::Running,
+        ))
+        .unwrap();
+
+        let error = validate_pool_not_consumed(&db, "pool-1", "loop-requesting").unwrap_err();
+
+        assert!(error.contains("spec-a"), "{error}");
+        assert!(error.contains("loop-other"), "{error}");
+    }
+
+    #[test]
+    fn pool_not_consumed_allows_the_owning_loop_to_resume_its_own_running_spec() {
+        // A paused pool run's active spec stays `running` between node
+        // executions. Resuming the SAME loop against the SAME pool must not
+        // be mistaken for a conflicting run.
+        let (_dir, db) = pool_test_db();
+        db.insert_loop_spec(&running_spec("spec-a")).unwrap();
+        insert_pool(&db, "pool-1");
+        db.append_pool_member("pool-1", "spec-a").unwrap();
+        insert_test_loop(&db, "loop-owner");
+        insert_test_node(&db, "node-1", "spec-a");
+        db.insert_loop_run(&loop_run_row(
+            "run-1",
+            "loop-owner",
+            "spec-a",
+            LoopRunStatus::Pass,
+        ))
+        .unwrap();
+
+        assert!(validate_pool_not_consumed(&db, "pool-1", "loop-owner").is_ok());
     }
 
     #[test]

@@ -42,8 +42,23 @@ impl LoopEngine {
     }
 
     pub fn start_background(self: Arc<Self>, loop_id: String) {
+        Arc::clone(&self).start_background_run(loop_id, None, None);
+    }
+
+    /// Same as [`Self::start_background`], but optionally drives the loop's
+    /// pending pool specs (see [`Self::run_loop`]) and/or overrides the
+    /// workdir for this run only.
+    pub fn start_background_run(
+        self: Arc<Self>,
+        loop_id: String,
+        pool_id: Option<String>,
+        workdir_override: Option<String>,
+    ) {
         tokio::spawn(async move {
-            if let Err(error) = self.run_loop(loop_id.clone()).await {
+            if let Err(error) = self
+                .run_loop(loop_id.clone(), pool_id, workdir_override)
+                .await
+            {
                 tracing::error!("Loop '{}' failed to run: {error:#}", loop_id);
                 let _ = self.fail_loop(&loop_id, &error.to_string());
             }
@@ -65,7 +80,25 @@ impl LoopEngine {
         }
     }
 
-    pub async fn run_loop(&self, loop_id: String) -> Result<()> {
+    /// Run `loop_id`'s specs through its graph (R2).
+    ///
+    /// With `pool_id`: runs the pool's pending members, in the pool's queue
+    /// order, instead of the loop's own bound specs. Pool membership never
+    /// mutates the specs themselves — they stay standalone (`loop_id: None`)
+    /// so the same pool can be run by different loops over time, and
+    /// already-`completed` members are simply skipped.
+    ///
+    /// `workdir_override`, when set, wins over `loop.workdir` for this run
+    /// only — the loop's own `workdir` is left untouched.
+    ///
+    /// Without `pool_id`: identical to the pre-pool behavior (bound specs,
+    /// `loop.workdir`).
+    pub async fn run_loop(
+        &self,
+        loop_id: String,
+        pool_id: Option<String>,
+        workdir_override: Option<String>,
+    ) -> Result<()> {
         let Some(lp) = self.db.get_loop(&loop_id)? else {
             bail!("Loop '{}' not found.", loop_id);
         };
@@ -77,7 +110,21 @@ impl LoopEngine {
             None,
         )?;
 
-        let specs = self.db.list_loop_specs(&loop_id)?;
+        // The run's `workdir` param wins over `loop.workdir` — a pool run can
+        // point the same loop's graph at a different checkout without
+        // mutating the loop itself.
+        let workdir = workdir_override.unwrap_or_else(|| lp.workdir.clone());
+
+        let specs = match &pool_id {
+            Some(pool_id) => self
+                .db
+                .list_pool_member_spec_ids(pool_id)?
+                .into_iter()
+                .filter_map(|spec_id| self.db.get_loop_spec(&spec_id).transpose())
+                .collect::<Result<Vec<_>>>()?,
+            None => self.db.list_loop_specs(&loop_id)?,
+        };
+
         for spec in specs {
             if self.is_paused(&loop_id)? {
                 return Ok(());
@@ -89,7 +136,7 @@ impl LoopEngine {
                 continue;
             }
 
-            match self.run_spec(&lp, &spec).await? {
+            match self.run_spec(&lp, &spec, &workdir).await? {
                 SpecExecutionOutcome::Completed => continue,
                 SpecExecutionOutcome::Paused => return Ok(()),
                 SpecExecutionOutcome::Failed(summary) => {
@@ -114,15 +161,14 @@ impl LoopEngine {
         &self,
         lp: &crate::domain::loops::Loop,
         spec: &LoopSpec,
+        workdir: &str,
     ) -> Result<SpecExecutionOutcome> {
-        let Some(details) = self.db.get_loop_details(&lp.id)? else {
-            bail!("Loop '{}' disappeared during execution.", lp.id);
-        };
-        let spec_details = details
-            .specs
-            .iter()
-            .find(|item| item.spec.id == spec.id)
+        let spec_details = self
+            .db
+            .get_loop_spec_details(&spec.id)?
             .ok_or_else(|| anyhow!("Loop spec '{}' not found.", spec.id))?;
+        let graph_nodes = self.db.list_loop_nodes_for_loop(&lp.id)?;
+        let graph_edges = self.db.list_loop_edges_for_loop(&lp.id)?;
 
         // A spec with its own graph always uses it (full backwards
         // compatibility). Only a spec with no nodes of its own falls back to
@@ -130,8 +176,8 @@ impl LoopEngine {
         // the loop without repeating it per spec.
         let (nodes, edges): (&[LoopNode], &[LoopEdge]) = if !spec_details.nodes.is_empty() {
             (&spec_details.nodes, &spec_details.edges)
-        } else if !details.graph_nodes.is_empty() {
-            (&details.graph_nodes, &details.graph_edges)
+        } else if !graph_nodes.is_empty() {
+            (&graph_nodes, &graph_edges)
         } else {
             let summary = format!(
                 "Spec '{}' has no nodes of its own and loop '{}' has no loop-level graph to fall back to.",
@@ -162,7 +208,7 @@ impl LoopEngine {
         let spec_start_head = if spec.status == LoopSpecStatus::Running {
             spec_details.spec.spec_start_head.clone()
         } else {
-            let head = capture_workdir_head(&lp.workdir).await;
+            let head = capture_workdir_head(workdir).await;
             self.db
                 .set_loop_spec_start_head(&spec.id, head.as_deref())?;
             head
@@ -220,6 +266,7 @@ impl LoopEngine {
                     previous_output.as_ref(),
                     spec_start_head.as_deref(),
                     &run_id,
+                    workdir,
                 )
                 .await?;
             let run = self
@@ -286,6 +333,7 @@ impl LoopEngine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_node(
         &self,
         lp: &crate::domain::loops::Loop,
@@ -294,12 +342,15 @@ impl LoopEngine {
         previous_output: Option<&Value>,
         spec_start_head: Option<&str>,
         run_id: &str,
+        workdir: &str,
     ) -> Result<NodeExecution> {
         match node.kind {
-            LoopNodeKind::Check => execute_check_node(lp, spec, node, spec_start_head).await,
+            LoopNodeKind::Check => {
+                execute_check_node(lp, spec, node, spec_start_head, workdir).await
+            }
             LoopNodeKind::Gate => execute_gate_node(node, previous_output),
             LoopNodeKind::Agent => {
-                execute_agent_node(&self.db, lp, spec, node, previous_output, run_id).await
+                execute_agent_node(&self.db, lp, spec, node, previous_output, run_id, workdir).await
             }
         }
     }
@@ -325,6 +376,7 @@ async fn execute_check_node(
     spec: &LoopSpec,
     node: &LoopNode,
     spec_start_head: Option<&str>,
+    workdir: &str,
 ) -> Result<NodeExecution> {
     let raw_command = node
         .config
@@ -346,7 +398,7 @@ async fn execute_check_node(
         .unwrap_or(120);
 
     let mut process = shell_command(&command);
-    process.current_dir(&lp.workdir);
+    process.current_dir(workdir);
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_seconds),
         process.output(),
@@ -399,6 +451,7 @@ async fn execute_agent_node(
     node: &LoopNode,
     previous_output: Option<&Value>,
     run_id: &str,
+    workdir: &str,
 ) -> Result<NodeExecution> {
     let cli_name = node
         .config
@@ -414,7 +467,7 @@ async fn execute_agent_node(
         .get("prompt_template")
         .and_then(Value::as_str)
         .unwrap_or("{{spec_content}}\n\n{{previous_feedback}}");
-    let prompt = render_agent_prompt(lp, spec, node, prompt_template, previous_output);
+    let prompt = render_agent_prompt(lp, spec, node, prompt_template, previous_output, workdir);
     let model = node.config.get("model").and_then(Value::as_str);
     let timeout_minutes = node
         .config
@@ -424,7 +477,7 @@ async fn execute_agent_node(
 
     let mut command = cli
         .strategy()
-        .build_command(&prompt, model, Some(&lp.workdir))
+        .build_command(&prompt, model, Some(workdir))
         .with_context(|| format!("Agent node '{}' failed to start.", node.name))?;
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_minutes * 60),
@@ -604,6 +657,7 @@ fn render_agent_prompt(
     node: &LoopNode,
     prompt_template: &str,
     previous_output: Option<&Value>,
+    workdir: &str,
 ) -> String {
     let previous_feedback = previous_output
         .map(|value| serde_json::to_string_pretty(value).unwrap_or_default())
@@ -611,7 +665,7 @@ fn render_agent_prompt(
     let spec_content = spec.description.as_deref().unwrap_or(&spec.name);
     let prompt = prompt_template
         .replace("{{loop_name}}", &lp.name)
-        .replace("{{workdir}}", &lp.workdir)
+        .replace("{{workdir}}", workdir)
         .replace("{{spec_id}}", &spec.id)
         .replace("{{spec_name}}", &spec.name)
         .replace("{{spec_content}}", spec_content)
@@ -623,7 +677,7 @@ fn render_agent_prompt(
         lp.name,
         spec.name,
         node.name,
-        lp.workdir,
+        workdir,
         prompt,
         previous_feedback,
         node.id,
@@ -786,7 +840,7 @@ mod tests {
         })
         .unwrap();
 
-        engine.run_loop(loop_id).await.unwrap();
+        engine.run_loop(loop_id, None, None).await.unwrap();
 
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
         assert_eq!(
@@ -815,7 +869,7 @@ mod tests {
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone()).await.unwrap();
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
@@ -842,7 +896,7 @@ mod tests {
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone()).await.unwrap();
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
@@ -894,7 +948,7 @@ mod tests {
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone()).await.unwrap();
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
@@ -923,7 +977,7 @@ mod tests {
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone()).await.unwrap();
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
@@ -1146,6 +1200,7 @@ mod tests {
             &node,
             "{{spec_content}}",
             Some(&serde_json::json!({"feedback":"ok"})),
+            &lp.workdir,
         );
 
         assert!(prompt.contains("loop_complete_node"));
@@ -1275,7 +1330,7 @@ mod tests {
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone()).await.unwrap();
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         assert_eq!(lp.status, LoopStatus::Completed);
@@ -1328,7 +1383,7 @@ mod tests {
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone()).await.unwrap();
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
@@ -1376,7 +1431,7 @@ mod tests {
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone()).await.unwrap();
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         assert_eq!(lp.status, LoopStatus::Completed);
@@ -1448,7 +1503,7 @@ mod tests {
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone()).await.unwrap();
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
@@ -1473,12 +1528,276 @@ mod tests {
         // spec is even marked failed.
         let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
 
-        engine.run_loop(loop_id.clone()).await.unwrap();
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
 
         assert_eq!(lp.status, LoopStatus::Failed);
         assert_eq!(spec.status, LoopSpecStatus::Failed);
+    }
+
+    // ── R5: `loop_run` with a pool ──────────────────────────────────────
+
+    /// A loop with no bound specs — the pool's own standalone specs supply
+    /// the work instead. Distinct from [`loop_fixture`], which always seeds
+    /// one bound spec.
+    fn bare_loop_fixture() -> Result<(TempDir, Arc<Database>, LoopEngine, String)> {
+        let dir = tempdir()?;
+        let db = Arc::new(Database::new(&dir.path().join("test.db"))?);
+        let lp = crate::domain::loops::Loop {
+            id: "wf-test".to_string(),
+            name: "Loop".to_string(),
+            description: None,
+            workdir: dir.path().to_string_lossy().to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+        };
+        db.insert_loop(&lp)?;
+        Ok((
+            dir,
+            Arc::clone(&db),
+            LoopEngine::new(db, Arc::new(DefaultNotificationService)),
+            lp.id,
+        ))
+    }
+
+    /// A standalone spec (`loop_id: None`), the shape pool members take —
+    /// pool membership never binds the spec to a loop.
+    fn standalone_spec(id: &str, position: i64) -> LoopSpec {
+        LoopSpec {
+            id: id.to_string(),
+            loop_id: None,
+            name: id.to_string(),
+            description: Some(
+                "Functional Requirements:\n- A\n\nNon-Functional Requirements:\n- B\n\nObjective:\n- C\n\nConstraints:\n- D\n\nGuidelines:\n- E\n\nIn Scope:\n- F\n\nOut of Scope:\n- G".to_string(),
+            ),
+            position,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+        }
+    }
+
+    fn insert_pool_with_members(db: &Database, pool_id: &str, member_ids: &[&str]) {
+        db.insert_pool(&crate::domain::pools::Pool {
+            id: pool_id.to_string(),
+            name: pool_id.to_string(),
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        for spec_id in member_ids {
+            db.append_pool_member(pool_id, spec_id).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_engine_pool_run_walks_loop_graph_across_pool_specs_in_queue_order() {
+        // Two standalone specs, queued into the pool in the *opposite* order
+        // of their `position` field — proving the pool's queue order drives
+        // execution, not the spec's own position. Each pass through the
+        // shared loop-level check node commits to the workdir's git repo, so
+        // the spec that captures the pre-commit HEAD ran first.
+        let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+        init_git_repo(dir.path());
+        let initial_head = git_head(dir.path());
+
+        let spec_a = standalone_spec("pool-spec-a", 1);
+        let spec_b = standalone_spec("pool-spec-b", 2);
+        db.insert_loop_spec(&spec_a).unwrap();
+        db.insert_loop_spec(&spec_b).unwrap();
+        // Queue order: b, then a — the reverse of position order.
+        insert_pool_with_members(&db, "pool-1", &[&spec_b.id, &spec_a.id]);
+
+        db.insert_loop_node(&LoopNode {
+            id: "loop-check".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "echo committed >> log.txt && git add -A && git commit -q -m spec && printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        engine
+            .run_loop(loop_id.clone(), Some("pool-1".to_string()), None)
+            .await
+            .unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Completed);
+
+        let spec_a_after = db.get_loop_spec(&spec_a.id).unwrap().unwrap();
+        let spec_b_after = db.get_loop_spec(&spec_b.id).unwrap().unwrap();
+        assert_eq!(spec_a_after.status, LoopSpecStatus::Completed);
+        assert_eq!(spec_b_after.status, LoopSpecStatus::Completed);
+        assert_eq!(db.list_loop_runs_for_spec(&spec_a.id).unwrap().len(), 1);
+        assert_eq!(db.list_loop_runs_for_spec(&spec_b.id).unwrap().len(), 1);
+
+        // spec_b ran first: nothing had been committed yet.
+        assert_eq!(
+            spec_b_after.spec_start_head.as_deref(),
+            Some(initial_head.as_str())
+        );
+        // spec_a ran second: spec_b's node had already committed by then.
+        assert_ne!(
+            spec_a_after.spec_start_head.as_deref(),
+            Some(initial_head.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_engine_run_workdir_override_is_used_as_check_node_cwd() {
+        // The loop's own workdir must be left untouched by an override — only
+        // the check node's actual working directory should change.
+        let db_dir = tempdir().unwrap();
+        let loop_workdir = tempdir().unwrap();
+        let override_workdir = tempdir().unwrap();
+        let db = Arc::new(Database::new(&db_dir.path().join("test.db")).unwrap());
+        let engine = LoopEngine::new(Arc::clone(&db), Arc::new(DefaultNotificationService));
+
+        let lp = crate::domain::loops::Loop {
+            id: "wf-workdir".to_string(),
+            name: "Loop".to_string(),
+            description: None,
+            workdir: loop_workdir.path().to_string_lossy().to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+        };
+        db.insert_loop(&lp).unwrap();
+        let spec = standalone_spec("bound-spec", 1);
+        let mut bound_spec = spec.clone();
+        bound_spec.loop_id = Some(lp.id.clone());
+        db.insert_loop_spec(&bound_spec).unwrap();
+
+        let override_path = override_workdir.path().to_string_lossy().to_string();
+        db.insert_loop_node(&LoopNode {
+            id: "loop-check".to_string(),
+            spec_id: None,
+            loop_id: Some(lp.id.clone()),
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": format!("test \"$(pwd)\" = \"{override_path}\""),
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        engine
+            .run_loop(lp.id.clone(), None, Some(override_path.clone()))
+            .await
+            .unwrap();
+
+        let lp_after = db.get_loop(&lp.id).unwrap().unwrap();
+        let spec_after = db.get_loop_spec(&bound_spec.id).unwrap().unwrap();
+        assert_eq!(lp_after.status, LoopStatus::Completed);
+        assert_eq!(spec_after.status, LoopSpecStatus::Completed);
+        // The loop's own workdir is unchanged by the run-level override.
+        assert_eq!(
+            lp_after.workdir,
+            loop_workdir.path().to_string_lossy().to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_engine_legacy_run_without_pool_id_only_touches_bound_specs() {
+        // A standalone spec exists in the DB (e.g. pool backlog) but isn't
+        // added to any pool and isn't bound to this loop. Calling run_loop
+        // without pool_id must behave exactly as before pools existed: only
+        // the loop's own bound specs are touched.
+        let (_dir, db, engine, loop_id, bound_spec_id) = loop_fixture().unwrap();
+        let untouched = standalone_spec("untouched-standalone", 99);
+        db.insert_loop_spec(&untouched).unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "loop-check".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        let bound = db.get_loop_spec(&bound_spec_id).unwrap().unwrap();
+        let untouched_after = db.get_loop_spec(&untouched.id).unwrap().unwrap();
+
+        assert_eq!(lp.status, LoopStatus::Completed);
+        assert_eq!(bound.status, LoopSpecStatus::Completed);
+        assert_eq!(untouched_after.status, LoopSpecStatus::Pending);
+        assert!(db
+            .list_loop_runs_for_spec(&untouched.id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn loop_engine_pool_run_skips_already_completed_members() {
+        let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+
+        let mut done = standalone_spec("pool-done", 1);
+        done.status = LoopSpecStatus::Completed;
+        let pending = standalone_spec("pool-pending", 2);
+        db.insert_loop_spec(&done).unwrap();
+        db.insert_loop_spec(&pending).unwrap();
+        insert_pool_with_members(&db, "pool-1", &[&done.id, &pending.id]);
+
+        db.insert_loop_node(&LoopNode {
+            id: "loop-check".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        engine
+            .run_loop(loop_id.clone(), Some("pool-1".to_string()), None)
+            .await
+            .unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        let done_after = db.get_loop_spec(&done.id).unwrap().unwrap();
+        let pending_after = db.get_loop_spec(&pending.id).unwrap().unwrap();
+
+        assert_eq!(lp.status, LoopStatus::Completed);
+        assert_eq!(done_after.status, LoopSpecStatus::Completed);
+        assert_eq!(pending_after.status, LoopSpecStatus::Completed);
+        // The already-completed spec was skipped outright: no run recorded.
+        assert!(db.list_loop_runs_for_spec(&done.id).unwrap().is_empty());
+        assert_eq!(db.list_loop_runs_for_spec(&pending.id).unwrap().len(), 1);
     }
 }

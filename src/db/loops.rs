@@ -310,6 +310,19 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// A single spec's own graph (nodes/edges), resolved by spec id alone —
+    /// independent of whether the spec is bound to a loop (`loop_specs.loop_id`)
+    /// or a standalone pool member. Lets the loop engine drive a pool spec
+    /// through the same lookup path as a bound spec (see `loop_engine::run`).
+    pub fn get_loop_spec_details(&self, spec_id: &str) -> Result<Option<LoopSpecDetails>> {
+        let Some(spec) = self.get_loop_spec(spec_id)? else {
+            return Ok(None);
+        };
+        let nodes = self.list_loop_nodes(spec_id)?;
+        let edges = self.list_loop_edges(spec_id)?;
+        Ok(Some(LoopSpecDetails { spec, nodes, edges }))
+    }
+
     /// Standalone specs, i.e. the backlog: specs not (yet) assigned to any
     /// loop, optionally filtered by their `workdir` tag and/or status.
     /// `unassigned_only` additionally filters to `loop_id IS NULL` — set it

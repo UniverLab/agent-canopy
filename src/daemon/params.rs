@@ -485,6 +485,13 @@ pub struct LoopListParams {
 pub struct LoopRunParams {
     /// Loop ID.
     pub loop_id: String,
+    /// Optional pool ID. When set, the loop runs the pool's pending specs (in
+    /// queue order) through the loop's graph instead of its own bound specs.
+    /// Pool membership is unaffected — specs stay standalone.
+    pub pool_id: Option<String>,
+    /// Optional absolute workdir override for this run only. Wins over the
+    /// loop's own `workdir`; the loop's `workdir` is left unchanged.
+    pub workdir: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
