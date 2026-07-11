@@ -85,8 +85,16 @@ impl LoopEngine {
     /// With `pool_id`: runs the pool's pending members, in the pool's queue
     /// order, instead of the loop's own bound specs. Pool membership never
     /// mutates the specs themselves — they stay standalone (`loop_id: None`)
-    /// so the same pool can be run by different loops over time, and
-    /// already-`completed` members are simply skipped.
+    /// so the same pool can be run by different loops over time.
+    ///
+    /// A pool run is *live* (R6): the "next pending" spec is re-queried from
+    /// the pool at every spec boundary via
+    /// [`Database::pool_next_pending_spec_id`], never off a list captured at
+    /// launch. That's what lets `pool_add_spec`/`pool_reorder` calls made
+    /// while the run is in flight actually change what runs next — the run
+    /// ends only when a pick finds no pending member left. A bound run (no
+    /// `pool_id`) keeps the pre-pool behavior below: its spec list is fixed
+    /// at launch.
     ///
     /// `workdir_override`, when set, wins over `loop.workdir` for this run
     /// only — the loop's own `workdir` is left untouched.
@@ -115,33 +123,52 @@ impl LoopEngine {
         // mutating the loop itself.
         let workdir = workdir_override.unwrap_or_else(|| lp.workdir.clone());
 
-        let specs = match &pool_id {
-            Some(pool_id) => self
-                .db
-                .list_pool_member_spec_ids(pool_id)?
-                .into_iter()
-                .filter_map(|spec_id| self.db.get_loop_spec(&spec_id).transpose())
-                .collect::<Result<Vec<_>>>()?,
-            None => self.db.list_loop_specs(&loop_id)?,
-        };
-
-        for spec in specs {
-            if self.is_paused(&loop_id)? {
-                return Ok(());
-            }
-            if matches!(
-                spec.status,
-                LoopSpecStatus::Completed | LoopSpecStatus::Skipped
-            ) {
-                continue;
-            }
-
-            match self.run_spec(&lp, &spec, &workdir).await? {
-                SpecExecutionOutcome::Completed => continue,
-                SpecExecutionOutcome::Paused => return Ok(()),
-                SpecExecutionOutcome::Failed(summary) => {
-                    self.fail_loop(&loop_id, &summary)?;
+        match &pool_id {
+            Some(pool_id) => loop {
+                if self.is_paused(&loop_id)? {
                     return Ok(());
+                }
+                // Live pick: fresh query, not a frozen list. Only ever
+                // returns a spec whose status is `pending` (defense in
+                // depth — even if the pool's stored order were ever
+                // corrupted to place a running/completed member where a
+                // pending one belongs, this filter still won't pick it).
+                let Some(spec_id) = self.db.pool_next_pending_spec_id(pool_id)? else {
+                    break;
+                };
+                let Some(spec) = self.db.get_loop_spec(&spec_id)? else {
+                    continue;
+                };
+
+                match self.run_spec(&lp, &spec, &workdir).await? {
+                    SpecExecutionOutcome::Completed => continue,
+                    SpecExecutionOutcome::Paused => return Ok(()),
+                    SpecExecutionOutcome::Failed(summary) => {
+                        self.fail_loop(&loop_id, &summary)?;
+                        return Ok(());
+                    }
+                }
+            },
+            None => {
+                for spec in self.db.list_loop_specs(&loop_id)? {
+                    if self.is_paused(&loop_id)? {
+                        return Ok(());
+                    }
+                    if matches!(
+                        spec.status,
+                        LoopSpecStatus::Completed | LoopSpecStatus::Skipped
+                    ) {
+                        continue;
+                    }
+
+                    match self.run_spec(&lp, &spec, &workdir).await? {
+                        SpecExecutionOutcome::Completed => continue,
+                        SpecExecutionOutcome::Paused => return Ok(()),
+                        SpecExecutionOutcome::Failed(summary) => {
+                            self.fail_loop(&loop_id, &summary)?;
+                            return Ok(());
+                        }
+                    }
                 }
             }
         }
@@ -1799,5 +1826,213 @@ mod tests {
         // The already-completed spec was skipped outright: no run recorded.
         assert!(db.list_loop_runs_for_spec(&done.id).unwrap().is_empty());
         assert_eq!(db.list_loop_runs_for_spec(&pending.id).unwrap().len(), 1);
+    }
+
+    // ── R6: live pools — append and reorder while running ────────────────
+
+    async fn wait_for_file(path: &std::path::Path) {
+        for _ in 0..500 {
+            if path.exists() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for file: {}", path.display());
+    }
+
+    fn record_node(id: &str, spec_id: &str, log: &std::path::Path, label: &str) -> LoopNode {
+        LoopNode {
+            id: id.to_string(),
+            spec_id: Some(spec_id.to_string()),
+            loop_id: None,
+            name: id.to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": format!(
+                    "echo {label} >> \"{log}\" && printf APPROVED",
+                    log = log.display(),
+                ),
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn touch_gate_node(
+        id: &str,
+        spec_id: &str,
+        marker: &std::path::Path,
+        gate: &std::path::Path,
+    ) -> LoopNode {
+        LoopNode {
+            id: id.to_string(),
+            spec_id: Some(spec_id.to_string()),
+            loop_id: None,
+            name: id.to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": format!(
+                    "touch \"{marker}\"; while [ ! -f \"{gate}\" ]; do sleep 0.02; done; printf APPROVED",
+                    marker = marker.display(),
+                    gate = gate.display(),
+                ),
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_engine_pool_run_picks_up_spec_appended_mid_run() {
+        // A spec appended to the pool while the run is in flight must still
+        // get executed before the run ends: the engine re-queries the pool
+        // for its next pending member at each spec boundary instead of
+        // iterating a list frozen at launch.
+        let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+        let started_marker = dir.path().join("started.marker");
+        let go_marker = dir.path().join("go.marker");
+        let order_log = dir.path().join("order.log");
+
+        let spec_a = standalone_spec("pool-spec-a", 1);
+        let spec_b = standalone_spec("pool-spec-b", 2);
+        db.insert_loop_spec(&spec_a).unwrap();
+        db.insert_loop_spec(&spec_b).unwrap();
+        // spec_b exists in the DB but is NOT yet in the pool — it's appended
+        // below, while spec_a is mid-run.
+        insert_pool_with_members(&db, "pool-1", &[&spec_a.id]);
+
+        db.insert_loop_node(&touch_gate_node(
+            "node-a",
+            &spec_a.id,
+            &started_marker,
+            &go_marker,
+        ))
+        .unwrap();
+        db.insert_loop_node(&record_node("node-b", &spec_b.id, &order_log, "spec-b"))
+            .unwrap();
+
+        let run_engine = engine.clone();
+        let run_loop_id = loop_id.clone();
+        let handle = tokio::spawn(async move {
+            run_engine
+                .run_loop(run_loop_id, Some("pool-1".to_string()), None)
+                .await
+        });
+
+        wait_for_file(&started_marker).await;
+        // spec_a is mid-run (blocked on the gate). Append spec_b to the pool
+        // now, while the run is in flight.
+        db.append_pool_member("pool-1", &spec_b.id).unwrap();
+        std::fs::write(&go_marker, "").unwrap();
+
+        handle.await.unwrap().unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        let spec_a_after = db.get_loop_spec(&spec_a.id).unwrap().unwrap();
+        let spec_b_after = db.get_loop_spec(&spec_b.id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Completed);
+        assert_eq!(spec_a_after.status, LoopSpecStatus::Completed);
+        assert_eq!(
+            spec_b_after.status,
+            LoopSpecStatus::Completed,
+            "spec appended mid-run must still be executed before the run ends"
+        );
+        assert_eq!(db.list_loop_runs_for_spec(&spec_b.id).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn loop_engine_pool_run_reorder_changes_pick_order_mid_run() {
+        // Reordering the pool's PENDING members while a run is in flight
+        // must change which one the engine picks next — proving the pick is
+        // a live, fresh query, not a list captured at launch.
+        let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+        let started_marker = dir.path().join("started.marker");
+        let go_marker = dir.path().join("go.marker");
+        let order_log = dir.path().join("order.log");
+
+        let spec_a = standalone_spec("pool-spec-a", 1);
+        let spec_b = standalone_spec("pool-spec-b", 2);
+        let spec_c = standalone_spec("pool-spec-c", 3);
+        db.insert_loop_spec(&spec_a).unwrap();
+        db.insert_loop_spec(&spec_b).unwrap();
+        db.insert_loop_spec(&spec_c).unwrap();
+        // Queue order at launch: a, b, c.
+        insert_pool_with_members(&db, "pool-1", &[&spec_a.id, &spec_b.id, &spec_c.id]);
+
+        db.insert_loop_node(&touch_gate_node(
+            "node-a",
+            &spec_a.id,
+            &started_marker,
+            &go_marker,
+        ))
+        .unwrap();
+        db.insert_loop_node(&record_node("node-b", &spec_b.id, &order_log, "spec-b"))
+            .unwrap();
+        db.insert_loop_node(&record_node("node-c", &spec_c.id, &order_log, "spec-c"))
+            .unwrap();
+
+        let run_engine = engine.clone();
+        let run_loop_id = loop_id.clone();
+        let handle = tokio::spawn(async move {
+            run_engine
+                .run_loop(run_loop_id, Some("pool-1".to_string()), None)
+                .await
+        });
+
+        wait_for_file(&started_marker).await;
+        // spec_a is mid-run. Swap the two PENDING members' order: c before b.
+        db.reorder_pool_members(
+            "pool-1",
+            &[spec_a.id.clone(), spec_c.id.clone(), spec_b.id.clone()],
+        )
+        .unwrap();
+        std::fs::write(&go_marker, "").unwrap();
+
+        handle.await.unwrap().unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Completed);
+
+        let order = std::fs::read_to_string(&order_log).unwrap();
+        let lines: Vec<&str> = order.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["spec-c", "spec-b"],
+            "reorder mid-run must change which pending spec runs next"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_engine_pool_run_ends_when_no_pending_members_remain() {
+        // Sanity check underpinning both tests above: with no gating at all,
+        // a pool run with N pending members ends after exactly N specs run,
+        // and picks up an appended spec before completing.
+        let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+        let order_log = dir.path().join("order.log");
+
+        let spec_a = standalone_spec("pool-spec-a", 1);
+        let spec_b = standalone_spec("pool-spec-b", 2);
+        db.insert_loop_spec(&spec_a).unwrap();
+        db.insert_loop_spec(&spec_b).unwrap();
+        insert_pool_with_members(&db, "pool-1", &[&spec_a.id, &spec_b.id]);
+
+        db.insert_loop_node(&record_node("node-a", &spec_a.id, &order_log, "spec-a"))
+            .unwrap();
+        db.insert_loop_node(&record_node("node-b", &spec_b.id, &order_log, "spec-b"))
+            .unwrap();
+
+        engine
+            .run_loop(loop_id.clone(), Some("pool-1".to_string()), None)
+            .await
+            .unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Completed);
+        assert!(db.pool_next_pending_spec_id("pool-1").unwrap().is_none());
+
+        let order = std::fs::read_to_string(&order_log).unwrap();
+        assert_eq!(order.lines().collect::<Vec<_>>(), vec!["spec-a", "spec-b"]);
     }
 }

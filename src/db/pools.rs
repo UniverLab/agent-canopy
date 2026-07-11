@@ -4,6 +4,7 @@ use rusqlite::{params, OptionalExtension};
 use std::io::{Error as IoError, ErrorKind};
 
 use crate::db::Database;
+use crate::domain::loops::LoopSpecStatus;
 use crate::domain::pools::{Pool, PoolDetails};
 
 impl Database {
@@ -120,6 +121,28 @@ impl Database {
             )?;
         }
         Ok(())
+    }
+
+    /// The pool's first PENDING member, in queue order — queried fresh on
+    /// every call rather than off a list frozen at run start. This is what
+    /// lets a live pool run pick up `pool_add_spec`/`pool_reorder` calls
+    /// made while the run is in flight: the engine calls this again at every
+    /// spec boundary instead of iterating a `Vec` captured once.
+    pub fn pool_next_pending_spec_id(&self, pool_id: &str) -> Result<Option<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        conn.query_row(
+            "SELECT pm.spec_id FROM pool_members pm
+             JOIN loop_specs ls ON ls.id = pm.spec_id
+             WHERE pm.pool_id = ?1 AND ls.status = ?2
+             ORDER BY pm.position ASC LIMIT 1",
+            params![pool_id, LoopSpecStatus::Pending.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     pub fn get_pool_details(&self, pool_id: &str) -> Result<Option<PoolDetails>> {

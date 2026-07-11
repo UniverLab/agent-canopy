@@ -456,6 +456,57 @@ fn validate_pool_reorder(current: &[String], spec_ids: &[String]) -> Result<(), 
     Ok(())
 }
 
+/// Live pools (R6): refuse to remove a pool member that is currently
+/// `running` — the tool-layer half of the same lock `pool_reorder` enforces
+/// via [`validate_pool_reorder_locking`]. A spec that isn't a pool member at
+/// all, or isn't found, is left for [`Database::remove_pool_member`]'s own
+/// "no such spec" error — this only ever blocks a positive `running` match.
+fn validate_pool_member_removable(
+    db: &Database,
+    pool_id: &str,
+    spec_id: &str,
+) -> Result<(), String> {
+    if let Some(spec) = db.get_loop_spec(spec_id).map_err(|e| e.to_string())? {
+        if spec.status == LoopSpecStatus::Running {
+            return Err(format!(
+                "Spec '{spec_id}' is currently running and cannot be removed from pool '{pool_id}'; wait for it to finish, or pause the loop, first."
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Live pools (R6): the currently running spec and every already-executed
+/// one (`completed`/`failed`/`skipped`) are immutable in the pool's order —
+/// only `pending` members may move. Call after [`validate_pool_reorder`] has
+/// already confirmed `spec_ids` is a total permutation of `current`: under
+/// that guarantee, a locked member "doesn't move" iff it sits at the same
+/// index in both slices, since moving it necessarily displaces whatever now
+/// occupies its old slot.
+fn validate_pool_reorder_locking(
+    db: &Database,
+    current: &[String],
+    spec_ids: &[String],
+) -> Result<(), String> {
+    for (index, spec_id) in current.iter().enumerate() {
+        let status = db
+            .get_loop_spec(spec_id)
+            .map_err(|e| e.to_string())?
+            .map(|spec| spec.status)
+            .unwrap_or(LoopSpecStatus::Pending);
+        if status == LoopSpecStatus::Pending {
+            continue;
+        }
+        if spec_ids.get(index) != Some(spec_id) {
+            return Err(format!(
+                "Spec '{spec_id}' is {} and cannot be moved by a reorder; only pending members may be reordered.",
+                status.as_str()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn pool_details_json(details: &PoolDetails) -> serde_json::Value {
     serde_json::json!({
         "id": details.pool.id,
@@ -2741,6 +2792,9 @@ impl TaskTriggerHandler {
             return Ok(error_result(&e));
         }
         let spec_id = params.spec_id.trim();
+        if let Err(e) = validate_pool_member_removable(&self.db, pool_id, spec_id) {
+            return Ok(error_result(&e));
+        }
         let removed = self
             .db
             .remove_pool_member(pool_id, spec_id)
@@ -2773,6 +2827,9 @@ impl TaskTriggerHandler {
             .list_pool_member_spec_ids(pool_id)
             .map_err(internal_error)?;
         if let Err(e) = validate_pool_reorder(&current, &params.spec_ids) {
+            return Ok(error_result(&e));
+        }
+        if let Err(e) = validate_pool_reorder_locking(&self.db, &current, &params.spec_ids) {
             return Ok(error_result(&e));
         }
 
@@ -3671,8 +3728,9 @@ mod tests {
     use super::{
         header_str, loop_details_json, missing_sync_identity_error, perform_loop_reset,
         resolve_graph_target, validate_node_config, validate_pool_exists,
-        validate_pool_not_consumed, validate_pool_reorder, validate_spec_deletable,
-        validate_spec_exists, MISSING_SYNC_IDENTITY_MESSAGE,
+        validate_pool_member_removable, validate_pool_not_consumed, validate_pool_reorder,
+        validate_pool_reorder_locking, validate_spec_deletable, validate_spec_exists,
+        MISSING_SYNC_IDENTITY_MESSAGE,
     };
     use crate::db::Database;
     use crate::domain::loops::{
@@ -4163,6 +4221,96 @@ mod tests {
 
         let error = validate_pool_reorder(&current, &order).unwrap_err();
         assert!(error.contains("more than once"), "{error}");
+    }
+
+    #[test]
+    fn pool_reorder_locking_refuses_ordering_that_moves_a_running_member() {
+        // R6: the currently running spec is immutable in the pool's order.
+        // Swapping it with a pending member must be refused, even though the
+        // result is still a valid total permutation.
+        let (_dir, db) = pool_test_db();
+        db.insert_loop_spec(&running_spec("spec-a")).unwrap();
+        db.insert_loop_spec(&standalone_spec("spec-b")).unwrap();
+        db.insert_loop_spec(&standalone_spec("spec-c")).unwrap();
+        insert_pool(&db, "pool-1");
+        for id in ["spec-a", "spec-b", "spec-c"] {
+            db.append_pool_member("pool-1", id).unwrap();
+        }
+        let current = db.list_pool_member_spec_ids("pool-1").unwrap();
+
+        // Moves spec-a (running) from position 0 to position 1.
+        let order = vec![
+            "spec-b".to_string(),
+            "spec-a".to_string(),
+            "spec-c".to_string(),
+        ];
+        assert!(validate_pool_reorder(&current, &order).is_ok());
+
+        let error = validate_pool_reorder_locking(&db, &current, &order).unwrap_err();
+        assert!(error.contains("spec-a"), "{error}");
+        assert!(error.contains("running"), "{error}");
+    }
+
+    #[test]
+    fn pool_reorder_locking_refuses_ordering_that_moves_a_completed_member() {
+        let (_dir, db) = pool_test_db();
+        let mut done = standalone_spec("spec-a");
+        done.status = LoopSpecStatus::Completed;
+        db.insert_loop_spec(&done).unwrap();
+        db.insert_loop_spec(&standalone_spec("spec-b")).unwrap();
+        insert_pool(&db, "pool-1");
+        for id in ["spec-a", "spec-b"] {
+            db.append_pool_member("pool-1", id).unwrap();
+        }
+        let current = db.list_pool_member_spec_ids("pool-1").unwrap();
+
+        let order = vec!["spec-b".to_string(), "spec-a".to_string()];
+        let error = validate_pool_reorder_locking(&db, &current, &order).unwrap_err();
+        assert!(error.contains("spec-a"), "{error}");
+        assert!(error.contains("completed"), "{error}");
+    }
+
+    #[test]
+    fn pool_reorder_locking_allows_permuting_pending_members_only() {
+        let (_dir, db) = pool_test_db();
+        db.insert_loop_spec(&running_spec("spec-a")).unwrap();
+        db.insert_loop_spec(&standalone_spec("spec-b")).unwrap();
+        db.insert_loop_spec(&standalone_spec("spec-c")).unwrap();
+        insert_pool(&db, "pool-1");
+        for id in ["spec-a", "spec-b", "spec-c"] {
+            db.append_pool_member("pool-1", id).unwrap();
+        }
+        let current = db.list_pool_member_spec_ids("pool-1").unwrap();
+
+        // spec-a (running) stays at position 0; only the pending tail moves.
+        let order = vec![
+            "spec-a".to_string(),
+            "spec-c".to_string(),
+            "spec-b".to_string(),
+        ];
+        assert!(validate_pool_reorder_locking(&db, &current, &order).is_ok());
+    }
+
+    #[test]
+    fn pool_remove_spec_refuses_the_currently_running_spec() {
+        let (_dir, db) = pool_test_db();
+        db.insert_loop_spec(&running_spec("spec-a")).unwrap();
+        insert_pool(&db, "pool-1");
+        db.append_pool_member("pool-1", "spec-a").unwrap();
+
+        let error = validate_pool_member_removable(&db, "pool-1", "spec-a").unwrap_err();
+        assert!(error.contains("spec-a"), "{error}");
+        assert!(error.contains("running"), "{error}");
+
+        // Once it's no longer running, removal is allowed again.
+        db.update_loop_spec_status(
+            "spec-a",
+            LoopSpecStatus::Completed,
+            None,
+            Some(chrono::Utc::now()),
+        )
+        .unwrap();
+        assert!(validate_pool_member_removable(&db, "pool-1", "spec-a").is_ok());
     }
 
     #[test]
