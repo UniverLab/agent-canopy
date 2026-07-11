@@ -407,6 +407,75 @@ impl IngestionManager {
         }
     }
 
+    /// Reconcile the ledger against the vector store at startup. If the
+    /// ledger believes files are indexed but the store comes back empty —
+    /// store loss, e.g. a hard crash destroyed the LanceDB directory while
+    /// the SQLite ledger survived — purge the stale ledger rows and the
+    /// pending queue so the caller's directory scan requeues everything for
+    /// a full re-index. A healthy/consistent startup, or a store that failed
+    /// to open, leaves everything untouched. Returns `true` if store loss
+    /// was detected and handled.
+    pub async fn reconcile_ledger_with_store(&self) -> bool {
+        let store_chunk_count = self.store_chunk_count().await;
+        let lancedb_path = match VectorStore::default_lancedb_path() {
+            Ok(path) => path,
+            Err(e) => {
+                tracing::error!("RAG reconcile: cannot determine LanceDB path: {e:#}");
+                return false;
+            }
+        };
+        self.reconcile_ledger_with_store_chunk_count_at(store_chunk_count, &lancedb_path)
+            .await
+    }
+
+    /// Core of `reconcile_ledger_with_store`, taking the store's chunk count
+    /// and the LanceDB directory as plain values so the decision + purge
+    /// logic can be unit tested against a scratch directory instead of the
+    /// real home-dir-rooted vector store.
+    async fn reconcile_ledger_with_store_chunk_count_at(
+        &self,
+        store_chunk_count: Option<i64>,
+        lancedb_path: &Path,
+    ) -> bool {
+        let ledger_indexed_count = self.db.indexed_files_timestamps().unwrap_or_default().len();
+        if !store_loss_detected(ledger_indexed_count, store_chunk_count) {
+            return false;
+        }
+
+        tracing::warn!(
+            "RAG reconcile: ledger reports {ledger_indexed_count} indexed file(s) but the \
+             vector store has 0 chunks — the store was likely destroyed (e.g. a hard crash) \
+             while the SQLite ledger survived; purging stale ledger rows and requeuing a full re-index"
+        );
+        if let Err(e) = wipe_lancedb_at(
+            lancedb_path,
+            &self.db,
+            "ledger/store reconciliation: ledger has indexed files but store is empty",
+        )
+        .await
+        {
+            tracing::error!(
+                "RAG reconcile: failed to purge ledger after detecting store loss: {e:#}"
+            );
+        }
+        self.clear_queue().await;
+        true
+    }
+
+    /// Chunk count in the vector store, or `None` if it could not be opened
+    /// (no model configured, or a genuine — not transient — open failure).
+    async fn store_chunk_count(&self) -> Option<i64> {
+        let config = crate::domain::canopy_config::CanopyConfig::load(&self.data_dir);
+        let store = open_vector_store(&config, &self.db).await?;
+        match store.count_chunks().await {
+            Ok(count) => Some(count),
+            Err(e) => {
+                tracing::warn!("RAG reconcile: failed to count vector store chunks: {e:#}");
+                None
+            }
+        }
+    }
+
     async fn run(&self, ct: tokio_util::sync::CancellationToken) {
         loop {
             tokio::select! {
@@ -1217,17 +1286,35 @@ async fn open_vector_store(
     }
 }
 
+/// Decide whether the vector store has silently lost data relative to the
+/// ledger — the signature of a hard crash that destroyed the LanceDB
+/// directory while the SQLite ledger (`rag_file_events`) survived. A store
+/// that failed to open (`None`) is never treated as loss: per the A4 fix, a
+/// transient open error on a known-existing table must not be conflated with
+/// "the store is empty".
+fn store_loss_detected(ledger_indexed_count: usize, store_chunk_count: Option<i64>) -> bool {
+    ledger_indexed_count > 0 && store_chunk_count == Some(0)
+}
+
 /// Delete the entire LanceDB directory so the next `open_vector_store` starts fresh.
 /// Used when the embeddings model is changed so stale vectors don't pollute results.
 pub async fn wipe_lancedb(db: &Database, reason: &str) -> anyhow::Result<()> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home dir"))?;
-    let lancedb_path = home.join(".canopy/rag/vectors.lancedb");
+    let lancedb_path = VectorStore::default_lancedb_path()?;
+    wipe_lancedb_at(&lancedb_path, db, reason).await
+}
+
+/// Core of `wipe_lancedb`, taking the LanceDB directory as a plain path so
+/// tests can point it at a scratch directory instead of the real
+/// home-directory-rooted store.
+pub(crate) async fn wipe_lancedb_at(
+    lancedb_path: &Path,
+    db: &Database,
+    reason: &str,
+) -> anyhow::Result<()> {
     if lancedb_path.exists() {
-        tokio::fs::remove_dir_all(&lancedb_path)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!("Failed to wipe LanceDB at {}: {e}", lancedb_path.display())
-            })?;
+        tokio::fs::remove_dir_all(lancedb_path).await.map_err(|e| {
+            anyhow::anyhow!("Failed to wipe LanceDB at {}: {e}", lancedb_path.display())
+        })?;
         tracing::info!(
             "RAG: wiped LanceDB at {} ({reason})",
             lancedb_path.display()
@@ -1409,5 +1496,94 @@ mod tests {
             "should unload once the in-flight use ends"
         );
         assert!(mgr.cached_client.lock().await.is_none());
+    }
+
+    #[test]
+    fn store_loss_detected_when_ledger_has_files_but_store_is_empty() {
+        assert!(store_loss_detected(310, Some(0)));
+    }
+
+    #[test]
+    fn store_loss_not_detected_when_ledger_and_store_agree() {
+        // Consistent state: ledger has entries and the store has chunks too.
+        assert!(!store_loss_detected(310, Some(1200)));
+    }
+
+    #[test]
+    fn store_loss_not_detected_when_ledger_is_empty() {
+        // Nothing indexed yet — an empty store is expected, not a loss.
+        assert!(!store_loss_detected(0, Some(0)));
+    }
+
+    #[test]
+    fn store_loss_not_detected_on_transient_open_failure() {
+        // A4 protection: a store that failed to open (`None`) must never be
+        // conflated with "the store is empty" — that would wipe a healthy
+        // ledger on a transient error.
+        assert!(!store_loss_detected(310, None));
+    }
+
+    /// Ledger reports indexed files but the store comes back with zero
+    /// chunks (store loss) → the ledger and pending queue are purged so the
+    /// caller's directory scan requeues everything for a full re-index.
+    #[tokio::test]
+    async fn reconcile_purges_ledger_and_queue_when_store_loss_detected() {
+        let (mgr, _dir) = test_manager();
+        mgr.db()
+            .log_rag_event(
+                "/docs/a.md",
+                "indexed",
+                None,
+                chrono::Utc::now().timestamp(),
+            )
+            .unwrap();
+        mgr.db()
+            .log_rag_event(
+                "/docs/b.md",
+                "indexed",
+                None,
+                chrono::Utc::now().timestamp(),
+            )
+            .unwrap();
+        mgr.enqueue("/docs/stale.md").await;
+        assert_eq!(mgr.db().indexed_files_timestamps().unwrap().len(), 2);
+
+        // A scratch path standing in for the (destroyed/empty) LanceDB
+        // directory — never the real home-dir-rooted store.
+        let scratch_lancedb = tempfile::tempdir().unwrap();
+        let handled = mgr
+            .reconcile_ledger_with_store_chunk_count_at(Some(0), scratch_lancedb.path())
+            .await;
+
+        assert!(handled, "store loss should have been detected and handled");
+        assert!(mgr.db().indexed_files_timestamps().unwrap().is_empty());
+        assert!(mgr.db_pending_queue().unwrap().is_empty());
+        assert_eq!(mgr.queue_len().await, 0);
+    }
+
+    /// Ledger and store agree (store has chunks) → nothing is purged and
+    /// nothing extra is queued.
+    #[tokio::test]
+    async fn reconcile_leaves_healthy_state_untouched() {
+        let (mgr, _dir) = test_manager();
+        mgr.db()
+            .log_rag_event(
+                "/docs/a.md",
+                "indexed",
+                None,
+                chrono::Utc::now().timestamp(),
+            )
+            .unwrap();
+        mgr.enqueue("/docs/pending.md").await;
+
+        let scratch_lancedb = tempfile::tempdir().unwrap();
+        let handled = mgr
+            .reconcile_ledger_with_store_chunk_count_at(Some(5), scratch_lancedb.path())
+            .await;
+
+        assert!(!handled, "consistent state must not trigger reconciliation");
+        assert_eq!(mgr.db().indexed_files_timestamps().unwrap().len(), 1);
+        assert_eq!(mgr.db_pending_queue().unwrap(), vec!["/docs/pending.md"]);
+        assert_eq!(mgr.queue_len().await, 1);
     }
 }

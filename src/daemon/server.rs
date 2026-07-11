@@ -316,6 +316,15 @@ async fn startup_personal_rag(ingestion: Arc<IngestionManager>, data_dir: &std::
             .set_state("rag_chunking_version", RAG_CHUNKING_VERSION);
     }
 
+    // ── Ledger vs vector-store reconciliation ───────────────────────────────
+    // A hard crash (e.g. a WSL kill) can destroy the LanceDB directory while
+    // the SQLite ledger (`rag_file_events`) survives on disk. Pure store
+    // deletion doesn't go through the corrupt-store recovery path (which
+    // already clears the ledger), so without this check the daemon would
+    // trust the stale ledger, queue nothing, and the RAG index would stay
+    // silently empty forever.
+    ingestion.reconcile_ledger_with_store().await;
+
     // Reload any items already in the DB queue from a previous session.
     let recovered = ingestion
         .db()

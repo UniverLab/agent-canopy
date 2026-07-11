@@ -299,9 +299,12 @@ mod tests {
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         db.set_state("rag_total_chunks", "42").unwrap();
         db.set_state("rag_indexed_files", "5").unwrap();
-        // wipe_lancedb will skip the actual rm if the dir doesn't exist,
-        // but it still resets DB state.
-        let _ = crate::rag::ingestion::wipe_lancedb(&db, "test").await;
+        // Point at a scratch LanceDB directory instead of the real
+        // home-directory-rooted store: the real path may be owned by an
+        // actual running canopy daemon, so touching it here would be both
+        // unsafe and racy.
+        let scratch_lancedb = dir.path().join("vectors.lancedb");
+        let _ = crate::rag::ingestion::wipe_lancedb_at(&scratch_lancedb, &db, "test").await;
         assert_eq!(db.get_state("rag_total_chunks").unwrap(), Some("0".into()));
         assert_eq!(db.get_state("rag_indexed_files").unwrap(), Some("0".into()));
     }
