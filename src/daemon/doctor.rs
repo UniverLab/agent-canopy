@@ -151,10 +151,11 @@ pub(crate) async fn run_doctor() -> Result<()> {
         issues.push("Add personal RAG directories via 'canopy setup'");
     } else {
         let mut total_files: usize = 0;
+        let mut oversize_files: usize = 0;
         for dir in &config.rag_personal_dirs {
             let path = std::path::Path::new(dir);
             if path.exists() {
-                let file_count = walkdir::WalkDir::new(path)
+                let indexable_entries: Vec<_> = walkdir::WalkDir::new(path)
                     .follow_links(false)
                     .into_iter()
                     .filter_map(|e| e.ok())
@@ -163,9 +164,18 @@ pub(crate) async fn run_doctor() -> Result<()> {
                             && crate::rag::chunker::detect_lang(&e.path().to_string_lossy())
                                 .is_some()
                     })
+                    .collect();
+                let file_count = indexable_entries.len();
+                let dir_oversize = indexable_entries
+                    .iter()
+                    .filter(|e| {
+                        e.metadata()
+                            .is_ok_and(|m| m.len() > crate::rag::ingestion::FILE_MAX_BYTES)
+                    })
                     .count();
                 println!(" \x1b[32m✓\x1b[0m RAG dir: {dir} ({file_count} indexable file(s))");
                 total_files += file_count;
+                oversize_files += dir_oversize;
             } else {
                 println!(" \x1b[31m✗\x1b[0m RAG dir missing: {dir}");
                 issues.push("Personal RAG directory not found on disk");
@@ -174,6 +184,16 @@ pub(crate) async fn run_doctor() -> Result<()> {
         if total_files == 0 && !config.rag_personal_dirs.is_empty() {
             println!(
                 " \x1b[33m⚠\x1b[0m No indexable files found (.md, .mdx, .pdf) in RAG directories"
+            );
+        }
+        if oversize_files > 0 {
+            let cap_mb = crate::rag::ingestion::FILE_MAX_BYTES as f64 / (1024.0 * 1024.0);
+            println!(
+                " \x1b[33m⚠\x1b[0m {oversize_files} configured file(s) exceed the {cap_mb:.0} MB \
+                 indexing limit (FILE_MAX_BYTES) and are skipped"
+            );
+            issues.push(
+                "Some configured files exceed FILE_MAX_BYTES and are skipped — see 'canopy rag report'",
             );
         }
     }

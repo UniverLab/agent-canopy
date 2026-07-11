@@ -25,7 +25,9 @@ const QUEUE_MAX: usize = 10_000;
 /// How often the background task checks whether the cached embedding client
 /// has been idle long enough to unload.
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
-const FILE_MAX_BYTES: u64 = 5 * 1024 * 1024; // 5 MB
+/// Exposed so `doctor` and `rag report` can point at the same cap when
+/// explaining why a file was skipped.
+pub(crate) const FILE_MAX_BYTES: u64 = 5 * 1024 * 1024; // 5 MB
 /// Max number of recorded `"error"` events before a file is given up on
 /// permanently, even if the error message doesn't match a known-fatal pattern.
 const MAX_RAG_ATTEMPTS: i64 = 3;
@@ -665,7 +667,13 @@ impl IngestionManager {
 
         let meta = std::fs::metadata(path)?;
         if meta.len() > FILE_MAX_BYTES {
-            tracing::debug!("Personal RAG: skipping large file {source_path}");
+            let size_mb = meta.len() as f64 / (1024.0 * 1024.0);
+            let cap_mb = FILE_MAX_BYTES as f64 / (1024.0 * 1024.0);
+            tracing::info!(
+                "Personal RAG: skipping '{source_path}' — {size_mb:.1} MB exceeds the \
+                 {cap_mb:.0} MB indexing limit (FILE_MAX_BYTES)"
+            );
+            record_oversize_skip(&self.db, source_path, meta.len());
             return Ok(());
         }
 
@@ -892,6 +900,31 @@ async fn purge_vector_chunks(data_dir: &Path, source_path: &str, db: Option<&cra
             );
         }
     }
+}
+
+/// Record a `"skipped_oversize"` ledger event for a file that exceeds
+/// `FILE_MAX_BYTES`, unless the latest recorded event for that path is
+/// already a `"skipped_oversize"` for the same size — the file is rescanned
+/// on every startup and watcher pass, so without this check an unchanged
+/// oversize file would spam a duplicate row every time.
+fn record_oversize_skip(db: &Database, source_path: &str, size_bytes: u64) {
+    let detail = size_bytes.to_string();
+    let already_recorded = db
+        .rag_events_for_file(source_path)
+        .ok()
+        .and_then(|events| events.into_iter().next())
+        .is_some_and(|e| {
+            e.event_type == "skipped_oversize" && e.detail.as_deref() == Some(detail.as_str())
+        });
+    if already_recorded {
+        return;
+    }
+    let _ = db.log_rag_event(
+        source_path,
+        "skipped_oversize",
+        Some(&detail),
+        chrono::Utc::now().timestamp(),
+    );
 }
 
 async fn refresh_rag_snapshot(db: &Database, data_dir: &Path) {
@@ -1585,5 +1618,73 @@ mod tests {
         assert_eq!(mgr.db().indexed_files_timestamps().unwrap().len(), 1);
         assert_eq!(mgr.db_pending_queue().unwrap(), vec!["/docs/pending.md"]);
         assert_eq!(mgr.queue_len().await, 1);
+    }
+
+    /// A file over `FILE_MAX_BYTES` records a `"skipped_oversize"` ledger
+    /// event carrying its size, instead of vanishing silently.
+    #[tokio::test]
+    async fn record_oversize_skip_logs_event_with_size() {
+        let (mgr, _dir) = test_manager();
+        record_oversize_skip(mgr.db(), "/docs/huge.pdf", 6_000_000);
+
+        let events = mgr.db().rag_events_for_file("/docs/huge.pdf").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "skipped_oversize");
+        assert_eq!(events[0].detail.as_deref(), Some("6000000"));
+    }
+
+    /// Recording the same oversize skip again (e.g. on the next startup scan,
+    /// file unchanged) must not duplicate the ledger row.
+    #[tokio::test]
+    async fn record_oversize_skip_is_idempotent_for_unchanged_size() {
+        let (mgr, _dir) = test_manager();
+        record_oversize_skip(mgr.db(), "/docs/huge.pdf", 6_000_000);
+        record_oversize_skip(mgr.db(), "/docs/huge.pdf", 6_000_000);
+        record_oversize_skip(mgr.db(), "/docs/huge.pdf", 6_000_000);
+
+        let events = mgr.db().rag_events_for_file("/docs/huge.pdf").unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "unchanged oversize file must not spam events"
+        );
+    }
+
+    /// If the file's size changes (e.g. grew further), a new event is
+    /// recorded so the ledger reflects the current size.
+    #[tokio::test]
+    async fn record_oversize_skip_records_new_event_when_size_changes() {
+        let (mgr, _dir) = test_manager();
+        record_oversize_skip(mgr.db(), "/docs/huge.pdf", 6_000_000);
+        record_oversize_skip(mgr.db(), "/docs/huge.pdf", 7_000_000);
+
+        let events = mgr.db().rag_events_for_file("/docs/huge.pdf").unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].detail.as_deref(), Some("7000000"));
+    }
+
+    /// End-to-end: `index_file` on a file above the cap does not error, does
+    /// not index anything, and leaves a `"skipped_oversize"` ledger trail.
+    #[tokio::test]
+    async fn index_file_skips_oversize_file_and_records_ledger_event() {
+        let (mgr, dir) = test_manager();
+        let big_path = dir.path().join("huge.md");
+        std::fs::write(&big_path, vec![b'a'; (FILE_MAX_BYTES + 1) as usize]).unwrap();
+        let source_path = big_path.to_string_lossy().to_string();
+
+        mgr.index_file(&source_path).await.unwrap();
+
+        let events = mgr.db().rag_events_for_file(&source_path).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "skipped_oversize");
+        assert_eq!(
+            events[0].detail.as_deref(),
+            Some((FILE_MAX_BYTES + 1).to_string().as_str())
+        );
+
+        // Re-running against the unchanged file must not duplicate the event.
+        mgr.index_file(&source_path).await.unwrap();
+        let events = mgr.db().rag_events_for_file(&source_path).unwrap();
+        assert_eq!(events.len(), 1);
     }
 }

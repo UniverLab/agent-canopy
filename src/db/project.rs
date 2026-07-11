@@ -348,6 +348,7 @@ pub struct RagFileEvent {
     pub id: i64,
     pub file_path: String,
     /// `"indexed"` | `"deleted"` | `"error"` | `"failed"` (permanent give-up)
+    /// | `"skipped_oversize"` (exceeds `FILE_MAX_BYTES`, `detail` holds size in bytes)
     pub event_type: String,
     pub detail: Option<String>,
     pub occurred_at: i64,
@@ -384,7 +385,7 @@ impl Database {
             "SELECT id, file_path, event_type, detail, occurred_at
                FROM rag_file_events
               WHERE file_path = ?1
-              ORDER BY occurred_at DESC",
+              ORDER BY occurred_at DESC, id DESC",
         )?;
         let rows = stmt.query_map(rusqlite::params![file_path], row_to_rag_file_event)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -400,7 +401,7 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT id, file_path, event_type, detail, occurred_at
                FROM rag_file_events
-              ORDER BY occurred_at DESC
+              ORDER BY occurred_at DESC, id DESC
               LIMIT ?1",
         )?;
         let rows = stmt.query_map(rusqlite::params![limit as i64], row_to_rag_file_event)?;

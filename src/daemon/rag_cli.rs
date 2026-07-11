@@ -143,6 +143,16 @@ async fn handle_rag_report(data_dir: &std::path::Path, db: &Database) -> Result<
     let is_paused = db.get_state("rag_paused")?.as_deref() == Some("1");
     let total_chunks: usize = chunk_counts.values().sum();
 
+    // A file's *current* oversize status is whatever its latest event says —
+    // if it later shrank and got indexed, the newer "indexed" event wins.
+    let is_oversize = |file: &str| -> bool {
+        events_by_file
+            .get(file)
+            .and_then(|events| events.first())
+            .is_some_and(|e| e.event_type == "skipped_oversize")
+    };
+    let oversize_count = all_files.iter().filter(|f| is_oversize(f)).count();
+
     println!("\n\x1b[1m── Canopy RAG Report ──────────────────────────────────────────\x1b[0m");
     println!(
         " Model:  {}",
@@ -173,6 +183,12 @@ async fn handle_rag_report(data_dir: &std::path::Path, db: &Database) -> Result<
         let queued = queue_items.iter().filter(|q| q.status == "queued").count();
         println!(" Queue:  {} queued, {} indexing", queued, processing);
     }
+    if oversize_count > 0 {
+        let cap_mb = crate::rag::ingestion::FILE_MAX_BYTES as f64 / (1024.0 * 1024.0);
+        println!(
+            " \x1b[33m⚠\x1b[0m Oversize: {oversize_count} file(s) skipped — exceed the {cap_mb:.0} MB indexing limit (FILE_MAX_BYTES)"
+        );
+    }
 
     println!("\n\x1b[1m── Files ──────────────────────────────────────────────────────\x1b[0m");
 
@@ -187,9 +203,12 @@ async fn handle_rag_report(data_dir: &std::path::Path, db: &Database) -> Result<
         let indexed_count = events.iter().filter(|e| e.event_type == "indexed").count();
         let deleted_count = events.iter().filter(|e| e.event_type == "deleted").count();
         let last_error = events.iter().find(|e| e.event_type == "error");
+        let file_is_oversize = is_oversize(file);
 
         // Status icon
-        let status = if last_error.is_some() && chunks == 0 {
+        let status = if file_is_oversize {
+            "\x1b[35m⊘\x1b[0m"
+        } else if last_error.is_some() && chunks == 0 {
             "\x1b[31m✗\x1b[0m"
         } else if in_queue {
             "\x1b[33m⏳\x1b[0m"
@@ -201,6 +220,18 @@ async fn handle_rag_report(data_dir: &std::path::Path, db: &Database) -> Result<
 
         let short = short_path(file);
         println!("\n  {} {}", status, short);
+        if file_is_oversize {
+            if let Some(size_bytes) = events.first().and_then(|e| e.detail.as_deref()) {
+                if let Ok(bytes) = size_bytes.parse::<u64>() {
+                    let cap_mb = crate::rag::ingestion::FILE_MAX_BYTES as f64 / (1024.0 * 1024.0);
+                    println!(
+                        "     \x1b[35moversize\x1b[0m: {:.1} MB (exceeds {:.0} MB limit — skipped)",
+                        bytes as f64 / (1024.0 * 1024.0),
+                        cap_mb
+                    );
+                }
+            }
+        }
         if chunks > 0 {
             println!("     chunks: {}", chunks);
         }
