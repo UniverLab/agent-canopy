@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::application::ports::AgentRepository;
 use crate::db::Database;
+use crate::domain::loops::{LoopResetOutcome, LoopStatus};
 use crate::executor::Executor;
 use crate::loop_engine::LoopEngine;
 
@@ -312,6 +313,16 @@ impl CronScheduler {
     /// the past that is still fireable (not `Running`/`Paused`), clear the
     /// schedule and launch it once via the loop engine. Unlike cron loops,
     /// this never repeats — see [`crate::domain::loops::Loop::is_autorun_due`].
+    ///
+    /// A `failed` loop is not launched as-is — `loop_run` refuses `failed`
+    /// loops, so firing here performs an explicit auto-reset-and-resume
+    /// first: the same transition [`Database::reset_loop`] that backs the
+    /// `loop_reset` MCP tool, logged at INFO. That is the sanctioned,
+    /// intentional way a quota-failed loop revives itself unattended (see
+    /// [`crate::daemon::handler`] `loop_reset`/`loop_schedule_autorun` tool
+    /// docs). A `completed` loop is deliberately left alone — re-running a
+    /// finished loop is a human decision via `loop_reset` + `loop_run` — so
+    /// firing on one only logs a WARN and clears the schedule.
     fn fire_due_autorun_loops(&self, now_utc: chrono::DateTime<Utc>) -> anyhow::Result<()> {
         let Some(loop_engine) = self.loop_engine.as_ref() else {
             return Ok(());
@@ -321,8 +332,40 @@ impl CronScheduler {
             if !lp.is_autorun_due(now_utc) {
                 continue;
             }
-            tracing::info!("Loop '{}' reached its autorun_at time; launching", lp.id);
             self.db.clear_loop_autorun(&lp.id)?;
+
+            if lp.status == LoopStatus::Completed {
+                tracing::warn!(
+                    "Loop '{}' autorun fired but the loop is already completed; clearing the \
+                     schedule without re-running it (re-running a finished loop is a human \
+                     decision via loop_reset + loop_run)",
+                    lp.id
+                );
+                continue;
+            }
+
+            if lp.status == LoopStatus::Failed {
+                match self.db.reset_loop(&lp.id, None)? {
+                    LoopResetOutcome::Reset { spec_count } => {
+                        tracing::info!(
+                            "Loop '{}' was failed; auto-reset by its schedule ({} spec(s) reset) \
+                             and resuming",
+                            lp.id,
+                            spec_count
+                        );
+                    }
+                    other => {
+                        tracing::warn!(
+                            "Loop '{}' autorun could not auto-reset it ({:?}); skipping launch",
+                            lp.id,
+                            other
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            tracing::info!("Loop '{}' reached its autorun_at time; launching", lp.id);
             Arc::clone(loop_engine).start_background(lp.id.clone());
         }
         Ok(())
@@ -760,6 +803,134 @@ mod tests {
                 "{status:?} loop must not have its autorun_at cleared"
             );
         }
+    }
+
+    /// `loop_run` refuses a `failed` loop directly, so firing autorun on one
+    /// must not call `start_background` on it as-is. Instead it must go
+    /// through the same reset transition as `loop_reset`
+    /// ([`Database::reset_loop`]) and then resume — the resilience pattern a
+    /// quota-failed loop relies on to revive itself unattended.
+    #[tokio::test]
+    async fn fire_due_autorun_loops_resets_failed_loop_through_shared_path_and_resumes() {
+        use crate::domain::loops::{
+            Loop, LoopNode, LoopNodeKind, LoopSpec, LoopSpecStatus, LoopStatus,
+        };
+
+        let (db, scheduler) = test_scheduler_with_loops();
+        // A real, existing workdir: the resumed run's check node actually
+        // spawns a shell in it, unlike the other autorun tests which only
+        // assert on synchronous state and never let the loop engine run.
+        let workdir = tempfile::tempdir().unwrap();
+        let loop_id = "failed-autorun".to_string();
+        db.insert_loop(&Loop {
+            id: loop_id.clone(),
+            name: "Autorun test loop".to_string(),
+            description: None,
+            workdir: workdir.path().to_string_lossy().to_string(),
+            status: LoopStatus::Failed,
+            trigger: None,
+            created_at: Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+        })
+        .unwrap();
+        db.insert_loop_spec(&LoopSpec {
+            id: "spec-1".to_string(),
+            loop_id: Some(loop_id.clone()),
+            name: "Spec 1".to_string(),
+            description: Some(
+                "Functional Requirements:\n- A\n\nNon-Functional Requirements:\n- B\n\nObjective:\n- C\n\nConstraints:\n- D\n\nGuidelines:\n- E\n\nIn Scope:\n- F\n\nOut of Scope:\n- G".to_string(),
+            ),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Failed,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: Utc::now(),
+        })
+        .unwrap();
+        db.schedule_loop_autorun(&loop_id, Utc::now() - chrono::Duration::minutes(1))
+            .unwrap();
+
+        scheduler.fire_due_autorun_loops(Utc::now()).unwrap();
+
+        // The reset happens synchronously, before the resumed run is spawned
+        // in the background.
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert!(lp.autorun_at.is_none(), "firing must clear autorun_at");
+        assert_ne!(
+            lp.status,
+            LoopStatus::Failed,
+            "the loop must be reset off `failed` before resuming"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let lp = db.get_loop(&loop_id).unwrap().unwrap();
+            if lp.status == LoopStatus::Completed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "resumed run did not complete in time; loop status is {:?}",
+                lp.status
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let spec = db.get_loop_spec("spec-1").unwrap().unwrap();
+        assert_eq!(
+            spec.status,
+            LoopSpecStatus::Completed,
+            "the auto-resumed run must have actually executed the spec's graph"
+        );
+    }
+
+    /// Firing autorun on an already-`completed` loop must not silently
+    /// re-run it — that's a human decision via `loop_reset` + `loop_run`.
+    /// The scheduler should warn and clear the schedule instead.
+    #[tokio::test]
+    async fn fire_due_autorun_loops_on_completed_loop_warns_and_does_not_run() {
+        use crate::domain::loops::LoopStatus;
+
+        let (db, scheduler) = test_scheduler_with_loops();
+        let loop_id = "completed-autorun".to_string();
+        db.insert_loop(&sample_loop(&loop_id, LoopStatus::Completed))
+            .unwrap();
+        db.schedule_loop_autorun(&loop_id, Utc::now() - chrono::Duration::minutes(1))
+            .unwrap();
+
+        scheduler.fire_due_autorun_loops(Utc::now()).unwrap();
+
+        // Give any (unexpected) spawned background run a chance to run.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert!(
+            lp.autorun_at.is_none(),
+            "the one-shot schedule must still be cleared"
+        );
+        assert_eq!(
+            lp.status,
+            LoopStatus::Completed,
+            "a completed loop must not be re-run by its own autorun"
+        );
     }
 
     /// A future `enable_at` must not flip the agent to enabled — it's a

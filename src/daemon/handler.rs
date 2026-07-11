@@ -51,7 +51,7 @@ use crate::db::Database;
 use crate::domain::blueprints::{merge_blueprint_config, validate_blueprint_deletable, Blueprint};
 use crate::domain::loops::{
     validate_spec_description_template, Loop, LoopDetails, LoopEdge, LoopEdgeCondition, LoopNode,
-    LoopNodeKind, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus,
+    LoopNodeKind, LoopResetOutcome, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus,
 };
 use crate::domain::models::{Agent, Trigger};
 use crate::domain::pools::{Pool, PoolDetails};
@@ -599,53 +599,57 @@ fn build_loop_update_response(loop_id: &str) -> CallToolResult {
     success_result(&format!("Loop '{loop_id}' updated."))
 }
 
+/// Whether `loop_run` accepts relaunching a loop in `status`, factored out as
+/// a pure function so the guard (and its wording) can be unit-tested without
+/// building a full `TaskTriggerHandler`.
+///
+/// `loop_run` refuses `failed`/`completed` loops outright — `loop_reset` (or,
+/// for a `failed` loop, `loop_schedule_autorun`'s auto-reset-and-resume) is
+/// the sanctioned way out, mirroring [`Database::reset_loop`].
+fn loop_run_status_guard(loop_id: &str, status: LoopStatus) -> Result<(), String> {
+    match status {
+        LoopStatus::Running => Err(format!("Loop '{loop_id}' is already running.")),
+        LoopStatus::Completed | LoopStatus::Failed => Err(
+            "Completed or failed loops cannot be resumed directly; call loop_reset first, \
+             then loop_run — or, for a failed loop, loop_schedule_autorun to have it \
+             auto-reset and resume once its schedule fires."
+                .to_string(),
+        ),
+        LoopStatus::Draft | LoopStatus::Paused => Ok(()),
+    }
+}
+
 /// Core logic for `loop_reset`, factored out of the tool method so it only
 /// needs `&Database` (no engine/executor) and can be unit-tested directly.
+///
+/// Delegates the actual state transition to [`Database::reset_loop`] — the
+/// scheduler's auto-reset-and-resume of a `failed` loop on autorun goes
+/// through the same function, so this tool and that background path can
+/// never drift apart.
 fn perform_loop_reset(
     db: &Database,
     loop_id: &str,
     specs: Option<&[String]>,
 ) -> Result<CallToolResult, McpError> {
-    let Some(lp) = db.get_loop(loop_id).map_err(internal_error)? else {
-        return Ok(error_result(&format!("Loop '{loop_id}' not found.")));
-    };
-
-    if lp.status == LoopStatus::Running {
-        return Ok(error_result(&format!(
-            "Loop '{loop_id}' is running; call loop_pause first, then loop_reset."
-        )));
-    }
-
-    let loop_specs = db.list_loop_specs(loop_id).map_err(internal_error)?;
-    let valid_ids: std::collections::HashSet<&str> =
-        loop_specs.iter().map(|spec| spec.id.as_str()).collect();
-
-    let target_ids: Vec<String> = match specs {
-        Some(ids) => {
-            for id in ids {
-                if !valid_ids.contains(id.as_str()) {
-                    return Ok(error_result(&format!(
-                        "Spec '{id}' does not belong to loop '{loop_id}'."
-                    )));
-                }
-            }
-            ids.to_vec()
+    let spec_count = match db.reset_loop(loop_id, specs).map_err(internal_error)? {
+        LoopResetOutcome::NotFound => {
+            return Ok(error_result(&format!("Loop '{loop_id}' not found.")));
         }
-        None => loop_specs
-            .iter()
-            .filter(|spec| spec.status != LoopSpecStatus::Completed)
-            .map(|spec| spec.id.clone())
-            .collect(),
+        LoopResetOutcome::Running => {
+            return Ok(error_result(&format!(
+                "Loop '{loop_id}' is running; call loop_pause first, then loop_reset."
+            )));
+        }
+        LoopResetOutcome::InvalidSpec(id) => {
+            return Ok(error_result(&format!(
+                "Spec '{id}' does not belong to loop '{loop_id}'."
+            )));
+        }
+        LoopResetOutcome::Reset { spec_count } => spec_count,
     };
-
-    for spec_id in &target_ids {
-        db.reset_loop_spec_status(spec_id).map_err(internal_error)?;
-    }
-    db.reset_loop_status(loop_id).map_err(internal_error)?;
 
     Ok(success_result(&format!(
-        "Loop '{loop_id}' reset to pending; {} spec(s) reset.",
-        target_ids.len()
+        "Loop '{loop_id}' reset to pending; {spec_count} spec(s) reset."
     )))
 }
 
@@ -3071,16 +3075,8 @@ impl TaskTriggerHandler {
             Err(e) => return Err(internal_error(e.to_string())),
         };
 
-        if lp.status == LoopStatus::Running {
-            return Ok(error_result(&format!(
-                "Loop '{}' is already running.",
-                params.loop_id
-            )));
-        }
-        if matches!(lp.status, LoopStatus::Completed | LoopStatus::Failed) {
-            return Ok(error_result(
-                "Completed or failed loops cannot be resumed yet.",
-            ));
+        if let Err(message) = loop_run_status_guard(&params.loop_id, lp.status) {
+            return Ok(error_result(&message));
         }
 
         let pool_id = params
@@ -3122,9 +3118,15 @@ impl TaskTriggerHandler {
     /// Reset a `completed`/`failed` (or otherwise stalled) loop back to
     /// `pending` so it can be relaunched via `loop_run`, which otherwise
     /// refuses to resume a completed or failed loop.
+    ///
+    /// This is also the exact state transition the scheduler uses to
+    /// auto-reset a `failed` loop when its `loop_schedule_autorun` fires —
+    /// both paths call [`crate::db::Database::reset_loop`], so a human
+    /// calling this tool and the scheduler resuming a failed loop on its own
+    /// can never diverge in behavior.
     #[tool(
         name = "loop_reset",
-        description = "Reset a completed/failed loop back to pending so loop_run can relaunch it. Without `specs`, resets every non-completed spec, leaving already-completed ones untouched so loop_run resumes at the first pending spec. With `specs`, resets exactly those spec IDs, even if they were completed. Rejects a `running` loop — call loop_pause first."
+        description = "Reset a completed/failed loop back to pending so loop_run can relaunch it. Without `specs`, resets every non-completed spec, leaving already-completed ones untouched so loop_run resumes at the first pending spec. With `specs`, resets exactly those spec IDs, even if they were completed. Rejects a `running` loop — call loop_pause first. Note: a `failed` loop with a pending loop_schedule_autorun resets and resumes itself automatically when the schedule fires — call this manually only to reset sooner, reset a `completed` loop, or reset specific spec IDs."
     )]
     async fn loop_reset(
         &self,
@@ -3137,9 +3139,16 @@ impl TaskTriggerHandler {
     /// on a quota can reschedule itself at the exact reset time instead of
     /// relying on a blindly polling cron). The scheduler fires it once the
     /// time is reached and the loop is fireable, then clears the schedule.
+    ///
+    /// Firing on a `failed` loop performs an explicit, logged
+    /// auto-reset-and-resume: it runs the same transition as `loop_reset`
+    /// (see [`crate::db::Database::reset_loop`]) and then resumes execution —
+    /// this is the sanctioned way a quota-failed loop revives itself
+    /// unattended. Firing on a `completed` loop does not re-run it: that is
+    /// a human decision, made via `loop_reset` + `loop_run`.
     #[tool(
         name = "loop_schedule_autorun",
-        description = "Schedule a one-shot resume for a loop at a future ISO 8601 time — the scheduler launches it once that time is reached and clears the schedule. Useful for a loop that failed on a quota to reschedule its own resumption at the exact reset time."
+        description = "Schedule a one-shot resume for a loop at a future ISO 8601 time. When the scheduler reaches that time: a `failed` loop is auto-reset (same transition as loop_reset) and resumed — useful for a loop that failed on a quota to reschedule its own resumption at the exact reset time; a `completed` loop is left alone (the schedule is cleared but the loop is not re-run — use loop_reset + loop_run to re-run a finished loop); any other fireable status launches normally. The schedule always clears after firing (one-shot)."
     )]
     async fn loop_schedule_autorun(
         &self,
@@ -3891,11 +3900,12 @@ impl ServerHandler for TaskTriggerHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        header_str, loop_details_json, missing_sync_identity_error, perform_loop_reset,
-        resolve_graph_target, resolve_node_kind_and_config, validate_blueprint_exists,
-        validate_node_config, validate_pool_exists, validate_pool_member_removable,
-        validate_pool_not_consumed, validate_pool_reorder, validate_pool_reorder_locking,
-        validate_spec_deletable, validate_spec_exists, MISSING_SYNC_IDENTITY_MESSAGE,
+        header_str, loop_details_json, loop_run_status_guard, missing_sync_identity_error,
+        perform_loop_reset, resolve_graph_target, resolve_node_kind_and_config,
+        validate_blueprint_exists, validate_node_config, validate_pool_exists,
+        validate_pool_member_removable, validate_pool_not_consumed, validate_pool_reorder,
+        validate_pool_reorder_locking, validate_spec_deletable, validate_spec_exists,
+        MISSING_SYNC_IDENTITY_MESSAGE,
     };
     use crate::db::Database;
     use crate::domain::blueprints::Blueprint;
@@ -4052,6 +4062,35 @@ mod tests {
         assert!(result.is_error.unwrap_or(false));
         let text = format!("{:?}", result.content);
         assert!(text.contains("not found"), "{text}");
+    }
+
+    /// `loop_run` must keep refusing a `failed` loop, and the refusal must
+    /// point at both sanctioned ways out: `loop_reset` (manual) and
+    /// `loop_schedule_autorun` (self-service, for a quota-failed loop).
+    #[test]
+    fn loop_run_status_guard_rejects_failed_loop_and_names_both_ways_out() {
+        let err = loop_run_status_guard("loop-1", LoopStatus::Failed).unwrap_err();
+        assert!(err.contains("loop_reset"), "{err}");
+        assert!(err.contains("loop_schedule_autorun"), "{err}");
+    }
+
+    #[test]
+    fn loop_run_status_guard_rejects_completed_loop() {
+        let err = loop_run_status_guard("loop-1", LoopStatus::Completed).unwrap_err();
+        assert!(err.contains("loop_reset"), "{err}");
+    }
+
+    #[test]
+    fn loop_run_status_guard_rejects_running_loop_with_loop_id() {
+        let err = loop_run_status_guard("loop-1", LoopStatus::Running).unwrap_err();
+        assert!(err.contains("loop-1"), "{err}");
+        assert!(err.contains("already running"), "{err}");
+    }
+
+    #[test]
+    fn loop_run_status_guard_accepts_draft_and_paused_loops() {
+        assert!(loop_run_status_guard("loop-1", LoopStatus::Draft).is_ok());
+        assert!(loop_run_status_guard("loop-1", LoopStatus::Paused).is_ok());
     }
 
     #[test]

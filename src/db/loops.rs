@@ -7,7 +7,7 @@ use std::io::{Error as IoError, ErrorKind};
 use crate::db::Database;
 use crate::domain::loops::{
     Loop, LoopDetails, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind, LoopNodeRun,
-    LoopRunStatus, LoopSpec, LoopSpecDetails, LoopSpecStatus, LoopStatus,
+    LoopResetOutcome, LoopRunStatus, LoopSpec, LoopSpecDetails, LoopSpecStatus, LoopStatus,
 };
 use crate::domain::models::Trigger;
 
@@ -253,6 +253,50 @@ impl Database {
             params![LoopSpecStatus::Pending.as_str(), spec_id],
         )?;
         Ok(rows > 0)
+    }
+
+    /// The single state-transition path behind `loop_reset` — resets a loop
+    /// (and, without `specs`, every non-completed spec) back to `pending` so
+    /// it can be relaunched. Shared by the `loop_reset` MCP tool and the
+    /// scheduler's auto-reset-and-resume of a `failed` loop on autorun, so
+    /// there is exactly one place that knows how to unstick a loop.
+    pub fn reset_loop(&self, loop_id: &str, specs: Option<&[String]>) -> Result<LoopResetOutcome> {
+        let Some(lp) = self.get_loop(loop_id)? else {
+            return Ok(LoopResetOutcome::NotFound);
+        };
+
+        if lp.status == LoopStatus::Running {
+            return Ok(LoopResetOutcome::Running);
+        }
+
+        let loop_specs = self.list_loop_specs(loop_id)?;
+        let valid_ids: std::collections::HashSet<&str> =
+            loop_specs.iter().map(|spec| spec.id.as_str()).collect();
+
+        let target_ids: Vec<String> = match specs {
+            Some(ids) => {
+                for id in ids {
+                    if !valid_ids.contains(id.as_str()) {
+                        return Ok(LoopResetOutcome::InvalidSpec(id.clone()));
+                    }
+                }
+                ids.to_vec()
+            }
+            None => loop_specs
+                .iter()
+                .filter(|spec| spec.status != LoopSpecStatus::Completed)
+                .map(|spec| spec.id.clone())
+                .collect(),
+        };
+
+        for spec_id in &target_ids {
+            self.reset_loop_spec_status(spec_id)?;
+        }
+        self.reset_loop_status(loop_id)?;
+
+        Ok(LoopResetOutcome::Reset {
+            spec_count: target_ids.len(),
+        })
     }
 
     pub fn insert_loop_spec(&self, spec: &LoopSpec) -> Result<()> {

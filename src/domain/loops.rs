@@ -138,6 +138,22 @@ impl LoopStatus {
     }
 }
 
+/// Result of [`crate::db::Database::reset_loop`] — the single state-transition
+/// path used by both the `loop_reset` MCP tool and the scheduler's
+/// auto-reset-and-resume of a `failed` loop on autorun.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoopResetOutcome {
+    NotFound,
+    /// A `running` loop must be paused first — resetting underneath a live
+    /// run would corrupt its in-flight state.
+    Running,
+    /// One of the explicitly requested `specs` doesn't belong to this loop.
+    InvalidSpec(String),
+    Reset {
+        spec_count: usize,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoopSpecStatus {
