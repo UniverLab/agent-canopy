@@ -24,6 +24,9 @@ impl Database {
         if let Err(e) = db.backfill_project_nodes() {
             tracing::warn!("Could not backfill project intelligence nodes: {e}");
         }
+        if let Err(e) = db.seed_builtin_blueprints() {
+            tracing::warn!("Could not seed builtin blueprints: {e}");
+        }
         Ok(db)
     }
 
@@ -293,7 +296,16 @@ impl Database {
             );
 
             CREATE INDEX IF NOT EXISTS idx_seed_sessions_seed
-                ON seed_sessions(seed_id);",
+                ON seed_sessions(seed_id);
+
+            CREATE TABLE IF NOT EXISTS blueprints (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                kind TEXT NOT NULL,
+                config TEXT NOT NULL,
+                builtin INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );",
         )?;
 
         let has_session_type: bool = conn
@@ -557,6 +569,7 @@ impl Database {
 
 pub mod achievements;
 pub mod agent;
+pub mod blueprints;
 pub mod gamification;
 pub mod group;
 pub mod intelligence;

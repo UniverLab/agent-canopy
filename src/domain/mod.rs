@@ -3,6 +3,7 @@
 //! This is the innermost layer of the architecture. It has no dependencies
 //! on infrastructure, frameworks, or external crates beyond basic utilities.
 
+pub mod blueprints;
 pub mod canopy_config;
 pub mod cli_config;
 pub mod cli_strategy;

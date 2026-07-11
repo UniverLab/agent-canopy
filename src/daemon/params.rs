@@ -388,10 +388,36 @@ pub struct LoopAddNodeParams {
     pub loop_id: Option<String>,
     /// Human-readable node name.
     pub name: String,
+    /// Node kind: agent, check, or gate. Optional when `blueprint` is given —
+    /// defaults to the blueprint's own kind.
+    pub kind: Option<String>,
+    /// Kind-specific configuration object. Alternative to `blueprint`;
+    /// provide exactly one of `config`/`blueprint`.
+    pub config: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Name of an existing blueprint (builtin or custom) to base this node
+    /// on, instead of a full `config`. See `blueprint_list`.
+    pub blueprint: Option<String>,
+    /// Shallow overrides merged onto the blueprint's config template —
+    /// override keys win, every other templated key is preserved. Only used
+    /// together with `blueprint`.
+    pub config_overrides: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BlueprintCreateParams {
+    /// Unique blueprint name.
+    pub name: String,
     /// Node kind: agent, check, or gate.
     pub kind: String,
-    /// Kind-specific configuration object.
+    /// Config template. `loop_add_node` uses this as the node's config,
+    /// optionally shallow-merged with `config_overrides`.
     pub config: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BlueprintDeleteParams {
+    /// Existing custom blueprint name. Builtins can't be deleted.
+    pub name: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -635,10 +661,15 @@ mod tests {
     fn loop_add_node_params_schema_declares_config_as_object() {
         let schema = schemars::schema_for!(LoopAddNodeParams);
         let value = serde_json::to_value(&schema).expect("schema should serialize");
-        let config_type = value["properties"]["config"]["type"]
-            .as_str()
-            .expect("config schema should have a \"type\" field");
-        assert_eq!(config_type, "object");
+        let config_schema = &value["properties"]["config"];
+        // `config` is now optional (an alternative to `blueprint`), so the
+        // "object" type may appear directly or nested under a $ref/anyOf
+        // produced for `Option<..>`.
+        let type_str = config_schema["type"].as_str();
+        assert!(
+            type_str == Some("object") || config_schema.to_string().contains("\"object\""),
+            "expected config schema to declare an object type, got {config_schema}"
+        );
     }
 
     #[test]
@@ -683,7 +714,11 @@ mod tests {
         let params: LoopAddNodeParams =
             serde_json::from_value(value).expect("object config should deserialize");
         assert_eq!(
-            params.config.get("platform").and_then(|v| v.as_str()),
+            params
+                .config
+                .as_ref()
+                .and_then(|c| c.get("platform"))
+                .and_then(|v| v.as_str()),
             Some("claude")
         );
     }

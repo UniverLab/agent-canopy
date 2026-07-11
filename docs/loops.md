@@ -49,3 +49,26 @@ needed. Iteration limits prevent infinite retry loops.
 Loops can be authored programmatically by agents through these tools,
 or edited in the [TUI loop editor](tui.md) with inline JSON config
 validation.
+
+## Node blueprints
+
+Rather than pasting a full `config` into every `loop_add_node` call, a
+node can reference a **blueprint** — a reusable `{name, kind, config}`
+template — by name:
+
+```
+loop_add_node { spec_id, name, blueprint: "cargo-gates" }
+loop_add_node { spec_id, name, blueprint: "implementer-claude", config_overrides: { "model": "opus" } }
+```
+
+`config_overrides` is a shallow merge on top of the blueprint's config
+template — override keys win, every other templated key is preserved.
+An unknown blueprint name returns an actionable error listing every
+available blueprint.
+
+Five builtins are seeded automatically at daemon startup if missing
+(re-seeded if deleted from the DB directly): `implementer-claude`,
+`cargo-gates`, `reviewer-committer-mimo`, `commit-check`,
+`resilience-mimo`. Builtins can't be deleted. Manage blueprints with
+`blueprint_list`, `blueprint_create`, and `blueprint_delete` (custom
+only).

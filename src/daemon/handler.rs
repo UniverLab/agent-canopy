@@ -48,6 +48,7 @@ use crate::daemon::helpers::{data_dir, error_result, notify_run_result, success_
 use crate::daemon::params::*;
 use crate::db::intelligence::IntelligenceNodeRecord;
 use crate::db::Database;
+use crate::domain::blueprints::{merge_blueprint_config, validate_blueprint_deletable, Blueprint};
 use crate::domain::loops::{
     validate_spec_description_template, Loop, LoopDetails, LoopEdge, LoopEdgeCondition, LoopNode,
     LoopNodeKind, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus,
@@ -386,6 +387,66 @@ fn validate_node_config(kind: LoopNodeKind, config: &serde_json::Value) -> Resul
     Ok(())
 }
 
+/// Look up a blueprint by name, or an actionable error listing every
+/// available blueprint name (builtin and custom) so the caller can pick a
+/// valid one without a separate `blueprint_list` round trip.
+fn validate_blueprint_exists(db: &Database, name: &str) -> Result<Blueprint, String> {
+    match db.get_blueprint_by_name(name).map_err(|e| e.to_string())? {
+        Some(blueprint) => Ok(blueprint),
+        None => {
+            let available = db
+                .list_blueprints()
+                .map_err(|e| e.to_string())?
+                .iter()
+                .map(|b| b.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(format!(
+                "Unknown blueprint '{name}'. Available blueprints: {available}."
+            ))
+        }
+    }
+}
+
+/// Resolve a `loop_add_node` call's kind/config, either from an explicit
+/// `kind`+`config` pair or from a named blueprint (optionally shallow-merged
+/// with `config_overrides`). Exactly one of `config`/`blueprint` must be
+/// usable — this is the "blueprint as an alternative to a full config"
+/// surface described in R7.
+fn resolve_node_kind_and_config(
+    db: &Database,
+    kind: Option<&str>,
+    config: Option<serde_json::Map<String, serde_json::Value>>,
+    blueprint: Option<&str>,
+    config_overrides: Option<serde_json::Map<String, serde_json::Value>>,
+) -> Result<(LoopNodeKind, serde_json::Value), String> {
+    let blueprint_name = blueprint.map(str::trim).filter(|s| !s.is_empty());
+    let explicit_kind = kind.map(str::trim).filter(|s| !s.is_empty());
+
+    match blueprint_name {
+        Some(blueprint_name) => {
+            let bp = validate_blueprint_exists(db, blueprint_name)?;
+            let node_kind = match explicit_kind {
+                Some(explicit) => validate_node_kind(explicit)?,
+                None => bp.kind,
+            };
+            let overrides = config_overrides.map(serde_json::Value::Object);
+            let merged = merge_blueprint_config(&bp.config, overrides.as_ref());
+            Ok((node_kind, merged))
+        }
+        None => {
+            let node_kind = validate_node_kind(
+                explicit_kind
+                    .ok_or_else(|| "Provide 'kind' when not using a blueprint.".to_string())?,
+            )?;
+            let config = config
+                .map(serde_json::Value::Object)
+                .ok_or_else(|| "Provide either 'config' or 'blueprint'.".to_string())?;
+            Ok((node_kind, config))
+        }
+    }
+}
+
 fn validate_pool_exists(db: &Database, pool_id: &str) -> Result<Pool, String> {
     db.get_pool(pool_id)
         .map_err(|e| e.to_string())?
@@ -605,6 +666,16 @@ fn spec_summary_json(spec: &LoopSpec) -> serde_json::Value {
         "position": spec.position,
         "parallelizable": spec.parallelizable,
         "status": spec.status.as_str(),
+    })
+}
+
+fn blueprint_json(blueprint: &Blueprint) -> serde_json::Value {
+    serde_json::json!({
+        "id": blueprint.id,
+        "name": blueprint.name,
+        "kind": blueprint.kind.as_str(),
+        "config": blueprint.config,
+        "builtin": blueprint.builtin,
     })
 }
 
@@ -2461,8 +2532,97 @@ impl TaskTriggerHandler {
     }
 
     #[tool(
+        name = "blueprint_list",
+        description = "List every node blueprint (builtin and custom) — predesigned, reusable node templates for loop_add_node."
+    )]
+    async fn blueprint_list(&self) -> Result<CallToolResult, McpError> {
+        let blueprints = self.db.list_blueprints().map_err(internal_error)?;
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&serde_json::json!({
+                "blueprints": blueprints.iter().map(blueprint_json).collect::<Vec<_>>(),
+            }))
+            .unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        name = "blueprint_create",
+        description = "Create a custom node blueprint: a reusable {name, kind, config template} that loop_add_node can reference by name."
+    )]
+    async fn blueprint_create(
+        &self,
+        Parameters(params): Parameters<BlueprintCreateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let name = params.name.trim();
+        if let Err(e) = validate_non_empty(name, "Blueprint name") {
+            return Ok(error_result(&e));
+        }
+        if self
+            .db
+            .get_blueprint_by_name(name)
+            .map_err(internal_error)?
+            .is_some()
+        {
+            return Ok(error_result(&format!(
+                "Blueprint '{name}' already exists; choose a different name."
+            )));
+        }
+
+        let kind = match validate_node_kind(params.kind.trim()) {
+            Ok(kind) => kind,
+            Err(e) => return Ok(error_result(&e)),
+        };
+        let config = serde_json::Value::Object(params.config);
+        if let Err(e) = validate_node_config(kind, &config) {
+            return Ok(error_result(&e));
+        }
+
+        let blueprint = Blueprint {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            kind,
+            config,
+            builtin: false,
+            created_at: chrono::Utc::now(),
+        };
+        self.db
+            .insert_blueprint(&blueprint)
+            .map_err(internal_error)?;
+
+        Ok(build_id_result(&blueprint.id, "blueprint_id"))
+    }
+
+    #[tool(
+        name = "blueprint_delete",
+        description = "Delete a custom node blueprint. Refuses to delete a builtin."
+    )]
+    async fn blueprint_delete(
+        &self,
+        Parameters(params): Parameters<BlueprintDeleteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let name = params.name.trim();
+        let Some(blueprint) = self
+            .db
+            .get_blueprint_by_name(name)
+            .map_err(internal_error)?
+        else {
+            return Ok(error_result(&format!("Blueprint '{name}' not found.")));
+        };
+        if let Err(e) = validate_blueprint_deletable(&blueprint) {
+            return Ok(error_result(&e));
+        }
+
+        self.db
+            .delete_blueprint_by_name(name)
+            .map_err(internal_error)?;
+
+        Ok(success_result(&format!("Blueprint '{name}' deleted.")))
+    }
+
+    #[tool(
         name = "loop_add_node",
-        description = "Add a graph node to an existing loop spec, or (via loop_id instead of spec_id) to the loop's top-level graph."
+        description = "Add a graph node to an existing loop spec, or (via loop_id instead of spec_id) to the loop's top-level graph. Provide either a full 'config' (with 'kind'), or a 'blueprint' name (see blueprint_list) optionally shallow-merged with 'config_overrides'."
     )]
     async fn loop_add_node(
         &self,
@@ -2481,11 +2641,16 @@ impl TaskTriggerHandler {
             Err(e) => return Ok(error_result(&e)),
         };
 
-        let kind = match validate_node_kind(params.kind.trim()) {
-            Ok(kind) => kind,
+        let (kind, config) = match resolve_node_kind_and_config(
+            &self.db,
+            params.kind.as_deref(),
+            params.config,
+            params.blueprint.as_deref(),
+            params.config_overrides,
+        ) {
+            Ok(result) => result,
             Err(e) => return Ok(error_result(&e)),
         };
-        let config = serde_json::Value::Object(params.config);
         if let Err(e) = validate_node_config(kind, &config) {
             return Ok(error_result(&e));
         }
@@ -3727,12 +3892,13 @@ impl ServerHandler for TaskTriggerHandler {
 mod tests {
     use super::{
         header_str, loop_details_json, missing_sync_identity_error, perform_loop_reset,
-        resolve_graph_target, validate_node_config, validate_pool_exists,
-        validate_pool_member_removable, validate_pool_not_consumed, validate_pool_reorder,
-        validate_pool_reorder_locking, validate_spec_deletable, validate_spec_exists,
-        MISSING_SYNC_IDENTITY_MESSAGE,
+        resolve_graph_target, resolve_node_kind_and_config, validate_blueprint_exists,
+        validate_node_config, validate_pool_exists, validate_pool_member_removable,
+        validate_pool_not_consumed, validate_pool_reorder, validate_pool_reorder_locking,
+        validate_spec_deletable, validate_spec_exists, MISSING_SYNC_IDENTITY_MESSAGE,
     };
     use crate::db::Database;
+    use crate::domain::blueprints::Blueprint;
     use crate::domain::loops::{
         Loop, LoopNode, LoopNodeKind, LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus,
         LoopStatus,
@@ -3944,6 +4110,127 @@ mod tests {
             &serde_json::json!({ "evaluate": "output_contains", "value": "ok" })
         )
         .is_ok());
+    }
+
+    #[test]
+    fn blueprints_are_listed_after_a_fresh_startup_and_reseeding_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+
+        let names_after_first_start: Vec<String> = db
+            .list_blueprints()
+            .unwrap()
+            .into_iter()
+            .map(|b| b.name)
+            .collect();
+        for expected in [
+            "implementer-claude",
+            "cargo-gates",
+            "reviewer-committer-mimo",
+            "commit-check",
+            "resilience-mimo",
+        ] {
+            assert!(
+                names_after_first_start.contains(&expected.to_string()),
+                "expected builtin '{expected}' after fresh startup, got {names_after_first_start:?}"
+            );
+        }
+
+        // Simulate a second daemon startup against the same database.
+        db.seed_builtin_blueprints().unwrap();
+        let names_after_second_start: Vec<String> = db
+            .list_blueprints()
+            .unwrap()
+            .into_iter()
+            .map(|b| b.name)
+            .collect();
+        assert_eq!(
+            names_after_first_start.len(),
+            names_after_second_start.len(),
+            "reseeding must not duplicate builtins"
+        );
+    }
+
+    #[test]
+    fn custom_blueprint_create_list_delete_round_trip_and_builtin_delete_refused() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+
+        let custom = Blueprint {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "tdd-implementer".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({ "platform": "claude", "prompt": "write a failing test first" }),
+            builtin: false,
+            created_at: chrono::Utc::now(),
+        };
+        db.insert_blueprint(&custom).unwrap();
+
+        let names: Vec<String> = db
+            .list_blueprints()
+            .unwrap()
+            .into_iter()
+            .map(|b| b.name)
+            .collect();
+        assert!(names.contains(&"tdd-implementer".to_string()));
+
+        let removed = db.delete_blueprint_by_name("tdd-implementer").unwrap();
+        assert!(removed);
+        assert!(db
+            .get_blueprint_by_name("tdd-implementer")
+            .unwrap()
+            .is_none());
+
+        // Deleting a builtin is refused at the validation layer with an
+        // actionable message, before ever touching the DB.
+        let builtin = db
+            .get_blueprint_by_name("implementer-claude")
+            .unwrap()
+            .expect("builtin should exist");
+        let error = super::validate_blueprint_deletable(&builtin).unwrap_err();
+        assert!(error.contains("implementer-claude"));
+        assert!(error.contains("cannot be deleted"));
+    }
+
+    #[test]
+    fn loop_add_node_from_blueprint_with_override_merges_config_and_override_wins() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+
+        let mut overrides = serde_json::Map::new();
+        overrides.insert(
+            "prompt".to_string(),
+            serde_json::json!("custom overridden prompt"),
+        );
+
+        let (kind, config) = resolve_node_kind_and_config(
+            &db,
+            None,
+            None,
+            Some("implementer-claude"),
+            Some(overrides),
+        )
+        .expect("blueprint resolution should succeed");
+
+        assert_eq!(kind, LoopNodeKind::Agent);
+        assert_eq!(config["prompt"], "custom overridden prompt");
+        // Other templated keys (e.g. platform) survive the shallow merge.
+        assert_eq!(config["platform"], "claude");
+    }
+
+    #[test]
+    fn loop_add_node_with_unknown_blueprint_lists_available_names() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+
+        let error = validate_blueprint_exists(&db, "does-not-exist").unwrap_err();
+
+        assert!(error.contains("does-not-exist"));
+        assert!(error.contains("implementer-claude"));
+        assert!(error.contains("cargo-gates"));
+        assert!(error.contains("reviewer-committer-mimo"));
+        assert!(error.contains("commit-check"));
+        assert!(error.contains("resilience-mimo"));
     }
 
     #[test]
