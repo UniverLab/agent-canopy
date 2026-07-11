@@ -432,38 +432,41 @@ pub struct LoopUpdateEdgeParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct LoopPoolAddParams {
-    /// Existing loop ID.
-    pub loop_id: String,
-    /// Human-readable name for the pool entry (unique within the pool).
-    pub name: String,
-    /// Node kind: agent, check, or gate.
-    pub kind: String,
-    /// Kind-specific configuration object.
-    pub config: serde_json::Map<String, serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct LoopPoolListParams {
-    /// Existing loop ID.
-    pub loop_id: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct LoopPoolRemoveParams {
-    /// Existing loop ID.
-    pub loop_id: String,
-    /// Name of the pool entry to remove.
+pub struct PoolCreateParams {
+    /// Human-readable pool name.
     pub name: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct LoopPoolReorderParams {
-    /// Existing loop ID.
-    pub loop_id: String,
-    /// Full list of pool spec names in the desired final order. Must be a
-    /// permutation of the pool's current names — every name exactly once.
-    pub order: Vec<String>,
+pub struct PoolAddSpecParams {
+    /// Existing pool ID.
+    pub pool_id: String,
+    /// Existing spec ID to append to the end of the pool's queue.
+    pub spec_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PoolListParams {
+    /// Existing pool ID. Omit to list every pool (summary only, no members).
+    pub pool_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PoolRemoveSpecParams {
+    /// Existing pool ID.
+    pub pool_id: String,
+    /// Spec ID to remove from the pool.
+    pub spec_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PoolReorderParams {
+    /// Existing pool ID.
+    pub pool_id: String,
+    /// Full list of spec IDs currently in the pool, in the desired final
+    /// order. Must be a total permutation of the pool's current members —
+    /// every spec id exactly once.
+    pub spec_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

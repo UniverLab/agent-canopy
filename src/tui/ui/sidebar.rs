@@ -1730,7 +1730,6 @@ mod tests {
             started_at: None,
             completed_at: None,
             autorun_at: None,
-            spec_pool: None,
         })
         .unwrap();
 

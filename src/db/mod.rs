@@ -269,6 +269,22 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_loop_runs_node_iteration
                 ON loop_runs(node_id, iteration DESC);
 
+            CREATE TABLE IF NOT EXISTS pools (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS pool_members (
+                pool_id TEXT NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
+                spec_id TEXT NOT NULL REFERENCES loop_specs(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                PRIMARY KEY (pool_id, spec_id)
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_pool_members_position
+                ON pool_members(pool_id, position);
+
             CREATE TABLE IF NOT EXISTS seed_sessions (
                 session_id TEXT PRIMARY KEY,
                 seed_id TEXT NOT NULL,
@@ -366,9 +382,10 @@ impl Database {
                 .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
         }
 
-        // Spec pools (reusable node/edge templates for building loop specs)
-        // are a newer addition; older databases predate the column. Nullable,
-        // so existing loops are unaffected.
+        // `spec_pool` (7f2efdf) was an unused template model, retired in favor
+        // of the `pools`/`pool_members` tables below. Kept only so pre-R4
+        // databases that already have the column don't need a destructive
+        // migration; current code never reads or writes it.
         let has_spec_pool: bool = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('loops') WHERE name = 'spec_pool'",
@@ -544,6 +561,7 @@ pub mod gamification;
 pub mod group;
 pub mod intelligence;
 pub mod loops;
+pub mod pools;
 pub mod project;
 pub mod run;
 pub mod seeds;

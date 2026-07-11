@@ -272,11 +272,6 @@ pub struct Loop {
     /// instead of relying on a blindly polling cron.
     #[serde(default)]
     pub autorun_at: Option<DateTime<Utc>>,
-    /// Optional reusable spec template. When set, building a new spec for
-    /// this loop can start from the pool's node/edge layout instead of
-    /// repeating the same handful of nodes and edges by hand each time.
-    #[serde(default)]
-    pub spec_pool: Option<SpecPool>,
 }
 
 impl Loop {
@@ -339,50 +334,6 @@ impl Loop {
     pub fn is_autorun_due(&self, now: DateTime<Utc>) -> bool {
         self.autorun_at.is_some_and(|at| now >= at) && self.is_fireable()
     }
-}
-
-/// A node within a [`SpecPool`] template.
-///
-/// Unlike [`LoopNode`], it has no `id`/`spec_id` — it isn't tied to any
-/// concrete spec yet. `name` is the join key `SpecPoolEdge` uses instead of a
-/// generated id.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SpecPoolNode {
-    pub name: String,
-    pub kind: LoopNodeKind,
-    #[serde(default = "default_json_object")]
-    pub config: Value,
-    pub position: i64,
-}
-
-/// An edge within a [`SpecPool`] template, joining two [`SpecPoolNode`]s by
-/// name rather than by generated node id.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SpecPoolEdge {
-    pub from_node: String,
-    pub to_node: String,
-    pub condition: LoopEdgeCondition,
-}
-
-fn default_json_object() -> Value {
-    Value::Object(serde_json::Map::new())
-}
-
-/// A reusable template of nodes and edges for building loop specs.
-///
-/// Loops that repeat the same handful of nodes/edges across specs (e.g. an
-/// "agent -> check -> gate" shape) can define that shape once as a
-/// `SpecPool` and reference it from [`Loop::spec_pool`], instead of
-/// re-declaring every node and edge each time a spec is built.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SpecPool {
-    pub id: String,
-    pub name: String,
-    pub description: Option<String>,
-    #[serde(default)]
-    pub nodes: Vec<SpecPoolNode>,
-    #[serde(default)]
-    pub edges: Vec<SpecPoolEdge>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -481,7 +432,7 @@ pub struct LoopDetails {
 mod tests {
     use super::{
         validate_spec_description_template, LoopEdgeCondition, LoopNodeKind, LoopRunStatus,
-        LoopSpecStatus, LoopStatus, SpecPool, SpecPoolEdge, SpecPoolNode,
+        LoopSpecStatus, LoopStatus,
     };
 
     #[test]
@@ -663,7 +614,6 @@ Task:
             started_at: None,
             completed_at: None,
             autorun_at: None,
-            spec_pool: None,
         }
     }
 
@@ -748,62 +698,5 @@ Task:
                 "{status:?} loop must not fire autorun_at"
             );
         }
-    }
-
-    fn sample_spec_pool() -> SpecPool {
-        SpecPool {
-            id: "pool-1".to_string(),
-            name: "Agent review gate".to_string(),
-            description: Some("agent -> check -> gate".to_string()),
-            nodes: vec![
-                SpecPoolNode {
-                    name: "implement".to_string(),
-                    kind: LoopNodeKind::Agent,
-                    config: serde_json::json!({"cli": "claude"}),
-                    position: 0,
-                },
-                SpecPoolNode {
-                    name: "run-tests".to_string(),
-                    kind: LoopNodeKind::Check,
-                    config: serde_json::json!({"command": "cargo test"}),
-                    position: 1,
-                },
-                SpecPoolNode {
-                    name: "reviewer-gate".to_string(),
-                    kind: LoopNodeKind::Gate,
-                    config: serde_json::json!({}),
-                    position: 2,
-                },
-            ],
-            edges: vec![
-                SpecPoolEdge {
-                    from_node: "implement".to_string(),
-                    to_node: "run-tests".to_string(),
-                    condition: LoopEdgeCondition::Always,
-                },
-                SpecPoolEdge {
-                    from_node: "run-tests".to_string(),
-                    to_node: "reviewer-gate".to_string(),
-                    condition: LoopEdgeCondition::Pass,
-                },
-            ],
-        }
-    }
-
-    #[test]
-    fn spec_pool_can_be_constructed_with_nodes_and_edges() {
-        let pool = sample_spec_pool();
-        assert_eq!(pool.nodes.len(), 3);
-        assert_eq!(pool.edges.len(), 2);
-        assert_eq!(pool.nodes[0].kind, LoopNodeKind::Agent);
-        assert_eq!(pool.edges[1].condition, LoopEdgeCondition::Pass);
-    }
-
-    #[test]
-    fn spec_pool_round_trips_through_json() {
-        let pool = sample_spec_pool();
-        let json = serde_json::to_string(&pool).expect("serialize spec pool");
-        let decoded: SpecPool = serde_json::from_str(&json).expect("deserialize spec pool");
-        assert_eq!(decoded, pool);
     }
 }

@@ -50,9 +50,10 @@ use crate::db::intelligence::IntelligenceNodeRecord;
 use crate::db::Database;
 use crate::domain::loops::{
     validate_spec_description_template, Loop, LoopDetails, LoopEdge, LoopEdgeCondition, LoopNode,
-    LoopNodeKind, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus, SpecPool, SpecPoolNode,
+    LoopNodeKind, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus,
 };
 use crate::domain::models::{Agent, Trigger};
+use crate::domain::pools::{Pool, PoolDetails};
 use crate::domain::sync::{MessageKind, MissionImpact, WorkspaceStatus};
 use crate::domain::validation::validate_id;
 use crate::executor::Executor;
@@ -165,12 +166,6 @@ fn validate_loop_exists(db: &Database, loop_id: &str) -> Result<(), String> {
         .ok_or_else(|| format!("Loop '{loop_id}' not found."))
 }
 
-fn validate_loop_and_get(db: &Database, loop_id: &str) -> Result<Loop, String> {
-    db.get_loop(loop_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Loop '{loop_id}' not found."))
-}
-
 fn validate_spec_exists(db: &Database, spec_id: &str) -> Result<LoopSpec, String> {
     db.get_loop_spec(spec_id)
         .map_err(|e| e.to_string())?
@@ -252,11 +247,10 @@ fn validate_position_conflict(
 /// Refuse to delete a spec that's still bound to a loop, with an actionable
 /// message pointing at the fix (detach it, or delete the loop instead).
 ///
-/// Note: a loop's `spec_pool` (see `loop_pool_add`) is a template of
-/// node/edge shapes keyed by name — it never references a standalone spec's
-/// `id`, so there is currently no way for a spec to be "referenced by a
-/// pool" the way it can be "bound to a loop". If pools gain that ability
-/// later, extend this check then.
+/// Note: a spec that's a member of a [`Pool`] can still be deleted — the
+/// `pool_members` row cascades away with it (see `pools` table). Pools are
+/// just queues over specs that already exist; they don't own them the way a
+/// loop owns its bound specs.
 fn validate_spec_deletable(spec: &LoopSpec) -> Result<(), String> {
     if let Some(loop_id) = &spec.loop_id {
         return Err(format!(
@@ -392,114 +386,53 @@ fn validate_node_config(kind: LoopNodeKind, config: &serde_json::Value) -> Resul
     Ok(())
 }
 
-fn validate_pool_name_unique(pool: Option<&SpecPool>, name: &str) -> Result<(), String> {
-    if pool.is_some_and(|p| p.nodes.iter().any(|n| n.name == name)) {
-        Err(format!("Pool already has a spec named '{name}'."))
-    } else {
-        Ok(())
-    }
+fn validate_pool_exists(db: &Database, pool_id: &str) -> Result<Pool, String> {
+    db.get_pool(pool_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Pool '{pool_id}' not found."))
 }
 
-/// Next 1-based position for a new pool entry: one past the highest existing
-/// position, or 1 for an empty/missing pool.
-fn next_pool_position(pool: Option<&SpecPool>) -> i64 {
-    pool.and_then(|p| p.nodes.iter().map(|n| n.position).max())
-        .map(|max| max + 1)
-        .unwrap_or(1)
-}
-
-/// Append `node` to `existing`, creating a fresh (empty-edges) pool for the
-/// loop if it doesn't have one yet.
-fn append_pool_node(existing: Option<SpecPool>, loop_id: &str, node: SpecPoolNode) -> SpecPool {
-    match existing {
-        Some(mut pool) => {
-            pool.nodes.push(node);
-            pool
-        }
-        None => SpecPool {
-            id: uuid::Uuid::new_v4().to_string(),
-            name: format!("{loop_id} spec pool"),
-            description: None,
-            nodes: vec![node],
-            edges: Vec::new(),
-        },
-    }
-}
-
-fn pool_nodes_json(pool: Option<&SpecPool>) -> Vec<serde_json::Value> {
-    pool.map(|p| {
-        p.nodes
-            .iter()
-            .map(|n| {
-                serde_json::json!({
-                    "name": n.name,
-                    "kind": n.kind.as_str(),
-                    "config": n.config,
-                    "position": n.position,
-                })
-            })
-            .collect()
-    })
-    .unwrap_or_default()
-}
-
-fn validate_pool_has_name(pool: Option<&SpecPool>, name: &str) -> Result<(), String> {
-    if pool.is_some_and(|p| p.nodes.iter().any(|n| n.name == name)) {
-        Ok(())
-    } else {
-        Err(format!("Pool has no spec named '{name}'."))
-    }
-}
-
-/// Remove the pool entry named `name`, along with any edges that referenced
-/// it by name — a dangling edge to a removed node would break the template.
-fn remove_pool_node(mut pool: SpecPool, name: &str) -> SpecPool {
-    pool.nodes.retain(|n| n.name != name);
-    pool.edges
-        .retain(|e| e.from_node != name && e.to_node != name);
-    pool
-}
-
-/// Validate that `order` is a total permutation of `pool`'s current spec
-/// names: same length, same set, no duplicates, no unknown names. This
-/// rejects any partial reorder (a subset, or a list with an unrecognized
-/// name) so the operation is always "here is the whole new order," never a
-/// swap of two entries applied on top of unknown existing state.
-fn validate_pool_reorder(pool: &SpecPool, order: &[String]) -> Result<(), String> {
-    if order.len() != pool.nodes.len() {
+/// Validate that `spec_ids` is a total permutation of `current`: same
+/// length, same set, no duplicates, no unknown ids. This rejects any partial
+/// reorder (a subset, or a list with an unrecognized id) so the operation is
+/// always "here is the whole new order," never a swap of two entries applied
+/// on top of unknown existing state.
+fn validate_pool_reorder(current: &[String], spec_ids: &[String]) -> Result<(), String> {
+    if spec_ids.len() != current.len() {
         return Err(format!(
             "Reorder must list all {} pool spec(s) exactly once; got {}.",
-            pool.nodes.len(),
-            order.len()
+            current.len(),
+            spec_ids.len()
         ));
     }
 
     let mut seen = std::collections::HashSet::new();
-    for name in order {
-        if !seen.insert(name.as_str()) {
-            return Err(format!("Reorder lists spec '{name}' more than once."));
+    for id in spec_ids {
+        if !seen.insert(id.as_str()) {
+            return Err(format!("Reorder lists spec '{id}' more than once."));
         }
-        if !pool.nodes.iter().any(|n| &n.name == name) {
-            return Err(format!("Pool has no spec named '{name}'."));
+        if !current.iter().any(|existing| existing == id) {
+            return Err(format!("Pool has no spec '{id}'."));
         }
     }
     Ok(())
 }
 
-/// Reassign each pool node's `position` to its 1-based index in `order`.
-/// Callers must run [`validate_pool_reorder`] first so `order` is known to
-/// be a full permutation of `pool`'s node names.
-fn reorder_pool_nodes(mut pool: SpecPool, order: &[String]) -> SpecPool {
-    pool.nodes.sort_by_key(|n| {
-        order
+fn pool_details_json(details: &PoolDetails) -> serde_json::Value {
+    serde_json::json!({
+        "id": details.pool.id,
+        "name": details.pool.name,
+        "members": details
+            .members
             .iter()
-            .position(|name| name == &n.name)
-            .unwrap_or(usize::MAX)
-    });
-    for (index, node) in pool.nodes.iter_mut().enumerate() {
-        node.position = (index + 1) as i64;
-    }
-    pool
+            .enumerate()
+            .map(|(index, spec)| {
+                let mut value = spec_summary_json(spec);
+                value["queue_position"] = serde_json::json!(index + 1);
+                value
+            })
+            .collect::<Vec<_>>(),
+    })
 }
 
 fn validate_at_least_one_bool(updates: &[bool], field_name: &str) -> Result<(), String> {
@@ -2055,7 +1988,6 @@ impl TaskTriggerHandler {
             started_at: None,
             completed_at: None,
             autorun_at: None,
-            spec_pool: None,
         };
 
         self.db.insert_loop(&lp).map_err(internal_error)?;
@@ -2659,136 +2591,158 @@ impl TaskTriggerHandler {
     }
 
     #[tool(
-        name = "loop_pool_add",
-        description = "Add a reusable spec to a loop's spec pool (a node template for building specs)."
+        name = "pool_create",
+        description = "Create a pool: an ordered queue of existing specs, decoupled from any one loop."
     )]
-    async fn loop_pool_add(
+    async fn pool_create(
         &self,
-        Parameters(params): Parameters<LoopPoolAddParams>,
+        Parameters(params): Parameters<PoolCreateParams>,
     ) -> Result<CallToolResult, McpError> {
         let name = params.name.trim();
-        if let Err(e) = validate_non_empty(name, "Pool spec name") {
-            return Ok(error_result(&e));
-        }
-        let loop_id = params.loop_id.trim();
-        let lp = match validate_loop_and_get(&self.db, loop_id) {
-            Ok(lp) => lp,
-            Err(e) => return Ok(error_result(&e)),
-        };
-
-        let kind = match validate_node_kind(params.kind.trim()) {
-            Ok(kind) => kind,
-            Err(e) => return Ok(error_result(&e)),
-        };
-        let config = serde_json::Value::Object(params.config);
-        if let Err(e) = validate_node_config(kind, &config) {
-            return Ok(error_result(&e));
-        }
-        if let Err(e) = validate_pool_name_unique(lp.spec_pool.as_ref(), name) {
+        if let Err(e) = validate_non_empty(name, "Pool name") {
             return Ok(error_result(&e));
         }
 
-        let node = SpecPoolNode {
+        let pool = Pool {
+            id: uuid::Uuid::new_v4().to_string(),
             name: name.to_string(),
-            kind,
-            config,
-            position: next_pool_position(lp.spec_pool.as_ref()),
+            created_at: chrono::Utc::now(),
         };
-        let pool = append_pool_node(lp.spec_pool, loop_id, node);
+        self.db.insert_pool(&pool).map_err(internal_error)?;
+
+        Ok(build_id_result(&pool.id, "pool_id"))
+    }
+
+    #[tool(
+        name = "pool_add_spec",
+        description = "Append an existing spec to the end of a pool's queue."
+    )]
+    async fn pool_add_spec(
+        &self,
+        Parameters(params): Parameters<PoolAddSpecParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let pool_id = params.pool_id.trim();
+        if let Err(e) = validate_pool_exists(&self.db, pool_id) {
+            return Ok(error_result(&e));
+        }
+        let spec_id = params.spec_id.trim();
+        if let Err(e) = validate_spec_exists(&self.db, spec_id) {
+            return Ok(error_result(&e));
+        }
+        let already_member = self
+            .db
+            .pool_has_member(pool_id, spec_id)
+            .map_err(internal_error)?;
+        if already_member {
+            return Ok(error_result(&format!(
+                "Spec '{spec_id}' is already in pool '{pool_id}'."
+            )));
+        }
+
         self.db
-            .update_loop_spec_pool(loop_id, &pool)
+            .append_pool_member(pool_id, spec_id)
             .map_err(internal_error)?;
 
         Ok(success_result(&format!(
-            "Spec '{name}' added to pool for loop '{loop_id}'."
+            "Spec '{spec_id}' added to pool '{pool_id}'."
         )))
     }
 
     #[tool(
-        name = "loop_pool_list",
-        description = "List the specs in a loop's spec pool."
+        name = "pool_list",
+        description = "List a pool's ordered members, or every pool (summary only) if pool_id is omitted."
     )]
-    async fn loop_pool_list(
+    async fn pool_list(
         &self,
-        Parameters(params): Parameters<LoopPoolListParams>,
+        Parameters(params): Parameters<PoolListParams>,
     ) -> Result<CallToolResult, McpError> {
-        let loop_id = params.loop_id.trim();
-        let lp = match validate_loop_and_get(&self.db, loop_id) {
-            Ok(lp) => lp,
-            Err(e) => return Ok(error_result(&e)),
+        let pool_id = params
+            .pool_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let body = match pool_id {
+            Some(pool_id) => {
+                let details = match self.db.get_pool_details(pool_id) {
+                    Ok(Some(details)) => details,
+                    Ok(None) => return Ok(error_result(&format!("Pool '{pool_id}' not found."))),
+                    Err(e) => return Err(internal_error(e.to_string())),
+                };
+                serde_json::json!({ "pool": pool_details_json(&details) })
+            }
+            None => {
+                let pools = self.db.list_pools().map_err(internal_error)?;
+                serde_json::json!({
+                    "pools": pools
+                        .iter()
+                        .map(|pool| serde_json::json!({
+                            "id": pool.id,
+                            "name": pool.name,
+                        }))
+                        .collect::<Vec<_>>(),
+                })
+            }
         };
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&serde_json::json!({
-                "loop_id": loop_id,
-                "specs": pool_nodes_json(lp.spec_pool.as_ref()),
-            }))
-            .unwrap_or_default(),
+            serde_json::to_string_pretty(&body).unwrap_or_default(),
         )]))
     }
 
     #[tool(
-        name = "loop_pool_remove",
-        description = "Remove a spec from a loop's spec pool by name."
+        name = "pool_remove_spec",
+        description = "Remove a spec from a pool's queue."
     )]
-    async fn loop_pool_remove(
+    async fn pool_remove_spec(
         &self,
-        Parameters(params): Parameters<LoopPoolRemoveParams>,
+        Parameters(params): Parameters<PoolRemoveSpecParams>,
     ) -> Result<CallToolResult, McpError> {
-        let loop_id = params.loop_id.trim();
-        let lp = match validate_loop_and_get(&self.db, loop_id) {
-            Ok(lp) => lp,
-            Err(e) => return Ok(error_result(&e)),
-        };
-        let name = params.name.trim();
-        if let Err(e) = validate_pool_has_name(lp.spec_pool.as_ref(), name) {
+        let pool_id = params.pool_id.trim();
+        if let Err(e) = validate_pool_exists(&self.db, pool_id) {
             return Ok(error_result(&e));
         }
-
-        let pool = remove_pool_node(
-            lp.spec_pool
-                .expect("validate_pool_has_name confirmed a pool exists"),
-            name,
-        );
-        self.db
-            .update_loop_spec_pool(loop_id, &pool)
+        let spec_id = params.spec_id.trim();
+        let removed = self
+            .db
+            .remove_pool_member(pool_id, spec_id)
             .map_err(internal_error)?;
+        if !removed {
+            return Ok(error_result(&format!(
+                "Pool '{pool_id}' has no spec '{spec_id}'."
+            )));
+        }
 
         Ok(success_result(&format!(
-            "Spec '{name}' removed from pool for loop '{loop_id}'."
+            "Spec '{spec_id}' removed from pool '{pool_id}'."
         )))
     }
 
     #[tool(
-        name = "loop_pool_reorder",
-        description = "Reorder a loop's spec pool. `order` must list every pool spec name exactly once, in the desired order — a total replacement, not a partial swap."
+        name = "pool_reorder",
+        description = "Reorder a pool's queue. `spec_ids` must list every pool member exactly once, in the desired order — a total replacement, not a partial swap."
     )]
-    async fn loop_pool_reorder(
+    async fn pool_reorder(
         &self,
-        Parameters(params): Parameters<LoopPoolReorderParams>,
+        Parameters(params): Parameters<PoolReorderParams>,
     ) -> Result<CallToolResult, McpError> {
-        let loop_id = params.loop_id.trim();
-        let lp = match validate_loop_and_get(&self.db, loop_id) {
-            Ok(lp) => lp,
-            Err(e) => return Ok(error_result(&e)),
-        };
-        let Some(existing_pool) = lp.spec_pool else {
-            return Ok(error_result(&format!(
-                "Loop '{loop_id}' has no spec pool to reorder."
-            )));
-        };
-        if let Err(e) = validate_pool_reorder(&existing_pool, &params.order) {
+        let pool_id = params.pool_id.trim();
+        if let Err(e) = validate_pool_exists(&self.db, pool_id) {
+            return Ok(error_result(&e));
+        }
+        let current = self
+            .db
+            .list_pool_member_spec_ids(pool_id)
+            .map_err(internal_error)?;
+        if let Err(e) = validate_pool_reorder(&current, &params.spec_ids) {
             return Ok(error_result(&e));
         }
 
-        let pool = reorder_pool_nodes(existing_pool, &params.order);
         self.db
-            .update_loop_spec_pool(loop_id, &pool)
+            .reorder_pool_members(pool_id, &params.spec_ids)
             .map_err(internal_error)?;
 
-        Ok(success_result(&format!(
-            "Pool for loop '{loop_id}' reordered."
-        )))
+        Ok(success_result(&format!("Pool '{pool_id}' reordered.")))
     }
 
     #[tool(
@@ -3648,16 +3602,15 @@ impl ServerHandler for TaskTriggerHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_pool_node, header_str, loop_details_json, missing_sync_identity_error,
-        next_pool_position, perform_loop_reset, pool_nodes_json, remove_pool_node,
-        reorder_pool_nodes, resolve_graph_target, validate_node_config, validate_pool_has_name,
-        validate_pool_name_unique, validate_pool_reorder, validate_spec_deletable,
-        MISSING_SYNC_IDENTITY_MESSAGE,
+        header_str, loop_details_json, missing_sync_identity_error, perform_loop_reset,
+        resolve_graph_target, validate_node_config, validate_pool_exists, validate_pool_reorder,
+        validate_spec_deletable, validate_spec_exists, MISSING_SYNC_IDENTITY_MESSAGE,
     };
     use crate::db::Database;
     use crate::domain::loops::{
-        Loop, LoopNode, LoopNodeKind, LoopSpec, LoopSpecStatus, LoopStatus, SpecPoolNode,
+        Loop, LoopNode, LoopNodeKind, LoopSpec, LoopSpecStatus, LoopStatus,
     };
+    use crate::domain::pools::Pool;
     use crate::shared::sync_identity::CANOPY_AGENT_ID_HEADER;
     use tempfile::tempdir;
 
@@ -3725,7 +3678,6 @@ mod tests {
             started_at: None,
             completed_at: Some(chrono::Utc::now()),
             autorun_at: None,
-            spec_pool: None,
         })
         .unwrap();
         (dir, db, loop_id)
@@ -3896,194 +3848,160 @@ mod tests {
         assert_eq!(error.message, MISSING_SYNC_IDENTITY_MESSAGE);
     }
 
-    #[test]
-    fn pool_add_then_list_returns_the_added_spec() {
-        let node = SpecPoolNode {
-            name: "review".to_string(),
-            kind: LoopNodeKind::Agent,
-            config: serde_json::json!({ "platform": "claude" }),
-            position: next_pool_position(None),
-        };
-        let pool = append_pool_node(None, "loop-1", node);
+    fn standalone_spec(id: &str) -> LoopSpec {
+        LoopSpec {
+            id: id.to_string(),
+            loop_id: None,
+            name: id.to_string(),
+            description: None,
+            position: 0,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+        }
+    }
 
-        let specs = pool_nodes_json(Some(&pool));
+    fn pool_test_db() -> (tempfile::TempDir, Database) {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        (dir, db)
+    }
 
-        assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0]["name"], "review");
-        assert_eq!(specs[0]["kind"], "agent");
-        assert_eq!(specs[0]["position"], 1);
+    fn insert_pool(db: &Database, id: &str) {
+        db.insert_pool(&Pool {
+            id: id.to_string(),
+            name: format!("{id}-name"),
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
     }
 
     #[test]
-    fn pool_list_on_empty_pool_returns_no_specs() {
-        assert!(pool_nodes_json(None).is_empty());
-    }
+    fn pool_crud_and_ordering_round_trips() {
+        let (_dir, db) = pool_test_db();
+        for id in ["spec-a", "spec-b", "spec-c"] {
+            db.insert_loop_spec(&standalone_spec(id)).unwrap();
+        }
+        insert_pool(&db, "pool-1");
 
-    #[test]
-    fn pool_position_increments_across_adds() {
-        let first = SpecPoolNode {
-            name: "implement".to_string(),
-            kind: LoopNodeKind::Agent,
-            config: serde_json::json!({ "cli": "claude" }),
-            position: next_pool_position(None),
-        };
-        let pool = append_pool_node(None, "loop-1", first);
+        db.append_pool_member("pool-1", "spec-a").unwrap();
+        db.append_pool_member("pool-1", "spec-b").unwrap();
+        db.append_pool_member("pool-1", "spec-c").unwrap();
 
-        let second_position = next_pool_position(Some(&pool));
-        assert_eq!(second_position, 2);
-
-        let second = SpecPoolNode {
-            name: "verify".to_string(),
-            kind: LoopNodeKind::Check,
-            config: serde_json::json!({ "command": "cargo test" }),
-            position: second_position,
-        };
-        let pool = append_pool_node(Some(pool), "loop-1", second);
-
-        let specs = pool_nodes_json(Some(&pool));
-        assert_eq!(specs.len(), 2);
-        assert_eq!(specs[1]["name"], "verify");
-        assert_eq!(specs[1]["position"], 2);
-    }
-
-    #[test]
-    fn pool_rejects_duplicate_spec_names() {
-        let node = SpecPoolNode {
-            name: "review".to_string(),
-            kind: LoopNodeKind::Agent,
-            config: serde_json::json!({ "platform": "claude" }),
-            position: 1,
-        };
-        let pool = append_pool_node(None, "loop-1", node);
-
-        let error = validate_pool_name_unique(Some(&pool), "review").unwrap_err();
-        assert!(
-            error.contains("already has a spec named 'review'"),
-            "{error}"
+        assert_eq!(
+            db.list_pool_member_spec_ids("pool-1").unwrap(),
+            vec!["spec-a", "spec-b", "spec-c"]
         );
-    }
 
-    fn sample_pool_of_three() -> crate::domain::loops::SpecPool {
-        let pool = append_pool_node(
-            None,
-            "loop-1",
-            SpecPoolNode {
-                name: "implement".to_string(),
-                kind: LoopNodeKind::Agent,
-                config: serde_json::json!({ "cli": "claude" }),
-                position: 1,
-            },
+        let details = db.get_pool_details("pool-1").unwrap().unwrap();
+        assert_eq!(details.pool.id, "pool-1");
+        assert_eq!(
+            details
+                .members
+                .iter()
+                .map(|spec| spec.id.clone())
+                .collect::<Vec<_>>(),
+            vec!["spec-a", "spec-b", "spec-c"]
         );
-        let pool = append_pool_node(
-            Some(pool),
-            "loop-1",
-            SpecPoolNode {
-                name: "verify".to_string(),
-                kind: LoopNodeKind::Check,
-                config: serde_json::json!({ "command": "cargo test" }),
-                position: 2,
-            },
+
+        assert!(db.remove_pool_member("pool-1", "spec-b").unwrap());
+        assert_eq!(
+            db.list_pool_member_spec_ids("pool-1").unwrap(),
+            vec!["spec-a", "spec-c"]
         );
-        append_pool_node(
-            Some(pool),
-            "loop-1",
-            SpecPoolNode {
-                name: "review".to_string(),
-                kind: LoopNodeKind::Gate,
-                config: serde_json::json!({ "evaluate": "output_contains", "value": "ok" }),
-                position: 3,
-            },
-        )
+        assert!(!db.remove_pool_member("pool-1", "spec-b").unwrap());
+
+        assert!(db.list_pools().unwrap().iter().any(|p| p.id == "pool-1"));
     }
 
     #[test]
-    fn pool_remove_deletes_existing_spec() {
-        let pool = sample_pool_of_three();
-        assert!(validate_pool_has_name(Some(&pool), "verify").is_ok());
+    fn pool_reorder_is_total_and_deterministic() {
+        let (_dir, db) = pool_test_db();
+        for id in ["spec-a", "spec-b", "spec-c"] {
+            db.insert_loop_spec(&standalone_spec(id)).unwrap();
+        }
+        insert_pool(&db, "pool-1");
+        for id in ["spec-a", "spec-b", "spec-c"] {
+            db.append_pool_member("pool-1", id).unwrap();
+        }
 
-        let pool = remove_pool_node(pool, "verify");
-
-        let specs = pool_nodes_json(Some(&pool));
-        assert_eq!(specs.len(), 2);
-        assert!(specs.iter().all(|s| s["name"] != "verify"));
-    }
-
-    #[test]
-    fn pool_remove_drops_edges_referencing_removed_node() {
-        let mut pool = sample_pool_of_three();
-        pool.edges.push(crate::domain::loops::SpecPoolEdge {
-            from_node: "implement".to_string(),
-            to_node: "verify".to_string(),
-            condition: crate::domain::loops::LoopEdgeCondition::Always,
-        });
-
-        let pool = remove_pool_node(pool, "verify");
-
-        assert!(pool.edges.is_empty());
-    }
-
-    #[test]
-    fn pool_remove_missing_spec_errors() {
-        let pool = sample_pool_of_three();
-
-        let error = validate_pool_has_name(Some(&pool), "ghost").unwrap_err();
-        assert!(error.contains("no spec named 'ghost'"), "{error}");
-    }
-
-    #[test]
-    fn pool_reorder_changes_position_order() {
-        let pool = sample_pool_of_three();
+        let current = db.list_pool_member_spec_ids("pool-1").unwrap();
         let order = vec![
-            "review".to_string(),
-            "implement".to_string(),
-            "verify".to_string(),
+            "spec-c".to_string(),
+            "spec-a".to_string(),
+            "spec-b".to_string(),
         ];
-        assert!(validate_pool_reorder(&pool, &order).is_ok());
+        assert!(validate_pool_reorder(&current, &order).is_ok());
 
-        let pool = reorder_pool_nodes(pool, &order);
-
-        let specs = pool_nodes_json(Some(&pool));
-        assert_eq!(specs[0]["name"], "review");
-        assert_eq!(specs[0]["position"], 1);
-        assert_eq!(specs[1]["name"], "implement");
-        assert_eq!(specs[1]["position"], 2);
-        assert_eq!(specs[2]["name"], "verify");
-        assert_eq!(specs[2]["position"], 3);
+        db.reorder_pool_members("pool-1", &order).unwrap();
+        assert_eq!(db.list_pool_member_spec_ids("pool-1").unwrap(), order);
     }
 
     #[test]
-    fn pool_reorder_rejects_wrong_count() {
-        let pool = sample_pool_of_three();
-        let order = vec!["review".to_string(), "implement".to_string()];
+    fn pool_reorder_rejects_partial_list() {
+        let current = vec![
+            "spec-a".to_string(),
+            "spec-b".to_string(),
+            "spec-c".to_string(),
+        ];
+        let order = vec!["spec-a".to_string(), "spec-b".to_string()];
 
-        let error = validate_pool_reorder(&pool, &order).unwrap_err();
+        let error = validate_pool_reorder(&current, &order).unwrap_err();
         assert!(error.contains("exactly once; got 2"), "{error}");
     }
 
     #[test]
-    fn pool_reorder_rejects_unknown_name() {
-        let pool = sample_pool_of_three();
+    fn pool_reorder_rejects_unknown_spec() {
+        let current = vec![
+            "spec-a".to_string(),
+            "spec-b".to_string(),
+            "spec-c".to_string(),
+        ];
         let order = vec![
-            "review".to_string(),
-            "implement".to_string(),
+            "spec-a".to_string(),
+            "spec-b".to_string(),
             "ghost".to_string(),
         ];
 
-        let error = validate_pool_reorder(&pool, &order).unwrap_err();
-        assert!(error.contains("no spec named 'ghost'"), "{error}");
+        let error = validate_pool_reorder(&current, &order).unwrap_err();
+        assert!(error.contains("no spec 'ghost'"), "{error}");
     }
 
     #[test]
-    fn pool_reorder_rejects_duplicate_name() {
-        let pool = sample_pool_of_three();
+    fn pool_reorder_rejects_duplicate_spec() {
+        let current = vec![
+            "spec-a".to_string(),
+            "spec-b".to_string(),
+            "spec-c".to_string(),
+        ];
         let order = vec![
-            "review".to_string(),
-            "review".to_string(),
-            "verify".to_string(),
+            "spec-a".to_string(),
+            "spec-a".to_string(),
+            "spec-b".to_string(),
         ];
 
-        let error = validate_pool_reorder(&pool, &order).unwrap_err();
+        let error = validate_pool_reorder(&current, &order).unwrap_err();
         assert!(error.contains("more than once"), "{error}");
+    }
+
+    #[test]
+    fn pool_add_spec_rejects_nonexistent_spec() {
+        let (_dir, db) = pool_test_db();
+        insert_pool(&db, "pool-1");
+
+        let error = validate_spec_exists(&db, "ghost-spec").unwrap_err();
+        assert!(error.contains("not found"), "{error}");
+    }
+
+    #[test]
+    fn pool_operations_reject_nonexistent_pool() {
+        let (_dir, db) = pool_test_db();
+
+        let error = validate_pool_exists(&db, "does-not-exist").unwrap_err();
+        assert!(error.contains("not found"), "{error}");
     }
 
     #[test]
@@ -4125,7 +4043,6 @@ mod tests {
             started_at: None,
             completed_at: None,
             autorun_at: None,
-            spec_pool: None,
         })
         .unwrap();
         db.insert_loop_node(&LoopNode {

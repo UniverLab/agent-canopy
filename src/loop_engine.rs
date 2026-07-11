@@ -707,7 +707,6 @@ mod tests {
             started_at: None,
             completed_at: None,
             autorun_at: None,
-            spec_pool: None,
         };
         let spec = crate::domain::loops::LoopSpec {
             id: "spec-test".to_string(),
@@ -1116,7 +1115,6 @@ mod tests {
             started_at: None,
             completed_at: None,
             autorun_at: None,
-            spec_pool: None,
         };
         let spec = LoopSpec {
             id: "spec".to_string(),

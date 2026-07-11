@@ -12,6 +12,7 @@ pub mod models;
 pub mod models_db;
 pub mod notification;
 pub mod nursery;
+pub mod pools;
 pub mod project;
 pub mod seeds;
 pub mod sync;

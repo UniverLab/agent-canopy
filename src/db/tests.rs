@@ -2,9 +2,10 @@ use super::*;
 use crate::db::intelligence::{IntelligenceNodeInput, IntelligenceRelationInput};
 use crate::domain::loops::{
     Loop, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind, LoopNodeRun, LoopRunStatus,
-    LoopSpec, LoopSpecStatus, LoopStatus, SpecPool, SpecPoolEdge, SpecPoolNode,
+    LoopSpec, LoopSpecStatus, LoopStatus,
 };
 use crate::domain::models::{Agent, Cli, RunLog, RunStatus, Trigger, TriggerType, WatchEvent};
+use crate::domain::pools::Pool;
 use crate::domain::sync::{
     IntentPayload, MessageKind, MissionImpact, StatusPayload, WorkspaceStatus,
 };
@@ -101,7 +102,6 @@ fn sample_loop(id: &str) -> Loop {
         started_at: None,
         completed_at: None,
         autorun_at: None,
-        spec_pool: None,
     }
 }
 
@@ -1156,96 +1156,187 @@ fn loop_trigger_round_trips_through_insert_and_get() {
     assert!(fetched.is_cron());
 }
 
-#[test]
-fn loop_spec_pool_round_trips_through_insert_and_get() {
-    let db = test_db();
-    let pool = SpecPool {
-        id: "pool-1".to_string(),
-        name: "Agent review gate".to_string(),
-        description: Some("agent -> check -> gate".to_string()),
-        nodes: vec![
-            SpecPoolNode {
-                name: "implement".to_string(),
-                kind: LoopNodeKind::Agent,
-                config: serde_json::json!({"cli": "claude"}),
-                position: 0,
-            },
-            SpecPoolNode {
-                name: "reviewer-gate".to_string(),
-                kind: LoopNodeKind::Gate,
-                config: serde_json::json!({}),
-                position: 1,
-            },
-        ],
-        edges: vec![SpecPoolEdge {
-            from_node: "implement".to_string(),
-            to_node: "reviewer-gate".to_string(),
-            condition: LoopEdgeCondition::Pass,
-        }],
-    };
-    let mut lp = sample_loop("wf-spec-pool");
-    lp.spec_pool = Some(pool.clone());
-    db.insert_loop(&lp).unwrap();
-
-    let fetched = db.get_loop("wf-spec-pool").unwrap().unwrap();
-    assert_eq!(fetched.spec_pool, Some(pool));
+fn sample_pool(id: &str) -> Pool {
+    Pool {
+        id: id.to_string(),
+        name: format!("{id} name"),
+        created_at: Utc::now(),
+    }
 }
 
 #[test]
-fn loop_without_spec_pool_round_trips_as_none() {
+fn pool_and_members_round_trip_through_insert_and_get_details() {
     let db = test_db();
-    let lp = sample_loop("wf-no-pool");
-    db.insert_loop(&lp).unwrap();
+    for id in ["spec-a", "spec-b", "spec-c"] {
+        db.insert_loop_spec(&sample_standalone_spec(id, None))
+            .unwrap();
+    }
+    db.insert_pool(&sample_pool("pool-1")).unwrap();
 
-    let fetched = db.get_loop("wf-no-pool").unwrap().unwrap();
-    assert_eq!(fetched.spec_pool, None);
-}
+    db.append_pool_member("pool-1", "spec-a").unwrap();
+    db.append_pool_member("pool-1", "spec-b").unwrap();
+    db.append_pool_member("pool-1", "spec-c").unwrap();
+    assert_eq!(
+        db.list_pool_member_spec_ids("pool-1").unwrap(),
+        vec!["spec-a", "spec-b", "spec-c"]
+    );
+    assert!(db.pool_has_member("pool-1", "spec-b").unwrap());
 
-#[test]
-fn update_loop_spec_pool_adds_a_spec_to_an_empty_pool() {
-    let db = test_db();
-    let lp = sample_loop("wf-pool-add");
-    db.insert_loop(&lp).unwrap();
-    assert!(db
-        .get_loop("wf-pool-add")
+    let details = db.get_pool_details("pool-1").unwrap().unwrap();
+    assert_eq!(details.pool.name, "pool-1 name");
+    assert_eq!(
+        details
+            .members
+            .iter()
+            .map(|spec| spec.id.clone())
+            .collect::<Vec<_>>(),
+        vec!["spec-a", "spec-b", "spec-c"]
+    );
+
+    assert!(db.remove_pool_member("pool-1", "spec-b").unwrap());
+    assert!(!db.pool_has_member("pool-1", "spec-b").unwrap());
+    assert_eq!(
+        db.list_pool_member_spec_ids("pool-1").unwrap(),
+        vec!["spec-a", "spec-c"]
+    );
+
+    let names = db
+        .list_pools()
         .unwrap()
-        .unwrap()
-        .spec_pool
-        .is_none());
-
-    let pool = SpecPool {
-        id: "pool-1".to_string(),
-        name: "wf-pool-add spec pool".to_string(),
-        description: None,
-        nodes: vec![SpecPoolNode {
-            name: "review".to_string(),
-            kind: LoopNodeKind::Agent,
-            config: serde_json::json!({"platform": "claude"}),
-            position: 1,
-        }],
-        edges: vec![],
-    };
-    let updated = db.update_loop_spec_pool("wf-pool-add", &pool).unwrap();
-    assert!(updated);
-
-    let fetched = db.get_loop("wf-pool-add").unwrap().unwrap();
-    let fetched_pool = fetched.spec_pool.expect("pool should now be set");
-    assert_eq!(fetched_pool.nodes.len(), 1);
-    assert_eq!(fetched_pool.nodes[0].name, "review");
+        .into_iter()
+        .map(|pool| pool.id)
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["pool-1"]);
+    assert!(db.get_pool("does-not-exist").unwrap().is_none());
 }
 
 #[test]
-fn update_loop_spec_pool_returns_false_for_missing_loop() {
+fn reorder_pool_members_replaces_positions_in_given_order() {
     let db = test_db();
-    let pool = SpecPool {
-        id: "pool-1".to_string(),
-        name: "pool".to_string(),
-        description: None,
-        nodes: vec![],
-        edges: vec![],
-    };
-    let updated = db.update_loop_spec_pool("does-not-exist", &pool).unwrap();
-    assert!(!updated);
+    for id in ["spec-a", "spec-b", "spec-c"] {
+        db.insert_loop_spec(&sample_standalone_spec(id, None))
+            .unwrap();
+    }
+    db.insert_pool(&sample_pool("pool-1")).unwrap();
+    for id in ["spec-a", "spec-b", "spec-c"] {
+        db.append_pool_member("pool-1", id).unwrap();
+    }
+
+    let order = vec![
+        "spec-c".to_string(),
+        "spec-a".to_string(),
+        "spec-b".to_string(),
+    ];
+    db.reorder_pool_members("pool-1", &order).unwrap();
+
+    assert_eq!(db.list_pool_member_spec_ids("pool-1").unwrap(), order);
+}
+
+#[test]
+fn append_pool_member_rejects_nonexistent_spec() {
+    let db = test_db();
+    db.insert_pool(&sample_pool("pool-1")).unwrap();
+
+    let error = db.append_pool_member("pool-1", "ghost-spec").unwrap_err();
+    assert!(
+        error.to_string().to_lowercase().contains("foreign key"),
+        "{error}"
+    );
+}
+
+#[test]
+fn deleting_a_spec_cascades_its_pool_membership() {
+    let db = test_db();
+    db.insert_loop_spec(&sample_standalone_spec("spec-a", None))
+        .unwrap();
+    db.insert_pool(&sample_pool("pool-1")).unwrap();
+    db.append_pool_member("pool-1", "spec-a").unwrap();
+
+    db.delete_loop_spec("spec-a").unwrap();
+
+    assert!(db.list_pool_member_spec_ids("pool-1").unwrap().is_empty());
+}
+
+#[test]
+fn pools_migration_is_idempotent_and_a_pre_r4_database_opens_cleanly() {
+    // Simulate a pre-R4 database: `loops` has the old `spec_pool` column
+    // (7f2efdf) but no `pools`/`pool_members` tables at all.
+    let tmp = NamedTempFile::new().expect("create temp file");
+    let path = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+
+    {
+        let conn = rusqlite::Connection::open(&path).expect("open raw legacy db");
+        conn.execute_batch(
+            "CREATE TABLE loops (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                workdir TEXT NOT NULL,
+                status TEXT NOT NULL,
+                trigger_type TEXT,
+                trigger_config TEXT,
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER,
+                autorun_at INTEGER,
+                spec_pool TEXT
+             );
+             CREATE TABLE loop_specs (
+                id TEXT PRIMARY KEY,
+                loop_id TEXT REFERENCES loops(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                description TEXT,
+                position INTEGER NOT NULL,
+                parallelizable INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER,
+                workdir TEXT
+             );
+             INSERT INTO loops (id, name, workdir, status, created_at, spec_pool)
+                 VALUES ('legacy-loop', 'Legacy', '/tmp', 'draft', 0, NULL);
+             INSERT INTO loop_specs (id, loop_id, name, position, status)
+                 VALUES ('legacy-spec', 'legacy-loop', 'Spec', 1, 'pending');",
+        )
+        .expect("seed legacy schema");
+    }
+
+    // Opening the DB (Database::new runs the migration) must succeed and add
+    // the pools tables without disturbing existing rows.
+    let db = Database::new(&path).expect("open pre-R4 db, running migration");
+    let lp = db.get_loop("legacy-loop").unwrap().unwrap();
+    assert_eq!(lp.name, "Legacy");
+    db.insert_pool(&sample_pool("pool-1")).unwrap();
+    db.append_pool_member("pool-1", "legacy-spec").unwrap();
+    assert_eq!(
+        db.list_pool_member_spec_ids("pool-1").unwrap(),
+        vec!["legacy-spec"]
+    );
+    drop(db);
+
+    // Reopening after the migration already ran must be a no-op: same data,
+    // no error (idempotent).
+    let db = Database::new(&path).expect("reopen db after migration already applied");
+    assert_eq!(
+        db.list_pool_member_spec_ids("pool-1").unwrap(),
+        vec!["legacy-spec"]
+    );
+
+    // The retired `spec_pool` column is never written by current code: a
+    // freshly inserted loop leaves it NULL.
+    db.insert_loop(&sample_loop("fresh-loop")).unwrap();
+    let raw: Option<String> = db
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT spec_pool FROM loops WHERE id = 'fresh-loop'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(raw, None);
 }
 
 #[test]
