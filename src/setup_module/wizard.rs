@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use inquire::{Confirm, MultiSelect, Select};
 use std::io::{self, Write};
 
-pub fn run_setup() -> Result<()> {
+pub fn run_setup(force_skills: bool) -> Result<()> {
     let mut wiz = WizardState::new();
     let home = dirs::home_dir().context("No home directory")?;
     let canopy_dir = home.join(".canopy");
@@ -207,7 +207,7 @@ pub fn run_setup() -> Result<()> {
 
     // ── Step 5: Essential Skills ─────────────────────────────────
     wiz.render()?;
-    let skills_step = run_essential_skills_step(&home, &selected);
+    let skills_step = run_essential_skills_step(&home, &selected, force_skills);
     wiz.add(skills_step);
 
     // ── Step 6: Daemon + service ────────────────────────────────

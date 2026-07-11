@@ -726,6 +726,11 @@ impl App {
                     return Ok(());
                 }
             }
+            AgentEntry::Orphaned(idx) => {
+                // Orphaned sessions are DB-only; just drop the entry.
+                self.orphaned_sessions.remove(*idx);
+                self.finish_session_mutation();
+            }
         }
 
         self.finish_session_mutation();
@@ -888,6 +893,44 @@ impl App {
         if self.remove_session_target(target) {
             self.finish_session_mutation();
         }
+    }
+
+    /// Revive a selected orphaned session by re-launching its CLI with stored
+    /// args in its stored workdir.
+    pub(crate) fn revive_selected_orphaned_session(&mut self) {
+        let Some(AgentEntry::Orphaned(idx)) = self.selected_agent() else {
+            return;
+        };
+        let idx = *idx;
+        let Some(session) = self.orphaned_sessions.get(idx).cloned() else {
+            return;
+        };
+
+        let home = dirs::home_dir().unwrap_or_default();
+        let canopy_config = crate::domain::canopy_config::CanopyConfig::load(&home.join(".canopy"));
+        let (cols, rows) = Self::session_panel_size();
+        let current_boot_id = crate::system::boot_id();
+
+        // Remove from orphaned list first.
+        self.orphaned_sessions.remove(idx);
+        self.resume_interactive_session(
+            &session,
+            &canopy_config,
+            cols,
+            rows,
+            current_boot_id.as_deref(),
+        );
+        self.finish_session_mutation();
+    }
+
+    /// Dismiss (remove) a selected orphaned session without reviving it.
+    pub(crate) fn dismiss_selected_orphaned_session(&mut self) {
+        let Some(AgentEntry::Orphaned(idx)) = self.selected_agent() else {
+            return;
+        };
+        let idx = *idx;
+        self.orphaned_sessions.remove(idx);
+        self.finish_session_mutation();
     }
 }
 

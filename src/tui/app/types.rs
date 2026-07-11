@@ -22,6 +22,7 @@ pub enum AgentEntry {
     Agent(Agent),
     Interactive(usize), // index into App::interactive_agents
     Terminal(usize),    // index into App::terminal_agents
+    Orphaned(usize),    // index into App::orphaned_sessions
     Group(usize),       // index into App::split_groups
 }
 
@@ -34,6 +35,7 @@ impl AgentEntry {
                 .get(*idx)
                 .map_or("?", |a| a.seed_name.as_deref().unwrap_or(&a.name)),
             Self::Terminal(idx) => app.terminal_agents.get(*idx).map_or("?", |a| &a.name),
+            Self::Orphaned(idx) => app.orphaned_sessions.get(*idx).map_or("?", |s| &s.name),
             Self::Group(idx) => app.split_groups.get(*idx).map_or("?", |g| &g.id),
         }
     }
@@ -226,6 +228,8 @@ pub struct App {
     pub(crate) interactive_agents: Vec<InteractiveAgent>,
     /// Raw terminal sessions (no AI CLI).
     pub(crate) terminal_agents: Vec<InteractiveAgent>,
+    /// Sessions orphaned during auto-resume (can be revived or dismissed).
+    pub(crate) orphaned_sessions: Vec<crate::db::session::InteractiveSession>,
 
     // Split group state
     pub(crate) split_groups: Vec<crate::domain::models::SplitGroup>,

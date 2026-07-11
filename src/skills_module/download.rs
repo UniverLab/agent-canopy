@@ -7,12 +7,18 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use super::ensure_global_skills_dir;
+use super::sync_policy;
 
 const ESSENTIAL_PACK_REPO: &str = "UniverLab/skills";
 const ESSENTIAL_PACK_API: &str = "https://api.github.com/repos/UniverLab/skills/contents";
 const SKILLS_TOML_URL: &str = "https://raw.githubusercontent.com/UniverLab/skills/main/skills.toml";
 
-pub fn download_essential_pack() -> Result<usize> {
+/// Download the Essential Pack from GitHub into `~/.agents/skills/`.
+///
+/// Existing files whose content diverges from the incoming sync source are
+/// left untouched (a WARN is logged and a `.sync-new` sidecar is written)
+/// unless `force` is set. See `sync_policy` for the decision logic.
+pub fn download_essential_pack(force: bool) -> Result<usize> {
     let global = ensure_global_skills_dir()?;
     let client = build_github_client()?;
 
@@ -22,7 +28,7 @@ pub fn download_essential_pack() -> Result<usize> {
         return Ok(0);
     };
 
-    download_missing_skill_dirs(&client, &global, &entries, &registry)
+    sync_skill_dirs(&client, &global, &entries, &registry, force)
 }
 
 fn build_github_client() -> Result<reqwest::blocking::Client> {
@@ -111,13 +117,20 @@ fn fetch_essential_pack_entries(
     Ok(Some(entries))
 }
 
-fn download_missing_skill_dirs(
+/// Sync every skill directory from the Essential Pack into `global`.
+///
+/// A skill directory that already exists locally is still visited — its
+/// files are synced individually under the content-hash overwrite policy —
+/// rather than being skipped wholesale, so legitimate upstream updates still
+/// land as long as they don't clobber local divergence.
+fn sync_skill_dirs(
     client: &reqwest::blocking::Client,
     global: &Path,
     entries: &[GhEntry],
     registry: &SkillsRegistry,
+    force: bool,
 ) -> Result<usize> {
-    let mut downloaded = 0usize;
+    let mut synced = 0usize;
 
     for entry in entries.iter().filter(|entry| entry.entry_type == "dir") {
         if !registry.should_install(&entry.name) {
@@ -130,22 +143,19 @@ fn download_missing_skill_dirs(
         }
 
         let skill_dir = global.join(&entry.name);
-        if skill_dir.exists() {
-            continue;
-        }
-
-        if download_skill_dir(client, &entry.name, &skill_dir)? {
-            downloaded += 1;
+        if sync_skill_dir(client, &entry.name, &skill_dir, force)? {
+            synced += 1;
         }
     }
 
-    Ok(downloaded)
+    Ok(synced)
 }
 
-fn download_skill_dir(
+fn sync_skill_dir(
     client: &reqwest::blocking::Client,
     skill_name: &str,
     skill_dir: &Path,
+    force: bool,
 ) -> Result<bool> {
     let Some(dir_entries) = fetch_skill_dir_entries(client, skill_name)? else {
         return Ok(false);
@@ -155,8 +165,7 @@ fn download_skill_dir(
     }
 
     std::fs::create_dir_all(skill_dir)?;
-    write_skill_files(client, skill_dir, &dir_entries);
-    Ok(true)
+    Ok(write_skill_files(client, skill_dir, &dir_entries, force))
 }
 
 fn fetch_skill_dir_entries(
@@ -183,28 +192,52 @@ fn has_skill_instructions_entry(entries: &[GhEntry]) -> bool {
         .any(|entry| matches!(entry.name.as_str(), "SKILL.md" | "INSTRUCTIONS.md"))
 }
 
-fn write_skill_files(client: &reqwest::blocking::Client, skill_dir: &Path, entries: &[GhEntry]) {
+/// Writes every file entry, applying the content-hash overwrite policy per
+/// file. Returns `true` if at least one file was actually written.
+fn write_skill_files(
+    client: &reqwest::blocking::Client,
+    skill_dir: &Path,
+    entries: &[GhEntry],
+    force: bool,
+) -> bool {
+    let mut wrote_any = false;
     for file in entries.iter().filter(|entry| entry.entry_type == "file") {
-        write_skill_file(client, skill_dir, file);
+        if write_skill_file(client, skill_dir, file, force) {
+            wrote_any = true;
+        }
     }
+    wrote_any
 }
 
-fn write_skill_file(client: &reqwest::blocking::Client, skill_dir: &Path, file: &GhEntry) {
+fn write_skill_file(
+    client: &reqwest::blocking::Client,
+    skill_dir: &Path,
+    file: &GhEntry,
+    force: bool,
+) -> bool {
     let Some(raw_url) = file.download_url.as_deref() else {
-        return;
+        return false;
     };
 
     let Ok(response) = client.get(raw_url).send() else {
-        return;
+        return false;
     };
     if !response.status().is_success() {
-        return;
+        return false;
     }
 
     let Ok(content) = response.bytes() else {
-        return;
+        return false;
     };
-    let _ = std::fs::write(skill_dir.join(&file.name), &content);
+
+    let dest = skill_dir.join(&file.name);
+    match sync_policy::sync_write(&dest, raw_url, &content, force) {
+        Ok(wrote) => wrote,
+        Err(e) => {
+            tracing::warn!("Skills sync: failed to write {}: {e}", dest.display());
+            false
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]

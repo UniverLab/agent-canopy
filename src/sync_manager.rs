@@ -246,6 +246,7 @@ mod tests {
                 None,
                 Some(4242),
                 "interactive",
+                None,
             )
             .expect("seed known session");
 
@@ -286,6 +287,7 @@ mod tests {
                 Some("canopy bridge"),
                 Some(4343),
                 "bridge",
+                None,
             )
             .expect("seed standalone session");
 

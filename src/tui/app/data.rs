@@ -45,6 +45,10 @@ impl App {
         for i in 0..self.terminal_agents.len() {
             self.agents.push(AgentEntry::Terminal(i));
         }
+        // Orphaned sessions (can be revived or dismissed)
+        for i in 0..self.orphaned_sessions.len() {
+            self.agents.push(AgentEntry::Orphaned(i));
+        }
         // Then split groups
         for i in 0..self.split_groups.len() {
             self.agents.push(AgentEntry::Group(i));

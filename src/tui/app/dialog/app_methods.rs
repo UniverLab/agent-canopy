@@ -675,6 +675,7 @@ impl App {
             args.as_deref(),
             agent.pid(),
             session_type,
+            crate::system::boot_id().as_deref(),
         );
         // Don't register nursery temp dir as a project — it's ephemeral
         if !is_nursery {

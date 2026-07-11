@@ -108,6 +108,10 @@ impl App {
                 .get(*idx)
                 .map(|agent| agent.working_dir.as_str()),
             AgentEntry::Agent(agent) => agent.working_dir.as_deref(),
+            AgentEntry::Orphaned(idx) => self
+                .orphaned_sessions
+                .get(*idx)
+                .map(|s| s.working_dir.as_str()),
             AgentEntry::Group(_) => None,
         }
     }

@@ -95,6 +95,7 @@ fn handle_background_agent_key(app: &mut App, code: KeyCode, modifiers: KeyModif
         Some(AgentEntry::Interactive(_))
             | Some(AgentEntry::Terminal(_))
             | Some(AgentEntry::Group(_))
+            | Some(AgentEntry::Orphaned(_))
     ) {
         return false;
     }
@@ -134,6 +135,7 @@ fn handle_focus_shortcuts(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
         || handle_split_picker_shortcut(app, code, modifiers)
         || handle_split_panel_focus_shortcut(app, code, modifiers)
         || handle_dismiss_exited_session(app, code)
+        || handle_orphaned_session_key(app, code)
         || handle_preview_shortcut(app, code)
         || handle_termination_shortcut(app, code, modifiers)
         || handle_legend_shortcut(app, code)
@@ -157,6 +159,25 @@ fn handle_dismiss_exited_session(app: &mut App, code: KeyCode) -> bool {
     }
     app.dismiss_selected_exited_session();
     true
+}
+
+/// Handle keys on a selected orphaned session: 'r' to revive, 'd' to dismiss.
+fn handle_orphaned_session_key(app: &mut App, code: KeyCode) -> bool {
+    let is_orphaned = matches!(app.selected_agent(), Some(AgentEntry::Orphaned(_)));
+    if !is_orphaned {
+        return false;
+    }
+    match code {
+        KeyCode::Char('r') => {
+            app.revive_selected_orphaned_session();
+            true
+        }
+        KeyCode::Char('d') | KeyCode::Esc | KeyCode::F(10) => {
+            app.dismiss_selected_orphaned_session();
+            true
+        }
+        _ => false,
+    }
 }
 
 fn handle_context_transfer_shortcut(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> bool {
@@ -309,6 +330,7 @@ fn try_cycle_through_focusable(app: &mut App, forward: bool) -> bool {
                     | AgentEntry::Terminal(_)
                     | AgentEntry::Group(_)
                     | AgentEntry::Agent(_)
+                    | AgentEntry::Orphaned(_)
             )
         })
         .map(|(idx, _)| idx)

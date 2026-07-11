@@ -66,6 +66,10 @@ pub fn run_tui() -> Result<()> {
     app.reconcile_bridge_sessions();
     // Auto-resume previously active interactive sessions
     app.auto_resume_sessions();
+    // Load orphaned sessions for TUI visibility
+    if let Ok(orphaned) = app.db.get_orphaned_sessions() {
+        app.orphaned_sessions = orphaned;
+    }
     // Auto-resume previously active terminal sessions
     app.auto_resume_terminal_sessions();
 

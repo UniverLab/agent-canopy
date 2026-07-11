@@ -15,6 +15,7 @@
 //! ```
 
 mod download;
+mod sync_policy;
 mod wizard;
 
 use anyhow::{Context, Result};

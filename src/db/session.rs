@@ -6,6 +6,7 @@ use crate::db::Database;
 
 /// Record of an interactive agent session (persisted in SQLite).
 #[allow(dead_code)]
+#[derive(Clone)]
 pub struct InteractiveSession {
     pub id: String,
     pub name: String,
@@ -16,6 +17,9 @@ pub struct InteractiveSession {
     pub status: String,
     pub session_type: String,
     pub pid: Option<i64>,
+    /// Machine boot id recorded when the session started (see
+    /// `system::boot_id`). NULL for rows written before this column existed.
+    pub boot_id: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -39,12 +43,13 @@ impl Database {
         args: Option<&str>,
         pid: Option<i64>,
         session_type: &str,
+        boot_id: Option<&str>,
     ) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         conn.execute(
-            "INSERT OR REPLACE INTO interactive_sessions (id, name, cli, working_dir, args, started_at, status, session_type, pid)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8)",
-            params![id, name, cli, working_dir, args, Utc::now().to_rfc3339(), session_type, pid],
+            "INSERT OR REPLACE INTO interactive_sessions (id, name, cli, working_dir, args, started_at, status, session_type, pid, boot_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, ?9)",
+            params![id, name, cli, working_dir, args, Utc::now().to_rfc3339(), session_type, pid, boot_id],
         )?;
         Ok(())
     }
@@ -86,7 +91,7 @@ impl Database {
     pub fn get_active_sessions(&self) -> Result<Vec<InteractiveSession>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, cli, working_dir, args, started_at, status, session_type, pid
+            "SELECT id, name, cli, working_dir, args, started_at, status, session_type, pid, boot_id
              FROM interactive_sessions WHERE status = 'active' AND session_type != 'bridge'
              ORDER BY started_at DESC",
         )?;
@@ -102,6 +107,38 @@ impl Database {
                     status: row.get(6)?,
                     session_type: row.get(7)?,
                     pid: row.get(8)?,
+                    boot_id: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Get all sessions with status = 'orphaned', excluding bridge sidecars.
+    ///
+    /// Populates the TUI's orphaned-sessions dialog, which lets the user
+    /// manually revive or dismiss a session that couldn't be (or wasn't)
+    /// auto-resumed at startup.
+    pub fn get_orphaned_sessions(&self) -> Result<Vec<InteractiveSession>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, cli, working_dir, args, started_at, status, session_type, pid, boot_id
+             FROM interactive_sessions WHERE status = 'orphaned' AND session_type != 'bridge'
+             ORDER BY started_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(InteractiveSession {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    cli: row.get(2)?,
+                    working_dir: row.get(3)?,
+                    args: row.get(4)?,
+                    started_at: row.get(5)?,
+                    status: row.get(6)?,
+                    session_type: row.get(7)?,
+                    pid: row.get(8)?,
+                    boot_id: row.get(9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -119,7 +156,7 @@ impl Database {
     ) -> Result<Vec<InteractiveSession>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, cli, working_dir, args, started_at, status, session_type, pid
+            "SELECT id, name, cli, working_dir, args, started_at, status, session_type, pid, boot_id
              FROM interactive_sessions WHERE status = 'active' AND session_type = ?1
              ORDER BY started_at DESC",
         )?;
@@ -135,18 +172,39 @@ impl Database {
                     status: row.get(6)?,
                     session_type: row.get(7)?,
                     pid: row.get(8)?,
+                    boot_id: row.get(9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
-    /// Mark all 'active' sessions as 'orphaned' (called on startup cleanup).
-    pub fn mark_orphaned_sessions(&self) -> Result<()> {
+    /// Mark a single session 'orphaned'. Only transitions rows that are
+    /// still 'active', so it's a no-op if the session was already resumed
+    /// or handled elsewhere.
+    ///
+    /// Called per-session, at the moment each session is decided, rather
+    /// than as a mass pre-pass over every active row (the old
+    /// `mark_orphaned_sessions` behavior) — a crash mid-resume-loop then
+    /// strands at most the one session being processed instead of every
+    /// session that hadn't been looked at yet.
+    pub fn mark_session_orphaned(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         conn.execute(
-            "UPDATE interactive_sessions SET status = 'orphaned' WHERE status = 'active'",
-            [],
+            "UPDATE interactive_sessions SET status = 'orphaned' WHERE id = ?1 AND status = 'active'",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a single session 'resumed', once its replacement process has
+    /// been launched. See `mark_session_orphaned` for why this is per-row
+    /// rather than a mass update.
+    pub fn mark_session_resumed(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        conn.execute(
+            "UPDATE interactive_sessions SET status = 'resumed' WHERE id = ?1 AND status = 'active'",
+            params![id],
         )?;
         Ok(())
     }

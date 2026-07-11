@@ -85,7 +85,8 @@ impl Database {
                 exit_code INTEGER,
                 status TEXT NOT NULL DEFAULT 'active',
                 session_type TEXT NOT NULL DEFAULT 'interactive',
-                pid INTEGER
+                pid INTEGER,
+                boot_id TEXT
             );
 
             CREATE TABLE IF NOT EXISTS terminal_sessions (
@@ -333,6 +334,26 @@ impl Database {
         if !has_pid {
             conn.execute(
                 "ALTER TABLE interactive_sessions ADD COLUMN pid INTEGER",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // Boot-id aware auto-resume (see should_resume_session in
+        // tui::app::mod): a stored pid alone can't tell a resumed session
+        // from an unrelated process that got the same pid after a reboot
+        // recycled the pid space. NULL for rows written before this column
+        // existed — treated as "unknown boot" (always safe to resume).
+        let has_boot_id: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('interactive_sessions') WHERE name = 'boot_id'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_boot_id {
+            conn.execute(
+                "ALTER TABLE interactive_sessions ADD COLUMN boot_id TEXT",
                 [],
             )
             .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;

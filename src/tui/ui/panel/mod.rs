@@ -313,6 +313,18 @@ fn draw_agent_panel(frame: &mut Frame, area: Rect, app: &mut App) -> bool {
             draw_background_agent_panel(frame, area, agent, app);
             true
         }
+        AgentEntry::Orphaned(idx) => {
+            if let Some(session) = app.orphaned_sessions.get(*idx) {
+                let text = format!(
+                    "Orphaned session: {}\nCLI: {}  Workdir: {}\n\nPress 'r' to revive or 'd' to dismiss.",
+                    session.name, session.cli, session.working_dir
+                );
+                let paragraph = ratatui::widgets::Paragraph::new(text)
+                    .style(ratatui::style::Style::default().fg(ratatui::style::Color::Yellow));
+                frame.render_widget(paragraph, area);
+            }
+            true
+        }
     }
 }
 
@@ -403,6 +415,18 @@ fn draw_selected_preview(frame: &mut Frame, area: Rect, app: &App, selected: &Ag
         AgentEntry::Terminal(idx) => draw_terminal_preview(frame, area, app, *idx),
         AgentEntry::Group(idx) => {
             draw_group_details(frame, area, app, *idx);
+            true
+        }
+        AgentEntry::Orphaned(idx) => {
+            if let Some(session) = app.orphaned_sessions.get(*idx) {
+                let text = format!(
+                    "Orphaned: {} ({})\nWorkdir: {}",
+                    session.name, session.cli, session.working_dir
+                );
+                let paragraph = ratatui::widgets::Paragraph::new(text)
+                    .style(ratatui::style::Style::default().fg(ratatui::style::Color::Yellow));
+                frame.render_widget(paragraph, area);
+            }
             true
         }
     }

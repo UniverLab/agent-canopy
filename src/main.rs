@@ -63,6 +63,11 @@ enum Commands {
         /// Useful for development and testing registry changes before publishing.
         #[arg(long = "local-registry", value_name = "PATH")]
         local_registry: Option<PathBuf>,
+        /// Overwrite local skill files that diverge from the sync source,
+        /// even if they were modified locally. Default: diverging files are
+        /// skipped with a WARN and left untouched.
+        #[arg(long = "force-skills")]
+        force_skills: bool,
     },
     /// Interactive wizard to configure MCP in your AI client.
     Mcp,
@@ -100,11 +105,14 @@ async fn main() -> Result<()> {
         Some(Commands::Doctor) => run_doctor().await,
         Some(Commands::Stdio) => run_stdio_server().await,
         Some(Commands::Serve) => run_http_server(cli.port).await,
-        Some(Commands::Setup { local_registry }) => {
+        Some(Commands::Setup {
+            local_registry,
+            force_skills,
+        }) => {
             if let Some(path) = local_registry {
                 setup_module::registry_fetch::set_local_registry(path);
             }
-            tokio::task::block_in_place(setup_module::run_setup)?;
+            tokio::task::block_in_place(|| setup_module::run_setup(force_skills))?;
             Ok(())
         }
         Some(Commands::Mcp) => {
@@ -123,7 +131,7 @@ async fn main() -> Result<()> {
         None => {
             tokio::task::block_in_place(|| {
                 if setup_module::needs_setup() {
-                    setup_module::run_setup()?;
+                    setup_module::run_setup(false)?;
                 }
                 setup_module::maybe_refresh_registry();
                 let _ = autoupdate::check_and_update_if_needed();

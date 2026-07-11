@@ -208,6 +208,7 @@ fn test_list_active_sync_agent_ids_includes_live_sessions_and_running_background
         None,
         None,
         "interactive",
+        None,
     )
     .unwrap();
     db.insert_terminal_session("term-1", "shell", "bash", "/tmp/project")
@@ -324,6 +325,7 @@ fn test_resolve_sync_actor_name_prefers_interactive_session_name() {
         None,
         None,
         "interactive",
+        None,
     )
     .unwrap();
     db.insert_sync_message(
@@ -2371,6 +2373,7 @@ fn seed_bind_and_resolve() {
         None,
         None,
         "interactive",
+        None,
     )
     .unwrap();
 
@@ -2398,6 +2401,7 @@ fn seed_bind_replaces_existing() {
         None,
         None,
         "interactive",
+        None,
     )
     .unwrap();
 
@@ -2419,6 +2423,7 @@ fn seed_unbind_removes_binding() {
         None,
         None,
         "interactive",
+        None,
     )
     .unwrap();
 
@@ -2456,6 +2461,7 @@ fn seed_multiple_sessions_for_same_seed() {
         None,
         None,
         "interactive",
+        None,
     )
     .unwrap();
     db.insert_interactive_session(
@@ -2466,6 +2472,7 @@ fn seed_multiple_sessions_for_same_seed() {
         None,
         None,
         "interactive",
+        None,
     )
     .unwrap();
     db.insert_interactive_session(
@@ -2476,6 +2483,7 @@ fn seed_multiple_sessions_for_same_seed() {
         None,
         None,
         "interactive",
+        None,
     )
     .unwrap();
 
@@ -2500,6 +2508,7 @@ fn interactive_session_pid_round_trips_through_get_active_sessions() {
         None,
         Some(4321),
         "interactive",
+        None,
     )
     .unwrap();
     db.insert_interactive_session(
@@ -2510,6 +2519,7 @@ fn interactive_session_pid_round_trips_through_get_active_sessions() {
         None,
         None,
         "interactive",
+        None,
     )
     .unwrap();
 
@@ -2539,6 +2549,7 @@ fn get_active_sessions_excludes_bridge_sessions() {
         Some("canopy bridge"),
         Some(4321),
         "bridge",
+        None,
     )
     .unwrap();
     db.insert_interactive_session(
@@ -2549,6 +2560,7 @@ fn get_active_sessions_excludes_bridge_sessions() {
         None,
         Some(1234),
         "interactive",
+        None,
     )
     .unwrap();
 
@@ -2569,6 +2581,7 @@ fn get_active_sessions_by_type_returns_only_matching_bridge_rows() {
         Some("canopy bridge"),
         Some(4321),
         "bridge",
+        None,
     )
     .unwrap();
     db.insert_interactive_session(
@@ -2579,6 +2592,7 @@ fn get_active_sessions_by_type_returns_only_matching_bridge_rows() {
         None,
         Some(1234),
         "interactive",
+        None,
     )
     .unwrap();
 
@@ -2604,6 +2618,7 @@ fn legacy_bridge_rows_are_reclassified_by_migration() {
         Some("canopy bridge"),
         Some(4321),
         "interactive",
+        None,
     )
     .unwrap();
     drop(db);

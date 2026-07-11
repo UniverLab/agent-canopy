@@ -58,6 +58,7 @@ impl App {
             recent_runs: Vec::new(),
             interactive_agents: Vec::new(),
             terminal_agents: Vec::new(),
+            orphaned_sessions: Vec::new(),
             split_groups: Vec::new(),
             active_split_id: None,
             split_right_focused: false,
@@ -422,7 +423,9 @@ impl App {
         if let Some(agent) = self.agents.get(self.selected) {
             self.agent_section_focus = match agent {
                 AgentEntry::Agent(_) | AgentEntry::Group(_) => AgentSectionFocus::Background,
-                AgentEntry::Interactive(_) => AgentSectionFocus::Interactive,
+                AgentEntry::Interactive(_) | AgentEntry::Orphaned(_) => {
+                    AgentSectionFocus::Interactive
+                }
                 AgentEntry::Terminal(_) => AgentSectionFocus::Terminal,
             };
         }
@@ -1186,7 +1189,7 @@ impl App {
         match entry {
             AgentEntry::Interactive(idx) => self.interactive_agents.get(*idx),
             AgentEntry::Terminal(idx) => self.terminal_agents.get(*idx),
-            AgentEntry::Agent(_) | AgentEntry::Group(_) => None,
+            AgentEntry::Agent(_) | AgentEntry::Group(_) | AgentEntry::Orphaned(_) => None,
         }
     }
 
@@ -1246,7 +1249,7 @@ impl App {
                 Some(format!("terminal:{}", agent.id))
             }
             types::AgentEntry::Agent(a) => Some(format!("agent:{}", a.id)),
-            types::AgentEntry::Group(_) => None,
+            types::AgentEntry::Group(_) | types::AgentEntry::Orphaned(_) => None,
         }
     }
 
@@ -1629,7 +1632,7 @@ impl App {
                 .terminal_agents
                 .get(*idx)
                 .map(|_| ContextTransferSource::Terminal(*idx)),
-            AgentEntry::Agent(_) | AgentEntry::Group(_) => None,
+            AgentEntry::Agent(_) | AgentEntry::Group(_) | AgentEntry::Orphaned(_) => None,
         }
     }
 
@@ -1914,6 +1917,7 @@ impl App {
         canopy_config: &crate::domain::canopy_config::CanopyConfig,
         cols: u16,
         rows: u16,
+        current_boot_id: Option<&str>,
     ) {
         let cli = crate::domain::models::Cli::from_str(&session.cli);
         let cli_config = canopy_config.get_cli(cli.as_str());
@@ -1982,6 +1986,8 @@ impl App {
             }
         };
 
+        // Mark the old session as 'resumed' before inserting its replacement.
+        let _ = self.db.mark_session_resumed(&session.id);
         let _ = self.db.insert_interactive_session(
             &agent.id,
             &agent.name,
@@ -1990,6 +1996,7 @@ impl App {
             used_args.as_deref(),
             agent.pid(),
             &session.session_type,
+            current_boot_id,
         );
         self.interactive_agents.push(agent);
     }
@@ -2042,7 +2049,14 @@ impl App {
             return;
         };
         for session in &sessions {
-            if should_resume_session(session.pid) {
+            // Bridges are internal daemon processes — a live PID always means
+            // the bridge is running, regardless of boot_id (unlike user CLI
+            // sessions where PID recycling after reboot makes PIDs unreliable).
+            let dead = match session.pid {
+                Some(pid) => !process_is_alive(pid),
+                None => true,
+            };
+            if dead {
                 let _ = self.db.finish_interactive_session(&session.id, 1);
             }
         }
@@ -2057,22 +2071,35 @@ impl App {
             return;
         }
         tracing::info!("Resuming {} active session(s)", sessions.len());
-        let _ = self.db.mark_orphaned_sessions();
 
+        let current_boot_id = crate::system::boot_id();
         let home = dirs::home_dir().unwrap_or_default();
         let canopy_config = crate::domain::canopy_config::CanopyConfig::load(&home.join(".canopy"));
         let (cols, rows) = Self::session_panel_size();
 
         for session in &sessions {
-            if !should_resume_session(session.pid) {
+            if !should_resume_session(
+                session.pid,
+                session.boot_id.as_deref(),
+                current_boot_id.as_deref(),
+            ) {
                 tracing::warn!(
-                    "Skipping auto-resume of session '{}': old process (pid {:?}) is still alive",
+                    "Skipping auto-resume of session '{}': old process (pid {:?}) is still alive (same boot)",
                     session.name,
                     session.pid
                 );
+                // Per-session orphan marking — only this session is stranded
+                // if we crash right here, not every remaining active session.
+                let _ = self.db.mark_session_orphaned(&session.id);
                 continue;
             }
-            self.resume_interactive_session(session, &canopy_config, cols, rows);
+            self.resume_interactive_session(
+                session,
+                &canopy_config,
+                cols,
+                rows,
+                current_boot_id.as_deref(),
+            );
         }
 
         if !self.interactive_agents.is_empty() {
@@ -2124,12 +2151,26 @@ fn process_is_alive(_pid: i64) -> bool {
 
 /// Whether an interactive session should be auto-resumed on startup.
 ///
-/// A session with no recorded pid is always safe to resume (older rows, or
-/// sessions that predate PID tracking). A session whose recorded pid still
-/// belongs to a live process is skipped — resuming it would fight the old
-/// process for the CLI's own session lock ("Session is active in another
-/// process").
-fn should_resume_session(pid: Option<i64>) -> bool {
+/// Boot-id rule: if the stored boot_id is `None` (legacy row) or differs
+/// from the current machine boot_id the PID is meaningless — after a reboot
+/// the OS recycles PIDs from the bottom, so a stored PID matching a live
+/// process is a coincidence, not evidence the original process survived.
+/// In that case we always resume.
+///
+/// Only when the stored boot_id matches the current one do we fall back to
+/// the PID-aliveness check: a live PID means the CLI is still running and
+/// resuming would fight it for the session lock.
+fn should_resume_session(
+    pid: Option<i64>,
+    session_boot_id: Option<&str>,
+    current_boot_id: Option<&str>,
+) -> bool {
+    // Different boot (or legacy NULL) → PID is meaningless, always resume.
+    match (session_boot_id, current_boot_id) {
+        (Some(s), Some(c)) if s == c => {}
+        _ => return true,
+    }
+    // Same boot → trust the PID-aliveness check.
     match pid {
         Some(pid) => !process_is_alive(pid),
         None => true,
@@ -2402,6 +2443,7 @@ mod tests {
             Some("canopy bridge"),
             Some(999_999_999),
             "bridge",
+            None,
         )
         .unwrap();
         db.insert_interactive_session(
@@ -2412,6 +2454,7 @@ mod tests {
             Some("canopy bridge"),
             Some(std::process::id() as i64),
             "bridge",
+            None,
         )
         .unwrap();
 
@@ -2436,6 +2479,7 @@ mod tests {
             status: "active".to_string(),
             session_type: "interactive".to_string(),
             pid: None,
+            boot_id: None,
         };
 
         assert!(
@@ -2457,6 +2501,7 @@ mod tests {
             status: "active".to_string(),
             session_type: "interactive".to_string(),
             pid: None,
+            boot_id: None,
         };
 
         let args = build_resumed_session_args(&session, None, None, None, Some("--yolo")).unwrap();
@@ -2475,6 +2520,7 @@ mod tests {
             status: "active".to_string(),
             session_type: "interactive".to_string(),
             pid: None,
+            boot_id: None,
         };
 
         let args = build_resumed_session_args(
@@ -2502,6 +2548,7 @@ mod tests {
             status: "active".to_string(),
             session_type: "interactive".to_string(),
             pid: None,
+            boot_id: None,
         };
 
         let args =
@@ -2523,6 +2570,7 @@ mod tests {
             status: "active".to_string(),
             session_type: "interactive".to_string(),
             pid: None,
+            boot_id: None,
         };
 
         let args = build_resumed_session_args(
@@ -2550,16 +2598,63 @@ mod tests {
 
     #[test]
     fn test_should_resume_session_with_no_pid_always_resumes() {
-        assert!(should_resume_session(None));
+        let current = crate::system::boot_id();
+        assert!(should_resume_session(
+            None,
+            current.as_deref(),
+            current.as_deref()
+        ));
     }
 
     #[test]
     fn test_should_resume_session_skips_when_owner_process_is_alive() {
-        assert!(!should_resume_session(Some(std::process::id() as i64)));
+        let current = crate::system::boot_id();
+        assert!(!should_resume_session(
+            Some(std::process::id() as i64),
+            current.as_deref(),
+            current.as_deref()
+        ));
     }
 
     #[test]
     fn test_should_resume_session_resumes_when_pid_is_gone() {
-        assert!(should_resume_session(Some(999_999_999)));
+        let current = crate::system::boot_id();
+        assert!(should_resume_session(
+            Some(999_999_999),
+            current.as_deref(),
+            current.as_deref()
+        ));
+    }
+
+    #[test]
+    fn test_should_resume_session_resumes_on_boot_id_mismatch_even_with_live_pid() {
+        let current = crate::system::boot_id();
+        // Stored boot_id differs from current → PID is meaningless, always resume.
+        assert!(should_resume_session(
+            Some(std::process::id() as i64),
+            Some("old-boot-id-from-previous-reboot"),
+            current.as_deref(),
+        ));
+    }
+
+    #[test]
+    fn test_should_resume_session_resumes_when_stored_boot_id_is_null() {
+        let current = crate::system::boot_id();
+        // Legacy row with NULL boot_id → always resume.
+        assert!(should_resume_session(
+            Some(std::process::id() as i64),
+            None,
+            current.as_deref(),
+        ));
+    }
+
+    #[test]
+    fn test_should_resume_session_resumes_when_current_boot_id_is_none() {
+        // Non-Linux host where boot_id can't be read → always resume.
+        assert!(should_resume_session(
+            Some(std::process::id() as i64),
+            Some("some-stored-boot-id"),
+            None,
+        ));
     }
 }

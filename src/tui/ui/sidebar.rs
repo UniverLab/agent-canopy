@@ -132,7 +132,7 @@ fn agent_indices_by_kind(app: &App) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
         (Vec::new(), Vec::new(), Vec::new()),
         |mut indices, (index, agent)| {
             match agent {
-                AgentEntry::Interactive(_) => indices.1.push(index),
+                AgentEntry::Interactive(_) | AgentEntry::Orphaned(_) => indices.1.push(index),
                 AgentEntry::Terminal(_) => indices.2.push(index),
                 AgentEntry::Group(_) => {}
                 _ => indices.0.push(index),
@@ -1190,7 +1190,9 @@ fn agent_section_border_style(app: &App, section: AgentSectionFocus) -> Style {
                 Some(AgentEntry::Agent(_) | AgentEntry::Group(_)) => {
                     section == AgentSectionFocus::Background
                 }
-                Some(AgentEntry::Interactive(_)) => section == AgentSectionFocus::Interactive,
+                Some(AgentEntry::Interactive(_) | AgentEntry::Orphaned(_)) => {
+                    section == AgentSectionFocus::Interactive
+                }
                 Some(AgentEntry::Terminal(_)) => section == AgentSectionFocus::Terminal,
                 None => false,
             }
@@ -1363,6 +1365,16 @@ fn agent_card_meta<'a>(agent: &'a AgentEntry, app: &'a App) -> AgentCardMeta<'a>
                 agent_type: "term",
                 type_detail: agent.shell.as_str(),
                 work_dir: Some(agent.working_dir.as_str()),
+            }
+        }
+        AgentEntry::Orphaned(index) => {
+            let session = &app.orphaned_sessions[*index];
+            AgentCardMeta {
+                accent: ratatui::style::Color::DarkGray,
+                status_color: STATUS_FAIL,
+                agent_type: "orphan",
+                type_detail: session.cli.as_str(),
+                work_dir: Some(session.working_dir.as_str()),
             }
         }
         AgentEntry::Group(_) => AgentCardMeta {

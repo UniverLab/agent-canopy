@@ -9,6 +9,8 @@ mod platform;
 mod power;
 mod windows;
 
+use std::path::Path;
+
 use sysinfo::{Components, System};
 
 use gpu::{get_linux_gpu_info, get_macos_gpu_info, try_get_nvidia_gpu_info};
@@ -228,6 +230,24 @@ fn get_load_average() -> Option<f64> {
     }
 }
 
+/// Current machine boot id, stable for the lifetime of the running boot and
+/// different after every reboot (including a WSL restart). Used to tell
+/// whether a PID persisted in an earlier run could plausibly still refer to
+/// the process that recorded it — after a reboot the OS recycles PIDs from
+/// scratch, so a stored PID matching a live process is a coincidence, not
+/// evidence the original process survived.
+///
+/// `None` if the id can't be read (non-Linux host, sandboxed environment, ...).
+pub fn boot_id() -> Option<String> {
+    read_boot_id_from(Path::new("/proc/sys/kernel/random/boot_id"))
+}
+
+fn read_boot_id_from(path: &Path) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let trimmed = contents.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,6 +271,28 @@ mod tests {
         let info = SystemInfo::new();
         if let Some(pct) = info.gpu_vram_usage_percent() {
             assert!((0.0..=100.0).contains(&pct));
+        }
+    }
+
+    #[test]
+    fn read_boot_id_from_trims_trailing_newline() {
+        let tmp = tempfile::NamedTempFile::new().expect("create temp file");
+        std::fs::write(tmp.path(), "abcd-1234\n").expect("write boot id");
+        assert_eq!(read_boot_id_from(tmp.path()), Some("abcd-1234".to_string()));
+    }
+
+    #[test]
+    fn read_boot_id_from_missing_file_returns_none() {
+        assert_eq!(
+            read_boot_id_from(Path::new("/nonexistent/boot_id_path")),
+            None
+        );
+    }
+
+    #[test]
+    fn boot_id_is_available_on_linux() {
+        if cfg!(target_os = "linux") {
+            assert!(boot_id().is_some());
         }
     }
 }
