@@ -5,7 +5,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 use tokio::process::Command;
 
-use crate::application::notification_service::NotificationService;
+use crate::application::notification_service::{LoopFinishOutcome, NotificationService};
 use crate::db::Database;
 use crate::domain::loops::{
     LoopEdge, LoopNode, LoopNodeKind, LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus,
@@ -70,7 +70,7 @@ impl LoopEngine {
                 .await
             {
                 tracing::error!("Loop '{}' failed to run: {error:#}", loop_id);
-                let _ = self.fail_loop(&loop_id, &error.to_string());
+                let _ = self.fail_loop(&loop_id, None, &error.to_string());
             }
         });
     }
@@ -172,6 +172,14 @@ impl LoopEngine {
         // mutating the loop itself.
         let workdir = workdir_override.unwrap_or_else(|| lp.workdir.clone());
 
+        // A single fire per dispatch: covers a fresh launch (manual
+        // `loop_run`, a cron/watch trigger) and a resume (`loop_continue`,
+        // autorun's auto-reset-and-resume) alike — every path that reaches
+        // this function is a run actually starting to execute.
+        let (_, total_specs) = self.spec_progress(&loop_id, pool_id.as_deref())?;
+        self.notification_service
+            .notify_loop_started(&lp.name, total_specs);
+
         match &pool_id {
             Some(pool_id) => loop {
                 if self.is_paused(&loop_id)? {
@@ -189,11 +197,14 @@ impl LoopEngine {
                     continue;
                 };
 
-                match self.run_spec(&lp, &spec, &workdir, is_resume).await? {
+                match self
+                    .run_spec(&lp, &spec, &workdir, is_resume, Some(pool_id.as_str()))
+                    .await?
+                {
                     SpecExecutionOutcome::Completed => continue,
                     SpecExecutionOutcome::Paused => return Ok(()),
                     SpecExecutionOutcome::Failed(summary) => {
-                        self.fail_loop(&loop_id, &summary)?;
+                        self.fail_loop(&loop_id, Some(&spec.name), &summary)?;
                         return Ok(());
                     }
                 }
@@ -210,11 +221,11 @@ impl LoopEngine {
                         continue;
                     }
 
-                    match self.run_spec(&lp, &spec, &workdir, is_resume).await? {
+                    match self.run_spec(&lp, &spec, &workdir, is_resume, None).await? {
                         SpecExecutionOutcome::Completed => continue,
                         SpecExecutionOutcome::Paused => return Ok(()),
                         SpecExecutionOutcome::Failed(summary) => {
-                            self.fail_loop(&loop_id, &summary)?;
+                            self.fail_loop(&loop_id, Some(&spec.name), &summary)?;
                             return Ok(());
                         }
                     }
@@ -253,8 +264,9 @@ impl LoopEngine {
             None,
             Some(chrono::Utc::now()),
         )?;
+        let (done, total) = self.spec_progress(&loop_id, pool_id.as_deref())?;
         self.notification_service
-            .notify_task_completed(&loop_id, true, Some(0));
+            .notify_loop_finished(&lp.name, LoopFinishOutcome::Completed { done, total });
         Ok(())
     }
 
@@ -284,7 +296,7 @@ impl LoopEngine {
                 .await
             {
                 tracing::error!("Loop '{}' failed to run: {error:#}", loop_id);
-                let _ = self.fail_loop(&loop_id, &error.to_string());
+                let _ = self.fail_loop(&loop_id, None, &error.to_string());
             }
         });
     }
@@ -303,6 +315,7 @@ impl LoopEngine {
         spec: &LoopSpec,
         workdir: &str,
         is_resume: bool,
+        pool_id: Option<&str>,
     ) -> Result<SpecExecutionOutcome> {
         let spec_details = self
             .db
@@ -467,6 +480,7 @@ impl LoopEngine {
                     None,
                     Some(chrono::Utc::now()),
                 )?;
+                self.notify_spec_completed(lp, spec, pool_id)?;
                 return Ok(SpecExecutionOutcome::Completed);
             }
 
@@ -485,6 +499,7 @@ impl LoopEngine {
                         None,
                         Some(chrono::Utc::now()),
                     )?;
+                    self.notify_spec_completed(lp, spec, pool_id)?;
                     return Ok(SpecExecutionOutcome::Completed);
                 }
                 None => {
@@ -529,11 +544,80 @@ impl LoopEngine {
             .is_some_and(|lp| lp.status == LoopStatus::Paused))
     }
 
-    fn fail_loop(&self, loop_id: &str, summary: &str) -> Result<()> {
+    fn fail_loop(&self, loop_id: &str, spec_name: Option<&str>, summary: &str) -> Result<()> {
         self.db
             .update_loop_status(loop_id, LoopStatus::Failed, None, Some(chrono::Utc::now()))?;
+        let loop_name = self
+            .db
+            .get_loop(loop_id)?
+            .map(|lp| lp.name)
+            .unwrap_or_else(|| loop_id.to_string());
+        self.notification_service.notify_loop_finished(
+            &loop_name,
+            LoopFinishOutcome::Failed {
+                spec_name: spec_name.unwrap_or(summary),
+            },
+        );
+        Ok(())
+    }
+
+    /// Notify that `loop_id` has become blocked on a node needing human
+    /// intervention (`loop_report_blocker`). This is the only "loop
+    /// finished" case not driven from within [`Self::run_loop_dispatch`] —
+    /// the daemon's `loop_report_blocker` tool owns the actual state
+    /// transition (pausing the loop, recording the blocker on the run) and
+    /// calls this to fire the matching notification.
+    pub fn notify_blocked(&self, loop_id: &str, summary: &str) -> Result<()> {
+        let loop_name = self
+            .db
+            .get_loop(loop_id)?
+            .map(|lp| lp.name)
+            .unwrap_or_else(|| loop_id.to_string());
         self.notification_service
-            .notify_task_failed(loop_id, 1, summary);
+            .notify_loop_finished(&loop_name, LoopFinishOutcome::Blocked { summary });
+        Ok(())
+    }
+
+    /// `(done, total)` specs for `loop_id`'s current run — the loop's bound
+    /// specs, or `pool_id`'s members when this run is drawing from a pool.
+    /// `done` counts specs already `completed`; skipped/pending/running/failed
+    /// specs count toward `total` but not `done`.
+    fn spec_progress(&self, loop_id: &str, pool_id: Option<&str>) -> Result<(usize, usize)> {
+        match pool_id {
+            Some(pool_id) => {
+                let ids = self.db.list_pool_member_spec_ids(pool_id)?;
+                let mut done = 0;
+                for id in &ids {
+                    if let Some(spec) = self.db.get_loop_spec(id)? {
+                        if spec.status == LoopSpecStatus::Completed {
+                            done += 1;
+                        }
+                    }
+                }
+                Ok((done, ids.len()))
+            }
+            None => {
+                let specs = self.db.list_loop_specs(loop_id)?;
+                let done = specs
+                    .iter()
+                    .filter(|spec| spec.status == LoopSpecStatus::Completed)
+                    .count();
+                Ok((done, specs.len()))
+            }
+        }
+    }
+
+    /// Fire the spec-completed notification for `spec`, which the caller has
+    /// already marked `completed` in the database.
+    fn notify_spec_completed(
+        &self,
+        lp: &crate::domain::loops::Loop,
+        spec: &LoopSpec,
+        pool_id: Option<&str>,
+    ) -> Result<()> {
+        let (done, total) = self.spec_progress(&lp.id, pool_id)?;
+        self.notification_service
+            .notify_spec_completed(&lp.name, &spec.name, done, total);
         Ok(())
     }
 }
@@ -1062,6 +1146,162 @@ mod tests {
             dir,
             Arc::clone(&db),
             LoopEngine::new(db, Arc::new(DefaultNotificationService)),
+            lp.id,
+            spec.id,
+        ))
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum RecordedNotification {
+        LoopStarted {
+            loop_name: String,
+            spec_count: usize,
+        },
+        SpecCompleted {
+            loop_name: String,
+            spec_name: String,
+            done: usize,
+            total: usize,
+        },
+        LoopFinishedCompleted {
+            loop_name: String,
+            done: usize,
+            total: usize,
+        },
+        LoopFinishedFailed {
+            loop_name: String,
+            spec_name: String,
+        },
+        LoopFinishedBlocked {
+            loop_name: String,
+            summary: String,
+        },
+    }
+
+    #[derive(Default)]
+    struct MockNotificationService {
+        events: std::sync::Mutex<Vec<RecordedNotification>>,
+    }
+
+    impl MockNotificationService {
+        fn events(&self) -> Vec<RecordedNotification> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl NotificationService for MockNotificationService {
+        fn notify_task_completed(&self, _task_id: &str, _success: bool, _exit_code: Option<i32>) {}
+        fn notify_task_failed(&self, _task_id: &str, _exit_code: i32, _error_msg: &str) {}
+        fn notify_watcher_triggered(&self, _watcher_id: &str, _path: &str, _event: &str) {}
+        fn notify_agent_failed(&self, _agent_id: &str, _cli: &str, _exit_code: i32, _output: &str) {
+        }
+        fn notify_nursery_failed(&self, _error_msg: &str) {}
+
+        fn notify_loop_started(&self, loop_name: &str, spec_count: usize) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(RecordedNotification::LoopStarted {
+                    loop_name: loop_name.to_string(),
+                    spec_count,
+                });
+        }
+
+        fn notify_spec_completed(
+            &self,
+            loop_name: &str,
+            spec_name: &str,
+            done: usize,
+            total: usize,
+        ) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(RecordedNotification::SpecCompleted {
+                    loop_name: loop_name.to_string(),
+                    spec_name: spec_name.to_string(),
+                    done,
+                    total,
+                });
+        }
+
+        fn notify_loop_finished(&self, loop_name: &str, outcome: LoopFinishOutcome<'_>) {
+            let event = match outcome {
+                LoopFinishOutcome::Completed { done, total } => {
+                    RecordedNotification::LoopFinishedCompleted {
+                        loop_name: loop_name.to_string(),
+                        done,
+                        total,
+                    }
+                }
+                LoopFinishOutcome::Failed { spec_name } => {
+                    RecordedNotification::LoopFinishedFailed {
+                        loop_name: loop_name.to_string(),
+                        spec_name: spec_name.to_string(),
+                    }
+                }
+                LoopFinishOutcome::Blocked { summary } => {
+                    RecordedNotification::LoopFinishedBlocked {
+                        loop_name: loop_name.to_string(),
+                        summary: summary.to_string(),
+                    }
+                }
+            };
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    type MockLoopFixture = (
+        TempDir,
+        Arc<Database>,
+        LoopEngine,
+        Arc<MockNotificationService>,
+        String,
+        String,
+    );
+
+    fn loop_fixture_with_mock() -> Result<MockLoopFixture> {
+        let dir = tempdir()?;
+        let db = Arc::new(Database::new(&dir.path().join("test.db"))?);
+        let lp = crate::domain::loops::Loop {
+            id: "wf-test".to_string(),
+            name: "Loop".to_string(),
+            description: None,
+            workdir: dir.path().to_string_lossy().to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            active_run_pool_id: None,
+        };
+        let spec = crate::domain::loops::LoopSpec {
+            id: "spec-test".to_string(),
+            loop_id: Some(lp.id.clone()),
+            name: "Spec".to_string(),
+            description: Some("Objective:\n- test".to_string()),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+        };
+
+        db.insert_loop(&lp)?;
+        db.insert_loop_spec(&spec)?;
+
+        let notifications = Arc::new(MockNotificationService::default());
+        Ok((
+            dir,
+            Arc::clone(&db),
+            LoopEngine::new(
+                db,
+                Arc::clone(&notifications) as Arc<dyn NotificationService>,
+            ),
+            notifications,
             lp.id,
             spec.id,
         ))
@@ -2889,5 +3129,123 @@ mod tests {
                 .await
                 .expect("spawn failure must not propagate as hard error");
         assert_eq!(fail_result.status, LoopRunStatus::Fail);
+    }
+
+    // ── N1: loop lifecycle notifications ──────────────────────────────────
+
+    #[tokio::test]
+    async fn loop_engine_notifies_started_spec_completed_and_finished_on_success() {
+        // A retrying check (self-loop on fail) must not spam a
+        // spec-completed notification per attempt — only once, when the
+        // spec actually reaches `completed`.
+        let (dir, db, engine, notifications, loop_id, spec_id) = loop_fixture_with_mock().unwrap();
+        let counter = dir.path().join("counter");
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": format!(
+                    "n=$(cat \"{counter}\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"{counter}\"; [ \"$n\" -ge 3 ] && printf APPROVED || exit 1",
+                    counter = counter.display(),
+                ),
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "edge-self".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "node-check".to_string(),
+            to_node: "node-check".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Fail,
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id, None, None).await.unwrap();
+
+        assert_eq!(
+            notifications.events(),
+            vec![
+                RecordedNotification::LoopStarted {
+                    loop_name: "Loop".to_string(),
+                    spec_count: 1,
+                },
+                RecordedNotification::SpecCompleted {
+                    loop_name: "Loop".to_string(),
+                    spec_name: "Spec".to_string(),
+                    done: 1,
+                    total: 1,
+                },
+                RecordedNotification::LoopFinishedCompleted {
+                    loop_name: "Loop".to_string(),
+                    done: 1,
+                    total: 1,
+                },
+            ],
+            "exactly one start, one spec-completed (not one per retry), and one finish notification"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_engine_notifies_failed_variant_with_failing_spec_name() {
+        let (_dir, _db, engine, notifications, loop_id, spec_id) =
+            loop_fixture_with_mock().unwrap();
+
+        _db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "exit 1",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id, None, None).await.unwrap();
+
+        assert_eq!(
+            notifications.events(),
+            vec![
+                RecordedNotification::LoopStarted {
+                    loop_name: "Loop".to_string(),
+                    spec_count: 1,
+                },
+                RecordedNotification::LoopFinishedFailed {
+                    loop_name: "Loop".to_string(),
+                    spec_name: "Spec".to_string(),
+                },
+            ],
+            "a spec that never completes must not fire spec-completed, only start + failed finish"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_engine_notify_blocked_fires_loop_finished_blocked() {
+        let (_dir, _db, engine, notifications, loop_id, _spec_id) =
+            loop_fixture_with_mock().unwrap();
+
+        engine
+            .notify_blocked(&loop_id, "needs human review")
+            .unwrap();
+
+        assert_eq!(
+            notifications.events(),
+            vec![RecordedNotification::LoopFinishedBlocked {
+                loop_name: "Loop".to_string(),
+                summary: "needs human review".to_string(),
+            }],
+        );
     }
 }

@@ -3,6 +3,16 @@
 //! Provides a clean abstraction for sending notifications from both
 //! daemon (background tasks) and TUI (interactive agents).
 
+/// How a loop run reached a terminal state, for [`NotificationService::notify_loop_finished`].
+pub enum LoopFinishOutcome<'a> {
+    /// Every spec in the run reached `completed`.
+    Completed { done: usize, total: usize },
+    /// A spec failed and the loop has no more retries/routes to take.
+    Failed { spec_name: &'a str },
+    /// A node reported a blocker needing human intervention; the loop paused.
+    Blocked { summary: &'a str },
+}
+
 /// Notification service for sending cross-platform desktop notifications.
 pub trait NotificationService: Send + Sync {
     /// Send a notification about a completing background task.
@@ -20,6 +30,18 @@ pub trait NotificationService: Send + Sync {
 
     /// Send a notification about a nursery (seed creation) failure.
     fn notify_nursery_failed(&self, error_msg: &str);
+
+    /// Send a notification when a loop run actually begins executing (a
+    /// fresh dispatch or a resume alike — anything that starts driving the
+    /// loop's graph).
+    fn notify_loop_started(&self, loop_name: &str, spec_count: usize);
+
+    /// Send a notification each time a spec within a loop reaches `completed`.
+    fn notify_spec_completed(&self, loop_name: &str, spec_name: &str, done: usize, total: usize);
+
+    /// Send a notification when a loop run reaches a terminal state
+    /// (completed, failed, or blocked).
+    fn notify_loop_finished(&self, loop_name: &str, outcome: LoopFinishOutcome<'_>);
 }
 
 use crate::domain::notification::{send_notification, NotificationLevel};
@@ -75,5 +97,31 @@ impl NotificationService for DefaultNotificationService {
 
     fn notify_nursery_failed(&self, error_msg: &str) {
         send_notification("Seed creation failed", error_msg, NotificationLevel::Error);
+    }
+
+    fn notify_loop_started(&self, loop_name: &str, spec_count: usize) {
+        let body = format!("Started · {spec_count} specs");
+        send_notification(loop_name, &body, NotificationLevel::Info);
+    }
+
+    fn notify_spec_completed(&self, loop_name: &str, spec_name: &str, done: usize, total: usize) {
+        let body = format!("{spec_name} ✓ · {done}/{total}");
+        send_notification(loop_name, &body, NotificationLevel::Success);
+    }
+
+    fn notify_loop_finished(&self, loop_name: &str, outcome: LoopFinishOutcome<'_>) {
+        let (body, level) = match outcome {
+            LoopFinishOutcome::Completed { done, total } => (
+                format!("Completed · {done}/{total}"),
+                NotificationLevel::Success,
+            ),
+            LoopFinishOutcome::Failed { spec_name } => {
+                (format!("Failed · {spec_name}"), NotificationLevel::Error)
+            }
+            LoopFinishOutcome::Blocked { summary } => {
+                (format!("Blocked · {summary}"), NotificationLevel::Warning)
+            }
+        };
+        send_notification(loop_name, &body, level);
     }
 }

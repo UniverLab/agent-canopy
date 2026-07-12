@@ -3358,8 +3358,9 @@ impl TaskTriggerHandler {
         self.db
             .update_loop_status(&run.loop_id, LoopStatus::Paused, None, None)
             .map_err(internal_error)?;
-        self.notification_service
-            .notify_task_failed(&run.loop_id, 1, &params.description);
+        self.loop_engine
+            .notify_blocked(&run.loop_id, &params.description)
+            .map_err(internal_error)?;
 
         Ok(success_result("Loop blocker recorded and loop paused."))
     }
