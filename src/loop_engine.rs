@@ -1112,10 +1112,15 @@ fn resolve_spec_start(
     ))
 }
 
+/// Spawns `command` under a non-login POSIX `sh`. Using `-c` (not `-l`) means
+/// no `/etc/profile` or `~/.profile` is sourced, so the process sees exactly
+/// the daemon's own environment plus whatever env vars the engine explicitly
+/// sets on the `Command` before spawning — never a user's shell-startup PATH
+/// overrides or side effects.
 #[cfg(unix)]
 fn shell_command(command: &str) -> Command {
     let mut process = Command::new("sh");
-    process.arg("-lc").arg(command);
+    process.arg("-c").arg(command);
     process
 }
 
@@ -3393,6 +3398,39 @@ mod tests {
                 loop_name: "Loop".to_string(),
                 summary: "needs human review".to_string(),
             }],
+        );
+    }
+
+    // ── B11: check nodes run under a non-login shell ─────────────────────
+
+    #[tokio::test]
+    async fn shell_command_runs_check_commands_with_sh_c_semantics() {
+        let mut process = shell_command("printf ok && exit 0");
+        let output = process.output().await.unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok");
+    }
+
+    #[tokio::test]
+    async fn shell_command_does_not_source_a_profile_with_bashisms() {
+        // A login shell (`sh -l`) sources `~/.profile` before running the
+        // command; a non-login `sh -c` never does. Point HOME at a profile
+        // containing a bashism (`[[ ... ]]`, which dash chokes on with
+        // `sh: N: [[: not found`) and confirm it never gets read: no stderr
+        // noise, and the command's own exit code is unaffected.
+        let fake_home = tempdir().unwrap();
+        std::fs::write(fake_home.path().join(".profile"), "[[ x ]]\n").unwrap();
+
+        let mut process = shell_command("exit 0");
+        process.env("HOME", fake_home.path());
+        let output = process.output().await.unwrap();
+
+        assert!(output.status.success());
+        assert!(
+            output.stderr.is_empty(),
+            "expected no stderr noise from a bashism in ~/.profile, got: {:?}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }
