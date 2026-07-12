@@ -6,6 +6,7 @@ use serde_json::Value;
 use tokio::process::Command;
 
 use crate::application::notification_service::{LoopFinishOutcome, NotificationService};
+use crate::daemon::process::KILL_GRACE;
 use crate::db::Database;
 use crate::domain::loops::{
     LoopEdge, LoopNode, LoopNodeKind, LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus,
@@ -82,8 +83,21 @@ impl LoopEngine {
 
         match lp.status {
             LoopStatus::Running => {
-                self.db
-                    .update_loop_status(loop_id, LoopStatus::Paused, None, None)
+                let result = self
+                    .db
+                    .update_loop_status(loop_id, LoopStatus::Paused, None, None);
+                // B12: don't wait for the sequential run_spec loop to notice
+                // the pause between node executions — that could be up to a
+                // full node timeout away. Kill whatever's actually running
+                // for this loop right now, so the in-flight `wait()` inside
+                // `run_agent_process`/`execute_check_node` unblocks promptly
+                // and `run_spec`'s existing post-execution pause check (which
+                // already tolerates a run whose status was changed out from
+                // under it) takes it from there.
+                for run in self.db.list_running_loop_runs(loop_id).unwrap_or_default() {
+                    self.terminate_run(&run, "loop paused");
+                }
+                result
             }
             LoopStatus::Paused => Ok(true),
             _ => Ok(false),
@@ -406,9 +420,34 @@ impl LoopEngine {
                 return Ok(SpecExecutionOutcome::Paused);
             }
 
+            // Reap a `running` row left by a prior attempt at this exact node
+            // that was never finalized (crashed mid-execution, daemon
+            // restarted before its own timeout handler ran, etc.) — B12.
+            // Execution here is strictly sequential (one node run in flight
+            // per spec at a time), so anything still `running` for this
+            // node_id at this point can only be a leftover, never the
+            // legitimately active run: this iteration's own row doesn't
+            // exist yet. Left alone, its process (if any) would be abandoned
+            // right here and its stale pid would confuse this attempt's own
+            // bookkeeping.
+            if let Some(stale) = self.db.get_active_loop_run_for_node(&current_node_id)? {
+                self.terminate_run(&stale, "superseded by a new attempt at this node");
+            }
+
             let iteration = iterations.entry(current_node_id.clone()).or_insert(0);
             *iteration += 1;
             if *iteration > DEFAULT_MAX_ITERATIONS_PER_NODE {
+                // B12: the process from the last execution at this node
+                // (or any other node still running) must not survive the
+                // spec failure — otherwise it burns quota, holds locks,
+                // and could call loop_complete_node late with a stale
+                // report. The process from the *previous* iteration is
+                // the most likely survivor: the budget check fires before
+                // any new execution starts, so the in-flight child is
+                // always from a prior run at this node.
+                for run in self.db.list_running_loop_runs(&lp.id).unwrap_or_default() {
+                    self.terminate_run(&run, "iteration budget exhausted");
+                }
                 let summary = format!(
                     "Spec '{}' exceeded max iterations for node '{}'.",
                     spec.name, current_node_id
@@ -437,6 +476,8 @@ impl LoopEngine {
                 started_at: chrono::Utc::now(),
                 completed_at: None,
                 iteration: *iteration as i64,
+                pid: None,
+                boot_id: crate::system::boot_id(),
             })?;
             let execution = self
                 .execute_node(
@@ -528,13 +569,33 @@ impl LoopEngine {
     ) -> Result<NodeExecution> {
         match node.kind {
             LoopNodeKind::Check => {
-                execute_check_node(lp, spec, node, spec_start_head, workdir).await
+                execute_check_node(&self.db, run_id, lp, spec, node, spec_start_head, workdir).await
             }
             LoopNodeKind::Gate => execute_gate_node(node, previous_output),
             LoopNodeKind::Agent => {
                 execute_agent_node(&self.db, lp, spec, node, previous_output, run_id, workdir).await
             }
         }
+    }
+
+    /// Best-effort termination (B12) of `run`'s OS process, if it still has
+    /// one recorded, and finalization of its DB row as `Fail` so it stops
+    /// showing up as `running`. Every abnormal end that abandons a node run
+    /// without letting it finish on its own — a stale row from a crashed
+    /// prior attempt, `loop_pause`, `loop_reset` of a running spec, or this
+    /// run failing elsewhere — goes through here. A no-op beyond the
+    /// status/summary update if `run` never got a pid recorded (e.g. a gate
+    /// node, or an agent/check node that hadn't finished spawning yet).
+    fn terminate_run(&self, run: &LoopNodeRun, reason: &str) {
+        if let Some(pid) = run.pid {
+            crate::daemon::process::terminate_process_group_async(pid, KILL_GRACE);
+        }
+        let _ = self.db.update_loop_run_result(
+            &run.id,
+            LoopRunStatus::Fail,
+            Some(&serde_json::json!({ "terminated": true, "reason": reason })),
+            Some(chrono::Utc::now()),
+        );
     }
 
     fn is_paused(&self, loop_id: &str) -> Result<bool> {
@@ -547,6 +608,14 @@ impl LoopEngine {
     fn fail_loop(&self, loop_id: &str, spec_name: Option<&str>, summary: &str) -> Result<()> {
         self.db
             .update_loop_status(loop_id, LoopStatus::Failed, None, Some(chrono::Utc::now()))?;
+        // B12 catch-all: whatever hard-error path got us here (a node
+        // timeout already kills its own process before bubbling up, but a
+        // DB error or any other error class reaching this point wouldn't
+        // have), make sure nothing is left running under this now-failed
+        // loop.
+        for run in self.db.list_running_loop_runs(loop_id).unwrap_or_default() {
+            self.terminate_run(&run, "loop run failed");
+        }
         let loop_name = self
             .db
             .get_loop(loop_id)?
@@ -623,6 +692,8 @@ impl LoopEngine {
 }
 
 async fn execute_check_node(
+    db: &Database,
+    run_id: &str,
     lp: &crate::domain::loops::Loop,
     spec: &LoopSpec,
     node: &LoopNode,
@@ -650,12 +721,43 @@ async fn execute_check_node(
 
     let mut process = shell_command(&command);
     process.current_dir(workdir);
-    let output = tokio::time::timeout(
+    let child = process
+        .spawn()
+        .with_context(|| format!("Check node '{}' failed to spawn.", node.name))?;
+    let pid = child.id();
+    if let Some(pid) = pid {
+        let _ = db.set_loop_run_pid(run_id, pid as i64, crate::system::boot_id().as_deref());
+    }
+
+    let timeout_result = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_seconds),
-        process.output(),
+        child.wait_with_output(),
     )
-    .await
-    .with_context(|| format!("Check node '{}' timed out.", node.name))??;
+    .await;
+
+    let output = match timeout_result {
+        Ok(result) => result?,
+        Err(_elapsed) => {
+            if let Some(pid) = pid {
+                crate::daemon::process::terminate_process_group_async(pid as i64, KILL_GRACE);
+            }
+            let _ = db.update_loop_run_result(
+                run_id,
+                LoopRunStatus::Fail,
+                Some(&serde_json::json!({
+                    "kind": "check",
+                    "loop_id": lp.id,
+                    "spec_id": spec.id,
+                    "node_id": node.id,
+                    "command": command,
+                    "error": "timed out",
+                    "timeout_seconds": timeout_seconds,
+                })),
+                Some(chrono::Utc::now()),
+            );
+            bail!("Check node '{}' timed out.", node.name);
+        }
+    };
 
     let exit_code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -718,7 +820,15 @@ async fn execute_agent_node(
         .get("prompt_template")
         .and_then(Value::as_str)
         .unwrap_or("{{spec_content}}\n\n{{previous_feedback}}");
-    let prompt = render_agent_prompt(lp, spec, node, prompt_template, previous_output, workdir);
+    let prompt = render_agent_prompt(
+        lp,
+        spec,
+        node,
+        prompt_template,
+        previous_output,
+        workdir,
+        run_id,
+    );
     let model = node.config.get("model").and_then(Value::as_str);
     let timeout_minutes = node
         .config
@@ -739,6 +849,8 @@ async fn execute_agent_node(
     }
 
     let execution = run_agent_process(
+        db,
+        run_id,
         &cli,
         &strategy,
         node,
@@ -771,9 +883,16 @@ async fn execute_agent_node(
 ///
 /// A timeout is a different failure class (the process started; it just
 /// didn't finish in time) and still propagates as a hard error, unchanged
-/// from prior behavior.
+/// from prior behavior — but unlike prior behavior, the spawned process
+/// group is now actually killed (B12) rather than abandoned: dropping the
+/// timed-out future used to leave it running indefinitely (`Command::output`
+/// gives the caller no handle to kill), which is exactly what let a
+/// `mimo run` child outlive its node run by 42+ minutes in the 2026-07-12
+/// incident.
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_process(
+    db: &Database,
+    run_id: &str,
     cli: &Cli,
     strategy: &crate::domain::cli_strategy::CliStrategy,
     node: &LoopNode,
@@ -786,22 +905,52 @@ async fn run_agent_process(
         Ok(command) => command,
         Err(error) => return Ok(agent_spawn_failure(node, cli, model, error)),
     };
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+
+    let child = match command.spawn() {
+        Ok(child) => child,
+        // Spawn failure (e.g. E2BIG from oversized argv, binary not found,
+        // permission denied): route as a node failure so the graph's fail
+        // edge can handle it, never abort the whole loop run.
+        Err(error) => return Ok(agent_spawn_failure(node, cli, model, error)),
+    };
+    // Captured before `wait_with_output` below takes ownership of `child`.
+    let pid = child.id();
+    if let Some(pid) = pid {
+        let _ = db.set_loop_run_pid(run_id, pid as i64, crate::system::boot_id().as_deref());
+    }
 
     let timeout_result = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_minutes * 60),
-        command.output(),
+        child.wait_with_output(),
     )
     .await;
 
     let output = match timeout_result {
         Ok(Ok(output)) => output,
-        // Spawn failure (e.g. E2BIG from oversized argv, binary not found,
-        // permission denied): route as a node failure so the graph's fail
-        // edge can handle it, never abort the whole loop run.
         Ok(Err(error)) => return Ok(agent_spawn_failure(node, cli, model, error)),
         // Timeout: the process started but didn't finish in time — propagate
-        // as a hard error (unchanged from prior behavior).
+        // as a hard error (unchanged from prior behavior), but not before
+        // killing the process group it's still running in and recording the
+        // run as failed, so it doesn't linger `running` in the DB forever.
         Err(_elapsed) => {
+            if let Some(pid) = pid {
+                crate::daemon::process::terminate_process_group_async(pid as i64, KILL_GRACE);
+            }
+            let _ = db.update_loop_run_result(
+                run_id,
+                LoopRunStatus::Fail,
+                Some(&serde_json::json!({
+                    "kind": "agent",
+                    "node_id": node.id,
+                    "cli": cli.as_str(),
+                    "model": model,
+                    "error": "timed out",
+                    "timeout_minutes": timeout_minutes,
+                })),
+                Some(chrono::Utc::now()),
+            );
             bail!("Agent node '{}' timed out.", node.name);
         }
     };
@@ -1042,6 +1191,7 @@ fn render_agent_prompt(
     prompt_template: &str,
     previous_output: Option<&Value>,
     workdir: &str,
+    run_id: &str,
 ) -> String {
     let previous_feedback = previous_output
         .map(|value| serde_json::to_string_pretty(value).unwrap_or_default())
@@ -1057,15 +1207,24 @@ fn render_agent_prompt(
         .replace("{{node_id}}", &node.id)
         .replace("{{previous_feedback}}", &previous_feedback);
 
+    // `run_id` (not just `node_id`) must round-trip through the report tools
+    // (B12): a node can be retried, so more than one run can exist for the
+    // same `node_id` over a spec's lifetime. Without the exact run_id, a
+    // report arriving late from a killed/superseded attempt (e.g. a timed-out
+    // agent that ignores its own termination and calls the tool anyway) would
+    // otherwise be matched to "whatever's currently active for this node_id"
+    // and silently corrupt a newer, unrelated run.
     format!(
-        "# [LOOP CONTEXT]\n<loop>\n  <name>{}</name>\n  <spec>{}</spec>\n  <node>{}</node>\n  <workdir>{}</workdir>\n</loop>\n\n# [SPEC]\n{}\n\n# [PREVIOUS FEEDBACK]\n{}\n\n# [REPORTING]\nWhen you finish this node, call loop_complete_node with node_id=\"{}\", status=\"pass\"|\"fail\", a concise summary, and your output.\nIf you are blocked and need human intervention, call loop_report_blocker with node_id=\"{}\" and the blocker description.\n",
+        "# [LOOP CONTEXT]\n<loop>\n  <name>{}</name>\n  <spec>{}</spec>\n  <node>{}</node>\n  <workdir>{}</workdir>\n</loop>\n\n# [SPEC]\n{}\n\n# [PREVIOUS FEEDBACK]\n{}\n\n# [REPORTING]\nWhen you finish this node, call loop_complete_node with run_id=\"{}\", node_id=\"{}\", status=\"pass\"|\"fail\", a concise summary, and your output.\nIf you are blocked and need human intervention, call loop_report_blocker with run_id=\"{}\", node_id=\"{}\" and the blocker description.\n",
         lp.name,
         spec.name,
         node.name,
         workdir,
         prompt,
         previous_feedback,
+        run_id,
         node.id,
+        run_id,
         node.id
     )
 }
@@ -1121,6 +1280,11 @@ fn resolve_spec_start(
 fn shell_command(command: &str) -> Command {
     let mut process = Command::new("sh");
     process.arg("-c").arg(command);
+    // Own process-group leader so a hung/timed-out check can be `killpg`'d
+    // along with anything it forks (B12) — see `CliStrategy::build_command`
+    // for the same treatment on agent nodes.
+    process.process_group(0);
+    process.kill_on_drop(true);
     process
 }
 
@@ -1128,6 +1292,7 @@ fn shell_command(command: &str) -> Command {
 fn shell_command(command: &str) -> Command {
     let mut process = Command::new("cmd");
     process.arg("/C").arg(command);
+    process.kill_on_drop(true);
     process
 }
 
@@ -1827,6 +1992,8 @@ mod tests {
             started_at: chrono::Utc::now(),
             completed_at: Some(chrono::Utc::now()),
             iteration: 1,
+            pid: None,
+            boot_id: None,
         }];
 
         let (node_id, previous_output, iterations) =
@@ -1883,6 +2050,8 @@ mod tests {
                 started_at: chrono::Utc::now(),
                 completed_at: Some(chrono::Utc::now()),
                 iteration: i + 1,
+                pid: None,
+                boot_id: None,
             })
             .collect();
 
@@ -2003,10 +2172,12 @@ mod tests {
             "{{spec_content}}",
             Some(&serde_json::json!({"feedback":"ok"})),
             &lp.workdir,
+            "run-1",
         );
 
         assert!(prompt.contains("loop_complete_node"));
         assert!(prompt.contains("loop_report_blocker"));
+        assert!(prompt.contains("run_id=\"run-1\""));
         assert!(prompt.contains("Do the thing"));
         assert!(prompt.contains("\"feedback\": \"ok\""));
     }
@@ -2079,6 +2250,7 @@ mod tests {
             "{{previous_feedback}}",
             Some(&serde_json::json!({"stdout": huge_log})),
             &lp.workdir,
+            "run-1",
         );
 
         assert!(prompt.contains("bytes elided"));
@@ -2098,6 +2270,16 @@ mod tests {
         }
     }
 
+    /// A throwaway `Database` for `run_agent_process` tests that only need
+    /// somewhere to (harmlessly) persist a pid — no loop/spec/node rows are
+    /// inserted, so `set_loop_run_pid`/`update_loop_run_result` against the
+    /// fake `run_id` below just affect zero rows.
+    fn test_db() -> (TempDir, Database) {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        (dir, db)
+    }
+
     fn sample_strategy(binary: &str) -> crate::domain::cli_strategy::CliStrategy {
         crate::domain::cli_strategy::CliStrategy {
             binary: binary.to_string(),
@@ -2115,14 +2297,17 @@ mod tests {
         // Simulates the E2BIG incident: the process fails to spawn. This
         // must come back as a failed node run (routed like any other node
         // failure) rather than an `Err` that would abort the whole loop.
+        let (_dir, db) = test_db();
         let cli = Cli::new("test-cli");
         let mut strategy = sample_strategy("/nonexistent/somewhere/definitely-not-a-binary");
         strategy.prompt_via_stdin = false;
         let node = sample_agent_node();
 
-        let execution = run_agent_process(&cli, &strategy, &node, "prompt", None, "/tmp", 1)
-            .await
-            .expect("spawn failure must not propagate as a hard error");
+        let execution = run_agent_process(
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1,
+        )
+        .await
+        .expect("spawn failure must not propagate as a hard error");
 
         assert_eq!(execution.status, LoopRunStatus::Fail);
         assert!(execution.summary.contains("failed to spawn"));
@@ -2134,15 +2319,26 @@ mod tests {
         // Feedback arrives already truncated per `bound_previous_feedback`,
         // but the transport itself must have no input-size cliff either —
         // stdin-mode CLIs must handle an oversized prompt without E2BIG.
+        let (_dir, db) = test_db();
         let cli = Cli::new("test-cli");
         let mut strategy = sample_strategy("/bin/cat");
         strategy.prompt_via_stdin = true;
         let node = sample_agent_node();
         let huge_prompt = "y".repeat(500 * 1024);
 
-        let execution = run_agent_process(&cli, &strategy, &node, &huge_prompt, None, "/tmp", 1)
-            .await
-            .unwrap();
+        let execution = run_agent_process(
+            &db,
+            "run-test",
+            &cli,
+            &strategy,
+            &node,
+            &huge_prompt,
+            None,
+            "/tmp",
+            1,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(execution.status, LoopRunStatus::Pass);
         assert_eq!(
@@ -2173,9 +2369,20 @@ mod tests {
         );
 
         let node = sample_agent_node();
-        let execution = run_agent_process(&cli, &strategy, &node, &large_prompt, None, "/tmp", 1)
-            .await
-            .unwrap();
+        let (_dir, db) = test_db();
+        let execution = run_agent_process(
+            &db,
+            "run-test",
+            &cli,
+            &strategy,
+            &node,
+            &large_prompt,
+            None,
+            "/tmp",
+            1,
+        )
+        .await
+        .unwrap();
         assert_eq!(execution.status, LoopRunStatus::Pass);
         assert_eq!(
             execution.output.get("stdout").and_then(Value::as_str),
@@ -3081,14 +3288,17 @@ mod tests {
     /// graph router (which selects the next node based on status).
     #[tokio::test]
     async fn agent_spawn_failure_node_execution_is_routable() {
+        let (_dir, db) = test_db();
         let cli = Cli::new("test-cli");
         let mut strategy = sample_strategy("/nonexistent/somewhere/definitely-not-a-binary");
         strategy.prompt_via_stdin = false;
         let node = sample_agent_node();
 
-        let execution = run_agent_process(&cli, &strategy, &node, "prompt", None, "/tmp", 1)
-            .await
-            .expect("spawn failure must not propagate as a hard error");
+        let execution = run_agent_process(
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1,
+        )
+        .await
+        .expect("spawn failure must not propagate as a hard error");
 
         // The execution must be a Fail — exactly what select_next_node matches
         // against the Fail edge condition.
@@ -3170,6 +3380,7 @@ mod tests {
             "{{previous_feedback}}",
             Some(&serde_json::json!({"stdout": huge_log})),
             &lp.workdir,
+            "run-1",
         );
         assert!(
             prompt.contains("bytes elided"),
@@ -3185,13 +3396,24 @@ mod tests {
         //    (the output contains the prompt twice: once via {{previous_feedback}}
         //    template substitution, once as the explicit # [PREVIOUS FEEDBACK]
         //    section — so stdout != prompt; we check it arrives in full instead).
+        let (_dir, db) = test_db();
         let cli = Cli::new("test-cli");
         let mut strategy = sample_strategy("/bin/cat");
         strategy.prompt_via_stdin = true;
         let stdin_node = sample_agent_node();
 
-        let execution =
-            run_agent_process(&cli, &strategy, &stdin_node, &prompt, None, "/tmp", 1).await;
+        let execution = run_agent_process(
+            &db,
+            "run-test",
+            &cli,
+            &strategy,
+            &stdin_node,
+            &prompt,
+            None,
+            "/tmp",
+            1,
+        )
+        .await;
         let result = execution.expect("stdin delivery must not fail");
         assert_eq!(result.status, LoopRunStatus::Pass);
         let stdout = result.output.get("stdout").and_then(Value::as_str).unwrap();
@@ -3203,10 +3425,19 @@ mod tests {
         // 4. Spawn failure caught as node failure (not hard error).
         let mut fail_strategy = sample_strategy("/nonexistent/binary");
         fail_strategy.prompt_via_stdin = false;
-        let fail_result =
-            run_agent_process(&cli, &fail_strategy, &stdin_node, &prompt, None, "/tmp", 1)
-                .await
-                .expect("spawn failure must not propagate as hard error");
+        let fail_result = run_agent_process(
+            &db,
+            "run-test",
+            &cli,
+            &fail_strategy,
+            &stdin_node,
+            &prompt,
+            None,
+            "/tmp",
+            1,
+        )
+        .await
+        .expect("spawn failure must not propagate as hard error");
         assert_eq!(fail_result.status, LoopRunStatus::Fail);
     }
 
@@ -3431,6 +3662,172 @@ mod tests {
             output.stderr.is_empty(),
             "expected no stderr noise from a bashism in ~/.profile, got: {:?}",
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // ── B12: process-group kill on all abnormal ends ────────────────────
+
+    /// Iteration budget exhaustion must terminate any in-flight child
+    /// processes and finalize all runs. A check node that always fails
+    /// loops back to itself via a self-loop edge until the per-node
+    /// iteration budget (DEFAULT_MAX_ITERATIONS_PER_NODE) is hit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn iteration_budget_exhaustion_kills_inflight_child() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        // This node always fails. A self-loop edge routes its failure
+        // back to itself, forcing retries until the budget is exhausted.
+        db.insert_loop_node(&LoopNode {
+            id: "flaky".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "flaky".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "sleep 0.2; exit 1",
+                "success_condition": "exit_code_0",
+                "timeout_seconds": 60,
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        // Self-loop: failure routes back to the same node for retry.
+        db.insert_loop_edge(&LoopEdge {
+            id: "self-loop".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "flaky".to_string(),
+            to_node: "flaky".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Fail,
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+
+        // The spec must have failed on budget exhaustion.
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(spec.status, LoopSpecStatus::Failed);
+
+        // All runs for this spec must be finalized (no longer `running`).
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        assert_eq!(runs.len(), DEFAULT_MAX_ITERATIONS_PER_NODE);
+        assert!(
+            runs.iter().all(|r| r.status != LoopRunStatus::Running),
+            "no run should still be running after budget exhaustion"
+        );
+    }
+
+    /// An agent node's timeout must kill the spawned OS process, not just
+    /// mark the run failed. Uses `sh -c "sleep 5; touch <marker>"` as a
+    /// stand-in for a hung agent CLI (a real long-running child process,
+    /// exercised through the exact same `run_agent_process` code path a
+    /// real agent CLI goes through) with an immediate timeout (agent
+    /// timeouts are minute-granular, so `0` is the only way to force one
+    /// without actually waiting a minute): if the timeout kill didn't
+    /// happen, the marker would appear ~5s later; if it did, the process is
+    /// gone long before that and the marker never appears.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_timeout_kills_child_process() {
+        let (dir, db, _engine, loop_id, spec_id) = loop_fixture().unwrap();
+        let marker = dir.path().join("agent_survived");
+
+        let node = LoopNode {
+            id: "agent-timeout".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "agent-timeout".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+        db.insert_loop_node(&node).unwrap();
+        let run_id = "run-agent-timeout".to_string();
+        db.insert_loop_run(&LoopNodeRun {
+            id: run_id.clone(),
+            loop_id: loop_id.clone(),
+            spec_id: spec_id.clone(),
+            node_id: node.id.clone(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+        })
+        .unwrap();
+
+        let cli = Cli::new("test-cli");
+        let mut strategy = sample_strategy("sh");
+        strategy.headless_mode = "-c".to_string();
+        let prompt = format!("sleep 5; touch \"{}\"", marker.display());
+
+        let result = run_agent_process(
+            &db, &run_id, &cli, &strategy, &node, &prompt, None, "/tmp", 0,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a timed-out agent process must propagate as a hard error"
+        );
+
+        // Wait out the grace period (plus a margin) before checking — the
+        // kill is `SIGTERM` now, `SIGKILL` after `KILL_GRACE` on a detached
+        // task, and either one reaps a plain `sh`/`sleep` well within that
+        // window since neither ignores `SIGTERM`.
+        tokio::time::sleep(KILL_GRACE + std::time::Duration::from_secs(2)).await;
+
+        assert!(
+            !marker.exists(),
+            "agent process should have been killed on timeout; marker file should not exist"
+        );
+    }
+
+    /// Process group children must die with the parent: spawn a check node
+    /// that forks a grandchild via `sh -c` subshell, then verify the
+    /// grandchild is gone after the check is terminated.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_group_children_die_with_parent() {
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        let marker = dir.path().join("grandchild_alive");
+
+        // The check node forks a grandchild that sleeps and touches a
+        // marker file. If the process group kill works, the grandchild
+        // dies before the marker appears.
+        db.insert_loop_node(&LoopNode {
+            id: "check-pg".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "check-pg".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": format!(
+                    "( sleep 60; touch \"{}\" ) & exit 1",
+                    marker.display()
+                ),
+                "success_condition": "exit_code_0",
+                "timeout_seconds": 3,
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+
+        // Wait for the grace period + a bit extra for the grandchild.
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+
+        assert!(
+            !marker.exists(),
+            "grandchild process should have been killed by process-group termination; \
+             marker file should not exist"
         );
     }
 }

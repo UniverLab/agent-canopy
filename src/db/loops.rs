@@ -327,6 +327,28 @@ impl Database {
         };
 
         for spec_id in &target_ids {
+            // B12: a spec being reset can still have a `running` node-run row
+            // left over from an interrupted attempt — the loop itself is
+            // already non-`Running` here (the guard above refuses otherwise),
+            // but that doesn't mean every spec's last run was cleanly
+            // finalized (e.g. the loop failed on a *different* spec, or the
+            // daemon crashed mid-node). Kill its process, if it still has
+            // one, before wiping the spec back to `pending`, so a fresh run
+            // never races a still-alive leftover in the same workdir.
+            if let Some(stale) = self.get_active_loop_run_for_spec(spec_id)? {
+                if let Some(pid) = stale.pid {
+                    crate::daemon::process::terminate_process_group_async(
+                        pid,
+                        crate::daemon::process::KILL_GRACE,
+                    );
+                }
+                self.update_loop_run_result(
+                    &stale.id,
+                    LoopRunStatus::Fail,
+                    Some(&serde_json::json!({ "terminated": true, "reason": "spec reset" })),
+                    Some(Utc::now()),
+                )?;
+            }
             self.reset_loop_spec_status(spec_id)?;
         }
         self.reset_loop_status(loop_id)?;
@@ -736,8 +758,8 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         conn.execute(
-            "INSERT INTO loop_runs (id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO loop_runs (id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 &run.id,
                 &run.loop_id,
@@ -755,9 +777,67 @@ impl Database {
                 run.started_at.timestamp(),
                 run.completed_at.map(|value| value.timestamp()),
                 run.iteration,
+                run.pid,
+                &run.boot_id,
             ],
         )?;
         Ok(())
+    }
+
+    /// Record the OS process-group leader spawned for `run_id`'s node
+    /// execution, and the boot it was spawned under. Called right after a
+    /// successful `spawn()` — before that, the run row (inserted by the
+    /// caller before execution starts) has `pid = NULL`, meaning "no live
+    /// process to kill" (e.g. a gate node, or an agent/check node that
+    /// hasn't finished spawning yet).
+    pub fn set_loop_run_pid(&self, run_id: &str, pid: i64, boot_id: Option<&str>) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE loop_runs SET pid = ?1, boot_id = ?2 WHERE id = ?3",
+            params![pid, boot_id, run_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// The active (`running`) node run for `spec_id`, if any. Mirrors
+    /// [`Self::get_active_loop_run_for_node`] but scoped to a whole spec —
+    /// used by `loop_reset`, which resets a spec wholesale rather than one
+    /// node at a time.
+    pub fn get_active_loop_run_for_spec(&self, spec_id: &str) -> Result<Option<LoopNodeRun>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id
+             FROM loop_runs
+             WHERE spec_id = ?1 AND status = 'running'
+             ORDER BY started_at DESC
+             LIMIT 1",
+        )?;
+
+        stmt.query_row(params![spec_id], map_loop_run_row)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Every node run still `running` across every loop — used at daemon
+    /// shutdown to terminate every process this boot owns before exiting.
+    pub fn list_all_running_loop_runs(&self) -> Result<Vec<LoopNodeRun>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id
+             FROM loop_runs WHERE status = 'running'",
+        )?;
+        let rows = stmt.query_map(params![], map_loop_run_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn list_loop_runs_for_spec(&self, spec_id: &str) -> Result<Vec<LoopNodeRun>> {
@@ -766,7 +846,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration
+            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id
              FROM loop_runs WHERE spec_id = ?1 ORDER BY started_at ASC, iteration ASC",
         )?;
         let rows = stmt.query_map(params![spec_id], map_loop_run_row)?;
@@ -787,7 +867,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration
+            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id
              FROM loop_runs WHERE loop_id = ?1 ORDER BY started_at ASC, iteration ASC",
         )?;
         let rows = stmt.query_map(params![loop_id], map_loop_run_row)?;
@@ -802,7 +882,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration
+            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id
              FROM loop_runs WHERE id = ?1",
         )?;
 
@@ -817,7 +897,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration
+            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id
              FROM loop_runs
              WHERE node_id = ?1 AND status = 'running'
              ORDER BY started_at DESC
@@ -844,7 +924,8 @@ impl Database {
             "UPDATE loop_runs
              SET status = ?1,
                  output = COALESCE(?2, output),
-                 completed_at = COALESCE(?3, completed_at)
+                 completed_at = COALESCE(?3, completed_at),
+                 pid = NULL
              WHERE id = ?4",
             params![
                 status.as_str(),
@@ -872,13 +953,13 @@ impl Database {
     }
 
     /// Node runs still `running` for a loop.
-    fn running_loop_runs(&self, loop_id: &str) -> Result<Vec<LoopNodeRun>> {
+    pub fn list_running_loop_runs(&self, loop_id: &str) -> Result<Vec<LoopNodeRun>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration
+            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id
              FROM loop_runs WHERE loop_id = ?1 AND status = 'running'",
         )?;
         let rows = stmt.query_map(params![loop_id], map_loop_run_row)?;
@@ -898,7 +979,7 @@ impl Database {
     pub fn reconcile_orphaned_loops(&self) -> Result<usize> {
         let orphaned = self.list_running_loops()?;
         for lp in &orphaned {
-            let dangling_runs = self.running_loop_runs(&lp.id)?;
+            let dangling_runs = self.list_running_loop_runs(&lp.id)?;
             if dangling_runs.is_empty() {
                 tracing::warn!(
                     "Reconciling orphaned loop '{}': no active node run found; pausing.",
@@ -911,6 +992,29 @@ impl Database {
                     lp.id,
                     run.node_id
                 );
+                // B12: this new daemon process never held a `Child` for
+                // `run` — it may not even share the previous process's
+                // memory — so a persisted pid is all reconciliation has to
+                // go on, and a pid alone can't tell a genuine survivor from
+                // an unrelated process that reused the same pid after a
+                // reboot recycled the pid space. Only attempt the kill when
+                // the run's recorded boot id still matches the machine's
+                // current one (same boot, i.e. the *daemon* crashed/restarted
+                // without the OS rebooting) — otherwise the pid is
+                // meaningless and killing it could hit an unrelated process.
+                if let (Some(pid), Some(run_boot_id)) = (run.pid, run.boot_id.as_deref()) {
+                    if crate::system::boot_id().as_deref() == Some(run_boot_id) {
+                        tracing::warn!(
+                            "Reconciling orphaned loop '{}': attempting best-effort kill of survivor pid {} from the same boot.",
+                            lp.id,
+                            pid
+                        );
+                        crate::daemon::process::terminate_process_group_async(
+                            pid,
+                            crate::daemon::process::KILL_GRACE,
+                        );
+                    }
+                }
                 self.update_loop_run_result(
                     &run.id,
                     LoopRunStatus::Fail,
@@ -1111,6 +1215,8 @@ fn map_loop_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoopNodeRun> {
             .map(from_timestamp)
             .transpose()?,
         iteration: row.get(9)?,
+        pid: row.get(10)?,
+        boot_id: row.get(11)?,
     })
 }
 

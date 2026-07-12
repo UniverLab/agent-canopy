@@ -265,7 +265,9 @@ impl Database {
                 output TEXT,
                 started_at INTEGER NOT NULL,
                 completed_at INTEGER,
-                iteration INTEGER NOT NULL DEFAULT 1
+                iteration INTEGER NOT NULL DEFAULT 1,
+                pid INTEGER,
+                boot_id TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_loop_runs_spec_started
@@ -600,6 +602,33 @@ impl Database {
         if !has_active_run_pool_id {
             conn.execute("ALTER TABLE loops ADD COLUMN active_run_pool_id TEXT", [])
                 .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // `pid`/`boot_id` (B12): the OS process-group leader spawned for a
+        // node run, and the boot it was spawned under. Lets the engine
+        // `killpg` an active run's process on every abnormal end (timeout,
+        // pause, reset, budget exhaustion, run failure, daemon shutdown),
+        // and lets startup reconciliation attempt a best-effort kill of
+        // survivors from the same boot. Older databases predate both
+        // columns; NULL on existing rows (nothing was tracked for them, so
+        // there's nothing to kill).
+        for column in ["pid", "boot_id"] {
+            let has_column: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('loop_runs') WHERE name = ?1",
+                    [column],
+                    |row| Ok(row.get::<_, i32>(0)? > 0),
+                )
+                .unwrap_or(false);
+            if !has_column {
+                let sql = if column == "pid" {
+                    "ALTER TABLE loop_runs ADD COLUMN pid INTEGER".to_string()
+                } else {
+                    "ALTER TABLE loop_runs ADD COLUMN boot_id TEXT".to_string()
+                };
+                conn.execute(&sql, [])
+                    .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+            }
         }
 
         Ok(())

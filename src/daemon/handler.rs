@@ -51,7 +51,8 @@ use crate::db::Database;
 use crate::domain::blueprints::{merge_blueprint_config, validate_blueprint_deletable, Blueprint};
 use crate::domain::loops::{
     validate_spec_description_template, Loop, LoopDetails, LoopEdge, LoopEdgeCondition, LoopNode,
-    LoopNodeKind, LoopResetOutcome, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus,
+    LoopNodeKind, LoopNodeRun, LoopResetOutcome, LoopRunStatus, LoopSpec, LoopSpecStatus,
+    LoopStatus,
 };
 use crate::domain::models::{Agent, Trigger};
 use crate::domain::pools::{Pool, PoolDetails};
@@ -651,6 +652,48 @@ fn perform_loop_reset(
     Ok(success_result(&format!(
         "Loop '{loop_id}' reset to pending; {spec_count} spec(s) reset."
     )))
+}
+
+/// Resolve the exact node run a `loop_complete_node`/`loop_report_blocker`
+/// report belongs to (B12). A node can be retried, so more than one run can
+/// exist for the same `node_id` over a spec's lifetime — matching on
+/// `node_id` alone (as this used to) means a report arriving late from a
+/// killed/superseded attempt (e.g. a timed-out or paused agent that ignores
+/// its own termination and calls the tool anyway) would get silently applied
+/// to whatever newer run is now active for that node. Requiring the exact
+/// `run_id` and verifying it's both still `running` and actually for the
+/// claimed `node_id` closes that gap: anything else is rejected outright
+/// rather than guessed at.
+///
+/// Returns `Err(McpError)` only for a genuine DB failure; a stale/malformed
+/// report is a normal `Ok(Err(CallToolResult))` — the tool call succeeded at
+/// the protocol level, it's just telling the caller its report didn't stick.
+fn resolve_reported_run(
+    db: &Database,
+    run_id: &str,
+    node_id: &str,
+) -> Result<Result<LoopNodeRun, CallToolResult>, McpError> {
+    let run = db.get_loop_run(run_id).map_err(internal_error)?;
+    let Some(run) = run else {
+        return Ok(Err(error_result(&format!(
+            "No loop run found with id '{run_id}'."
+        ))));
+    };
+    if run.node_id != node_id {
+        return Ok(Err(error_result(&format!(
+            "Run '{run_id}' belongs to node '{}', not '{node_id}'.",
+            run.node_id
+        ))));
+    }
+    if run.status != LoopRunStatus::Running {
+        return Ok(Err(error_result(&format!(
+            "Run '{run_id}' for node '{node_id}' is no longer active (status: {}); this report \
+             is stale — the run was already finalized (timed out, paused, reset, superseded by \
+             a retry, or already reported) — and was rejected.",
+            run.status.as_str()
+        ))));
+    }
+    Ok(Ok(run))
 }
 
 fn build_spec_update_response(spec_id: &str) -> CallToolResult {
@@ -3300,15 +3343,9 @@ impl TaskTriggerHandler {
                 "loop_complete_node status must be pass or fail.",
             ));
         };
-        let run = match self.db.get_active_loop_run_for_node(&params.node_id) {
-            Ok(Some(r)) => r,
-            Ok(None) => {
-                return Ok(error_result(&format!(
-                    "No active loop run found for node '{}'.",
-                    params.node_id
-                )))
-            }
-            Err(e) => return Err(internal_error(e.to_string())),
+        let run = match resolve_reported_run(&self.db, &params.run_id, &params.node_id)? {
+            Ok(run) => run,
+            Err(result) => return Ok(result),
         };
 
         self.db
@@ -3334,15 +3371,9 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<LoopReportBlockerParams>,
     ) -> Result<CallToolResult, McpError> {
-        let run = match self.db.get_active_loop_run_for_node(&params.node_id) {
-            Ok(Some(r)) => r,
-            Ok(None) => {
-                return Ok(error_result(&format!(
-                    "No active loop run found for node '{}'.",
-                    params.node_id
-                )))
-            }
-            Err(e) => return Err(internal_error(e.to_string())),
+        let run = match resolve_reported_run(&self.db, &params.run_id, &params.node_id)? {
+            Ok(run) => run,
+            Err(result) => return Ok(result),
         };
 
         self.db
@@ -3928,10 +3959,10 @@ mod tests {
     use super::{
         header_str, loop_details_json, loop_run_status_guard, missing_sync_identity_error,
         perform_loop_reset, resolve_graph_target, resolve_node_kind_and_config,
-        validate_blueprint_exists, validate_node_config, validate_pool_exists,
-        validate_pool_member_removable, validate_pool_not_consumed, validate_pool_reorder,
-        validate_pool_reorder_locking, validate_spec_deletable, validate_spec_exists,
-        MISSING_SYNC_IDENTITY_MESSAGE,
+        resolve_reported_run, validate_blueprint_exists, validate_node_config,
+        validate_pool_exists, validate_pool_member_removable, validate_pool_not_consumed,
+        validate_pool_reorder, validate_pool_reorder_locking, validate_spec_deletable,
+        validate_spec_exists, MISSING_SYNC_IDENTITY_MESSAGE,
     };
     use crate::db::Database;
     use crate::domain::blueprints::Blueprint;
@@ -4577,7 +4608,102 @@ mod tests {
             started_at: chrono::Utc::now(),
             completed_at: (status != LoopRunStatus::Running).then(chrono::Utc::now),
             iteration: 1,
+            pid: None,
+            boot_id: None,
         }
+    }
+
+    // ── B12: stale loop_complete_node/loop_report_blocker reports ─────
+
+    fn reported_run_fixture() -> (tempfile::TempDir, Database) {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        insert_test_loop(&db, "loop-1");
+        db.insert_loop_spec(&standalone_spec("spec-a")).unwrap();
+        insert_test_node(&db, "node-1", "spec-a");
+        (dir, db)
+    }
+
+    #[test]
+    fn resolve_reported_run_accepts_matching_active_run() {
+        let (_dir, db) = reported_run_fixture();
+        db.insert_loop_run(&loop_run_row(
+            "run-1",
+            "loop-1",
+            "spec-a",
+            LoopRunStatus::Running,
+        ))
+        .unwrap();
+
+        let run = resolve_reported_run(&db, "run-1", "node-1")
+            .unwrap()
+            .expect("a running run for the claimed node_id must be accepted");
+        assert_eq!(run.id, "run-1");
+    }
+
+    #[test]
+    fn resolve_reported_run_rejects_unknown_run_id() {
+        let (_dir, db) = reported_run_fixture();
+
+        let result = resolve_reported_run(&db, "no-such-run", "node-1").unwrap();
+        let error = result.expect_err("an unknown run_id must be rejected");
+        assert!(error.is_error.unwrap_or(false));
+    }
+
+    #[test]
+    fn resolve_reported_run_rejects_node_id_mismatch() {
+        let (_dir, db) = reported_run_fixture();
+        db.insert_loop_run(&loop_run_row(
+            "run-1",
+            "loop-1",
+            "spec-a",
+            LoopRunStatus::Running,
+        ))
+        .unwrap();
+
+        // "run-1" really belongs to "node-1" (see loop_run_row) — a report
+        // claiming a different node_id for the same run_id is malformed.
+        let result = resolve_reported_run(&db, "run-1", "some-other-node").unwrap();
+        let error = result.expect_err("a node_id that doesn't match the run must be rejected");
+        assert!(error.is_error.unwrap_or(false));
+    }
+
+    /// The core B12 regression case: a node run that was already finalized
+    /// (timed out, killed on pause/reset, or superseded by a retry — any of
+    /// which flips its status away from `running`) must reject a late report
+    /// naming its exact `run_id`, rather than that report silently landing
+    /// on whatever's now active for the same `node_id`.
+    #[test]
+    fn resolve_reported_run_rejects_already_finalized_run() {
+        let (_dir, db) = reported_run_fixture();
+        // The stale run: already finalized (e.g. by the timeout/pause kill
+        // path), simulating the orphaned agent's late self-report arriving
+        // after the engine gave up on it.
+        db.insert_loop_run(&loop_run_row(
+            "run-stale",
+            "loop-1",
+            "spec-a",
+            LoopRunStatus::Fail,
+        ))
+        .unwrap();
+        // A newer attempt at the SAME node is now the genuinely active run —
+        // exactly the run a naive node_id-only lookup would have
+        // misattributed the stale report to.
+        db.insert_loop_run(&loop_run_row(
+            "run-current",
+            "loop-1",
+            "spec-a",
+            LoopRunStatus::Running,
+        ))
+        .unwrap();
+
+        let result = resolve_reported_run(&db, "run-stale", "node-1").unwrap();
+        let error = result.expect_err("a finalized run must reject a late report");
+        assert!(error.is_error.unwrap_or(false));
+
+        // And the genuinely active run must be left completely untouched.
+        let current = db.get_loop_run("run-current").unwrap().unwrap();
+        assert_eq!(current.status, LoopRunStatus::Running);
     }
 
     #[test]

@@ -555,6 +555,10 @@ pub struct LoopScheduleAutorunParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LoopCompleteNodeParams {
+    /// The exact node run ID this report belongs to (given to you in the
+    /// [REPORTING] section of your prompt). Required so a report can never
+    /// be misattributed to a different, newer attempt at the same node.
+    pub run_id: String,
     /// Loop node ID.
     pub node_id: String,
     /// pass or fail.
@@ -567,6 +571,10 @@ pub struct LoopCompleteNodeParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LoopReportBlockerParams {
+    /// The exact node run ID this report belongs to (given to you in the
+    /// [REPORTING] section of your prompt). Required so a report can never
+    /// be misattributed to a different, newer attempt at the same node.
+    pub run_id: String,
     /// Loop node ID.
     pub node_id: String,
     /// Human-readable blocker description.

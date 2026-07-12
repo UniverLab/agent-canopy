@@ -143,11 +143,55 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
 
     scheduler_cancel.cancel();
     watcher_engine.stop_all().await;
+    terminate_owned_running_node_processes(&db).await;
     remove_pid_file(&data_dir);
     crate::domain::notification::clear_notifications_on_exit();
     tracing::info!("Daemon stopped");
 
     Ok(())
+}
+
+/// Terminate every loop node run's process this boot still owns (B12), so a
+/// graceful shutdown never leaves a `mimo run`/check process behind the way
+/// an abandoned timeout used to. `SIGTERM`s every owned process up front,
+/// waits out a single shared grace period, then `SIGKILL`s survivors —
+/// awaited inline (unlike the detached `terminate_process_group_async` used
+/// elsewhere) because the daemon process is about to exit, so a detached
+/// grace-kill task would never get to fire, and a *sequential*
+/// terminate-and-wait per process would multiply the shutdown delay by the
+/// number of processes instead of bounding it by one grace period total.
+async fn terminate_owned_running_node_processes(db: &Database) {
+    let Ok(runs) = db.list_all_running_loop_runs() else {
+        return;
+    };
+    if runs.is_empty() {
+        return;
+    }
+
+    #[cfg(unix)]
+    for run in &runs {
+        if let Some(pid) = run.pid {
+            let _ = crate::daemon::process::send_signal_to_group(pid as i32, libc::SIGTERM);
+        }
+    }
+    #[cfg(unix)]
+    {
+        tokio::time::sleep(crate::daemon::process::KILL_GRACE).await;
+        for run in &runs {
+            if let Some(pid) = run.pid {
+                let _ = crate::daemon::process::send_signal_to_group(pid as i32, libc::SIGKILL);
+            }
+        }
+    }
+
+    for run in &runs {
+        let _ = db.update_loop_run_result(
+            &run.id,
+            crate::domain::loops::LoopRunStatus::Fail,
+            Some(&serde_json::json!({ "terminated": true, "reason": "daemon shutdown" })),
+            Some(chrono::Utc::now()),
+        );
+    }
 }
 
 pub(crate) async fn run_stdio_server() -> Result<()> {

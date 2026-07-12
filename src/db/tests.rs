@@ -903,6 +903,8 @@ fn loop_run_roundtrip_preserves_json_payloads() {
         started_at: Utc::now(),
         completed_at: Some(Utc::now()),
         iteration: 2,
+        pid: Some(4242),
+        boot_id: Some("boot-abc".to_string()),
     };
 
     db.insert_loop(&lp).unwrap();
@@ -915,6 +917,8 @@ fn loop_run_roundtrip_preserves_json_payloads() {
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].iteration, 2);
     assert_eq!(runs[0].status, LoopRunStatus::Pass);
+    assert_eq!(runs[0].pid, Some(4242));
+    assert_eq!(runs[0].boot_id.as_deref(), Some("boot-abc"));
     assert_eq!(
         runs[0]
             .input
@@ -1051,6 +1055,8 @@ fn reconcile_orphaned_loops_pauses_running_loop_and_interrupts_its_run() {
         started_at: Utc::now(),
         completed_at: None,
         iteration: 1,
+        pid: None,
+        boot_id: None,
     };
 
     db.insert_loop(&lp).unwrap();
@@ -1099,6 +1105,8 @@ fn reconcile_orphaned_loops_is_idempotent() {
         started_at: Utc::now(),
         completed_at: None,
         iteration: 1,
+        pid: None,
+        boot_id: None,
     };
 
     db.insert_loop(&lp).unwrap();
@@ -1120,6 +1128,123 @@ fn reconcile_orphaned_loops_is_idempotent() {
     assert_eq!(lp_after_second.status, lp_after_first.status);
     assert_eq!(run_after_second.status, run_after_first.status);
     assert_eq!(run_after_second.completed_at, run_after_first.completed_at);
+}
+
+/// B12: reconciliation at daemon boot can't have held a `Child` for a run
+/// that predates it, but if the dangling run's `pid`/`boot_id` were
+/// persisted by the process that spawned it, and the machine hasn't
+/// rebooted since (same `boot_id`), reconciliation should still attempt a
+/// best-effort kill of the survivor instead of just abandoning it.
+#[tokio::test]
+async fn reconcile_orphaned_loops_kills_survivor_pid_from_same_boot() {
+    let Some(current_boot_id) = crate::system::boot_id() else {
+        // Non-Linux host (or /proc unavailable): boot_id is never known, so
+        // the same-boot check can never match — nothing to test here.
+        return;
+    };
+
+    let db = test_db();
+    let mut lp = sample_loop("wf-orphan-survivor");
+    lp.status = LoopStatus::Running;
+    let mut spec = sample_loop_spec(&lp.id, "spec-orphan-survivor", 1);
+    spec.status = LoopSpecStatus::Running;
+    let node = sample_loop_node(&spec.id, "node-orphan-survivor", 1);
+
+    // A real, still-running process group leader to stand in for a `mimo
+    // run` that outlived the daemon that spawned it. Must be its own
+    // process-group leader (as every real spawn site is, via
+    // `.process_group(0)`) for `killpg` to reach it rather than the test
+    // process's own group.
+    let mut command = std::process::Command::new("sleep");
+    command.arg("30");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().expect("spawn survivor process");
+    let pid = child.id() as i64;
+
+    let run = LoopNodeRun {
+        id: "run-orphan-survivor".to_string(),
+        loop_id: lp.id.clone(),
+        spec_id: spec.id.clone(),
+        node_id: node.id.clone(),
+        status: LoopRunStatus::Running,
+        input: None,
+        output: None,
+        started_at: Utc::now(),
+        completed_at: None,
+        iteration: 1,
+        pid: Some(pid),
+        boot_id: Some(current_boot_id),
+    };
+
+    db.insert_loop(&lp).unwrap();
+    db.insert_loop_spec(&spec).unwrap();
+    db.insert_loop_node(&node).unwrap();
+    db.insert_loop_run(&run).unwrap();
+
+    assert_eq!(db.reconcile_orphaned_loops().unwrap(), 1);
+
+    // The kill is fired via a detached task (see
+    // `terminate_process_group_async`); poll briefly for the SIGTERM to
+    // land instead of asserting immediately.
+    let killed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+                Err(_) => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    assert!(killed, "survivor process from the same boot must be killed");
+}
+
+/// The mirror case: a dangling run whose `boot_id` does NOT match the
+/// current machine boot must be left alone — the pid may have been recycled
+/// by an unrelated process since the reboot, so killing it would be
+/// dangerous, not just useless.
+#[test]
+fn reconcile_orphaned_loops_skips_kill_for_mismatched_boot_id() {
+    let db = test_db();
+    let mut lp = sample_loop("wf-orphan-stale-boot");
+    lp.status = LoopStatus::Running;
+    let mut spec = sample_loop_spec(&lp.id, "spec-orphan-stale-boot", 1);
+    spec.status = LoopSpecStatus::Running;
+    let node = sample_loop_node(&spec.id, "node-orphan-stale-boot", 1);
+    let run = LoopNodeRun {
+        id: "run-orphan-stale-boot".to_string(),
+        loop_id: lp.id.clone(),
+        spec_id: spec.id.clone(),
+        node_id: node.id.clone(),
+        status: LoopRunStatus::Running,
+        input: None,
+        output: None,
+        started_at: Utc::now(),
+        completed_at: None,
+        iteration: 1,
+        // A pid from a previous boot — never a real live process on this
+        // machine right now, but also never allowed to be signaled.
+        pid: Some(1),
+        boot_id: Some("some-other-boot-that-is-not-current".to_string()),
+    };
+
+    db.insert_loop(&lp).unwrap();
+    db.insert_loop_spec(&spec).unwrap();
+    db.insert_loop_node(&node).unwrap();
+    db.insert_loop_run(&run).unwrap();
+
+    // Must not panic or error even though pid 1 is a real (unkillable by
+    // us) process — the boot_id mismatch must short-circuit before any
+    // signal is ever attempted.
+    assert_eq!(db.reconcile_orphaned_loops().unwrap(), 1);
+    let run_after = db.get_loop_run(&run.id).unwrap().unwrap();
+    assert_ne!(run_after.status, LoopRunStatus::Running);
 }
 
 #[test]

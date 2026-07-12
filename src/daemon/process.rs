@@ -1,5 +1,11 @@
 use anyhow::Result;
 
+/// Grace period between `SIGTERM` and `SIGKILL` when terminating a node
+/// run's process group (B12): timeout, iteration-budget exhaustion,
+/// `loop_pause`, `loop_reset`, run failure elsewhere, and daemon shutdown
+/// all go through [`terminate_process_group_async`] with this grace.
+pub(crate) const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Advisory singleton lock held for the lifetime of a running daemon.
 ///
 /// The lock is acquired via `flock(2)` on a dedicated `daemon.lock` file
@@ -104,6 +110,51 @@ fn terminate_process(pid: u32, port: u16) {
         eprintln!("PID {pid} did not exit — sending SIGKILL");
         unsafe { libc::kill(pid as i32, libc::SIGKILL) };
         std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// Send `signal` to the process group led by `pid` (i.e. `killpg`). A group
+/// that's already gone (`ESRCH`) is treated as success — there's nothing
+/// left to signal, which is exactly the caller's desired end state.
+#[cfg(unix)]
+pub(crate) fn send_signal_to_group(pid: i32, signal: i32) -> std::io::Result<()> {
+    let result = unsafe { libc::killpg(pid, signal) };
+    if result == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(err)
+}
+
+/// Best-effort termination (B12) of the process group led by `pid`: `SIGTERM`
+/// now, `SIGKILL` after `grace` if the group is still alive. The grace wait
+/// runs on a detached task so the caller (e.g. `loop_pause`, an iteration
+/// budget check) never blocks on it — the killed process's own
+/// `wait()`/`wait_with_output()` elsewhere unblocks as soon as it actually
+/// dies, whether that's from the `SIGTERM` or the follow-up `SIGKILL`.
+///
+/// Unix-only: killing a whole process group by PID with no live `Child`
+/// handle has no portable equivalent. On non-unix targets this is a no-op —
+/// the one path that still gets best-effort termination on Windows is a
+/// timeout with a live `Child` in hand, which kills the direct child via
+/// `tokio::process::Child::start_kill`.
+pub(crate) fn terminate_process_group_async(pid: i64, grace: std::time::Duration) {
+    #[cfg(unix)]
+    {
+        let pid = pid as i32;
+        let _ = send_signal_to_group(pid, libc::SIGTERM);
+        tokio::spawn(async move {
+            tokio::time::sleep(grace).await;
+            let _ = send_signal_to_group(pid, libc::SIGKILL);
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        let _ = grace;
     }
 }
 

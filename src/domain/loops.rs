@@ -434,6 +434,17 @@ pub struct LoopNodeRun {
     pub started_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
     pub iteration: i64,
+    /// PID of the OS process group currently executing this node run (the
+    /// spawned child is always its own process-group leader — see
+    /// `process_group(0)` at the spawn sites), so the engine can `killpg` it
+    /// on any abnormal end. `None` once the run is finalized, or if no
+    /// process was ever spawned for it (e.g. a gate node).
+    pub pid: Option<i64>,
+    /// `system::boot_id()` at the moment `pid` was recorded. A PID alone
+    /// can't tell a live survivor from an unrelated process that reused the
+    /// same PID after a reboot recycled the PID space — only meaningful
+    /// together with a matching current boot id. See B12.
+    pub boot_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

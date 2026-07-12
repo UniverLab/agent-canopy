@@ -90,6 +90,16 @@ impl CliStrategy {
         let resolved = resolve_binary(&self.binary)?;
         let mut cmd = Command::new(resolved);
 
+        // Make the child its own process-group leader so the engine can
+        // `killpg` it (and any helpers it forks) as a unit on timeout/abnormal
+        // end (B12), instead of leaving them to keep running past the daemon's
+        // control. `kill_on_drop` is a cross-platform safety net for the
+        // direct child alone, in case the `Command`/`Child` is ever dropped
+        // without an explicit kill.
+        #[cfg(unix)]
+        cmd.process_group(0);
+        cmd.kill_on_drop(true);
+
         // Set environment variables
         for (key, value) in &self.env_vars {
             cmd.env(key, value);

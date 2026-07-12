@@ -460,6 +460,8 @@ mod tests {
             started_at: DateTime::<Utc>::from_timestamp(started_at_secs, 0).unwrap(),
             completed_at: None,
             iteration: 1,
+            pid: None,
+            boot_id: None,
         }
     }
 
