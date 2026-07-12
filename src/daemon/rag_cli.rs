@@ -142,6 +142,15 @@ async fn handle_rag_report(data_dir: &std::path::Path, db: &Database) -> Result<
 
     let is_paused = db.get_state("rag_paused")?.as_deref() == Some("1");
     let total_chunks: usize = chunk_counts.values().sum();
+    let processing_items = queue_items
+        .iter()
+        .filter(|q| q.status == "processing")
+        .count();
+    let model_status = crate::rag::status::compute_rag_model_status(
+        is_paused,
+        crate::rag::status::is_model_loaded(db),
+        processing_items as i64,
+    );
 
     // A file's *current* oversize status is whatever its latest event says —
     // if it later shrank and got indexed, the newer "indexed" event wins.
@@ -164,24 +173,27 @@ async fn handle_rag_report(data_dir: &std::path::Path, db: &Database) -> Result<
     );
     println!(
         " Status: {}",
-        if is_paused {
-            "\x1b[33m⏸ paused\x1b[0m"
-        } else {
-            "\x1b[32m● running\x1b[0m"
+        match model_status {
+            crate::rag::status::RagModelStatus::Paused => "\x1b[33m⏸ paused\x1b[0m".to_string(),
+            crate::rag::status::RagModelStatus::Ready =>
+                "\x1b[32m● ready (model loaded)\x1b[0m".to_string(),
+            crate::rag::status::RagModelStatus::Sleeping =>
+                "\x1b[90m○ sleeping (lazy — loads on demand)\x1b[0m".to_string(),
         }
     );
+    if model_status == crate::rag::status::RagModelStatus::Ready {
+        if let Some(since) = crate::rag::status::model_loaded_since(db) {
+            println!("         since: {}", format_ts(since));
+        }
+    }
     println!(
         " Total:  {} indexed file(s), {} chunk(s)",
         chunk_counts.len(),
         total_chunks
     );
     if !queue_items.is_empty() {
-        let processing = queue_items
-            .iter()
-            .filter(|q| q.status == "processing")
-            .count();
         let queued = queue_items.iter().filter(|q| q.status == "queued").count();
-        println!(" Queue:  {} queued, {} indexing", queued, processing);
+        println!(" Queue:  {} queued, {} indexing", queued, processing_items);
     }
     if oversize_count > 0 {
         let cap_mb = crate::rag::ingestion::FILE_MAX_BYTES as f64 / (1024.0 * 1024.0);
@@ -321,6 +333,66 @@ mod tests {
         assert!(
             help.contains("Delete the entire vector store"),
             "purge should have description:\n{help}"
+        );
+    }
+
+    /// Integration-style check of the exact mapping `handle_rag_report` performs:
+    /// live daemon state read from the DB (the CLI's only transport to the
+    /// daemon today) must flow through `compute_rag_model_status` to the
+    /// truthful three-valued status, including the paused-wins and
+    /// active-processing-implies-ready rules.
+    #[test]
+    fn rag_report_status_mapping_reads_live_daemon_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+
+        // Fresh daemon, nothing loaded yet: sleeping.
+        assert_eq!(
+            crate::rag::status::compute_rag_model_status(
+                false,
+                crate::rag::status::is_model_loaded(&db),
+                0,
+            ),
+            crate::rag::status::RagModelStatus::Sleeping
+        );
+
+        // Daemon loads the model (as `IngestionManager::get_or_load_client` persists).
+        db.set_state(crate::rag::status::RAG_MODEL_LOADED_KEY, "1")
+            .unwrap();
+        assert_eq!(
+            crate::rag::status::compute_rag_model_status(
+                false,
+                crate::rag::status::is_model_loaded(&db),
+                0,
+            ),
+            crate::rag::status::RagModelStatus::Ready
+        );
+
+        // Paused wins even while the model is still loaded.
+        db.set_state("rag_paused", "1").unwrap();
+        let is_paused = db.get_state("rag_paused").unwrap().as_deref() == Some("1");
+        assert_eq!(
+            crate::rag::status::compute_rag_model_status(
+                is_paused,
+                crate::rag::status::is_model_loaded(&db),
+                0,
+            ),
+            crate::rag::status::RagModelStatus::Paused
+        );
+
+        // Unpaused, model unloaded, but a queue item is actively "processing":
+        // must never read as sleeping while chunks are being embedded.
+        db.set_state("rag_paused", "0").unwrap();
+        db.set_state(crate::rag::status::RAG_MODEL_LOADED_KEY, "0")
+            .unwrap();
+        let is_paused = db.get_state("rag_paused").unwrap().as_deref() == Some("1");
+        assert_eq!(
+            crate::rag::status::compute_rag_model_status(
+                is_paused,
+                crate::rag::status::is_model_loaded(&db),
+                1,
+            ),
+            crate::rag::status::RagModelStatus::Ready
         );
     }
 

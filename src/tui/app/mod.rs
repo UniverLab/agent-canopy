@@ -153,6 +153,7 @@ impl App {
             playground_scroll: 0,
             playground_project_hash: None,
             rag_paused: false,
+            rag_model_loaded: false,
             agents_rag_focused: false,
             sync_scroll_offset: 0,
             last_sync_area: None,
@@ -675,6 +676,7 @@ impl App {
             .get_state("rag_paused")?
             .map(|v| v == "1")
             .unwrap_or(false);
+        self.rag_model_loaded = crate::rag::status::is_model_loaded(&self.db);
 
         let (queued, processing) = self
             .db

@@ -371,6 +371,9 @@ pub struct App {
 
     // RAG pause state (synced from daemon_state table)
     pub(crate) rag_paused: bool,
+    /// Whether the embedding model is currently loaded in the daemon's
+    /// memory (synced from daemon_state table — see `rag::status`).
+    pub(crate) rag_model_loaded: bool,
     /// Whether the RagInfo panel has focus in Agents sidebar mode.
     pub(crate) agents_rag_focused: bool,
 

@@ -1098,25 +1098,26 @@ fn labeled_kv_line(label: &'static str, value: &str) -> Line<'static> {
 }
 
 fn rag_status_line(app: &App) -> Line<'static> {
-    if app.rag_paused {
-        return Line::from(Span::styled(
+    use crate::rag::status::{compute_rag_model_status, RagModelStatus};
+
+    match compute_rag_model_status(
+        app.rag_paused,
+        app.rag_model_loaded,
+        app.rag_info.processing_items,
+    ) {
+        RagModelStatus::Paused => Line::from(Span::styled(
             " ⏸ paused ",
             Style::default().fg(Color::Yellow),
-        ));
-    }
-    if app.rag_info.processing_items > 0 {
-        return Line::from(Span::styled(
+        )),
+        RagModelStatus::Ready if app.rag_info.processing_items > 0 => Line::from(Span::styled(
             " ◉ indexing ",
             Style::default().fg(Color::Yellow),
-        ));
+        )),
+        RagModelStatus::Ready => Line::from(Span::styled(" ● ready ", Style::default().fg(ACCENT))),
+        RagModelStatus::Sleeping => {
+            Line::from(Span::styled(" ○ sleeping ", Style::default().fg(DIM)))
+        }
     }
-    if app.rag_info.queued_items > 0 {
-        return Line::from(Span::styled(
-            " ⏳ pending ",
-            Style::default().fg(Color::Yellow),
-        ));
-    }
-    Line::from(Span::styled(" ✓ ready ", Style::default().fg(ACCENT)))
 }
 
 fn rag_queue_text(app: &App) -> String {

@@ -102,6 +102,11 @@ pub struct IngestionManager {
 impl IngestionManager {
     pub fn new(db: Arc<Database>, data_dir: PathBuf) -> Self {
         crate::rag::ragignore::ensure_ragignore(&data_dir);
+        // `cached_client` always starts empty, so the persisted flag other
+        // processes read (see `rag::status`) must agree — otherwise a stale
+        // "1" surviving a daemon restart would make `canopy rag report` lie
+        // about the model being loaded before anything has queried it.
+        let _ = db.set_state(crate::rag::status::RAG_MODEL_LOADED_KEY, "0");
         Self {
             db,
             data_dir,
@@ -322,6 +327,9 @@ impl IngestionManager {
 
         let model = cached.model.clone();
         *guard = None;
+        let _ = self
+            .db
+            .set_state(crate::rag::status::RAG_MODEL_LOADED_KEY, "0");
         Some((model, idle_for))
     }
 
@@ -654,6 +662,18 @@ impl IngestionManager {
             last_used: Instant::now(),
         });
         tracing::info!("RAG: embedding client loaded and cached for model '{model_id}'");
+
+        let _ = self
+            .db
+            .set_state(crate::rag::status::RAG_MODEL_LOADED_KEY, "1");
+        let _ = self
+            .db
+            .set_state(crate::rag::status::RAG_MODEL_NAME_KEY, &model_id);
+        let _ = self.db.set_state(
+            crate::rag::status::RAG_MODEL_SINCE_KEY,
+            &chrono::Utc::now().timestamp().to_string(),
+        );
+
         Ok(client)
     }
 
@@ -1471,6 +1491,19 @@ mod tests {
         let guard = mgr.cached_client.lock().await;
         let cached = guard.as_ref().expect("client should now be cached");
         assert_eq!(cached.model, "mock-model");
+        drop(guard);
+
+        assert!(crate::rag::status::is_model_loaded(&mgr.db));
+        assert!(crate::rag::status::model_loaded_since(&mgr.db).is_some());
+    }
+
+    /// A fresh manager persists "not loaded" so a stale flag left over from a
+    /// previous daemon run (the DB file survives restarts) can't make
+    /// `canopy rag report` claim the model is warm before anything has used it.
+    #[tokio::test]
+    async fn new_manager_persists_model_not_loaded() {
+        let (mgr, _dir) = test_manager();
+        assert!(!crate::rag::status::is_model_loaded(&mgr.db));
     }
 
     /// (3) Simulated idle timeout releases the cached client.
@@ -1493,6 +1526,7 @@ mod tests {
             Some("mock-model".to_string())
         );
         assert!(mgr.cached_client.lock().await.is_none());
+        assert!(!crate::rag::status::is_model_loaded(&mgr.db));
     }
 
     /// (4) The client is not released while an in-progress use still holds the Arc,

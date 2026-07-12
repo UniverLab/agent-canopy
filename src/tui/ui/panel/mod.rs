@@ -1051,14 +1051,17 @@ fn loop_graph_lines(
 }
 
 fn rag_status(app: &App) -> (&'static str, Color) {
-    if app.rag_paused {
-        ("⏸ paused", Color::Yellow)
-    } else if app.rag_info.processing_items > 0 {
-        ("◉ indexing", Color::Yellow)
-    } else if app.rag_info.queued_items > 0 {
-        ("⏳ pending", Color::Yellow)
-    } else {
-        ("✓ ready", ACCENT)
+    use crate::rag::status::{compute_rag_model_status, RagModelStatus};
+
+    match compute_rag_model_status(
+        app.rag_paused,
+        app.rag_model_loaded,
+        app.rag_info.processing_items,
+    ) {
+        RagModelStatus::Paused => ("⏸ paused", Color::Yellow),
+        RagModelStatus::Ready if app.rag_info.processing_items > 0 => ("◉ indexing", Color::Yellow),
+        RagModelStatus::Ready => ("● ready", ACCENT),
+        RagModelStatus::Sleeping => ("○ sleeping", DIM),
     }
 }
 
