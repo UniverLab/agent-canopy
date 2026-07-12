@@ -776,16 +776,23 @@ async fn run_agent_process(
         Err(error) => return Ok(agent_spawn_failure(node, cli, model, error)),
     };
 
-    let spawn_result = tokio::time::timeout(
+    let timeout_result = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_minutes * 60),
         command.output(),
     )
-    .await
-    .with_context(|| format!("Agent node '{}' timed out.", node.name))?;
+    .await;
 
-    let output = match spawn_result {
-        Ok(output) => output,
-        Err(error) => return Ok(agent_spawn_failure(node, cli, model, error)),
+    let output = match timeout_result {
+        Ok(Ok(output)) => output,
+        // Spawn failure (e.g. E2BIG from oversized argv, binary not found,
+        // permission denied): route as a node failure so the graph's fail
+        // edge can handle it, never abort the whole loop run.
+        Ok(Err(error)) => return Ok(agent_spawn_failure(node, cli, model, error)),
+        // Timeout: the process started but didn't finish in time — propagate
+        // as a hard error (unchanged from prior behavior).
+        Err(_elapsed) => {
+            bail!("Agent node '{}' timed out.", node.name);
+        }
     };
 
     let exit_code = output.status.code().unwrap_or(-1);
@@ -3129,6 +3136,79 @@ mod tests {
                 .await
                 .expect("spawn failure must not propagate as hard error");
         assert_eq!(fail_result.status, LoopRunStatus::Fail);
+    }
+
+    /// Full engine integration: a node failure must route through the graph's
+    /// fail edge and let the loop continue — never abort the entire loop run.
+    /// This proves the resilience contract that the E2BIG fix depends on:
+    /// when `run_agent_process` returns a failed `NodeExecution` (instead of
+    /// propagating `Err`), the engine routes it through the fail edge.
+    #[tokio::test]
+    async fn loop_engine_node_failure_routes_through_fail_edge_and_loop_continues() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        // "implement" node: always fails (simulates any node failure,
+        // including an agent spawn failure that's caught by
+        // `run_agent_process`).
+        db.insert_loop_node(&LoopNode {
+            id: "node-implement".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "implement".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "exit 1",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        // "review" node: runs after the failure, proving the loop survived.
+        db.insert_loop_node(&LoopNode {
+            id: "node-review".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "review".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 2,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        // implement --fail--> review
+        db.insert_loop_edge(&LoopEdge {
+            id: "edge-fail".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "node-implement".to_string(),
+            to_node: "node-review".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Fail,
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+
+        // The loop must complete (not fail/abort), the spec must complete
+        // (review passed), and both nodes must have run.
+        assert_eq!(lp.status, LoopStatus::Completed);
+        assert_eq!(spec.status, LoopSpecStatus::Completed);
+        assert_eq!(runs.len(), 2);
+
+        let implement_run = runs.iter().find(|r| r.node_id == "node-implement").unwrap();
+        assert_eq!(implement_run.status, LoopRunStatus::Fail);
+
+        let review_run = runs.iter().find(|r| r.node_id == "node-review").unwrap();
+        assert_eq!(review_run.status, LoopRunStatus::Pass);
     }
 
     // ── N1: loop lifecycle notifications ──────────────────────────────────
