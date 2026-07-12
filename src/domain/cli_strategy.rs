@@ -4,10 +4,11 @@
 //! Commands are built dynamically based on the saved configuration.
 
 use std::collections::HashMap;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 /// Strategy for building CLI commands from registry config.
 pub struct CliStrategy {
@@ -17,6 +18,12 @@ pub struct CliStrategy {
     pub supports_working_dir: bool,
     pub working_dir_flag: Option<String>,
     pub env_vars: HashMap<String, String>,
+    /// When true, the prompt is delivered via stdin (backed by an anonymous
+    /// temp file) instead of argv. See [`CliConfig::prompt_via_stdin`] for
+    /// why this must stay opt-in per CLI.
+    ///
+    /// [`CliConfig::prompt_via_stdin`]: super::cli_config::CliConfig::prompt_via_stdin
+    pub prompt_via_stdin: bool,
 }
 
 /// Resolve the executable path for a CLI's configured `binary`.
@@ -81,8 +88,24 @@ impl CliStrategy {
             cmd.arg(arg);
         }
 
-        // Add prompt
-        cmd.arg(prompt);
+        // Deliver the prompt via stdin (backed by an anonymous temp file) or
+        // argv, per the CLI's registered capability. argv has an OS-level
+        // per-argument/argv size cliff (Linux MAX_ARG_STRLEN, ARG_MAX) that a
+        // large composed prompt (e.g. one embedding a prior node's full
+        // output) can cross, crashing the spawn with E2BIG. Node outputs are
+        // arbitrarily large, so any CLI that can read the prompt from stdin
+        // instead should.
+        if self.prompt_via_stdin {
+            let mut file = tempfile::tempfile().context("failed to create temp file for prompt")?;
+            file.write_all(prompt.as_bytes())
+                .context("failed to write prompt to temp file")?;
+            file.seek(SeekFrom::Start(0))
+                .context("failed to rewind prompt temp file")?;
+            cmd.stdin(std::process::Stdio::from(file));
+        } else {
+            cmd.arg(prompt);
+            cmd.stdin(std::process::Stdio::null());
+        }
 
         // Add model if specified
         if let Some(m) = model {
@@ -121,6 +144,7 @@ mod tests {
             supports_working_dir: true,
             working_dir_flag: Some("--workdir".to_string()),
             env_vars,
+            prompt_via_stdin: false,
         }
     }
 
@@ -192,6 +216,40 @@ mod tests {
 
         let cmd_str = format!("{:?}", cmd);
         assert!(cmd_str.contains("test-cli"));
+    }
+
+    #[test]
+    fn test_build_command_prompt_via_stdin_keeps_prompt_out_of_argv() {
+        let mut strategy = sample_strategy();
+        strategy.prompt_via_stdin = true;
+
+        let cmd = strategy
+            .build_command("this must not appear in argv", None, None)
+            .unwrap();
+
+        let cmd_str = format!("{:?}", cmd);
+        assert!(!cmd_str.contains("this must not appear in argv"));
+    }
+
+    #[tokio::test]
+    async fn test_build_command_prompt_via_stdin_delivers_huge_prompt() {
+        // A multi-hundred-KB prompt would blow argv (Linux MAX_ARG_STRLEN is
+        // 128KiB) if passed via `cmd.arg`. Piped via stdin it has no
+        // input-size cliff: spawn `cat`, which just echoes stdin to stdout.
+        let mut strategy = sample_strategy();
+        strategy.binary = "/bin/cat".to_string();
+        strategy.headless_mode = String::new();
+        strategy.model_flag = None;
+        strategy.supports_working_dir = false;
+        strategy.prompt_via_stdin = true;
+
+        let huge_prompt = "x".repeat(500 * 1024);
+        let mut cmd = strategy.build_command(&huge_prompt, None, None).unwrap();
+        cmd.stdout(std::process::Stdio::piped());
+
+        let output = cmd.output().await.unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), huge_prompt);
     }
 
     #[test]

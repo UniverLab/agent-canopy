@@ -141,6 +141,15 @@ fn handle_loop_info(db: &Database, id_or_name: &str) -> Result<()> {
                 " {} ({})  running {}  iteration {}",
                 node_name, node_kind, elapsed, run.iteration
             );
+            // Surfaces the exact baseline `{{spec_start_head}}` resolved to
+            // for this spec's current attempt (B10) — the one number every
+            // "why did this check pass/fail" debugging session needs.
+            if let Some(spec) = db.get_loop_spec(&run.spec_id)? {
+                match spec.spec_start_head {
+                    Some(head) => println!(" spec_start_head: {head}"),
+                    None => println!(" spec_start_head: (not a git workdir)"),
+                }
+            }
         }
     }
 

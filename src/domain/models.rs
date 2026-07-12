@@ -289,6 +289,7 @@ impl Cli {
             supports_working_dir: cli_config.supports_working_dir,
             working_dir_flag: cli_config.working_dir_flag.clone(),
             env_vars: cli_config.env_vars.clone(),
+            prompt_via_stdin: cli_config.prompt_via_stdin,
         })
     }
 

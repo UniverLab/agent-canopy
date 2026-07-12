@@ -408,7 +408,9 @@ fn build_cli_command(
     let strategy = cli.strategy();
     let mut cmd = strategy.build_command(prompt, model, working_dir)?;
 
-    cmd.stdin(std::process::Stdio::null());
+    // Stdin is already set by `build_command` (null for argv-mode CLIs, or
+    // an open temp-file handle carrying the prompt for stdin-mode CLIs) —
+    // don't clobber it here.
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
 

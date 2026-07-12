@@ -3728,6 +3728,10 @@ fn loop_spec_details_json(
         "blocked": blocker.is_some(),
         "blocker": blocker,
         "resume_actions": resume_actions,
+        // The baseline `{{spec_start_head}}` resolved to for this spec's
+        // current attempt (B10) — lets debugging see exactly which HEAD a
+        // check node's commit-detection compared against.
+        "spec_start_head": spec.spec.spec_start_head,
         "started_at": spec.spec.started_at.map(|value| value.to_rfc3339()),
         "completed_at": spec.spec.completed_at.map(|value| value.to_rfc3339()),
         "nodes": spec.nodes.iter().map(loop_node_json).collect::<Vec<_>>(),

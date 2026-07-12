@@ -51,6 +51,14 @@ pub struct CliConfig {
     /// Path to the custom instructions file (e.g. `.github/copilot-instructions.md`).
     #[serde(default)]
     pub instruction_file: Option<String>,
+    /// When true, the composed prompt is written to a temp file and piped in
+    /// via stdin instead of being passed as a command-line argument, keeping
+    /// argv small and fixed-size regardless of prompt size. Only set this for
+    /// CLIs that read the prompt from stdin when none is given as an argument
+    /// (e.g. `claude -p`). Defaults to `false` (legacy argv behavior), since
+    /// most CLIs require the prompt as a positional argument.
+    #[serde(default)]
+    pub prompt_via_stdin: bool,
 }
 
 /// Persisted CLI configuration for available CLIs.
@@ -153,6 +161,7 @@ mod tests {
             accent_color: None,
             yolo_flag: None,
             instruction_file: None,
+            prompt_via_stdin: false,
         }
     }
 

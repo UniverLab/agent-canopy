@@ -930,6 +930,7 @@ mod tests {
             accent_color: None,
             yolo_flag: None,
             instruction_file: None,
+            prompt_via_stdin: false,
         }
     }
 

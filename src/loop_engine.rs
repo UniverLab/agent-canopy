@@ -48,6 +48,16 @@ impl LoopEngine {
     /// Same as [`Self::start_background`], but optionally drives the loop's
     /// pending pool specs (see [`Self::run_loop`]) and/or overrides the
     /// workdir for this run only.
+    ///
+    /// This is a fresh dispatch, not a resume — it backs `loop_run`, the tool
+    /// a human/scheduler calls to launch or *relaunch* a loop (including
+    /// directly relaunching a `paused` loop instead of going through
+    /// `loop_continue`). Every spec it reaches is treated as newly entered
+    /// for `{{spec_start_head}}` purposes (B10): even a spec left `running`
+    /// from a stale, never-reset prior attempt gets a fresh baseline here,
+    /// rather than silently inheriting one captured under a previous
+    /// run/launch. See [`Self::resume_background`] for the one path that is
+    /// allowed to reuse a persisted baseline.
     pub fn start_background_run(
         self: Arc<Self>,
         loop_id: String,
@@ -101,11 +111,42 @@ impl LoopEngine {
     ///
     /// Without `pool_id`: identical to the pre-pool behavior (bound specs,
     /// `loop.workdir`).
+    ///
+    /// Equivalent to a fresh (non-resumed) dispatch — see
+    /// [`Self::run_loop_dispatch`] for the `is_resume` distinction that
+    /// matters for `{{spec_start_head}}` (B10).
     pub async fn run_loop(
         &self,
         loop_id: String,
         pool_id: Option<String>,
         workdir_override: Option<String>,
+    ) -> Result<()> {
+        self.run_loop_dispatch(loop_id, pool_id, workdir_override, false)
+            .await
+    }
+
+    /// Core of [`Self::run_loop`], plus the one bit `run_loop`'s public
+    /// signature can't carry: whether this call is *resuming* an
+    /// already-in-flight run ([`Self::resume_background`], the sole path
+    /// behind `loop_continue` and interrupted-pool/autorun resumption) or a
+    /// fresh dispatch (`loop_run`, including relaunching a `paused` loop
+    /// directly, and the loop's initial launch).
+    ///
+    /// That distinction is exactly what `{{spec_start_head}}` (B10) needs: a
+    /// spec can be left `running` in the DB either because this exact run is
+    /// paused mid-node-graph (daemon restart, explicit `loop_pause`) — where
+    /// the previously captured baseline is still correct and must be kept —
+    /// or because a *prior, distinct* run/launch died without ever being
+    /// reset — where reusing that baseline would silently compare against a
+    /// HEAD from a different attempt entirely. Only `is_resume = true`
+    /// (i.e. only [`Self::resume_background`]) is allowed to reuse it; every
+    /// other entry point re-captures, per spec.
+    async fn run_loop_dispatch(
+        &self,
+        loop_id: String,
+        pool_id: Option<String>,
+        workdir_override: Option<String>,
+        is_resume: bool,
     ) -> Result<()> {
         let Some(lp) = self.db.get_loop(&loop_id)? else {
             bail!("Loop '{}' not found.", loop_id);
@@ -148,7 +189,7 @@ impl LoopEngine {
                     continue;
                 };
 
-                match self.run_spec(&lp, &spec, &workdir).await? {
+                match self.run_spec(&lp, &spec, &workdir, is_resume).await? {
                     SpecExecutionOutcome::Completed => continue,
                     SpecExecutionOutcome::Paused => return Ok(()),
                     SpecExecutionOutcome::Failed(summary) => {
@@ -169,7 +210,7 @@ impl LoopEngine {
                         continue;
                     }
 
-                    match self.run_spec(&lp, &spec, &workdir).await? {
+                    match self.run_spec(&lp, &spec, &workdir, is_resume).await? {
                         SpecExecutionOutcome::Completed => continue,
                         SpecExecutionOutcome::Paused => return Ok(()),
                         SpecExecutionOutcome::Failed(summary) => {
@@ -223,6 +264,13 @@ impl LoopEngine {
     /// the scheduler's autorun auto-reset-and-resume, `loop_continue` — must
     /// go through, so a pool run is never silently swapped for the loop's own
     /// (typically empty) bound specs.
+    ///
+    /// This is the *only* entry point allowed to carry `is_resume = true`
+    /// into [`Self::run_loop_dispatch`] — see that function's doc for why the
+    /// distinction matters for `{{spec_start_head}}` (B10). A loop relaunched
+    /// via `loop_run` directly (even a `paused` one) goes through
+    /// [`Self::start_background_run`] instead and always gets a fresh
+    /// baseline.
     pub fn resume_background(self: Arc<Self>, loop_id: String) {
         let pool_id = self
             .db
@@ -230,14 +278,31 @@ impl LoopEngine {
             .ok()
             .flatten()
             .and_then(|lp| lp.active_run_pool_id);
-        self.start_background_run(loop_id, pool_id, None);
+        tokio::spawn(async move {
+            if let Err(error) = self
+                .run_loop_dispatch(loop_id.clone(), pool_id, None, true)
+                .await
+            {
+                tracing::error!("Loop '{}' failed to run: {error:#}", loop_id);
+                let _ = self.fail_loop(&loop_id, &error.to_string());
+            }
+        });
     }
 
+    /// Run one spec's node graph to completion, pause, or failure.
+    ///
+    /// `is_resume` (see [`Self::run_loop_dispatch`]) governs whether
+    /// `{{spec_start_head}}` may be inherited from a value this spec already
+    /// persisted (only valid when this call is genuinely continuing the same
+    /// in-flight attempt) or must be captured fresh (every other case,
+    /// including a spec that is stuck `running` from an unrelated, never-reset
+    /// prior attempt).
     async fn run_spec(
         &self,
         lp: &crate::domain::loops::Loop,
         spec: &LoopSpec,
         workdir: &str,
+        is_resume: bool,
     ) -> Result<SpecExecutionOutcome> {
         let spec_details = self
             .db
@@ -276,12 +341,38 @@ impl LoopEngine {
         let (mut current_node_id, mut previous_output, mut iterations) =
             resolve_spec_start(nodes, edges, spec, &existing_runs)?;
 
-        // Capture the workdir's git HEAD once, at the moment the spec starts
-        // running — not on every node. A resumed spec (interrupted mid-run
-        // by e.g. a daemon restart, then continued) reuses the value it
-        // already persisted instead of re-capturing, so `{{spec_start_head}}`
-        // always means "HEAD when this spec began", never "HEAD right now".
-        let spec_start_head = if spec.status == LoopSpecStatus::Running {
+        // Capture the workdir's git HEAD once, at the moment the engine
+        // starts executing this spec in the *current run attempt* — never
+        // re-resolved at node-exec time (B10). The persisted value is only
+        // ever reused, never re-derived, and only when both of these hold:
+        //
+        // - `is_resume` — this call is genuinely continuing the same
+        //   in-flight attempt (daemon restart mid-node-graph, explicit
+        //   `loop_pause`/`loop_continue`), not a fresh dispatch. Only
+        //   `resume_background` sets this; `start_background_run`/`loop_run`
+        //   — including relaunching a `paused` loop directly — never do, so
+        //   a relaunch always re-captures even if it finds a spec still
+        //   marked `running` from a stale, never-reset earlier attempt. That
+        //   stale-`running` case is exactly the 2026-07-11 incident: a
+        //   spec's baseline from a launch two relaunches earlier kept getting
+        //   silently reused because status alone couldn't distinguish "same
+        //   attempt, paused" from "different, abandoned attempt".
+        // - `spec.status == Running` — this spec itself has already started
+        //   (as opposed to a pending/failed spec a resumed pool/loop run is
+        //   only now reaching for the first time, which must capture fresh
+        //   like any other new entry).
+        //
+        // Whenever a fresh capture happens, it happens strictly before any
+        // node of this attempt executes (right here, before the node loop
+        // below and before `spec.status` is even flipped to `running`), so
+        // it can never observe a commit this attempt's own agent node is
+        // about to make — only commits that landed before this attempt
+        // started (e.g. a prior spec's work, or a concurrent spec sharing
+        // this workdir) are visible in it. Once captured, the value is fixed
+        // for every node execution and every review/check retry of this
+        // attempt, amend or no amend — it is never touched again until the
+        // next spec attempt captures its own.
+        let spec_start_head = if is_resume && spec.status == LoopSpecStatus::Running {
             spec_details.spec.spec_start_head.clone()
         } else {
             let head = capture_workdir_head(workdir).await;
@@ -551,16 +642,17 @@ async fn execute_agent_node(
         .and_then(Value::as_u64)
         .unwrap_or(30);
 
-    let mut command = cli
-        .strategy()
-        .build_command(&prompt, model, Some(workdir))
-        .with_context(|| format!("Agent node '{}' failed to start.", node.name))?;
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_minutes * 60),
-        command.output(),
+    let strategy = cli.strategy();
+    let execution = run_agent_process(
+        &cli,
+        &strategy,
+        node,
+        &prompt,
+        model,
+        workdir,
+        timeout_minutes,
     )
-    .await
-    .with_context(|| format!("Agent node '{}' timed out.", node.name))??;
+    .await?;
 
     if let Some(run) = db.get_loop_run(run_id)? {
         if run.status != LoopRunStatus::Running {
@@ -571,6 +663,46 @@ async fn execute_agent_node(
             });
         }
     }
+
+    Ok(execution)
+}
+
+/// Build the CLI command and spawn it, turning any failure to build or spawn
+/// the process into a failed `NodeExecution` rather than propagating a hard
+/// error. A spawn failure (e.g. `E2BIG` from an oversized argv) must fail
+/// this node like any other — routed through the graph's fail edge for
+/// resilience triage — never abort the whole loop run the way an `Err`
+/// bubbling out of here would.
+///
+/// A timeout is a different failure class (the process started; it just
+/// didn't finish in time) and still propagates as a hard error, unchanged
+/// from prior behavior.
+#[allow(clippy::too_many_arguments)]
+async fn run_agent_process(
+    cli: &Cli,
+    strategy: &crate::domain::cli_strategy::CliStrategy,
+    node: &LoopNode,
+    prompt: &str,
+    model: Option<&str>,
+    workdir: &str,
+    timeout_minutes: u64,
+) -> Result<NodeExecution> {
+    let mut command = match strategy.build_command(prompt, model, Some(workdir)) {
+        Ok(command) => command,
+        Err(error) => return Ok(agent_spawn_failure(node, cli, model, error)),
+    };
+
+    let spawn_result = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_minutes * 60),
+        command.output(),
+    )
+    .await
+    .with_context(|| format!("Agent node '{}' timed out.", node.name))?;
+
+    let output = match spawn_result {
+        Ok(output) => output,
+        Err(error) => return Ok(agent_spawn_failure(node, cli, model, error)),
+    };
 
     let exit_code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -592,6 +724,26 @@ async fn execute_agent_node(
         }),
         summary: format!("Agent node '{}' exited with code {}.", node.name, exit_code),
     })
+}
+
+fn agent_spawn_failure(
+    node: &LoopNode,
+    cli: &Cli,
+    model: Option<&str>,
+    error: impl std::fmt::Display,
+) -> NodeExecution {
+    let message = error.to_string();
+    NodeExecution {
+        status: LoopRunStatus::Fail,
+        output: serde_json::json!({
+            "kind": "agent",
+            "node_id": node.id,
+            "cli": cli.as_str(),
+            "model": model,
+            "error": message,
+        }),
+        summary: format!("Agent node '{}' failed to spawn: {}", node.name, message),
+    }
 }
 
 fn execute_gate_node(node: &LoopNode, previous_output: Option<&Value>) -> Result<NodeExecution> {
@@ -727,6 +879,53 @@ fn should_advance_to_next_spec(node: &LoopNode, status: LoopRunStatus) -> bool {
             .is_some_and(|route| route == "next_spec")
 }
 
+/// Above this many bytes, `{{previous_feedback}}` is elided to head+tail with
+/// a marker instead of interpolated in full. This is a defensive bound that
+/// applies regardless of prompt transport (argv or stdin): a prior node can
+/// emit an arbitrarily large output (e.g. a full `cargo test` log), and
+/// nothing about interpolating it whole into the next prompt is actually
+/// useful past a point. The full output is never lost — it stays in
+/// `loop_runs.output` for humans to inspect.
+const PREVIOUS_FEEDBACK_ELISION_THRESHOLD: usize = 16 * 1024;
+
+/// Elide the middle of `text` with a marker once it exceeds
+/// `PREVIOUS_FEEDBACK_ELISION_THRESHOLD`, keeping head and tail (each half
+/// the threshold) intact. Slices on char boundaries so it never panics on
+/// multi-byte UTF-8 content.
+fn bound_previous_feedback(text: String) -> String {
+    if text.len() <= PREVIOUS_FEEDBACK_ELISION_THRESHOLD {
+        return text;
+    }
+
+    let half = PREVIOUS_FEEDBACK_ELISION_THRESHOLD / 2;
+    let head_end = floor_char_boundary(&text, half);
+    let tail_start = ceil_char_boundary(&text, text.len() - half);
+    let elided_bytes = tail_start - head_end;
+
+    format!(
+        "{}\n[...{} bytes elided...]\n{}",
+        &text[..head_end],
+        elided_bytes,
+        &text[tail_start..]
+    )
+}
+
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    let mut i = index.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil_char_boundary(s: &str, index: usize) -> usize {
+    let mut i = index.min(s.len());
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
 fn render_agent_prompt(
     lp: &crate::domain::loops::Loop,
     spec: &LoopSpec,
@@ -738,6 +937,7 @@ fn render_agent_prompt(
     let previous_feedback = previous_output
         .map(|value| serde_json::to_string_pretty(value).unwrap_or_default())
         .unwrap_or_else(|| "(none)".to_string());
+    let previous_feedback = bound_previous_feedback(previous_feedback);
     let spec_content = spec.description.as_deref().unwrap_or(&spec.name);
     let prompt = prompt_template
         .replace("{{loop_name}}", &lp.name)
@@ -980,6 +1180,260 @@ mod tests {
         assert_eq!(lp.status, LoopStatus::Completed);
         assert_eq!(spec.status, LoopSpecStatus::Completed);
         assert_eq!(spec.spec_start_head, None);
+    }
+
+    // ── B10: spec_start_head frozen-per-attempt, amend-proof ─────────────
+
+    #[tokio::test]
+    async fn loop_engine_resume_dispatch_reuses_persisted_spec_start_head_even_if_stale() {
+        // `resume_background` (`loop_continue`, autorun's plain resume) is
+        // the one path allowed to inherit a spec's already-persisted
+        // baseline while it's still `running` — this is what makes resuming
+        // a daemon-restart-interrupted spec keep comparing against the HEAD
+        // it started at, not whatever HEAD happens to be at resume time.
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        init_git_repo(dir.path());
+
+        db.update_loop_spec_status(&spec_id, LoopSpecStatus::Running, None, None)
+            .unwrap();
+        db.set_loop_spec_start_head(&spec_id, Some("deadbeef"))
+            .unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "test \"{{spec_start_head}}\" = \"deadbeef\" && printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        engine
+            .run_loop_dispatch(loop_id.clone(), None, None, true)
+            .await
+            .unwrap();
+
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(spec.status, LoopSpecStatus::Completed);
+        assert_eq!(
+            spec.spec_start_head.as_deref(),
+            Some("deadbeef"),
+            "a resumed dispatch must reuse the persisted baseline, not recapture"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_engine_fresh_relaunch_recaptures_even_when_spec_still_shows_running() {
+        // The 2026-07-11 incident: a spec left `running` by a prior,
+        // never-reset attempt kept having its stale baseline reused across
+        // later relaunches ("12:56 relaunch compared against b9e8928, the
+        // HEAD of the ORIGINAL 07:58 launch, two relaunches earlier"). A
+        // fresh dispatch — `loop_run`/`start_background_run`, including
+        // relaunching a `paused` loop directly instead of via
+        // `loop_continue` — must never inherit that: it re-captures
+        // regardless of the spec's leftover `running` status.
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        init_git_repo(dir.path());
+        let real_head = git_head(dir.path());
+
+        // Simulate the abandoned attempt: still `running`, with a baseline
+        // that has nothing to do with the current, real HEAD.
+        db.update_loop_spec_status(&spec_id, LoopSpecStatus::Running, None, None)
+            .unwrap();
+        db.set_loop_spec_start_head(&spec_id, Some("deadbeef"))
+            .unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "test \"{{spec_start_head}}\" != \"deadbeef\" && printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        // `run_loop` is the fresh-dispatch entry point (same one `loop_run`
+        // uses) — no `is_resume` flag reaches it.
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(spec.status, LoopSpecStatus::Completed);
+        assert_eq!(
+            spec.spec_start_head.as_deref(),
+            Some(real_head.as_str()),
+            "a fresh relaunch must recapture the real current HEAD, not inherit the stale value"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_engine_check_retry_baseline_stays_frozen_across_reviewer_commits() {
+        // Placeholder captured at spec entry must be stable across every
+        // node execution of that attempt, including check retries after
+        // reviewer iterations — even while the reviewer keeps committing new
+        // work in between.
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        init_git_repo(dir.path());
+        let initial_head = git_head(dir.path());
+        let baseline_log = dir.path().join("baseline.log");
+        let counter = dir.path().join("counter");
+
+        // "review": always commits a bit more work and passes.
+        db.insert_loop_node(&LoopNode {
+            id: "node-review".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "review".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "echo more >> work.txt && git add -A && git commit -q -m more && printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        // "check": logs the substituted baseline every time it runs, and
+        // only passes on its third invocation — forcing review<->check to
+        // iterate a few times within the same spec attempt.
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": format!(
+                    "echo '{{{{spec_start_head}}}}' >> \"{log}\"; n=$(cat \"{counter}\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"{counter}\"; [ \"$n\" -ge 3 ] && printf APPROVED || exit 1",
+                    log = baseline_log.display(),
+                    counter = counter.display(),
+                ),
+                "success_condition": "exit_code_0"
+            }),
+            position: 2,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "edge-review-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "node-review".to_string(),
+            to_node: "node-check".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Pass,
+        })
+        .unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "edge-check-review".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "node-check".to_string(),
+            to_node: "node-review".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Fail,
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(spec.status, LoopSpecStatus::Completed);
+        assert_eq!(spec.spec_start_head.as_deref(), Some(initial_head.as_str()));
+
+        let logged = std::fs::read_to_string(&baseline_log).unwrap();
+        let lines: Vec<&str> = logged.lines().collect();
+        assert_eq!(
+            lines.len(),
+            3,
+            "check must have retried exactly twice before passing"
+        );
+        for line in lines {
+            assert_eq!(
+                line, initial_head,
+                "the substituted baseline must never move across retries, even though \
+                 the reviewer committed between every one of them"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_engine_regression_reviewer_commit_between_implement_and_check_uses_precommit_baseline(
+    ) {
+        // Regression for the 18:19 incident shape: the reviewer commits as
+        // part of this spec's own work, then the check node runs — it must
+        // evaluate against the baseline captured *before* that commit and
+        // pass, never see its own attempt's commit as "no movement".
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        init_git_repo(dir.path());
+        let pre_commit_head = git_head(dir.path());
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-implement".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "implement".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "echo change >> work.txt && git add -A && git commit -q -m change && printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "test \"$(git rev-parse HEAD)\" != \"{{spec_start_head}}\" && printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 2,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "edge-implement-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "node-implement".to_string(),
+            to_node: "node-check".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Pass,
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Completed);
+        assert_eq!(spec.status, LoopSpecStatus::Completed);
+        assert_eq!(
+            spec.spec_start_head.as_deref(),
+            Some(pre_commit_head.as_str()),
+            "the baseline must stay the pre-commit HEAD, never re-resolved after the \
+             reviewer's own commit"
+        );
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        let check_run = runs
+            .iter()
+            .find(|r| r.node_id == "node-check")
+            .expect("check node must have run");
+        assert_eq!(check_run.status, LoopRunStatus::Pass);
     }
 
     #[tokio::test]
@@ -1285,6 +1739,146 @@ mod tests {
         assert!(prompt.contains("loop_report_blocker"));
         assert!(prompt.contains("Do the thing"));
         assert!(prompt.contains("\"feedback\": \"ok\""));
+    }
+
+    #[test]
+    fn bound_previous_feedback_leaves_small_text_unchanged() {
+        let text = "small feedback".to_string();
+        assert_eq!(bound_previous_feedback(text.clone()), text);
+    }
+
+    #[test]
+    fn bound_previous_feedback_elides_marker_only_above_threshold() {
+        let at_threshold = "a".repeat(PREVIOUS_FEEDBACK_ELISION_THRESHOLD);
+        assert!(!bound_previous_feedback(at_threshold).contains("bytes elided"));
+
+        let over_threshold = "a".repeat(PREVIOUS_FEEDBACK_ELISION_THRESHOLD + 1);
+        let bounded = bound_previous_feedback(over_threshold);
+        assert!(bounded.contains("bytes elided"));
+        assert!(bounded.len() < PREVIOUS_FEEDBACK_ELISION_THRESHOLD + 200);
+    }
+
+    #[test]
+    fn render_agent_prompt_elides_huge_previous_feedback() {
+        // A prior node (e.g. a `cargo test` check) can emit a full log many
+        // times over the elision threshold — the real incident this fixes
+        // was a 65KB test log blowing up argv. The full text must never be
+        // interpolated whole; the marker must show it was cut.
+        let lp = crate::domain::loops::Loop {
+            id: "wf".to_string(),
+            name: "Loop".to_string(),
+            description: None,
+            workdir: "/tmp/project".to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            active_run_pool_id: None,
+        };
+        let spec = LoopSpec {
+            id: "spec".to_string(),
+            loop_id: Some("wf".to_string()),
+            name: "Spec".to_string(),
+            description: Some("Do the thing".to_string()),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+        };
+        let node = LoopNode {
+            id: "node-1".to_string(),
+            spec_id: Some("spec".to_string()),
+            loop_id: None,
+            name: "Agent".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+        let huge_log = "x".repeat(500 * 1024);
+
+        let prompt = render_agent_prompt(
+            &lp,
+            &spec,
+            &node,
+            "{{previous_feedback}}",
+            Some(&serde_json::json!({"stdout": huge_log})),
+            &lp.workdir,
+        );
+
+        assert!(prompt.contains("bytes elided"));
+        assert!(prompt.len() < 600 * 1024);
+    }
+
+    fn sample_agent_node() -> LoopNode {
+        LoopNode {
+            id: "node-agent".to_string(),
+            spec_id: Some("spec".to_string()),
+            loop_id: None,
+            name: "Agent".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn sample_strategy(binary: &str) -> crate::domain::cli_strategy::CliStrategy {
+        crate::domain::cli_strategy::CliStrategy {
+            binary: binary.to_string(),
+            headless_mode: String::new(),
+            model_flag: None,
+            supports_working_dir: false,
+            working_dir_flag: None,
+            env_vars: HashMap::new(),
+            prompt_via_stdin: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn run_agent_process_reports_spawn_failure_as_node_fail_not_hard_error() {
+        // Simulates the E2BIG incident: the process fails to spawn. This
+        // must come back as a failed node run (routed like any other node
+        // failure) rather than an `Err` that would abort the whole loop.
+        let cli = Cli::new("test-cli");
+        let mut strategy = sample_strategy("/nonexistent/somewhere/definitely-not-a-binary");
+        strategy.prompt_via_stdin = false;
+        let node = sample_agent_node();
+
+        let execution = run_agent_process(&cli, &strategy, &node, "prompt", None, "/tmp", 1)
+            .await
+            .expect("spawn failure must not propagate as a hard error");
+
+        assert_eq!(execution.status, LoopRunStatus::Fail);
+        assert!(execution.summary.contains("failed to spawn"));
+        assert!(execution.output.get("error").is_some());
+    }
+
+    #[tokio::test]
+    async fn run_agent_process_delivers_multi_hundred_kb_prompt_via_stdin() {
+        // Feedback arrives already truncated per `bound_previous_feedback`,
+        // but the transport itself must have no input-size cliff either —
+        // stdin-mode CLIs must handle an oversized prompt without E2BIG.
+        let cli = Cli::new("test-cli");
+        let mut strategy = sample_strategy("/bin/cat");
+        strategy.prompt_via_stdin = true;
+        let node = sample_agent_node();
+        let huge_prompt = "y".repeat(500 * 1024);
+
+        let execution = run_agent_process(&cli, &strategy, &node, &huge_prompt, None, "/tmp", 1)
+            .await
+            .unwrap();
+
+        assert_eq!(execution.status, LoopRunStatus::Pass);
+        assert_eq!(
+            execution.output.get("stdout").and_then(Value::as_str),
+            Some(huge_prompt.as_str())
+        );
     }
 
     #[test]
@@ -2158,5 +2752,142 @@ mod tests {
 
         let order = std::fs::read_to_string(&order_log).unwrap();
         assert_eq!(order.lines().collect::<Vec<_>>(), vec!["spec-a", "spec-b"]);
+    }
+
+    // ── E2BIG resilience: spawn failure routes through fail edge ──────
+
+    /// Agent spawn failure produces the correct NodeExecution shape that
+    /// `select_next_node` can route. This tests the contract between
+    /// `run_agent_process` (which catches E2BIG / spawn errors) and the
+    /// graph router (which selects the next node based on status).
+    #[tokio::test]
+    async fn agent_spawn_failure_node_execution_is_routable() {
+        let cli = Cli::new("test-cli");
+        let mut strategy = sample_strategy("/nonexistent/somewhere/definitely-not-a-binary");
+        strategy.prompt_via_stdin = false;
+        let node = sample_agent_node();
+
+        let execution = run_agent_process(&cli, &strategy, &node, "prompt", None, "/tmp", 1)
+            .await
+            .expect("spawn failure must not propagate as a hard error");
+
+        // The execution must be a Fail — exactly what select_next_node matches
+        // against the Fail edge condition.
+        assert_eq!(execution.status, LoopRunStatus::Fail);
+        assert!(execution.summary.contains("failed to spawn"));
+
+        // Verify the output JSON has the fields the loop engine expects.
+        let output = &execution.output;
+        assert_eq!(output.get("kind").and_then(Value::as_str), Some("agent"));
+        assert_eq!(
+            output.get("node_id").and_then(Value::as_str),
+            Some("node-agent")
+        );
+        assert!(output.get("error").is_some(), "must include error message");
+    }
+
+    /// The full E2BIG resilience path: prompt is built (with elision),
+    /// delivered via stdin (no argv cliff), and a spawn failure is caught
+    /// as a node-level failure. This exercises the three components that
+    /// together prevent the E2BIG incident from recurring:
+    /// 1. `bound_previous_feedback` — truncates large prior output
+    /// 2. `CliStrategy::build_command` with `prompt_via_stdin` — avoids argv
+    /// 3. `run_agent_process` — catches spawn errors as node failures
+    #[tokio::test]
+    async fn e2big_resilience_path_elision_stdin_and_spawn_failure() {
+        // 1. Simulate a huge previous_feedback (like a 65KB cargo test log).
+        let huge_log = "x".repeat(500 * 1024);
+        let bounded = bound_previous_feedback(huge_log.clone());
+        assert!(
+            bounded.contains("bytes elided"),
+            "large feedback must be elided"
+        );
+        assert!(
+            bounded.len() < 200 * 1024,
+            "elided feedback must be well under argv limit"
+        );
+
+        // 2. Render the full prompt — elision must survive composition.
+        let lp = crate::domain::loops::Loop {
+            id: "wf".to_string(),
+            name: "Loop".to_string(),
+            description: None,
+            workdir: "/tmp/project".to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            active_run_pool_id: None,
+        };
+        let spec = LoopSpec {
+            id: "spec".to_string(),
+            loop_id: Some("wf".to_string()),
+            name: "Spec".to_string(),
+            description: Some("Do the thing".to_string()),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+        };
+        let node = LoopNode {
+            id: "node-1".to_string(),
+            spec_id: Some("spec".to_string()),
+            loop_id: None,
+            name: "Agent".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+        let prompt = render_agent_prompt(
+            &lp,
+            &spec,
+            &node,
+            "{{previous_feedback}}",
+            Some(&serde_json::json!({"stdout": huge_log})),
+            &lp.workdir,
+        );
+        assert!(
+            prompt.contains("bytes elided"),
+            "composed prompt must contain the elision marker"
+        );
+        assert!(
+            prompt.len() < 300 * 1024,
+            "composed prompt must stay well under argv limit"
+        );
+
+        // 3. Deliver via stdin — no E2BIG even for oversized prompts.
+        //    `cat` echoes stdin to stdout; the full output must arrive intact
+        //    (the output contains the prompt twice: once via {{previous_feedback}}
+        //    template substitution, once as the explicit # [PREVIOUS FEEDBACK]
+        //    section — so stdout != prompt; we check it arrives in full instead).
+        let cli = Cli::new("test-cli");
+        let mut strategy = sample_strategy("/bin/cat");
+        strategy.prompt_via_stdin = true;
+        let stdin_node = sample_agent_node();
+
+        let execution =
+            run_agent_process(&cli, &strategy, &stdin_node, &prompt, None, "/tmp", 1).await;
+        let result = execution.expect("stdin delivery must not fail");
+        assert_eq!(result.status, LoopRunStatus::Pass);
+        let stdout = result.output.get("stdout").and_then(Value::as_str).unwrap();
+        assert!(
+            stdout.contains("bytes elided"),
+            "stdout from cat must contain the elision marker"
+        );
+
+        // 4. Spawn failure caught as node failure (not hard error).
+        let mut fail_strategy = sample_strategy("/nonexistent/binary");
+        fail_strategy.prompt_via_stdin = false;
+        let fail_result =
+            run_agent_process(&cli, &fail_strategy, &stdin_node, &prompt, None, "/tmp", 1)
+                .await
+                .expect("spawn failure must not propagate as hard error");
+        assert_eq!(fail_result.status, LoopRunStatus::Fail);
     }
 }
