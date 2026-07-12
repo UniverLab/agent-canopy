@@ -49,6 +49,17 @@ fn default_debounce() -> u64 {
     2
 }
 
+/// An agent row that failed to decode — e.g. a `trigger_config` written
+/// directly to SQLite by an external tool that isn't the JSON `Trigger`
+/// shape canopy expects. Carries just enough to quarantine and report the
+/// row; canopy never guesses at what the malformed data meant.
+#[derive(Debug, Clone)]
+pub struct CorruptAgent {
+    pub id: String,
+    pub enabled: bool,
+    pub error: String,
+}
+
 /// A unified agent — the core entity in canopy.
 ///
 /// An agent can have a trigger (cron schedule or file watcher) or no trigger

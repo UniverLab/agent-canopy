@@ -1,7 +1,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 
-use crate::domain::models::{Agent, RunLog, RunStatus};
+use crate::domain::models::{Agent, CorruptAgent, RunLog, RunStatus};
 
 // ── Repository traits ────────────────────────────────────────────────
 
@@ -14,7 +14,13 @@ pub trait AgentRepository {
     fn list_watch_agents(&self) -> Result<Vec<Agent>>;
     /// Agents currently disabled with a pending one-shot `enable_at`.
     fn list_pending_enable_agents(&self) -> Result<Vec<Agent>>;
-    fn delete_agent(&self, id: &str) -> Result<()>;
+    /// Agent rows that failed to decode (e.g. malformed `trigger_config`
+    /// written directly to SQLite by an external tool). Never errors the
+    /// whole query and never attempts to repair or reinterpret the row.
+    fn list_corrupt_agents(&self) -> Result<Vec<CorruptAgent>>;
+    /// Deletes by id without parsing the stored row, so a corrupt row can
+    /// always be removed. Returns whether a row was actually deleted.
+    fn delete_agent(&self, id: &str) -> Result<bool>;
     fn rename_agent(&self, old_id: &str, new_id: &str, new_log_path: &str) -> Result<()>;
     fn update_agent_enabled(&self, id: &str, enabled: bool) -> Result<()>;
     /// Leave the agent disabled but set a one-shot `enable_at` time.

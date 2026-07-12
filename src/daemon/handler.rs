@@ -1102,12 +1102,24 @@ impl TaskTriggerHandler {
             .db
             .list_agents()
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let corrupt = self
+            .db
+            .list_corrupt_agents()
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        if agents.is_empty() {
+        if agents.is_empty() && corrupt.is_empty() {
             return Ok(success_result("No agents registered."));
         }
 
-        let mut lines = vec![format!("Found {} agent(s):\n", agents.len())];
+        let mut lines = vec![format!(
+            "Found {} agent(s){}:\n",
+            agents.len(),
+            if corrupt.is_empty() {
+                String::new()
+            } else {
+                format!(" ({} corrupt)", corrupt.len())
+            }
+        )];
 
         for a in &agents {
             let mut info = format_agent_info(a);
@@ -1127,6 +1139,13 @@ impl TaskTriggerHandler {
             lines.push(info);
         }
 
+        for c in &corrupt {
+            lines.push(format!(
+                "- **{}** [corrupt config] — trigger_config failed to parse: {}\n",
+                c.id, c.error
+            ));
+        }
+
         Ok(CallToolResult::success(vec![Content::text(
             lines.join("\n"),
         )]))
@@ -1141,20 +1160,19 @@ impl TaskTriggerHandler {
         &self,
         Parameters(IdParam { id }): Parameters<IdParam>,
     ) -> Result<CallToolResult, McpError> {
-        let existing = self
-            .db
-            .get_agent(&id)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-
-        if existing.is_none() {
-            return Ok(error_result(&format!("No agent found with ID '{}'", id)));
-        }
-
         let _ = self.watcher_engine.stop_watcher(&id).await;
 
-        self.db
+        // Deletes by id without parsing the stored row, so a corrupt row
+        // (e.g. malformed trigger_config) can always be removed — it must
+        // never block its own repair.
+        let deleted = self
+            .db
             .delete_agent(&id)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        if !deleted {
+            return Ok(error_result(&format!("No agent found with ID '{}'", id)));
+        }
 
         self.scheduler_notify.notify_one();
         Ok(success_result(&format!("Agent '{}' removed", id)))

@@ -422,7 +422,9 @@ impl App {
     fn update_agent_section_focus_on_change(&mut self, _prev_selected: usize) {
         if let Some(agent) = self.agents.get(self.selected) {
             self.agent_section_focus = match agent {
-                AgentEntry::Agent(_) | AgentEntry::Group(_) => AgentSectionFocus::Background,
+                AgentEntry::Agent(_) | AgentEntry::Corrupt(_) | AgentEntry::Group(_) => {
+                    AgentSectionFocus::Background
+                }
                 AgentEntry::Interactive(_) | AgentEntry::Orphaned(_) => {
                     AgentSectionFocus::Interactive
                 }
@@ -1189,7 +1191,10 @@ impl App {
         match entry {
             AgentEntry::Interactive(idx) => self.interactive_agents.get(*idx),
             AgentEntry::Terminal(idx) => self.terminal_agents.get(*idx),
-            AgentEntry::Agent(_) | AgentEntry::Group(_) | AgentEntry::Orphaned(_) => None,
+            AgentEntry::Agent(_)
+            | AgentEntry::Corrupt(_)
+            | AgentEntry::Group(_)
+            | AgentEntry::Orphaned(_) => None,
         }
     }
 
@@ -1249,7 +1254,9 @@ impl App {
                 Some(format!("terminal:{}", agent.id))
             }
             types::AgentEntry::Agent(a) => Some(format!("agent:{}", a.id)),
-            types::AgentEntry::Group(_) | types::AgentEntry::Orphaned(_) => None,
+            types::AgentEntry::Corrupt(_)
+            | types::AgentEntry::Group(_)
+            | types::AgentEntry::Orphaned(_) => None,
         }
     }
 
@@ -1632,7 +1639,10 @@ impl App {
                 .terminal_agents
                 .get(*idx)
                 .map(|_| ContextTransferSource::Terminal(*idx)),
-            AgentEntry::Agent(_) | AgentEntry::Group(_) | AgentEntry::Orphaned(_) => None,
+            AgentEntry::Agent(_)
+            | AgentEntry::Corrupt(_)
+            | AgentEntry::Group(_)
+            | AgentEntry::Orphaned(_) => None,
         }
     }
 

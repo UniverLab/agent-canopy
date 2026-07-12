@@ -711,6 +711,12 @@ impl App {
                 use crate::application::ports::AgentRepository;
                 self.db.delete_agent(&agent.id)?;
             }
+            AgentEntry::Corrupt(corrupt) => {
+                // Deletes by id without parsing the stored row — a corrupt
+                // row must always be removable.
+                use crate::application::ports::AgentRepository;
+                self.db.delete_agent(&corrupt.id)?;
+            }
             AgentEntry::Group(idx) => {
                 if !self.delete_group_at(*idx) {
                     return Ok(());

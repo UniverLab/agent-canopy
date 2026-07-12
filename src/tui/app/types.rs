@@ -7,7 +7,7 @@ use crate::application::notification_service::NotificationService;
 use crate::db::project::{RagInfoSummary, RagQueueItem};
 use crate::db::Database;
 use crate::domain::loops::{Loop, LoopDetails, LoopNodeRun};
-use crate::domain::models::{Agent, RunLog};
+use crate::domain::models::{Agent, CorruptAgent, RunLog};
 use crate::domain::project::Project;
 use crate::domain::sync::{ActiveIntent, SyncMessage, WorkspaceStatus};
 use crate::rag::vector_store::SearchResult;
@@ -20,6 +20,10 @@ use crate::tui::app::terminal_search::TerminalSearch;
 #[allow(clippy::large_enum_variant)]
 pub enum AgentEntry {
     Agent(Agent),
+    /// An agent row that failed to decode (e.g. malformed `trigger_config`
+    /// written directly to SQLite by an external tool). Rendered as a
+    /// degraded card instead of crashing the whole sidebar.
+    Corrupt(CorruptAgent),
     Interactive(usize), // index into App::interactive_agents
     Terminal(usize),    // index into App::terminal_agents
     Orphaned(usize),    // index into App::orphaned_sessions
@@ -30,6 +34,7 @@ impl AgentEntry {
     pub fn id<'a>(&'a self, app: &'a App) -> &'a str {
         match self {
             Self::Agent(a) => &a.id,
+            Self::Corrupt(c) => &c.id,
             Self::Interactive(idx) => app
                 .interactive_agents
                 .get(*idx)

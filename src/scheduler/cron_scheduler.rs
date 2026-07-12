@@ -267,8 +267,34 @@ impl CronScheduler {
         }
     }
 
+    /// Quarantine any agent whose row failed to decode (e.g. a `trigger_config`
+    /// written directly to SQLite by an external tool, not the JSON shape
+    /// canopy expects): disable it and warn once, then leave it alone.
+    ///
+    /// Once disabled, the row is excluded from `list_cron_agents` (which
+    /// filters `enabled = 1`), so subsequent ticks never see it as still
+    /// enabled and never re-warn — this is what keeps a single corrupt row
+    /// from producing a repeating per-tick error. The row itself is never
+    /// touched or reinterpreted; only `enabled` changes.
+    fn quarantine_corrupt_agents(&self) -> anyhow::Result<()> {
+        for corrupt in self.db.list_corrupt_agents()? {
+            if !corrupt.enabled {
+                continue;
+            }
+            tracing::warn!(
+                "Agent '{}' has a corrupt trigger_config and cannot be scheduled ({}); \
+                 quarantining (disabling) it",
+                corrupt.id,
+                corrupt.error
+            );
+            self.db.update_agent_enabled(&corrupt.id, false)?;
+        }
+        Ok(())
+    }
+
     /// Fire all agents whose next cron time is now (within a 1-second tolerance).
     async fn fire_due_tasks(&self) -> anyhow::Result<()> {
+        self.quarantine_corrupt_agents()?;
         let agents = self.db.list_cron_agents()?;
         // Evaluate schedules in the user's local timezone. `now_utc` is only
         // used for the persisted `last_fired` comparison (which is stored in
@@ -660,7 +686,7 @@ mod tests {
     use super::*;
     use crate::application::notification_service::DefaultNotificationService;
     use crate::application::ports::AgentRepository;
-    use crate::domain::models::{Agent, Cli};
+    use crate::domain::models::{Agent, Cli, Trigger};
 
     fn manual_agent(id: &str, enabled: bool) -> Agent {
         Agent {
@@ -989,6 +1015,87 @@ mod tests {
             "expected to wake in ~5s for the pending enable_at, got {:?}",
             dur
         );
+    }
+
+    /// B7: a single agent row with a malformed `trigger_config` (e.g. a raw
+    /// cron string `11 3 11 7 *` written directly to SQLite by an external
+    /// tool, where JSON `{"type":"cron","schedule_expr":"..."}` is expected)
+    /// must be quarantined — disabled with one WARN — not left to bail
+    /// `list_cron_agents` and repeat "Scheduler fire failed" every tick.
+    #[test]
+    fn quarantine_corrupt_agents_disables_corrupt_row_and_leaves_healthy_untouched() {
+        let (db, scheduler) = test_scheduler();
+        db.insert_corrupt_agent_for_test("corrupt-1", true).unwrap();
+        db.upsert_agent(&manual_agent("healthy-1", true)).unwrap();
+
+        scheduler
+            .quarantine_corrupt_agents()
+            .expect("must not bail on a corrupt row");
+
+        let corrupt = db.list_corrupt_agents().unwrap();
+        assert_eq!(corrupt.len(), 1);
+        assert_eq!(corrupt[0].id, "corrupt-1");
+        assert!(!corrupt[0].enabled, "corrupt row must be quarantined");
+
+        let healthy = db.get_agent("healthy-1").unwrap().unwrap();
+        assert!(healthy.enabled, "healthy agent must be left untouched");
+    }
+
+    /// Quarantining an already-disabled corrupt row must be a no-op — this is
+    /// what keeps a repeated tick from re-warning about the same row forever.
+    #[test]
+    fn quarantine_corrupt_agents_is_idempotent_for_an_already_disabled_row() {
+        let (db, scheduler) = test_scheduler();
+        db.insert_corrupt_agent_for_test("corrupt-1", false)
+            .unwrap();
+
+        scheduler.quarantine_corrupt_agents().unwrap();
+        scheduler.quarantine_corrupt_agents().unwrap();
+
+        let corrupt = db.list_corrupt_agents().unwrap();
+        assert_eq!(corrupt.len(), 1, "the row itself is untouched, not deleted");
+        assert!(!corrupt[0].enabled);
+    }
+
+    /// The actual incident: `fire_due_tasks` (the scheduler tick) must not
+    /// bail when a corrupt cron row is present — it must quarantine that row
+    /// and still evaluate/fire the remaining, healthy cron agents.
+    #[tokio::test]
+    async fn fire_due_tasks_quarantines_corrupt_row_and_keeps_scheduling_others() {
+        let (db, scheduler) = test_scheduler();
+        db.insert_corrupt_agent_for_test("corrupt-1", true).unwrap();
+
+        let mut healthy = manual_agent("healthy-1", true);
+        healthy.cli = Cli::new("definitely-not-a-real-cli-binary-xyz");
+        healthy.trigger = Some(Trigger::Cron {
+            schedule_expr: "* * * * *".to_string(),
+        });
+        db.upsert_agent(&healthy).unwrap();
+
+        scheduler
+            .fire_due_tasks()
+            .await
+            .expect("a corrupt row must not fail the whole tick");
+
+        let corrupt = db.list_corrupt_agents().unwrap();
+        assert_eq!(corrupt.len(), 1);
+        assert!(!corrupt[0].enabled, "corrupt row must be quarantined");
+
+        {
+            let last_fired = scheduler.last_fired.lock().await;
+            assert!(
+                last_fired.contains_key("healthy-1"),
+                "the healthy cron agent must still have been evaluated and fired \
+                 despite the corrupt row"
+            );
+        }
+
+        // A second tick must not re-touch the now-disabled corrupt row (no
+        // repeated per-tick warning/write for the same row).
+        scheduler.fire_due_tasks().await.unwrap();
+        let corrupt_again = db.list_corrupt_agents().unwrap();
+        assert_eq!(corrupt_again.len(), 1);
+        assert!(!corrupt_again[0].enabled);
     }
 
     #[test]

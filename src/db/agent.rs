@@ -4,7 +4,7 @@ use rusqlite::{params, OptionalExtension};
 
 use crate::application::ports::AgentRepository;
 use crate::db::Database;
-use crate::domain::models::{Agent, Cli, Trigger};
+use crate::domain::models::{Agent, Cli, CorruptAgent, Trigger};
 
 const AGENT_COLUMNS: &str = "id, prompt, trigger_type, trigger_config, cli, model, working_dir, \
                              enabled, enable_at, created_at, log_path, timeout_minutes, expires_at, last_run_at, \
@@ -58,29 +58,7 @@ impl AgentRepository for Database {
         let mut stmt =
             conn.prepare(&format!("SELECT {AGENT_COLUMNS} FROM agents WHERE id = ?1"))?;
 
-        let row = stmt
-            .query_row(params![id], |row| {
-                Ok(AgentRow {
-                    id: row.get(0)?,
-                    prompt: row.get(1)?,
-                    trigger_type: row.get(2)?,
-                    trigger_config: row.get(3)?,
-                    cli_str: row.get(4)?,
-                    model: row.get(5)?,
-                    working_dir: row.get(6)?,
-                    enabled: row.get(7)?,
-                    enable_at_str: row.get(8)?,
-                    created_at_str: row.get(9)?,
-                    log_path: row.get(10)?,
-                    timeout_minutes: row.get(11)?,
-                    expires_at_str: row.get(12)?,
-                    last_run_at_str: row.get(13)?,
-                    last_run_ok: row.get(14)?,
-                    last_triggered_at_str: row.get(15)?,
-                    trigger_count: row.get(16)?,
-                })
-            })
-            .optional()?;
+        let row = stmt.query_row(params![id], AgentRow::from_row).optional()?;
 
         match row {
             Some(r) => Ok(Some(r.into_agent()?)),
@@ -104,7 +82,7 @@ impl AgentRepository for Database {
         self.list_agents_where("WHERE enabled = 0 AND enable_at IS NOT NULL")
     }
 
-    fn delete_agent(&self, id: &str) -> Result<()> {
+    fn delete_agent(&self, id: &str) -> Result<bool> {
         let conn = self
             .conn
             .lock()
@@ -113,8 +91,8 @@ impl AgentRepository for Database {
             "DELETE FROM runs WHERE background_agent_id = ?1",
             params![id],
         )?;
-        conn.execute("DELETE FROM agents WHERE id = ?1", params![id])?;
-        Ok(())
+        let deleted = conn.execute("DELETE FROM agents WHERE id = ?1", params![id])?;
+        Ok(deleted > 0)
     }
 
     fn rename_agent(&self, old_id: &str, new_id: &str, new_log_path: &str) -> Result<()> {
@@ -204,6 +182,25 @@ impl AgentRepository for Database {
         Ok(())
     }
 
+    fn list_corrupt_agents(&self) -> Result<Vec<CorruptAgent>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let sql = format!("SELECT {AGENT_COLUMNS} FROM agents ORDER BY created_at DESC");
+        let mut stmt = conn.prepare(&sql)?;
+
+        let rows = stmt.query_map([], AgentRow::from_row)?;
+
+        let mut corrupt = Vec::new();
+        for row_result in rows {
+            if let Err(c) = decode_agent_row(row_result?) {
+                corrupt.push(c);
+            }
+        }
+        Ok(corrupt)
+    }
+
     fn update_agent_triggered(&self, id: &str) -> Result<()> {
         let conn = self
             .conn
@@ -218,6 +215,10 @@ impl AgentRepository for Database {
 }
 
 impl Database {
+    /// Lists agents matching `where_clause`, silently skipping any row whose
+    /// `trigger_config` (or other fields) fails to decode. Healthy agents are
+    /// never affected; a corrupt row is simply absent here — callers that
+    /// need visibility into corrupt rows use [`AgentRepository::list_corrupt_agents`].
     fn list_agents_where(&self, where_clause: &str) -> Result<Vec<Agent>> {
         let conn = self
             .conn
@@ -227,34 +228,34 @@ impl Database {
             format!("SELECT {AGENT_COLUMNS} FROM agents {where_clause} ORDER BY created_at DESC");
         let mut stmt = conn.prepare(&sql)?;
 
-        let rows = stmt.query_map([], |row| {
-            Ok(AgentRow {
-                id: row.get(0)?,
-                prompt: row.get(1)?,
-                trigger_type: row.get(2)?,
-                trigger_config: row.get(3)?,
-                cli_str: row.get(4)?,
-                model: row.get(5)?,
-                working_dir: row.get(6)?,
-                enabled: row.get(7)?,
-                enable_at_str: row.get(8)?,
-                created_at_str: row.get(9)?,
-                log_path: row.get(10)?,
-                timeout_minutes: row.get(11)?,
-                expires_at_str: row.get(12)?,
-                last_run_at_str: row.get(13)?,
-                last_run_ok: row.get(14)?,
-                last_triggered_at_str: row.get(15)?,
-                trigger_count: row.get(16)?,
-            })
-        })?;
+        let rows = stmt.query_map([], AgentRow::from_row)?;
 
         let mut agents = Vec::new();
         for row_result in rows {
-            agents.push(row_result?.into_agent()?);
+            match decode_agent_row(row_result?) {
+                Ok(agent) => agents.push(agent),
+                Err(c) => tracing::debug!(
+                    "Skipping corrupt agent row '{}' in list query: {}",
+                    c.id,
+                    c.error
+                ),
+            }
         }
         Ok(agents)
     }
+}
+
+/// The one lenient row-decoding path for agent rows: never reinterprets or
+/// repairs malformed data, just reports it as [`CorruptAgent`] so callers can
+/// quarantine or flag the row instead of taking down the whole query.
+fn decode_agent_row(row: AgentRow) -> Result<Agent, CorruptAgent> {
+    let id = row.id.clone();
+    let enabled = row.enabled;
+    row.into_agent().map_err(|e| CorruptAgent {
+        id,
+        enabled,
+        error: e.to_string(),
+    })
 }
 
 struct AgentRow {
@@ -279,6 +280,28 @@ struct AgentRow {
 }
 
 impl AgentRow {
+    fn from_row(row: &rusqlite::Row) -> rusqlite::Result<Self> {
+        Ok(AgentRow {
+            id: row.get(0)?,
+            prompt: row.get(1)?,
+            trigger_type: row.get(2)?,
+            trigger_config: row.get(3)?,
+            cli_str: row.get(4)?,
+            model: row.get(5)?,
+            working_dir: row.get(6)?,
+            enabled: row.get(7)?,
+            enable_at_str: row.get(8)?,
+            created_at_str: row.get(9)?,
+            log_path: row.get(10)?,
+            timeout_minutes: row.get(11)?,
+            expires_at_str: row.get(12)?,
+            last_run_at_str: row.get(13)?,
+            last_run_ok: row.get(14)?,
+            last_triggered_at_str: row.get(15)?,
+            trigger_count: row.get(16)?,
+        })
+    }
+
     fn into_agent(self) -> Result<Agent> {
         let cli = Cli::from_str(&self.cli_str);
         let created_at =
@@ -328,5 +351,32 @@ impl AgentRow {
             last_triggered_at,
             trigger_count: self.trigger_count as u64,
         })
+    }
+}
+
+#[cfg(test)]
+impl Database {
+    /// Inserts an agent row with an unparseable `trigger_config` directly via
+    /// SQL, bypassing `upsert_agent`'s JSON serialization. Mirrors the real
+    /// incident this exists to guard against: an external tool writing a raw
+    /// cron string (`11 3 11 7 *`) into a column where canopy expects JSON
+    /// (`{"type":"cron","schedule_expr":"..."}`).
+    pub(crate) fn insert_corrupt_agent_for_test(&self, id: &str, enabled: bool) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        conn.execute(
+            "INSERT INTO agents (id, prompt, trigger_type, trigger_config, cli, enabled, created_at, log_path, timeout_minutes, trigger_count)
+             VALUES (?1, 'corrupt test agent', 'cron', ?2, 'opencode', ?3, ?4, ?5, 15, 0)",
+            params![
+                id,
+                "11 3 11 7 *",
+                enabled,
+                Utc::now().to_rfc3339(),
+                format!("/tmp/{id}.log"),
+            ],
+        )?;
+        Ok(())
     }
 }

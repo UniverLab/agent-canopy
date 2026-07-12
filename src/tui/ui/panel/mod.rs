@@ -313,6 +313,10 @@ fn draw_agent_panel(frame: &mut Frame, area: Rect, app: &mut App) -> bool {
             draw_background_agent_panel(frame, area, agent, app);
             true
         }
+        AgentEntry::Corrupt(corrupt) => {
+            draw_corrupt_agent_panel(frame, area, corrupt);
+            true
+        }
         AgentEntry::Orphaned(idx) => {
             if let Some(session) = app.orphaned_sessions.get(*idx) {
                 let text = format!(
@@ -326,6 +330,25 @@ fn draw_agent_panel(frame: &mut Frame, area: Rect, app: &mut App) -> bool {
             true
         }
     }
+}
+
+/// Renders a corrupt agent row's detail panel: id and parse error, no
+/// attempt to interpret the malformed data.
+fn draw_corrupt_agent_panel(
+    frame: &mut Frame,
+    area: Rect,
+    corrupt: &crate::domain::models::CorruptAgent,
+) {
+    let text = format!(
+        "{} [corrupt config]\n\nThis agent's trigger_config failed to parse and has been \
+         quarantined (disabled). It was not modified or reinterpreted.\n\nError: {}\n\nPress 'd' \
+         to delete this row.",
+        corrupt.id, corrupt.error
+    );
+    let paragraph = ratatui::widgets::Paragraph::new(text)
+        .style(ratatui::style::Style::default().fg(ratatui::style::Color::Red))
+        .wrap(ratatui::widgets::Wrap { trim: false });
+    frame.render_widget(paragraph, area);
 }
 
 fn draw_interactive_preview(frame: &mut Frame, area: Rect, app: &App, idx: usize) -> bool {
@@ -409,6 +432,10 @@ fn draw_selected_preview(frame: &mut Frame, area: Rect, app: &App, selected: &Ag
     match selected {
         AgentEntry::Agent(agent) => {
             draw_agent_details(frame, area, agent, app);
+            true
+        }
+        AgentEntry::Corrupt(corrupt) => {
+            draw_corrupt_agent_panel(frame, area, corrupt);
             true
         }
         AgentEntry::Interactive(idx) => draw_interactive_preview(frame, area, app, *idx),

@@ -1187,7 +1187,7 @@ fn agent_section_border_style(app: &App, section: AgentSectionFocus) -> Style {
     } else if app.focus == Focus::Agent {
         in_agents_mode && not_playground && {
             match app.agents.get(app.selected) {
-                Some(AgentEntry::Agent(_) | AgentEntry::Group(_)) => {
+                Some(AgentEntry::Agent(_) | AgentEntry::Corrupt(_) | AgentEntry::Group(_)) => {
                     section == AgentSectionFocus::Background
                 }
                 Some(AgentEntry::Interactive(_) | AgentEntry::Orphaned(_)) => {
@@ -1381,6 +1381,13 @@ fn agent_card_meta<'a>(agent: &'a AgentEntry, app: &'a App) -> AgentCardMeta<'a>
             accent: ACCENT,
             status_color: STATUS_OK,
             agent_type: "group",
+            type_detail: "",
+            work_dir: None,
+        },
+        AgentEntry::Corrupt(_) => AgentCardMeta {
+            accent: ratatui::style::Color::Red,
+            status_color: STATUS_FAIL,
+            agent_type: "corrupt config",
             type_detail: "",
             work_dir: None,
         },

@@ -108,6 +108,7 @@ impl App {
                 .get(*idx)
                 .map(|agent| agent.working_dir.as_str()),
             AgentEntry::Agent(agent) => agent.working_dir.as_deref(),
+            AgentEntry::Corrupt(_) => None,
             AgentEntry::Orphaned(idx) => self
                 .orphaned_sessions
                 .get(*idx)

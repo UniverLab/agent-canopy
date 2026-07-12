@@ -1754,8 +1754,75 @@ fn test_delete_agent() {
     db.upsert_agent(&sample_cron_agent("to-delete")).unwrap();
     assert!(db.get_agent("to-delete").unwrap().is_some());
 
-    db.delete_agent("to-delete").unwrap();
+    assert!(db.delete_agent("to-delete").unwrap(), "row existed");
     assert!(db.get_agent("to-delete").unwrap().is_none());
+}
+
+#[test]
+fn test_delete_agent_reports_whether_a_row_existed() {
+    let db = test_db();
+    assert!(
+        !db.delete_agent("never-existed").unwrap(),
+        "deleting a missing id must report false, not error"
+    );
+}
+
+/// B7: a single corrupt row (malformed `trigger_config`, e.g. a raw cron
+/// string inserted directly via SQL by an external tool) must not take down
+/// `list_agents`/`list_cron_agents`/`list_watch_agents` — it must simply be
+/// absent from those healthy-only lists.
+#[test]
+fn list_queries_skip_corrupt_row_without_erroring() {
+    let db = test_db();
+    db.insert_corrupt_agent_for_test("corrupt-1", true).unwrap();
+    db.upsert_agent(&sample_cron_agent("cron-1")).unwrap();
+    db.upsert_agent(&sample_watch_agent("watch-1")).unwrap();
+
+    let all = db
+        .list_agents()
+        .expect("a corrupt row must not error the whole query");
+    let mut ids: Vec<&str> = all.iter().map(|a| a.id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["cron-1", "watch-1"]);
+
+    let cron = db.list_cron_agents().expect("must not error");
+    assert_eq!(cron.len(), 1);
+    assert_eq!(cron[0].id, "cron-1");
+
+    let watch = db.list_watch_agents().expect("must not error");
+    assert_eq!(watch.len(), 1);
+    assert_eq!(watch[0].id, "watch-1");
+}
+
+/// `list_corrupt_agents` is the one place corrupt rows are surfaced —
+/// callers (scheduler quarantine, TUI, MCP `agent_list`) use it to flag the
+/// row instead of guessing at its contents.
+#[test]
+fn list_corrupt_agents_flags_the_row_with_its_parse_error() {
+    let db = test_db();
+    db.insert_corrupt_agent_for_test("corrupt-1", true).unwrap();
+    db.upsert_agent(&sample_cron_agent("cron-1")).unwrap();
+
+    let corrupt = db.list_corrupt_agents().unwrap();
+    assert_eq!(corrupt.len(), 1);
+    assert_eq!(corrupt[0].id, "corrupt-1");
+    assert!(corrupt[0].enabled);
+    assert!(
+        !corrupt[0].error.is_empty(),
+        "must carry the parse error for diagnosis"
+    );
+}
+
+/// `agent_remove` must always succeed against a corrupt row — it deletes by
+/// id and never has to parse `trigger_config` to do it.
+#[test]
+fn delete_agent_removes_corrupt_row_without_parsing_it() {
+    let db = test_db();
+    db.insert_corrupt_agent_for_test("corrupt-1", true).unwrap();
+
+    assert!(db.delete_agent("corrupt-1").unwrap());
+    assert!(db.list_corrupt_agents().unwrap().is_empty());
+    assert!(db.list_agents().unwrap().is_empty());
 }
 
 #[test]

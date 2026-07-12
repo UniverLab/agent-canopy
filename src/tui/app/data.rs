@@ -31,11 +31,17 @@ impl App {
 
     pub(super) fn refresh_agents(&mut self) -> Result<()> {
         let agents = self.db.list_agents()?;
+        // Corrupt rows (e.g. malformed trigger_config) never fail this
+        // refresh — they're shown as degraded cards instead.
+        let corrupt = self.db.list_corrupt_agents().unwrap_or_default();
 
         self.agents.clear();
         // Background agents first (they are rendered at the top of the sidebar)
         for a in agents {
             self.agents.push(AgentEntry::Agent(a));
+        }
+        for c in corrupt {
+            self.agents.push(AgentEntry::Corrupt(c));
         }
         // Interactive sessions
         for i in 0..self.interactive_agents.len() {
