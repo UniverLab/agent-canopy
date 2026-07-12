@@ -726,7 +726,18 @@ async fn execute_agent_node(
         .and_then(Value::as_u64)
         .unwrap_or(30);
 
-    let strategy = cli.strategy();
+    let mut strategy = cli.strategy();
+
+    // Node outputs are arbitrarily large (e.g. a full `cargo test` log), and
+    // the composed prompt embeds previous_output via `{{previous_feedback}}`.
+    // Even after elision, the total prompt can exceed Linux's
+    // MAX_ARG_STRLEN (128KiB), crashing the spawn with E2BIG. Force stdin
+    // delivery when the prompt is large — the temp-file + stdin transport
+    // has no size cliff.
+    if prompt.len() > ARGV_SAFETY_THRESHOLD && !strategy.prompt_via_stdin {
+        *strategy = strategy.with_stdin_forced();
+    }
+
     let execution = run_agent_process(
         &cli,
         &strategy,
@@ -978,6 +989,13 @@ fn should_advance_to_next_spec(node: &LoopNode, status: LoopRunStatus) -> bool {
 /// useful past a point. The full output is never lost — it stays in
 /// `loop_runs.output` for humans to inspect.
 const PREVIOUS_FEEDBACK_ELISION_THRESHOLD: usize = 16 * 1024;
+
+/// Maximum prompt size (in bytes) that is safe to pass via argv. Linux's
+/// `MAX_ARG_STRLEN` is 128KiB; we leave headroom for other argv elements
+/// (headless flags, model flag, working dir flag) by using 100KiB. When
+/// the composed prompt exceeds this, the loop engine forces stdin delivery
+/// regardless of the CLI's `prompt_via_stdin` registry setting.
+const ARGV_SAFETY_THRESHOLD: usize = 100 * 1024;
 
 /// Elide the middle of `text` with a marker once it exceeds
 /// `PREVIOUS_FEEDBACK_ELISION_THRESHOLD`, keeping head and tail (each half
@@ -2125,6 +2143,55 @@ mod tests {
         assert_eq!(
             execution.output.get("stdout").and_then(Value::as_str),
             Some(huge_prompt.as_str())
+        );
+    }
+
+    /// When the composed prompt exceeds `ARGV_SAFETY_THRESHOLD` and the CLI
+    /// doesn't have `prompt_via_stdin` set, the loop engine must override the
+    /// strategy to force stdin delivery — preventing E2BIG.
+    #[tokio::test]
+    async fn large_prompt_overrides_strategy_to_stdin() {
+        let cli = Cli::new("test-cli");
+        // Strategy starts with prompt_via_stdin = false (the problematic
+        // default that caused the original E2BIG incident).
+        let mut strategy = sample_strategy("/bin/cat");
+        assert!(!strategy.prompt_via_stdin);
+
+        // Simulate the override that execute_agent_node applies.
+        let large_prompt = "z".repeat(ARGV_SAFETY_THRESHOLD + 1);
+        if large_prompt.len() > ARGV_SAFETY_THRESHOLD && !strategy.prompt_via_stdin {
+            strategy = strategy.with_stdin_forced();
+        }
+        assert!(
+            strategy.prompt_via_stdin,
+            "stdin must be forced for large prompts"
+        );
+
+        let node = sample_agent_node();
+        let execution = run_agent_process(&cli, &strategy, &node, &large_prompt, None, "/tmp", 1)
+            .await
+            .unwrap();
+        assert_eq!(execution.status, LoopRunStatus::Pass);
+        assert_eq!(
+            execution.output.get("stdout").and_then(Value::as_str),
+            Some(large_prompt.as_str())
+        );
+    }
+
+    /// A prompt just under the threshold must NOT trigger the override —
+    /// argv delivery stays active for small prompts.
+    #[test]
+    fn small_prompt_does_not_force_stdin() {
+        let mut strategy = sample_strategy("/bin/cat");
+        assert!(!strategy.prompt_via_stdin);
+
+        let small_prompt = "a".repeat(ARGV_SAFETY_THRESHOLD);
+        if small_prompt.len() > ARGV_SAFETY_THRESHOLD && !strategy.prompt_via_stdin {
+            strategy = strategy.with_stdin_forced();
+        }
+        assert!(
+            !strategy.prompt_via_stdin,
+            "stdin must NOT be forced for small prompts"
         );
     }
 

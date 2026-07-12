@@ -11,6 +11,7 @@ use tokio::process::Command;
 use anyhow::{Context, Result};
 
 /// Strategy for building CLI commands from registry config.
+#[derive(Clone)]
 pub struct CliStrategy {
     pub binary: String,
     pub headless_mode: String,
@@ -64,6 +65,17 @@ fn resolve_binary_with_home(binary: &str, home: Option<&Path>) -> Result<PathBuf
 }
 
 impl CliStrategy {
+    /// Return a copy of this strategy with `prompt_via_stdin` forced to
+    /// `true`. Used by the loop engine when the composed prompt exceeds
+    /// the OS argv size limit — delivering via stdin avoids E2BIG
+    /// regardless of what the CLI's registered capability says.
+    pub fn with_stdin_forced(&self) -> Self {
+        Self {
+            prompt_via_stdin: true,
+            ..self.clone()
+        }
+    }
+
     /// Build a command using the registry-defined configuration.
     ///
     /// Resolves `self.binary` to an actual executable path first, so a
@@ -216,6 +228,22 @@ mod tests {
 
         let cmd_str = format!("{:?}", cmd);
         assert!(cmd_str.contains("test-cli"));
+    }
+
+    #[test]
+    fn test_with_stdin_forced_overrides_flag() {
+        let mut strategy = sample_strategy();
+        strategy.prompt_via_stdin = false;
+        let forced = strategy.with_stdin_forced();
+        assert!(
+            forced.prompt_via_stdin,
+            "with_stdin_forced must set prompt_via_stdin to true"
+        );
+        assert!(!strategy.prompt_via_stdin, "original must be unchanged");
+        assert_eq!(
+            strategy.binary, forced.binary,
+            "all other fields must be preserved"
+        );
     }
 
     #[test]
