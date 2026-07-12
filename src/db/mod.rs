@@ -203,7 +203,8 @@ impl Database {
                 started_at INTEGER,
                 completed_at INTEGER,
                 autorun_at INTEGER,
-                spec_pool TEXT
+                spec_pool TEXT,
+                active_run_pool_id TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_loops_workdir_created
@@ -583,6 +584,23 @@ impl Database {
                  ON loop_edges(loop_id, from_node);",
         )
         .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+
+        // `active_run_pool_id` persists which pool (if any) a loop's current/
+        // last run drew from, so an interrupted run (quota failure, daemon
+        // crash) can be resumed against the same pool by every resume path
+        // (scheduled autorun, `loop_reset`) instead of falling back to the
+        // loop's own bound specs. Older databases predate the column.
+        let has_active_run_pool_id: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loops') WHERE name = 'active_run_pool_id'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_active_run_pool_id {
+            conn.execute("ALTER TABLE loops ADD COLUMN active_run_pool_id TEXT", [])
+                .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
 
         Ok(())
     }

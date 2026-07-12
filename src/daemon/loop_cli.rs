@@ -370,6 +370,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            active_run_pool_id: None,
         }
     }
 

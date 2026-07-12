@@ -145,6 +145,31 @@ impl Database {
         .map_err(Into::into)
     }
 
+    /// Whether `pool_id` still has a member that isn't `completed`/`skipped`
+    /// (i.e. `pending` or stuck `running`). Used by the loop engine as a
+    /// guard against marking a pool run's loop `completed` when
+    /// [`Self::pool_next_pending_spec_id`] finds no `pending` member to pick
+    /// next but a member is nonetheless left non-terminal — e.g. `running`
+    /// because a previous run crashed mid-spec and hasn't been reset yet.
+    pub fn pool_has_incomplete_members(&self, pool_id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pool_members pm
+             JOIN loop_specs ls ON ls.id = pm.spec_id
+             WHERE pm.pool_id = ?1 AND ls.status NOT IN (?2, ?3)",
+            params![
+                pool_id,
+                LoopSpecStatus::Completed.as_str(),
+                LoopSpecStatus::Skipped.as_str()
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     pub fn get_pool_details(&self, pool_id: &str) -> Result<Option<PoolDetails>> {
         let Some(pool) = self.get_pool(pool_id)? else {
             return Ok(None);

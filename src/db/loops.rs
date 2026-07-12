@@ -28,8 +28,8 @@ impl Database {
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let (trigger_type, trigger_config) = encode_loop_trigger(lp.trigger.as_ref())?;
         conn.execute(
-            "INSERT INTO loops (id, name, description, workdir, status, trigger_type, trigger_config, created_at, started_at, completed_at, autorun_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO loops (id, name, description, workdir, status, trigger_type, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 &lp.id,
                 &lp.name,
@@ -42,6 +42,7 @@ impl Database {
                 lp.started_at.map(|value| value.timestamp()),
                 lp.completed_at.map(|value| value.timestamp()),
                 lp.autorun_at.map(|value| value.timestamp()),
+                &lp.active_run_pool_id,
             ],
         )?;
         Ok(())
@@ -82,7 +83,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id
              FROM loops WHERE autorun_at IS NOT NULL",
         )?;
         let rows = stmt.query_map([], map_loop_row)?;
@@ -121,7 +122,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id
              FROM loops WHERE trigger_type = ?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![trigger_type], map_loop_row)?;
@@ -166,7 +167,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id
              FROM loops WHERE id = ?1",
         )?;
 
@@ -181,10 +182,10 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let sql = if workdir.is_some() {
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id
              FROM loops WHERE workdir = ?1 ORDER BY created_at DESC"
         } else {
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id
              FROM loops ORDER BY created_at DESC"
         };
         let mut stmt = conn.prepare(sql)?;
@@ -225,6 +226,24 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Persist (or, with `None`, clear) the pool a run against `loop_id` is
+    /// currently drawing from. Called once when a run starts — including a
+    /// resumed run, so a failed pool run that gets auto-reset-and-relaunched
+    /// re-persists the same pool rather than losing it — and cleared again
+    /// only when a run finishes genuinely. See
+    /// [`crate::domain::loops::Loop::active_run_pool_id`].
+    pub fn set_loop_active_run_pool(&self, loop_id: &str, pool_id: Option<&str>) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE loops SET active_run_pool_id = ?1 WHERE id = ?2",
+            params![pool_id, loop_id],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// Reset a loop back to `Draft` (the status `loop_run` accepts) and clear
     /// `completed_at`, so a `failed` or `completed` loop can be relaunched via
     /// `loop_reset` + `loop_run` instead of being stuck forever.
@@ -260,6 +279,14 @@ impl Database {
     /// it can be relaunched. Shared by the `loop_reset` MCP tool and the
     /// scheduler's auto-reset-and-resume of a `failed` loop on autorun, so
     /// there is exactly one place that knows how to unstick a loop.
+    ///
+    /// When the loop's last run was against a pool (`active_run_pool_id` is
+    /// set), the pool's *members* are what actually need resetting — the
+    /// loop's own bound specs are typically empty for a pool run — so they're
+    /// folded into the same eligible set as the loop's bound specs, both for
+    /// validating an explicit `specs` list and for the "every non-completed"
+    /// default. This is the one reset implementation both `loop_reset` and
+    /// the scheduler's autorun share; it must not be forked.
     pub fn reset_loop(&self, loop_id: &str, specs: Option<&[String]>) -> Result<LoopResetOutcome> {
         let Some(lp) = self.get_loop(loop_id)? else {
             return Ok(LoopResetOutcome::NotFound);
@@ -269,9 +296,19 @@ impl Database {
             return Ok(LoopResetOutcome::Running);
         }
 
-        let loop_specs = self.list_loop_specs(loop_id)?;
+        let bound_specs = self.list_loop_specs(loop_id)?;
+        let pool_specs: Vec<LoopSpec> = match &lp.active_run_pool_id {
+            Some(pool_id) => self
+                .list_pool_member_spec_ids(pool_id)?
+                .into_iter()
+                .filter_map(|spec_id| self.get_loop_spec(&spec_id).transpose())
+                .collect::<Result<Vec<_>>>()?,
+            None => Vec::new(),
+        };
+        let eligible_specs: Vec<&LoopSpec> = bound_specs.iter().chain(pool_specs.iter()).collect();
+
         let valid_ids: std::collections::HashSet<&str> =
-            loop_specs.iter().map(|spec| spec.id.as_str()).collect();
+            eligible_specs.iter().map(|spec| spec.id.as_str()).collect();
 
         let target_ids: Vec<String> = match specs {
             Some(ids) => {
@@ -282,7 +319,7 @@ impl Database {
                 }
                 ids.to_vec()
             }
-            None => loop_specs
+            None => eligible_specs
                 .iter()
                 .filter(|spec| spec.status != LoopSpecStatus::Completed)
                 .map(|spec| spec.id.clone())
@@ -826,7 +863,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id
              FROM loops WHERE status = ?1",
         )?;
         let rows = stmt.query_map(params![LoopStatus::Running.as_str()], map_loop_row)?;
@@ -957,6 +994,7 @@ fn map_loop_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Loop> {
             .get::<_, Option<i64>>(9)?
             .map(from_timestamp)
             .transpose()?,
+        active_run_pool_id: row.get(10)?,
     })
 }
 

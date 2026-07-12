@@ -392,7 +392,13 @@ impl CronScheduler {
             }
 
             tracing::info!("Loop '{}' reached its autorun_at time; launching", lp.id);
-            Arc::clone(loop_engine).start_background(lp.id.clone());
+            // Resume with the loop's persisted run context (its pool, if any)
+            // rather than a fresh `start_background`, which would fall back
+            // to the loop's own bound specs — empty for a pool run, and
+            // exactly how a resumed pool run used to be mistaken for
+            // "nothing to do" and marked completed with members still
+            // pending.
+            Arc::clone(loop_engine).resume_background(lp.id.clone());
         }
         Ok(())
     }
@@ -752,6 +758,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            active_run_pool_id: None,
         }
     }
 
@@ -859,6 +866,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            active_run_pool_id: None,
         })
         .unwrap();
         db.insert_loop_spec(&LoopSpec {
@@ -925,6 +933,128 @@ mod tests {
             spec.status,
             LoopSpecStatus::Completed,
             "the auto-resumed run must have actually executed the spec's graph"
+        );
+    }
+
+    /// The exact incident this spec fixes: a loop was launched with
+    /// `loop_run { pool_id }`, failed mid-pool (e.g. a quota error), and its
+    /// `loop_schedule_autorun` fired to revive it. Before this fix, autorun
+    /// resumed the loop with its own bound specs — empty for a pool run — so
+    /// the engine found nothing to do and marked the loop `completed` with
+    /// pool members still pending. Firing autorun now must reset and resume
+    /// against the *same pool*, in queue order, until it's genuinely done.
+    #[tokio::test]
+    async fn fire_due_autorun_loops_resumes_same_pool_after_failed_run() {
+        use crate::domain::loops::{
+            Loop, LoopNode, LoopNodeKind, LoopSpec, LoopSpecStatus, LoopStatus,
+        };
+        use crate::domain::pools::Pool;
+
+        let (db, scheduler) = test_scheduler_with_loops();
+        let workdir = tempfile::tempdir().unwrap();
+        let loop_id = "failed-pool-autorun".to_string();
+        db.insert_loop(&Loop {
+            id: loop_id.clone(),
+            name: "Autorun pool test loop".to_string(),
+            description: None,
+            workdir: workdir.path().to_string_lossy().to_string(),
+            status: LoopStatus::Failed,
+            trigger: None,
+            created_at: Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            active_run_pool_id: Some("pool-1".to_string()),
+        })
+        .unwrap();
+
+        let standalone = |id: &str, position: i64, status: LoopSpecStatus| LoopSpec {
+            id: id.to_string(),
+            loop_id: None,
+            name: id.to_string(),
+            description: None,
+            position,
+            parallelizable: false,
+            status,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+        };
+        db.insert_loop_spec(&standalone("pool-done", 1, LoopSpecStatus::Completed))
+            .unwrap();
+        // Left `failed` by the run that hit quota mid-pool — never explicitly
+        // reset, unlike the loop's own status.
+        db.insert_loop_spec(&standalone("pool-failed", 2, LoopSpecStatus::Failed))
+            .unwrap();
+        db.insert_loop_spec(&standalone("pool-pending", 3, LoopSpecStatus::Pending))
+            .unwrap();
+        db.insert_pool(&Pool {
+            id: "pool-1".to_string(),
+            name: "pool-1".to_string(),
+            created_at: Utc::now(),
+        })
+        .unwrap();
+        for spec_id in ["pool-done", "pool-failed", "pool-pending"] {
+            db.append_pool_member("pool-1", spec_id).unwrap();
+        }
+        // No bound specs on the loop itself — this is what the real incident
+        // hit: a `loop_run { pool_id }` launch never binds specs to the loop.
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: Utc::now(),
+        })
+        .unwrap();
+        db.schedule_loop_autorun(&loop_id, Utc::now() - chrono::Duration::minutes(1))
+            .unwrap();
+
+        scheduler.fire_due_autorun_loops(Utc::now()).unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert!(lp.autorun_at.is_none(), "firing must clear autorun_at");
+        assert_ne!(
+            lp.status,
+            LoopStatus::Failed,
+            "the loop must be reset off `failed` before resuming"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let lp = db.get_loop(&loop_id).unwrap().unwrap();
+            if lp.status == LoopStatus::Completed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "resumed pool run did not complete in time; loop status is {:?}",
+                lp.status
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // All three pool members ran to completion via the *same* pool — not
+        // a false completion with them left pending.
+        for spec_id in ["pool-done", "pool-failed", "pool-pending"] {
+            let spec = db.get_loop_spec(spec_id).unwrap().unwrap();
+            assert_eq!(
+                spec.status,
+                LoopSpecStatus::Completed,
+                "spec '{spec_id}' should have completed via the resumed pool run"
+            );
+        }
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(
+            lp.active_run_pool_id, None,
+            "a genuinely finished pool run must clear the persisted run context"
         );
     }
 

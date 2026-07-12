@@ -288,6 +288,16 @@ pub struct Loop {
     /// instead of relying on a blindly polling cron.
     #[serde(default)]
     pub autorun_at: Option<DateTime<Utc>>,
+    /// The pool a run against this loop is currently drawing from, persisted
+    /// the moment that run starts (`None` for a bound-spec run). Interrupted
+    /// runs (a quota failure, a daemon restart) leave this set so every
+    /// resume path — scheduled autorun, `loop_reset` — knows which pool to
+    /// pick up rather than falling back to the loop's (often empty) bound
+    /// specs. Cleared only when a run finishes genuinely (nothing pending or
+    /// running left), so a later fresh `loop_run` against a different pool
+    /// isn't polluted by a stale value.
+    #[serde(default)]
+    pub active_run_pool_id: Option<String>,
 }
 
 impl Loop {
@@ -630,6 +640,7 @@ Task:
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            active_run_pool_id: None,
         }
     }
 

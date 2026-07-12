@@ -117,6 +117,14 @@ impl LoopEngine {
             Some(chrono::Utc::now()),
             None,
         )?;
+        // Persist which pool (if any) this run is drawing from *before* the
+        // first spec executes, so an interruption (quota failure, daemon
+        // crash) leaves behind the context every resume path needs — a
+        // resumed run must never fall back to the loop's own (often empty)
+        // bound specs. `None` for a bound-spec run, overwriting whatever a
+        // previous run against this loop may have left behind.
+        self.db
+            .set_loop_active_run_pool(&loop_id, pool_id.as_deref())?;
 
         // The run's `workdir` param wins over `loop.workdir` — a pool run can
         // point the same loop's graph at a different checkout without
@@ -173,6 +181,31 @@ impl LoopEngine {
             }
         }
 
+        // A pool run's live-pick loop above only ever breaks when no
+        // `pending` member remains — but a member can still be stuck
+        // `running`/`failed` from a prior interrupted run that was never
+        // reset. That isn't a genuinely finished pool, so the loop must not
+        // be marked `completed` out from under it (it would silently strand
+        // those members forever, exactly the false-completion this guards
+        // against).
+        if let Some(pool_id) = &pool_id {
+            if self.db.pool_has_incomplete_members(pool_id)? {
+                tracing::warn!(
+                    "Loop '{}' pool run against '{}' found no pending member to pick, but the \
+                     pool still has incomplete (non completed/skipped) member(s); leaving the \
+                     loop as-is rather than marking it completed. Reset the stuck member(s) via \
+                     loop_reset to resume.",
+                    loop_id,
+                    pool_id
+                );
+                return Ok(());
+            }
+        }
+
+        // The run is genuinely finished — clear the persisted run context so
+        // a later fresh `loop_run` against a different pool isn't polluted
+        // by this one.
+        self.db.set_loop_active_run_pool(&loop_id, None)?;
         self.db.update_loop_status(
             &loop_id,
             LoopStatus::Completed,
@@ -182,6 +215,22 @@ impl LoopEngine {
         self.notification_service
             .notify_task_completed(&loop_id, true, Some(0));
         Ok(())
+    }
+
+    /// Resume `loop_id` in the background using whatever run context (pool
+    /// or bound-spec) it last persisted via [`Database::set_loop_active_run_pool`].
+    /// The one path every "continue where this loop left off" entry point —
+    /// the scheduler's autorun auto-reset-and-resume, `loop_continue` — must
+    /// go through, so a pool run is never silently swapped for the loop's own
+    /// (typically empty) bound specs.
+    pub fn resume_background(self: Arc<Self>, loop_id: String) {
+        let pool_id = self
+            .db
+            .get_loop(&loop_id)
+            .ok()
+            .flatten()
+            .and_then(|lp| lp.active_run_pool_id);
+        self.start_background_run(loop_id, pool_id, None);
     }
 
     async fn run_spec(
@@ -788,6 +837,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            active_run_pool_id: None,
         };
         let spec = crate::domain::loops::LoopSpec {
             id: "spec-test".to_string(),
@@ -1196,6 +1246,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            active_run_pool_id: None,
         };
         let spec = LoopSpec {
             id: "spec".to_string(),
@@ -1583,6 +1634,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            active_run_pool_id: None,
         };
         db.insert_loop(&lp)?;
         Ok((
@@ -1706,6 +1758,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            active_run_pool_id: None,
         };
         db.insert_loop(&lp).unwrap();
         let spec = standalone_spec("bound-spec", 1);
@@ -1826,6 +1879,77 @@ mod tests {
         // The already-completed spec was skipped outright: no run recorded.
         assert!(db.list_loop_runs_for_spec(&done.id).unwrap().is_empty());
         assert_eq!(db.list_loop_runs_for_spec(&pending.id).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn loop_engine_pool_run_persists_context_and_clears_it_on_genuine_completion() {
+        let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+
+        let spec = standalone_spec("pool-spec", 1);
+        db.insert_loop_spec(&spec).unwrap();
+        insert_pool_with_members(&db, "pool-1", &[&spec.id]);
+
+        db.insert_loop_node(&LoopNode {
+            id: "loop-check".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        engine
+            .run_loop(loop_id.clone(), Some("pool-1".to_string()), None)
+            .await
+            .unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Completed);
+        assert_eq!(
+            lp.active_run_pool_id, None,
+            "a genuinely finished pool run must clear the persisted run context so a later \
+             fresh loop_run against a different pool isn't polluted by this one"
+        );
+    }
+
+    /// If `pool_next_pending_spec_id` finds no `pending` member to pick, but a
+    /// member is nonetheless left non-terminal (e.g. `running`, from a crash
+    /// mid-spec that never got reset), the pool isn't genuinely finished —
+    /// the loop must not be marked `completed` out from under it. This is
+    /// the guard that keeps a resumed pool run from repeating the incident's
+    /// false-completion (17 of 20 pool specs still pending, loop marked
+    /// completed anyway).
+    #[tokio::test]
+    async fn loop_engine_pool_run_does_not_complete_loop_while_member_left_running() {
+        let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+
+        let mut stuck = standalone_spec("pool-stuck", 1);
+        stuck.status = LoopSpecStatus::Running;
+        db.insert_loop_spec(&stuck).unwrap();
+        insert_pool_with_members(&db, "pool-1", &[&stuck.id]);
+
+        engine
+            .run_loop(loop_id.clone(), Some("pool-1".to_string()), None)
+            .await
+            .unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(
+            lp.status,
+            LoopStatus::Running,
+            "must not be marked completed while a pool member is still non-terminal"
+        );
+        assert_eq!(
+            lp.active_run_pool_id.as_deref(),
+            Some("pool-1"),
+            "the run context must survive so a later resume still knows the pool"
+        );
     }
 
     // ── R6: live pools — append and reorder while running ────────────────

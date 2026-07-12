@@ -2170,6 +2170,7 @@ impl TaskTriggerHandler {
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            active_run_pool_id: None,
         };
 
         self.db.insert_loop(&lp).map_err(internal_error)?;
@@ -3144,7 +3145,7 @@ impl TaskTriggerHandler {
     /// can never diverge in behavior.
     #[tool(
         name = "loop_reset",
-        description = "Reset a completed/failed loop back to pending so loop_run can relaunch it. Without `specs`, resets every non-completed spec, leaving already-completed ones untouched so loop_run resumes at the first pending spec. With `specs`, resets exactly those spec IDs, even if they were completed. Rejects a `running` loop — call loop_pause first. Note: a `failed` loop with a pending loop_schedule_autorun resets and resumes itself automatically when the schedule fires — call this manually only to reset sooner, reset a `completed` loop, or reset specific spec IDs."
+        description = "Reset a completed/failed loop back to pending so loop_run can relaunch it. Without `specs`, resets every non-completed spec, leaving already-completed ones untouched so loop_run resumes at the first pending spec. With `specs`, resets exactly those spec IDs, even if they were completed. If the loop's last run was against a pool, its pool members are what get reset (same semantics), since a pool run's own bound specs are typically empty. Rejects a `running` loop — call loop_pause first. Note: a `failed` loop with a pending loop_schedule_autorun resets and resumes itself automatically when the schedule fires — call this manually only to reset sooner, reset a `completed` loop, or reset specific spec IDs."
     )]
     async fn loop_reset(
         &self,
@@ -3166,7 +3167,7 @@ impl TaskTriggerHandler {
     /// a human decision, made via `loop_reset` + `loop_run`.
     #[tool(
         name = "loop_schedule_autorun",
-        description = "Schedule a one-shot resume for a loop at a future ISO 8601 time. When the scheduler reaches that time: a `failed` loop is auto-reset (same transition as loop_reset) and resumed — useful for a loop that failed on a quota to reschedule its own resumption at the exact reset time; a `completed` loop is left alone (the schedule is cleared but the loop is not re-run — use loop_reset + loop_run to re-run a finished loop); any other fireable status launches normally. The schedule always clears after firing (one-shot)."
+        description = "Schedule a one-shot resume for a loop at a future ISO 8601 time. When the scheduler reaches that time: a `failed` loop is auto-reset (same transition as loop_reset) and resumed — useful for a loop that failed on a quota to reschedule its own resumption at the exact reset time; a `completed` loop is left alone (the schedule is cleared but the loop is not re-run — use loop_reset + loop_run to re-run a finished loop); any other fireable status launches normally. If the loop's last run was against a pool, the resume targets that same pool (its pending members, in queue order) instead of the loop's own bound specs. The schedule always clears after firing (one-shot)."
     )]
     async fn loop_schedule_autorun(
         &self,
@@ -3271,7 +3272,9 @@ impl TaskTriggerHandler {
         self.db
             .update_loop_status(&params.loop_id, LoopStatus::Running, None, None)
             .map_err(internal_error)?;
-        Arc::clone(&self.loop_engine).start_background(params.loop_id.clone());
+        // Resume with the loop's persisted run context — a paused pool run
+        // must pick the same pool back up, not the loop's own bound specs.
+        Arc::clone(&self.loop_engine).resume_background(params.loop_id.clone());
 
         Ok(success_result(&format!(
             "Loop '{}' resumed with action '{}'.",
@@ -3999,6 +4002,7 @@ mod tests {
             started_at: None,
             completed_at: Some(chrono::Utc::now()),
             autorun_at: None,
+            active_run_pool_id: None,
         })
         .unwrap();
         (dir, db, loop_id)
@@ -4055,6 +4059,82 @@ mod tests {
         let spec = db.get_loop_spec("spec-done").unwrap().unwrap();
         assert_eq!(spec.status, LoopSpecStatus::Pending);
         assert!(spec.completed_at.is_none());
+    }
+
+    /// A loop whose last run was against a pool has empty (or irrelevant)
+    /// bound specs — the pool's *members* are what actually need resetting.
+    /// `loop_reset` must find them via the loop's persisted
+    /// `active_run_pool_id`, reset every non-completed one back to pending
+    /// (completed members untouched), and report the real count — not "0
+    /// spec(s) reset", the false report from the incident this spec fixes.
+    #[test]
+    fn loop_reset_pool_run_resets_pending_pool_members_and_reports_count() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let loop_id = "loop-pool-reset-test".to_string();
+        db.insert_loop(&Loop {
+            id: loop_id.clone(),
+            name: "Loop".to_string(),
+            description: None,
+            workdir: dir.path().to_string_lossy().to_string(),
+            status: LoopStatus::Failed,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: Some(chrono::Utc::now()),
+            autorun_at: None,
+            active_run_pool_id: Some("pool-1".to_string()),
+        })
+        .unwrap();
+
+        let standalone = |id: &str, position: i64, status: LoopSpecStatus| LoopSpec {
+            id: id.to_string(),
+            loop_id: None,
+            name: id.to_string(),
+            description: None,
+            position,
+            parallelizable: false,
+            status,
+            started_at: None,
+            completed_at: Some(chrono::Utc::now()),
+            spec_start_head: None,
+            workdir: None,
+        };
+        db.insert_loop_spec(&standalone("pool-done", 1, LoopSpecStatus::Completed))
+            .unwrap();
+        db.insert_loop_spec(&standalone("pool-failed", 2, LoopSpecStatus::Failed))
+            .unwrap();
+        db.insert_loop_spec(&standalone("pool-pending", 3, LoopSpecStatus::Pending))
+            .unwrap();
+        db.insert_pool(&Pool {
+            id: "pool-1".to_string(),
+            name: "pool-1".to_string(),
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        for spec_id in ["pool-done", "pool-failed", "pool-pending"] {
+            db.append_pool_member("pool-1", spec_id).unwrap();
+        }
+
+        let result = perform_loop_reset(&db, &loop_id, None).unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        let text = format!("{:?}", result.content);
+        assert!(text.contains("2 spec(s) reset"), "{text}");
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Draft);
+
+        let done = db.get_loop_spec("pool-done").unwrap().unwrap();
+        let failed = db.get_loop_spec("pool-failed").unwrap().unwrap();
+        let pending = db.get_loop_spec("pool-pending").unwrap().unwrap();
+        assert_eq!(
+            done.status,
+            LoopSpecStatus::Completed,
+            "completed pool member must be left untouched"
+        );
+        assert_eq!(failed.status, LoopSpecStatus::Pending);
+        assert!(failed.completed_at.is_none());
+        assert_eq!(pending.status, LoopSpecStatus::Pending);
     }
 
     #[test]
@@ -4460,6 +4540,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            active_run_pool_id: None,
         })
         .unwrap();
     }
@@ -4713,6 +4794,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            active_run_pool_id: None,
         })
         .unwrap();
         db.insert_loop_node(&LoopNode {

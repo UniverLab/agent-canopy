@@ -102,6 +102,7 @@ fn sample_loop(id: &str) -> Loop {
         started_at: None,
         completed_at: None,
         autorun_at: None,
+        active_run_pool_id: None,
     }
 }
 
@@ -1339,6 +1340,90 @@ fn pools_migration_is_idempotent_and_a_pre_r4_database_opens_cleanly() {
         )
         .unwrap();
     assert_eq!(raw, None);
+}
+
+#[test]
+fn active_run_pool_id_migration_is_idempotent_and_a_pre_b8_database_opens_cleanly() {
+    // Simulate a pre-B8 database: `loops` has `autorun_at` and `pools`/
+    // `pool_members` already exist, but `loops` predates `active_run_pool_id`.
+    let tmp = NamedTempFile::new().expect("create temp file");
+    let path = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+
+    {
+        let conn = rusqlite::Connection::open(&path).expect("open raw legacy db");
+        conn.execute_batch(
+            "CREATE TABLE loops (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                workdir TEXT NOT NULL,
+                status TEXT NOT NULL,
+                trigger_type TEXT,
+                trigger_config TEXT,
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER,
+                autorun_at INTEGER,
+                spec_pool TEXT
+             );
+             CREATE TABLE loop_specs (
+                id TEXT PRIMARY KEY,
+                loop_id TEXT REFERENCES loops(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                description TEXT,
+                position INTEGER NOT NULL,
+                parallelizable INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER,
+                workdir TEXT
+             );
+             CREATE TABLE pools (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+             );
+             CREATE TABLE pool_members (
+                pool_id TEXT NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
+                spec_id TEXT NOT NULL REFERENCES loop_specs(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                PRIMARY KEY (pool_id, spec_id)
+             );
+             INSERT INTO loops (id, name, workdir, status, created_at)
+                 VALUES ('legacy-loop', 'Legacy', '/tmp', 'failed', 0);
+             INSERT INTO loop_specs (id, loop_id, name, position, status)
+                 VALUES ('legacy-spec', NULL, 'Spec', 1, 'pending');
+             INSERT INTO pools (id, name, created_at) VALUES ('pool-1', 'pool-1', 0);
+             INSERT INTO pool_members (pool_id, spec_id, position)
+                 VALUES ('pool-1', 'legacy-spec', 1);",
+        )
+        .expect("seed legacy schema");
+    }
+
+    // Opening the DB (Database::new runs the migration) must succeed and add
+    // `active_run_pool_id` without disturbing existing rows.
+    let db = Database::new(&path).expect("open pre-B8 db, running migration");
+    let lp = db.get_loop("legacy-loop").unwrap().unwrap();
+    assert_eq!(lp.name, "Legacy");
+    assert_eq!(lp.active_run_pool_id, None);
+
+    // The new column is actually usable: persist a run context and reset
+    // through the shared path picks up the pool's members.
+    db.set_loop_active_run_pool("legacy-loop", Some("pool-1"))
+        .unwrap();
+    let outcome = db.reset_loop("legacy-loop", None).unwrap();
+    assert_eq!(
+        outcome,
+        crate::domain::loops::LoopResetOutcome::Reset { spec_count: 1 }
+    );
+    drop(db);
+
+    // Reopening after the migration already ran must be a no-op: same data,
+    // no error (idempotent).
+    let db = Database::new(&path).expect("reopen db after migration already applied");
+    let lp = db.get_loop("legacy-loop").unwrap().unwrap();
+    assert_eq!(lp.active_run_pool_id.as_deref(), Some("pool-1"));
 }
 
 #[test]
