@@ -204,11 +204,26 @@ fn selected_agent_accent(app: &App) -> Option<Color> {
     }
 }
 
-fn log_panel_border_color(app: &App) -> Color {
-    match app.focus {
-        Focus::Agent | Focus::Preview => selected_agent_accent(app).unwrap_or(BORDER_COLOR),
-        _ => BORDER_COLOR,
+/// Resolves (border color, label color) for the log panel given the current
+/// focus and the selected agent's accent (if any). Pure so it's testable
+/// without constructing a full `App`.
+fn panel_focus_colors(focus: Focus, agent_accent: Option<Color>) -> (Color, Color) {
+    let accent = agent_accent.unwrap_or(BORDER_COLOR);
+    match focus {
+        // Full-border accent for real focus.
+        Focus::Agent => (accent, accent),
+        // Preview is quieter: normal border, accent only on the label.
+        Focus::Preview => (BORDER_COLOR, accent),
+        _ => (BORDER_COLOR, BORDER_COLOR),
     }
+}
+
+fn log_panel_border_color(app: &App) -> Color {
+    panel_focus_colors(app.focus, selected_agent_accent(app)).0
+}
+
+fn panel_mode_label_color(app: &App) -> Color {
+    panel_focus_colors(app.focus, selected_agent_accent(app)).1
 }
 
 fn panel_mode_label(app: &App) -> Option<&'static str> {
@@ -544,11 +559,12 @@ pub(super) fn draw_log_panel(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 
     let border_color = log_panel_border_color(app);
+    let label_color = panel_mode_label_color(app);
     let title = panel_mode_label(app).map(|label| {
         Span::styled(
             label,
             Style::default()
-                .fg(border_color)
+                .fg(label_color)
                 .add_modifier(Modifier::BOLD),
         )
     });
@@ -1617,10 +1633,13 @@ fn find_session_by_name(app: &App, name: &str) -> Option<SessionRef> {
 #[cfg(test)]
 mod tests {
     use super::adjusted_interactive_cursor_col;
+    use super::panel_focus_colors;
     use super::split_warp_areas;
     use super::warp;
+    use super::BORDER_COLOR;
     use crate::tui::agent::screen::VtCell;
     use crate::tui::agent::ScreenSnapshot;
+    use crate::tui::app::types::Focus;
     use ratatui::layout::Rect;
     use ratatui::style::Color;
 
@@ -1714,5 +1733,41 @@ mod tests {
     #[test]
     fn warp_input_height_empty_is_base() {
         assert_eq!(warp::input_height("", 40), 4);
+    }
+
+    #[test]
+    fn focus_agent_draws_full_accent_border() {
+        let accent = Color::Rgb(200, 50, 50);
+        let (border, label) = panel_focus_colors(Focus::Agent, Some(accent));
+        assert_eq!(border, accent);
+        assert_eq!(label, accent);
+    }
+
+    #[test]
+    fn focus_preview_keeps_normal_border_and_accents_only_label() {
+        let accent = Color::Rgb(50, 200, 50);
+        let (border, label) = panel_focus_colors(Focus::Preview, Some(accent));
+        assert_eq!(border, BORDER_COLOR);
+        assert_eq!(label, accent);
+    }
+
+    #[test]
+    fn other_focus_states_use_normal_border_and_label() {
+        let accent = Color::Rgb(50, 50, 200);
+        let (border, label) = panel_focus_colors(Focus::Home, Some(accent));
+        assert_eq!(border, BORDER_COLOR);
+        assert_eq!(label, BORDER_COLOR);
+    }
+
+    #[test]
+    fn missing_accent_falls_back_to_border_color_everywhere() {
+        assert_eq!(
+            panel_focus_colors(Focus::Agent, None),
+            (BORDER_COLOR, BORDER_COLOR)
+        );
+        assert_eq!(
+            panel_focus_colors(Focus::Preview, None),
+            (BORDER_COLOR, BORDER_COLOR)
+        );
     }
 }
