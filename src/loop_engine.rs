@@ -39,6 +39,24 @@ struct NodeExecution {
     summary: String,
 }
 
+/// (B17) Distinct failure mode for [`LoopEngine::run_loop_dispatch`]'s launch
+/// guard: the loop's effective spec set (bound specs, or the given pool's
+/// pending members) was empty, so the run never actually launched. Unlike
+/// every other error `run_loop_dispatch` can return, this one must never flip
+/// the loop to `Failed` — [`LoopEngine::start_background_run`] and
+/// [`LoopEngine::resume_background`] downcast for it and skip `fail_loop`,
+/// leaving the loop's status exactly as it was before the call.
+#[derive(Debug)]
+struct EmptySpecSetError(String);
+
+impl std::fmt::Display for EmptySpecSetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for EmptySpecSetError {}
+
 impl LoopEngine {
     pub fn new(db: Arc<Database>, notification_service: Arc<dyn NotificationService>) -> Self {
         Self {
@@ -75,8 +93,15 @@ impl LoopEngine {
                 .run_loop(loop_id.clone(), pool_id, workdir_override)
                 .await
             {
-                tracing::error!("Loop '{}' failed to run: {error:#}", loop_id);
-                let _ = self.fail_loop(&loop_id, None, &error.to_string());
+                if error.downcast_ref::<EmptySpecSetError>().is_some() {
+                    // (B17) The loop never launched — its status is already
+                    // untouched, and it must stay that way, so don't
+                    // `fail_loop` it.
+                    tracing::error!("Loop '{}' launch refused: {error:#}", loop_id);
+                } else {
+                    tracing::error!("Loop '{}' failed to run: {error:#}", loop_id);
+                    let _ = self.fail_loop(&loop_id, None, &error.to_string());
+                }
             }
         });
     }
@@ -170,6 +195,18 @@ impl LoopEngine {
         let Some(lp) = self.db.get_loop(&loop_id)? else {
             bail!("Loop '{}' not found.", loop_id);
         };
+
+        // (B17) Compute the effective spec set BEFORE flipping the loop to
+        // `Running` — the single choke point every launch path (fresh
+        // `loop_run`, cron/watch triggers, scheduled autorun, and
+        // `loop_continue`'s resume) funnels through. An empty set is a launch
+        // error, not a successful no-op run: it must leave the loop's status
+        // untouched and record no run, so monitoring never sees a false
+        // `completed` over a backlog the caller simply failed to point this
+        // launch at (the 2026-07-14T14:16:31Z incident).
+        if let Some(message) = self.empty_launch_check(&loop_id, pool_id.as_deref())? {
+            return Err(EmptySpecSetError(message).into());
+        }
 
         self.db.update_loop_status(
             &loop_id,
@@ -297,7 +334,14 @@ impl LoopEngine {
             Some(chrono::Utc::now()),
         )?;
         let (done, total) = self.spec_progress(&loop_id, pool_id.as_deref())?;
-        let hook_launched = lp.on_completed.is_some();
+        // (B17) This dispatch's own completed-spec count is what makes a
+        // completion "real": a run that never actually executed a spec this
+        // dispatch (every bound spec was already completed/skipped, or —
+        // resuming a pool — the last pending member got skipped out from
+        // under it) still legitimately transitions to `Completed`, but must
+        // never fire `on_completed` for work it didn't do.
+        let executed_any_spec = !completed_specs.is_empty();
+        let hook_launched = executed_any_spec && lp.on_completed.is_some();
         self.notification_service.notify_loop_finished(
             &lp.name,
             LoopFinishOutcome::Completed {
@@ -312,8 +356,10 @@ impl LoopEngine {
         // fire-and-forget) so its outcome is recorded before this dispatch
         // returns, but its own pass/fail never feeds back into `loop_id`'s
         // status above: the run is already finished.
-        self.fire_completion_hook(&lp, &workdir, &completed_specs)
-            .await;
+        if executed_any_spec {
+            self.fire_completion_hook(&lp, &workdir, &completed_specs)
+                .await;
+        }
 
         Ok(())
     }
@@ -416,6 +462,105 @@ impl LoopEngine {
         }
     }
 
+    /// (B17) `Ok(Some(message))` if launching `loop_id` (optionally against
+    /// `pool_id`) would find no effective spec to run — `message` is the
+    /// actionable, human/LLM-readable error to surface. `Ok(None)` means the
+    /// launch may proceed.
+    ///
+    /// Exposed (not just inlined in [`Self::run_loop_dispatch`]) so the
+    /// synchronous `loop_run` MCP handler can hand this straight back to its
+    /// caller instead of the caller only finding out via a log line once the
+    /// fire-and-forget background dispatch fails — every other launch path
+    /// (autorun, cron/watch triggers, `loop_continue`) still gets the same
+    /// check from `run_loop_dispatch` itself.
+    ///
+    /// Emptiness is defined per launch mode:
+    /// - Bound specs (`pool_id` is `None`): the loop has *zero* specs bound
+    ///   to it at all — mirrors the incident exactly (a loop whose specs all
+    ///   live in a pool has no bound specs). Deliberately not "every bound
+    ///   spec is already completed/skipped" — a loop's own bound specs
+    ///   belong to it 1:1, so if they're all done the loop genuinely is
+    ///   finished (see the zero-execution completion path in
+    ///   `run_loop_dispatch`, which still completes but never fires the
+    ///   hook).
+    /// - A pool (`pool_id` is `Some`): the pool has no `pending` member *and*
+    ///   no other non-terminal (`running`/`failed`) member left either — i.e.
+    ///   [`Database::pool_has_incomplete_members`] is false. Unlike bound
+    ///   specs, a pool is a shared queue another loop or a stale relaunch can
+    ///   easily point at by mistake, so "every member already done" is
+    ///   treated as an error here rather than a silent, do-nothing
+    ///   completion (regression (b): a pool run where every member is
+    ///   already completed).
+    pub fn empty_launch_check(
+        &self,
+        loop_id: &str,
+        pool_id: Option<&str>,
+    ) -> Result<Option<String>> {
+        let Some(lp) = self.db.get_loop(loop_id)? else {
+            // Not-found is handled by the caller (`run_loop_dispatch` bails
+            // on it above this check runs; the MCP handler checks it before
+            // calling this at all) — nothing to report here.
+            return Ok(None);
+        };
+
+        let is_empty = match pool_id {
+            Some(pool_id) => !self.db.pool_has_incomplete_members(pool_id)?,
+            None => self.db.list_loop_specs(loop_id)?.is_empty(),
+        };
+        if !is_empty {
+            return Ok(None);
+        }
+
+        Ok(Some(self.empty_spec_set_message(&lp, pool_id)?))
+    }
+
+    /// Build the actionable error text for [`Self::empty_launch_check`].
+    ///
+    /// Pool membership doesn't record which loop(s) normally draw from it
+    /// (pool specs stay standalone — see [`Self::run_loop`]'s doc), so the
+    /// one concrete, discoverable link back to "which pool should this loop
+    /// use?" is the loop's own [`crate::domain::loops::Loop::active_run_pool_id`]
+    /// — the pool its last real run drew from. This is exactly requirement 3's
+    /// guard rail: a pool-less relaunch of a loop that was last pool-driven
+    /// names that pool so a recovery agent can retry correctly instead of
+    /// the launch silently discarding the pool context.
+    fn empty_spec_set_message(
+        &self,
+        lp: &crate::domain::loops::Loop,
+        pool_id: Option<&str>,
+    ) -> Result<String> {
+        match pool_id {
+            Some(pool_id) => {
+                let total = self.db.list_pool_member_spec_ids(pool_id)?.len();
+                Ok(format!(
+                    "Loop '{}' has no specs to run: pool '{}' has {} member(s), none pending \
+                     (all already completed/skipped, or the pool is empty). Add pending specs \
+                     to the pool, or pass a different pool_id.",
+                    lp.name, pool_id, total
+                ))
+            }
+            None => {
+                let mut message = format!(
+                    "Loop '{}' has no specs to run: it has 0 bound specs and no pool_id was \
+                     given.",
+                    lp.name
+                );
+                match &lp.active_run_pool_id {
+                    Some(last_pool) => {
+                        message.push_str(&format!(
+                            " Its last run drew from pool '{last_pool}' — pass pool_id: \
+                             \"{last_pool}\" to relaunch against it."
+                        ));
+                    }
+                    None => {
+                        message.push_str(" Pass pool_id to run it against a pool instead.");
+                    }
+                }
+                Ok(message)
+            }
+        }
+    }
+
     /// Resume `loop_id` in the background using whatever run context (pool
     /// or bound-spec) it last persisted via [`Database::set_loop_active_run_pool`].
     /// The one path every "continue where this loop left off" entry point —
@@ -441,8 +586,12 @@ impl LoopEngine {
                 .run_loop_dispatch(loop_id.clone(), pool_id, None, true)
                 .await
             {
-                tracing::error!("Loop '{}' failed to run: {error:#}", loop_id);
-                let _ = self.fail_loop(&loop_id, None, &error.to_string());
+                if error.downcast_ref::<EmptySpecSetError>().is_some() {
+                    tracing::error!("Loop '{}' launch refused: {error:#}", loop_id);
+                } else {
+                    tracing::error!("Loop '{}' failed to run: {error:#}", loop_id);
+                    let _ = self.fail_loop(&loop_id, None, &error.to_string());
+                }
             }
         });
     }
@@ -4323,8 +4472,13 @@ mod tests {
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         assert_eq!(lp.status, LoopStatus::Completed);
 
-        // Reset and recomplete.
-        db.reset_loop(&loop_id, None).unwrap();
+        // Reset and recomplete. `reset_loop`'s default (`specs: None`) leaves
+        // an already-`Completed` spec untouched (see its doc) — pass the
+        // spec id explicitly so it actually re-runs (B17: a dispatch that
+        // executes zero specs must not fire the hook a second time for
+        // doing nothing).
+        db.reset_loop(&loop_id, Some(std::slice::from_ref(&spec_id)))
+            .unwrap();
         engine.run_loop(loop_id.clone(), None, None).await.unwrap();
         drop(_home);
         drop(fake_home);
@@ -4334,6 +4488,214 @@ mod tests {
 
         let hook_runs = db.list_loop_completion_hook_runs(&loop_id).unwrap();
         assert_eq!(hook_runs.len(), 2, "hook must fire once per completion");
+    }
+
+    // ── B17: empty effective spec set is a launch error, not a completion ──
+
+    /// The core incident: a loop with zero bound specs and no `pool_id`
+    /// given must refuse to launch — not silently transition to
+    /// `Completed`. Status must stay untouched and no run recorded.
+    #[tokio::test]
+    async fn loop_engine_zero_bound_specs_and_no_pool_is_a_launch_error() {
+        let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+
+        let error = engine
+            .run_loop(loop_id.clone(), None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("no specs to run"),
+            "unexpected error message: {error}"
+        );
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(
+            lp.status,
+            LoopStatus::Draft,
+            "an empty launch must leave the loop's status untouched"
+        );
+        assert!(
+            db.list_loop_runs_for_loop(&loop_id).unwrap().is_empty(),
+            "an empty launch must record no run"
+        );
+    }
+
+    /// (Requirement 3) When the loop's last run was pool-driven and a fresh
+    /// `loop_run` arrives without `pool_id` and finds zero bound specs, the
+    /// error must name the last pool so a recovery agent can retry
+    /// correctly instead of silently discarding the pool context.
+    #[tokio::test]
+    async fn loop_engine_pool_less_relaunch_after_pool_run_names_last_pool() {
+        let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+
+        // Simulate the incident: a pool-driven run left interrupted (daemon
+        // crash, quota failure) — `active_run_pool_id` stays persisted
+        // (it's only ever cleared on a *genuine* completion) with pending
+        // pool members still queued behind it.
+        let pending = standalone_spec("pool-pending", 1);
+        db.insert_loop_spec(&pending).unwrap();
+        insert_pool_with_members(&db, "pool-1", &[&pending.id]);
+        db.set_loop_active_run_pool(&loop_id, Some("pool-1"))
+            .unwrap();
+
+        // The recovery agent's mistake: relaunch directly (the loop's own
+        // bound specs are still empty — every spec lives in the pool)
+        // without passing `pool_id` back.
+        let error = engine
+            .run_loop(loop_id.clone(), None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("pool-1"),
+            "error must name the last pool so a recovery agent can retry correctly: {error}"
+        );
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(
+            lp.status,
+            LoopStatus::Draft,
+            "the failed pool-less relaunch must not touch the loop's status"
+        );
+        assert_eq!(
+            lp.active_run_pool_id.as_deref(),
+            Some("pool-1"),
+            "the pool context must not be silently discarded by the failed relaunch"
+        );
+    }
+
+    /// (Requirement 4b) A pool run where every member is already completed
+    /// must be treated as the same empty-set error, not a fresh completed
+    /// run — a pool is shared/reusable, so "nothing pending" is far more
+    /// likely a stale/incorrect pool_id than a genuine finish.
+    #[tokio::test]
+    async fn loop_engine_pool_run_with_all_members_completed_is_a_launch_error() {
+        let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+
+        let mut done = standalone_spec("pool-done", 1);
+        done.status = LoopSpecStatus::Completed;
+        db.insert_loop_spec(&done).unwrap();
+        insert_pool_with_members(&db, "pool-1", &[&done.id]);
+
+        let error = engine
+            .run_loop(loop_id.clone(), Some("pool-1".to_string()), None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("no specs to run"),
+            "unexpected error message: {error}"
+        );
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(
+            lp.status,
+            LoopStatus::Draft,
+            "an empty pool launch must leave the loop's status untouched"
+        );
+    }
+
+    /// (Requirement 4c) A normal pool run — real pending members — still
+    /// completes and fires the `on_completed` hook exactly once; the B17
+    /// guard must not interfere with a genuine completion.
+    #[tokio::test]
+    async fn loop_engine_normal_pool_run_still_completes_and_fires_hook_once() {
+        let fake_home = setup_test_cli_home();
+        let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+        let marker = dir.path().join("hook_fired.marker");
+
+        let spec = standalone_spec("pool-spec", 1);
+        db.insert_loop_spec(&spec).unwrap();
+        insert_pool_with_members(&db, "pool-1", &[&spec.id]);
+
+        db.insert_loop_node(&LoopNode {
+            id: "loop-check".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let marker_path = marker.to_string_lossy().to_string();
+        let hook = crate::domain::loops::LoopCompletionHook {
+            platform: "test-cli".to_string(),
+            model: None,
+            prompt: format!("touch \"{}\"", marker_path),
+            timeout_minutes: Some(1),
+        };
+        db.update_loop_completion_hook(&loop_id, Some(&hook))
+            .unwrap();
+
+        let _home = HomeGuard::set(fake_home.path());
+        let result = engine
+            .run_loop(loop_id.clone(), Some("pool-1".to_string()), None)
+            .await;
+        drop(_home);
+        drop(fake_home);
+        result.unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Completed);
+        assert!(marker.exists(), "on_completed hook must have run");
+
+        let hook_runs = db.list_loop_completion_hook_runs(&loop_id).unwrap();
+        assert_eq!(hook_runs.len(), 1, "hook must fire exactly once");
+    }
+
+    /// A loop whose bound specs are non-empty but were *all* already
+    /// completed/skipped before this dispatch (e.g. the loop's last spec was
+    /// explicitly skipped via `loop_continue`) legitimately completes — the
+    /// B17 guard only fires on *zero bound specs*, not "zero pending" — but
+    /// must not fire the hook, since this dispatch executed nothing.
+    #[tokio::test]
+    async fn loop_engine_all_bound_specs_already_done_completes_without_firing_hook() {
+        let fake_home = setup_test_cli_home();
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        let marker = dir.path().join("hook_should_not_exist.marker");
+
+        db.update_loop_spec_status(
+            &spec_id,
+            LoopSpecStatus::Skipped,
+            None,
+            Some(chrono::Utc::now()),
+        )
+        .unwrap();
+
+        let marker_path = marker.to_string_lossy().to_string();
+        let hook = crate::domain::loops::LoopCompletionHook {
+            platform: "test-cli".to_string(),
+            model: None,
+            prompt: format!("touch \"{}\"", marker_path),
+            timeout_minutes: Some(1),
+        };
+        db.update_loop_completion_hook(&loop_id, Some(&hook))
+            .unwrap();
+
+        let _home = HomeGuard::set(fake_home.path());
+        let result = engine.run_loop(loop_id.clone(), None, None).await;
+        drop(_home);
+        drop(fake_home);
+        result.unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(
+            lp.status,
+            LoopStatus::Completed,
+            "a loop whose only bound spec is already skipped is genuinely done"
+        );
+        assert!(
+            !marker.exists(),
+            "on_completed must not fire for a dispatch that executed zero specs"
+        );
+        assert!(db
+            .list_loop_completion_hook_runs(&loop_id)
+            .unwrap()
+            .is_empty());
     }
 
     /// Placeholder interpolation: `{{loop_name}}`, `{{workdir}}`,

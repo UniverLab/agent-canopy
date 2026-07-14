@@ -3217,6 +3217,22 @@ impl TaskTriggerHandler {
             }
         }
 
+        // (B17) An empty effective spec set is a launch error, not a
+        // successful no-op run — check it here, synchronously, so the caller
+        // (human or an LLM recovery agent) gets the actionable message back
+        // directly instead of only via a log line once the fire-and-forget
+        // background dispatch below refuses to launch. `run_loop_dispatch`
+        // re-runs this identical check right before flipping the loop to
+        // `Running`, so every other launch path inherits it too.
+        match self
+            .loop_engine
+            .empty_launch_check(&params.loop_id, pool_id)
+        {
+            Ok(Some(message)) => return Ok(error_result(&message)),
+            Ok(None) => {}
+            Err(e) => return Err(internal_error(e.to_string())),
+        }
+
         Arc::clone(&self.loop_engine).start_background_run(
             params.loop_id.clone(),
             pool_id.map(str::to_string),
