@@ -30,7 +30,7 @@ no external services, no cloud account.
 |---|---|
 | **Daemon** | MCP server (Streamable HTTP + stdio), scheduler, watcher engine, database |
 | **Canopy Hub (TUI)** | Full-screen terminal UI for agents, loops and system metrics |
-| **46 MCP tools** | Agent management, sync, intelligence, seeds, loops, RAG, projects |
+| **61 MCP tools** | Agent management, sync, intelligence, seeds, loops, specs, pools, blueprints, RAG, projects |
 | **Seed identities** | Persistent, evolvable agent personalities stored as TOML |
 
 ## How the documentation is organized
@@ -42,7 +42,7 @@ no external services, no cloud account.
 - [Intelligence & Sync](intelligence-and-sync.md) — knowledge graph and multi-agent coordination.
 - [Loops](loops.md) — the DAG loop engine.
 - [RAG Pipeline](rag.md) — personal document search.
-- [MCP Tools](mcp-tools.md) — all 46 tools by category.
+- [MCP Tools](mcp-tools.md) — all 61 tools by category.
 - [CLI Reference](cli-reference.md) — every `canopy` command.
 
 ## Part of UniverLab

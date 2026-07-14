@@ -34,6 +34,17 @@ first if needed, and checking for updates).
 | `canopy mcp` | MCP wizard — sync/add/remove canopy's MCP entry across platforms |
 | `canopy doctor` | Full health diagnostics |
 
+## Loop inspection
+
+| Command | Description |
+|---|---|
+| `canopy loop list` | List all loops with status and spec progress |
+| `canopy loop list --workdir <path>` | Filter loops by workdir |
+| `canopy loop info <id-or-name>` | Detailed status for a single loop (specs, runs, hooks) |
+
+Loop ids can be specified by exact id, exact name, or unambiguous id
+prefix. Ambiguous references list the candidates.
+
 ## RAG
 
 | Command | Description |

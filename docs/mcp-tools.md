@@ -1,15 +1,15 @@
 ---
 title: MCP Tools
-description: All 46 MCP tools exposed by the canopy daemon, by category.
+description: All 61 MCP tools exposed by the canopy daemon, by category.
 order: 9
 ---
 
 # MCP Tools
 
-The daemon exposes **46 MCP tools** over Streamable HTTP (port 7755) and
+The daemon exposes **61 MCP tools** over Streamable HTTP (port 7755) and
 stdio. Connect any MCP-capable AI CLI with `canopy mcp`.
 
-## Agent management (12)
+## Agent management (13)
 
 | Tool | Description |
 |---|---|
@@ -18,6 +18,7 @@ stdio. Connect any MCP-capable AI CLI with `canopy mcp`.
 | `agent_list` | List registered agents |
 | `agent_remove` | Remove an agent |
 | `agent_enable` / `agent_disable` | Toggle an agent |
+| `agent_schedule_enable` | Schedule a one-shot enable at a future time |
 | `agent_run` | Run an agent immediately |
 | `agent_status` | Daemon health and agent status |
 | `agent_models` | List available models per CLI |
@@ -53,14 +54,42 @@ stdio. Connect any MCP-capable AI CLI with `canopy mcp`.
 | `evolve_identity` | Refine the identity over time |
 | `create_seed` / `list_seeds` / `remove_seed` | Manage the seed nursery |
 
-## Loop engine (15)
+## Loop engine (17)
 
 `loop_create`, `loop_update`, `loop_add_spec`,
 `loop_update_spec`, `loop_add_node`, `loop_update_node`,
 `loop_add_edge`, `loop_update_edge`, `loop_get`,
-`loop_list`, `loop_run`, `loop_pause`, `loop_continue`,
+`loop_list`, `loop_run`, `loop_reset`, `loop_schedule_autorun`,
+`loop_pause`, `loop_continue`,
 `loop_complete_node`, `loop_report_blocker` — see
 [Loops](loops.md).
+
+## Spec backlog (4)
+
+| Tool | Description |
+|---|---|
+| `spec_create` | Create a standalone spec (not bound to any loop) |
+| `spec_list` | List specs, filterable by workdir and status |
+| `spec_update` | Update a spec's name, description, or workdir tag |
+| `spec_delete` | Delete an unbound spec |
+
+## Spec pools (5)
+
+| Tool | Description |
+|---|---|
+| `pool_create` | Create an ordered queue of specs |
+| `pool_add_spec` | Append a spec to the end of a pool's queue |
+| `pool_list` | List a pool's members, or all pools |
+| `pool_remove_spec` | Remove a spec from a pool |
+| `pool_reorder` | Full replacement of a pool's queue order |
+
+## Node blueprints (3)
+
+| Tool | Description |
+|---|---|
+| `blueprint_list` | List all builtins and custom blueprints |
+| `blueprint_create` | Create a reusable node config template |
+| `blueprint_delete` | Delete a custom blueprint (builtins protected) |
 
 ## Project (2)
 

@@ -26,16 +26,39 @@ The dialog includes a CLI picker, model picker, seed identity selector
 
 ## Monitoring
 
+- **Agent status colors** — green for working (recent output), blue for
+  idle, red for failed, gray for exited. The sidebar shows a colored
+  gutter bar per agent.
 - **Split groups** — side-by-side horizontal/vertical views to watch
   multiple agents simultaneously.
 - **System dashboard** — CPU, memory, disk, GPU (NVIDIA/Linux/macOS) and
   temperatures with amber/red alert thresholds. Under WSL, metrics come
   from the Windows host via PowerShell.
+- **Live loop view** — real-time graph rendering of the running loop's
+  current spec, auto-following the active node. Manual node inspection
+  shows per-node run info (status, elapsed time, output tail, iteration).
+  `Esc` toggles between auto-follow and manual mode.
 - **Idle visuals** — Brian's Brain cellular automaton and animated
   kaomoji status messages (whimsg).
 
+## Projects sidebar
+
+The sidebar shows sections for the selected project:
+
+- **Loops** — active loops with spec progress (done/total) and current
+  spec indicator. Selecting a loop opens the live loop view.
+- **Backlog** — standalone specs tagged to the project's workdir, not
+  yet assigned to any loop.
+- **History** — completed and failed loops for the project.
+
+Sections are automatically filtered by the selected project's workdir.
+
 ## Moving context around
 
+- **Scheduled delivery** — `Shift+Enter` (requires Kitty keyboard
+  enhancement protocol support) opens a time picker to send the prompt
+  at a chosen hour instead of immediately. Falls back to `Ctrl+S` on
+  terminals without Kitty protocol.
 - **Context transfer** — a two-step modal (preview → agent picker)
   transfers conversation context, prompts and output between agents while
   preserving session state and scrollback.
@@ -54,6 +77,8 @@ validation. See [Loops](loops.md) for the engine itself.
 
 ## Notifications
 
-Native desktop notifications for task completions, failures and watcher
-triggers. Platform auto-detected: WSL (PowerShell toasts), macOS
+Native desktop notifications for task completions, failures, watcher
+triggers, and loop lifecycle events (loop started, spec completed with
+progress, loop finished with outcome, blocker reported, completion hook
+failure). Platform auto-detected: WSL (PowerShell toasts), macOS
 (`osascript`), Linux (`notify-send`).

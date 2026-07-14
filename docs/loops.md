@@ -36,7 +36,11 @@ feed its output back into the retrying agent node.
 Create → run → (pause / continue) → complete. `loop_continue`
 supports **retry** and **skip** strategies for stuck nodes, and
 `loop_report_blocker` escalates to a human when intervention is
-needed. Iteration limits prevent infinite retry loops.
+needed. Iteration limits prevent infinite retry loops. `loop_reset`
+returns a completed/failed loop to pending so `loop_run` can restart
+it, and `loop_schedule_autorun` sets a future time at which the loop
+auto-resumes (useful for quota-limited loops that fail and need to
+wait before retrying).
 
 ## `on_completed` hook
 
@@ -68,17 +72,53 @@ The first intended use is a documentation-maintenance agent: on
 completion, review the specs this run closed, the resulting code, and
 `docs/`/`README`, then update the docs to match what actually shipped.
 
-## The 15 MCP tools
+## Standalone spec backlog
+
+Specs don't have to belong to a loop. The spec backlog lets you create,
+list, update and delete specs independently, optionally tagging each to
+a workdir for filtering:
+
+| Tool | Description |
+|---|---|
+| `spec_create` | Create a standalone spec |
+| `spec_list` | List specs (filterable by workdir, status) |
+| `spec_update` | Update a spec's name, description, or workdir tag |
+| `spec_delete` | Delete an unbound spec |
+
+The TUI sidebar shows backlog specs under the **Backlog** section,
+filtered to the selected project's workdir.
+
+## Spec pools
+
+A **pool** is an ordered queue of existing specs decoupled from any one
+loop. When a loop runs against a pool, it drains the pool's pending
+specs (in queue order) through the loop's graph instead of its own
+bound specs:
+
+| Tool | Description |
+|---|---|
+| `pool_create` | Create an empty pool |
+| `pool_add_spec` | Append a spec to the end of a pool's queue |
+| `pool_list` | List a pool's members (or all pools) |
+| `pool_remove_spec` | Remove a spec from a pool |
+| `pool_reorder` | Full replacement of a pool's queue order |
+
+Pool membership is unaffected by `loop_run` — specs stay standalone.
+The `loop info` CLI and `loop_get` MCP tool show pool-driven progress
+by reconstructing what ran from the run history.
+
+## The 22 MCP tools
 
 | Stage | Tools |
 |---|---|
 | Authoring | `loop_create`, `loop_update`, `loop_add_spec`, `loop_update_spec`, `loop_add_node`, `loop_update_node`, `loop_add_edge`, `loop_update_edge` |
 | Inspection | `loop_get`, `loop_list` |
-| Runtime | `loop_run`, `loop_pause`, `loop_continue`, `loop_complete_node`, `loop_report_blocker` |
+| Runtime | `loop_run`, `loop_reset`, `loop_schedule_autorun`, `loop_pause`, `loop_continue`, `loop_complete_node`, `loop_report_blocker` |
 
 Loops can be authored programmatically by agents through these tools,
 or edited in the [TUI loop editor](tui.md) with inline JSON config
-validation.
+validation. The `canopy loop list` and `canopy loop info` CLI
+subcommands provide read-only inspection from the terminal.
 
 ## Node blueprints
 
@@ -101,4 +141,5 @@ Five builtins are seeded automatically at daemon startup if missing
 `cargo-gates`, `reviewer-committer-mimo`, `commit-check`,
 `resilience-mimo`. Builtins can't be deleted. Manage blueprints with
 `blueprint_list`, `blueprint_create`, and `blueprint_delete` (custom
-only).
+only). The TUI sidebar lists available blueprints, and the loop editor
+validates blueprint references inline.

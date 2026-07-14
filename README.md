@@ -42,7 +42,7 @@ See [`docs/installation.md`](docs/installation.md) for all methods and first-tim
 
 Full documentation lives in [`docs/`](docs/): installation, quick start, the
 TUI, agents and seed identities, intelligence & sync, loops, the RAG
-pipeline, all 46 MCP tools, and the complete CLI reference.
+pipeline, all 61 MCP tools, and the complete CLI reference.
 
 ---
 
@@ -85,10 +85,14 @@ pipeline, all 46 MCP tools, and the complete CLI reference.
 ### 🔀 Loop DAG Engine
 
 - **Ordered Specs** — Loops contain sequenced `Spec`s, each with `Node`s connected by `Edge`s with routing conditions (`pass`/`fail`/`always`).
+- **Standalone Spec Backlog** — Specs exist independently from loops; tag them to a workdir for filtering. Managed via `spec_create`, `spec_list`, `spec_update`, `spec_delete`.
+- **Spec Pools** — Ordered queues of existing specs that a loop drains one by one. Append and reorder while a loop is running via `pool_create`, `pool_add_spec`, `pool_list`, `pool_remove_spec`, `pool_reorder`.
 - **Node Kinds** — `agent` nodes invoke CLI tools with prompt templates; `check` nodes execute shell commands; `gate` nodes validate previous output (e.g., `output_contains`).
-- **Full Lifecycle** — Create, update, run, pause, continue (retry or skip), complete nodes, and report blockers for human intervention.
-- **Template Variables** — Loop prompts support `{{loop_name}}`, `{{spec_content}}`, `{{node_id}}`, `{{previous_feedback}}`, and more.
-- **15 MCP Tools** — Complete CRUD + runtime management: `loop_create`, `loop_update`, `loop_add_spec`, `loop_add_node`, `loop_add_edge`, `loop_run`, `loop_pause`, `loop_continue`, `loop_complete_node`, `loop_report_blocker`, `loop_get`, `loop_list`, `loop_update_spec`, `loop_update_node`, `loop_update_edge`.
+- **Node Blueprints** — Reusable `{name, kind, config}` templates referenced by name in `loop_add_node`. Five builtins seeded at startup; custom blueprints via `blueprint_create`/`blueprint_delete`/`blueprint_list`.
+- **Full Lifecycle** — Create, update, run, pause, continue (retry or skip), reset, complete nodes, and report blockers for human intervention. `loop_schedule_autorun` resumes failed/completed loops at a future time.
+- **`on_completed` Hook** — Post-completion agent execution (e.g. documentation maintenance) that fires once per completion.
+- **Template Variables** — Loop prompts support `{{loop_name}}`, `{{spec_content}}`, `{{node_id}}`, `{{previous_feedback}}`, `{{spec_start_head}}`, and more.
+- **22 MCP Tools** — Complete authoring, inspection, runtime, spec, pool, and blueprint management.
 
 ### 📚 Personal RAG Pipeline
 
@@ -102,8 +106,12 @@ pipeline, all 46 MCP tools, and the complete CLI reference.
 ### 🖥️ Interactive TUI (Canopy Hub)
 
 - **NewAgentDialog** — Three modes (Interactive, Background Cron/Watch, Terminal) with CLI picker, model picker, seed identity selector (`◀ None / SeedName ▶`), directory browser, and yolo mode toggle.
+- **Scheduled Delivery** — `Shift+Enter` (Kitty keyboard protocol) sends prompts at a chosen time instead of immediately.
 - **Split Groups** — Side-by-side horizontal/vertical views for monitoring multiple agents simultaneously.
 - **System Dashboard** — CPU, memory, disk, GPU (NVIDIA/Linux/macOS), temperatures with amber/red alert thresholds. WSL queries Windows host metrics via PowerShell.
+- **Live Loop View** — Real-time graph rendering with auto-follow on the running node, manual node inspection, and per-node run info (status, elapsed, output tail).
+- **Agent Status Colors** — Green for working (recent output), blue for idle, red for failed, gray for exited.
+- **Projects Sidebar** — Sections for active loops, backlog specs, and loop history, filterable by project workdir.
 - **Loop Editor** — Inline node config JSON editing with validation.
 - **RAG Transfer Modal** — Send semantic search results to other agents as injected context.
 - **Context Transfer** — Two-step modal (preview → agent picker) to inject conversation context between sessions.
@@ -119,19 +127,22 @@ pipeline, all 46 MCP tools, and the complete CLI reference.
 - **MCP Wizard** — `canopy mcp` subcommand for syncing, adding, and removing MCP server entries across all detected platforms with automatic format conversion (JSON ↔ TOML).
 - **Skills Manager** — List, validate symlink integrity, and remove installed skills across platforms.
 - **Doctor Diagnostics** — `canopy doctor` checks data directory, database, config, harnesses, RAG status, file watchers, daemon process, registry connectivity, and auto-update health.
-- **Desktop Notifications** — Cross-platform alerts for task completions, failures, watcher triggers, and RAG indexing events.
+- **Desktop Notifications** — Cross-platform alerts for task completions, failures, watcher triggers, RAG indexing events, and loop lifecycle (started, spec completed, finished with outcome, blocker, hook failure).
 
 ---
 
-## MCP Tools (46)
+## MCP Tools (61)
 
 | Category | Tools |
 |----------|-------|
-| **Agent Management** (12) | `agent_add`, `agent_watch`, `agent_list`, `agent_remove`, `agent_enable`, `agent_disable`, `agent_run`, `agent_status`, `agent_models`, `agent_logs`, `agent_update`, `agent_report` |
+| **Agent Management** (13) | `agent_add`, `agent_watch`, `agent_list`, `agent_remove`, `agent_enable`, `agent_disable`, `agent_schedule_enable`, `agent_run`, `agent_status`, `agent_models`, `agent_logs`, `agent_update`, `agent_report` |
 | **Multi-Agent Sync** (4) | `sync_declare_intent`, `sync_report_status`, `sync_broadcast`, `sync_get_context` |
 | **Intelligence V2** (6) | `intelligence_get_context`, `intelligence_upsert`, `intelligence_search`, `intelligence_graph_walk`, `intelligence_list_projects`, `intelligence_link_projects` |
 | **Seed Identity** (5) | `get_identity`, `evolve_identity`, `create_seed`, `list_seeds`, `remove_seed` |
-| **Loop Engine** (15) | `loop_create`, `loop_update`, `loop_add_spec`, `loop_update_spec`, `loop_add_node`, `loop_update_node`, `loop_add_edge`, `loop_update_edge`, `loop_get`, `loop_list`, `loop_run`, `loop_pause`, `loop_continue`, `loop_complete_node`, `loop_report_blocker` |
+| **Loop Engine** (17) | `loop_create`, `loop_update`, `loop_add_spec`, `loop_update_spec`, `loop_add_node`, `loop_update_node`, `loop_add_edge`, `loop_update_edge`, `loop_get`, `loop_list`, `loop_run`, `loop_reset`, `loop_schedule_autorun`, `loop_pause`, `loop_continue`, `loop_complete_node`, `loop_report_blocker` |
+| **Spec Backlog** (4) | `spec_create`, `spec_list`, `spec_update`, `spec_delete` |
+| **Spec Pools** (5) | `pool_create`, `pool_add_spec`, `pool_list`, `pool_remove_spec`, `pool_reorder` |
+| **Node Blueprints** (3) | `blueprint_list`, `blueprint_create`, `blueprint_delete` |
 | **Project** (2) | `project_search`, `project_update` |
 | **RAG** (1) | `rag_search` |
 | **Protocol** (1) | `get_tools` |
@@ -140,13 +151,13 @@ pipeline, all 46 MCP tools, and the complete CLI reference.
 
 ## Architecture Overview
 
-- **Daemon** — Owns the MCP server (Streamable HTTP on port 7755 + stdio), scheduler, watcher engine, and database. Exposes all 46 MCP tools.
+- **Daemon** — Owns the MCP server (Streamable HTTP on port 7755 + stdio), scheduler, watcher engine, and database. Exposes all 61 MCP tools.
 - **Scheduler** — Computes next fire times for all active tasks, sleeping until needed. Wakes instantly on changes.
 - **Watcher Engine** — Reacts to file system events, triggering tasks as defined.
 - **Executor** — Runs tasks and agents, manages locking, logs, and status.
 - **Intelligence V2** — Project-scoped knowledge graph with node/edge CRUD, graph walk, project relationships.
 - **Sync Manager** — Per-workdir in-memory broadcast channels (64 capacity), DB persistence, and intelligence node auto-upsert.
-- **Loop Engine** — DAG execution engine: check/gate/agent node runners, iteration limits, pause/continue, blocker reporting.
+- **Loop Engine** — DAG execution engine: check/gate/agent node runners, iteration limits, pause/continue, blocker reporting, spec pools, node blueprints, scheduled autorun.
 - **RAG Pipeline** — Background ingestion, language-aware chunking, embedding client, vector store, and rate-limited search.
 - **TUI** — Full-screen ratatui terminal UI for managing agents, viewing output, loops, and system metrics in real time.
 
@@ -158,7 +169,7 @@ pipeline, all 46 MCP tools, and the complete CLI reference.
 - `autoupdate/` — Self-update system (GitHub releases)
 - `daemon/` — MCP server, handler, params, RAG CLI, doctor
 - `db/` — SQLite persistence and migrations (agents, runs, sessions, sync, intelligence, loops, projects, seeds, groups, state)
-- `domain/` — Core models: Agent, Trigger, WatchEvent, Project, SeedIdentity, Loop, SyncMessage, IntelligenceNode
+- `domain/` — Core models: Agent, Trigger, WatchEvent, Project, SeedIdentity, Loop, LoopSpec, LoopPool, LoopNodeBlueprint, SyncMessage, IntelligenceNode
 - `executor/` — Task and agent execution logic
 - `rag/` — RAG pipeline (ingestion, chunking, embedding, vector store, rate limiting)
 - `scheduler/` — Internal cron scheduler with template variables
