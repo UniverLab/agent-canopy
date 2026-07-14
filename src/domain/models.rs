@@ -223,6 +223,16 @@ impl Cli {
             .unwrap_or_else(|| self.0.clone())
     }
 
+    /// Registry-driven paste+submit behavior for delivering a prompt to this
+    /// platform's interactive session as a submitted message. Falls back to
+    /// [`super::cli_config::PasteSubmitSpec::default`] when the platform has
+    /// no registry entry or leaves the fields unset.
+    pub fn paste_submit_spec(&self) -> super::cli_config::PasteSubmitSpec {
+        let registry = Self::load_registry();
+        let config = registry.as_ref().and_then(|r| r.get(self.as_str()));
+        super::cli_config::PasteSubmitSpec::from_cli_config(config)
+    }
+
     pub fn detect_available() -> Vec<Cli> {
         let Some(registry) = Self::load_registry() else {
             return Vec::new();

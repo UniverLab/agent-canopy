@@ -931,6 +931,9 @@ mod tests {
             yolo_flag: None,
             instruction_file: None,
             prompt_via_stdin: false,
+            paste_submit_delay_ms: None,
+            paste_submit_key: None,
+            paste_submit_presses: 1,
         }
     }
 

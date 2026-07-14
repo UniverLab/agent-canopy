@@ -736,9 +736,12 @@ fn write_prompt_to_selected_agent(app: &mut App, prompt: &str) {
     // conversation driver, not just direct typing.
     agent.record_prompt(prompt);
 
-    let pasted = format!("\x1b[200~{prompt}\x1b[201~");
-    let _ = agent.write_to_pty(pasted.as_bytes());
-    let _ = agent.write_to_pty(b"\r");
+    // Delivery must mean submission: the paste and the submit keystroke are
+    // written as separate events (see `write_submitted_prompt`), with any
+    // per-platform override (delay/key/extra presses) coming from the CLI
+    // registry rather than being hardcoded here.
+    let spec = agent.cli.paste_submit_spec();
+    let _ = agent.submit_prompt_to_pty(prompt, spec);
 }
 
 fn selected_interactive_index(app: &App) -> Option<usize> {

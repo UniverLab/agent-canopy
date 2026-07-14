@@ -59,6 +59,78 @@ pub struct CliConfig {
     /// most CLIs require the prompt as a positional argument.
     #[serde(default)]
     pub prompt_via_stdin: bool,
+    /// Milliseconds to wait after a prompt-builder paste completes before
+    /// writing the submit keystroke. `None` uses the built-in default (see
+    /// [`PasteSubmitSpec`]). Set this for harnesses whose bracketed-paste
+    /// handling needs longer to settle before it will treat the next
+    /// keypress as a distinct Enter rather than folding it into the pasted
+    /// text.
+    #[serde(default)]
+    pub paste_submit_delay_ms: Option<u64>,
+    /// Key written to submit a prompt-builder paste: `"cr"` (default) or
+    /// `"lf"`.
+    #[serde(default)]
+    pub paste_submit_key: Option<String>,
+    /// Number of times to write the submit keystroke, each after its own
+    /// settle delay. Some composers need a second Enter to actually submit
+    /// rather than just closing multi-line entry. Defaults to 1.
+    #[serde(default = "default_paste_submit_presses")]
+    pub paste_submit_presses: u8,
+}
+
+fn default_paste_submit_presses() -> u8 {
+    1
+}
+
+/// Registry-driven paste+submit behavior for delivering a prompt-builder
+/// prompt to an interactive session as a SUBMITTED message, not just pending
+/// input sitting in the target's input box. Resolved from [`CliConfig`]
+/// metadata — add fields there for a harness that needs different behavior;
+/// never hardcode a CLI name at a call site to pick this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PasteSubmitSpec {
+    pub settle: std::time::Duration,
+    pub submit_key: &'static [u8],
+    pub presses: u8,
+}
+
+/// Small, constant settle delay between the pasted block and the submit
+/// keystroke: long enough that a TUI's bracketed-paste handling has closed
+/// out the paste event before the next keypress arrives (so it can't be
+/// folded into the pasted text), short enough that sending still feels
+/// instant.
+const DEFAULT_PASTE_SUBMIT_DELAY_MS: u64 = 30;
+
+impl Default for PasteSubmitSpec {
+    fn default() -> Self {
+        Self {
+            settle: std::time::Duration::from_millis(DEFAULT_PASTE_SUBMIT_DELAY_MS),
+            submit_key: b"\r",
+            presses: 1,
+        }
+    }
+}
+
+impl PasteSubmitSpec {
+    /// Resolve from registry metadata, falling back to the default for any
+    /// unset field (and for CLIs with no registry entry at all).
+    pub fn from_cli_config(config: Option<&CliConfig>) -> Self {
+        let default = Self::default();
+        let Some(config) = config else {
+            return default;
+        };
+        Self {
+            settle: config
+                .paste_submit_delay_ms
+                .map(std::time::Duration::from_millis)
+                .unwrap_or(default.settle),
+            submit_key: match config.paste_submit_key.as_deref() {
+                Some("lf") => b"\n",
+                _ => default.submit_key,
+            },
+            presses: config.paste_submit_presses.max(1),
+        }
+    }
 }
 
 /// Persisted CLI configuration for available CLIs.
@@ -162,6 +234,9 @@ mod tests {
             yolo_flag: None,
             instruction_file: None,
             prompt_via_stdin: false,
+            paste_submit_delay_ms: None,
+            paste_submit_key: None,
+            paste_submit_presses: 1,
         }
     }
 
@@ -247,5 +322,60 @@ mod tests {
         registry.save(&path).unwrap();
 
         assert!(path.exists());
+    }
+
+    #[test]
+    fn paste_submit_spec_defaults_when_no_registry_entry() {
+        let spec = PasteSubmitSpec::from_cli_config(None);
+        assert_eq!(spec, PasteSubmitSpec::default());
+        assert_eq!(spec.submit_key, b"\r");
+        assert_eq!(spec.presses, 1);
+    }
+
+    #[test]
+    fn paste_submit_spec_defaults_when_fields_unset() {
+        let config = sample_cli_config();
+        let spec = PasteSubmitSpec::from_cli_config(Some(&config));
+        assert_eq!(spec, PasteSubmitSpec::default());
+    }
+
+    #[test]
+    fn paste_submit_spec_honors_delay_override() {
+        let mut config = sample_cli_config();
+        config.paste_submit_delay_ms = Some(80);
+        let spec = PasteSubmitSpec::from_cli_config(Some(&config));
+        assert_eq!(spec.settle, std::time::Duration::from_millis(80));
+    }
+
+    #[test]
+    fn paste_submit_spec_honors_lf_key_override() {
+        let mut config = sample_cli_config();
+        config.paste_submit_key = Some("lf".to_string());
+        let spec = PasteSubmitSpec::from_cli_config(Some(&config));
+        assert_eq!(spec.submit_key, b"\n");
+    }
+
+    #[test]
+    fn paste_submit_spec_unrecognized_key_falls_back_to_cr() {
+        let mut config = sample_cli_config();
+        config.paste_submit_key = Some("bogus".to_string());
+        let spec = PasteSubmitSpec::from_cli_config(Some(&config));
+        assert_eq!(spec.submit_key, b"\r");
+    }
+
+    #[test]
+    fn paste_submit_spec_honors_double_enter_override() {
+        let mut config = sample_cli_config();
+        config.paste_submit_presses = 2;
+        let spec = PasteSubmitSpec::from_cli_config(Some(&config));
+        assert_eq!(spec.presses, 2);
+    }
+
+    #[test]
+    fn paste_submit_spec_clamps_zero_presses_to_one() {
+        let mut config = sample_cli_config();
+        config.paste_submit_presses = 0;
+        let spec = PasteSubmitSpec::from_cli_config(Some(&config));
+        assert_eq!(spec.presses, 1);
     }
 }

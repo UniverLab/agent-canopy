@@ -1,9 +1,11 @@
+use crate::domain::cli_config::PasteSubmitSpec;
 use crate::tui::agent::sanitize::{line_looks_sensitive_prompt, strip_shell_prompt_prefix};
 use crate::tui::agent::{
     AgentStatus, InteractiveAgent, PromptEntry, ACTIVITY_IDLE_THRESHOLD_MS, MAX_PROMPT_HISTORY,
 };
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use std::io::Write;
 use std::time::Duration;
 
 impl InteractiveAgent {
@@ -164,6 +166,20 @@ impl InteractiveAgent {
         } else {
             self.write_to_pty(text.as_bytes())
         }
+    }
+
+    /// Deliver a prompt-builder prompt to the PTY as a SUBMITTED message —
+    /// not text left pending in the target's input box. See
+    /// [`write_submitted_prompt`] for why the submit keystroke must be a
+    /// separate write from the paste.
+    pub fn submit_prompt_to_pty(&self, prompt: &str, spec: PasteSubmitSpec) -> Result<()> {
+        let bracketed = self.bracketed_paste_enabled();
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("pty writer lock poisoned"))?;
+        write_submitted_prompt(&mut *writer, prompt, bracketed, spec)?;
+        Ok(())
     }
 
     pub fn sync_warp_input_from_pty(&self, wait: Duration) -> Option<String> {
@@ -330,6 +346,41 @@ fn recently_active(last_output_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     now.signed_duration_since(last_output_at).num_milliseconds() < ACTIVITY_IDLE_THRESHOLD_MS
 }
 
+/// Write `prompt` to `writer` as a SUBMITTED message: the paste lands as one
+/// block (bracketed only when the target actually enabled bracketed-paste
+/// mode — see [`InteractiveAgent::bracketed_paste_enabled`]), then the
+/// submit keystroke is written as a SEPARATE event after `spec.settle`.
+///
+/// This separation matters: writing the submit key immediately after the
+/// paste (zero delay, same logical write) lets the two coalesce into one
+/// chunk at the pty/kernel level. A target CLI with bracketed-paste
+/// handling that reads a `\r` inside (or immediately trailing, same-chunk)
+/// the paste event can fold it into the pasted text as a literal newline
+/// instead of parsing it as a distinct Enter keypress — the prompt lands in
+/// the input box but is never submitted.
+pub fn write_submitted_prompt(
+    writer: &mut impl Write,
+    prompt: &str,
+    bracketed: bool,
+    spec: PasteSubmitSpec,
+) -> std::io::Result<()> {
+    if bracketed {
+        writer.write_all(format!("\x1b[200~{prompt}\x1b[201~").as_bytes())?;
+    } else {
+        writer.write_all(prompt.as_bytes())?;
+    }
+    writer.flush()?;
+
+    for _ in 0..spec.presses.max(1) {
+        if spec.settle > Duration::ZERO {
+            std::thread::sleep(spec.settle);
+        }
+        writer.write_all(spec.submit_key)?;
+        writer.flush()?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod activity_tests {
     use super::recently_active;
@@ -353,5 +404,119 @@ mod activity_tests {
         let now = Utc::now();
         let last_output_at = now - Duration::milliseconds(12_001);
         assert!(!recently_active(last_output_at, now));
+    }
+}
+
+#[cfg(test)]
+mod submit_sequencing_tests {
+    use super::{write_submitted_prompt, PasteSubmitSpec};
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    /// Fake pty writer that records each `write_all` call as its own chunk,
+    /// mirroring how a real pty preserves write-call boundaries at rest but
+    /// lets a caller accidentally coalesce them by writing back-to-back with
+    /// zero delay. Recording per-call lets tests assert the paste and the
+    /// submit keystroke are genuinely separate writes, not just adjacent
+    /// bytes in one buffer.
+    #[derive(Default)]
+    struct FakeWriter {
+        chunks: Vec<Vec<u8>>,
+    }
+
+    impl Write for FakeWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.chunks.push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn instant_spec() -> PasteSubmitSpec {
+        PasteSubmitSpec {
+            settle: Duration::ZERO,
+            submit_key: b"\r",
+            presses: 1,
+        }
+    }
+
+    #[test]
+    fn paste_and_submit_are_separate_writes() {
+        let mut writer = FakeWriter::default();
+        write_submitted_prompt(&mut writer, "hello", true, instant_spec()).unwrap();
+
+        assert_eq!(writer.chunks.len(), 2);
+        assert_eq!(writer.chunks[0], b"\x1b[200~hello\x1b[201~".to_vec());
+        assert_eq!(writer.chunks[1], b"\r".to_vec());
+    }
+
+    #[test]
+    fn skips_bracket_markers_when_target_never_enabled_bracketed_paste() {
+        let mut writer = FakeWriter::default();
+        write_submitted_prompt(&mut writer, "hello", false, instant_spec()).unwrap();
+
+        assert_eq!(writer.chunks[0], b"hello".to_vec());
+    }
+
+    #[test]
+    fn honors_lf_submit_key_override() {
+        let mut writer = FakeWriter::default();
+        let spec = PasteSubmitSpec {
+            settle: Duration::ZERO,
+            submit_key: b"\n",
+            presses: 1,
+        };
+        write_submitted_prompt(&mut writer, "hi", true, spec).unwrap();
+
+        assert_eq!(writer.chunks[1], b"\n".to_vec());
+    }
+
+    #[test]
+    fn sends_submit_key_once_per_configured_press() {
+        let mut writer = FakeWriter::default();
+        let spec = PasteSubmitSpec {
+            settle: Duration::ZERO,
+            submit_key: b"\r",
+            presses: 2,
+        };
+        write_submitted_prompt(&mut writer, "hi", true, spec).unwrap();
+
+        // One paste chunk + two separate submit-key writes.
+        assert_eq!(writer.chunks.len(), 3);
+        assert_eq!(writer.chunks[1], b"\r".to_vec());
+        assert_eq!(writer.chunks[2], b"\r".to_vec());
+    }
+
+    #[test]
+    fn settle_delay_elapses_before_the_submit_write() {
+        let mut writer = FakeWriter::default();
+        let spec = PasteSubmitSpec {
+            settle: Duration::from_millis(20),
+            submit_key: b"\r",
+            presses: 1,
+        };
+
+        let start = Instant::now();
+        write_submitted_prompt(&mut writer, "hi", true, spec).unwrap();
+
+        assert!(start.elapsed() >= Duration::from_millis(20));
+        // The delay must not stall the paste write itself — only the submit
+        // keystroke after it.
+        assert_eq!(writer.chunks[0], b"\x1b[200~hi\x1b[201~".to_vec());
+    }
+
+    #[test]
+    fn zero_presses_still_sends_one_submit_key() {
+        let mut writer = FakeWriter::default();
+        let spec = PasteSubmitSpec {
+            settle: Duration::ZERO,
+            submit_key: b"\r",
+            presses: 0,
+        };
+        write_submitted_prompt(&mut writer, "hi", true, spec).unwrap();
+
+        assert_eq!(writer.chunks.len(), 2);
     }
 }
