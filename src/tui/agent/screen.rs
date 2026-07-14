@@ -106,10 +106,12 @@ impl InteractiveAgent {
             }
             vt.process(&replay);
         }
-
-        if let Ok(mut t) = self.last_output_at.lock() {
-            *t = chrono::Utc::now();
-        }
+        // Do NOT update last_output_at here. Replay is a history reconstruction
+        // (auto-resume, new-terminal scrollback), not fresh PTY output. Stamping
+        // now would make every replayed agent appear "actively working" for the
+        // next ACTIVITY_IDLE_THRESHOLD_MS, which is the root cause of the
+        // "all-green on navigation" bug — the activity timestamp must only move
+        // when the PTY background reader (mod.rs) actually receives bytes.
     }
 
     /// Get a snapshot of the virtual terminal screen for rendering.

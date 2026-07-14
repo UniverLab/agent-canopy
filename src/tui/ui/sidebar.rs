@@ -1669,7 +1669,11 @@ fn agent_card_meta<'a>(agent: &'a AgentEntry, app: &'a App) -> AgentCardMeta<'a>
             let agent = &app.interactive_agents[*index];
             AgentCardMeta {
                 accent: agent.accent_color,
-                status_color: session_status_color(&agent.status, agent.has_recent_activity()),
+                status_color: session_status_color(
+                    &agent.status,
+                    agent.has_recent_activity(),
+                    app.animation_tick,
+                ),
                 agent_type: "pty",
                 type_detail: agent.cli.as_str(),
                 work_dir: Some(agent.working_dir.as_str()),
@@ -1679,7 +1683,11 @@ fn agent_card_meta<'a>(agent: &'a AgentEntry, app: &'a App) -> AgentCardMeta<'a>
             let agent = &app.terminal_agents[*index];
             AgentCardMeta {
                 accent: agent.accent_color,
-                status_color: session_status_color(&agent.status, agent.has_recent_activity()),
+                status_color: session_status_color(
+                    &agent.status,
+                    agent.has_recent_activity(),
+                    app.animation_tick,
+                ),
                 agent_type: "term",
                 type_detail: agent.shell.as_str(),
                 work_dir: Some(agent.working_dir.as_str()),
@@ -1712,18 +1720,28 @@ fn agent_card_meta<'a>(agent: &'a AgentEntry, app: &'a App) -> AgentCardMeta<'a>
     }
 }
 
-/// Status color for an interactive/terminal session card. Error states win
-/// outright; a running session is green while it's registering activity
-/// (see `ACTIVITY_IDLE_THRESHOLD_MS`) and falls back to blue — "healthy but
-/// idle" — once output has been quiet for a while. This mirrors the
-/// green/blue semantics background agents already use for active vs. idle
-/// (see `agent_status` in `panel/details.rs`).
-fn session_status_color(status: &AgentStatus, recently_active: bool) -> Color {
+/// Status color for an interactive/terminal session card. Blue is reserved
+/// for background agents (see `agent_status` in `panel/details.rs`) — a PTY
+/// is either alive (green) or dead (red). A running session blinks green
+/// while it's registering activity (see `ACTIVITY_IDLE_THRESHOLD_MS`) and
+/// holds solid green — "healthy, available" — once output has been quiet
+/// for a while. Any exit, clean or not, means the PTY is dead: red.
+fn session_status_color(status: &AgentStatus, recently_active: bool, animation_tick: u32) -> Color {
     match status {
-        AgentStatus::Running if recently_active => STATUS_RUNNING,
-        AgentStatus::Running => STATUS_OK,
-        AgentStatus::Exited(0) => STATUS_OK,
+        AgentStatus::Running if recently_active => pulse(STATUS_RUNNING, animation_tick),
+        AgentStatus::Running => STATUS_RUNNING,
         AgentStatus::Exited(_) => STATUS_FAIL,
+    }
+}
+
+/// Alternate between `on` and the shared "off" tone on the TUI's existing
+/// animation tick — the same cadence pulsing yellow uses — so a blinking
+/// indicator never needs its own timer.
+fn pulse(on: Color, animation_tick: u32) -> Color {
+    if (animation_tick / 10).is_multiple_of(2) {
+        on
+    } else {
+        super::STATUS_WAIT_OFF
     }
 }
 
@@ -1732,11 +1750,7 @@ fn effective_status_color(base: Color, agent: &AgentEntry, app: &App, selected: 
         return base;
     }
 
-    if (app.animation_tick / 10).is_multiple_of(2) {
-        super::STATUS_WAIT_ON
-    } else {
-        super::STATUS_WAIT_OFF
-    }
+    pulse(super::STATUS_WAIT_ON, app.animation_tick)
 }
 
 fn agent_is_waiting(agent: &AgentEntry, app: &App, selected: bool) -> bool {
@@ -2427,40 +2441,40 @@ mod tests {
     #[test]
     fn running_session_with_recent_activity_is_working_green() {
         assert_eq!(
-            session_status_color(&AgentStatus::Running, true),
-            STATUS_RUNNING
+            session_status_color(&AgentStatus::Running, true, 0),
+            pulse(STATUS_RUNNING, 0)
         );
     }
 
     #[test]
-    fn running_session_gone_quiet_is_healthy_idle_blue() {
+    fn running_session_gone_quiet_is_healthy_idle_green() {
         assert_eq!(
-            session_status_color(&AgentStatus::Running, false),
-            STATUS_OK
+            session_status_color(&AgentStatus::Running, false, 0),
+            STATUS_RUNNING
         );
     }
 
     #[test]
     fn exit_error_wins_over_activity() {
         assert_eq!(
-            session_status_color(&AgentStatus::Exited(1), true),
+            session_status_color(&AgentStatus::Exited(1), true, 0),
             STATUS_FAIL
         );
         assert_eq!(
-            session_status_color(&AgentStatus::Exited(1), false),
+            session_status_color(&AgentStatus::Exited(1), false, 0),
             STATUS_FAIL
         );
     }
 
     #[test]
-    fn clean_exit_stays_healthy_regardless_of_activity() {
+    fn exit_clean_or_not_is_dead_pty_red() {
         assert_eq!(
-            session_status_color(&AgentStatus::Exited(0), true),
-            STATUS_OK
+            session_status_color(&AgentStatus::Exited(0), true, 0),
+            STATUS_FAIL
         );
         assert_eq!(
-            session_status_color(&AgentStatus::Exited(0), false),
-            STATUS_OK
+            session_status_color(&AgentStatus::Exited(0), false, 0),
+            STATUS_FAIL
         );
     }
 }
