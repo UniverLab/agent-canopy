@@ -13,7 +13,7 @@ use tokio::process::Command;
 use crate::application::notification_service::NotificationService;
 use crate::application::ports::{AgentRepository, RunRepository};
 use crate::db::Database;
-use crate::domain::models::{Agent, Cli, RunLog, RunStatus, Trigger, TriggerType};
+use crate::domain::models::{Agent, Cli, RunLog, RunStatus, StartRunOutcome, Trigger, TriggerType};
 use crate::scheduler::substitute_variables;
 
 #[cfg(test)]
@@ -80,34 +80,22 @@ impl Executor {
         let _ = self.db.update_agent_last_run(agent_id, false);
     }
 
-    /// Check if the agent is locked by an active run. Records a missed run and returns
-    /// `Some(-1)` if locked, `None` if free to proceed.
-    fn check_lock(&self, agent: &Agent, trigger_type: TriggerType) -> Result<Option<i32>> {
-        let Ok(Some(active)) = self.db.get_active_run(&agent.id) else {
-            return Ok(None);
-        };
-        tracing::info!(
-            "Agent '{}' is locked (run {}), recording as missed",
-            agent.id,
-            active.id
-        );
-        let missed = RunLog {
-            id: uuid::Uuid::new_v4().to_string(),
-            background_agent_id: agent.id.clone(),
-            status: RunStatus::Missed,
-            trigger_type,
-            summary: Some(format!("Skipped: agent locked by run {}", active.id)),
-            started_at: Utc::now(),
-            finished_at: Some(Utc::now()),
-            exit_code: None,
-            timeout_at: None,
-        };
-        let _ = self.db.insert_run(&missed);
-        Ok(Some(-1))
-    }
-
-    /// Create a pending run record and return its ID.
-    fn create_run(&self, agent: &Agent, trigger_type: TriggerType) -> Result<String> {
+    /// Atomically claim the right to run `agent`.
+    ///
+    /// This is the single choke point every firing path routes through —
+    /// the scheduler's cron tick, a file-watch trigger, and a manual
+    /// `agent_run` all end up here via [`Self::run_agent`] — so no two of
+    /// them can ever spawn overlapping executions of the same agent, no
+    /// matter which combination races. The check-then-insert itself is
+    /// atomic (see [`crate::application::ports::RunRepository::try_start_run`]),
+    /// closing the gap a bare "check active, then insert" would leave
+    /// between the check and the write.
+    ///
+    /// Returns the new run's id if this call won the race, or `None` if
+    /// another run was already active — in which case a `Missed` run is
+    /// recorded (visible via `agent_logs`/recent executions, distinct from
+    /// an agent that has never fired) and an INFO line is logged.
+    fn start_run(&self, agent: &Agent, trigger_type: TriggerType) -> Result<Option<String>> {
         let run_id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now();
         let timeout_at = now + chrono::Duration::minutes(i64::from(agent.timeout_minutes));
@@ -122,8 +110,30 @@ impl Executor {
             exit_code: None,
             timeout_at: Some(timeout_at),
         };
-        self.db.insert_run(&run)?;
-        Ok(run_id)
+
+        match self.db.try_start_run(&run)? {
+            StartRunOutcome::Started => Ok(Some(run_id)),
+            StartRunOutcome::AlreadyActive(active) => {
+                tracing::info!(
+                    "Agent '{}' is already running (run '{}'); skipping this fire",
+                    agent.id,
+                    active.id
+                );
+                let missed = RunLog {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    background_agent_id: agent.id.clone(),
+                    status: RunStatus::Missed,
+                    trigger_type,
+                    summary: Some(format!("Skipped: already running (run '{}')", active.id)),
+                    started_at: now,
+                    finished_at: Some(now),
+                    exit_code: None,
+                    timeout_at: None,
+                };
+                let _ = self.db.insert_run(&missed);
+                Ok(None)
+            }
+        }
     }
 
     /// Finalize a run: update status, exit code, trigger count, and last_run.
@@ -200,11 +210,9 @@ impl Executor {
     async fn run_agent(&self, agent: &Agent, ctx: ExecutionContext<'_>) -> Result<i32> {
         self.resolve_timeout(&agent.id);
 
-        if let Some(code) = self.check_lock(agent, ctx.trigger_type)? {
-            return Ok(code);
-        }
-
-        let run_id = self.create_run(agent, ctx.trigger_type)?;
+        let Some(run_id) = self.start_run(agent, ctx.trigger_type)? else {
+            return Ok(-1);
+        };
 
         let user_prompt = substitute_variables(
             &agent.prompt,

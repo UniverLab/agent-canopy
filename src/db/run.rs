@@ -5,7 +5,7 @@ use rusqlite::{params, OptionalExtension};
 use crate::application::ports::AgentRepository;
 use crate::application::ports::RunRepository;
 use crate::db::Database;
-use crate::domain::models::{RunLog, RunStatus, TriggerType};
+use crate::domain::models::{RunLog, RunStatus, StartRunOutcome, TriggerType};
 
 impl RunRepository for Database {
     fn insert_run(&self, run: &RunLog) -> Result<()> {
@@ -13,24 +13,53 @@ impl RunRepository for Database {
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-        conn.execute(
-            "INSERT INTO runs (id, background_agent_id, status, trigger_type, summary, started_at, finished_at, exit_code, timeout_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                &run.id,
-                &run.background_agent_id,
-                run.status.as_str(),
-                run.trigger_type.as_str(),
-                &run.summary,
-                run.started_at.to_rfc3339(),
-                run.finished_at.map(|t| t.to_rfc3339()),
-                run.exit_code,
-                run.timeout_at.map(|t| t.to_rfc3339()),
-            ],
-        )?;
+        insert_run_row(&conn, run)?;
         drop(conn);
         self.upsert_run_intelligence_node(run)?;
         Ok(())
+    }
+
+    fn try_start_run(&self, run: &RunLog) -> Result<StartRunOutcome> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
+        // Check-then-insert under the *same* lock acquisition: two
+        // concurrent callers (e.g. a scheduled tick and a manual
+        // `agent_run`, or two evaluations of the same cron tick) serialize
+        // on `self.conn`'s mutex, so whichever loses the race sees the
+        // winner's row already inserted here instead of both seeing "no
+        // active run" and both starting an execution.
+        let active = {
+            let mut stmt = conn.prepare(
+                "SELECT id, background_agent_id, status, trigger_type, summary, started_at, finished_at, exit_code, timeout_at
+                 FROM runs WHERE background_agent_id = ?1 AND status IN ('pending', 'in_progress') LIMIT 1",
+            )?;
+            stmt.query_row(params![&run.background_agent_id], |row| {
+                Ok(RunRow {
+                    id: row.get(0)?,
+                    background_agent_id: row.get(1)?,
+                    status_str: row.get(2)?,
+                    trigger_str: row.get(3)?,
+                    summary: row.get(4)?,
+                    started_at_str: row.get(5)?,
+                    finished_at_str: row.get(6)?,
+                    exit_code: row.get(7)?,
+                    timeout_at_str: row.get(8)?,
+                })
+            })
+            .optional()?
+        };
+
+        if let Some(row) = active {
+            return Ok(StartRunOutcome::AlreadyActive(row.into_run_log()?));
+        }
+
+        insert_run_row(&conn, run)?;
+        drop(conn);
+        self.upsert_run_intelligence_node(run)?;
+        Ok(StartRunOutcome::Started)
     }
 
     fn list_runs(&self, background_agent_id: &str, limit: usize) -> Result<Vec<RunLog>> {
@@ -252,6 +281,27 @@ impl Database {
 
         Ok(())
     }
+}
+
+/// Insert a run row on an already-locked connection. Shared by `insert_run`
+/// and `try_start_run` so the INSERT itself stays single-sourced.
+fn insert_run_row(conn: &rusqlite::Connection, run: &RunLog) -> Result<()> {
+    conn.execute(
+        "INSERT INTO runs (id, background_agent_id, status, trigger_type, summary, started_at, finished_at, exit_code, timeout_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            &run.id,
+            &run.background_agent_id,
+            run.status.as_str(),
+            run.trigger_type.as_str(),
+            &run.summary,
+            run.started_at.to_rfc3339(),
+            run.finished_at.map(|t| t.to_rfc3339()),
+            run.exit_code,
+            run.timeout_at.map(|t| t.to_rfc3339()),
+        ],
+    )?;
+    Ok(())
 }
 
 struct RunRow {

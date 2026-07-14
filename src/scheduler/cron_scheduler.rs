@@ -14,7 +14,7 @@ use cron::Schedule;
 use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
-use crate::application::ports::AgentRepository;
+use crate::application::ports::{AgentRepository, RunRepository};
 use crate::db::Database;
 use crate::domain::loops::{LoopResetOutcome, LoopStatus};
 use crate::executor::Executor;
@@ -85,10 +85,26 @@ pub struct CronScheduler {
     /// Optional loop engine — when set, the scheduler also evaluates loops
     /// whose trigger is `Cron` and launches them alongside agents.
     loop_engine: Option<Arc<LoopEngine>>,
-    /// Track last execution time per schedulable to avoid double-firing.
-    /// Agents are keyed by their id; loops by [`loop_key`] to avoid colliding
-    /// with an agent that happens to share the same id.
+    /// Tick idempotency: the most recent *scheduled* tick already fired per
+    /// schedulable (agents keyed by their id; loops by [`loop_key`] to avoid
+    /// colliding with an agent that happens to share the same id).
+    ///
+    /// The stored value is the matched fire time itself (what
+    /// [`due_fire_local`] returned), not the wall-clock instant the
+    /// evaluation ran at. Two evaluations of the *same* tick — whether from
+    /// the regular tick loop firing twice in a row or a second evaluation
+    /// path racing it — compute the identical scheduled-tick value, so a
+    /// plain equality/`>=` check dedupes them exactly. A wall-clock window
+    /// (e.g. "fired within the last 60s") would instead depend on how long
+    /// evaluation happened to take, which is what let two evaluations of one
+    /// tick slip past a time-window check and both spawn.
     last_fired: Arc<Mutex<std::collections::HashMap<String, chrono::DateTime<Utc>>>>,
+    /// Per-agent in-flight guard: agents currently spawned and not yet
+    /// finalized. A fire for an agent already in this set is SKIPPED and
+    /// logged at info — never queued behind, never spawned in parallel.
+    /// This is the single choke point every firing path (scheduled, watch,
+    /// manual) routes through at the scheduler level.
+    in_flight: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Failure-retry policy applied to scheduled runs.
     retry: RetryPolicy,
 }
@@ -107,6 +123,7 @@ impl CronScheduler {
             notify: Arc::new(Notify::new()),
             loop_engine: None,
             last_fired: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
             retry: RetryPolicy::from_env(),
         }
     }
@@ -128,8 +145,15 @@ impl CronScheduler {
         Arc::clone(&self.notify)
     }
 
-    /// Initialize the last_fired tracking from database to prevent duplicate
-    /// executions after daemon restart.
+    /// Seed the tick-idempotency map from the database so a restart doesn't
+    /// immediately re-fire a tick whose run is still recorded from before
+    /// the restart. `last_run_at` is a completion timestamp, not a scheduled
+    /// tick, so this is a conservative approximation: it only suppresses a
+    /// re-fire when the next candidate tick is not newer than the last
+    /// recorded run. The [`try_start_run`](crate::application::ports::RunRepository::try_start_run)
+    /// in-flight guard is what actually prevents a concurrent duplicate
+    /// execution; this seed is just about not re-spawning a tick that was
+    /// already handled moments before the restart.
     async fn initialize_last_fired(&self) {
         let mut last_fired = self.last_fired.lock().await;
         if let Ok(agents) = self.db.list_cron_agents() {
@@ -303,14 +327,14 @@ impl CronScheduler {
         let now_utc = Utc::now();
 
         for agent in &agents {
-            self.try_fire_agent(agent, now_local, now_utc).await?;
+            self.try_fire_agent(agent, now_local).await?;
         }
 
         // Cron-triggered loops are evaluated in the same local frame.
         if self.loop_engine.is_some() {
             let loops = self.db.list_cron_loops()?;
             for lp in &loops {
-                self.try_fire_loop(lp, now_local, now_utc).await?;
+                self.try_fire_loop(lp, now_local).await?;
             }
         }
 
@@ -408,7 +432,6 @@ impl CronScheduler {
         &self,
         lp: &crate::domain::loops::Loop,
         now_local: chrono::DateTime<Local>,
-        now_utc: chrono::DateTime<Utc>,
     ) -> anyhow::Result<()> {
         let Some(loop_engine) = self.loop_engine.as_ref() else {
             return Ok(());
@@ -434,22 +457,28 @@ impl CronScheduler {
             }
         };
 
-        if due_fire_local(&schedule, now_local).is_none() {
+        let Some(due_local) = due_fire_local(&schedule, now_local) else {
             return Ok(());
-        }
+        };
+        let scheduled_tick = due_local.with_timezone(&Utc);
 
-        // De-dupe in UTC using a loop-namespaced key.
+        // Tick idempotency in a loop-namespaced key: dedupe by the scheduled
+        // tick itself, not by when this evaluation happened to run.
         let key = loop_key(&lp.id);
-        let window_start_utc = now_utc - chrono::Duration::seconds(60);
         {
             let mut last_fired = self.last_fired.lock().await;
             if last_fired
                 .get(&key)
-                .is_some_and(|last| *last >= window_start_utc)
+                .is_some_and(|last| *last >= scheduled_tick)
             {
+                tracing::info!(
+                    "Loop '{}' tick {} already fired; skipping duplicate evaluation",
+                    lp.id,
+                    scheduled_tick
+                );
                 return Ok(());
             }
-            last_fired.insert(key, now_utc);
+            last_fired.insert(key, scheduled_tick);
         }
 
         tracing::info!("Cron loop '{}' is due; launching", lp.id);
@@ -466,7 +495,6 @@ impl CronScheduler {
         &self,
         agent: &crate::domain::models::Agent,
         now_local: chrono::DateTime<Local>,
-        now_utc: chrono::DateTime<Utc>,
     ) -> anyhow::Result<()> {
         if !agent.enabled {
             return Ok(());
@@ -498,30 +526,78 @@ impl CronScheduler {
 
         // 1-minute lookback so a scheduler hiccup doesn't skip a fire that
         // was scheduled to happen just before "now" (in local time).
-        if due_fire_local(&schedule, now_local).is_none() {
+        let Some(due_local) = due_fire_local(&schedule, now_local) else {
             return Ok(());
-        }
+        };
+        let scheduled_tick = due_local.with_timezone(&Utc);
 
-        // Persist and de-dupe in UTC so the timestamps line up with the rest
-        // of the system (DB schema, `last_run_at`, daemon JSON).
-        let window_start_utc = now_utc - chrono::Duration::seconds(60);
+        // Tick idempotency: dedupe by the scheduled tick itself (in UTC, so
+        // it lines up with the rest of the system — DB schema, `last_run_at`,
+        // daemon JSON), not by when this evaluation happened to run. Two
+        // evaluations of the same tick — the regular tick loop firing twice,
+        // or a second evaluation path racing it — compute the identical
+        // `scheduled_tick`, so this is an exact key, not a time-window guess.
         {
             let mut last_fired = self.last_fired.lock().await;
             if last_fired
                 .get(&agent.id)
-                .is_some_and(|last| *last >= window_start_utc)
+                .is_some_and(|last| *last >= scheduled_tick)
             {
+                tracing::info!(
+                    "Agent '{}' tick {} already fired; skipping duplicate evaluation",
+                    agent.id,
+                    scheduled_tick
+                );
                 return Ok(());
             }
-            last_fired.insert(agent.id.clone(), now_utc);
+            last_fired.insert(agent.id.clone(), scheduled_tick);
+        }
+
+        // Per-agent in-flight guard: if this agent is already running
+        // (spawned but not yet finalized), skip this fire. This is the
+        // single choke point at the scheduler level — all firing paths
+        // (scheduled tick, notify wake-up) go through it.
+        {
+            let mut in_flight = self.in_flight.lock().await;
+            if !in_flight.insert(agent.id.clone()) {
+                tracing::info!(
+                    "Agent '{}' is already running; skipping this fire",
+                    agent.id
+                );
+                // Record a Missed run so the skip is visible in execution
+                // history, distinguishing "skipped: already running" from
+                // "never fired".
+                let now = Utc::now();
+                let missed = crate::domain::models::RunLog {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    background_agent_id: agent.id.clone(),
+                    status: crate::domain::models::RunStatus::Missed,
+                    trigger_type: crate::domain::models::TriggerType::Scheduled,
+                    summary: Some(
+                        "Skipped: already running (scheduler in-flight guard)".to_string(),
+                    ),
+                    started_at: now,
+                    finished_at: Some(now),
+                    exit_code: None,
+                    timeout_at: None,
+                };
+                let _ = self.db.insert_run(&missed);
+                return Ok(());
+            }
         }
 
         let executor = Arc::clone(&self.executor);
         let agent = agent.clone();
         let retry = self.retry;
         let cancel = self.cancel.clone();
+        let in_flight = Arc::clone(&self.in_flight);
+        let agent_id = agent.id.clone();
         tokio::spawn(async move {
             run_with_retry(executor, agent, retry, cancel).await;
+            // Remove from in-flight set when the run completes (including
+            // retries). This must happen unconditionally so a failed run
+            // doesn't permanently block future fires.
+            in_flight.lock().await.remove(&agent_id);
         });
 
         Ok(())
@@ -691,7 +767,7 @@ fn to_7field_cron(expr: &str) -> String {
 mod tests {
     use super::*;
     use crate::application::notification_service::DefaultNotificationService;
-    use crate::application::ports::AgentRepository;
+    use crate::application::ports::{AgentRepository, RunRepository};
     use crate::domain::models::{Agent, Cli, Trigger};
 
     fn manual_agent(id: &str, enabled: bool) -> Agent {
@@ -1418,6 +1494,86 @@ mod tests {
         assert!(
             due_fire_local(&schedule, stale).is_none(),
             "08:31:30 is past the 60s lookback and must not re-fire"
+        );
+    }
+
+    /// B15: booting the scheduler and then evaluating the same cron tick a
+    /// second time (simulating a second firing path racing the regular tick
+    /// loop) must record exactly one execution for that tick, never two.
+    ///
+    /// Uses an every-minute schedule: thanks to `due_fire_local`'s 60-second
+    /// lookback, the most recent minute boundary is *always* due at the
+    /// instant this test runs, so there's no need to align to (or wait for)
+    /// a real cron boundary. `start_paused` means the scheduler's internal
+    /// `tokio::time::sleep` for its first tick is advanced virtually — the
+    /// test performs no real wall-clock sleep.
+    #[tokio::test(start_paused = true)]
+    async fn scheduler_fires_a_cron_agent_at_most_once_per_tick() {
+        let (db, scheduler) = test_scheduler();
+        let mut agent = manual_agent("b15-once-per-tick", true);
+        agent.trigger = Some(Trigger::Cron {
+            schedule_expr: "* * * * *".to_string(),
+        });
+        // A binary that can't resolve: `run_cli_process` fails fast without
+        // depending on any real external CLI, but the executor still runs
+        // its full start-run/finalize-run path and records the run row —
+        // all this test needs to count fires.
+        agent.cli = Cli::new("definitely-not-a-real-cli-binary-b15");
+        db.upsert_agent(&agent).unwrap();
+
+        let scheduler = Arc::new(scheduler);
+        let _cancel = Arc::clone(&scheduler).start();
+
+        // Advance the virtual clock past the scheduler's first computed
+        // sleep (at most ~60s until the next minute boundary) in small
+        // steps, yielding between each so the background `run_loop` task
+        // actually gets polled and reaches its own `fire_due_tasks` call —
+        // a single large `advance` only fast-forwards the clock, it doesn't
+        // by itself guarantee the woken task has run before this test task
+        // continues.
+        for _ in 0..200 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            if !db.list_runs("b15-once-per-tick", 10).unwrap().is_empty() {
+                break;
+            }
+        }
+        assert!(
+            !db.list_runs("b15-once-per-tick", 10).unwrap().is_empty(),
+            "the scheduler's own tick loop never fired the due agent"
+        );
+
+        // Simulate a second evaluation path for the same tick (e.g. a
+        // concurrent reconcile) landing right on top of the regular tick.
+        scheduler.fire_due_tasks().await.unwrap();
+
+        // Let the spawned executions (detached tokio tasks) record their run
+        // rows on the paused-clock executor. Waits for the recorded count to
+        // go quiet rather than stopping at the first row seen — stopping
+        // early would miss a second spawn still in flight and turn this
+        // into a false-negative regression test.
+        let mut runs = db.list_runs("b15-once-per-tick", 10).unwrap();
+        let mut quiet_iters = 0;
+        for _ in 0..500 {
+            tokio::task::yield_now().await;
+            let current = db.list_runs("b15-once-per-tick", 10).unwrap();
+            if current.len() == runs.len() {
+                quiet_iters += 1;
+                if quiet_iters >= 20 {
+                    break;
+                }
+            } else {
+                quiet_iters = 0;
+            }
+            runs = current;
+        }
+
+        assert_eq!(
+            runs.len(),
+            1,
+            "the same tick must fire at most once, got {} run(s): {:?}",
+            runs.len(),
+            runs
         );
     }
 }

@@ -377,6 +377,23 @@ impl std::fmt::Display for RunStatus {
     }
 }
 
+/// Outcome of atomically claiming the right to start a run for an agent
+/// (see [`crate::application::ports::RunRepository::try_start_run`]).
+///
+/// This exists so the "is another run already active" check and the
+/// "insert the new run" write happen under the same lock — a bare
+/// `get_active_run` followed by a separate `insert_run` leaves a window
+/// where two concurrent callers can both see "no active run" and both
+/// start an execution for the same agent.
+#[derive(Debug, Clone)]
+pub enum StartRunOutcome {
+    /// No other run was active; the given run was recorded as active.
+    Started,
+    /// Another run for the same agent is already active; nothing was
+    /// inserted.
+    AlreadyActive(RunLog),
+}
+
 /// Record of a single agent execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunLog {

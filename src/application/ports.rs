@@ -1,7 +1,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 
-use crate::domain::models::{Agent, CorruptAgent, RunLog, RunStatus};
+use crate::domain::models::{Agent, CorruptAgent, RunLog, RunStatus, StartRunOutcome};
 
 // ── Repository traits ────────────────────────────────────────────────
 
@@ -34,6 +34,12 @@ pub trait AgentRepository {
 /// Persistence operations for execution run logs.
 pub trait RunRepository {
     fn insert_run(&self, run: &RunLog) -> Result<()>;
+    /// Atomically check for an active run and, if none exists, insert `run`
+    /// as the new active run — all under one lock acquisition. This is the
+    /// single choke point every firing path (scheduled, watch, manual) must
+    /// go through so no two of them can ever start overlapping executions
+    /// of the same agent.
+    fn try_start_run(&self, run: &RunLog) -> Result<StartRunOutcome>;
     fn list_runs(&self, background_agent_id: &str, limit: usize) -> Result<Vec<RunLog>>;
     fn list_all_recent_runs(&self, limit: usize) -> Result<Vec<RunLog>>;
     fn get_active_run(&self, background_agent_id: &str) -> Result<Option<RunLog>>;
