@@ -1,10 +1,24 @@
 use crate::tui::agent::sanitize::{line_looks_sensitive_prompt, strip_shell_prompt_prefix};
-use crate::tui::agent::{AgentStatus, InteractiveAgent, PromptEntry, MAX_PROMPT_HISTORY};
+use crate::tui::agent::{
+    AgentStatus, InteractiveAgent, PromptEntry, ACTIVITY_IDLE_THRESHOLD_MS, MAX_PROMPT_HISTORY,
+};
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use std::time::Duration;
 
 impl InteractiveAgent {
+    /// True when the session has registered PTY output within
+    /// [`ACTIVITY_IDLE_THRESHOLD_MS`] — i.e. it is actively working rather
+    /// than merely alive. Used to drive the green/blue status color split
+    /// for interactive sessions; distinct from [`Self::is_waiting_for_input`],
+    /// which looks at cursor position to guess whether the agent wants a
+    /// reply.
+    pub fn has_recent_activity(&self) -> bool {
+        let Ok(last_output_at) = self.last_output_at.lock() else {
+            return false;
+        };
+        recently_active(*last_output_at, Utc::now())
+    }
     /// Record a user prompt submission. Called when Enter is pressed.
     /// Captures the input and the current scrollback depth as the start
     /// of the response range (visible screen content starts at max_sb).
@@ -307,5 +321,37 @@ impl InteractiveAgent {
                 self.write_to_pty(&single)
             }
         }
+    }
+}
+
+/// Pure predicate behind [`InteractiveAgent::has_recent_activity`]: was
+/// `last_output_at` within [`ACTIVITY_IDLE_THRESHOLD_MS`] of `now`?
+fn recently_active(last_output_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    now.signed_duration_since(last_output_at).num_milliseconds() < ACTIVITY_IDLE_THRESHOLD_MS
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::recently_active;
+    use chrono::{Duration, Utc};
+
+    #[test]
+    fn output_just_now_counts_as_active() {
+        let now = Utc::now();
+        assert!(recently_active(now, now));
+    }
+
+    #[test]
+    fn output_inside_window_counts_as_active() {
+        let now = Utc::now();
+        let last_output_at = now - Duration::milliseconds(500);
+        assert!(recently_active(last_output_at, now));
+    }
+
+    #[test]
+    fn output_past_window_is_stale() {
+        let now = Utc::now();
+        let last_output_at = now - Duration::milliseconds(12_001);
+        assert!(!recently_active(last_output_at, now));
     }
 }

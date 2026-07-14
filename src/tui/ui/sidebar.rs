@@ -1669,7 +1669,7 @@ fn agent_card_meta<'a>(agent: &'a AgentEntry, app: &'a App) -> AgentCardMeta<'a>
             let agent = &app.interactive_agents[*index];
             AgentCardMeta {
                 accent: agent.accent_color,
-                status_color: session_status_color(&agent.status),
+                status_color: session_status_color(&agent.status, agent.has_recent_activity()),
                 agent_type: "pty",
                 type_detail: agent.cli.as_str(),
                 work_dir: Some(agent.working_dir.as_str()),
@@ -1679,7 +1679,7 @@ fn agent_card_meta<'a>(agent: &'a AgentEntry, app: &'a App) -> AgentCardMeta<'a>
             let agent = &app.terminal_agents[*index];
             AgentCardMeta {
                 accent: agent.accent_color,
-                status_color: session_status_color(&agent.status),
+                status_color: session_status_color(&agent.status, agent.has_recent_activity()),
                 agent_type: "term",
                 type_detail: agent.shell.as_str(),
                 work_dir: Some(agent.working_dir.as_str()),
@@ -1712,9 +1712,16 @@ fn agent_card_meta<'a>(agent: &'a AgentEntry, app: &'a App) -> AgentCardMeta<'a>
     }
 }
 
-fn session_status_color(status: &AgentStatus) -> Color {
+/// Status color for an interactive/terminal session card. Error states win
+/// outright; a running session is green while it's registering activity
+/// (see `ACTIVITY_IDLE_THRESHOLD_MS`) and falls back to blue — "healthy but
+/// idle" — once output has been quiet for a while. This mirrors the
+/// green/blue semantics background agents already use for active vs. idle
+/// (see `agent_status` in `panel/details.rs`).
+fn session_status_color(status: &AgentStatus, recently_active: bool) -> Color {
     match status {
-        AgentStatus::Running => STATUS_RUNNING,
+        AgentStatus::Running if recently_active => STATUS_RUNNING,
+        AgentStatus::Running => STATUS_OK,
         AgentStatus::Exited(0) => STATUS_OK,
         AgentStatus::Exited(_) => STATUS_FAIL,
     }
@@ -2413,5 +2420,45 @@ mod tests {
         assert_eq!(layout.terminal.unwrap().height, needed_agents(1));
         // Leftover space becomes the brain panel.
         assert!(layout.brain.is_some());
+    }
+
+    #[test]
+    fn running_session_with_recent_activity_is_working_green() {
+        assert_eq!(
+            session_status_color(&AgentStatus::Running, true),
+            STATUS_RUNNING
+        );
+    }
+
+    #[test]
+    fn running_session_gone_quiet_is_healthy_idle_blue() {
+        assert_eq!(
+            session_status_color(&AgentStatus::Running, false),
+            STATUS_OK
+        );
+    }
+
+    #[test]
+    fn exit_error_wins_over_activity() {
+        assert_eq!(
+            session_status_color(&AgentStatus::Exited(1), true),
+            STATUS_FAIL
+        );
+        assert_eq!(
+            session_status_color(&AgentStatus::Exited(1), false),
+            STATUS_FAIL
+        );
+    }
+
+    #[test]
+    fn clean_exit_stays_healthy_regardless_of_activity() {
+        assert_eq!(
+            session_status_color(&AgentStatus::Exited(0), true),
+            STATUS_OK
+        );
+        assert_eq!(
+            session_status_color(&AgentStatus::Exited(0), false),
+            STATUS_OK
+        );
     }
 }
