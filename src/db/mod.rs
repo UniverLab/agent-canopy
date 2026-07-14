@@ -329,8 +329,38 @@ impl Database {
                 config TEXT NOT NULL,
                 builtin INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS scheduled_sends (
+                id TEXT PRIMARY KEY,
+                prompt TEXT NOT NULL,
+                target_session_id TEXT NOT NULL,
+                fire_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS failed_scheduled_sends (
+                id TEXT PRIMARY KEY,
+                prompt TEXT NOT NULL,
+                target_session_id TEXT NOT NULL,
+                workdir TEXT,
+                failed_at INTEGER NOT NULL
             );",
         )?;
+
+        // `workdir` records which project a scheduled send targeted so a
+        // dead-target failure can be preserved per-project for U8's recall.
+        let has_scheduled_send_workdir: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('scheduled_sends') WHERE name = 'workdir'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_scheduled_send_workdir {
+            conn.execute("ALTER TABLE scheduled_sends ADD COLUMN workdir TEXT", [])
+                .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
 
         let has_session_type: bool = conn
             .query_row(
@@ -682,6 +712,7 @@ pub mod loops;
 pub mod pools;
 pub mod project;
 pub mod run;
+pub mod scheduled_sends;
 pub mod seeds;
 pub mod session;
 pub mod state;

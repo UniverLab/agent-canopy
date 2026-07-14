@@ -440,6 +440,10 @@ pub struct App {
     // Nursery — temporary path for seed creation loop
     pub(crate) nursery_path: Option<std::path::PathBuf>,
 
+    /// Whether the terminal supports and has enabled the Kitty keyboard
+    /// enhancement protocol (Shift+Enter disambiguation).
+    pub(crate) keyboard_enhancement_active: bool,
+
     // Atmosphere engine
     pub(crate) atmosphere: crate::tui::atmosphere::SceneManager,
     pub(crate) atmosphere_ctx: crate::tui::atmosphere::AtmosphereCtx,

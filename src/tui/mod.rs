@@ -22,9 +22,15 @@ pub(crate) use ui::truncate_str_keep_tail;
 
 use anyhow::{Context, Result};
 use ratatui::crossterm::{
-    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
+        LeaveAlternateScreen,
+    },
 };
 use std::io;
 use std::sync::Arc;
@@ -82,6 +88,18 @@ pub fn run_tui() -> Result<()> {
         EnableMouseCapture,
         EnableBracketedPaste
     )?;
+
+    // Enable Kitty keyboard enhancement if supported — allows Shift+Enter
+    // disambiguation. Where unsupported, Ctrl+S remains the fallback send key.
+    let ke_supported = supports_keyboard_enhancement().unwrap_or(false);
+    if ke_supported {
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
+    app.keyboard_enhancement_active = ke_supported;
+
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
 
@@ -90,6 +108,9 @@ pub fn run_tui() -> Result<()> {
 
     // Restore terminal — always, even on error
     disable_raw_mode()?;
+    if ke_supported {
+        execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags)?;
+    }
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,

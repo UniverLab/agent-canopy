@@ -1,4 +1,5 @@
 use anyhow::Result;
+use chrono::Timelike;
 use ratatui::style::Color;
 use std::collections::{HashMap, HashSet};
 
@@ -79,6 +80,12 @@ pub struct SimplePromptDialog {
     /// protocol is read before the task. None = omit. Set once per workdir
     /// session (idempotent).
     pub system_content: Option<String>,
+    /// Scheduled delivery time. `None` = send immediately (default).
+    /// Stored as `(hour, minute)` in 24h format; date is always "today"
+    /// (or tomorrow if the time has already passed — computed at send time).
+    pub send_at: Option<(u8, u8)>,
+    /// Which unit of `send_at` is focused for editing: 0=hour, 1=minute.
+    pub send_at_focus_unit: usize,
 }
 
 impl SimplePromptDialog {
@@ -105,6 +112,8 @@ impl SimplePromptDialog {
             collapsed_pastes: HashMap::new(),
             locked_sections: HashSet::new(),
             system_content: None,
+            send_at: None,
+            send_at_focus_unit: 0,
         }
     }
 
@@ -1088,6 +1097,94 @@ impl SimplePromptDialog {
         );
     }
 
+    /// Whether the `send_at` field is currently focused (virtual section at index 0).
+    #[allow(dead_code)]
+    pub fn is_send_at_focused(&self) -> bool {
+        self.focused_section == 0 && !self.enabled_sections.is_empty()
+    }
+
+    /// Total focusable items: send_at (1) + enabled_sections.
+    pub fn total_focusable(&self) -> usize {
+        1 + self.enabled_sections.len()
+    }
+
+    /// Move focus to the next field. When leaving send_at, shift section
+    /// indices down by 1 so they remain contiguous.
+    pub fn focus_next(&mut self) {
+        if self.focused_section < self.total_focusable() - 1 {
+            self.focused_section += 1;
+        }
+    }
+
+    /// Move focus to the previous field.
+    pub fn focus_prev(&mut self) {
+        if self.focused_section > 0 {
+            self.focused_section -= 1;
+        }
+    }
+
+    /// Map the focus index to an `enabled_sections` index.
+    /// `None` when send_at (focus 0) is selected.
+    pub fn focused_section_index(&self) -> Option<usize> {
+        if self.focused_section == 0 {
+            None
+        } else {
+            Some(self.focused_section - 1)
+        }
+    }
+
+    /// Resolve the currently focused section name, if any (not send_at).
+    pub fn focused_section_name(&self) -> Option<&str> {
+        self.focused_section_index()
+            .and_then(|idx| self.enabled_sections.get(idx))
+            .map(String::as_str)
+    }
+
+    /// Increment the focused unit of `send_at` (hour or minute).
+    pub fn send_at_increment(&mut self) {
+        let (ref mut hour, ref mut minute) = self
+            .send_at
+            .get_or_insert_with(|| (chrono::Local::now().hour() as u8, 0));
+        match self.send_at_focus_unit {
+            0 => *hour = (*hour + 1) % 24,
+            _ => *minute = (*minute + 1) % 60,
+        }
+    }
+
+    /// Decrement the focused unit of `send_at` (hour or minute).
+    pub fn send_at_decrement(&mut self) {
+        let (ref mut hour, ref mut minute) = self
+            .send_at
+            .get_or_insert_with(|| (chrono::Local::now().hour() as u8, 0));
+        match self.send_at_focus_unit {
+            0 => *hour = (*hour + 23) % 24,
+            _ => *minute = (*minute + 59) % 60,
+        }
+    }
+
+    /// Move focus between hour/minute within send_at.
+    pub fn send_at_move_focus(&mut self, delta: isize) {
+        if delta < 0 && self.send_at_focus_unit > 0 {
+            self.send_at_focus_unit -= 1;
+        } else if delta > 0 && self.send_at_focus_unit < 1 {
+            self.send_at_focus_unit += 1;
+        }
+    }
+
+    /// Clear the send_at schedule (set to immediate).
+    pub fn clear_send_at(&mut self) {
+        self.send_at = None;
+        self.send_at_focus_unit = 0;
+    }
+
+    /// Format the send_at value for display.
+    pub fn send_at_display(&self) -> String {
+        match self.send_at {
+            Some((h, m)) => format!("{h:02}:{m:02}"),
+            None => "now (unset)".to_string(),
+        }
+    }
+
     fn should_collapse_paste(text: &str) -> bool {
         text.lines().count() > 1 || text.chars().count() > 200
     }
@@ -1496,6 +1593,7 @@ pub struct PromptBuilderSession {
     pub section_scrolls: HashMap<String, usize>,
     pub collapsed_pastes: HashMap<String, String>,
     pub locked_sections: HashSet<String>,
+    pub send_at: Option<(u8, u8)>,
 }
 
 impl PromptBuilderSession {
@@ -1509,6 +1607,7 @@ impl PromptBuilderSession {
             section_scrolls: dialog.section_scrolls.clone(),
             collapsed_pastes: dialog.collapsed_pastes.clone(),
             locked_sections: dialog.locked_sections.clone(),
+            send_at: dialog.send_at,
         }
     }
 
@@ -1521,10 +1620,12 @@ impl PromptBuilderSession {
         dialog.section_scrolls = self.section_scrolls.clone();
         dialog.collapsed_pastes = self.collapsed_pastes.clone();
         dialog.locked_sections = self.locked_sections.clone();
+        dialog.send_at = self.send_at;
         // Reset transient UI state (not persisted across openings)
         dialog.picker_mode = SectionPickerMode::None;
         dialog.at_picker = None;
         dialog.system_content = None; // re-evaluated on each open
+        dialog.send_at_focus_unit = 0;
     }
 }
 

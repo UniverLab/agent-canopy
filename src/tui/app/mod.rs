@@ -175,6 +175,7 @@ impl App {
             knowledge_filter: String::new(),
             knowledge_filter_mode: false,
             nursery_path: None,
+            keyboard_enhancement_active: false,
             atmosphere: crate::tui::atmosphere::SceneManager::new(),
             atmosphere_ctx: crate::tui::atmosphere::AtmosphereCtx::default(),
             atmosphere_last_mouse: (0, 0),
@@ -200,6 +201,7 @@ impl App {
         self.refresh_active_runs()?;
         self.poll_interactive_agents();
         self.poll_terminal_agents();
+        self.deliver_due_scheduled_sends();
         self.tick_banner_animation();
         self.ensure_sidebar_brain();
         self.refresh_log();

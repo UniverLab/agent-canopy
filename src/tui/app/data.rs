@@ -186,4 +186,91 @@ impl App {
             }
         }
     }
+
+    /// Poll for due scheduled sends and deliver them to the target interactive
+    /// session. If the target session is dead/missing, send a desktop
+    /// notification and keep the prompt recoverable via the last-prompt recall.
+    pub(super) fn deliver_due_scheduled_sends(&mut self) {
+        let now = chrono::Utc::now();
+        let due = match self.db.list_due_scheduled_sends(now) {
+            Ok(due) => due,
+            Err(e) => {
+                tracing::warn!("Failed to list due scheduled sends: {e}");
+                return;
+            }
+        };
+
+        let live_session_ids: Vec<String> = self
+            .interactive_agents
+            .iter()
+            .map(|a| a.id.clone())
+            .collect();
+
+        for send in &due {
+            if crate::db::scheduled_sends::is_target_alive(
+                &send.target_session_id,
+                &live_session_ids,
+            ) {
+                // Find the target interactive agent by session ID.
+                let Some(agent) = self
+                    .interactive_agents
+                    .iter()
+                    .find(|a| a.id == send.target_session_id)
+                else {
+                    continue;
+                };
+                // Deliver the prompt using the same path as a manual send.
+                let spec = agent.cli.paste_submit_spec();
+                if let Err(e) = agent.submit_prompt_to_pty(&send.prompt, spec) {
+                    tracing::warn!("Scheduled send '{}' delivery failed: {e}", send.id);
+                    crate::domain::notification::send_notification(
+                        "Scheduled send failed",
+                        &format!("Could not deliver prompt: {e}"),
+                        crate::domain::notification::NotificationLevel::Error,
+                    );
+                } else {
+                    tracing::info!(
+                        "Scheduled send '{}' delivered to session '{}'",
+                        send.id,
+                        send.target_session_id
+                    );
+                }
+            } else {
+                // Target session doesn't exist — notify and preserve the prompt
+                // so it stays reachable via the project's last-prompt recall.
+                tracing::warn!(
+                    "Scheduled send '{}': target session '{}' not found; \
+                     prompt preserved for recall",
+                    send.id,
+                    send.target_session_id
+                );
+                if let Err(e) = self.db.insert_failed_scheduled_send(
+                    &send.id,
+                    &send.prompt,
+                    &send.target_session_id,
+                    send.workdir.as_deref(),
+                    now,
+                ) {
+                    tracing::warn!(
+                        "Failed to preserve failed scheduled send '{}': {e}",
+                        send.id
+                    );
+                }
+                crate::domain::notification::send_notification(
+                    "Scheduled send: session not found",
+                    &format!(
+                        "Target session '{}' is no longer active. The prompt is preserved for recall.",
+                        send.target_session_id
+                    ),
+                    crate::domain::notification::NotificationLevel::Warning,
+                );
+            }
+
+            // Remove the scheduled send after delivery attempt (whether
+            // successful or not — the prompt is either delivered or preserved).
+            if let Err(e) = self.db.delete_scheduled_send(&send.id) {
+                tracing::warn!("Failed to delete scheduled send '{}': {e}", send.id);
+            }
+        }
+    }
 }

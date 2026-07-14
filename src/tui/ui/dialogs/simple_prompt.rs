@@ -189,6 +189,19 @@ fn centered_rect_fixed(
     ratatui::layout::Rect::new(x, y, clamped_w, clamped_h)
 }
 
+/// Which send shortcut is currently active, for the footer/hint line.
+/// Shift+Enter requires the terminal's Kitty keyboard enhancement protocol
+/// to disambiguate it from plain Enter; where that isn't supported, Ctrl+S
+/// remains the fallback (see `run_tui`'s `supports_keyboard_enhancement`
+/// probe at startup).
+fn active_send_shortcut_label(keyboard_enhancement_active: bool) -> (&'static str, &'static str) {
+    if keyboard_enhancement_active {
+        ("Shift+Enter ", "send")
+    } else {
+        ("Ctrl+S ", "send")
+    }
+}
+
 pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) {
     let Some(dialog) = &app.simple_prompt_dialog else {
         return;
@@ -205,6 +218,17 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) {
         })
         .unwrap_or(ACCENT);
 
+    // Pending scheduled sends targeting the currently selected session —
+    // shown next to the Schedule field and cancelable with Ctrl+K there.
+    let selected_session_id = app.selected_agent().and_then(|a| match a {
+        AgentEntry::Interactive(idx) => app.interactive_agents.get(*idx).map(|ia| ia.id.clone()),
+        _ => None,
+    });
+    let pending_scheduled = selected_session_id
+        .as_deref()
+        .and_then(|id| app.db.list_pending_scheduled_sends_for_session(id).ok())
+        .unwrap_or_default();
+
     // Use 65% of terminal width (responsive, not edge-to-edge)
     let percent_x = 65u16;
     let frame_area = frame.area();
@@ -216,12 +240,14 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) {
     let field_width = inner_width.saturating_sub(2).max(10) as usize;
 
     // Pre-compute render height for each section (label + content + border + gap = content_h + 3).
+    // focused_section 0 = send_at, sections start at index 1.
+    let section_focus_offset = 1;
     let section_heights: Vec<u16> = dialog
         .enabled_sections
         .iter()
         .enumerate()
         .map(|(i, section_name)| {
-            let is_focused = dialog.focused_section == i;
+            let is_focused = dialog.focused_section == i + section_focus_offset;
             let content_h = if is_focused {
                 let content = dialog.section_content_for_build(section_name).unwrap_or("");
                 let vis = crate::tui::app::dialog::SimplePromptDialog::visual_line_count(
@@ -262,6 +288,7 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) {
     frame.render_widget(block, area);
 
     // Draw hint line
+    let (send_label, send_hint) = active_send_shortcut_label(app.keyboard_enhancement_active);
     let instructions = Line::from(vec![
         Span::styled("↑↓ ", Style::default().fg(DIM)),
         Span::styled("fields  ", Style::default().fg(Color::White)),
@@ -273,8 +300,8 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) {
         Span::styled("add section  ", Style::default().fg(Color::White)),
         Span::styled("Ctrl+X ", Style::default().fg(DIM)),
         Span::styled("remove  ", Style::default().fg(Color::White)),
-        Span::styled("Ctrl+S ", Style::default().fg(DIM)),
-        Span::styled("send  ", Style::default().fg(Color::White)),
+        Span::styled(send_label, Style::default().fg(DIM)),
+        Span::styled(format!("{send_hint}  "), Style::default().fg(Color::White)),
         Span::styled("Esc  ", Style::default().fg(DIM)),
         Span::styled("hide", Style::default().fg(Color::White)),
     ]);
@@ -287,15 +314,83 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) {
     };
     frame.render_widget(Paragraph::new(instructions), instructions_area);
 
+    // ── Send-at field (virtual section at focus index 0) ────────────────
+    let send_at_y = inner.y + 1;
+    let send_at_is_focused = dialog.focused_section == 0 && !dialog.enabled_sections.is_empty();
+    let send_at_bg = if send_at_is_focused {
+        Color::Rgb(40, 40, 40)
+    } else {
+        Color::Rgb(30, 30, 30)
+    };
+    let send_at_label_style = if send_at_is_focused {
+        Style::default().fg(accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(accent)
+    };
+    let send_at_label = generate_top_border("Schedule", inner.width, send_at_label_style);
+    let send_at_label_area = ratatui::layout::Rect {
+        x: inner.x,
+        y: send_at_y,
+        width: inner.width,
+        height: 1,
+    };
+    frame.render_widget(Paragraph::new(send_at_label), send_at_label_area);
+
+    // Render send_at content
+    let send_at_display = dialog.send_at_display();
+    let send_at_hint = " ↑↓ adjust  ←→ unit  Backspace clear";
+    let pending_suffix = match pending_scheduled.first() {
+        Some(next) => {
+            let next_local = next.fire_at.with_timezone(&chrono::Local);
+            format!(
+                "   {} scheduled → {} (Ctrl+K cancel)",
+                pending_scheduled.len(),
+                next_local.format("%H:%M")
+            )
+        }
+        None => String::new(),
+    };
+    let send_at_text = format!("  {send_at_display}{send_at_hint}{pending_suffix}");
+    let send_at_content_style = Style::default()
+        .fg(if send_at_is_focused {
+            Color::White
+        } else {
+            DIM
+        })
+        .bg(send_at_bg);
+    let send_at_paragraph = Paragraph::new(Line::from(Span::styled(
+        send_at_text,
+        send_at_content_style,
+    )));
+    let send_at_content_area = ratatui::layout::Rect {
+        x: inner.x + 1,
+        y: send_at_y + 1,
+        width: inner.width.saturating_sub(2),
+        height: 1,
+    };
+    frame.render_widget(send_at_paragraph, send_at_content_area);
+
+    let send_at_border = generate_bottom_border(inner.width, send_at_label_style);
+    let send_at_border_area = ratatui::layout::Rect {
+        x: inner.x,
+        y: send_at_y + 2,
+        width: inner.width,
+        height: 1,
+    };
+    frame.render_widget(Paragraph::new(send_at_border), send_at_border_area);
+
     // ── Scroll computation ─────────────────────────────────────────────────
-    // sections_available_h = inner height minus hint(1) + blank(1).
-    let sections_top = inner.y + 2;
-    let sections_available_h = inner.height.saturating_sub(2);
+    // sections_available_h = inner height minus hint(1) + send_at(3) + blank(1).
+    let sections_top = send_at_y + 4;
+    let sections_available_h = inner.height.saturating_sub(5);
     let mut picker_anchor_area: Option<ratatui::layout::Rect> = None;
 
     // Work backwards from focused_section to find the first section that fits.
+    // focused_section 0 = send_at (handled above), sections start at index 1.
+    let section_focus_offset = 1; // send_at occupies focus index 0
     let start_idx = {
-        let focused = dialog.focused_section;
+        let focused = dialog.focused_section.saturating_sub(section_focus_offset);
+        let focused = focused.min(dialog.enabled_sections.len().saturating_sub(1));
         let focused_h = section_heights.get(focused).copied().unwrap_or(4);
         let mut remaining = sections_available_h.saturating_sub(focused_h);
         let mut start = focused;
@@ -339,7 +434,7 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) {
             break;
         }
 
-        let is_focused = dialog.focused_section == i;
+        let is_focused = dialog.focused_section == i + section_focus_offset;
 
         let section_type = {
             let known = [
@@ -541,6 +636,16 @@ mod tests {
 
     fn line_text(line: &Line) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn active_send_shortcut_prefers_shift_enter_when_supported() {
+        assert_eq!(active_send_shortcut_label(true), ("Shift+Enter ", "send"));
+    }
+
+    #[test]
+    fn active_send_shortcut_falls_back_to_ctrl_s_when_unsupported() {
+        assert_eq!(active_send_shortcut_label(false), ("Ctrl+S ", "send"));
     }
 
     #[test]
