@@ -20,6 +20,7 @@ pub mod background_agent;
 pub mod details;
 pub mod home;
 pub mod log_fallback;
+mod loop_live;
 pub mod sync;
 pub mod vt100;
 pub mod warp;
@@ -28,6 +29,7 @@ pub(crate) use background_agent::draw_background_agent_panel;
 pub use details::{draw_agent_details, draw_group_details};
 pub(crate) use home::draw_brians_brain;
 pub use log_fallback::draw_log_text;
+use loop_live::draw_loop_live_view;
 pub(crate) use sync::draw_activity_panel;
 use vt100::render_vt_screen;
 #[allow(unused_imports)]
@@ -745,7 +747,7 @@ fn draw_projects_mode_panel(frame: &mut Frame, area: Rect, app: &App) {
 
     match app.projects_panel_focus {
         ProjectsPanelFocus::Projects => draw_project_overview(frame, area, app),
-        ProjectsPanelFocus::Loops => draw_loop_overview(frame, area, app),
+        ProjectsPanelFocus::Loops => draw_loop_live_view(frame, area, app),
         ProjectsPanelFocus::Backlog => draw_backlog_overview(frame, area, app),
         ProjectsPanelFocus::History => draw_history_overview(frame, area, app),
         ProjectsPanelFocus::Knowledge => draw_knowledge_overview(frame, area, app),
@@ -804,8 +806,9 @@ fn draw_backlog_overview(frame: &mut Frame, area: Rect, app: &App) {
 
 /// `History`'s main-panel preview: while collapsed, just the summary the
 /// header already advertises; once expanded, the selected finished loop's
-/// details — reusing `draw_loop_overview` rather than duplicating it, since
-/// selecting a history loop keeps today's loop-view behavior.
+/// details — reusing `draw_loop_live_view` rather than duplicating it, since
+/// selecting a history loop keeps today's loop-view behavior (rendered
+/// statically: no engine to auto-follow, see `LoopLiveState`).
 fn draw_history_overview(frame: &mut Frame, area: Rect, app: &App) {
     let finished = app.finished_loops();
     if finished.is_empty() {
@@ -832,7 +835,7 @@ fn draw_history_overview(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    draw_loop_overview(frame, area, app);
+    draw_loop_live_view(frame, area, app);
 }
 
 fn draw_knowledge_overview(frame: &mut Frame, area: Rect, app: &App) {
@@ -883,255 +886,6 @@ fn draw_knowledge_overview(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_rag_queue_overview(frame: &mut Frame, area: Rect, app: &App) {
     draw_rag_info_overview(frame, area, app);
-}
-
-fn draw_loop_overview(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(lp) = app.selected_loop() else {
-        frame.render_widget(
-            Paragraph::new("No loops yet").style(Style::default().fg(DIM)),
-            area,
-        );
-        return;
-    };
-    let Some(details) = app.selected_loop_details() else {
-        frame.render_widget(
-            Paragraph::new("Loop details are unavailable").style(Style::default().fg(DIM)),
-            area,
-        );
-        return;
-    };
-    let Some(spec) = app.selected_loop_spec() else {
-        frame.render_widget(
-            Paragraph::new("Loop has no specs yet").style(Style::default().fg(DIM)),
-            area,
-        );
-        return;
-    };
-
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("Loop ", Style::default().fg(DIM)),
-            Span::styled(
-                lp.name.as_str(),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                lp.status.as_str().to_uppercase(),
-                Style::default().fg(Color::White),
-            ),
-        ]),
-        Line::from(format!("Workdir: {}", lp.workdir)),
-        Line::from(format!(
-            "Spec {}/{}: {} [{}]",
-            app.loop_selected_spec + 1,
-            details.specs.len(),
-            spec.spec.name,
-            spec.spec.status.as_str()
-        )),
-        Line::from(Span::styled(
-            "Tab section  ·  [ ] spec  ·  ←→ node  ·  Enter/e edit",
-            Style::default().fg(DIM),
-        )),
-        Line::from(""),
-        Line::from(Span::styled("Graph", Style::default().fg(DIM))),
-    ];
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("Graph", Style::default().fg(DIM))));
-
-    if spec.nodes.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  (no nodes yet)",
-            Style::default().fg(DIM),
-        )));
-    } else {
-        lines.extend(loop_graph_lines(spec, app.loop_selected_node, area.width));
-    }
-
-    if !app.loop_runs.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Recent runs",
-            Style::default().fg(DIM),
-        )));
-        lines.extend(app.loop_runs.iter().rev().take(4).map(|run| {
-            Line::from(format!(
-                "  iter {}  {}  {}",
-                run.iteration,
-                run.node_id,
-                run.status.as_str()
-            ))
-        }));
-    }
-
-    render_wrapped_paragraph(frame, area, lines);
-}
-
-fn loop_node_summary(node: &crate::domain::loops::LoopNode) -> String {
-    match node.kind {
-        crate::domain::loops::LoopNodeKind::Agent => node
-            .config
-            .get("prompt_template")
-            .and_then(serde_json::Value::as_str)
-            .map(|prompt| truncate_str(prompt, 72))
-            .filter(|prompt| !prompt.is_empty())
-            .unwrap_or_else(|| "prompt_template not set".to_string()),
-        crate::domain::loops::LoopNodeKind::Check => node
-            .config
-            .get("command")
-            .and_then(serde_json::Value::as_str)
-            .map(|command| format!("check: {}", truncate_str(command, 72)))
-            .unwrap_or_else(|| "check config".to_string()),
-        crate::domain::loops::LoopNodeKind::Gate => {
-            let evaluate = node
-                .config
-                .get("evaluate")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("gate");
-            let value = node
-                .config
-                .get("value")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            format!("{evaluate}: {}", truncate_str(value, 48))
-        }
-    }
-}
-
-fn loop_node_box_styles(selected: bool) -> (Style, Style) {
-    if selected {
-        (
-            Style::default().fg(ACCENT),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )
-    } else {
-        (
-            Style::default().fg(BORDER_COLOR),
-            Style::default().fg(Color::White),
-        )
-    }
-}
-
-fn loop_node_content_line(
-    node: &crate::domain::loops::LoopNode,
-    selected: bool,
-    inner: usize,
-) -> Option<Line<'static>> {
-    let summary = loop_node_summary(node);
-    if summary.is_empty() {
-        return None;
-    }
-
-    let summary_trunc = truncate_str(&summary, inner.saturating_sub(3));
-    let summary_pad = inner.saturating_sub(3 + summary_trunc.len());
-    let summary_line = format!("  │   {}{}│", summary_trunc, " ".repeat(summary_pad));
-    Some(Line::from(Span::styled(
-        summary_line,
-        if selected {
-            Style::default().fg(Color::White)
-        } else {
-            Style::default().fg(DIM)
-        },
-    )))
-}
-
-fn loop_node_lines(
-    node: &crate::domain::loops::LoopNode,
-    selected: bool,
-    inner: usize,
-) -> Vec<Line<'static>> {
-    let (border_style, text_style) = loop_node_box_styles(selected);
-    let kind_tag = format!("[{}]", node.kind.as_str());
-    let max_name = inner.saturating_sub(2 + kind_tag.len());
-    let name_display = truncate_str(&node.name, max_name);
-    let spaces = inner.saturating_sub(2 + name_display.len() + kind_tag.len());
-    let marker = if selected { "›" } else { " " };
-
-    let mut lines = vec![
-        Line::from(Span::styled(
-            format!("  ┌{}┐", "─".repeat(inner)),
-            border_style,
-        )),
-        Line::from(Span::styled(
-            format!(
-                "  │{} {}{}{}│",
-                marker,
-                name_display,
-                " ".repeat(spaces),
-                kind_tag
-            ),
-            text_style,
-        )),
-    ];
-
-    if let Some(content) = loop_node_content_line(node, selected, inner) {
-        lines.push(content);
-    }
-
-    lines.push(Line::from(Span::styled(
-        format!("  └{}┘", "─".repeat(inner)),
-        border_style,
-    )));
-
-    lines
-}
-
-fn loop_edge_lines(
-    edges: &[(usize, crate::domain::loops::LoopEdgeCondition)],
-    spec_nodes: &[crate::domain::loops::LoopNode],
-) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    for (i, (target_idx, condition)) in edges.iter().enumerate() {
-        let branch = if i == edges.len() - 1 { "└" } else { "├" };
-        let target_name = spec_nodes
-            .get(*target_idx)
-            .map(|n| n.name.clone())
-            .unwrap_or_else(|| "?".to_string());
-        lines.push(Line::from(Span::styled(
-            format!("   {}─ {} → {}", branch, condition.as_str(), target_name),
-            Style::default().fg(DIM),
-        )));
-    }
-    lines
-}
-
-fn loop_graph_lines(
-    spec: &crate::domain::loops::LoopSpecDetails,
-    selected_node_idx: usize,
-    area_width: u16,
-) -> Vec<Line<'static>> {
-    use std::collections::HashMap;
-
-    let mut outgoing: HashMap<&str, Vec<(usize, crate::domain::loops::LoopEdgeCondition)>> =
-        HashMap::new();
-    for edge in &spec.edges {
-        if let Some(target_idx) = spec.nodes.iter().position(|n| n.id == edge.to_node) {
-            outgoing
-                .entry(edge.from_node.as_str())
-                .or_default()
-                .push((target_idx, edge.condition));
-        }
-    }
-
-    let box_width = (area_width as usize).saturating_sub(4).clamp(22, 48);
-    let inner = box_width.saturating_sub(2);
-
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    for (idx, node) in spec.nodes.iter().enumerate() {
-        let selected = idx == selected_node_idx;
-        lines.extend(loop_node_lines(node, selected, inner));
-
-        if let Some(edges) = outgoing.get(node.id.as_str()) {
-            lines.extend(loop_edge_lines(edges, &spec.nodes));
-            lines.push(Line::from(""));
-        } else if idx < spec.nodes.len() - 1 {
-            lines.push(Line::from(""));
-        }
-    }
-
-    lines
 }
 
 fn rag_status(app: &App) -> (&'static str, Color) {

@@ -2,7 +2,7 @@ mod agents;
 mod data;
 pub mod dialog;
 mod gamification;
-mod loop_live_state;
+pub(crate) mod loop_live_state;
 mod project_graph;
 mod sync;
 
@@ -103,6 +103,8 @@ impl App {
             loop_form_dialog: None,
             loop_sidebar_meta: HashMap::new(),
             loop_live_state: None,
+            loop_graph_follow: true,
+            loop_graph_selected_node: None,
             backlog_specs: Vec::new(),
             selected_backlog: 0,
             history_collapsed: true,
@@ -931,6 +933,8 @@ impl App {
             self.loop_selected_spec = 0;
             self.loop_selected_node = 0;
             self.loop_live_state = None;
+            self.loop_graph_follow = true;
+            self.loop_graph_selected_node = None;
             return;
         }
 
@@ -951,6 +955,8 @@ impl App {
         if selected_changed {
             self.loop_selected_spec = self.default_loop_spec_index();
             self.loop_selected_node = 0;
+            self.loop_graph_follow = true;
+            self.loop_graph_selected_node = None;
         } else {
             self.clamp_loop_selection();
         }
@@ -966,6 +972,87 @@ impl App {
             .loop_details
             .as_ref()
             .and_then(|details| loop_live_state::assemble_loop_live_state(&self.db, details));
+
+        // A manually-highlighted node that no longer exists in the
+        // (possibly just-advanced) effective graph falls back to
+        // auto-follow rather than pointing at a stale/missing node.
+        if !self.loop_graph_follow {
+            let still_present = self.loop_live_state.as_ref().is_some_and(|state| {
+                self.loop_graph_selected_node
+                    .as_deref()
+                    .is_some_and(|id| state.effective_nodes.iter().any(|n| n.id == id))
+            });
+            if !still_present {
+                self.loop_graph_follow = true;
+                self.loop_graph_selected_node = None;
+            }
+        }
+    }
+
+    /// Move the live loop view's graph highlight to the next/previous node
+    /// (by `position` order) in the current spec's effective graph, entering
+    /// manual-inspection mode. No-op when there's no live state or graph.
+    pub fn loop_graph_move_highlight(&mut self, forward: bool) {
+        let ids: Vec<String> = match self.loop_live_state.as_ref() {
+            Some(state) if !state.effective_nodes.is_empty() => {
+                state.effective_nodes.iter().map(|n| n.id.clone()).collect()
+            }
+            _ => return,
+        };
+
+        let current = self.loop_graph_highlighted_node_id().map(str::to_string);
+        let idx = current
+            .as_deref()
+            .and_then(|id| ids.iter().position(|n| n == id))
+            .unwrap_or(0);
+        let next_idx = if forward {
+            (idx + 1) % ids.len()
+        } else {
+            idx.checked_sub(1).unwrap_or(ids.len() - 1)
+        };
+        self.loop_graph_selected_node = Some(ids[next_idx].clone());
+        self.loop_graph_follow = false;
+    }
+
+    /// Return the live loop view to auto-follow, discarding any manual
+    /// node-inspection selection.
+    pub fn loop_graph_reset_follow(&mut self) {
+        self.loop_graph_follow = true;
+        self.loop_graph_selected_node = None;
+    }
+
+    /// The node id currently highlighted in the live loop view: the
+    /// engine's current node while auto-following, else the manually
+    /// selected node.
+    pub fn loop_graph_highlighted_node_id(&self) -> Option<&str> {
+        if self.loop_graph_follow {
+            self.loop_live_state.as_ref()?.current_node_id.as_deref()
+        } else {
+            self.loop_graph_selected_node.as_deref()
+        }
+    }
+
+    /// Run info (status/started_at/iteration/output tail) for the live loop
+    /// view's currently highlighted node — reuses the snapshot's own
+    /// current-node fields when the highlight matches it (no query), else
+    /// looks up the manually-highlighted node directly.
+    pub fn loop_graph_highlighted_node_run_info(&self) -> loop_live_state::NodeRunInfo {
+        let Some(state) = self.loop_live_state.as_ref() else {
+            return loop_live_state::NodeRunInfo::default();
+        };
+        let highlighted = self.loop_graph_highlighted_node_id();
+        if highlighted == state.current_node_id.as_deref() {
+            return loop_live_state::NodeRunInfo {
+                status: state.current_node_status,
+                started_at: state.current_node_started_at,
+                iteration: state.current_node_iteration,
+                output_tail: state.current_node_output_tail.clone(),
+            };
+        }
+        let (Some(spec_id), Some(node_id)) = (state.current_spec_id.as_deref(), highlighted) else {
+            return loop_live_state::NodeRunInfo::default();
+        };
+        self.loop_node_run_info(spec_id, node_id)
     }
 
     fn refresh_rag_state(&mut self) -> Result<()> {
@@ -1059,10 +1146,6 @@ impl App {
         self.loops.iter().find(|lp| lp.id == *selected_id)
     }
 
-    pub fn selected_loop_details(&self) -> Option<&crate::domain::loops::LoopDetails> {
-        self.loop_details.as_ref()
-    }
-
     pub fn selected_loop_spec(&self) -> Option<&crate::domain::loops::LoopSpecDetails> {
         self.loop_details
             .as_ref()
@@ -1078,7 +1161,6 @@ impl App {
     /// `node_id` within `spec_id` — for a node the user has navigated to in
     /// the graph, which may differ from `loop_live_state`'s auto-detected
     /// current node.
-    #[allow(dead_code)]
     pub(crate) fn loop_node_run_info(
         &self,
         spec_id: &str,
@@ -1331,23 +1413,6 @@ impl App {
         self.loop_selected_node = 0;
         self.refresh_loop_runs_for_selected_spec();
         self.select_default_loop_node_if_needed(true);
-        self.reset_log_scroll();
-    }
-
-    pub fn cycle_loop_node(&mut self, forward: bool) {
-        let Some(spec) = self.selected_loop_spec() else {
-            return;
-        };
-        if spec.nodes.is_empty() {
-            return;
-        }
-        self.loop_selected_node = if forward {
-            (self.loop_selected_node + 1) % spec.nodes.len()
-        } else {
-            self.loop_selected_node
-                .checked_sub(1)
-                .unwrap_or(spec.nodes.len() - 1)
-        };
         self.reset_log_scroll();
     }
 

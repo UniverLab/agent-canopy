@@ -38,7 +38,7 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                     let mut h = vec![
                         ("Tab", "section"),
                         ("↑↓", "nav"),
-                        ("←→", "node"),
+                        ("←→", "highlight"),
                         ("[ ]", "spec"),
                         ("Enter/e", "edit"),
                         ("F2", "agents"),

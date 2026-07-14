@@ -327,6 +327,14 @@ pub struct App {
     /// Live snapshot of the currently-selected loop's runtime state,
     /// refreshed every tick. `None` when no loop is selected.
     pub(crate) loop_live_state: Option<LoopLiveState>,
+    /// Whether the live loop view's graph highlight auto-follows the
+    /// engine's current node (`true`, the default) or sits on a node the
+    /// user manually navigated to (`false`, see `loop_graph_selected_node`).
+    /// Reset to `true` whenever the selected loop changes.
+    pub(crate) loop_graph_follow: bool,
+    /// The node id manually highlighted in the live loop view's graph.
+    /// Only meaningful while `loop_graph_follow` is `false`.
+    pub(crate) loop_graph_selected_node: Option<String>,
     /// Standalone/backlog specs (no loop yet), filtered to the selected
     /// project's workdir tag when a project is selected. Refreshed alongside
     /// `projects` in `App::refresh_projects`.

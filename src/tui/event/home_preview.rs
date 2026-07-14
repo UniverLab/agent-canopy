@@ -145,6 +145,16 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
     }
 
     match code {
+        // Manual node inspection in the live loop view intercepts Esc to
+        // return to auto-follow first; a second Esc falls through to the
+        // general "back to Home" behavior below.
+        KeyCode::Esc
+            if app.sidebar_mode == SidebarMode::Projects
+                && app.projects_panel_focus == ProjectsPanelFocus::Loops
+                && !app.loop_graph_follow =>
+        {
+            app.loop_graph_reset_follow();
+        }
         KeyCode::Esc | KeyCode::Char('h') => {
             app.focus = Focus::Home;
         }
@@ -206,13 +216,13 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
             if app.sidebar_mode == SidebarMode::Projects
                 && app.projects_panel_focus == ProjectsPanelFocus::Loops =>
         {
-            app.cycle_loop_node(false);
+            app.loop_graph_move_highlight(false);
         }
         KeyCode::Right
             if app.sidebar_mode == SidebarMode::Projects
                 && app.projects_panel_focus == ProjectsPanelFocus::Loops =>
         {
-            app.cycle_loop_node(true);
+            app.loop_graph_move_highlight(true);
         }
         KeyCode::Left
             if app.sidebar_mode == SidebarMode::Projects
