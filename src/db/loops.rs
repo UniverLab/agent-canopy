@@ -6,8 +6,9 @@ use std::io::{Error as IoError, ErrorKind};
 
 use crate::db::Database;
 use crate::domain::loops::{
-    Loop, LoopDetails, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind, LoopNodeRun,
-    LoopResetOutcome, LoopRunStatus, LoopSpec, LoopSpecDetails, LoopSpecStatus, LoopStatus,
+    Loop, LoopCompletionHook, LoopCompletionHookRun, LoopDetails, LoopEdge, LoopEdgeCondition,
+    LoopNode, LoopNodeKind, LoopNodeRun, LoopResetOutcome, LoopRunStatus, LoopSpec,
+    LoopSpecDetails, LoopSpecStatus, LoopStatus,
 };
 use crate::domain::models::Trigger;
 
@@ -27,9 +28,10 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let (trigger_type, trigger_config) = encode_loop_trigger(lp.trigger.as_ref())?;
+        let on_completed = encode_loop_completion_hook(lp.on_completed.as_ref())?;
         conn.execute(
-            "INSERT INTO loops (id, name, description, workdir, status, trigger_type, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO loops (id, name, description, workdir, status, trigger_type, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 &lp.id,
                 &lp.name,
@@ -43,6 +45,7 @@ impl Database {
                 lp.completed_at.map(|value| value.timestamp()),
                 lp.autorun_at.map(|value| value.timestamp()),
                 &lp.active_run_pool_id,
+                on_completed,
             ],
         )?;
         Ok(())
@@ -83,7 +86,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed
              FROM loops WHERE autorun_at IS NOT NULL",
         )?;
         let rows = stmt.query_map([], map_loop_row)?;
@@ -106,6 +109,26 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Replace a loop's `on_completed` hook config (N2). Passing `None`
+    /// clears it, making the loop's completion behave exactly as it did
+    /// before N2 (no hook).
+    pub fn update_loop_completion_hook(
+        &self,
+        loop_id: &str,
+        hook: Option<&LoopCompletionHook>,
+    ) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let on_completed = encode_loop_completion_hook(hook)?;
+        let rows = conn.execute(
+            "UPDATE loops SET on_completed = ?1 WHERE id = ?2",
+            params![on_completed, loop_id],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// Loops that fire on a cron schedule (their trigger is `Cron`).
     pub fn list_cron_loops(&self) -> Result<Vec<Loop>> {
         self.list_loops_where_trigger("cron")
@@ -122,7 +145,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed
              FROM loops WHERE trigger_type = ?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![trigger_type], map_loop_row)?;
@@ -167,7 +190,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed
              FROM loops WHERE id = ?1",
         )?;
 
@@ -182,10 +205,10 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let sql = if workdir.is_some() {
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed
              FROM loops WHERE workdir = ?1 ORDER BY created_at DESC"
         } else {
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed
              FROM loops ORDER BY created_at DESC"
         };
         let mut stmt = conn.prepare(sql)?;
@@ -937,6 +960,102 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Record one firing of a loop's `on_completed` hook (N2), started as
+    /// `Running` before the process is spawned — mirrors [`Self::insert_loop_run`]'s
+    /// pattern of a row that exists before the child does, so a crash mid-spawn
+    /// still leaves a `Running` row behind rather than nothing.
+    pub fn insert_loop_completion_hook_run(&self, run: &LoopCompletionHookRun) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        conn.execute(
+            "INSERT INTO loop_completion_hook_runs (id, loop_id, status, output, summary, started_at, completed_at, pid, boot_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                &run.id,
+                &run.loop_id,
+                run.status.as_str(),
+                run.output.as_ref().map(serde_json::to_string).transpose()?,
+                &run.summary,
+                run.started_at.timestamp(),
+                run.completed_at.map(|value| value.timestamp()),
+                run.pid,
+                &run.boot_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Same B12 treatment as [`Self::set_loop_run_pid`]: record the spawned
+    /// process-group leader so an abnormal end can `killpg` it.
+    pub fn set_loop_completion_hook_run_pid(
+        &self,
+        run_id: &str,
+        pid: i64,
+        boot_id: Option<&str>,
+    ) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE loop_completion_hook_runs SET pid = ?1, boot_id = ?2 WHERE id = ?3",
+            params![pid, boot_id, run_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    pub fn update_loop_completion_hook_run_result(
+        &self,
+        run_id: &str,
+        status: LoopRunStatus,
+        output: Option<&Value>,
+        summary: Option<&str>,
+        completed_at: Option<DateTime<Utc>>,
+    ) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE loop_completion_hook_runs
+             SET status = ?1,
+                 output = COALESCE(?2, output),
+                 summary = COALESCE(?3, summary),
+                 completed_at = COALESCE(?4, completed_at),
+                 pid = NULL
+             WHERE id = ?5",
+            params![
+                status.as_str(),
+                output.map(serde_json::to_string).transpose()?,
+                summary,
+                completed_at.map(|value| value.timestamp()),
+                run_id,
+            ],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Every past `on_completed` firing for a loop, oldest first — surfaced
+    /// via `loop_get`/`canopy loop info` alongside the graph's node runs.
+    pub fn list_loop_completion_hook_runs(
+        &self,
+        loop_id: &str,
+    ) -> Result<Vec<LoopCompletionHookRun>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, loop_id, status, output, summary, started_at, completed_at, pid, boot_id
+             FROM loop_completion_hook_runs WHERE loop_id = ?1 ORDER BY started_at ASC",
+        )?;
+        let rows = stmt.query_map(params![loop_id], map_loop_completion_hook_run_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     /// Loops left `Running` when the daemon starts.
     pub fn list_running_loops(&self) -> Result<Vec<Loop>> {
         let conn = self
@@ -944,7 +1063,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed
              FROM loops WHERE status = ?1",
         )?;
         let rows = stmt.query_map(params![LoopStatus::Running.as_str()], map_loop_row)?;
@@ -1045,12 +1164,14 @@ impl Database {
                 Ok(LoopSpecDetails { spec, nodes, edges })
             })
             .collect::<Result<Vec<_>>>()?;
+        let completion_hook_runs = self.list_loop_completion_hook_runs(loop_id)?;
 
         Ok(Some(LoopDetails {
             lp,
             graph_nodes,
             graph_edges,
             specs,
+            completion_hook_runs,
         }))
     }
 }
@@ -1099,6 +1220,11 @@ fn map_loop_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Loop> {
             .map(from_timestamp)
             .transpose()?,
         active_run_pool_id: row.get(10)?,
+        on_completed: row
+            .get::<_, Option<String>>(11)?
+            .as_deref()
+            .map(decode_loop_completion_hook)
+            .transpose()?,
     })
 }
 
@@ -1119,6 +1245,22 @@ fn encode_loop_trigger(trigger: Option<&Trigger>) -> Result<(Option<String>, Opt
 fn decode_loop_trigger(raw: &str) -> rusqlite::Result<Trigger> {
     serde_json::from_str(raw).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(error))
+    })
+}
+
+/// Encode a loop's `on_completed` hook config as JSON for the `on_completed`
+/// column. `None` (no hook configured) stores `NULL` — exactly today's
+/// (pre-N2) row shape.
+fn encode_loop_completion_hook(hook: Option<&LoopCompletionHook>) -> Result<Option<String>> {
+    hook.map(serde_json::to_string)
+        .transpose()
+        .map_err(Into::into)
+}
+
+/// Decode the `on_completed` column JSON back into a [`LoopCompletionHook`].
+fn decode_loop_completion_hook(raw: &str) -> rusqlite::Result<LoopCompletionHook> {
+    serde_json::from_str(raw).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(11, rusqlite::types::Type::Text, Box::new(error))
     })
 }
 
@@ -1217,6 +1359,29 @@ fn map_loop_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoopNodeRun> {
         iteration: row.get(9)?,
         pid: row.get(10)?,
         boot_id: row.get(11)?,
+    })
+}
+
+fn map_loop_completion_hook_run_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<LoopCompletionHookRun> {
+    Ok(LoopCompletionHookRun {
+        id: row.get(0)?,
+        loop_id: row.get(1)?,
+        status: LoopRunStatus::from_str(&row.get::<_, String>(2)?),
+        output: row
+            .get::<_, Option<String>>(3)?
+            .as_deref()
+            .map(parse_json_value)
+            .transpose()?,
+        summary: row.get(4)?,
+        started_at: from_timestamp(row.get(5)?)?,
+        completed_at: row
+            .get::<_, Option<i64>>(6)?
+            .map(from_timestamp)
+            .transpose()?,
+        pid: row.get(7)?,
+        boot_id: row.get(8)?,
     })
 }
 

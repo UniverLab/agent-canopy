@@ -333,6 +333,7 @@ mod tests {
             completed_at: None,
             autorun_at: None,
             active_run_pool_id: None,
+            on_completed: None,
         }
     }
 

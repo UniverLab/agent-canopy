@@ -295,6 +295,26 @@ pub struct LoopCreateParams {
     pub trigger: Option<LoopTriggerParams>,
 }
 
+/// Config for a loop's `on_completed` hook (N2) — an agent-node-style
+/// payload (platform/model/timeout_minutes), but with its own `prompt` field
+/// rather than a node's `prompt_template` since the hook has no spec/node
+/// graph context to template against. See [`crate::loop_engine`]'s
+/// `render_completion_hook_prompt` for the placeholders `prompt` supports:
+/// `{{loop_name}}`, `{{completed_specs}}`, `{{workdir}}`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopCompletionHookParams {
+    /// CLI platform to run the hook with (e.g. "mimo", "claude").
+    pub platform: String,
+    /// Optional model override.
+    pub model: Option<String>,
+    /// Hook prompt template. Supports {{loop_name}}, {{completed_specs}},
+    /// {{workdir}}.
+    pub prompt: String,
+    /// Timeout in minutes for the hook's process (default: 30, same default
+    /// as an agent node).
+    pub timeout_minutes: Option<u64>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LoopUpdateParams {
     /// Loop ID.
@@ -308,6 +328,11 @@ pub struct LoopUpdateParams {
     /// New automatic trigger. Provide kind = "manual" to clear it. Omit to
     /// leave the current trigger unchanged.
     pub trigger: Option<LoopTriggerParams>,
+    /// New `on_completed` post-completion hook config, or null to clear it.
+    /// Omit to leave the current hook unchanged. Fires at most once per run,
+    /// exactly when the loop transitions to `completed` (never on
+    /// failed/paused, never retroactively).
+    pub on_completed: Option<Option<LoopCompletionHookParams>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

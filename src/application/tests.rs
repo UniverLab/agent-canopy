@@ -58,6 +58,7 @@ mod test {
             LoopFinishOutcome::Completed {
                 done: 19,
                 total: 19,
+                hook_launched: false,
             },
         );
         service.notify_loop_finished("R4 loop", LoopFinishOutcome::Failed { spec_name: "R4" });
@@ -67,5 +68,9 @@ mod test {
                 summary: "needs human review",
             },
         );
+
+        // N2: post-completion hook failure notification.
+        service
+            .notify_loop_completion_hook_failed("R4 loop", "on_completed hook exited with code 1.");
     }
 }

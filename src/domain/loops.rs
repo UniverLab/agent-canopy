@@ -298,6 +298,30 @@ pub struct Loop {
     /// isn't polluted by a stale value.
     #[serde(default)]
     pub active_run_pool_id: Option<String>,
+    /// Optional post-completion hook (N2): an agent-node-style config the
+    /// engine fires exactly once, right after a run transitions to
+    /// `Completed` — never on `failed`/`paused`, never retroactively, and
+    /// never more than once per completing run (a completed→reset→completed
+    /// cycle fires again, once per completion). `None` preserves pre-N2
+    /// behavior exactly. See [`crate::loop_engine::LoopEngine`]'s
+    /// `run_loop_dispatch` for where it fires and
+    /// `render_completion_hook_prompt` for its placeholders.
+    #[serde(default)]
+    pub on_completed: Option<LoopCompletionHook>,
+}
+
+/// Config for a loop's `on_completed` hook — deliberately shaped like an
+/// agent node's config (`platform`/`model`/`timeout_minutes`) so it reuses
+/// the same CLI-resolution and spawn path, but keeps its own `prompt` field
+/// (rather than `prompt_template`) since it has no spec/node graph context to
+/// template against — only the placeholders `render_completion_hook_prompt`
+/// documents.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoopCompletionHook {
+    pub platform: String,
+    pub model: Option<String>,
+    pub prompt: String,
+    pub timeout_minutes: Option<u64>,
 }
 
 impl Loop {
@@ -447,6 +471,25 @@ pub struct LoopNodeRun {
     pub boot_id: Option<String>,
 }
 
+/// One firing of a loop's `on_completed` hook (N2). Deliberately its own
+/// table/type rather than a `LoopNodeRun` — a hook run belongs to no spec and
+/// no graph node (`loop_runs.spec_id`/`node_id` are `NOT NULL` FKs into
+/// exactly those), and its outcome must never feed back into the run's
+/// routing or final status the way a node run's does.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoopCompletionHookRun {
+    pub id: String,
+    pub loop_id: String,
+    pub status: LoopRunStatus,
+    pub output: Option<Value>,
+    pub summary: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    /// Same B12 kill-on-abnormal-end treatment as [`LoopNodeRun::pid`].
+    pub pid: Option<i64>,
+    pub boot_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopSpecDetails {
     pub spec: LoopSpec,
@@ -463,6 +506,9 @@ pub struct LoopDetails {
     pub graph_nodes: Vec<LoopNode>,
     pub graph_edges: Vec<LoopEdge>,
     pub specs: Vec<LoopSpecDetails>,
+    /// Every past firing of `on_completed` (oldest first) — populated only
+    /// when the loop has completed at least once with a hook configured.
+    pub completion_hook_runs: Vec<LoopCompletionHookRun>,
 }
 
 #[cfg(test)]
@@ -652,6 +698,7 @@ Task:
             completed_at: None,
             autorun_at: None,
             active_run_pool_id: None,
+            on_completed: None,
         }
     }
 

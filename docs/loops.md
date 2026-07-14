@@ -38,6 +38,36 @@ supports **retry** and **skip** strategies for stuck nodes, and
 `loop_report_blocker` escalates to a human when intervention is
 needed. Iteration limits prevent infinite retry loops.
 
+## `on_completed` hook
+
+A loop can carry one optional `on_completed` hook: an agent-node-style
+config (`platform`, `model`, `prompt`, `timeout_minutes`) set via
+`loop_update`. The engine fires it exactly once, right when a run
+transitions to `completed` — never on `failed` or `paused`, never
+retroactively for a loop that completed before the hook was configured,
+and never twice for the same completion. A completed → `loop_reset` →
+completed cycle fires it again, once per completing run.
+
+The hook's `prompt` supports its own small placeholder set (not the
+full node template-variable list above):
+
+- `{{loop_name}}` — the loop's name.
+- `{{workdir}}` — the loop's working directory.
+- `{{completed_specs}}` — name + one-line summary of each spec this run
+  completed, one per line (`(none)` if the run completed zero specs).
+
+It runs through the same spawn path as a loop agent node (detached,
+process-group tracked), and its run is recorded and visible in
+`loop_get` / `canopy loop info` alongside the graph's node runs — but
+its pass/fail never changes the loop's final status, since the run is
+already `completed` by the time it fires. A hook failure logs a
+warning and sends a desktop notification if available; the
+loop-completed notification itself notes when a hook was launched.
+
+The first intended use is a documentation-maintenance agent: on
+completion, review the specs this run closed, the resulting code, and
+`docs/`/`README`, then update the docs to match what actually shipped.
+
 ## The 15 MCP tools
 
 | Stage | Tools |

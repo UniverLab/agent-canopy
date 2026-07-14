@@ -23,7 +23,12 @@ pub struct LoopEngine {
 }
 
 enum SpecExecutionOutcome {
-    Completed,
+    /// `summary` is the completing node's own summary text — the "one-line
+    /// summary" [`render_completion_hook_prompt`]'s `{{completed_specs}}`
+    /// placeholder reports for this spec.
+    Completed {
+        summary: String,
+    },
     Paused,
     Failed(String),
 }
@@ -194,6 +199,13 @@ impl LoopEngine {
         self.notification_service
             .notify_loop_started(&lp.name, total_specs);
 
+        // Specs this dispatch itself completes — never specs that were
+        // already `completed`/`skipped` before this run started (those are
+        // skipped below without ever reaching `run_spec`). Feeds
+        // `{{completed_specs}}` in the `on_completed` hook's prompt (N2) —
+        // see `render_completion_hook_prompt`.
+        let mut completed_specs: Vec<(String, String)> = Vec::new();
+
         match &pool_id {
             Some(pool_id) => loop {
                 if self.is_paused(&loop_id)? {
@@ -215,7 +227,10 @@ impl LoopEngine {
                     .run_spec(&lp, &spec, &workdir, is_resume, Some(pool_id.as_str()))
                     .await?
                 {
-                    SpecExecutionOutcome::Completed => continue,
+                    SpecExecutionOutcome::Completed { summary } => {
+                        completed_specs.push((spec.name.clone(), summary));
+                        continue;
+                    }
                     SpecExecutionOutcome::Paused => return Ok(()),
                     SpecExecutionOutcome::Failed(summary) => {
                         self.fail_loop(&loop_id, Some(&spec.name), &summary)?;
@@ -236,7 +251,10 @@ impl LoopEngine {
                     }
 
                     match self.run_spec(&lp, &spec, &workdir, is_resume, None).await? {
-                        SpecExecutionOutcome::Completed => continue,
+                        SpecExecutionOutcome::Completed { summary } => {
+                            completed_specs.push((spec.name.clone(), summary));
+                            continue;
+                        }
                         SpecExecutionOutcome::Paused => return Ok(()),
                         SpecExecutionOutcome::Failed(summary) => {
                             self.fail_loop(&loop_id, Some(&spec.name), &summary)?;
@@ -279,9 +297,123 @@ impl LoopEngine {
             Some(chrono::Utc::now()),
         )?;
         let (done, total) = self.spec_progress(&loop_id, pool_id.as_deref())?;
-        self.notification_service
-            .notify_loop_finished(&lp.name, LoopFinishOutcome::Completed { done, total });
+        let hook_launched = lp.on_completed.is_some();
+        self.notification_service.notify_loop_finished(
+            &lp.name,
+            LoopFinishOutcome::Completed {
+                done,
+                total,
+                hook_launched,
+            },
+        );
+
+        // N2: fire the loop's `on_completed` hook exactly once, right here —
+        // the sole place a run transitions to `Completed`. Awaited (not
+        // fire-and-forget) so its outcome is recorded before this dispatch
+        // returns, but its own pass/fail never feeds back into `loop_id`'s
+        // status above: the run is already finished.
+        self.fire_completion_hook(&lp, &workdir, &completed_specs)
+            .await;
+
         Ok(())
+    }
+
+    /// Fire `lp`'s `on_completed` hook (N2), if configured — a no-op
+    /// otherwise. Runs through the same spawn path as a loop agent node
+    /// ([`run_agent_process`]/[`spawn_and_wait_cli_process`]), records the
+    /// firing in `loop_completion_hook_runs` (visible via `loop_get`/`canopy
+    /// loop info`), and on failure logs a WARN plus a "post-completion hook
+    /// failed" notification. Never returns an `Err` — a malformed hook
+    /// config or a failed process must never propagate past the run that
+    /// already finished successfully.
+    async fn fire_completion_hook(
+        &self,
+        lp: &crate::domain::loops::Loop,
+        workdir: &str,
+        completed_specs: &[(String, String)],
+    ) {
+        let Some(hook) = lp.on_completed.as_ref() else {
+            return;
+        };
+
+        // Recorded the moment the hook fires — even a platform that fails to
+        // resolve below still shows up in `loop_get`/`canopy loop info` as a
+        // failed firing, exactly like a spawn failure would, rather than
+        // silently vanishing.
+        let run_id = uuid::Uuid::new_v4().to_string();
+        if let Err(error) =
+            self.db
+                .insert_loop_completion_hook_run(&crate::domain::loops::LoopCompletionHookRun {
+                    id: run_id.clone(),
+                    loop_id: lp.id.clone(),
+                    status: LoopRunStatus::Running,
+                    output: None,
+                    summary: None,
+                    started_at: chrono::Utc::now(),
+                    completed_at: None,
+                    pid: None,
+                    boot_id: None,
+                })
+        {
+            tracing::warn!(
+                "Loop '{}' failed to record on_completed hook run: {:#}",
+                lp.name,
+                error
+            );
+        }
+
+        let execution = match Cli::resolve(Some(&hook.platform)) {
+            Ok(cli) => {
+                let mut strategy = cli.strategy();
+                let prompt =
+                    render_completion_hook_prompt(lp, workdir, completed_specs, &hook.prompt);
+                // Same E2BIG safety net as an agent node (see
+                // `execute_agent_node`): an oversized `{{completed_specs}}`
+                // list must not crash the spawn.
+                if prompt.len() > ARGV_SAFETY_THRESHOLD && !strategy.prompt_via_stdin {
+                    *strategy = strategy.with_stdin_forced();
+                }
+                let timeout_minutes = hook.timeout_minutes.unwrap_or(30);
+
+                run_completion_hook_process(
+                    &self.db,
+                    &run_id,
+                    &cli,
+                    &strategy,
+                    &prompt,
+                    hook.model.as_deref(),
+                    workdir,
+                    timeout_minutes,
+                )
+                .await
+            }
+            Err(error) => HookExecution {
+                status: LoopRunStatus::Fail,
+                output: serde_json::json!({ "platform": hook.platform, "error": error }),
+                summary: format!(
+                    "on_completed hook has an invalid platform '{}': {error}",
+                    hook.platform
+                ),
+            },
+        };
+
+        let _ = self.db.update_loop_completion_hook_run_result(
+            &run_id,
+            execution.status,
+            Some(&execution.output),
+            Some(&execution.summary),
+            Some(chrono::Utc::now()),
+        );
+
+        if execution.status != LoopRunStatus::Pass {
+            tracing::warn!(
+                "Loop '{}' on_completed hook failed: {}",
+                lp.name,
+                execution.summary
+            );
+            self.notification_service
+                .notify_loop_completion_hook_failed(&lp.name, &execution.summary);
+        }
     }
 
     /// Resume `loop_id` in the background using whatever run context (pool
@@ -522,7 +654,9 @@ impl LoopEngine {
                     Some(chrono::Utc::now()),
                 )?;
                 self.notify_spec_completed(lp, spec, pool_id)?;
-                return Ok(SpecExecutionOutcome::Completed);
+                return Ok(SpecExecutionOutcome::Completed {
+                    summary: final_execution.summary,
+                });
             }
 
             let next_node_id =
@@ -541,7 +675,9 @@ impl LoopEngine {
                         Some(chrono::Utc::now()),
                     )?;
                     self.notify_spec_completed(lp, spec, pool_id)?;
-                    return Ok(SpecExecutionOutcome::Completed);
+                    return Ok(SpecExecutionOutcome::Completed {
+                        summary: final_execution.summary,
+                    });
                 }
                 None => {
                     self.db.update_loop_spec_status(
@@ -874,21 +1010,96 @@ async fn execute_agent_node(
     Ok(execution)
 }
 
-/// Build the CLI command and spawn it, turning any failure to build or spawn
-/// the process into a failed `NodeExecution` rather than propagating a hard
-/// error. A spawn failure (e.g. `E2BIG` from an oversized argv) must fail
-/// this node like any other — routed through the graph's fail edge for
-/// resilience triage — never abort the whole loop run the way an `Err`
-/// bubbling out of here would.
+/// Outcome of actually running the child process to completion, as opposed
+/// to failing to build/spawn it (see [`spawn_and_wait_cli_process`]'s `Err`).
+enum CliProcessOutcome {
+    Finished {
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+    },
+    /// The process started but didn't finish within `timeout_minutes`. Its
+    /// process group has already been killed (B12) by the time this variant
+    /// is returned — callers only need to decide how to record the failure.
+    TimedOut,
+}
+
+/// Build the CLI command, spawn it, and wait for it (or a timeout) — the
+/// one spawn path shared by every detached single-agent execution the
+/// engine runs, node or hook alike: a loop agent node
+/// ([`run_agent_process`]) and the `on_completed` hook
+/// ([`run_completion_hook_process`]).
+///
+/// Returns `Err` only for a failure to build/spawn the process itself (e.g.
+/// `E2BIG` from an oversized argv, binary not found, permission denied) —
+/// callers turn that into their own kind of "failed" record rather than a
+/// hard error, since a spawn failure must never abort anything wider (the
+/// whole loop run, for a node; the loop's already-finalized status, for the
+/// hook).
 ///
 /// A timeout is a different failure class (the process started; it just
-/// didn't finish in time) and still propagates as a hard error, unchanged
-/// from prior behavior — but unlike prior behavior, the spawned process
-/// group is now actually killed (B12) rather than abandoned: dropping the
-/// timed-out future used to leave it running indefinitely (`Command::output`
-/// gives the caller no handle to kill), which is exactly what let a
-/// `mimo run` child outlive its node run by 42+ minutes in the 2026-07-12
-/// incident.
+/// didn't finish in time). Unlike a build/spawn failure, the spawned process
+/// group is actually killed here (B12) before returning
+/// [`CliProcessOutcome::TimedOut`] — dropping the timed-out future used to
+/// leave it running indefinitely (`Command::output` gives the caller no
+/// handle to kill), which is exactly what let a `mimo run` child outlive its
+/// node run by 42+ minutes in the 2026-07-12 incident.
+async fn spawn_and_wait_cli_process(
+    strategy: &crate::domain::cli_strategy::CliStrategy,
+    prompt: &str,
+    model: Option<&str>,
+    workdir: &str,
+    timeout_minutes: u64,
+    on_pid: impl FnOnce(u32),
+) -> Result<CliProcessOutcome, String> {
+    let mut command = strategy
+        .build_command(prompt, model, Some(workdir))
+        .map_err(|error| error.to_string())?;
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+
+    let child = command.spawn().map_err(|error| error.to_string())?;
+    // Captured before `wait_with_output` below takes ownership of `child`.
+    let pid = child.id();
+    if let Some(pid) = pid {
+        on_pid(pid);
+    }
+
+    let timeout_result = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_minutes * 60),
+        child.wait_with_output(),
+    )
+    .await;
+
+    match timeout_result {
+        Ok(Ok(output)) => {
+            let exit_code = output.status.code().unwrap_or(-1);
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Ok(CliProcessOutcome::Finished {
+                exit_code,
+                stdout,
+                stderr,
+            })
+        }
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_elapsed) => {
+            if let Some(pid) = pid {
+                crate::daemon::process::terminate_process_group_async(pid as i64, KILL_GRACE);
+            }
+            Ok(CliProcessOutcome::TimedOut)
+        }
+    }
+}
+
+/// Run an agent node's process via [`spawn_and_wait_cli_process`], turning
+/// any failure to build or spawn the process into a failed `NodeExecution`
+/// rather than propagating a hard error — routed through the graph's fail
+/// edge for resilience triage, never aborting the whole loop run.
+///
+/// A timeout still propagates as a hard error (unchanged from before this
+/// function was split out of the shared spawn core), after recording the run
+/// as failed so it doesn't linger `running` in the DB forever.
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_process(
     db: &Database,
@@ -901,43 +1112,15 @@ async fn run_agent_process(
     workdir: &str,
     timeout_minutes: u64,
 ) -> Result<NodeExecution> {
-    let mut command = match strategy.build_command(prompt, model, Some(workdir)) {
-        Ok(command) => command,
-        Err(error) => return Ok(agent_spawn_failure(node, cli, model, error)),
-    };
-    command.stdout(std::process::Stdio::piped());
-    command.stderr(std::process::Stdio::piped());
+    let outcome =
+        spawn_and_wait_cli_process(strategy, prompt, model, workdir, timeout_minutes, |pid| {
+            let _ = db.set_loop_run_pid(run_id, pid as i64, crate::system::boot_id().as_deref());
+        })
+        .await;
 
-    let child = match command.spawn() {
-        Ok(child) => child,
-        // Spawn failure (e.g. E2BIG from oversized argv, binary not found,
-        // permission denied): route as a node failure so the graph's fail
-        // edge can handle it, never abort the whole loop run.
-        Err(error) => return Ok(agent_spawn_failure(node, cli, model, error)),
-    };
-    // Captured before `wait_with_output` below takes ownership of `child`.
-    let pid = child.id();
-    if let Some(pid) = pid {
-        let _ = db.set_loop_run_pid(run_id, pid as i64, crate::system::boot_id().as_deref());
-    }
-
-    let timeout_result = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_minutes * 60),
-        child.wait_with_output(),
-    )
-    .await;
-
-    let output = match timeout_result {
-        Ok(Ok(output)) => output,
-        Ok(Err(error)) => return Ok(agent_spawn_failure(node, cli, model, error)),
-        // Timeout: the process started but didn't finish in time — propagate
-        // as a hard error (unchanged from prior behavior), but not before
-        // killing the process group it's still running in and recording the
-        // run as failed, so it doesn't linger `running` in the DB forever.
-        Err(_elapsed) => {
-            if let Some(pid) = pid {
-                crate::daemon::process::terminate_process_group_async(pid as i64, KILL_GRACE);
-            }
+    match outcome {
+        Err(error) => Ok(agent_spawn_failure(node, cli, model, error)),
+        Ok(CliProcessOutcome::TimedOut) => {
             let _ = db.update_loop_run_result(
                 run_id,
                 LoopRunStatus::Fail,
@@ -953,28 +1136,28 @@ async fn run_agent_process(
             );
             bail!("Agent node '{}' timed out.", node.name);
         }
-    };
-
-    let exit_code = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    Ok(NodeExecution {
-        status: if output.status.success() {
-            LoopRunStatus::Pass
-        } else {
-            LoopRunStatus::Fail
-        },
-        output: serde_json::json!({
-            "kind": "agent",
-            "node_id": node.id,
-            "cli": cli.as_str(),
-            "model": model,
-            "exit_code": exit_code,
-            "stdout": stdout,
-            "stderr": stderr,
+        Ok(CliProcessOutcome::Finished {
+            exit_code,
+            stdout,
+            stderr,
+        }) => Ok(NodeExecution {
+            status: if exit_code == 0 {
+                LoopRunStatus::Pass
+            } else {
+                LoopRunStatus::Fail
+            },
+            output: serde_json::json!({
+                "kind": "agent",
+                "node_id": node.id,
+                "cli": cli.as_str(),
+                "model": model,
+                "exit_code": exit_code,
+                "stdout": stdout,
+                "stderr": stderr,
+            }),
+            summary: format!("Agent node '{}' exited with code {}.", node.name, exit_code),
         }),
-        summary: format!("Agent node '{}' exited with code {}.", node.name, exit_code),
-    })
+    }
 }
 
 fn agent_spawn_failure(
@@ -994,6 +1177,85 @@ fn agent_spawn_failure(
             "error": message,
         }),
         summary: format!("Agent node '{}' failed to spawn: {}", node.name, message),
+    }
+}
+
+/// Result of one `on_completed` hook firing (N2) — deliberately not a
+/// [`NodeExecution`]: the hook belongs to no node, and unlike a node's
+/// result, this one must never feed back into the run's routing or final
+/// status (the run is already `Completed` by the time this fires).
+struct HookExecution {
+    status: LoopRunStatus,
+    output: Value,
+    summary: String,
+}
+
+/// Run the `on_completed` hook's process via [`spawn_and_wait_cli_process`] —
+/// the same spawn path as [`run_agent_process`], minus the parts that are
+/// specific to a graph node run (no `LoopNodeRun` id to route a late report
+/// against, no hard-error timeout: a hook failure is always recorded and
+/// reported to the caller as data, never propagated as an `Err`, since it
+/// must never affect the already-finalized loop run that spawned it).
+#[allow(clippy::too_many_arguments)]
+async fn run_completion_hook_process(
+    db: &Database,
+    hook_run_id: &str,
+    cli: &Cli,
+    strategy: &crate::domain::cli_strategy::CliStrategy,
+    prompt: &str,
+    model: Option<&str>,
+    workdir: &str,
+    timeout_minutes: u64,
+) -> HookExecution {
+    let outcome =
+        spawn_and_wait_cli_process(strategy, prompt, model, workdir, timeout_minutes, |pid| {
+            let _ = db.set_loop_completion_hook_run_pid(
+                hook_run_id,
+                pid as i64,
+                crate::system::boot_id().as_deref(),
+            );
+        })
+        .await;
+
+    match outcome {
+        Err(error) => HookExecution {
+            status: LoopRunStatus::Fail,
+            output: serde_json::json!({
+                "cli": cli.as_str(),
+                "model": model,
+                "error": error,
+            }),
+            summary: format!("on_completed hook failed to spawn: {error}"),
+        },
+        Ok(CliProcessOutcome::TimedOut) => HookExecution {
+            status: LoopRunStatus::Fail,
+            output: serde_json::json!({
+                "cli": cli.as_str(),
+                "model": model,
+                "error": "timed out",
+                "timeout_minutes": timeout_minutes,
+            }),
+            summary: format!("on_completed hook timed out after {timeout_minutes}m."),
+        },
+        Ok(CliProcessOutcome::Finished {
+            exit_code,
+            stdout,
+            stderr,
+        }) => HookExecution {
+            status: if exit_code == 0 {
+                LoopRunStatus::Pass
+            } else {
+                LoopRunStatus::Fail
+            },
+            output: serde_json::json!({
+                "cli": cli.as_str(),
+                "model": model,
+                "exit_code": exit_code,
+                "stdout": stdout,
+                "stderr": stderr,
+            }),
+            summary: format!("on_completed hook exited with code {exit_code}."),
+        },
     }
 }
 
@@ -1229,6 +1491,39 @@ fn render_agent_prompt(
     )
 }
 
+/// Render the `on_completed` hook's prompt template (N2). The hook has no
+/// spec/node graph context to template against (it fires once per whole run,
+/// not per spec), so it supports a smaller, hook-specific placeholder set
+/// rather than [`render_agent_prompt`]'s full one:
+///
+/// - `{{loop_name}}` / `{{workdir}}` — same meaning as the node-prompt
+///   placeholders of the same name.
+/// - `{{completed_specs}}` — name + one-line summary of each spec completed
+///   *in this run* (the final node's own summary text), one per line;
+///   `(none)` if this run completed zero specs (e.g. every spec was already
+///   `completed`/`skipped` before this run started).
+fn render_completion_hook_prompt(
+    lp: &crate::domain::loops::Loop,
+    workdir: &str,
+    completed_specs: &[(String, String)],
+    prompt_template: &str,
+) -> String {
+    let completed_specs_text = if completed_specs.is_empty() {
+        "(none)".to_string()
+    } else {
+        completed_specs
+            .iter()
+            .map(|(name, summary)| format!("- {name}: {summary}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    prompt_template
+        .replace("{{loop_name}}", &lp.name)
+        .replace("{{workdir}}", workdir)
+        .replace("{{completed_specs}}", &completed_specs_text)
+}
+
 /// The workdir's current `git rev-parse HEAD`, or `None` if it isn't a git
 /// repo (or the command otherwise fails). Never errors the caller — a check
 /// node that references `{{spec_start_head}}` in a non-git workdir just sees
@@ -1317,6 +1612,7 @@ mod tests {
             completed_at: None,
             autorun_at: None,
             active_run_pool_id: None,
+            on_completed: None,
         };
         let spec = crate::domain::loops::LoopSpec {
             id: "spec-test".to_string(),
@@ -1362,6 +1658,7 @@ mod tests {
             loop_name: String,
             done: usize,
             total: usize,
+            hook_launched: bool,
         },
         LoopFinishedFailed {
             loop_name: String,
@@ -1370,6 +1667,10 @@ mod tests {
         LoopFinishedBlocked {
             loop_name: String,
             summary: String,
+        },
+        CompletionHookFailed {
+            loop_name: String,
+            error: String,
         },
     }
 
@@ -1422,13 +1723,16 @@ mod tests {
 
         fn notify_loop_finished(&self, loop_name: &str, outcome: LoopFinishOutcome<'_>) {
             let event = match outcome {
-                LoopFinishOutcome::Completed { done, total } => {
-                    RecordedNotification::LoopFinishedCompleted {
-                        loop_name: loop_name.to_string(),
-                        done,
-                        total,
-                    }
-                }
+                LoopFinishOutcome::Completed {
+                    done,
+                    total,
+                    hook_launched,
+                } => RecordedNotification::LoopFinishedCompleted {
+                    loop_name: loop_name.to_string(),
+                    done,
+                    total,
+                    hook_launched,
+                },
                 LoopFinishOutcome::Failed { spec_name } => {
                     RecordedNotification::LoopFinishedFailed {
                         loop_name: loop_name.to_string(),
@@ -1443,6 +1747,16 @@ mod tests {
                 }
             };
             self.events.lock().unwrap().push(event);
+        }
+
+        fn notify_loop_completion_hook_failed(&self, loop_name: &str, error: &str) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(RecordedNotification::CompletionHookFailed {
+                    loop_name: loop_name.to_string(),
+                    error: error.to_string(),
+                });
         }
     }
 
@@ -1470,6 +1784,7 @@ mod tests {
             completed_at: None,
             autorun_at: None,
             active_run_pool_id: None,
+            on_completed: None,
         };
         let spec = crate::domain::loops::LoopSpec {
             id: "spec-test".to_string(),
@@ -2140,6 +2455,7 @@ mod tests {
             completed_at: None,
             autorun_at: None,
             active_run_pool_id: None,
+            on_completed: None,
         };
         let spec = LoopSpec {
             id: "spec".to_string(),
@@ -2217,6 +2533,7 @@ mod tests {
             completed_at: None,
             autorun_at: None,
             active_run_pool_id: None,
+            on_completed: None,
         };
         let spec = LoopSpec {
             id: "spec".to_string(),
@@ -2755,6 +3072,7 @@ mod tests {
             completed_at: None,
             autorun_at: None,
             active_run_pool_id: None,
+            on_completed: None,
         };
         db.insert_loop(&lp)?;
         Ok((
@@ -2879,6 +3197,7 @@ mod tests {
             completed_at: None,
             autorun_at: None,
             active_run_pool_id: None,
+            on_completed: None,
         };
         db.insert_loop(&lp).unwrap();
         let spec = standalone_spec("bound-spec", 1);
@@ -3349,6 +3668,7 @@ mod tests {
             completed_at: None,
             autorun_at: None,
             active_run_pool_id: None,
+            on_completed: None,
         };
         let spec = LoopSpec {
             id: "spec".to_string(),
@@ -3570,6 +3890,7 @@ mod tests {
                     loop_name: "Loop".to_string(),
                     done: 1,
                     total: 1,
+                    hook_launched: false,
                 },
             ],
             "exactly one start, one spec-completed (not one per retry), and one finish notification"
@@ -3786,6 +4107,342 @@ mod tests {
             !marker.exists(),
             "agent process should have been killed on timeout; marker file should not exist"
         );
+    }
+
+    // ── N2: on_completed hook tests ────────────────────────────────────
+
+    /// Set up a temporary HOME with a canopy config containing a `test-cli`
+    /// entry that points at `/bin/sh` — needed because `Cli::strategy()`
+    /// reads from `~/.canopy/config.toml`.
+    fn setup_test_cli_home() -> tempfile::TempDir {
+        let fake_home = tempfile::tempdir().unwrap();
+        let canopy_dir = fake_home.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        let config = crate::domain::canopy_config::CanopyConfig {
+            configured_at: Some(chrono::Utc::now().to_rfc3339()),
+            clis: vec![crate::domain::cli_config::CliConfig {
+                name: "test-cli".to_string(),
+                binary: "/bin/sh".to_string(),
+                headless_mode: "-c".to_string(),
+                model_flag: None,
+                supports_working_dir: false,
+                working_dir_flag: None,
+                env_vars: std::collections::HashMap::new(),
+                interactive_args: None,
+                fallback_interactive_args: None,
+                resume_args: None,
+                session_list_cmd: None,
+                session_resume_cmd: None,
+                accent_color: None,
+                yolo_flag: None,
+                prompt_via_stdin: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        config.save(&canopy_dir).unwrap();
+        fake_home
+    }
+
+    /// Serializes [`HomeGuard`] users against each other. `HomeGuard` sets
+    /// `CANOPY_HOME_OVERRIDE` rather than the real `HOME` specifically so
+    /// unrelated tests (which never read that var) are unaffected — but the
+    /// var is still process-wide, so the handful of tests that *do* use it
+    /// must not run concurrently with each other.
+    static HOME_OVERRIDE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard that sets `CANOPY_HOME_OVERRIDE` (consulted by
+    /// [`crate::domain::models::Cli::strategy`]) for the duration of its
+    /// lifetime and restores the previous value on drop. Deliberately not
+    /// `HOME` itself: an earlier version of this guard swapped the real
+    /// `HOME` env var, which raced with concurrently-running tests that
+    /// shell out to git (git reads `HOME` for `user.name`/`user.email`),
+    /// intermittently failing unrelated reviewer-commit tests under
+    /// `cargo test`'s default parallel execution.
+    struct HomeGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev: Option<String>,
+    }
+
+    impl HomeGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let lock = HOME_OVERRIDE_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let prev = std::env::var("CANOPY_HOME_OVERRIDE").ok();
+            unsafe {
+                std::env::set_var("CANOPY_HOME_OVERRIDE", path);
+            }
+            Self { _lock: lock, prev }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(val) => unsafe {
+                    std::env::set_var("CANOPY_HOME_OVERRIDE", val);
+                },
+                None => unsafe {
+                    std::env::remove_var("CANOPY_HOME_OVERRIDE");
+                },
+            }
+        }
+    }
+
+    /// Hook fires once when the loop completes. The mock process writes a
+    /// marker file so we can verify it actually ran.
+    #[tokio::test]
+    async fn loop_engine_on_completed_hook_fires_on_completion() {
+        let fake_home = setup_test_cli_home();
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        let marker = dir.path().join("hook_fired.marker");
+
+        let node = LoopNode {
+            id: "node-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+        db.insert_loop_node(&node).unwrap();
+
+        let marker_path = marker.to_string_lossy().to_string();
+        let hook = crate::domain::loops::LoopCompletionHook {
+            platform: "test-cli".to_string(),
+            model: None,
+            prompt: format!("touch \"{}\"", marker_path),
+            timeout_minutes: Some(1),
+        };
+        db.update_loop_completion_hook(&loop_id, Some(&hook))
+            .unwrap();
+
+        // Cli::strategy() reads from $CANOPY_HOME_OVERRIDE/.canopy/config.toml.
+        let _home = HomeGuard::set(fake_home.path());
+        let result = engine.run_loop(loop_id.clone(), None, None).await;
+        drop(_home);
+        drop(fake_home);
+        result.unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Completed);
+        assert!(marker.exists(), "on_completed hook must have run");
+
+        let hook_runs = db.list_loop_completion_hook_runs(&loop_id).unwrap();
+        assert_eq!(hook_runs.len(), 1);
+        assert_eq!(hook_runs[0].status, LoopRunStatus::Pass);
+    }
+
+    /// Hook must NOT fire when the loop fails (a spec's check node returns
+    /// non-zero). Only `Completed` triggers it.
+    #[tokio::test]
+    async fn loop_engine_on_completed_hook_does_not_fire_on_failure() {
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        let marker = dir.path().join("hook_should_not_exist.marker");
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "exit 1",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let marker_path = marker.to_string_lossy().to_string();
+        let hook = crate::domain::loops::LoopCompletionHook {
+            platform: "test-cli".to_string(),
+            model: None,
+            prompt: format!("touch \"{}\"", marker_path),
+            timeout_minutes: Some(1),
+        };
+        db.update_loop_completion_hook(&loop_id, Some(&hook))
+            .unwrap();
+
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Failed);
+        assert!(
+            !marker.exists(),
+            "on_completed hook must NOT fire on a failed loop"
+        );
+
+        let hook_runs = db.list_loop_completion_hook_runs(&loop_id).unwrap();
+        assert!(hook_runs.is_empty(), "no hook runs should be recorded");
+    }
+
+    /// After a completed→reset→recomplete cycle, the hook fires again (once
+    /// per completion).
+    #[tokio::test]
+    async fn loop_engine_on_completed_hook_fires_again_after_reset_and_recomplete() {
+        let fake_home = setup_test_cli_home();
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        let marker = dir.path().join("hook_count.log");
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let marker_path = marker.to_string_lossy().to_string();
+        let hook = crate::domain::loops::LoopCompletionHook {
+            platform: "test-cli".to_string(),
+            model: None,
+            prompt: format!("echo fire >> \"{}\"", marker_path),
+            timeout_minutes: Some(1),
+        };
+        db.update_loop_completion_hook(&loop_id, Some(&hook))
+            .unwrap();
+
+        let _home = HomeGuard::set(fake_home.path());
+        // First completion.
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Completed);
+
+        // Reset and recomplete.
+        db.reset_loop(&loop_id, None).unwrap();
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        drop(_home);
+        drop(fake_home);
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Completed);
+
+        let hook_runs = db.list_loop_completion_hook_runs(&loop_id).unwrap();
+        assert_eq!(hook_runs.len(), 2, "hook must fire once per completion");
+    }
+
+    /// Placeholder interpolation: `{{loop_name}}`, `{{workdir}}`,
+    /// `{{completed_specs}}` must all be substituted.
+    #[tokio::test]
+    async fn render_completion_hook_prompt_substitutes_all_placeholders() {
+        let lp = crate::domain::loops::Loop {
+            id: "wf".to_string(),
+            name: "MyLoop".to_string(),
+            description: None,
+            workdir: "/tmp/proj".to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            active_run_pool_id: None,
+            on_completed: None,
+        };
+        let completed_specs = vec![
+            ("Spec-A".to_string(), "summary A".to_string()),
+            ("Spec-B".to_string(), "summary B".to_string()),
+        ];
+
+        let result = render_completion_hook_prompt(
+            &lp,
+            &lp.workdir,
+            &completed_specs,
+            "Loop={{loop_name}} Workdir={{workdir}} Specs={{completed_specs}}",
+        );
+
+        assert_eq!(
+            result,
+            "Loop=MyLoop Workdir=/tmp/proj Specs=- Spec-A: summary A\n- Spec-B: summary B"
+        );
+    }
+
+    /// Empty completed_specs list renders `(none)`.
+    #[tokio::test]
+    async fn render_completion_hook_prompt_empty_specs_shows_none() {
+        let lp = crate::domain::loops::Loop {
+            id: "wf".to_string(),
+            name: "Loop".to_string(),
+            description: None,
+            workdir: "/tmp".to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            active_run_pool_id: None,
+            on_completed: None,
+        };
+
+        let result = render_completion_hook_prompt(&lp, &lp.workdir, &[], "{{completed_specs}}");
+
+        assert_eq!(result, "(none)");
+    }
+
+    /// A hook failure does not change the loop's already-final status — the
+    /// loop is `Completed` even though the hook exited non-zero.
+    #[tokio::test]
+    async fn loop_engine_hook_failure_does_not_alter_loop_status() {
+        let fake_home = setup_test_cli_home();
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        // Hook that always fails (exit 1).
+        let hook = crate::domain::loops::LoopCompletionHook {
+            platform: "test-cli".to_string(),
+            model: None,
+            prompt: "exit 1".to_string(),
+            timeout_minutes: Some(1),
+        };
+        db.update_loop_completion_hook(&loop_id, Some(&hook))
+            .unwrap();
+
+        let _home = HomeGuard::set(fake_home.path());
+        let result = engine.run_loop(loop_id.clone(), None, None).await;
+        drop(_home);
+        drop(fake_home);
+        result.unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(
+            lp.status,
+            LoopStatus::Completed,
+            "loop must stay Completed even when its on_completed hook fails"
+        );
+
+        let hook_runs = db.list_loop_completion_hook_runs(&loop_id).unwrap();
+        assert_eq!(hook_runs.len(), 1);
+        assert_eq!(hook_runs[0].status, LoopRunStatus::Fail);
     }
 
     /// Process group children must die with the parent: spawn a check node

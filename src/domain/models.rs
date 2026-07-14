@@ -268,7 +268,16 @@ impl Cli {
     }
 
     pub fn strategy(&self) -> Box<super::cli_strategy::CliStrategy> {
-        let home = dirs::home_dir().expect("Could not determine home directory");
+        // `CANOPY_HOME_OVERRIDE` lets tests point this at a fixture
+        // `.canopy/config.toml` without mutating the process-wide `HOME` env
+        // var — swapping `HOME` itself raced with concurrently-running
+        // tests that shell out to git (which reads the real `HOME` for
+        // `user.name`/`user.email`), causing unrelated test failures under
+        // `cargo test`'s default parallel execution. Unset in production.
+        let home = std::env::var_os("CANOPY_HOME_OVERRIDE")
+            .map(std::path::PathBuf::from)
+            .or_else(dirs::home_dir)
+            .expect("Could not determine home directory");
         let canopy_dir = home.join(".canopy");
         let config = super::canopy_config::CanopyConfig::load(&canopy_dir);
 

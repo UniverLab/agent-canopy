@@ -98,9 +98,17 @@ fn handle_loop_info(db: &Database, id_or_name: &str) -> Result<()> {
     if let Some(at) = lp.autorun_at {
         println!(" autorun: {}", format_dt(at));
     }
+    if let Some(hook) = &lp.on_completed {
+        println!(
+            " on_completed: {} ({})",
+            hook.platform,
+            hook.model.as_deref().unwrap_or("default model")
+        );
+    }
 
     let specs = db.list_loop_specs(&lp.id)?;
     let all_runs = db.list_loop_runs_for_loop(&lp.id)?;
+    let hook_runs = db.list_loop_completion_hook_runs(&lp.id)?;
 
     println!("\n\x1b[1m── Specs ──────────────────────────────────────────────────────\x1b[0m");
     if !specs.is_empty() {
@@ -167,6 +175,17 @@ fn handle_loop_info(db: &Database, id_or_name: &str) -> Result<()> {
             node_name,
             format_dt(run.started_at)
         );
+    }
+
+    if !hook_runs.is_empty() {
+        println!("\n\x1b[1m── on_completed Hook Runs ─────────────────────────────────────\x1b[0m");
+        for run in hook_runs.iter().rev().take(5) {
+            println!(
+                " {} {}",
+                run_status_icon(run.status),
+                format_dt(run.started_at)
+            );
+        }
     }
     println!();
     Ok(())
@@ -380,6 +399,7 @@ mod tests {
             completed_at: None,
             autorun_at: None,
             active_run_pool_id: None,
+            on_completed: None,
         }
     }
 

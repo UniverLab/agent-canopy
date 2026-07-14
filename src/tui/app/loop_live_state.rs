@@ -322,6 +322,7 @@ mod tests {
             completed_at: None,
             autorun_at: None,
             active_run_pool_id: None,
+            on_completed: None,
         }
     }
 
@@ -404,11 +405,15 @@ mod tests {
             .collect();
         let graph_nodes = db.list_loop_nodes_for_loop(&lp.id).unwrap_or_default();
         let graph_edges = db.list_loop_edges_for_loop(&lp.id).unwrap_or_default();
+        let completion_hook_runs = db
+            .list_loop_completion_hook_runs(&lp.id)
+            .unwrap_or_default();
         crate::domain::loops::LoopDetails {
             lp: lp.clone(),
             graph_nodes,
             graph_edges,
             specs: specs_with_details,
+            completion_hook_runs,
         }
     }
 

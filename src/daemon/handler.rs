@@ -160,6 +160,38 @@ pub(crate) fn build_loop_trigger(
     }
 }
 
+/// Build a validated [`crate::domain::loops::LoopCompletionHook`] from MCP
+/// params — same shape of requirement as an agent node's config
+/// (`validate_node_config`'s `LoopNodeKind::Agent` arm): a non-empty
+/// `platform`. `prompt` is required outright (unlike a node's
+/// `prompt_template`, which defaults) since a completion hook has no
+/// spec/node graph context to fall back on.
+fn build_loop_completion_hook(
+    params: &LoopCompletionHookParams,
+) -> Result<crate::domain::loops::LoopCompletionHook, String> {
+    let platform = params.platform.trim();
+    if platform.is_empty() {
+        return Err("on_completed hook 'platform' must not be empty.".to_string());
+    }
+    let prompt = params.prompt.trim();
+    if prompt.is_empty() {
+        return Err("on_completed hook 'prompt' must not be empty.".to_string());
+    }
+    let model = params
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    Ok(crate::domain::loops::LoopCompletionHook {
+        platform: platform.to_string(),
+        model,
+        prompt: prompt.to_string(),
+        timeout_minutes: params.timeout_minutes,
+    })
+}
+
 fn validate_loop_exists(db: &Database, loop_id: &str) -> Result<(), String> {
     db.get_loop(loop_id)
         .map_err(|e| e.to_string())?
@@ -2214,6 +2246,7 @@ impl TaskTriggerHandler {
             completed_at: None,
             autorun_at: None,
             active_run_pool_id: None,
+            on_completed: None,
         };
 
         self.db.insert_loop(&lp).map_err(internal_error)?;
@@ -2273,12 +2306,24 @@ impl TaskTriggerHandler {
             None
         };
 
+        // A provided `on_completed` param (even `null`, to clear it) counts
+        // as an update — same `Option<Option<_>>` shape as `description`.
+        let new_completion_hook = match &params.on_completed {
+            None => None,
+            Some(None) => Some(None),
+            Some(Some(hook_params)) => match build_loop_completion_hook(hook_params) {
+                Ok(hook) => Some(Some(hook)),
+                Err(e) => return Ok(error_result(&e)),
+            },
+        };
+
         if let Err(e) = validate_at_least_one_bool(
             &[
                 name.is_some(),
                 description.is_some(),
                 workdir.is_some(),
                 new_trigger.is_some(),
+                new_completion_hook.is_some(),
             ],
             "loop_update",
         ) {
@@ -2298,6 +2343,12 @@ impl TaskTriggerHandler {
             if let Ok(Some(lp)) = self.db.get_loop(loop_id) {
                 self.activate_loop_trigger(&lp).await;
             }
+        }
+
+        if let Some(hook) = new_completion_hook {
+            self.db
+                .update_loop_completion_hook(loop_id, hook.as_ref())
+                .map_err(internal_error)?;
         }
 
         Ok(build_loop_update_response(loop_id))
@@ -3725,7 +3776,36 @@ fn loop_details_json(db: &Database, lp: &LoopDetails) -> anyhow::Result<serde_js
             "edges": lp.graph_edges.iter().map(loop_edge_json).collect::<Vec<_>>(),
         },
         "specs": specs,
+        "on_completed": lp.lp.on_completed.as_ref().map(loop_completion_hook_json),
+        "completion_hook_runs": lp
+            .completion_hook_runs
+            .iter()
+            .map(loop_completion_hook_run_json)
+            .collect::<Vec<_>>(),
     }))
+}
+
+fn loop_completion_hook_json(hook: &crate::domain::loops::LoopCompletionHook) -> serde_json::Value {
+    serde_json::json!({
+        "platform": hook.platform,
+        "model": hook.model,
+        "prompt": hook.prompt,
+        "timeout_minutes": hook.timeout_minutes,
+    })
+}
+
+fn loop_completion_hook_run_json(
+    run: &crate::domain::loops::LoopCompletionHookRun,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": run.id,
+        "loop_id": run.loop_id,
+        "status": run.status.as_str(),
+        "output": run.output,
+        "summary": run.summary,
+        "started_at": run.started_at.to_rfc3339(),
+        "completed_at": run.completed_at.map(|value| value.to_rfc3339()),
+    })
 }
 
 fn loop_spec_details_json(
@@ -4039,6 +4119,7 @@ mod tests {
             completed_at: Some(chrono::Utc::now()),
             autorun_at: None,
             active_run_pool_id: None,
+            on_completed: None,
         })
         .unwrap();
         (dir, db, loop_id)
@@ -4120,6 +4201,7 @@ mod tests {
             completed_at: Some(chrono::Utc::now()),
             autorun_at: None,
             active_run_pool_id: Some("pool-1".to_string()),
+            on_completed: None,
         })
         .unwrap();
 
@@ -4577,6 +4659,7 @@ mod tests {
             completed_at: None,
             autorun_at: None,
             active_run_pool_id: None,
+            on_completed: None,
         })
         .unwrap();
     }
@@ -4926,6 +5009,7 @@ mod tests {
             completed_at: None,
             autorun_at: None,
             active_run_pool_id: None,
+            on_completed: None,
         })
         .unwrap();
         db.insert_loop_node(&LoopNode {

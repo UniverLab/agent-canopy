@@ -204,7 +204,8 @@ impl Database {
                 completed_at INTEGER,
                 autorun_at INTEGER,
                 spec_pool TEXT,
-                active_run_pool_id TEXT
+                active_run_pool_id TEXT,
+                on_completed TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_loops_workdir_created
@@ -275,6 +276,25 @@ impl Database {
 
             CREATE INDEX IF NOT EXISTS idx_loop_runs_node_iteration
                 ON loop_runs(node_id, iteration DESC);
+
+            -- N2: firings of a loop's `on_completed` hook. Deliberately not
+            -- `loop_runs` — that table's spec_id/node_id are NOT NULL FKs into
+            -- a spec's graph, which a completion hook (no spec, no graph node)
+            -- can never satisfy.
+            CREATE TABLE IF NOT EXISTS loop_completion_hook_runs (
+                id TEXT PRIMARY KEY,
+                loop_id TEXT NOT NULL REFERENCES loops(id) ON DELETE CASCADE,
+                status TEXT NOT NULL,
+                output TEXT,
+                summary TEXT,
+                started_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                pid INTEGER,
+                boot_id TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_loop_completion_hook_runs_loop_started
+                ON loop_completion_hook_runs(loop_id, started_at ASC);
 
             CREATE TABLE IF NOT EXISTS pools (
                 id TEXT PRIMARY KEY,
@@ -601,6 +621,23 @@ impl Database {
             .unwrap_or(false);
         if !has_active_run_pool_id {
             conn.execute("ALTER TABLE loops ADD COLUMN active_run_pool_id TEXT", [])
+                .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // `on_completed` (N2): the loop's optional post-completion hook
+        // config (agent-node-style JSON: platform/model/prompt/
+        // timeout_minutes), fired once when a run reaches `Completed`. `NULL`
+        // on older databases and on any loop that never configured one —
+        // exactly today's (pre-N2) behavior.
+        let has_on_completed: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loops') WHERE name = 'on_completed'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_on_completed {
+            conn.execute("ALTER TABLE loops ADD COLUMN on_completed TEXT", [])
                 .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
         }
 

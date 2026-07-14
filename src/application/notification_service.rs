@@ -6,7 +6,14 @@
 /// How a loop run reached a terminal state, for [`NotificationService::notify_loop_finished`].
 pub enum LoopFinishOutcome<'a> {
     /// Every spec in the run reached `completed`.
-    Completed { done: usize, total: usize },
+    Completed {
+        done: usize,
+        total: usize,
+        /// Whether this run's `on_completed` hook (N2) was launched right
+        /// after this notification — surfaced in the notification body so a
+        /// human watching it knows a post-completion agent is now running.
+        hook_launched: bool,
+    },
     /// A spec failed and the loop has no more retries/routes to take.
     Failed { spec_name: &'a str },
     /// A node reported a blocker needing human intervention; the loop paused.
@@ -42,6 +49,12 @@ pub trait NotificationService: Send + Sync {
     /// Send a notification when a loop run reaches a terminal state
     /// (completed, failed, or blocked).
     fn notify_loop_finished(&self, loop_name: &str, outcome: LoopFinishOutcome<'_>);
+
+    /// Send a notification when a loop's `on_completed` hook (N2) fails —
+    /// a bad platform/CLI config, a non-zero exit, or a timeout. Never sent
+    /// for the loop run itself (that already finished successfully by the
+    /// time the hook runs); this is purely about the hook's own outcome.
+    fn notify_loop_completion_hook_failed(&self, loop_name: &str, error: &str);
 }
 
 use crate::domain::notification::{send_notification, NotificationLevel};
@@ -111,10 +124,21 @@ impl NotificationService for DefaultNotificationService {
 
     fn notify_loop_finished(&self, loop_name: &str, outcome: LoopFinishOutcome<'_>) {
         let (body, level) = match outcome {
-            LoopFinishOutcome::Completed { done, total } => (
-                format!("Completed · {done}/{total}"),
-                NotificationLevel::Success,
-            ),
+            LoopFinishOutcome::Completed {
+                done,
+                total,
+                hook_launched,
+            } => {
+                let hook_note = if hook_launched {
+                    " · post-completion hook launched"
+                } else {
+                    ""
+                };
+                (
+                    format!("Completed · {done}/{total}{hook_note}"),
+                    NotificationLevel::Success,
+                )
+            }
             LoopFinishOutcome::Failed { spec_name } => {
                 (format!("Failed · {spec_name}"), NotificationLevel::Error)
             }
@@ -123,5 +147,13 @@ impl NotificationService for DefaultNotificationService {
             }
         };
         send_notification(loop_name, &body, level);
+    }
+
+    fn notify_loop_completion_hook_failed(&self, loop_name: &str, error: &str) {
+        send_notification(
+            loop_name,
+            &format!("Post-completion hook failed · {error}"),
+            NotificationLevel::Warning,
+        );
     }
 }
