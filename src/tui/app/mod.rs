@@ -1074,6 +1074,19 @@ impl App {
             .and_then(|spec| spec.nodes.get(self.loop_selected_node))
     }
 
+    /// Latest run info (status/started_at/iteration/output tail) for
+    /// `node_id` within `spec_id` — for a node the user has navigated to in
+    /// the graph, which may differ from `loop_live_state`'s auto-detected
+    /// current node.
+    #[allow(dead_code)]
+    pub(crate) fn loop_node_run_info(
+        &self,
+        spec_id: &str,
+        node_id: &str,
+    ) -> loop_live_state::NodeRunInfo {
+        loop_live_state::resolve_node_run_info(&self.db, spec_id, node_id)
+    }
+
     pub fn delete_selected_project(&mut self) -> Result<()> {
         let Some(hash) = self.selected_project().map(|p| p.hash.clone()) else {
             return Ok(());

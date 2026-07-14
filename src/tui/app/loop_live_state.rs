@@ -92,16 +92,7 @@ pub(crate) fn assemble_loop_live_state(
         resolve_effective_graph(db, details, current_spec_id.as_deref());
 
     // ── Current node + output tail ──────────────────────────────
-    let (current_node_id, current_node_status, current_node_started_at, current_node_iteration) =
-        resolve_current_node(db, current_spec_id.as_deref());
-
-    let current_node_output_tail = current_node_id.as_deref().and_then(|node_id| {
-        db.get_active_loop_run_for_node(node_id)
-            .ok()
-            .flatten()
-            .or_else(|| latest_run_for_node(db, node_id))
-            .and_then(|run| extract_output_tail(&run.output))
-    });
+    let (current_node_id, current_node_info) = resolve_current_node(db, current_spec_id.as_deref());
 
     Some(LoopLiveState {
         loop_id: lp.id.clone(),
@@ -119,11 +110,55 @@ pub(crate) fn assemble_loop_live_state(
         effective_nodes,
         effective_edges,
         current_node_id,
-        current_node_status,
-        current_node_started_at,
-        current_node_iteration,
-        current_node_output_tail,
+        current_node_status: current_node_info.status,
+        current_node_started_at: current_node_info.started_at,
+        current_node_iteration: current_node_info.iteration,
+        current_node_output_tail: current_node_info.output_tail,
     })
+}
+
+/// Latest-run info for a single node: status, start time, iteration, and a
+/// bounded output tail. Shared by the snapshot's auto-detected "current"
+/// node and by [`resolve_node_run_info`] for a caller-requested node.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+pub(crate) struct NodeRunInfo {
+    pub status: Option<LoopRunStatus>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub iteration: Option<i64>,
+    pub output_tail: Option<String>,
+}
+
+impl NodeRunInfo {
+    fn from_run(run: &crate::domain::loops::LoopNodeRun) -> Self {
+        NodeRunInfo {
+            status: Some(run.status),
+            started_at: Some(run.started_at),
+            iteration: Some(run.iteration),
+            output_tail: extract_output_tail(&run.output),
+        }
+    }
+}
+
+/// Latest run info for `node_id` within `spec_id`: the active (running) run
+/// if any, else the most recent run recorded for that node. Unlike
+/// [`resolve_current_node`], this takes an explicit node id — used when the
+/// caller (e.g. the graph view) has navigated to a node other than the
+/// snapshot's auto-detected current one.
+#[allow(dead_code)]
+pub(crate) fn resolve_node_run_info(db: &Database, spec_id: &str, node_id: &str) -> NodeRunInfo {
+    if let Ok(Some(run)) = db.get_active_loop_run_for_node(node_id) {
+        if run.spec_id == spec_id {
+            return NodeRunInfo::from_run(&run);
+        }
+    }
+    db.list_loop_runs_for_spec(spec_id)
+        .unwrap_or_default()
+        .iter()
+        .rev()
+        .find(|run| run.node_id == node_id)
+        .map(NodeRunInfo::from_run)
+        .unwrap_or_default()
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────
@@ -181,53 +216,30 @@ fn resolve_effective_graph(
 }
 
 /// Determine the current node: find the latest running run, or the most
-/// recent completed run for the current spec.
+/// recent completed run for the current spec. Returns the node id alongside
+/// its full [`NodeRunInfo`] (status, timing, output tail) from that same
+/// run, so a completed node's output tail isn't lost.
 fn resolve_current_node(
     db: &Database,
     current_spec_id: Option<&str>,
-) -> (
-    Option<String>,
-    Option<LoopRunStatus>,
-    Option<DateTime<Utc>>,
-    Option<i64>,
-) {
+) -> (Option<String>, NodeRunInfo) {
     let Some(spec_id) = current_spec_id else {
-        return (None, None, None, None);
+        return (None, NodeRunInfo::default());
     };
 
     // Try active (running) run first.
     if let Ok(Some(run)) = db.get_active_loop_run_for_spec(spec_id) {
-        return (
-            Some(run.node_id),
-            Some(run.status),
-            Some(run.started_at),
-            Some(run.iteration),
-        );
+        let node_id = run.node_id.clone();
+        return (Some(node_id), NodeRunInfo::from_run(&run));
     }
 
     // Fall back to most recent run for this spec.
     let runs = db.list_loop_runs_for_spec(spec_id).unwrap_or_default();
     if let Some(run) = runs.last() {
-        return (
-            Some(run.node_id.clone()),
-            Some(run.status),
-            Some(run.started_at),
-            Some(run.iteration),
-        );
+        return (Some(run.node_id.clone()), NodeRunInfo::from_run(run));
     }
 
-    (None, None, None, None)
-}
-
-/// Find the latest run for a specific node. Used when the active run is gone
-/// but we still want the output tail from the most recent completed run.
-/// Returns `None` because `get_active_loop_run_for_node` already covers the
-/// running case, and completed runs require a loop_id we don't have here.
-fn latest_run_for_node(
-    _db: &Database,
-    _node_id: &str,
-) -> Option<crate::domain::loops::LoopNodeRun> {
-    None
+    (None, NodeRunInfo::default())
 }
 
 /// Extract a bounded text tail (~15 lines) from a JSON output value.
@@ -643,6 +655,55 @@ mod tests {
 
         assert_eq!(state.current_node_id.as_deref(), Some("n2"));
         assert_eq!(state.current_node_status, Some(LoopRunStatus::Pass));
+        // Regression: a completed (non-running) current node must still
+        // surface its output tail, not just status/timing.
+        assert_eq!(state.current_node_output_tail.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn requested_node_info_for_non_current_node() {
+        let db = test_db();
+        let lp = make_loop("lp1", LoopStatus::Running);
+        db.insert_loop(&lp).unwrap();
+
+        db.insert_loop_spec(&make_spec("s1", "lp1", LoopSpecStatus::Running, 1))
+            .unwrap();
+        db.insert_loop_node(&make_node("n1", "s1", LoopNodeKind::Agent, 1))
+            .unwrap();
+        db.insert_loop_node(&make_node("n2", "s1", LoopNodeKind::Check, 2))
+            .unwrap();
+
+        // n1 already completed; n2 is the active run (the "current" node).
+        db.insert_loop_run(&make_run(
+            "lp1",
+            "s1",
+            "n1",
+            LoopRunStatus::Pass,
+            1,
+            Some(json!({"summary": "n1 finished"})),
+        ))
+        .unwrap();
+        db.insert_loop_run(&make_run(
+            "lp1",
+            "s1",
+            "n2",
+            LoopRunStatus::Running,
+            1,
+            None,
+        ))
+        .unwrap();
+
+        let details = details_from_loop(&db, &lp);
+        let state = assemble_loop_live_state(&db, &details).unwrap();
+        assert_eq!(state.current_node_id.as_deref(), Some("n2"));
+
+        // Requesting n1 explicitly (not the current node) still works.
+        let n1_info = resolve_node_run_info(&db, "s1", "n1");
+        assert_eq!(n1_info.status, Some(LoopRunStatus::Pass));
+        assert_eq!(n1_info.output_tail.as_deref(), Some("n1 finished"));
+
+        let n2_info = resolve_node_run_info(&db, "s1", "n2");
+        assert_eq!(n2_info.status, Some(LoopRunStatus::Running));
     }
 
     #[test]
