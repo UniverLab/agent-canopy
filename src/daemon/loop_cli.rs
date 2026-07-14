@@ -66,7 +66,7 @@ fn handle_loop_list(db: &Database, workdir: Option<&str>) -> Result<()> {
         }
 
         if let Some(at) = lp.autorun_at {
-            line.push_str(&format!("  \x1b[36mautorun:\x1b[0m {}", format_dt(at)));
+            line.push_str(&format!("  \x1b[36m{}\x1b[0m", format_autorun_compact(at)));
         }
 
         println!("{line}");
@@ -96,7 +96,11 @@ fn handle_loop_info(db: &Database, id_or_name: &str) -> Result<()> {
     }
     println!();
     if let Some(at) = lp.autorun_at {
-        println!(" autorun: {}", format_dt(at));
+        println!(
+            " autorun: {} ({})",
+            at.to_rfc3339(),
+            format_relative_duration(at - Utc::now())
+        );
     }
     if let Some(hook) = &lp.on_completed {
         println!(
@@ -339,6 +343,34 @@ fn format_dt(dt: DateTime<Utc>) -> String {
     dt.with_timezone(&chrono::Local)
         .format("%Y-%m-%d %H:%M")
         .to_string()
+}
+
+/// Compact `⏲ HH:MMZ` badge for a scheduled autorun, used in `loop list` rows.
+fn format_autorun_compact(at: DateTime<Utc>) -> String {
+    format!("⏲ {}", at.format("%H:%MZ"))
+}
+
+/// Human relative hint for a scheduled autorun, e.g. "in 2h 14m", used
+/// alongside the ISO8601 timestamp in `loop info`.
+fn format_relative_duration(d: chrono::Duration) -> String {
+    let secs = d.num_seconds();
+    if secs <= 0 {
+        "due now".to_string()
+    } else if secs < 60 {
+        format!("in {secs}s")
+    } else if secs < 3600 {
+        format!("in {}m", secs / 60)
+    } else if secs < 86400 {
+        let hours = secs / 3600;
+        let mins = (secs % 3600) / 60;
+        if mins == 0 {
+            format!("in {hours}h")
+        } else {
+            format!("in {hours}h {mins}m")
+        }
+    } else {
+        format!("in {}d", secs / 86400)
+    }
 }
 
 fn format_elapsed(d: chrono::Duration) -> String {
@@ -615,5 +647,47 @@ mod tests {
         assert_eq!(format_elapsed(chrono::Duration::seconds(5)), "5s");
         assert_eq!(format_elapsed(chrono::Duration::seconds(65)), "1m5s");
         assert_eq!(format_elapsed(chrono::Duration::seconds(3661)), "1h1m");
+    }
+
+    #[test]
+    fn format_relative_duration_buckets() {
+        assert_eq!(
+            format_relative_duration(chrono::Duration::seconds(30)),
+            "in 30s"
+        );
+        assert_eq!(
+            format_relative_duration(chrono::Duration::minutes(1)),
+            "in 1m"
+        );
+        assert_eq!(
+            format_relative_duration(chrono::Duration::minutes(134)),
+            "in 2h 14m"
+        );
+        assert_eq!(
+            format_relative_duration(chrono::Duration::hours(3)),
+            "in 3h"
+        );
+        assert_eq!(
+            format_relative_duration(chrono::Duration::hours(30)),
+            "in 1d"
+        );
+    }
+
+    #[test]
+    fn format_relative_duration_past_or_now_reads_due_now() {
+        assert_eq!(
+            format_relative_duration(chrono::Duration::seconds(0)),
+            "due now"
+        );
+        assert_eq!(
+            format_relative_duration(chrono::Duration::seconds(-5)),
+            "due now"
+        );
+    }
+
+    #[test]
+    fn format_autorun_compact_renders_utc_badge() {
+        let at = DateTime::<Utc>::from_timestamp(5 * 3600, 0).unwrap(); // 05:00:00 UTC
+        assert_eq!(format_autorun_compact(at), "⏲ 05:00Z");
     }
 }

@@ -3771,6 +3771,7 @@ fn loop_details_json(db: &Database, lp: &LoopDetails) -> anyhow::Result<serde_js
         "created_at": lp.lp.created_at.to_rfc3339(),
         "started_at": lp.lp.started_at.map(|value| value.to_rfc3339()),
         "completed_at": lp.lp.completed_at.map(|value| value.to_rfc3339()),
+        "autorun_at": lp.lp.autorun_at.map(|value| value.to_rfc3339()),
         "graph": {
             "nodes": lp.graph_nodes.iter().map(loop_node_json).collect::<Vec<_>>(),
             "edges": lp.graph_edges.iter().map(loop_edge_json).collect::<Vec<_>>(),
@@ -5031,5 +5032,49 @@ mod tests {
         assert_eq!(json["graph"]["nodes"][0]["id"], "graph-node");
         assert_eq!(json["graph"]["nodes"][0]["loop_id"], loop_id);
         assert!(json["specs"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn loop_get_response_exposes_autorun_at_so_agents_never_need_sql() {
+        // B14: a failed loop's pending autorun schedule must be visible via
+        // `loop_get` — before this, an agent had to query
+        // `background_agents.db` directly to learn whether a recovery wait
+        // was already scheduled.
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let loop_id = "loop-with-autorun".to_string();
+        db.insert_loop(&Loop {
+            id: loop_id.clone(),
+            name: "Loop".to_string(),
+            description: None,
+            workdir: dir.path().to_string_lossy().to_string(),
+            status: LoopStatus::Failed,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            active_run_pool_id: None,
+            on_completed: None,
+        })
+        .unwrap();
+
+        // Unset: field must be present and null, not just absent.
+        let details = db.get_loop_details(&loop_id).unwrap().unwrap();
+        let json = loop_details_json(&db, &details).unwrap();
+        assert!(json["autorun_at"].is_null());
+
+        // `autorun_at` round-trips through an INTEGER (unix seconds) column,
+        // so compare against a second-precision timestamp.
+        let at = chrono::DateTime::from_timestamp(
+            (chrono::Utc::now() + chrono::Duration::hours(2)).timestamp(),
+            0,
+        )
+        .unwrap();
+        db.schedule_loop_autorun(&loop_id, at).unwrap();
+
+        let details = db.get_loop_details(&loop_id).unwrap().unwrap();
+        let json = loop_details_json(&db, &details).unwrap();
+        assert_eq!(json["autorun_at"].as_str().unwrap(), at.to_rfc3339());
     }
 }
