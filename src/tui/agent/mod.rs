@@ -52,11 +52,11 @@ const MAX_PROMPT_HISTORY: usize = 20;
 const VT_SCROLLBACK_LINES: usize = 5_000;
 
 /// How recently a session must have produced PTY output to count as
-/// "working" (green) rather than merely "healthy but idle" (blue) in the
-/// status color. Mirrors the green/blue semantics background agents already
-/// use for active vs. idle. Kept short enough that the color reacts within
-/// one interaction, long enough to survive brief pauses between output
-/// chunks so a steadily streaming session doesn't flicker.
+/// "working" (blinking green) rather than merely "healthy but idle" (solid
+/// green) in the status color. Blue is reserved for background agents; see
+/// `session_status_color` in `ui/sidebar.rs`. Kept short enough that the
+/// color reacts within one interaction, long enough to survive brief pauses
+/// between output chunks so a steadily streaming session doesn't flicker.
 pub(crate) const ACTIVITY_IDLE_THRESHOLD_MS: i64 = 12_000;
 
 /// vt100 callbacks that mirror a PTY program's OSC 52 clipboard writes to the
