@@ -746,9 +746,93 @@ fn draw_projects_mode_panel(frame: &mut Frame, area: Rect, app: &App) {
     match app.projects_panel_focus {
         ProjectsPanelFocus::Projects => draw_project_overview(frame, area, app),
         ProjectsPanelFocus::Loops => draw_loop_overview(frame, area, app),
+        ProjectsPanelFocus::Backlog => draw_backlog_overview(frame, area, app),
+        ProjectsPanelFocus::History => draw_history_overview(frame, area, app),
         ProjectsPanelFocus::Knowledge => draw_knowledge_overview(frame, area, app),
         ProjectsPanelFocus::RagInfo => draw_rag_queue_overview(frame, area, app),
     }
+}
+
+/// Read-only preview of the selected backlog spec — name + description,
+/// same "focus already previews it" convention as `draw_loop_overview` and
+/// `draw_knowledge_overview` (no dedicated confirm step needed).
+fn draw_backlog_overview(frame: &mut Frame, area: Rect, app: &App) {
+    if app.backlog_specs.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No backlog specs yet").style(Style::default().fg(DIM)),
+            area,
+        );
+        return;
+    }
+
+    let Some(spec) = app.backlog_specs.get(app.selected_backlog) else {
+        frame.render_widget(
+            Paragraph::new("No backlog spec selected").style(Style::default().fg(DIM)),
+            area,
+        );
+        return;
+    };
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Backlog ", Style::default().fg(DIM)),
+            Span::styled(
+                spec.name.as_str(),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+    ];
+
+    match spec.description.as_deref() {
+        Some(description) if !description.is_empty() => {
+            for line in description.lines() {
+                lines.push(Line::from(Span::styled(
+                    line,
+                    Style::default().fg(Color::White),
+                )));
+            }
+        }
+        _ => lines.push(Line::from(Span::styled(
+            "(no description)",
+            Style::default().fg(DIM),
+        ))),
+    }
+
+    render_wrapped_paragraph(frame, area, lines);
+}
+
+/// `History`'s main-panel preview: while collapsed, just the summary the
+/// header already advertises; once expanded, the selected finished loop's
+/// details — reusing `draw_loop_overview` rather than duplicating it, since
+/// selecting a history loop keeps today's loop-view behavior.
+fn draw_history_overview(frame: &mut Frame, area: Rect, app: &App) {
+    let finished = app.finished_loops();
+    if finished.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No finished loops yet").style(Style::default().fg(DIM)),
+            area,
+        );
+        return;
+    }
+
+    if app.history_collapsed {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(format!(
+                    "{} completed/failed loop{}",
+                    finished.len(),
+                    if finished.len() == 1 { "" } else { "s" }
+                )),
+                Line::from(Span::styled("Enter/→ to expand", Style::default().fg(DIM))),
+            ])
+            .style(Style::default().fg(Color::White)),
+            area,
+        );
+        return;
+    }
+
+    draw_loop_overview(frame, area, app);
 }
 
 fn draw_knowledge_overview(frame: &mut Frame, area: Rect, app: &App) {
@@ -1636,15 +1720,87 @@ fn find_session_by_name(app: &App, name: &str) -> Option<SessionRef> {
 #[cfg(test)]
 mod tests {
     use super::adjusted_interactive_cursor_col;
+    use super::draw_backlog_overview;
     use super::panel_focus_colors;
     use super::split_warp_areas;
     use super::warp;
     use super::BORDER_COLOR;
     use crate::tui::agent::screen::VtCell;
     use crate::tui::agent::ScreenSnapshot;
-    use crate::tui::app::types::Focus;
+    use crate::tui::app::types::{App, Focus, ProjectsPanelFocus};
+    use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
     use ratatui::style::Color;
+    use ratatui::Terminal;
+
+    fn render_to_text(
+        width: u16,
+        height: u16,
+        draw: impl FnOnce(&mut ratatui::Frame, Rect),
+    ) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw(frame, area);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn backlog_overview_previews_selected_spec_name_and_description_read_only() {
+        use crate::db::Database;
+        use crate::domain::loops::{LoopSpec, LoopSpecStatus};
+        use std::sync::Arc;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        db.insert_loop_spec(&LoopSpec {
+            id: "spec-1".to_string(),
+            loop_id: None,
+            name: "Add retry backoff".to_string(),
+            description: Some("## Objective\nRetry requests with backoff.".to_string()),
+            position: 0,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+        })
+        .unwrap();
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
+        app.projects_panel_focus = ProjectsPanelFocus::Backlog;
+        assert_eq!(app.backlog_specs.len(), 1, "backlog spec should be loaded");
+
+        let text = render_to_text(50, 10, |frame, area| {
+            draw_backlog_overview(frame, area, &app);
+        });
+
+        assert!(
+            text.contains("Add retry backoff"),
+            "expected spec name in preview, got:\n{text}"
+        );
+        assert!(
+            text.contains("Retry requests with backoff."),
+            "expected spec description in preview, got:\n{text}"
+        );
+    }
 
     #[test]
     fn copilot_cursor_no_longer_shifted_without_inverse() {

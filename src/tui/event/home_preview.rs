@@ -158,6 +158,13 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
                     ProjectsPanelFocus::Loops => {
                         let _ = app.open_loop_editor_dialog();
                     }
+                    // Backlog is read-only: the selected spec's name and
+                    // description are already shown in the main panel via
+                    // panel focus, so Enter has nothing further to do.
+                    ProjectsPanelFocus::Backlog => {}
+                    ProjectsPanelFocus::History => {
+                        app.toggle_history_collapsed();
+                    }
                     ProjectsPanelFocus::Knowledge => {
                         edit_knowledge_dialog(app);
                     }
@@ -206,6 +213,20 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
                 && app.projects_panel_focus == ProjectsPanelFocus::Loops =>
         {
             app.cycle_loop_node(true);
+        }
+        KeyCode::Left
+            if app.sidebar_mode == SidebarMode::Projects
+                && app.projects_panel_focus == ProjectsPanelFocus::History
+                && !app.history_collapsed =>
+        {
+            app.toggle_history_collapsed();
+        }
+        KeyCode::Right
+            if app.sidebar_mode == SidebarMode::Projects
+                && app.projects_panel_focus == ProjectsPanelFocus::History
+                && app.history_collapsed =>
+        {
+            app.toggle_history_collapsed();
         }
         KeyCode::Char('[')
             if app.sidebar_mode == SidebarMode::Projects

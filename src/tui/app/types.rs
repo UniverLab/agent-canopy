@@ -3,10 +3,11 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+use super::loop_live_state::LoopLiveState;
 use crate::application::notification_service::NotificationService;
 use crate::db::project::{RagInfoSummary, RagQueueItem};
 use crate::db::Database;
-use crate::domain::loops::{Loop, LoopDetails, LoopNodeRun};
+use crate::domain::loops::{Loop, LoopDetails, LoopNodeRun, LoopSpec};
 use crate::domain::models::{Agent, CorruptAgent, RunLog};
 use crate::domain::project::Project;
 use crate::domain::sync::{ActiveIntent, SyncMessage, WorkspaceStatus};
@@ -85,12 +86,25 @@ impl TerminalSelection {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ProjectsPanelFocus {
     Projects,
     Loops,
+    Backlog,
+    History,
     Knowledge,
     RagInfo,
+}
+
+/// Per-loop rendering data for the sidebar's `Loops` section — spec progress
+/// and whether the loop is stuck on a reported blocker (a `Paused` loop whose
+/// latest run recorded a `blocker`, see `loop_report_blocker`). Computed once
+/// per refresh cycle (`App::refresh_loops`) rather than queried per frame.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct LoopSidebarMeta {
+    pub done: usize,
+    pub total: usize,
+    pub blocked: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -306,6 +320,22 @@ pub struct App {
     pub(crate) loop_selected_node: usize,
     pub(crate) loop_editor_dialog: Option<LoopEditorDialog>,
     pub(crate) loop_form_dialog: Option<LoopFormDialog>,
+    /// Per-loop spec progress ("done/total") and blocked status for the
+    /// sidebar's `Loops` section, keyed by loop id. Refreshed alongside
+    /// `loops` in `App::refresh_loops`.
+    pub(crate) loop_sidebar_meta: HashMap<String, LoopSidebarMeta>,
+    /// Live snapshot of the currently-selected loop's runtime state,
+    /// refreshed every tick. `None` when no loop is selected.
+    pub(crate) loop_live_state: Option<LoopLiveState>,
+    /// Standalone/backlog specs (no loop yet), filtered to the selected
+    /// project's workdir tag when a project is selected. Refreshed alongside
+    /// `projects` in `App::refresh_projects`.
+    pub(crate) backlog_specs: Vec<LoopSpec>,
+    pub(crate) selected_backlog: usize,
+    /// Whether the sidebar's `History` section (completed/failed loops) is
+    /// collapsed to just its header. Collapsed by default.
+    pub(crate) history_collapsed: bool,
+    pub(crate) selected_history: usize,
     pub(crate) global_rag_queue: Vec<RagQueueItem>,
     pub(crate) selected_rag_queue: usize,
     pub(crate) rag_info: RagInfoSummary,

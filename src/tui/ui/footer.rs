@@ -50,6 +50,16 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                         h.push(("n", "new loop"));
                         h.push(("E", "loop settings"));
                     }
+                    if app.projects_panel_focus == crate::tui::app::ProjectsPanelFocus::History {
+                        h.push((
+                            "Enter/→",
+                            if app.history_collapsed {
+                                "expand"
+                            } else {
+                                "collapse"
+                            },
+                        ));
+                    }
                     h.push(("Esc", "home"));
                     h
                 }

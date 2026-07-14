@@ -2,6 +2,7 @@ mod agents;
 mod data;
 pub mod dialog;
 mod gamification;
+mod loop_live_state;
 mod project_graph;
 mod sync;
 
@@ -22,7 +23,7 @@ use super::context_transfer::{
     interactive_line_page_count, interactive_prompt_count, ContextCaptureKind, ContextSourceKind,
     ContextTransferConfig, ContextTransferModal, ContextTransferStep,
 };
-use crate::domain::loops::{LoopNodeKind, LoopSpecStatus};
+use crate::domain::loops::{LoopNodeKind, LoopSpecStatus, LoopStatus};
 use crate::tui::prompt_templates::PromptTemplates;
 
 pub(crate) use crate::tui::mcp_client::send_mcp_task_run;
@@ -37,8 +38,8 @@ pub mod utils;
 pub(crate) use session_resume::build_resumed_session_args;
 pub use terminal_search::TerminalSearch;
 pub(crate) use types::ContextTransferSource;
-use types::RagTransferModal;
 pub use types::{AgentEntry, AgentSectionFocus, App, Focus, ProjectsPanelFocus, SidebarMode};
+use types::{LoopSidebarMeta, RagTransferModal};
 
 impl App {
     pub fn new(db: Arc<Database>, data_dir: &Path) -> Result<Self> {
@@ -100,6 +101,12 @@ impl App {
             loop_selected_node: 0,
             loop_editor_dialog: None,
             loop_form_dialog: None,
+            loop_sidebar_meta: HashMap::new(),
+            loop_live_state: None,
+            backlog_specs: Vec::new(),
+            selected_backlog: 0,
+            history_collapsed: true,
+            selected_history: 0,
             global_rag_queue: Vec::new(),
             selected_rag_queue: 0,
             rag_info: crate::db::project::RagInfoSummary::default(),
@@ -297,7 +304,9 @@ impl App {
         self.normalize_projects_panel_focus();
         match self.projects_panel_focus {
             ProjectsPanelFocus::Projects => self.navigate_projects_next(),
-            ProjectsPanelFocus::Loops => self.navigate_loops_next(),
+            ProjectsPanelFocus::Loops => self.navigate_active_loops_next(),
+            ProjectsPanelFocus::Backlog => self.navigate_backlog_next(),
+            ProjectsPanelFocus::History => self.navigate_history_next(),
             ProjectsPanelFocus::Knowledge => self.navigate_knowledge_next(),
             ProjectsPanelFocus::RagInfo => self.navigate_from_rag_info_next(),
         }
@@ -326,18 +335,40 @@ impl App {
             self.refresh_loops_selection();
             return;
         }
+        self.cross_forward_from_projects();
+    }
+
+    /// Shared "ran off the end" fallback for Projects/Loops/Backlog: try
+    /// entering the next non-empty section in sidebar order (Loops →
+    /// Backlog → History → RagInfo), else wrap to the first project.
+    fn cross_forward_from_projects(&mut self) {
         if self.try_cross_to_loops_first() {
+            return;
+        }
+        self.cross_forward_from_loops();
+    }
+
+    fn cross_forward_from_loops(&mut self) {
+        if self.try_cross_to_backlog_first() {
+            return;
+        }
+        self.cross_forward_from_backlog();
+    }
+
+    fn cross_forward_from_backlog(&mut self) {
+        if self.try_cross_to_history_first() {
             return;
         }
         if self.rag_info.has_rag_activity() {
             self.projects_panel_focus = ProjectsPanelFocus::RagInfo;
             return;
         }
+        self.projects_panel_focus = ProjectsPanelFocus::Projects;
         self.selected_project = 0;
     }
 
     fn try_cross_to_loops_first(&mut self) -> bool {
-        let Some(id) = self.visible_loops().first().map(|w| w.id.clone()) else {
+        let Some(id) = self.active_loops().first().map(|lp| lp.id.clone()) else {
             return false;
         };
         self.projects_panel_focus = ProjectsPanelFocus::Loops;
@@ -346,13 +377,44 @@ impl App {
         true
     }
 
-    fn navigate_loops_next(&mut self) {
+    fn try_cross_to_backlog_first(&mut self) -> bool {
+        if self.backlog_specs.is_empty() {
+            return false;
+        }
+        self.projects_panel_focus = ProjectsPanelFocus::Backlog;
+        self.selected_backlog = 0;
+        true
+    }
+
+    /// Focuses `History` on its first finished loop. When the section is
+    /// collapsed there is nothing to select yet — focus lands on the header
+    /// (Enter/→ expands it) without disturbing `selected_loop_id`.
+    fn try_cross_to_history_first(&mut self) -> bool {
+        let finished_ids: Vec<String> = self
+            .finished_loops()
+            .iter()
+            .map(|lp| lp.id.clone())
+            .collect();
+        if finished_ids.is_empty() {
+            return false;
+        }
+        self.projects_panel_focus = ProjectsPanelFocus::History;
+        if !self.history_collapsed {
+            self.selected_history = 0;
+            self.selected_loop_id = Some(finished_ids[0].clone());
+            self.refresh_loops_selection();
+        }
+        true
+    }
+
+    fn navigate_active_loops_next(&mut self) {
         let visible_ids: Vec<String> = self
-            .visible_loops()
+            .active_loops()
             .into_iter()
-            .map(|w| w.id.clone())
+            .map(|lp| lp.id.clone())
             .collect();
         if visible_ids.is_empty() {
+            self.cross_forward_from_loops();
             return;
         }
         let current = self
@@ -363,6 +425,49 @@ impl App {
         let next = current + 1;
         if next < visible_ids.len() {
             self.selected_loop_id = Some(visible_ids[next].clone());
+            self.refresh_loops_selection();
+            return;
+        }
+        self.cross_forward_from_loops();
+    }
+
+    fn navigate_backlog_next(&mut self) {
+        if self.backlog_specs.is_empty() {
+            self.cross_forward_from_backlog();
+            return;
+        }
+        let next = self.selected_backlog + 1;
+        if next < self.backlog_specs.len() {
+            self.selected_backlog = next;
+            return;
+        }
+        self.cross_forward_from_backlog();
+    }
+
+    fn navigate_history_next(&mut self) {
+        let finished_ids: Vec<String> = self
+            .finished_loops()
+            .iter()
+            .map(|lp| lp.id.clone())
+            .collect();
+        if finished_ids.is_empty() || self.history_collapsed {
+            if self.rag_info.has_rag_activity() {
+                self.projects_panel_focus = ProjectsPanelFocus::RagInfo;
+                return;
+            }
+            self.projects_panel_focus = ProjectsPanelFocus::Projects;
+            self.selected_project = 0;
+            return;
+        }
+        let current = self
+            .selected_loop_id
+            .as_ref()
+            .and_then(|id| finished_ids.iter().position(|vid| vid == id))
+            .unwrap_or(0);
+        let next = current + 1;
+        if next < finished_ids.len() {
+            self.selected_history = next;
+            self.selected_loop_id = Some(finished_ids[next].clone());
             self.refresh_loops_selection();
             return;
         }
@@ -447,7 +552,9 @@ impl App {
         self.normalize_projects_panel_focus();
         match self.projects_panel_focus {
             ProjectsPanelFocus::Projects => self.navigate_projects_prev(),
-            ProjectsPanelFocus::Loops => self.navigate_loops_prev(),
+            ProjectsPanelFocus::Loops => self.navigate_active_loops_prev(),
+            ProjectsPanelFocus::Backlog => self.navigate_backlog_prev(),
+            ProjectsPanelFocus::History => self.navigate_history_prev(),
             ProjectsPanelFocus::Knowledge => self.navigate_knowledge_prev(),
             ProjectsPanelFocus::RagInfo => self.navigate_from_rag_info_prev(),
         }
@@ -476,8 +583,21 @@ impl App {
             self.refresh_loops_selection();
             return;
         }
+        self.cross_backward_from_projects();
+    }
+
+    /// Shared "ran off the start" fallback for Projects: try entering the
+    /// previous non-empty section in reverse sidebar order (RagInfo →
+    /// History → Backlog → Loops), else wrap to the last project.
+    fn cross_backward_from_projects(&mut self) {
         if self.rag_info.has_rag_activity() {
             self.projects_panel_focus = ProjectsPanelFocus::RagInfo;
+            return;
+        }
+        if self.try_cross_to_history_last() {
+            return;
+        }
+        if self.try_cross_to_backlog_last() {
             return;
         }
         if self.try_cross_to_loops_last() {
@@ -486,8 +606,29 @@ impl App {
         self.selected_project = self.projects.len() - 1;
     }
 
+    fn cross_backward_from_loops(&mut self) {
+        if !self.projects.is_empty() {
+            self.projects_panel_focus = ProjectsPanelFocus::Projects;
+            self.selected_project = self.projects.len() - 1;
+            return;
+        }
+        // No projects to land on either — stay put on the last active loop
+        // if one exists, otherwise there's nothing navigable at all.
+        if let Some(last) = self.active_loops().last() {
+            self.selected_loop_id = Some(last.id.clone());
+            self.refresh_loops_selection();
+        }
+    }
+
+    fn cross_backward_from_backlog(&mut self) {
+        if self.try_cross_to_loops_last() {
+            return;
+        }
+        self.cross_backward_from_loops();
+    }
+
     fn try_cross_to_loops_last(&mut self) -> bool {
-        let Some(id) = self.visible_loops().last().map(|w| w.id.clone()) else {
+        let Some(id) = self.active_loops().last().map(|lp| lp.id.clone()) else {
             return false;
         };
         self.projects_panel_focus = ProjectsPanelFocus::Loops;
@@ -496,13 +637,44 @@ impl App {
         true
     }
 
-    fn navigate_loops_prev(&mut self) {
+    fn try_cross_to_backlog_last(&mut self) -> bool {
+        if self.backlog_specs.is_empty() {
+            return false;
+        }
+        self.projects_panel_focus = ProjectsPanelFocus::Backlog;
+        self.selected_backlog = self.backlog_specs.len() - 1;
+        true
+    }
+
+    /// Focuses `History` on its last finished loop. When collapsed there is
+    /// nothing to select — focus lands on the header without disturbing
+    /// `selected_loop_id`, matching `try_cross_to_history_first`.
+    fn try_cross_to_history_last(&mut self) -> bool {
+        let finished_ids: Vec<String> = self
+            .finished_loops()
+            .iter()
+            .map(|lp| lp.id.clone())
+            .collect();
+        if finished_ids.is_empty() {
+            return false;
+        }
+        self.projects_panel_focus = ProjectsPanelFocus::History;
+        if !self.history_collapsed {
+            self.selected_history = finished_ids.len() - 1;
+            self.selected_loop_id = Some(finished_ids[finished_ids.len() - 1].clone());
+            self.refresh_loops_selection();
+        }
+        true
+    }
+
+    fn navigate_active_loops_prev(&mut self) {
         let visible_ids: Vec<String> = self
-            .visible_loops()
+            .active_loops()
             .into_iter()
-            .map(|w| w.id.clone())
+            .map(|lp| lp.id.clone())
             .collect();
         if visible_ids.is_empty() {
+            self.cross_backward_from_loops();
             return;
         }
         let current = self
@@ -515,21 +687,59 @@ impl App {
             self.refresh_loops_selection();
             return;
         }
-        if !self.projects.is_empty() {
-            self.projects_panel_focus = ProjectsPanelFocus::Projects;
-            self.selected_project = self.projects.len() - 1;
+        self.cross_backward_from_loops();
+    }
+
+    fn navigate_backlog_prev(&mut self) {
+        if self.backlog_specs.is_empty() {
+            self.cross_backward_from_backlog();
             return;
         }
-        self.selected_loop_id = Some(visible_ids[visible_ids.len() - 1].clone());
-        self.refresh_loops_selection();
+        if self.selected_backlog > 0 {
+            self.selected_backlog -= 1;
+            return;
+        }
+        self.cross_backward_from_backlog();
+    }
+
+    fn navigate_history_prev(&mut self) {
+        let finished_ids: Vec<String> = self
+            .finished_loops()
+            .iter()
+            .map(|lp| lp.id.clone())
+            .collect();
+        if finished_ids.is_empty() || self.history_collapsed {
+            if self.try_cross_to_backlog_last() {
+                return;
+            }
+            self.cross_backward_from_loops();
+            return;
+        }
+        let current = self
+            .selected_loop_id
+            .as_ref()
+            .and_then(|id| finished_ids.iter().position(|vid| vid == id))
+            .unwrap_or(0);
+        if current > 0 {
+            self.selected_history = current - 1;
+            self.selected_loop_id = Some(finished_ids[current - 1].clone());
+            self.refresh_loops_selection();
+            return;
+        }
+        if self.try_cross_to_backlog_last() {
+            return;
+        }
+        self.cross_backward_from_loops();
     }
 
     fn navigate_from_rag_info_prev(&mut self) {
-        let last_id = self.visible_loops().last().map(|w| w.id.clone());
-        if let Some(id) = last_id {
-            self.projects_panel_focus = ProjectsPanelFocus::Loops;
-            self.selected_loop_id = Some(id);
-            self.refresh_loops_selection();
+        if self.try_cross_to_history_last() {
+            return;
+        }
+        if self.try_cross_to_backlog_last() {
+            return;
+        }
+        if self.try_cross_to_loops_last() {
             return;
         }
         if self.projects.is_empty() {
@@ -614,6 +824,22 @@ impl App {
             self.selected_project = self.selected_project.min(self.projects.len() - 1);
         }
         self.refresh_project_knowledge()?;
+        self.refresh_backlog_specs()?;
+        Ok(())
+    }
+
+    /// Reload the standalone/backlog specs shown in the sidebar's `Backlog`
+    /// section, tag-filtered to the selected project's workdir (or
+    /// unfiltered when no project is registered/selected). Runs on the same
+    /// cadence as `refresh_projects` — no dedicated polling loop.
+    fn refresh_backlog_specs(&mut self) -> Result<()> {
+        let workdir_filter = self.selected_project().map(|p| p.path.clone());
+        self.backlog_specs = self.db.list_specs(workdir_filter.as_deref(), None, true)?;
+        if self.backlog_specs.is_empty() {
+            self.selected_backlog = 0;
+        } else {
+            self.selected_backlog = self.selected_backlog.min(self.backlog_specs.len() - 1);
+        }
         Ok(())
     }
 
@@ -630,8 +856,70 @@ impl App {
 
     fn refresh_loops(&mut self) -> Result<()> {
         self.loops = self.db.list_loops(None)?;
+        self.refresh_loop_sidebar_meta();
         self.refresh_loops_selection();
         Ok(())
+    }
+
+    /// Recompute the sidebar's per-loop spec progress ("done/total") and
+    /// blocked status (a `Paused` loop whose latest run recorded a
+    /// `loop_report_blocker` description). One `list_loop_specs` +, for
+    /// paused loops, one `list_loop_runs_for_loop` query per loop — bounded
+    /// by the (typically small) number of loops, run on the existing
+    /// refresh cadence rather than a dedicated poller.
+    fn refresh_loop_sidebar_meta(&mut self) {
+        let mut meta = HashMap::new();
+        for lp in &self.loops {
+            let specs = self.db.list_loop_specs(&lp.id).unwrap_or_default();
+            let total = specs.len();
+            let done = specs
+                .iter()
+                .filter(|spec| spec.status == LoopSpecStatus::Completed)
+                .count();
+            let blocked = lp.status == LoopStatus::Paused
+                && self
+                    .db
+                    .list_loop_runs_for_loop(&lp.id)
+                    .ok()
+                    .and_then(|runs| runs.last().and_then(|run| run.output.clone()))
+                    .is_some_and(|output| output.get("blocker").is_some());
+            meta.insert(
+                lp.id.clone(),
+                LoopSidebarMeta {
+                    done,
+                    total,
+                    blocked,
+                },
+            );
+        }
+        self.loop_sidebar_meta = meta;
+    }
+
+    /// Non-terminal loops (`Draft`/`Running`/`Paused`) for the sidebar's
+    /// `Loops` section, with running loops sorted first, then paused
+    /// (including blocked), then draft — ties broken by the existing
+    /// `created_at DESC` order from `list_loops`.
+    pub fn active_loops(&self) -> Vec<&crate::domain::loops::Loop> {
+        let mut loops: Vec<&crate::domain::loops::Loop> = self
+            .loops
+            .iter()
+            .filter(|lp| !matches!(lp.status, LoopStatus::Completed | LoopStatus::Failed))
+            .collect();
+        loops.sort_by_key(|lp| match lp.status {
+            LoopStatus::Running => 0,
+            LoopStatus::Paused => 1,
+            LoopStatus::Draft => 2,
+            LoopStatus::Completed | LoopStatus::Failed => 3,
+        });
+        loops
+    }
+
+    /// Completed/failed loops for the sidebar's `History` section.
+    pub fn finished_loops(&self) -> Vec<&crate::domain::loops::Loop> {
+        self.loops
+            .iter()
+            .filter(|lp| matches!(lp.status, LoopStatus::Completed | LoopStatus::Failed))
+            .collect()
     }
 
     fn refresh_loops_selection(&mut self) {
@@ -642,6 +930,7 @@ impl App {
             self.loop_runs.clear();
             self.loop_selected_spec = 0;
             self.loop_selected_node = 0;
+            self.loop_live_state = None;
             return;
         }
 
@@ -667,6 +956,16 @@ impl App {
         }
         self.refresh_loop_runs_for_selected_spec();
         self.select_default_loop_node_if_needed(selected_changed);
+        self.refresh_loop_live_state();
+    }
+
+    /// Assemble a fresh [`LoopLiveState`] snapshot for the currently selected
+    /// loop. Zero cost when no loop is selected (no queries).
+    fn refresh_loop_live_state(&mut self) {
+        self.loop_live_state = self
+            .loop_details
+            .as_ref()
+            .and_then(|details| loop_live_state::assemble_loop_live_state(&self.db, details));
     }
 
     fn refresh_rag_state(&mut self) -> Result<()> {
@@ -874,6 +1173,8 @@ impl App {
         let mut panels = vec![
             ProjectsPanelFocus::Projects,
             ProjectsPanelFocus::Loops,
+            ProjectsPanelFocus::Backlog,
+            ProjectsPanelFocus::History,
             ProjectsPanelFocus::Knowledge,
         ];
         if self.rag_info.has_rag_activity() {
@@ -885,7 +1186,9 @@ impl App {
     fn project_panel_has_navigable_items(&self, panel: ProjectsPanelFocus) -> bool {
         match panel {
             ProjectsPanelFocus::Projects => !self.projects.is_empty(),
-            ProjectsPanelFocus::Loops => !self.visible_loops().is_empty(),
+            ProjectsPanelFocus::Loops => !self.active_loops().is_empty(),
+            ProjectsPanelFocus::Backlog => !self.backlog_specs.is_empty(),
+            ProjectsPanelFocus::History => !self.finished_loops().is_empty(),
             ProjectsPanelFocus::Knowledge => true,
             ProjectsPanelFocus::RagInfo => self.rag_info.has_rag_activity(),
         }
@@ -978,6 +1281,23 @@ impl App {
         }
         self.agents_rag_focused = false;
         self.reset_log_scroll();
+    }
+
+    /// Toggles the sidebar's `History` section between its collapsed header
+    /// (just the count) and the expanded finished-loop list. On expand,
+    /// selects the first finished loop so the main panel previews it — same
+    /// as entering the section from an edge.
+    pub fn toggle_history_collapsed(&mut self) {
+        self.history_collapsed = !self.history_collapsed;
+        if self.history_collapsed {
+            return;
+        }
+        let Some(first) = self.finished_loops().first().map(|lp| lp.id.clone()) else {
+            return;
+        };
+        self.selected_history = 0;
+        self.selected_loop_id = Some(first);
+        self.refresh_loops_selection();
     }
 
     pub fn cycle_loop_spec(&mut self, forward: bool) {
@@ -2675,5 +2995,229 @@ mod tests {
             Some("some-stored-boot-id"),
             None,
         ));
+    }
+
+    // ── Sidebar: loops/backlog/history sections ─────────────────────
+
+    fn make_project(hash: &str, path: &str) -> crate::domain::project::Project {
+        crate::domain::project::Project {
+            hash: hash.to_string(),
+            path: path.to_string(),
+            name: hash.to_string(),
+            description: None,
+            tags: None,
+            indexed_at: None,
+            created_at: 0,
+        }
+    }
+
+    fn make_loop(
+        id: &str,
+        name: &str,
+        status: crate::domain::loops::LoopStatus,
+    ) -> crate::domain::loops::Loop {
+        crate::domain::loops::Loop {
+            id: id.to_string(),
+            name: name.to_string(),
+            description: None,
+            workdir: "/tmp".to_string(),
+            status,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            active_run_pool_id: None,
+        }
+    }
+
+    fn make_backlog_spec(
+        id: &str,
+        name: &str,
+        workdir: Option<&str>,
+    ) -> crate::domain::loops::LoopSpec {
+        crate::domain::loops::LoopSpec {
+            id: id.to_string(),
+            loop_id: None,
+            name: name.to_string(),
+            description: None,
+            position: 0,
+            parallelizable: false,
+            status: crate::domain::loops::LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: workdir.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn active_loops_orders_running_before_paused_before_draft() {
+        use crate::domain::loops::LoopStatus;
+
+        let db = test_db();
+        db.insert_loop(&make_loop("l-draft", "Draft Loop", LoopStatus::Draft))
+            .unwrap();
+        db.insert_loop(&make_loop("l-done", "Done Loop", LoopStatus::Completed))
+            .unwrap();
+        db.insert_loop(&make_loop("l-paused", "Paused Loop", LoopStatus::Paused))
+            .unwrap();
+        db.insert_loop(&make_loop("l-running", "Running Loop", LoopStatus::Running))
+            .unwrap();
+
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+
+        let ids: Vec<&str> = app.active_loops().iter().map(|lp| lp.id.as_str()).collect();
+        assert_eq!(ids, vec!["l-running", "l-paused", "l-draft"]);
+        assert!(
+            !ids.contains(&"l-done"),
+            "completed loops must not appear in active_loops"
+        );
+    }
+
+    #[test]
+    fn finished_loops_only_includes_completed_and_failed() {
+        use crate::domain::loops::LoopStatus;
+
+        let db = test_db();
+        db.insert_loop(&make_loop("l-running", "Running Loop", LoopStatus::Running))
+            .unwrap();
+        db.insert_loop(&make_loop("l-done", "Done Loop", LoopStatus::Completed))
+            .unwrap();
+        db.insert_loop(&make_loop("l-failed", "Failed Loop", LoopStatus::Failed))
+            .unwrap();
+
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+
+        let mut ids: Vec<&str> = app
+            .finished_loops()
+            .iter()
+            .map(|lp| lp.id.as_str())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["l-done", "l-failed"]);
+    }
+
+    #[test]
+    fn refresh_backlog_specs_filters_by_selected_project_workdir() {
+        let db = test_db();
+        db.upsert_project(&make_project("hash0", "/tmp/proj0"))
+            .unwrap();
+        db.upsert_project(&make_project("hash1", "/tmp/proj1"))
+            .unwrap();
+        db.insert_loop_spec(&make_backlog_spec("spec-a", "Spec A", Some("/tmp/proj0")))
+            .unwrap();
+        db.insert_loop_spec(&make_backlog_spec("spec-b", "Spec B", Some("/tmp/proj1")))
+            .unwrap();
+        db.insert_loop_spec(&make_backlog_spec("spec-c", "Spec C", None))
+            .unwrap();
+
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        assert_eq!(app.selected_project, 0);
+        assert_eq!(
+            app.backlog_specs
+                .iter()
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["Spec A".to_string()],
+            "backlog should be tag-filtered to the selected project's workdir"
+        );
+
+        app.selected_project = 1;
+        app.refresh_backlog_specs().expect("refresh backlog");
+        assert_eq!(
+            app.backlog_specs
+                .iter()
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["Spec B".to_string()]
+        );
+    }
+
+    #[test]
+    fn toggle_history_collapsed_selects_first_finished_loop() {
+        use crate::domain::loops::LoopStatus;
+
+        let db = test_db();
+        // A second, active loop so the initially-selected loop (whichever
+        // `refresh_loops_selection` defaults to) isn't already "l-done" —
+        // otherwise the assertion below can't tell a real selection change
+        // from a coincidence.
+        db.insert_loop(&make_loop("l-active", "Active Loop", LoopStatus::Running))
+            .unwrap();
+        db.insert_loop(&make_loop("l-done", "Done Loop", LoopStatus::Completed))
+            .unwrap();
+
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.selected_loop_id = Some("l-active".to_string());
+        assert!(app.history_collapsed, "history starts collapsed");
+
+        app.toggle_history_collapsed();
+        assert!(!app.history_collapsed);
+        assert_eq!(app.selected_loop_id.as_deref(), Some("l-done"));
+        assert_eq!(app.selected_history, 0);
+
+        app.toggle_history_collapsed();
+        assert!(app.history_collapsed);
+    }
+
+    #[test]
+    fn select_next_cycles_projects_loops_backlog_history_then_wraps() {
+        use crate::domain::loops::LoopStatus;
+        use crate::tui::app::types::{ProjectsPanelFocus, SidebarMode};
+
+        let db = test_db();
+        db.upsert_project(&make_project("hash0", "/tmp/proj0"))
+            .unwrap();
+        db.insert_loop(&make_loop("l-active", "Active Loop", LoopStatus::Running))
+            .unwrap();
+        db.insert_loop(&make_loop("l-done", "Done Loop", LoopStatus::Completed))
+            .unwrap();
+        db.insert_loop_spec(&make_backlog_spec("spec-a", "Spec A", Some("/tmp/proj0")))
+            .unwrap();
+
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.toggle_sidebar_mode();
+        assert!(matches!(app.sidebar_mode, SidebarMode::Projects));
+        app.projects_panel_focus = ProjectsPanelFocus::Projects;
+        app.selected_project = 0;
+
+        app.select_next();
+        assert_eq!(app.projects_panel_focus, ProjectsPanelFocus::Loops);
+        assert_eq!(app.selected_loop_id.as_deref(), Some("l-active"));
+
+        app.select_next();
+        assert_eq!(app.projects_panel_focus, ProjectsPanelFocus::Backlog);
+        assert_eq!(app.selected_backlog, 0);
+
+        app.select_next();
+        assert_eq!(app.projects_panel_focus, ProjectsPanelFocus::History);
+        assert!(
+            app.history_collapsed,
+            "crossing into History shouldn't auto-expand it"
+        );
+
+        // Collapsed History has nothing to cycle through, so the next arrow
+        // press falls through to the end of the chain and wraps back to
+        // Projects (there's no RAG activity in this test).
+        app.select_next();
+        assert_eq!(app.projects_panel_focus, ProjectsPanelFocus::Projects);
+        assert_eq!(app.selected_project, 0);
+
+        // And the reverse chain mirrors it exactly.
+        app.select_prev();
+        assert_eq!(app.projects_panel_focus, ProjectsPanelFocus::History);
+
+        app.select_prev();
+        assert_eq!(app.projects_panel_focus, ProjectsPanelFocus::Backlog);
+
+        app.select_prev();
+        assert_eq!(app.projects_panel_focus, ProjectsPanelFocus::Loops);
+        assert_eq!(app.selected_loop_id.as_deref(), Some("l-active"));
     }
 }

@@ -11,15 +11,30 @@ use super::{
     INTERACTIVE_COLOR,
 };
 use super::{STATUS_DISABLED, STATUS_FAIL, STATUS_OK, STATUS_RUNNING};
+use crate::domain::loops::{Loop, LoopStatus};
 use crate::tui::agent::AgentStatus;
 use crate::tui::app::types::{
-    AgentEntry, AgentSectionFocus, App, Focus, ProjectsPanelFocus, SidebarMode,
+    AgentEntry, AgentSectionFocus, App, Focus, LoopSidebarMeta, ProjectsPanelFocus, SidebarMode,
 };
 use ratatui::style::Color;
 
-/// Minimum rows reserved for the `loops` section when the projects sidebar
-/// overflows and sections must be shrunk to fit.
-const MIN_LOOPS_HEIGHT: u16 = 4;
+/// Minimum rows reserved for the `loops`/`backlog`/`history`/`knowledge`
+/// sections when the projects sidebar overflows and sections must be shrunk
+/// to fit — each is "always present" (shown with a placeholder when empty,
+/// see `projects_layout_requirements`), so none of them may silently claim
+/// to exist while being allocated zero rows (bug T41).
+// Loop/history cards are 3 content rows tall (name, progress/status,
+// workdir); one full card plus its 2-row border is the minimum that can
+// show a single entry, not just a placeholder line.
+const MIN_LOOPS_HEIGHT: u16 = 5;
+const MIN_BACKLOG_HEIGHT: u16 = 3;
+const MIN_HISTORY_HEIGHT: u16 = 5;
+const MIN_KNOWLEDGE_HEIGHT: u16 = 4;
+/// Floor used for `projects`/`rag` under overflow — unlike the other four,
+/// they don't have their own placeholder-driven minimum, but still shouldn't
+/// be crushed to an unusable sliver by `fair_section_heights`' proportional
+/// split (see `section_floor`).
+const MIN_SECTION_HEIGHT: u16 = 3;
 
 pub(super) fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App) {
     app.sidebar_click_map.clear();
@@ -62,6 +77,8 @@ struct SidebarContentAreas {
 struct ProjectsLayout {
     projects: Option<Rect>,
     loops: Option<Rect>,
+    backlog: Option<Rect>,
+    history: Option<Rect>,
     knowledge: Option<Rect>,
     rag_queue: Option<Rect>,
     brain: Option<Rect>,
@@ -266,21 +283,19 @@ fn render_dashboard_if_present(frame: &mut Frame, area: Option<Rect>, app: &App)
 
 fn draw_projects_sidebar(frame: &mut Frame, areas: SidebarContentAreas, app: &App) {
     let rag_items = &app.global_rag_queue;
-    let loops = app.visible_loops();
+    let active_loop_count = app.active_loops().len();
+    let finished_loop_count = app.finished_loops().len();
     let show_rag_info = app.rag_info.has_rag_activity() && areas.content.height >= 6;
     // ragInfo sits at the TOP of the projects sidebar so it's always visible.
     let (rag_info_area, content_below) = split_top_panel(areas.content, show_rag_info, 6);
-    let (has_projects, has_loops, projects_needed, loops_needed, knowledge_needed, rag_needed) =
-        projects_layout_requirements(app, loops.len(), rag_items, content_below.height);
-    let layout = layout_projects_sections(
-        content_below,
-        has_projects,
-        has_loops,
-        projects_needed,
-        loops_needed,
-        knowledge_needed,
-        rag_needed,
+    let needs = projects_layout_requirements(
+        app,
+        active_loop_count,
+        finished_loop_count,
+        rag_items,
+        content_below.height,
     );
+    let layout = layout_projects_sections(content_below, &needs);
 
     if let Some(rag_info_area) = rag_info_area.filter(|area| area.height >= 3) {
         render_titled_panel(
@@ -312,6 +327,28 @@ fn draw_projects_sidebar(frame: &mut Frame, areas: SidebarContentAreas, app: &Ap
             Style::default().fg(DIM),
             projects_panel_border_style(app, ProjectsPanelFocus::Loops),
             |frame, inner| draw_loops_list(frame, inner, app),
+        );
+    }
+
+    if let Some(backlog_area) = layout.backlog {
+        render_titled_panel(
+            frame,
+            backlog_area,
+            &format!(" backlog ({}) ", app.backlog_specs.len()),
+            Style::default().fg(DIM),
+            projects_panel_border_style(app, ProjectsPanelFocus::Backlog),
+            |frame, inner| draw_backlog_list(frame, inner, app),
+        );
+    }
+
+    if let Some(history_area) = layout.history {
+        render_titled_panel(
+            frame,
+            history_area,
+            &format!(" history ({}) ", finished_loop_count),
+            Style::default().fg(DIM),
+            projects_panel_border_style(app, ProjectsPanelFocus::History),
+            |frame, inner| draw_history_list(frame, inner, app),
         );
     }
 
@@ -371,43 +408,85 @@ fn split_top_panel(content: Rect, enabled: bool, top_height: u16) -> (Option<Rec
     (Some(top), bottom)
 }
 
+/// Height each section of the projects sidebar would like, computed once per
+/// frame from the current data. `loops`, `backlog`, `history`, and
+/// `knowledge` are "always present" sections — they fall back to a small
+/// placeholder height when empty rather than disappearing (see
+/// `layout_projects_sections`), matching the pre-existing `loops`/`knowledge`
+/// convention. `projects` and `rag` are the only sections omitted outright
+/// when they have nothing to show.
+struct ProjectsSectionNeeds {
+    has_projects: bool,
+    projects: u16,
+    loops: u16,
+    backlog: u16,
+    history: u16,
+    knowledge: u16,
+    rag: u16,
+}
+
+/// Total box height (border + content) needed to show `count` stacked
+/// 3-content-row cards with a 1-row gap between them — used by `projects`,
+/// `loops`, and expanded `history`, whose entries all render via
+/// `draw_project_loop_card`/`draw_active_loop_card` (`row_h = 4`, but only
+/// the *last* visible card skips its trailing gap row). Plain `count*3+2`
+/// undercounts by one row per item beyond the first.
+fn card_section_height(count: u16) -> u16 {
+    if count == 0 {
+        0
+    } else {
+        count * 4 + 1
+    }
+}
+
 fn projects_layout_requirements(
     app: &App,
-    loop_count: usize,
+    active_loop_count: usize,
+    finished_loop_count: usize,
     rag_items: &[crate::db::project::RagQueueItem],
     content_height: u16,
-) -> (bool, bool, u16, u16, u16, u16) {
+) -> ProjectsSectionNeeds {
     let has_projects = !app.projects.is_empty();
-    let has_loops = true;
-    let projects_needed = if has_projects {
-        (app.projects.len() as u16 * 3 + 2).min(content_height)
+    let projects = if has_projects {
+        card_section_height(app.projects.len() as u16).min(content_height)
     } else {
         0
     };
-    let loops_needed = if loop_count > 0 {
-        (loop_count as u16 * 3 + 2).min(content_height)
+    let loops = if active_loop_count > 0 {
+        card_section_height(active_loop_count as u16).min(content_height)
     } else {
-        4.min(content_height)
+        MIN_LOOPS_HEIGHT.min(content_height)
     };
-    let knowledge_needed = if !app.project_knowledge.is_empty() {
+    let backlog = if !app.backlog_specs.is_empty() {
+        (app.backlog_specs.len() as u16 + 2).min(content_height)
+    } else {
+        MIN_BACKLOG_HEIGHT.min(content_height)
+    };
+    let history = if !app.history_collapsed && finished_loop_count > 0 {
+        card_section_height(finished_loop_count as u16).min(content_height)
+    } else {
+        MIN_HISTORY_HEIGHT.min(content_height)
+    };
+    let knowledge = if !app.project_knowledge.is_empty() {
         (app.project_knowledge.len() as u16 * 3 + 2).min(12)
     } else {
-        4.min(content_height)
+        MIN_KNOWLEDGE_HEIGHT.min(content_height)
     };
-    let rag_needed = if app.playground_active && !rag_items.is_empty() {
+    let rag = if app.playground_active && !rag_items.is_empty() {
         (rag_items.len() as u16 * 2 + 3).min(14)
     } else {
         0
     };
 
-    (
+    ProjectsSectionNeeds {
         has_projects,
-        has_loops,
-        projects_needed,
-        loops_needed,
-        knowledge_needed,
-        rag_needed,
-    )
+        projects,
+        loops,
+        backlog,
+        history,
+        knowledge,
+        rag,
+    }
 }
 
 fn rag_queue_title(rag_paused: bool) -> &'static str {
@@ -418,76 +497,128 @@ fn rag_queue_title(rag_paused: bool) -> &'static str {
     }
 }
 
-fn layout_projects_sections(
-    content_top: Rect,
-    has_projects: bool,
-    has_loops: bool,
-    projects_needed: u16,
-    loops_needed: u16,
-    knowledge_needed: u16,
-    rag_needed: u16,
-) -> ProjectsLayout {
-    if (has_projects || has_loops)
-        && rag_needed > 0
-        && projects_needed + loops_needed + knowledge_needed + rag_needed < content_top.height
-    {
-        let mut remaining = content_top;
-        let projects = take_top(&mut remaining, projects_needed);
-        let loops = take_top(&mut remaining, loops_needed);
-        let knowledge = take_top(&mut remaining, knowledge_needed);
-        let rag_queue = take_top(&mut remaining, rag_needed);
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProjectsSectionKind {
+    Projects,
+    Loops,
+    Backlog,
+    History,
+    Knowledge,
+    Rag,
+}
 
-        return ProjectsLayout {
-            projects,
-            loops,
-            knowledge,
-            rag_queue,
-            brain: Some(remaining),
-        };
+fn assign_projects_rect(
+    layout: &mut ProjectsLayout,
+    kind: ProjectsSectionKind,
+    rect: Option<Rect>,
+) {
+    match kind {
+        ProjectsSectionKind::Projects => layout.projects = rect,
+        ProjectsSectionKind::Loops => layout.loops = rect,
+        ProjectsSectionKind::Backlog => layout.backlog = rect,
+        ProjectsSectionKind::History => layout.history = rect,
+        ProjectsSectionKind::Knowledge => layout.knowledge = rect,
+        ProjectsSectionKind::Rag => layout.rag_queue = rect,
+    }
+}
+
+/// Guaranteed minimum height for a section, capped at its own demand — one
+/// full entry (or the empty-state placeholder) plus its 2-row border, so a
+/// section is never reserved more than it could ever use.
+fn section_floor(kind: ProjectsSectionKind, demand: u16) -> u16 {
+    let floor = match kind {
+        ProjectsSectionKind::Loops => MIN_LOOPS_HEIGHT,
+        ProjectsSectionKind::Backlog => MIN_BACKLOG_HEIGHT,
+        ProjectsSectionKind::History => MIN_HISTORY_HEIGHT,
+        ProjectsSectionKind::Knowledge => MIN_KNOWLEDGE_HEIGHT,
+        ProjectsSectionKind::Projects | ProjectsSectionKind::Rag => MIN_SECTION_HEIGHT,
+    };
+    floor.min(demand)
+}
+
+/// Priority order for reserving each section's floor when the budget can't
+/// cover every floor at once (see `layout_projects_sections`). `Loops` goes
+/// first — "what's running right now" is the sidebar's headline concern —
+/// then `Backlog`/`History` (this change's other two sections), then the
+/// pre-existing `Knowledge`, then `Projects` (which, being a per-project
+/// list, degrades the most gracefully by just showing fewer projects) and
+/// finally `Rag` (already omitted outright unless the playground is open).
+const PROJECTS_SECTION_FLOOR_PRIORITY: [ProjectsSectionKind; 6] = [
+    ProjectsSectionKind::Loops,
+    ProjectsSectionKind::Backlog,
+    ProjectsSectionKind::History,
+    ProjectsSectionKind::Knowledge,
+    ProjectsSectionKind::Projects,
+    ProjectsSectionKind::Rag,
+];
+
+/// Lays out every projects-sidebar section top-to-bottom. `loops`, `backlog`,
+/// `history`, and `knowledge` are always included (with their placeholder
+/// height when empty); `projects`/`rag` are included only when they have
+/// something to show.
+///
+/// Every included section is first reserved its `section_floor`, taken in
+/// `PROJECTS_SECTION_FLOOR_PRIORITY` order so higher-priority sections keep
+/// their floor even if the budget runs out before reaching the rest (bug
+/// T41: a demanding section like `projects` with many entries must not
+/// out-vote a small one like `loops` down to 0). Whatever budget remains
+/// after every floor is then handed out by `fair_section_heights` — the same
+/// max-min-fair allocator the agents sidebar uses — proportional to each
+/// section's remaining (above-floor) demand, and any leftover becomes
+/// `brain`.
+fn layout_projects_sections(content_top: Rect, needs: &ProjectsSectionNeeds) -> ProjectsLayout {
+    let mut kinds: Vec<ProjectsSectionKind> = Vec::new();
+    let mut demands: Vec<u16> = Vec::new();
+
+    if needs.has_projects {
+        kinds.push(ProjectsSectionKind::Projects);
+        demands.push(needs.projects);
+    }
+    kinds.push(ProjectsSectionKind::Loops);
+    demands.push(needs.loops);
+    kinds.push(ProjectsSectionKind::Backlog);
+    demands.push(needs.backlog);
+    kinds.push(ProjectsSectionKind::History);
+    demands.push(needs.history);
+    kinds.push(ProjectsSectionKind::Knowledge);
+    demands.push(needs.knowledge);
+    if needs.rag > 0 {
+        kinds.push(ProjectsSectionKind::Rag);
+        demands.push(needs.rag);
     }
 
-    if (has_projects || has_loops)
-        && projects_needed + loops_needed + knowledge_needed < content_top.height
-    {
-        let mut remaining = content_top;
-        return ProjectsLayout {
-            projects: take_top(&mut remaining, projects_needed),
-            loops: take_top(&mut remaining, loops_needed),
-            knowledge: take_top(&mut remaining, knowledge_needed),
-            rag_queue: (rag_needed > 0 && remaining.height >= 3).then_some(remaining),
-            brain: None,
-        };
+    let mut floors = vec![0u16; kinds.len()];
+    let mut budget_left = content_top.height;
+    for &want_kind in &PROJECTS_SECTION_FLOOR_PRIORITY {
+        if let Some(i) = kinds.iter().position(|&kind| kind == want_kind) {
+            let floor = section_floor(want_kind, demands[i]).min(budget_left);
+            floors[i] = floor;
+            budget_left -= floor;
+        }
     }
 
-    if has_projects || has_loops {
-        // Not enough room for everyone. `projects` is taken first (it's drawn
-        // on top), but a naive sequential take_top can let it swallow the
-        // whole budget via its own clamping, leaving 0 rows — and thus no
-        // visible section — for `loops`. Reserve loops a minimum slice first
-        // and shrink projects to fit around it.
-        let mut remaining = content_top;
-        let loops_reserved = loops_needed.max(MIN_LOOPS_HEIGHT).min(remaining.height);
-        let projects_budget = remaining.height.saturating_sub(loops_reserved);
-        return ProjectsLayout {
-            projects: take_top(&mut remaining, projects_needed.min(projects_budget)),
-            loops: take_top(&mut remaining, loops_needed)
-                .or_else(|| (remaining.height > 0).then_some(remaining)),
-            knowledge: None,
-            ..ProjectsLayout::default()
-        };
-    }
+    let extra_demands: Vec<u16> = demands
+        .iter()
+        .zip(floors.iter())
+        .map(|(&demand, &floor)| demand - floor)
+        .collect();
+    let extra_alloc = fair_section_heights(&extra_demands, budget_left);
+    let allocation: Vec<u16> = floors
+        .iter()
+        .zip(extra_alloc.iter())
+        .map(|(&floor, &extra)| floor + extra)
+        .collect();
 
-    if rag_needed > 0 {
-        return ProjectsLayout {
-            rag_queue: Some(content_top),
-            ..ProjectsLayout::default()
-        };
+    let mut layout = ProjectsLayout::default();
+    let mut remaining = content_top;
+    for (&kind, &height) in kinds.iter().zip(allocation.iter()) {
+        let rect = take_top(&mut remaining, height);
+        assign_projects_rect(&mut layout, kind, rect);
     }
-
-    ProjectsLayout {
-        brain: Some(content_top),
-        ..ProjectsLayout::default()
+    if remaining.height > 0 {
+        layout.brain = Some(remaining);
     }
+    layout
 }
 
 fn draw_empty_agents_sidebar(frame: &mut Frame, areas: SidebarContentAreas, app: &App) {
@@ -943,12 +1074,69 @@ fn draw_knowledge_card(
     );
 }
 
+/// Status icon shown on an active loop's card: running takes priority, then
+/// blocked (a paused loop whose latest run recorded a `loop_report_blocker`
+/// description), then plain paused, then draft.
+fn loop_status_icon(lp: &Loop, meta: LoopSidebarMeta) -> (&'static str, Color) {
+    match lp.status {
+        LoopStatus::Running => ("▶", STATUS_RUNNING),
+        LoopStatus::Paused if meta.blocked => ("⛔", STATUS_FAIL),
+        LoopStatus::Paused => ("⏸", Color::Yellow),
+        LoopStatus::Draft | LoopStatus::Completed | LoopStatus::Failed => ("·", DIM),
+    }
+}
+
+fn draw_active_loop_card(
+    frame: &mut Frame,
+    area: Rect,
+    selected: bool,
+    lp: &Loop,
+    meta: LoopSidebarMeta,
+    panel_focused: bool,
+) {
+    let bg = if selected { BG_SELECTED } else { Color::Reset };
+    let title_style = project_title_style(selected, panel_focused);
+    let meta_style = project_meta_style(selected);
+    let (icon, icon_color) = loop_status_icon(lp, meta);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(icon, Style::default().fg(icon_color)),
+            Span::raw(" "),
+            Span::styled(
+                truncate_str(&lp.name, area.width.saturating_sub(2) as usize),
+                title_style,
+            ),
+        ]))
+        .style(Style::default().bg(bg)),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+
+    let progress = format!("{}/{} specs", meta.done, meta.total);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            truncate_str(&progress, area.width as usize),
+            meta_style,
+        )))
+        .style(Style::default().bg(bg)),
+        Rect::new(area.x, area.y + 1, area.width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            truncate_str(&last_two_segments(&lp.workdir), area.width as usize),
+            meta_style,
+        )))
+        .style(Style::default().bg(bg)),
+        Rect::new(area.x, area.y + 2, area.width, 1),
+    );
+}
+
 fn draw_loops_list(frame: &mut Frame, area: Rect, app: &App) {
-    let loops = app.visible_loops();
+    let loops = app.active_loops();
     if loops.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "No loops yet",
+                "No active loops",
                 Style::default().fg(Color::DarkGray),
             ))),
             area,
@@ -957,20 +1145,149 @@ fn draw_loops_list(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let selected_index = app
-        .selected_loop()
-        .and_then(|lp| loops.iter().position(|candidate| candidate.id == lp.id));
+        .selected_loop_id
+        .as_deref()
+        .and_then(|id| loops.iter().position(|lp| lp.id == id));
     let scroll = scroll_state(
         loops.len(),
         selected_index,
-        (area.height / 4).max(1) as usize, // Ajustado para cards
+        // Only the *last* visible card skips its trailing gap row, so a
+        // plain `height / row_h` undercounts by one card whenever `height`
+        // is an exact fit (e.g. 7 rows is enough for 2 cards, not 1).
+        ((area.height + 1) / 4).max(1) as usize,
     );
     let panel_focused = app.projects_panel_focus == ProjectsPanelFocus::Loops;
     let mut y = area.y;
     let row_h = 4u16;
 
-    for (_idx, lp) in loops
+    for lp in loops
         .iter()
+        .copied()
+        .skip(scroll.start)
+        .take(scroll.max_visible)
+    {
+        if y + 3 > area.y + area.height {
+            break;
+        }
+        let meta = app
+            .loop_sidebar_meta
+            .get(&lp.id)
+            .copied()
+            .unwrap_or_default();
+        draw_active_loop_card(
+            frame,
+            Rect::new(area.x, y, area.width, 3),
+            app.selected_loop_id.as_deref() == Some(lp.id.as_str()),
+            lp,
+            meta,
+            panel_focused,
+        );
+        y += row_h;
+    }
+
+    draw_scroll_indicators(frame, area, scroll.has_up, scroll.has_down);
+}
+
+fn draw_backlog_list(frame: &mut Frame, area: Rect, app: &App) {
+    if app.backlog_specs.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "No backlog specs",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            area,
+        );
+        return;
+    }
+
+    let panel_focused = app.projects_panel_focus == ProjectsPanelFocus::Backlog;
+    let scroll = scroll_state(
+        app.backlog_specs.len(),
+        Some(app.selected_backlog),
+        area.height.max(1) as usize,
+    );
+    let mut y = area.y;
+
+    for (display_idx, spec) in app
+        .backlog_specs
+        .iter()
+        .skip(scroll.start)
+        .take(scroll.max_visible)
         .enumerate()
+    {
+        if y >= area.y + area.height {
+            break;
+        }
+        let selected = display_idx + scroll.start == app.selected_backlog;
+        let bg = if selected { BG_SELECTED } else { Color::Reset };
+        let title_style = if selected && panel_focused {
+            Style::default()
+                .fg(Color::Black)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else if selected {
+            Style::default()
+                .fg(Color::White)
+                .bg(BG_SELECTED)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate_str(&spec.name, area.width as usize),
+                title_style,
+            )))
+            .style(Style::default().bg(bg)),
+            Rect::new(area.x, y, area.width, 1),
+        );
+        y += 1;
+    }
+
+    draw_scroll_indicators(frame, area, scroll.has_up, scroll.has_down);
+}
+
+fn draw_history_list(frame: &mut Frame, area: Rect, app: &App) {
+    let finished = app.finished_loops();
+    if finished.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "No finished loops yet",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            area,
+        );
+        return;
+    }
+
+    if app.history_collapsed {
+        let summary = format!("{} completed/failed — Enter to expand", finished.len());
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate_str(&summary, area.width as usize),
+                Style::default().fg(DIM),
+            ))),
+            area,
+        );
+        return;
+    }
+
+    let selected_index = app
+        .selected_loop_id
+        .as_deref()
+        .and_then(|id| finished.iter().position(|lp| lp.id == id));
+    let scroll = scroll_state(
+        finished.len(),
+        selected_index,
+        ((area.height + 1) / 4).max(1) as usize,
+    );
+    let panel_focused = app.projects_panel_focus == ProjectsPanelFocus::History;
+    let mut y = area.y;
+    let row_h = 4u16;
+
+    for lp in finished
+        .iter()
+        .copied()
         .skip(scroll.start)
         .take(scroll.max_visible)
     {
@@ -1798,6 +2115,204 @@ mod tests {
         let text = render_projects_sidebar_text(20, 34, 20);
         assert!(text.contains("loops"), "expected loops section title");
         assert!(text.contains("Probe Loop"), "expected loop name visible");
+    }
+
+    /// Like `render_projects_sidebar_text`, but also seeds `spec_count`
+    /// standalone backlog specs (tagged to `/tmp/project0`, the first
+    /// project) and `finished_count` completed loops, and lets the caller
+    /// control the `History` section's collapsed state before rendering.
+    fn render_projects_sidebar_text_with_backlog_and_history(
+        project_count: usize,
+        width: u16,
+        height: u16,
+        spec_count: usize,
+        finished_count: usize,
+        history_collapsed: bool,
+    ) -> String {
+        use crate::db::Database;
+        use crate::domain::loops::{Loop, LoopSpec, LoopSpecStatus, LoopStatus};
+        use crate::domain::project::Project;
+        use crate::tui::app::App;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::sync::Arc;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        for i in 0..project_count {
+            db.upsert_project(&Project {
+                hash: format!("hash{i}"),
+                path: format!("/tmp/project{i}"),
+                name: format!("project{i}"),
+                description: None,
+                tags: None,
+                indexed_at: None,
+                created_at: 0,
+            })
+            .unwrap();
+        }
+        for i in 0..spec_count {
+            db.insert_loop_spec(&LoopSpec {
+                id: format!("spec-{i}"),
+                loop_id: None,
+                name: format!("Spec {i}"),
+                description: None,
+                position: 0,
+                parallelizable: false,
+                status: LoopSpecStatus::Pending,
+                started_at: None,
+                completed_at: None,
+                spec_start_head: None,
+                workdir: (project_count > 0).then(|| "/tmp/project0".to_string()),
+            })
+            .unwrap();
+        }
+        for i in 0..finished_count {
+            db.insert_loop(&Loop {
+                id: format!("loop-done-{i}"),
+                name: format!("Finished Loop {i}"),
+                description: None,
+                workdir: "/tmp/probe".to_string(),
+                status: LoopStatus::Completed,
+                trigger: None,
+                created_at: chrono::Utc::now(),
+                started_at: None,
+                completed_at: None,
+                autorun_at: None,
+                active_run_pool_id: None,
+            })
+            .unwrap();
+        }
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
+        app.toggle_sidebar_mode();
+        app.history_collapsed = history_collapsed;
+
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_sidebar(frame, area, &mut app);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn backlog_section_shows_count_and_spec_names_with_ample_room() {
+        let text = render_projects_sidebar_text_with_backlog_and_history(1, 34, 40, 2, 0, true);
+        assert!(
+            text.contains("backlog (2)"),
+            "expected backlog title with count, got:\n{text}"
+        );
+        assert!(text.contains("Spec 0"));
+        assert!(text.contains("Spec 1"));
+    }
+
+    #[test]
+    fn history_section_collapsed_by_default_hides_finished_loop_names() {
+        let text = render_projects_sidebar_text_with_backlog_and_history(1, 34, 40, 0, 2, true);
+        assert!(
+            text.contains("history (2)"),
+            "expected history title with count, got:\n{text}"
+        );
+        assert!(
+            !text.contains("Finished Loop 0"),
+            "collapsed history should not list finished loop names"
+        );
+    }
+
+    #[test]
+    fn history_section_expanded_shows_finished_loop_names() {
+        let text = render_projects_sidebar_text_with_backlog_and_history(1, 34, 40, 0, 2, false);
+        assert!(text.contains("history (2)"));
+        assert!(text.contains("Finished Loop 0"));
+        assert!(text.contains("Finished Loop 1"));
+    }
+
+    #[test]
+    fn backlog_and_history_sections_still_render_when_projects_overflow_the_sidebar() {
+        // Same T41 regression as `loops_section_still_renders_when_projects_
+        // overflow_the_sidebar`, extended to the two new sections: a lone
+        // backlog spec and a lone finished loop must stay visible even when
+        // 20 projects are competing for the same short sidebar.
+        let text = render_projects_sidebar_text_with_backlog_and_history(20, 34, 20, 1, 1, false);
+        assert!(text.contains("backlog"), "expected backlog section title");
+        assert!(text.contains("Spec 0"), "expected backlog spec visible");
+        assert!(text.contains("history"), "expected history section title");
+        assert!(
+            text.contains("Finished Loop 0"),
+            "expected finished loop visible, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn layout_projects_sections_gives_each_section_its_full_demand_when_room_is_ample() {
+        let needs = ProjectsSectionNeeds {
+            has_projects: true,
+            projects: 8,
+            loops: 5,
+            backlog: 4,
+            history: 5,
+            knowledge: 4,
+            rag: 0,
+        };
+        let content = Rect::new(0, 0, 34, 40);
+        let layout = layout_projects_sections(content, &needs);
+
+        assert_eq!(layout.projects.unwrap().height, 8);
+        assert_eq!(layout.loops.unwrap().height, 5);
+        assert_eq!(layout.backlog.unwrap().height, 4);
+        assert_eq!(layout.history.unwrap().height, 5);
+        assert_eq!(layout.knowledge.unwrap().height, 4);
+        assert!(layout.brain.is_some(), "leftover room should go to brain");
+    }
+
+    #[test]
+    fn layout_projects_sections_prioritizes_loops_backlog_history_floors_over_projects() {
+        // 20 projects' worth of demand competing with one active loop, one
+        // backlog spec, and one finished (expanded) loop in a short sidebar.
+        // `loops`/`backlog`/`history` must keep at least their floor even
+        // though `projects` alone would happily consume the entire budget.
+        let needs = ProjectsSectionNeeds {
+            has_projects: true,
+            projects: 62,
+            loops: 5,
+            backlog: 3,
+            history: 5,
+            knowledge: 4,
+            rag: 0,
+        };
+        let content = Rect::new(0, 0, 34, 15);
+        let layout = layout_projects_sections(content, &needs);
+
+        assert!(
+            layout.loops.unwrap().height >= MIN_LOOPS_HEIGHT,
+            "loops must keep its floor"
+        );
+        assert!(
+            layout.backlog.unwrap().height >= MIN_BACKLOG_HEIGHT,
+            "backlog must keep its floor"
+        );
+        assert!(
+            layout.history.unwrap().height >= MIN_HISTORY_HEIGHT,
+            "history must keep its floor"
+        );
+        // `projects` is the one allowed to give the most ground.
+        assert!(layout.projects.map(|r| r.height).unwrap_or(0) <= needs.projects);
     }
 
     #[test]
