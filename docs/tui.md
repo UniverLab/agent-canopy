@@ -66,7 +66,9 @@ Sections are automatically filtered by the selected project's workdir.
   injected context.
 - **Prompt builder** — structured prompt templates with configurable
   sections (instruction, context, resources, examples) and @-mention
-  agent references.
+  agent references. Press `Ctrl+L` to recall the last prompt you sent
+  in the current project, restoring the full prompt text, tools, and
+  preset selection.
 - **Launchpad** — start new sessions with previous-mission recovery and
   auto-injected context.
 
