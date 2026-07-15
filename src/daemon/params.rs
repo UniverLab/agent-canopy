@@ -482,6 +482,82 @@ pub struct LoopUpdateEdgeParams {
     pub condition: String,
 }
 
+/// One ensemble member: differs from its siblings only by
+/// platform/model — homogeneous by design (v1), see `loop_add_ensemble`.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct EnsembleMemberParams {
+    /// CLI platform for this member (e.g. "claude", "openrouter").
+    pub platform: String,
+    /// Optional model override for this member.
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopAddEnsembleParams {
+    /// Existing spec ID. Provide exactly one of `spec_id`/`loop_id`.
+    pub spec_id: Option<String>,
+    /// Existing loop ID, to add this ensemble to the loop's top-level graph
+    /// instead of a spec's graph. Provide exactly one of `spec_id`/`loop_id`.
+    pub loop_id: Option<String>,
+    /// Human-readable ensemble name.
+    pub name: String,
+    /// The one shared prompt every member renders — supports the same
+    /// placeholders as an agent node's `prompt_template`. Required unless
+    /// `blueprint` supplies one.
+    pub prompt_template: Option<String>,
+    /// 2-8 members: parallel proposer/reviewer variants that differ only by
+    /// platform/model. Required unless `blueprint` supplies them.
+    pub members: Option<Vec<EnsembleMemberParams>>,
+    /// Name of an existing ensemble blueprint (e.g. "ensemble-proposers") to
+    /// source `prompt_template`/`members` from when they're omitted above.
+    /// An explicit `prompt_template`/`members` still wins if both are given.
+    pub blueprint: Option<String>,
+    /// Existing node ID this ensemble is wired from. Every member gets an
+    /// incoming edge from this node with `condition`.
+    pub from_node: String,
+    /// Entry routing condition from `from_node`: pass, fail, or always.
+    pub condition: String,
+    /// Members required to pass for the join to report `pass`. Defaults to
+    /// every member.
+    pub min_pass: Option<i64>,
+    /// Minutes a member may run before the join kills it and counts it as
+    /// failed. Defaults to `timeout_minutes` (the members' own agent
+    /// timeout).
+    pub straggler_timeout_minutes: Option<i64>,
+    /// Shared agent timeout (minutes) applied to every member. Defaults to
+    /// 30, matching an ordinary agent node.
+    pub timeout_minutes: Option<i64>,
+    /// Existing node ID the join routes to on `pass` (e.g. an arbiter node).
+    pub on_pass_to: String,
+    /// Existing node ID the join routes to on `fail`. Omit for a dead end on
+    /// fail, same as any other node with no matching outgoing edge.
+    pub on_fail_to: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopUpdateEnsembleParams {
+    /// Existing ensemble ID.
+    pub ensemble_id: String,
+    /// New shared prompt, propagated to every current member.
+    pub prompt_template: Option<String>,
+    /// Replacement member list (2-8 entries) — added/removed/replaced by
+    /// position. Individual member overrides are not supported; this always
+    /// replaces the full list.
+    pub members: Option<Vec<EnsembleMemberParams>>,
+    /// New pass threshold.
+    pub min_pass: Option<i64>,
+    /// New straggler timeout in minutes, or null to fall back to
+    /// `timeout_minutes` again.
+    pub straggler_timeout_minutes: Option<Option<i64>>,
+    /// New shared member agent timeout in minutes.
+    pub timeout_minutes: Option<i64>,
+    /// New `pass` exit target node ID.
+    pub on_pass_to: Option<String>,
+    /// New `fail` exit target node ID, or null to clear it (dead end on
+    /// fail).
+    pub on_fail_to: Option<Option<String>>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PoolCreateParams {
     /// Human-readable pool name.

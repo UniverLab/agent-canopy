@@ -54,6 +54,13 @@ pub struct CanopyConfig {
     /// is dropped from memory. Reloaded transparently on next use.
     #[serde(default = "default_embeddings_idle_unload_secs")]
     pub embeddings_idle_unload_secs: u64,
+
+    /// Global cap (F1) on how many ensemble members run concurrently across
+    /// every loop run, shared by the whole daemon so one ensemble can't
+    /// starve another's. An 8-member ensemble queues past this rather than
+    /// fork-bombing the host.
+    #[serde(default = "default_ensemble_concurrency_cap")]
+    pub ensemble_concurrency_cap: usize,
 }
 
 /// Preferred unit for temperature display.
@@ -77,6 +84,10 @@ fn default_similarity_threshold() -> f32 {
 
 fn default_embeddings_idle_unload_secs() -> u64 {
     600
+}
+
+fn default_ensemble_concurrency_cap() -> usize {
+    4
 }
 
 fn default_projects_root() -> String {
@@ -148,6 +159,7 @@ impl Default for CanopyConfig {
             rag_personal_root: String::new(),
             projects_root: default_projects_root(),
             embeddings_idle_unload_secs: default_embeddings_idle_unload_secs(),
+            ensemble_concurrency_cap: default_ensemble_concurrency_cap(),
         }
     }
 }
@@ -216,6 +228,34 @@ mod tests {
 
         let loaded = CanopyConfig::load(&canopy_dir);
         assert_eq!(loaded.embeddings_idle_unload_secs, 600);
+    }
+
+    #[test]
+    fn test_config_without_ensemble_cap_field_uses_default_of_four() {
+        let dir = TempDir::new().unwrap();
+        let canopy_dir = dir.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        // Simulates a config written before `ensemble_concurrency_cap` existed.
+        let toml = r#"embeddings_model = "intfloat/multilingual-e5-base""#;
+        std::fs::write(canopy_dir.join("config.toml"), toml).unwrap();
+
+        let loaded = CanopyConfig::load(&canopy_dir);
+        assert_eq!(loaded.ensemble_concurrency_cap, 4);
+    }
+
+    #[test]
+    fn test_ensemble_concurrency_cap_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let canopy_dir = dir.path().join(".canopy");
+
+        let config = CanopyConfig {
+            ensemble_concurrency_cap: 8,
+            ..CanopyConfig::default()
+        };
+        config.save(&canopy_dir).unwrap();
+
+        let loaded = CanopyConfig::load(&canopy_dir);
+        assert_eq!(loaded.ensemble_concurrency_cap, 8);
     }
 
     #[test]

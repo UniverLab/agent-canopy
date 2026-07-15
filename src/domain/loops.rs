@@ -192,6 +192,12 @@ pub enum LoopNodeKind {
     Agent,
     Check,
     Gate,
+    /// Engine-executed join gate for an ensemble (F1) — never created via
+    /// `loop_add_node` directly, only as part of `loop_add_ensemble`'s
+    /// one-call expansion. Waits for every member branch to terminate,
+    /// consolidates their outputs, and routes onward. See
+    /// [`crate::loop_engine::LoopEngine`]'s ensemble fan-out handling.
+    Join,
 }
 
 impl LoopNodeKind {
@@ -200,6 +206,7 @@ impl LoopNodeKind {
             Self::Agent => "agent",
             Self::Check => "check",
             Self::Gate => "gate",
+            Self::Join => "join",
         }
     }
 
@@ -208,6 +215,7 @@ impl LoopNodeKind {
             "agent" => Some(Self::Agent),
             "check" => Some(Self::Check),
             "gate" => Some(Self::Gate),
+            "join" => Some(Self::Join),
             _ => None,
         }
     }
@@ -511,6 +519,83 @@ pub struct LoopDetails {
     pub completion_hook_runs: Vec<LoopCompletionHookRun>,
 }
 
+/// An ensemble (F1): a group of homogeneous agent-node members that receive
+/// the same shared prompt in parallel, plus the join gate that waits for
+/// every member, consolidates their outputs, and routes onward. Persisted as
+/// its own row so `loop_get`/`loop_update_ensemble` can address the whole
+/// unit — the members and join themselves are ordinary [`LoopNode`] rows
+/// (see [`EnsembleMember`]), wired with ordinary [`LoopEdge`] rows, so the
+/// engine's existing graph-walking code needs only the ensemble-aware
+/// fan-out/fan-in added in `loop_engine`.
+///
+/// Exactly one of `spec_id`/`loop_id` is set — same invariant as
+/// [`LoopNode`]/[`LoopEdge`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Ensemble {
+    pub id: String,
+    pub spec_id: Option<String>,
+    pub loop_id: Option<String>,
+    pub name: String,
+    /// The one shared prompt every member renders against — supports the
+    /// same placeholders as an agent node's `prompt_template`.
+    pub prompt_template: String,
+    /// The engine-executed [`LoopNodeKind::Join`] node that waits for every
+    /// member and consolidates their outputs.
+    pub join_node_id: String,
+    /// The node this ensemble is wired from — every member gets an incoming
+    /// edge from this node with `entry_condition`.
+    pub entry_from_node: String,
+    pub entry_condition: LoopEdgeCondition,
+    /// Members required to pass for the join to report `pass`. Defaults to
+    /// every member (set at creation to `members.len()`).
+    pub min_pass: i64,
+    /// Minutes a member may run before the join kills it (B12) and counts it
+    /// as failed. `None` means "use `timeout_minutes`" (the members' own
+    /// agent timeout) — see [`Self::effective_straggler_timeout_minutes`].
+    pub straggler_timeout_minutes: Option<i64>,
+    /// Shared agent timeout (minutes) applied to every member's node config.
+    pub timeout_minutes: i64,
+    /// Join-node outgoing routing: where a `pass`/`fail` join result routes
+    /// to next. `on_pass_to` is required at creation; `on_fail_to` is
+    /// optional (a dead end on fail, same as any other node with no
+    /// matching outgoing edge).
+    pub on_pass_to: String,
+    pub on_fail_to: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl Ensemble {
+    /// The straggler kill timeout to actually use: the explicit override, or
+    /// (by default) the members' own agent timeout.
+    pub fn effective_straggler_timeout_minutes(&self) -> i64 {
+        self.straggler_timeout_minutes
+            .unwrap_or(self.timeout_minutes)
+    }
+}
+
+/// One homogeneous member of an [`Ensemble`] — differs from its siblings
+/// only in `platform`/`model`; `node_id` points at the underlying
+/// [`LoopNodeKind::Agent`] row that actually executes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnsembleMember {
+    pub ensemble_id: String,
+    pub node_id: String,
+    /// Position within the ensemble (0-based) — the deterministic order used
+    /// for consolidation and for keying resize diffs in
+    /// `loop_update_ensemble`.
+    pub position: i64,
+    pub platform: String,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnsembleDetails {
+    pub ensemble: Ensemble,
+    /// Members in `position` order — the order consolidation and
+    /// `loop_update_ensemble` resize diffs rely on.
+    pub members: Vec<EnsembleMember>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -637,6 +722,7 @@ Task:
         assert_eq!(LoopNodeKind::Agent.as_str(), "agent");
         assert_eq!(LoopNodeKind::Check.as_str(), "check");
         assert_eq!(LoopNodeKind::Gate.as_str(), "gate");
+        assert_eq!(LoopNodeKind::Join.as_str(), "join");
     }
 
     #[test]
@@ -644,7 +730,33 @@ Task:
         assert_eq!(LoopNodeKind::from_str("agent"), Some(LoopNodeKind::Agent));
         assert_eq!(LoopNodeKind::from_str("check"), Some(LoopNodeKind::Check));
         assert_eq!(LoopNodeKind::from_str("gate"), Some(LoopNodeKind::Gate));
+        assert_eq!(LoopNodeKind::from_str("join"), Some(LoopNodeKind::Join));
         assert!(LoopNodeKind::from_str("invalid").is_none());
+    }
+
+    #[test]
+    fn ensemble_straggler_timeout_defaults_to_member_timeout() {
+        let ensemble = super::Ensemble {
+            id: "ens1".to_string(),
+            spec_id: Some("spec1".to_string()),
+            loop_id: None,
+            name: "Proposers".to_string(),
+            prompt_template: "{{spec_content}}".to_string(),
+            join_node_id: "join1".to_string(),
+            entry_from_node: "n0".to_string(),
+            entry_condition: LoopEdgeCondition::Always,
+            min_pass: 2,
+            straggler_timeout_minutes: None,
+            timeout_minutes: 30,
+            on_pass_to: "arbiter".to_string(),
+            on_fail_to: None,
+            created_at: chrono::Utc::now(),
+        };
+        assert_eq!(ensemble.effective_straggler_timeout_minutes(), 30);
+
+        let mut overridden = ensemble;
+        overridden.straggler_timeout_minutes = Some(5);
+        assert_eq!(overridden.effective_straggler_timeout_minutes(), 5);
     }
 
     #[test]

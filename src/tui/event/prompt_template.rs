@@ -14,6 +14,8 @@ enum PromptAction {
     ScheduleSend(String, u8, u8),
     /// Cancel the soonest pending scheduled send for the current target session.
     CancelNextScheduled,
+    /// Recall the current project's last prompt (Ctrl+L).
+    RecallLastPrompt,
 }
 
 pub fn handle_prompt_template_key(
@@ -29,6 +31,24 @@ pub fn handle_prompt_template_key(
         app.focus = Focus::Agent;
         return Ok(());
     };
+
+    // Recall confirm overlay intercepts all keys while it's up (standard
+    // confirm pattern: y/Enter confirms, n/Esc cancels, anything else is a
+    // no-op).
+    if dialog.pending_recall.is_some() {
+        match code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                if let Some(last) = dialog.pending_recall.take() {
+                    apply_last_prompt(dialog, &last);
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                dialog.pending_recall = None;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
 
     if handle_section_picker_key(dialog, &db, &workdir, code)? {
         return Ok(());
@@ -70,6 +90,7 @@ pub fn handle_prompt_template_key(
             schedule_send_prompt(app, &prompt, hour, minute);
         }
         PromptAction::CancelNextScheduled => cancel_next_scheduled_send(app),
+        PromptAction::RecallLastPrompt => recall_last_prompt(app),
     }
 
     Ok(())
@@ -539,6 +560,12 @@ fn handle_dialog_key(
     workdir: &Path,
     keyboard_enhancement: bool,
 ) -> Result<PromptAction> {
+    // Ctrl+L recalls the project's last prompt regardless of which field is
+    // currently focused.
+    if code == KeyCode::Char('l') && modifiers.contains(KeyModifiers::CONTROL) {
+        return Ok(PromptAction::RecallLastPrompt);
+    }
+
     let is_shift = modifiers.contains(KeyModifiers::SHIFT);
     let is_send_at = dialog.focused_section == 0 && !dialog.enabled_sections.is_empty();
 
@@ -812,6 +839,7 @@ fn submit_prompt(app: &mut App, prompt: &str) {
     let workdir = app.current_workdir();
     let session_key = app.current_prompt_session_key();
 
+    persist_last_prompt(app, &workdir, prompt);
     write_prompt_to_selected_agent(app, prompt);
     app.prompt_builder_sessions.remove(&session_key);
     app.discard_simple_prompt_dialog();
@@ -821,6 +849,77 @@ fn submit_prompt(app: &mut App, prompt: &str) {
         let state = app.workdir_system_state.entry(workdir).or_default();
         state.sent = true;
         state.sent_as_solo = is_solo;
+    }
+}
+
+/// Persist `prompt` (and, if the builder is still open, its structured
+/// field state) as the last prompt sent for `workdir`. Best-effort: a
+/// failure to persist must never block the send itself.
+fn persist_last_prompt(app: &mut App, workdir: &Path, prompt: &str) {
+    let builder_state = app
+        .simple_prompt_dialog
+        .as_ref()
+        .map(crate::tui::app::dialog::PersistedBuilderState::from_dialog)
+        .and_then(|state| serde_json::to_string(&state).ok());
+
+    let id = format!("lp-{}", uuid::Uuid::new_v4());
+    let workdir_str = workdir.to_string_lossy().to_string();
+    if let Err(e) = app.db.insert_last_prompt(
+        &id,
+        &workdir_str,
+        prompt,
+        builder_state.as_deref(),
+        chrono::Utc::now(),
+    ) {
+        tracing::warn!("Failed to persist last prompt for '{workdir_str}': {e}");
+    }
+}
+
+/// Load the current project's last prompt into the builder (Ctrl+L). Shows a
+/// one-line hint if nothing has been sent from this project yet; otherwise
+/// applies immediately for an empty builder, or stages a confirm for a
+/// non-empty one so the user doesn't lose in-progress work.
+fn recall_last_prompt(app: &mut App) {
+    let workdir = app.current_workdir().to_string_lossy().to_string();
+    let last = match app.db.get_last_prompt_for_workdir(&workdir) {
+        Ok(Some(last)) => last,
+        Ok(None) => {
+            crate::domain::notification::send_notification(
+                "No prompt to recall",
+                "Nothing has been sent from this project yet.",
+                crate::domain::notification::NotificationLevel::Info,
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("Failed to load last prompt for '{workdir}': {e}");
+            return;
+        }
+    };
+
+    let Some(dialog) = app.simple_prompt_dialog.as_mut() else {
+        return;
+    };
+
+    if dialog.is_empty() {
+        apply_last_prompt(dialog, &last);
+    } else {
+        dialog.pending_recall = Some(last);
+    }
+}
+
+/// Apply a recalled prompt to `dialog`: a faithful structured restore when
+/// the send captured the builder's field state, otherwise the flattened
+/// prompt text in a single instruction section (see
+/// `SimplePromptDialog::load_flat_text`).
+fn apply_last_prompt(dialog: &mut SimplePromptDialog, last: &crate::db::last_prompts::LastPrompt) {
+    let restored = last.builder_state.as_deref().and_then(|json| {
+        serde_json::from_str::<crate::tui::app::dialog::PersistedBuilderState>(json).ok()
+    });
+
+    match restored {
+        Some(state) => state.restore_into(dialog),
+        None => dialog.load_flat_text(&last.prompt_text),
     }
 }
 
@@ -872,6 +971,13 @@ fn schedule_send_prompt(app: &mut App, prompt: &str, hour: u8, minute: u8) {
         );
         return;
     }
+
+    // Persist as the project's last prompt before discarding — a scheduled
+    // send is still a "sent" prompt from the builder's perspective, and this
+    // also covers the U7 dead-target path (see `deliver_due_scheduled_sends`),
+    // which recovers only the flattened text once the builder is long gone.
+    let workdir = app.current_workdir();
+    persist_last_prompt(app, &workdir, prompt);
 
     // Discard the dialog (don't persist builder session — prompt is scheduled).
     app.prompt_builder_sessions.remove(&session_key);
@@ -979,6 +1085,124 @@ mod tests {
         assert_eq!(
             normalize_prompt_char_input('a', KeyModifiers::CONTROL),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod recall_last_prompt_tests {
+    use super::handle_prompt_template_key;
+    use crate::db::Database;
+    use crate::tui::app::types::App;
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+    use std::sync::Arc;
+    use tempfile::{tempdir, NamedTempFile};
+
+    fn test_app() -> (App, tempfile::TempDir) {
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).expect("create test db"));
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(db, data_dir.path()).expect("create app");
+        (app, data_dir)
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        handle_prompt_template_key(app, code, KeyModifiers::NONE).expect("key handled");
+    }
+
+    fn ctrl_l(app: &mut App) {
+        handle_prompt_template_key(app, KeyCode::Char('l'), KeyModifiers::CONTROL)
+            .expect("ctrl+l handled");
+    }
+
+    #[test]
+    fn ctrl_l_with_nothing_stored_leaves_empty_builder_untouched() {
+        let (mut app, _dir) = test_app();
+        app.open_simple_prompt_dialog(None);
+
+        ctrl_l(&mut app);
+
+        let dialog = app.simple_prompt_dialog.as_ref().unwrap();
+        assert!(dialog.is_empty());
+        assert!(dialog.pending_recall.is_none());
+    }
+
+    #[test]
+    fn ctrl_l_recalls_immediately_into_an_empty_builder() {
+        let (mut app, _dir) = test_app();
+        let workdir = app.current_workdir().to_string_lossy().to_string();
+        app.db
+            .insert_last_prompt(
+                "lp-1",
+                &workdir,
+                "recovered prompt",
+                None,
+                chrono::Utc::now(),
+            )
+            .expect("seed last prompt");
+
+        app.open_simple_prompt_dialog(None);
+        assert!(app.simple_prompt_dialog.as_ref().unwrap().is_empty());
+
+        ctrl_l(&mut app);
+
+        let dialog = app.simple_prompt_dialog.as_ref().unwrap();
+        assert!(dialog.pending_recall.is_none());
+        assert_eq!(
+            dialog.get_section_content("instruction_1"),
+            "recovered prompt"
+        );
+    }
+
+    #[test]
+    fn ctrl_l_on_a_non_empty_builder_stages_a_confirm_instead_of_overwriting() {
+        let (mut app, _dir) = test_app();
+        let workdir = app.current_workdir().to_string_lossy().to_string();
+        app.db
+            .insert_last_prompt(
+                "lp-1",
+                &workdir,
+                "recovered prompt",
+                None,
+                chrono::Utc::now(),
+            )
+            .expect("seed last prompt");
+
+        app.open_simple_prompt_dialog(None);
+        app.simple_prompt_dialog
+            .as_mut()
+            .unwrap()
+            .set_section_content("instruction_1", "work in progress".to_string());
+
+        ctrl_l(&mut app);
+
+        // Content must survive until the confirm is answered.
+        let dialog = app.simple_prompt_dialog.as_ref().unwrap();
+        assert!(dialog.pending_recall.is_some());
+        assert_eq!(
+            dialog.get_section_content("instruction_1"),
+            "work in progress"
+        );
+
+        // 'n' cancels the recall and leaves the in-progress draft intact.
+        press(&mut app, KeyCode::Char('n'));
+        let dialog = app.simple_prompt_dialog.as_ref().unwrap();
+        assert!(dialog.pending_recall.is_none());
+        assert_eq!(
+            dialog.get_section_content("instruction_1"),
+            "work in progress"
+        );
+
+        // Recall again and this time confirm with 'y'.
+        ctrl_l(&mut app);
+        press(&mut app, KeyCode::Char('y'));
+        let dialog = app.simple_prompt_dialog.as_ref().unwrap();
+        assert!(dialog.pending_recall.is_none());
+        assert_eq!(
+            dialog.get_section_content("instruction_1"),
+            "recovered prompt"
         );
     }
 }

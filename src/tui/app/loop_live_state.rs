@@ -35,6 +35,11 @@ pub(crate) struct LoopLiveState {
     /// Spec's own graph if it has nodes, else the loop-level graph.
     pub effective_nodes: Vec<LoopNode>,
     pub effective_edges: Vec<LoopEdge>,
+    /// Every ensemble (F1) whose join lives in `effective_nodes` — lets the
+    /// graph view collapse its N member boxes + join into one "name [N
+    /// models]" box with live per-member state, instead of drawing N+1
+    /// separate boxes.
+    pub ensembles: Vec<EnsembleLiveInfo>,
 
     // ── Current node ────────────────────────────────────────────
     /// Id of the node currently executing, or the most recent completed node.
@@ -55,6 +60,28 @@ pub(crate) struct SpecQueueEntry {
     pub spec_id: String,
     pub spec_name: String,
     pub status: LoopSpecStatus,
+}
+
+/// One ensemble (F1) collapsed for the graph view: its join node id (so the
+/// renderer can fold both the members and the join into a single box) plus
+/// live per-member state.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct EnsembleLiveInfo {
+    pub ensemble_id: String,
+    pub name: String,
+    pub join_node_id: String,
+    /// Members in position order.
+    pub members: Vec<EnsembleMemberLiveInfo>,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct EnsembleMemberLiveInfo {
+    pub node_id: String,
+    /// `"platform"` or `"platform/model"`.
+    pub label: String,
+    pub status: Option<LoopRunStatus>,
 }
 
 const OUTPUT_TAIL_LINES: usize = 15;
@@ -90,6 +117,7 @@ pub(crate) fn assemble_loop_live_state(
     // ── Effective graph ─────────────────────────────────────────
     let (effective_nodes, effective_edges) =
         resolve_effective_graph(db, details, current_spec_id.as_deref());
+    let ensembles = resolve_ensembles_live_info(db, &effective_nodes, current_spec_id.as_deref());
 
     // ── Current node + output tail ──────────────────────────────
     let (current_node_id, current_node_info) = resolve_current_node(db, current_spec_id.as_deref());
@@ -109,12 +137,55 @@ pub(crate) fn assemble_loop_live_state(
         current_spec_id,
         effective_nodes,
         effective_edges,
+        ensembles,
         current_node_id,
         current_node_status: current_node_info.status,
         current_node_started_at: current_node_info.started_at,
         current_node_iteration: current_node_info.iteration,
         current_node_output_tail: current_node_info.output_tail,
     })
+}
+
+/// Resolve every ensemble (F1) whose join node appears in `effective_nodes`,
+/// alongside each member's live run status (if a spec is selected).
+fn resolve_ensembles_live_info(
+    db: &Database,
+    effective_nodes: &[LoopNode],
+    current_spec_id: Option<&str>,
+) -> Vec<EnsembleLiveInfo> {
+    effective_nodes
+        .iter()
+        .filter(|node| node.kind == crate::domain::loops::LoopNodeKind::Join)
+        .filter_map(|node| db.get_ensemble_by_join_node(&node.id).ok().flatten())
+        .map(|details| {
+            let members = details
+                .members
+                .iter()
+                .map(|member| {
+                    let label = match member.model.as_deref().map(str::trim) {
+                        Some(model) if !model.is_empty() => {
+                            format!("{}/{}", member.platform, model)
+                        }
+                        _ => member.platform.clone(),
+                    };
+                    let status = current_spec_id
+                        .map(|spec_id| resolve_node_run_info(db, spec_id, &member.node_id))
+                        .and_then(|info| info.status);
+                    EnsembleMemberLiveInfo {
+                        node_id: member.node_id.clone(),
+                        label,
+                        status,
+                    }
+                })
+                .collect();
+            EnsembleLiveInfo {
+                ensemble_id: details.ensemble.id,
+                name: details.ensemble.name,
+                join_node_id: details.ensemble.join_node_id,
+                members,
+            }
+        })
+        .collect()
 }
 
 /// Latest-run info for a single node: status, start time, iteration, and a
@@ -822,5 +893,127 @@ mod tests {
         let state = assemble_loop_live_state(&db, &details).unwrap();
 
         assert!(state.autorun_at.is_some());
+    }
+
+    fn insert_ensemble_fixture(db: &Database, spec_id: &str) {
+        use crate::domain::loops::{Ensemble, EnsembleMember, LoopEdgeCondition, LoopNodeKind};
+
+        let member_nodes: Vec<LoopNode> = (1..=3)
+            .map(|i| LoopNode {
+                id: format!("m{i}"),
+                spec_id: Some(spec_id.to_string()),
+                loop_id: None,
+                name: format!("Proposers [{i}]"),
+                kind: LoopNodeKind::Agent,
+                config: json!({}),
+                position: i,
+                created_at: Utc::now(),
+            })
+            .collect();
+        let join_node = LoopNode {
+            id: "join1".to_string(),
+            spec_id: Some(spec_id.to_string()),
+            loop_id: None,
+            name: "Proposers (join)".to_string(),
+            kind: LoopNodeKind::Join,
+            config: json!({}),
+            position: 4,
+            created_at: Utc::now(),
+        };
+        let mut edges = Vec::new();
+        for node in &member_nodes {
+            edges.push(LoopEdge {
+                id: format!("entry-{}", node.id),
+                spec_id: Some(spec_id.to_string()),
+                loop_id: None,
+                from_node: "n1".to_string(),
+                to_node: node.id.clone(),
+                condition: LoopEdgeCondition::Always,
+            });
+            edges.push(LoopEdge {
+                id: format!("join-{}", node.id),
+                spec_id: Some(spec_id.to_string()),
+                loop_id: None,
+                from_node: node.id.clone(),
+                to_node: "join1".to_string(),
+                condition: LoopEdgeCondition::Always,
+            });
+        }
+        let ensemble = Ensemble {
+            id: "ens1".to_string(),
+            spec_id: Some(spec_id.to_string()),
+            loop_id: None,
+            name: "Proposers".to_string(),
+            prompt_template: "{{spec_content}}".to_string(),
+            join_node_id: "join1".to_string(),
+            entry_from_node: "n1".to_string(),
+            entry_condition: LoopEdgeCondition::Always,
+            min_pass: 3,
+            straggler_timeout_minutes: None,
+            timeout_minutes: 30,
+            on_pass_to: "n2".to_string(),
+            on_fail_to: None,
+            created_at: Utc::now(),
+        };
+        let members: Vec<EnsembleMember> = member_nodes
+            .iter()
+            .enumerate()
+            .map(|(i, node)| EnsembleMember {
+                ensemble_id: "ens1".to_string(),
+                node_id: node.id.clone(),
+                position: i as i64,
+                platform: "openrouter".to_string(),
+                model: Some(format!("model-{i}")),
+            })
+            .collect();
+        db.insert_ensemble_unit(&ensemble, &members, &member_nodes, &join_node, &edges)
+            .unwrap();
+    }
+
+    #[test]
+    fn ensembles_live_info_reports_join_and_per_member_status() {
+        let db = test_db();
+        let lp = make_loop("lp1", LoopStatus::Running);
+        db.insert_loop(&lp).unwrap();
+        db.insert_loop_spec(&make_spec("s1", "lp1", LoopSpecStatus::Running, 1))
+            .unwrap();
+        db.insert_loop_node(&make_node("n1", "s1", LoopNodeKind::Agent, 0))
+            .unwrap();
+        db.insert_loop_node(&make_node("n2", "s1", LoopNodeKind::Agent, 5))
+            .unwrap();
+        insert_ensemble_fixture(&db, "s1");
+
+        db.insert_loop_run(&make_run(
+            "lp1",
+            "s1",
+            "m1",
+            LoopRunStatus::Pass,
+            1,
+            Some(json!({"stdout": "draft one"})),
+        ))
+        .unwrap();
+        db.insert_loop_run(&make_run(
+            "lp1",
+            "s1",
+            "m2",
+            LoopRunStatus::Running,
+            1,
+            None,
+        ))
+        .unwrap();
+        // m3 has no run yet — still pending.
+
+        let details = details_from_loop(&db, &lp);
+        let state = assemble_loop_live_state(&db, &details).unwrap();
+
+        assert_eq!(state.ensembles.len(), 1);
+        let ensemble = &state.ensembles[0];
+        assert_eq!(ensemble.name, "Proposers");
+        assert_eq!(ensemble.join_node_id, "join1");
+        assert_eq!(ensemble.members.len(), 3);
+        assert_eq!(ensemble.members[0].label, "openrouter/model-0");
+        assert_eq!(ensemble.members[0].status, Some(LoopRunStatus::Pass));
+        assert_eq!(ensemble.members[1].status, Some(LoopRunStatus::Running));
+        assert_eq!(ensemble.members[2].status, None);
     }
 }

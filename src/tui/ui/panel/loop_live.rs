@@ -20,7 +20,9 @@ use super::{
 use crate::domain::loops::{
     LoopEdgeCondition, LoopNode, LoopRunStatus, LoopSpecStatus, LoopStatus,
 };
-use crate::tui::app::loop_live_state::{LoopLiveState, NodeRunInfo, SpecQueueEntry};
+use crate::tui::app::loop_live_state::{
+    EnsembleLiveInfo, LoopLiveState, NodeRunInfo, SpecQueueEntry,
+};
 use crate::tui::app::types::App;
 
 pub(crate) fn draw_loop_live_view(frame: &mut Frame, area: Rect, app: &App) {
@@ -252,16 +254,104 @@ fn node_box_lines(
     ]
 }
 
-fn edge_lines(edges: &[(&LoopNode, LoopEdgeCondition)]) -> Vec<Line<'static>> {
+/// Collapsed box for an ensemble (F1) — folds its N member nodes plus the
+/// join into ONE box ("name [N models]") with a live status tag per member,
+/// instead of drawing N+1 separate boxes and a fan-out of near-identical
+/// edges. Expand-on-inspect isn't a separate view: the member/join ids are
+/// still real entries in `state.effective_nodes`, so navigating directly to
+/// one (e.g. via a future picker) still resolves correctly — this box is
+/// purely a collapsed *rendering*, not a different graph.
+fn ensemble_box_lines(
+    ensemble: &EnsembleLiveInfo,
+    is_highlighted: bool,
+    follow: bool,
+    inner: usize,
+) -> Vec<Line<'static>> {
+    let (border_style, text_style, marker) = node_style(is_highlighted, follow);
+    let title = format!("{} [{} models]", ensemble.name, ensemble.members.len());
+    let max_title = inner.saturating_sub(2);
+    let title_display = truncate_str(&title, max_title);
+    let title_spaces = inner.saturating_sub(2 + title_display.chars().count());
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("  ┌{}┐", "─".repeat(inner)),
+            border_style,
+        )),
+        Line::from(Span::styled(
+            format!(
+                "  │{} {}{}│",
+                marker,
+                title_display,
+                " ".repeat(title_spaces)
+            ),
+            text_style,
+        )),
+    ];
+    for member in &ensemble.members {
+        let (tag, color) = ensemble_member_status_tag(member.status);
+        let label = format!("{} {tag}", member.label);
+        let max_label = inner.saturating_sub(4);
+        let label_display = truncate_str(&label, max_label);
+        let spaces = inner.saturating_sub(4 + label_display.chars().count());
+        lines.push(Line::from(Span::styled(
+            format!("  │  {}{}│", label_display, " ".repeat(spaces)),
+            Style::default().fg(color),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("  └{}┘", "─".repeat(inner)),
+        border_style,
+    )));
+    lines
+}
+
+fn ensemble_member_status_tag(status: Option<LoopRunStatus>) -> (&'static str, Color) {
+    match status {
+        Some(LoopRunStatus::Pass) => ("[pass]", STATUS_OK),
+        Some(LoopRunStatus::Fail) => ("[fail]", STATUS_FAIL),
+        Some(LoopRunStatus::Running) => ("[running]", STATUS_RUNNING),
+        None => ("[pending]", DIM),
+    }
+}
+
+fn edge_lines(edges: &[(String, LoopEdgeCondition)]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    for (i, (target, condition)) in edges.iter().enumerate() {
+    for (i, (label, condition)) in edges.iter().enumerate() {
         let branch = if i == edges.len() - 1 { "└" } else { "├" };
         lines.push(Line::from(Span::styled(
-            format!("   {}─ {} → {}", branch, condition.as_str(), target.name),
+            format!("   {}─ {} → {}", branch, condition.as_str(), label),
             Style::default().fg(DIM),
         )));
     }
     lines
+}
+
+/// Collapse a node's outgoing edge targets for display: consecutive targets
+/// that are all members of the same ensemble (F1) become one
+/// `"<ensemble name> [N models]"` label instead of N near-identical edges —
+/// this is what an ensemble's *entry* fan-out looks like from its
+/// predecessor's side. Targets outside any ensemble pass through unchanged.
+fn collapse_ensemble_targets(
+    edges: &[(&LoopNode, LoopEdgeCondition)],
+    ensemble_by_member: &HashMap<&str, &EnsembleLiveInfo>,
+) -> Vec<(String, LoopEdgeCondition)> {
+    let mut seen_ensembles: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for (target, condition) in edges {
+        match ensemble_by_member.get(target.id.as_str()) {
+            Some(ensemble) => {
+                if seen_ensembles.insert(ensemble.ensemble_id.as_str()) {
+                    out.push((
+                        format!("{} [{} models]", ensemble.name, ensemble.members.len()),
+                        *condition,
+                    ));
+                }
+            }
+            None => out.push((target.name.clone(), *condition)),
+        }
+    }
+    out
 }
 
 /// Node boxes in `position` order (a simple, deterministic layout — see the
@@ -269,6 +359,12 @@ fn edge_lines(edges: &[(&LoopNode, LoopEdgeCondition)]) -> Vec<Line<'static>> {
 /// outgoing edges labeled with their condition. Handles cycles (a node
 /// whose edges point back up the list) since edges are rendered as text
 /// annotations rather than a 2-D layout.
+///
+/// An ensemble (F1) renders as one collapsed box (its members + join folded
+/// together — see [`ensemble_box_lines`]) at the position of its first
+/// member; every other member and the join itself are skipped as individual
+/// boxes. Fan-out edges into an ensemble's members are likewise collapsed to
+/// one edge (see [`collapse_ensemble_targets`]).
 fn graph_lines(
     state: &LoopLiveState,
     highlighted_node_id: Option<&str>,
@@ -292,14 +388,56 @@ fn graph_lines(
     let box_width = (area_width as usize).saturating_sub(4).clamp(22, 48);
     let inner = box_width.saturating_sub(2);
 
+    let join_node_ids: std::collections::HashSet<&str> = state
+        .ensembles
+        .iter()
+        .map(|e| e.join_node_id.as_str())
+        .collect();
+    let ensemble_by_member: HashMap<&str, &EnsembleLiveInfo> = state
+        .ensembles
+        .iter()
+        .flat_map(|e| e.members.iter().map(move |m| (m.node_id.as_str(), e)))
+        .collect();
+
     let nodes = &state.effective_nodes;
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut rendered_ensembles: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (idx, node) in nodes.iter().enumerate() {
+        // The join is folded into its ensemble's collapsed box (rendered at
+        // the first member's position) — never drawn as its own box.
+        if join_node_ids.contains(node.id.as_str()) {
+            continue;
+        }
+
+        if let Some(ensemble) = ensemble_by_member.get(node.id.as_str()) {
+            if !rendered_ensembles.insert(ensemble.ensemble_id.as_str()) {
+                continue;
+            }
+            let is_highlighted = ensemble
+                .members
+                .iter()
+                .any(|m| Some(m.node_id.as_str()) == highlighted_node_id)
+                || highlighted_node_id == Some(ensemble.join_node_id.as_str());
+            lines.extend(ensemble_box_lines(ensemble, is_highlighted, follow, inner));
+
+            // The collapsed box's own outgoing routing is the join's real
+            // outgoing edges (on_pass_to/on_fail_to).
+            if let Some(edges) = outgoing.get(ensemble.join_node_id.as_str()) {
+                let labeled = collapse_ensemble_targets(edges, &ensemble_by_member);
+                lines.extend(edge_lines(&labeled));
+                lines.push(Line::from(""));
+            } else if idx + 1 < nodes.len() {
+                lines.push(Line::from(""));
+            }
+            continue;
+        }
+
         let is_highlighted = highlighted_node_id == Some(node.id.as_str());
         lines.extend(node_box_lines(node, is_highlighted, follow, inner));
 
         if let Some(edges) = outgoing.get(node.id.as_str()) {
-            lines.extend(edge_lines(edges));
+            let labeled = collapse_ensemble_targets(edges, &ensemble_by_member);
+            lines.extend(edge_lines(&labeled));
             lines.push(Line::from(""));
         } else if idx + 1 < nodes.len() {
             lines.push(Line::from(""));
@@ -512,6 +650,7 @@ mod tests {
             current_spec_id: Some("s2".to_string()),
             effective_nodes: team_nodes(),
             effective_edges: team_edges(),
+            ensembles: Vec::new(),
             current_node_id: Some("n0".to_string()),
             current_node_status: Some(LoopRunStatus::Running),
             current_node_started_at: Some(Utc::now() - chrono::Duration::seconds(75)),
@@ -679,6 +818,153 @@ mod tests {
 
         assert!(text.contains("completed"), "{text}");
         assert!(text.contains("3/3 specs"), "{text}");
+    }
+
+    fn ensemble_live_fixture() -> EnsembleLiveInfo {
+        EnsembleLiveInfo {
+            ensemble_id: "ens1".to_string(),
+            name: "Proposers".to_string(),
+            join_node_id: "join1".to_string(),
+            members: vec![
+                crate::tui::app::loop_live_state::EnsembleMemberLiveInfo {
+                    node_id: "m1".to_string(),
+                    label: "openrouter/deepseek".to_string(),
+                    status: Some(LoopRunStatus::Pass),
+                },
+                crate::tui::app::loop_live_state::EnsembleMemberLiveInfo {
+                    node_id: "m2".to_string(),
+                    label: "openrouter/qwen".to_string(),
+                    status: Some(LoopRunStatus::Running),
+                },
+                crate::tui::app::loop_live_state::EnsembleMemberLiveInfo {
+                    node_id: "m3".to_string(),
+                    label: "openrouter/llama".to_string(),
+                    status: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn ensemble_renders_as_one_collapsed_box_with_per_member_status() {
+        let mut state = running_state();
+        // kickoff -> {m1, m2, m3} -> join -> arbiter, replacing the plain
+        // team graph so the ensemble is the only thing on screen.
+        state.effective_nodes = vec![
+            LoopNode {
+                id: "kickoff".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                name: "Kickoff".to_string(),
+                kind: LoopNodeKind::Agent,
+                config: json!({}),
+                position: 0,
+                created_at: Utc::now(),
+            },
+            LoopNode {
+                id: "m1".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                name: "Proposers [1]".to_string(),
+                kind: LoopNodeKind::Agent,
+                config: json!({}),
+                position: 1,
+                created_at: Utc::now(),
+            },
+            LoopNode {
+                id: "m2".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                name: "Proposers [2]".to_string(),
+                kind: LoopNodeKind::Agent,
+                config: json!({}),
+                position: 2,
+                created_at: Utc::now(),
+            },
+            LoopNode {
+                id: "m3".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                name: "Proposers [3]".to_string(),
+                kind: LoopNodeKind::Agent,
+                config: json!({}),
+                position: 3,
+                created_at: Utc::now(),
+            },
+            LoopNode {
+                id: "join1".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                name: "Proposers (join)".to_string(),
+                kind: LoopNodeKind::Join,
+                config: json!({}),
+                position: 4,
+                created_at: Utc::now(),
+            },
+            LoopNode {
+                id: "arbiter".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                name: "Arbiter".to_string(),
+                kind: LoopNodeKind::Agent,
+                config: json!({}),
+                position: 5,
+                created_at: Utc::now(),
+            },
+        ];
+        state.effective_edges = vec![
+            ("kickoff", "m1", LoopEdgeCondition::Always),
+            ("kickoff", "m2", LoopEdgeCondition::Always),
+            ("kickoff", "m3", LoopEdgeCondition::Always),
+            ("m1", "join1", LoopEdgeCondition::Always),
+            ("m2", "join1", LoopEdgeCondition::Always),
+            ("m3", "join1", LoopEdgeCondition::Always),
+            ("join1", "arbiter", LoopEdgeCondition::Pass),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (from, to, condition))| LoopEdge {
+            id: format!("ee{i}"),
+            spec_id: Some("spec-1".to_string()),
+            loop_id: None,
+            from_node: from.to_string(),
+            to_node: to.to_string(),
+            condition,
+        })
+        .collect();
+        state.ensembles = vec![ensemble_live_fixture()];
+        state.current_node_id = Some("kickoff".to_string());
+
+        let node_info = NodeRunInfo::default();
+        let text = render_to_text(80, 40, |frame, area| {
+            render_loop_live_view(
+                frame,
+                area,
+                &LiveViewContext {
+                    state: &state,
+                    follow: true,
+                    highlighted_node_id: state.current_node_id.as_deref(),
+                    node_info: &node_info,
+                    blocked: false,
+                    now: Utc::now(),
+                },
+            );
+        });
+
+        // Collapsed to one box with the member count, not three separate
+        // member boxes or a fourth box for the join.
+        assert!(text.contains("Proposers [3 models]"), "{text}");
+        assert!(!text.contains("Proposers [1]"), "{text}");
+        assert!(!text.contains("Proposers [2]"), "{text}");
+        assert!(!text.contains("Proposers (join)"), "{text}");
+        // Per-member live status inside the collapsed box.
+        assert!(text.contains("[pass]"), "{text}");
+        assert!(text.contains("[running]"), "{text}");
+        assert!(text.contains("[pending]"), "{text}");
+        // The fan-out from kickoff collapses to one edge, and the join's own
+        // routing to the arbiter still renders.
+        assert!(text.contains("Kickoff"), "{text}");
+        assert!(text.contains("Arbiter"), "{text}");
     }
 
     fn test_db_and_dir() -> (Arc<Database>, tempfile::TempDir) {

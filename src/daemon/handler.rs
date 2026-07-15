@@ -50,9 +50,9 @@ use crate::db::intelligence::IntelligenceNodeRecord;
 use crate::db::Database;
 use crate::domain::blueprints::{merge_blueprint_config, validate_blueprint_deletable, Blueprint};
 use crate::domain::loops::{
-    validate_spec_description_template, Loop, LoopDetails, LoopEdge, LoopEdgeCondition, LoopNode,
-    LoopNodeKind, LoopNodeRun, LoopResetOutcome, LoopRunStatus, LoopSpec, LoopSpecStatus,
-    LoopStatus,
+    validate_spec_description_template, Ensemble, EnsembleMember, Loop, LoopDetails, LoopEdge,
+    LoopEdgeCondition, LoopNode, LoopNodeKind, LoopNodeRun, LoopResetOutcome, LoopRunStatus,
+    LoopSpec, LoopSpecStatus, LoopStatus,
 };
 use crate::domain::models::{Agent, Trigger};
 use crate::domain::pools::{Pool, PoolDetails};
@@ -189,6 +189,58 @@ fn build_loop_completion_hook(
         model,
         prompt: prompt.to_string(),
         timeout_minutes: params.timeout_minutes,
+    })
+}
+
+const ENSEMBLE_MIN_MEMBERS: usize = 2;
+const ENSEMBLE_MAX_MEMBERS: usize = 8;
+const DEFAULT_ENSEMBLE_MEMBER_TIMEOUT_MINUTES: i64 = 30;
+
+/// Validate a `loop_add_ensemble`/`loop_update_ensemble` member list: 2-8
+/// entries, each with a non-empty `platform`. Returns the normalized
+/// `(platform, model)` pairs in the caller's order — the order consolidation
+/// and resize diffs rely on.
+fn validate_ensemble_members(
+    members: &[EnsembleMemberParams],
+) -> Result<Vec<(String, Option<String>)>, String> {
+    if members.len() < ENSEMBLE_MIN_MEMBERS || members.len() > ENSEMBLE_MAX_MEMBERS {
+        return Err(format!(
+            "An ensemble must have {ENSEMBLE_MIN_MEMBERS}-{ENSEMBLE_MAX_MEMBERS} members, got {}.",
+            members.len()
+        ));
+    }
+    members
+        .iter()
+        .map(|member| {
+            let platform = member.platform.trim();
+            if platform.is_empty() {
+                return Err("Ensemble member 'platform' must not be empty.".to_string());
+            }
+            let model = member
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            Ok((platform.to_string(), model))
+        })
+        .collect()
+}
+
+/// Build a member agent node's `config` — the shared ensemble prompt plus
+/// this member's own platform/model, the same shape `validate_node_config`'s
+/// `Agent` arm expects.
+fn member_node_config(
+    platform: &str,
+    model: Option<&str>,
+    prompt_template: &str,
+    timeout_minutes: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "platform": platform,
+        "model": model,
+        "prompt_template": prompt_template,
+        "timeout_minutes": timeout_minutes,
     })
 }
 
@@ -340,6 +392,46 @@ fn validate_node_kind(kind: &str) -> Result<LoopNodeKind, String> {
         .ok_or_else(|| "Loop node kind must be one of: agent, check, gate.".to_string())
 }
 
+/// `loop_add_node`/`loop_update_node`'s `kind: "join"` guard — a join node is
+/// engine-managed and only ever created as part of `loop_add_ensemble`'s
+/// one-call expansion, never directly.
+fn validate_not_join_kind(kind: LoopNodeKind) -> Result<(), String> {
+    if kind == LoopNodeKind::Join {
+        return Err(
+            "Loop node kind 'join' is engine-managed; it can only be created via loop_add_ensemble."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Refuse to edit a node directly with `loop_update_node`/`loop_add_edge` if
+/// it belongs to an ensemble (member or join) — F1's "individual member
+/// overrides are NOT supported in v1": the ensemble is homogeneous by
+/// design, so every edit to a member/join goes through
+/// `loop_update_ensemble`, never a direct node/edge tool.
+fn validate_node_not_ensemble_owned(db: &Database, node_id: &str) -> Result<(), String> {
+    if let Some(details) = db
+        .get_ensemble_by_member_node(node_id)
+        .map_err(|e| e.to_string())?
+    {
+        return Err(format!(
+            "Node '{node_id}' is a member of ensemble '{}' ('{}'); edit it via loop_update_ensemble instead.",
+            details.ensemble.id, details.ensemble.name
+        ));
+    }
+    if let Some(details) = db
+        .get_ensemble_by_join_node(node_id)
+        .map_err(|e| e.to_string())?
+    {
+        return Err(format!(
+            "Node '{node_id}' is the join of ensemble '{}' ('{}'); edit it via loop_update_ensemble instead.",
+            details.ensemble.id, details.ensemble.name
+        ));
+    }
+    Ok(())
+}
+
 /// Unlike [`LoopSpecStatus::from_str`] (infallible, defaults to `Pending`
 /// for callers that already trust the value came from the DB), a
 /// `spec_list` status filter comes from the caller — an unrecognized value
@@ -415,6 +507,11 @@ fn validate_node_config(kind: LoopNodeKind, config: &serde_json::Value) -> Resul
                 );
             }
         }
+        // A join node's config is engine-managed (see `loop_add_ensemble`) —
+        // there is nothing for a caller to validate, and callers can never
+        // reach this arm anyway since `loop_add_node`/`loop_update_node`
+        // refuse `kind: "join"` outright.
+        LoopNodeKind::Join => {}
     }
 
     Ok(())
@@ -650,6 +747,60 @@ fn loop_run_status_guard(loop_id: &str, status: LoopStatus) -> Result<(), String
         ),
         LoopStatus::Draft | LoopStatus::Paused => Ok(()),
     }
+}
+
+/// Validate every ensemble (F1) reachable by a `loop_run` call — the loop's
+/// own top-level graph, plus the own graph of every spec that could actually
+/// run (the loop's bound specs, and a pool's members when `pool_id` is
+/// given). A spec with no nodes of its own falls back to the loop-level
+/// graph at execution time (see `LoopEngine::run_spec`), so it's skipped
+/// here rather than double-validated.
+fn validate_loop_ensembles_for_run(
+    db: &Database,
+    loop_id: &str,
+    pool_id: Option<&str>,
+) -> Result<(), String> {
+    let graph_nodes = db
+        .list_loop_nodes_for_loop(loop_id)
+        .map_err(|e| e.to_string())?;
+    let graph_edges = db
+        .list_loop_edges_for_loop(loop_id)
+        .map_err(|e| e.to_string())?;
+    let graph_ensembles = db
+        .list_ensembles_for_loop(loop_id)
+        .map_err(|e| e.to_string())?;
+    crate::domain::validation::validate_ensembles_in_graph(
+        &graph_ensembles,
+        &graph_nodes,
+        &graph_edges,
+    )?;
+
+    let mut spec_ids: Vec<String> = db
+        .list_loop_specs(loop_id)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|spec| spec.id)
+        .collect();
+    if let Some(pool_id) = pool_id {
+        spec_ids.extend(
+            db.list_pool_member_spec_ids(pool_id)
+                .map_err(|e| e.to_string())?,
+        );
+    }
+
+    for spec_id in spec_ids {
+        let nodes = db.list_loop_nodes(&spec_id).map_err(|e| e.to_string())?;
+        if nodes.is_empty() {
+            continue;
+        }
+        let edges = db.list_loop_edges(&spec_id).map_err(|e| e.to_string())?;
+        let ensembles = db
+            .list_ensembles_for_spec(&spec_id)
+            .map_err(|e| e.to_string())?;
+        crate::domain::validation::validate_ensembles_in_graph(&ensembles, &nodes, &edges)?;
+    }
+
+    Ok(())
 }
 
 /// Core logic for `loop_reset`, factored out of the tool method so it only
@@ -2768,6 +2919,9 @@ impl TaskTriggerHandler {
             Ok(result) => result,
             Err(e) => return Ok(error_result(&e)),
         };
+        if let Err(e) = validate_not_join_kind(kind) {
+            return Ok(error_result(&e));
+        }
         if let Err(e) = validate_node_config(kind, &config) {
             return Ok(error_result(&e));
         }
@@ -2823,6 +2977,9 @@ impl TaskTriggerHandler {
             Ok(node) => node,
             Err(e) => return Ok(error_result(&e)),
         };
+        if let Err(e) = validate_node_not_ensemble_owned(&self.db, node_id) {
+            return Ok(error_result(&e));
+        }
 
         let name = match params.name.as_deref().map(str::trim) {
             Some("") => return Ok(error_result("Loop node name must not be empty.")),
@@ -2837,6 +2994,11 @@ impl TaskTriggerHandler {
             },
             None => None,
         };
+        if let Some(kind) = kind {
+            if let Err(e) = validate_not_join_kind(kind) {
+                return Ok(error_result(&e));
+            }
+        }
 
         if let Some(position) = params.position {
             if let Err(e) = validate_node_position_conflict(&self.db, &node, node_id, position) {
@@ -2909,6 +3071,12 @@ impl TaskTriggerHandler {
                 "Both loop edge endpoints must belong to the same spec or loop graph as the edge.",
             ));
         }
+        if let Err(e) = validate_node_not_ensemble_owned(&self.db, &params.from_node) {
+            return Ok(error_result(&e));
+        }
+        if let Err(e) = validate_node_not_ensemble_owned(&self.db, &params.to_node) {
+            return Ok(error_result(&e));
+        }
 
         let (spec_id, loop_id) = match target {
             GraphTarget::Spec(spec_id) => (Some(spec_id), None),
@@ -2941,6 +3109,12 @@ impl TaskTriggerHandler {
             Ok(e) => e,
             Err(e) => return Ok(error_result(&e)),
         };
+        if let Err(e) = validate_node_not_ensemble_owned(&self.db, &edge.from_node) {
+            return Ok(error_result(&e));
+        }
+        if let Err(e) = validate_node_not_ensemble_owned(&self.db, &edge.to_node) {
+            return Ok(error_result(&e));
+        }
         let condition = match validate_edge_condition(params.condition.trim()) {
             Ok(c) => c,
             Err(e) => return Ok(error_result(&e)),
@@ -2959,6 +3133,600 @@ impl TaskTriggerHandler {
             .map_err(internal_error)?;
 
         Ok(success_result(&format!("Loop edge '{}' updated.", edge.id)))
+    }
+
+    #[tool(
+        name = "loop_add_ensemble",
+        description = "Create an ensemble in ONE call: N (2-8) parallel agent-node members sharing one prompt, plus the join gate that waits for all of them, consolidates their outputs, and routes onward. Members differ only by platform/model. (Formerly called 'fusion' — retired to avoid colliding with OpenRouter's fusion technology.)"
+    )]
+    async fn loop_add_ensemble(
+        &self,
+        Parameters(params): Parameters<LoopAddEnsembleParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let name = params.name.trim();
+        if let Err(e) = validate_non_empty(name, "Ensemble name") {
+            return Ok(error_result(&e));
+        }
+
+        let blueprint_name = params
+            .blueprint
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let blueprint = match blueprint_name {
+            Some(blueprint_name) => match self
+                .db
+                .get_ensemble_blueprint_by_name(blueprint_name)
+                .map_err(internal_error)?
+            {
+                Some(bp) => Some(bp),
+                None => {
+                    return Ok(error_result(&format!(
+                        "Unknown ensemble blueprint '{blueprint_name}'."
+                    )))
+                }
+            },
+            None => None,
+        };
+
+        let prompt_template: String = match params
+            .prompt_template
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(explicit) => explicit.to_string(),
+            None => match &blueprint {
+                Some(bp) => bp.prompt_template.clone(),
+                None => {
+                    return Ok(error_result(
+                        "Provide prompt_template, or a blueprint that supplies one.",
+                    ))
+                }
+            },
+        };
+        let prompt_template = prompt_template.as_str();
+
+        let members: Vec<(String, Option<String>)> = match &params.members {
+            Some(explicit) => match validate_ensemble_members(explicit) {
+                Ok(members) => members,
+                Err(e) => return Ok(error_result(&e)),
+            },
+            None => match &blueprint {
+                Some(bp) => bp.members.clone(),
+                None => {
+                    return Ok(error_result(
+                        "Provide members, or a blueprint that supplies them.",
+                    ))
+                }
+            },
+        };
+        let condition = match validate_edge_condition(params.condition.trim()) {
+            Ok(c) => c,
+            Err(e) => return Ok(error_result(&e)),
+        };
+
+        let target = match resolve_graph_target(
+            &self.db,
+            params.spec_id.as_deref(),
+            params.loop_id.as_deref(),
+        ) {
+            Ok(target) => target,
+            Err(e) => return Ok(error_result(&e)),
+        };
+        let existing_nodes = match &target {
+            GraphTarget::Spec(spec_id) => {
+                self.db.list_loop_nodes(spec_id).map_err(internal_error)?
+            }
+            GraphTarget::Loop(loop_id) => self
+                .db
+                .list_loop_nodes_for_loop(loop_id)
+                .map_err(internal_error)?,
+        };
+        let node_exists = |id: &str| existing_nodes.iter().any(|node| node.id == id);
+
+        let from_node = params.from_node.trim();
+        if !node_exists(from_node) {
+            return Ok(error_result(&format!(
+                "Loop node '{from_node}' not found in the target graph."
+            )));
+        }
+        if let Err(e) = validate_node_not_ensemble_owned(&self.db, from_node) {
+            return Ok(error_result(&format!(
+                "Cannot wire an ensemble's entry from an ensemble-owned node (nested ensembles are not supported): {e}"
+            )));
+        }
+
+        let on_pass_to = params.on_pass_to.trim();
+        if let Err(e) = validate_non_empty(on_pass_to, "on_pass_to") {
+            return Ok(error_result(&e));
+        }
+        if !node_exists(on_pass_to) {
+            return Ok(error_result(&format!(
+                "Loop node '{on_pass_to}' not found in the target graph."
+            )));
+        }
+        if let Err(e) = validate_node_not_ensemble_owned(&self.db, on_pass_to) {
+            return Ok(error_result(&format!(
+                "Cannot wire an ensemble's exit into another ensemble's members/join (nested ensembles are not supported): {e}"
+            )));
+        }
+
+        let on_fail_to = params
+            .on_fail_to
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if let Some(on_fail_to) = on_fail_to {
+            if !node_exists(on_fail_to) {
+                return Ok(error_result(&format!(
+                    "Loop node '{on_fail_to}' not found in the target graph."
+                )));
+            }
+            if let Err(e) = validate_node_not_ensemble_owned(&self.db, on_fail_to) {
+                return Ok(error_result(&format!(
+                    "Cannot wire an ensemble's exit into another ensemble's members/join (nested ensembles are not supported): {e}"
+                )));
+            }
+        }
+
+        let min_pass = params
+            .min_pass
+            .or_else(|| blueprint.as_ref().and_then(|bp| bp.min_pass))
+            .unwrap_or(members.len() as i64);
+        if min_pass < 1 || min_pass > members.len() as i64 {
+            return Ok(error_result(&format!(
+                "min_pass must be between 1 and {} (the member count), got {min_pass}.",
+                members.len()
+            )));
+        }
+        let timeout_minutes = params
+            .timeout_minutes
+            .unwrap_or(DEFAULT_ENSEMBLE_MEMBER_TIMEOUT_MINUTES);
+        if timeout_minutes < 0 {
+            return Ok(error_result("timeout_minutes must not be negative."));
+        }
+        if let Some(straggler) = params.straggler_timeout_minutes {
+            if straggler < 0 {
+                return Ok(error_result(
+                    "straggler_timeout_minutes must not be negative.",
+                ));
+            }
+        }
+
+        let (spec_id, loop_id) = match &target {
+            GraphTarget::Spec(spec_id) => (Some(spec_id.clone()), None),
+            GraphTarget::Loop(loop_id) => (None, Some(loop_id.clone())),
+        };
+        let mut next_position = existing_nodes
+            .last()
+            .map(|node| node.position + 1)
+            .unwrap_or(1);
+
+        let ensemble_id = uuid::Uuid::new_v4().to_string();
+        let join_node_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now();
+
+        let mut member_nodes = Vec::with_capacity(members.len());
+        let mut ensemble_members = Vec::with_capacity(members.len());
+        let mut edges = Vec::new();
+
+        for (index, (platform, model)) in members.iter().enumerate() {
+            let node_id = uuid::Uuid::new_v4().to_string();
+            member_nodes.push(LoopNode {
+                id: node_id.clone(),
+                spec_id: spec_id.clone(),
+                loop_id: loop_id.clone(),
+                name: format!("{name} [{}]", index + 1),
+                kind: LoopNodeKind::Agent,
+                config: member_node_config(
+                    platform,
+                    model.as_deref(),
+                    prompt_template,
+                    timeout_minutes,
+                ),
+                position: next_position,
+                created_at: now,
+            });
+            edges.push(LoopEdge {
+                id: uuid::Uuid::new_v4().to_string(),
+                spec_id: spec_id.clone(),
+                loop_id: loop_id.clone(),
+                from_node: from_node.to_string(),
+                to_node: node_id.clone(),
+                condition,
+            });
+            edges.push(LoopEdge {
+                id: uuid::Uuid::new_v4().to_string(),
+                spec_id: spec_id.clone(),
+                loop_id: loop_id.clone(),
+                from_node: node_id.clone(),
+                to_node: join_node_id.clone(),
+                condition: LoopEdgeCondition::Always,
+            });
+            ensemble_members.push(EnsembleMember {
+                ensemble_id: ensemble_id.clone(),
+                node_id,
+                position: index as i64,
+                platform: platform.clone(),
+                model: model.clone(),
+            });
+            next_position += 1;
+        }
+
+        let join_node = LoopNode {
+            id: join_node_id.clone(),
+            spec_id: spec_id.clone(),
+            loop_id: loop_id.clone(),
+            name: format!("{name} (join)"),
+            kind: LoopNodeKind::Join,
+            config: serde_json::json!({ "ensemble_id": ensemble_id }),
+            position: next_position,
+            created_at: now,
+        };
+
+        edges.push(LoopEdge {
+            id: uuid::Uuid::new_v4().to_string(),
+            spec_id: spec_id.clone(),
+            loop_id: loop_id.clone(),
+            from_node: join_node_id.clone(),
+            to_node: on_pass_to.to_string(),
+            condition: LoopEdgeCondition::Pass,
+        });
+        if let Some(on_fail_to) = on_fail_to {
+            edges.push(LoopEdge {
+                id: uuid::Uuid::new_v4().to_string(),
+                spec_id: spec_id.clone(),
+                loop_id: loop_id.clone(),
+                from_node: join_node_id.clone(),
+                to_node: on_fail_to.to_string(),
+                condition: LoopEdgeCondition::Fail,
+            });
+        }
+
+        let ensemble = Ensemble {
+            id: ensemble_id,
+            spec_id,
+            loop_id,
+            name: name.to_string(),
+            prompt_template: prompt_template.to_string(),
+            join_node_id,
+            entry_from_node: from_node.to_string(),
+            entry_condition: condition,
+            min_pass,
+            straggler_timeout_minutes: params.straggler_timeout_minutes,
+            timeout_minutes,
+            on_pass_to: on_pass_to.to_string(),
+            on_fail_to: on_fail_to.map(str::to_string),
+            created_at: now,
+        };
+
+        self.db
+            .insert_ensemble_unit(
+                &ensemble,
+                &ensemble_members,
+                &member_nodes,
+                &join_node,
+                &edges,
+            )
+            .map_err(internal_error)?;
+
+        Ok(build_id_result(&ensemble.id, "ensemble_id"))
+    }
+
+    #[tool(
+        name = "loop_update_ensemble",
+        description = "Update an ensemble's shared prompt (propagated to every member), member list (platform/model — added/removed/replaced by position), join config (min_pass, straggler_timeout_minutes, timeout_minutes), and/or exit wiring (on_pass_to/on_fail_to) — all in one call, without touching individual member nodes directly."
+    )]
+    async fn loop_update_ensemble(
+        &self,
+        Parameters(params): Parameters<LoopUpdateEnsembleParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let ensemble_id = params.ensemble_id.trim();
+        let Some(mut details) = self
+            .db
+            .get_ensemble_details(ensemble_id)
+            .map_err(internal_error)?
+        else {
+            return Ok(error_result(&format!(
+                "Ensemble '{ensemble_id}' not found."
+            )));
+        };
+
+        if let Err(e) = validate_at_least_one_bool(
+            &[
+                params.prompt_template.is_some(),
+                params.members.is_some(),
+                params.min_pass.is_some(),
+                params.straggler_timeout_minutes.is_some(),
+                params.timeout_minutes.is_some(),
+                params.on_pass_to.is_some(),
+                params.on_fail_to.is_some(),
+            ],
+            "loop_update_ensemble",
+        ) {
+            return Ok(error_result(&e));
+        }
+
+        if let Some(prompt_template) = &params.prompt_template {
+            if let Err(e) = validate_non_empty(prompt_template.trim(), "Ensemble prompt_template") {
+                return Ok(error_result(&e));
+            }
+        }
+
+        let owner_nodes = match (&details.ensemble.spec_id, &details.ensemble.loop_id) {
+            (Some(spec_id), None) => self.db.list_loop_nodes(spec_id).map_err(internal_error)?,
+            (None, Some(loop_id)) => self
+                .db
+                .list_loop_nodes_for_loop(loop_id)
+                .map_err(internal_error)?,
+            _ => Vec::new(),
+        };
+
+        // ── member list resize/replace (add/remove/replace by position) ──
+        if let Some(new_members) = &params.members {
+            let members = match validate_ensemble_members(new_members) {
+                Ok(members) => members,
+                Err(e) => return Ok(error_result(&e)),
+            };
+            let prompt_template = params
+                .prompt_template
+                .as_deref()
+                .unwrap_or(&details.ensemble.prompt_template);
+            let timeout_minutes = params
+                .timeout_minutes
+                .unwrap_or(details.ensemble.timeout_minutes);
+
+            let old_members = details.members.clone();
+            let old_len = old_members.len();
+            let new_len = members.len();
+
+            for (index, (platform, model)) in members.iter().enumerate().take(old_len.min(new_len))
+            {
+                let existing = &old_members[index];
+                self.db
+                    .update_ensemble_member_platform(
+                        ensemble_id,
+                        &existing.node_id,
+                        platform,
+                        model.as_deref(),
+                    )
+                    .map_err(internal_error)?;
+                let config = member_node_config(
+                    platform,
+                    model.as_deref(),
+                    prompt_template,
+                    timeout_minutes,
+                );
+                self.db
+                    .update_loop_node_details(&existing.node_id, None, None, Some(&config), None)
+                    .map_err(internal_error)?;
+            }
+
+            if new_len > old_len {
+                let mut next_position = owner_nodes
+                    .last()
+                    .map(|node| node.position + 1)
+                    .unwrap_or(1);
+                let mut next_member_position = old_len as i64;
+                for (platform, model) in &members[old_len..new_len] {
+                    let node_id = uuid::Uuid::new_v4().to_string();
+                    let node = LoopNode {
+                        id: node_id.clone(),
+                        spec_id: details.ensemble.spec_id.clone(),
+                        loop_id: details.ensemble.loop_id.clone(),
+                        name: format!("{} [{}]", details.ensemble.name, next_member_position + 1),
+                        kind: LoopNodeKind::Agent,
+                        config: member_node_config(
+                            platform,
+                            model.as_deref(),
+                            prompt_template,
+                            timeout_minutes,
+                        ),
+                        position: next_position,
+                        created_at: chrono::Utc::now(),
+                    };
+                    let entry_edge = LoopEdge {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        spec_id: details.ensemble.spec_id.clone(),
+                        loop_id: details.ensemble.loop_id.clone(),
+                        from_node: details.ensemble.entry_from_node.clone(),
+                        to_node: node_id.clone(),
+                        condition: details.ensemble.entry_condition,
+                    };
+                    let join_edge = LoopEdge {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        spec_id: details.ensemble.spec_id.clone(),
+                        loop_id: details.ensemble.loop_id.clone(),
+                        from_node: node_id.clone(),
+                        to_node: details.ensemble.join_node_id.clone(),
+                        condition: LoopEdgeCondition::Always,
+                    };
+                    let member = EnsembleMember {
+                        ensemble_id: ensemble_id.to_string(),
+                        node_id,
+                        position: next_member_position,
+                        platform: platform.clone(),
+                        model: model.clone(),
+                    };
+                    self.db
+                        .add_ensemble_member(&member, &node, &entry_edge, &join_edge)
+                        .map_err(internal_error)?;
+                    next_position += 1;
+                    next_member_position += 1;
+                }
+            } else if new_len < old_len {
+                for existing in &old_members[new_len..old_len] {
+                    self.db
+                        .remove_ensemble_member(&existing.node_id)
+                        .map_err(internal_error)?;
+                }
+            }
+
+            details = self
+                .db
+                .get_ensemble_details(ensemble_id)
+                .map_err(internal_error)?
+                .ok_or_else(|| {
+                    internal_error(format!("Ensemble '{ensemble_id}' vanished mid-update."))
+                })?;
+        } else if params.prompt_template.is_some() || params.timeout_minutes.is_some() {
+            // Prompt and/or shared timeout changed without a member-list
+            // resize: propagate onto every existing member's config as-is.
+            let prompt_template = params
+                .prompt_template
+                .as_deref()
+                .unwrap_or(&details.ensemble.prompt_template);
+            let timeout_minutes = params
+                .timeout_minutes
+                .unwrap_or(details.ensemble.timeout_minutes);
+            for member in &details.members {
+                let config = member_node_config(
+                    &member.platform,
+                    member.model.as_deref(),
+                    prompt_template,
+                    timeout_minutes,
+                );
+                self.db
+                    .update_loop_node_details(&member.node_id, None, None, Some(&config), None)
+                    .map_err(internal_error)?;
+            }
+        }
+
+        if let Some(prompt_template) = params.prompt_template.as_deref() {
+            self.db
+                .update_ensemble_prompt(ensemble_id, prompt_template.trim())
+                .map_err(internal_error)?;
+        }
+
+        // ── join config: min_pass / straggler_timeout_minutes / timeout_minutes ──
+        if params.min_pass.is_some()
+            || params.timeout_minutes.is_some()
+            || params.straggler_timeout_minutes.is_some()
+        {
+            let member_count = details.members.len() as i64;
+            if let Some(min_pass) = params.min_pass {
+                if min_pass < 1 || min_pass > member_count {
+                    return Ok(error_result(&format!(
+                        "min_pass must be between 1 and {member_count} (the member count), got {min_pass}."
+                    )));
+                }
+            }
+            if let Some(Some(straggler)) = params.straggler_timeout_minutes {
+                if straggler < 0 {
+                    return Ok(error_result(
+                        "straggler_timeout_minutes must not be negative.",
+                    ));
+                }
+            }
+            if let Some(timeout_minutes) = params.timeout_minutes {
+                if timeout_minutes < 0 {
+                    return Ok(error_result("timeout_minutes must not be negative."));
+                }
+            }
+            self.db
+                .update_ensemble_join_config(
+                    ensemble_id,
+                    params.min_pass,
+                    params.straggler_timeout_minutes,
+                    params.timeout_minutes,
+                )
+                .map_err(internal_error)?;
+        }
+
+        // ── exit wiring: on_pass_to / on_fail_to ──────────────────────
+        if params.on_pass_to.is_some() || params.on_fail_to.is_some() {
+            let owner_nodes = match (&details.ensemble.spec_id, &details.ensemble.loop_id) {
+                (Some(spec_id), None) => {
+                    self.db.list_loop_nodes(spec_id).map_err(internal_error)?
+                }
+                (None, Some(loop_id)) => self
+                    .db
+                    .list_loop_nodes_for_loop(loop_id)
+                    .map_err(internal_error)?,
+                _ => Vec::new(),
+            };
+            let node_exists = |id: &str| owner_nodes.iter().any(|node| node.id == id);
+
+            if let Some(on_pass_to) = params.on_pass_to.as_deref().map(str::trim) {
+                if let Err(e) = validate_non_empty(on_pass_to, "on_pass_to") {
+                    return Ok(error_result(&e));
+                }
+                if !node_exists(on_pass_to) {
+                    return Ok(error_result(&format!(
+                        "Loop node '{on_pass_to}' not found in the ensemble's graph."
+                    )));
+                }
+                if let Err(e) = validate_node_not_ensemble_owned(&self.db, on_pass_to) {
+                    return Ok(error_result(&format!(
+                        "Cannot wire an ensemble's exit into another ensemble's members/join: {e}"
+                    )));
+                }
+                self.db
+                    .delete_loop_edges_from_node_with_condition(
+                        &details.ensemble.join_node_id,
+                        LoopEdgeCondition::Pass,
+                    )
+                    .map_err(internal_error)?;
+                self.db
+                    .insert_loop_edge(&LoopEdge {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        spec_id: details.ensemble.spec_id.clone(),
+                        loop_id: details.ensemble.loop_id.clone(),
+                        from_node: details.ensemble.join_node_id.clone(),
+                        to_node: on_pass_to.to_string(),
+                        condition: LoopEdgeCondition::Pass,
+                    })
+                    .map_err(internal_error)?;
+            }
+
+            if let Some(on_fail_to) = &params.on_fail_to {
+                self.db
+                    .delete_loop_edges_from_node_with_condition(
+                        &details.ensemble.join_node_id,
+                        LoopEdgeCondition::Fail,
+                    )
+                    .map_err(internal_error)?;
+                if let Some(target) = on_fail_to
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                {
+                    if !node_exists(target) {
+                        return Ok(error_result(&format!(
+                            "Loop node '{target}' not found in the ensemble's graph."
+                        )));
+                    }
+                    if let Err(e) = validate_node_not_ensemble_owned(&self.db, target) {
+                        return Ok(error_result(&format!(
+                            "Cannot wire an ensemble's exit into another ensemble's members/join: {e}"
+                        )));
+                    }
+                    self.db
+                        .insert_loop_edge(&LoopEdge {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            spec_id: details.ensemble.spec_id.clone(),
+                            loop_id: details.ensemble.loop_id.clone(),
+                            from_node: details.ensemble.join_node_id,
+                            to_node: target.to_string(),
+                            condition: LoopEdgeCondition::Fail,
+                        })
+                        .map_err(internal_error)?;
+                }
+            }
+
+            self.db
+                .update_ensemble_exit_wiring(
+                    ensemble_id,
+                    params.on_pass_to.as_deref(),
+                    params.on_fail_to.as_ref().map(|value| value.as_deref()),
+                )
+                .map_err(internal_error)?;
+        }
+
+        Ok(success_result(&format!(
+            "Ensemble '{ensemble_id}' updated."
+        )))
     }
 
     #[tool(
@@ -3217,6 +3985,10 @@ impl TaskTriggerHandler {
             }
         }
 
+        if let Err(e) = validate_loop_ensembles_for_run(&self.db, &params.loop_id, pool_id) {
+            return Ok(error_result(&e));
+        }
+
         // (B17) An empty effective spec set is a launch error, not a
         // successful no-op run — check it here, synchronously, so the caller
         // (human or an LLM recovery agent) gets the actionable message back
@@ -3371,7 +4143,7 @@ impl TaskTriggerHandler {
 
         match params.action.trim() {
             "retry_current_node" => {}
-            "skip_next_spec" => self.handle_skip_next_spec(&params.loop_id)?,
+            "skip_next_spec" => handle_skip_next_spec(&self.db, &params.loop_id)?,
             _ => {
                 return Ok(error_result(
                     "loop_continue action must be retry_current_node or skip_next_spec.",
@@ -3652,32 +4424,59 @@ impl TaskTriggerHandler {
     }
 }
 
-impl TaskTriggerHandler {
-    fn handle_skip_next_spec(&self, loop_id: &str) -> Result<(), McpError> {
-        let current_spec = self
-            .db
-            .list_loop_specs(loop_id)
-            .map_err(internal_error)?
-            .into_iter()
-            .find(|spec| spec.status == LoopSpecStatus::Running)
-            .ok_or_else(|| {
-                McpError::invalid_params(
-                    "No running spec found to skip from this paused loop.",
-                    None,
-                )
-            })?;
+/// Find and skip `loop_id`'s currently `running` spec — its own bound spec,
+/// or, for a pool-driven run, the pool member currently in flight. A pool
+/// member's `loop_id` column stays `None` (pool membership never binds it),
+/// so `list_loop_specs(loop_id)` alone can't see it (B18): the loop's
+/// persisted `active_run_pool_id` is what names the pool to look in instead.
+fn handle_skip_next_spec(db: &Database, loop_id: &str) -> Result<(), McpError> {
+    let bound_running = db
+        .list_loop_specs(loop_id)
+        .map_err(internal_error)?
+        .into_iter()
+        .find(|spec| spec.status == LoopSpecStatus::Running);
 
-        self.db
-            .update_loop_spec_status(
-                &current_spec.id,
-                LoopSpecStatus::Skipped,
-                None,
-                Some(chrono::Utc::now()),
-            )
-            .map_err(internal_error)?;
-        Ok(())
+    let current_spec = match bound_running {
+        Some(spec) => spec,
+        None => pool_running_spec(db, loop_id)?.ok_or_else(|| {
+            McpError::invalid_params("No running spec found to skip from this paused loop.", None)
+        })?,
+    };
+
+    db.update_loop_spec_status(
+        &current_spec.id,
+        LoopSpecStatus::Skipped,
+        None,
+        Some(chrono::Utc::now()),
+    )
+    .map_err(internal_error)?;
+    Ok(())
+}
+
+/// The `running` member of `loop_id`'s currently active pool run, if any —
+/// `None` if the loop isn't drawing from a pool, or no member is `running`.
+fn pool_running_spec(db: &Database, loop_id: &str) -> Result<Option<LoopSpec>, McpError> {
+    let Some(pool_id) = db
+        .get_loop(loop_id)
+        .map_err(internal_error)?
+        .and_then(|lp| lp.active_run_pool_id)
+    else {
+        return Ok(None);
+    };
+    for spec_id in db
+        .list_pool_member_spec_ids(&pool_id)
+        .map_err(internal_error)?
+    {
+        if let Some(spec) = db.get_loop_spec(&spec_id).map_err(internal_error)? {
+            if spec.status == LoopSpecStatus::Running {
+                return Ok(Some(spec));
+            }
+        }
     }
+    Ok(None)
+}
 
+impl TaskTriggerHandler {
     async fn restart_updated_watcher(
         &self,
         params: &TaskUpdateParams,
@@ -3776,6 +4575,11 @@ fn loop_details_json(db: &Database, lp: &LoopDetails) -> anyhow::Result<serde_js
         .iter()
         .map(|spec| loop_spec_details_json(db, spec, lp.lp.status))
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let ensembles = db
+        .list_ensembles_for_loop(&lp.lp.id)?
+        .iter()
+        .map(ensemble_details_json)
+        .collect::<Vec<_>>();
 
     Ok(serde_json::json!({
         "id": lp.lp.id,
@@ -3791,6 +4595,7 @@ fn loop_details_json(db: &Database, lp: &LoopDetails) -> anyhow::Result<serde_js
         "graph": {
             "nodes": lp.graph_nodes.iter().map(loop_node_json).collect::<Vec<_>>(),
             "edges": lp.graph_edges.iter().map(loop_edge_json).collect::<Vec<_>>(),
+            "ensembles": ensembles,
         },
         "specs": specs,
         "on_completed": lp.lp.on_completed.as_ref().map(loop_completion_hook_json),
@@ -3800,6 +4605,35 @@ fn loop_details_json(db: &Database, lp: &LoopDetails) -> anyhow::Result<serde_js
             .map(loop_completion_hook_run_json)
             .collect::<Vec<_>>(),
     }))
+}
+
+/// Serialize an ensemble (F1) as the one unit `loop_get`/`loop_update_ensemble`
+/// address — members in position order alongside the join's own config, so a
+/// client can render/edit it without reconstructing it from the underlying
+/// nodes/edges itself.
+fn ensemble_details_json(details: &crate::domain::loops::EnsembleDetails) -> serde_json::Value {
+    let ensemble = &details.ensemble;
+    serde_json::json!({
+        "id": ensemble.id,
+        "name": ensemble.name,
+        "prompt_template": ensemble.prompt_template,
+        "join_node_id": ensemble.join_node_id,
+        "entry_from_node": ensemble.entry_from_node,
+        "entry_condition": ensemble.entry_condition.as_str(),
+        "min_pass": ensemble.min_pass,
+        "straggler_timeout_minutes": ensemble.straggler_timeout_minutes,
+        "effective_straggler_timeout_minutes": ensemble.effective_straggler_timeout_minutes(),
+        "timeout_minutes": ensemble.timeout_minutes,
+        "on_pass_to": ensemble.on_pass_to,
+        "on_fail_to": ensemble.on_fail_to,
+        "created_at": ensemble.created_at.to_rfc3339(),
+        "members": details.members.iter().map(|member| serde_json::json!({
+            "node_id": member.node_id,
+            "position": member.position,
+            "platform": member.platform,
+            "model": member.model,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 fn loop_completion_hook_json(hook: &crate::domain::loops::LoopCompletionHook) -> serde_json::Value {
@@ -3844,6 +4678,11 @@ fn loop_spec_details_json(
             Vec::new()
         };
     let runs = runs.iter().map(loop_run_json).collect::<Vec<_>>();
+    let ensembles = db
+        .list_ensembles_for_spec(&spec.spec.id)?
+        .iter()
+        .map(ensemble_details_json)
+        .collect::<Vec<_>>();
 
     Ok(serde_json::json!({
         "id": spec.spec.id,
@@ -3865,6 +4704,7 @@ fn loop_spec_details_json(
         "completed_at": spec.spec.completed_at.map(|value| value.to_rfc3339()),
         "nodes": spec.nodes.iter().map(loop_node_json).collect::<Vec<_>>(),
         "edges": spec.edges.iter().map(loop_edge_json).collect::<Vec<_>>(),
+        "ensembles": ensembles,
         "runs": runs,
     }))
 }
@@ -4054,22 +4894,221 @@ impl ServerHandler for TaskTriggerHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        header_str, loop_details_json, loop_run_status_guard, missing_sync_identity_error,
-        perform_loop_reset, resolve_graph_target, resolve_node_kind_and_config,
-        resolve_reported_run, validate_blueprint_exists, validate_node_config,
+        handle_skip_next_spec, header_str, loop_details_json, loop_run_status_guard,
+        missing_sync_identity_error, perform_loop_reset, resolve_graph_target,
+        resolve_node_kind_and_config, resolve_reported_run, validate_blueprint_exists,
+        validate_ensemble_members, validate_node_config, validate_node_not_ensemble_owned,
         validate_pool_exists, validate_pool_member_removable, validate_pool_not_consumed,
         validate_pool_reorder, validate_pool_reorder_locking, validate_spec_deletable,
-        validate_spec_exists, MISSING_SYNC_IDENTITY_MESSAGE,
+        validate_spec_exists, EnsembleMemberParams, MISSING_SYNC_IDENTITY_MESSAGE,
     };
     use crate::db::Database;
     use crate::domain::blueprints::Blueprint;
     use crate::domain::loops::{
-        Loop, LoopNode, LoopNodeKind, LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus,
-        LoopStatus,
+        Ensemble, EnsembleMember, Loop, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind,
+        LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus,
     };
     use crate::domain::pools::Pool;
     use crate::shared::sync_identity::CANOPY_AGENT_ID_HEADER;
     use tempfile::tempdir;
+
+    fn ensemble_member_params(platform: &str) -> EnsembleMemberParams {
+        EnsembleMemberParams {
+            platform: platform.to_string(),
+            model: None,
+        }
+    }
+
+    #[test]
+    fn validate_ensemble_members_rejects_below_minimum() {
+        let members = vec![ensemble_member_params("claude")];
+        let err = validate_ensemble_members(&members).unwrap_err();
+        assert!(err.contains("2-8 members"), "{err}");
+    }
+
+    #[test]
+    fn validate_ensemble_members_rejects_above_maximum() {
+        let members: Vec<_> = (0..9).map(|_| ensemble_member_params("claude")).collect();
+        let err = validate_ensemble_members(&members).unwrap_err();
+        assert!(err.contains("2-8 members"), "{err}");
+    }
+
+    #[test]
+    fn validate_ensemble_members_accepts_boundary_counts() {
+        let two: Vec<_> = (0..2).map(|_| ensemble_member_params("claude")).collect();
+        assert!(validate_ensemble_members(&two).is_ok());
+        let eight: Vec<_> = (0..8).map(|_| ensemble_member_params("claude")).collect();
+        assert!(validate_ensemble_members(&eight).is_ok());
+    }
+
+    #[test]
+    fn validate_ensemble_members_rejects_empty_platform() {
+        let members = vec![
+            ensemble_member_params("claude"),
+            ensemble_member_params("  "),
+        ];
+        let err = validate_ensemble_members(&members).unwrap_err();
+        assert!(err.contains("platform"), "{err}");
+    }
+
+    /// F1's "no nested ensembles" rule: wiring into a node that already
+    /// belongs to another ensemble (as a member or as its join) must be
+    /// rejected, not silently accepted.
+    #[test]
+    fn validate_node_not_ensemble_owned_rejects_member_and_join_nodes() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        db.insert_loop_spec(&LoopSpec {
+            id: "spec-1".to_string(),
+            loop_id: None,
+            name: "spec-1".to_string(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+        })
+        .unwrap();
+        let now = chrono::Utc::now();
+        db.insert_loop_node(&LoopNode {
+            id: "kickoff".to_string(),
+            spec_id: Some("spec-1".to_string()),
+            loop_id: None,
+            name: "kickoff".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "true", "success_condition": "exit_code_0"}),
+            position: 1,
+            created_at: now,
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "arbiter".to_string(),
+            spec_id: Some("spec-1".to_string()),
+            loop_id: None,
+            name: "arbiter".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 10,
+            created_at: now,
+        })
+        .unwrap();
+        let member_nodes = vec![
+            LoopNode {
+                id: "m1".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                name: "member-1".to_string(),
+                kind: LoopNodeKind::Agent,
+                config: serde_json::json!({"platform": "claude"}),
+                position: 2,
+                created_at: now,
+            },
+            LoopNode {
+                id: "m2".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                name: "member-2".to_string(),
+                kind: LoopNodeKind::Agent,
+                config: serde_json::json!({"platform": "codex"}),
+                position: 3,
+                created_at: now,
+            },
+        ];
+        let join_node = LoopNode {
+            id: "join1".to_string(),
+            spec_id: Some("spec-1".to_string()),
+            loop_id: None,
+            name: "join".to_string(),
+            kind: LoopNodeKind::Join,
+            config: serde_json::json!({"ensemble_id": "ens1"}),
+            position: 4,
+            created_at: now,
+        };
+        let edges = vec![
+            LoopEdge {
+                id: "kickoff->m1".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                from_node: "kickoff".to_string(),
+                to_node: "m1".to_string(),
+                condition: LoopEdgeCondition::Always,
+            },
+            LoopEdge {
+                id: "kickoff->m2".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                from_node: "kickoff".to_string(),
+                to_node: "m2".to_string(),
+                condition: LoopEdgeCondition::Always,
+            },
+            LoopEdge {
+                id: "m1->join1".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                from_node: "m1".to_string(),
+                to_node: "join1".to_string(),
+                condition: LoopEdgeCondition::Always,
+            },
+            LoopEdge {
+                id: "m2->join1".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                from_node: "m2".to_string(),
+                to_node: "join1".to_string(),
+                condition: LoopEdgeCondition::Always,
+            },
+            LoopEdge {
+                id: "join1->arbiter".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                from_node: "join1".to_string(),
+                to_node: "arbiter".to_string(),
+                condition: LoopEdgeCondition::Pass,
+            },
+        ];
+        let ensemble = Ensemble {
+            id: "ens1".to_string(),
+            spec_id: Some("spec-1".to_string()),
+            loop_id: None,
+            name: "Proposers".to_string(),
+            prompt_template: "draft it".to_string(),
+            join_node_id: "join1".to_string(),
+            entry_from_node: "kickoff".to_string(),
+            entry_condition: LoopEdgeCondition::Always,
+            min_pass: 2,
+            straggler_timeout_minutes: None,
+            timeout_minutes: 30,
+            on_pass_to: "arbiter".to_string(),
+            on_fail_to: None,
+            created_at: now,
+        };
+        let members = vec![
+            EnsembleMember {
+                ensemble_id: "ens1".to_string(),
+                node_id: "m1".to_string(),
+                position: 0,
+                platform: "claude".to_string(),
+                model: None,
+            },
+            EnsembleMember {
+                ensemble_id: "ens1".to_string(),
+                node_id: "m2".to_string(),
+                position: 1,
+                platform: "codex".to_string(),
+                model: None,
+            },
+        ];
+        db.insert_ensemble_unit(&ensemble, &members, &member_nodes, &join_node, &edges)
+            .unwrap();
+
+        assert!(validate_node_not_ensemble_owned(&db, "m1").is_err());
+        assert!(validate_node_not_ensemble_owned(&db, "join1").is_err());
+        assert!(validate_node_not_ensemble_owned(&db, "kickoff").is_ok());
+        assert!(validate_node_not_ensemble_owned(&db, "arbiter").is_ok());
+    }
 
     fn spec_with_status(
         loop_id: &str,
@@ -4860,6 +5899,67 @@ mod tests {
         .unwrap();
 
         assert!(validate_pool_not_consumed(&db, "pool-1", "loop-owner").is_ok());
+    }
+
+    /// B18 (Requirement 2): `skip_next_spec` on a pool-driven paused loop
+    /// must find its in-flight member through the loop's persisted
+    /// `active_run_pool_id` — the member's own `loop_id` column stays `None`
+    /// (pool membership never binds it), so `list_loop_specs(loop_id)` alone
+    /// can't see it. Before this fix `handle_skip_next_spec` always errored
+    /// "No running spec found" for a pool-driven pause.
+    #[test]
+    fn skip_next_spec_finds_and_skips_the_running_pool_member() {
+        let (_dir, db) = pool_test_db();
+        insert_test_loop(&db, "loop-owner");
+        db.set_loop_active_run_pool("loop-owner", Some("pool-1"))
+            .unwrap();
+
+        db.insert_loop_spec(&running_spec("spec-a")).unwrap();
+        db.insert_loop_spec(&standalone_spec("spec-b")).unwrap();
+        insert_pool(&db, "pool-1");
+        db.append_pool_member("pool-1", "spec-a").unwrap();
+        db.append_pool_member("pool-1", "spec-b").unwrap();
+
+        handle_skip_next_spec(&db, "loop-owner").unwrap();
+
+        let spec_a = db.get_loop_spec("spec-a").unwrap().unwrap();
+        let spec_b = db.get_loop_spec("spec-b").unwrap().unwrap();
+        assert_eq!(spec_a.status, LoopSpecStatus::Skipped);
+        assert_eq!(spec_b.status, LoopSpecStatus::Pending);
+    }
+
+    #[test]
+    fn skip_next_spec_prefers_the_loop_bound_spec_over_pool_context() {
+        // A loop with its own bound `running` spec must use that, even if a
+        // stale `active_run_pool_id` is still sitting on the loop from an
+        // earlier, unrelated pool run.
+        let (_dir, db) = pool_test_db();
+        insert_test_loop(&db, "loop-owner");
+        db.set_loop_active_run_pool("loop-owner", Some("pool-1"))
+            .unwrap();
+
+        let mut bound = running_spec("spec-bound");
+        bound.loop_id = Some("loop-owner".to_string());
+        db.insert_loop_spec(&bound).unwrap();
+        db.insert_loop_spec(&running_spec("spec-pool")).unwrap();
+        insert_pool(&db, "pool-1");
+        db.append_pool_member("pool-1", "spec-pool").unwrap();
+
+        handle_skip_next_spec(&db, "loop-owner").unwrap();
+
+        let bound_after = db.get_loop_spec("spec-bound").unwrap().unwrap();
+        let pool_after = db.get_loop_spec("spec-pool").unwrap().unwrap();
+        assert_eq!(bound_after.status, LoopSpecStatus::Skipped);
+        assert_eq!(pool_after.status, LoopSpecStatus::Running);
+    }
+
+    #[test]
+    fn skip_next_spec_errors_when_no_spec_is_running_anywhere() {
+        let (_dir, db) = pool_test_db();
+        insert_test_loop(&db, "loop-owner");
+
+        let error = handle_skip_next_spec(&db, "loop-owner").unwrap_err();
+        assert!(error.message.contains("No running spec found"));
     }
 
     #[test]

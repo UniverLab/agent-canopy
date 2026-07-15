@@ -1064,6 +1064,12 @@ fn reconcile_orphaned_loops_pauses_running_loop_and_interrupts_its_run() {
     db.insert_loop_spec(&spec).unwrap();
     db.insert_loop_node(&node).unwrap();
     db.insert_loop_run(&run).unwrap();
+    // Prove the reconcile pass actually clears these, not that they were
+    // never set.
+    db.update_loop_spec_status(&spec.id, LoopSpecStatus::Running, Some(Utc::now()), None)
+        .unwrap();
+    db.set_loop_spec_start_head(&spec.id, Some("deadbeef"))
+        .unwrap();
 
     let reconciled = db.reconcile_orphaned_loops().unwrap();
     assert_eq!(reconciled, 1);
@@ -1081,10 +1087,125 @@ fn reconcile_orphaned_loops_pauses_running_loop_and_interrupts_its_run() {
         Some(&serde_json::json!(true))
     );
 
-    // Test 2: the spec keeps its `Running` status so `resolve_spec_start`
-    // resumes at the same node.
+    // Test 2 (B18): the spec is reset back to `pending` in the same pass —
+    // its completed work is preserved by the worktree/commits, not by its
+    // status, and leaving it `running` would make it invisible to pool
+    // selection (`pool_next_pending_spec_id` only ever picks `pending`).
     let spec_after = db.get_loop_spec(&spec.id).unwrap().unwrap();
-    assert_eq!(spec_after.status, LoopSpecStatus::Running);
+    assert_eq!(spec_after.status, LoopSpecStatus::Pending);
+    assert_eq!(spec_after.started_at, None);
+    assert_eq!(spec_after.spec_start_head, None);
+}
+
+/// B18: the real incident — a pool-driven run's in-flight member (a
+/// standalone spec, `loop_id: None`, never bound to the loop that's
+/// currently running it) must be reset to `pending` exactly like a
+/// loop-bound spec is. Left `running`, it would be invisible to
+/// `pool_next_pending_spec_id` (which only ever picks `pending` members)
+/// forever — the orphan this whole fix exists to prevent.
+#[test]
+fn reconcile_orphaned_loops_resets_pool_member_spec_to_pending() {
+    let db = test_db();
+    let mut lp = sample_loop("wf-orphan-pool");
+    lp.status = LoopStatus::Running;
+    lp.active_run_pool_id = Some("pool-1".to_string());
+    db.insert_loop(&lp).unwrap();
+
+    let mut spec = sample_loop_spec("unused-loop-id", "spec-orphan-pool", 1);
+    spec.loop_id = None; // pool membership never binds the spec to a loop
+    spec.status = LoopSpecStatus::Running;
+    db.insert_loop_spec(&spec).unwrap();
+    db.insert_pool(&Pool {
+        id: "pool-1".to_string(),
+        name: "pool-1".to_string(),
+        created_at: Utc::now(),
+    })
+    .unwrap();
+    db.append_pool_member("pool-1", &spec.id).unwrap();
+
+    let node = sample_loop_node(&spec.id, "node-orphan-pool", 1);
+    db.insert_loop_node(&node).unwrap();
+    db.insert_loop_run(&LoopNodeRun {
+        id: "run-orphan-pool".to_string(),
+        loop_id: lp.id.clone(),
+        spec_id: spec.id.clone(),
+        node_id: node.id,
+        status: LoopRunStatus::Running,
+        input: None,
+        output: None,
+        started_at: Utc::now(),
+        completed_at: None,
+        iteration: 1,
+        pid: None,
+        boot_id: None,
+    })
+    .unwrap();
+
+    assert_eq!(db.reconcile_orphaned_loops().unwrap(), 1);
+
+    let lp_after = db.get_loop(&lp.id).unwrap().unwrap();
+    assert_eq!(lp_after.status, LoopStatus::Paused);
+    let spec_after = db.get_loop_spec(&spec.id).unwrap().unwrap();
+    assert_eq!(spec_after.status, LoopSpecStatus::Pending);
+    // The pool's live pick can now find it again.
+    assert_eq!(
+        db.pool_next_pending_spec_id("pool-1").unwrap().as_deref(),
+        Some(spec.id.as_str())
+    );
+}
+
+/// R3 (B18): the defensive selection safety net. A pool member left
+/// `running` with no `loop_runs` row proving it's still live in *this*
+/// daemon's lifetime must be flagged as stale — but a member whose `running`
+/// node run really does carry the current boot id (i.e. genuinely still in
+/// flight right now) must not be.
+#[test]
+fn pool_stale_running_members_flags_only_the_member_with_no_live_run() {
+    let db = test_db();
+    let lp = sample_loop("wf-pool-stale");
+    db.insert_loop(&lp).unwrap();
+
+    let mut stale = sample_loop_spec("unused-loop-id", "spec-stale", 1);
+    stale.loop_id = None;
+    stale.status = LoopSpecStatus::Running;
+    let mut live = sample_loop_spec("unused-loop-id", "spec-live", 2);
+    live.loop_id = None;
+    live.status = LoopSpecStatus::Running;
+    db.insert_loop_spec(&stale).unwrap();
+    db.insert_loop_spec(&live).unwrap();
+
+    db.insert_pool(&Pool {
+        id: "pool-1".to_string(),
+        name: "pool-1".to_string(),
+        created_at: Utc::now(),
+    })
+    .unwrap();
+    db.append_pool_member("pool-1", &stale.id).unwrap();
+    db.append_pool_member("pool-1", &live.id).unwrap();
+
+    // `live`'s node run genuinely belongs to the current daemon's boot.
+    let node = sample_loop_node(&live.id, "node-live", 1);
+    db.insert_loop_node(&node).unwrap();
+    db.insert_loop_run(&LoopNodeRun {
+        id: "run-live".to_string(),
+        loop_id: lp.id,
+        spec_id: live.id,
+        node_id: node.id,
+        status: LoopRunStatus::Running,
+        input: None,
+        output: None,
+        started_at: Utc::now(),
+        completed_at: None,
+        iteration: 1,
+        pid: None,
+        boot_id: Some("boot-current".to_string()),
+    })
+    .unwrap();
+
+    let stale_members = db
+        .pool_stale_running_members("pool-1", Some("boot-current"))
+        .unwrap();
+    assert_eq!(stale_members, vec![stale.id]);
 }
 
 #[test]

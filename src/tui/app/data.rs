@@ -256,6 +256,22 @@ impl App {
                         send.id
                     );
                 }
+                // Also surface it as the project's last prompt so Ctrl+L in
+                // the prompt builder recovers it (U8). Only the flattened
+                // text is available here — the builder that composed it is
+                // long gone by the time this fires.
+                if let Some(workdir) = send.workdir.as_deref() {
+                    let id = format!("lp-{}", uuid::Uuid::new_v4());
+                    if let Err(e) =
+                        self.db
+                            .insert_last_prompt(&id, workdir, &send.prompt, None, now)
+                    {
+                        tracing::warn!(
+                            "Failed to record last prompt for failed send '{}': {e}",
+                            send.id
+                        );
+                    }
+                }
                 crate::domain::notification::send_notification(
                     "Scheduled send: session not found",
                     &format!(
@@ -272,5 +288,75 @@ impl App {
                 tracing::warn!("Failed to delete scheduled send '{}': {e}", send.id);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::App;
+    use crate::db::Database;
+    use std::sync::Arc;
+    use tempfile::{tempdir, NamedTempFile};
+
+    fn test_app() -> (App, tempfile::TempDir) {
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).expect("create test db"));
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(db, data_dir.path()).expect("create app");
+        (app, data_dir)
+    }
+
+    /// U7's dead-target path (no live interactive session matches the
+    /// scheduled send's target) must not just preserve the prompt in
+    /// `failed_scheduled_sends` — it must also surface it as the project's
+    /// last prompt so Ctrl+L (U8) can recover it, since the builder that
+    /// composed it is long gone by delivery time.
+    #[test]
+    fn dead_target_scheduled_send_becomes_the_projects_last_prompt() {
+        let (mut app, _dir) = test_app();
+        let workdir = "/home/user/dead-target-project";
+        let fire_at = chrono::Utc::now() - chrono::Duration::minutes(1);
+
+        app.db
+            .insert_scheduled_send(
+                "ss-dead-1",
+                "please recover me",
+                "session-that-no-longer-exists",
+                Some(workdir),
+                fire_at,
+            )
+            .expect("insert scheduled send");
+
+        // No interactive agents registered, so the target cannot be alive.
+        assert!(app.interactive_agents.is_empty());
+
+        app.deliver_due_scheduled_sends();
+
+        let last = app
+            .db
+            .get_last_prompt_for_workdir(workdir)
+            .expect("query last prompt")
+            .expect("last prompt recorded for the dead-target workdir");
+        assert_eq!(last.prompt_text, "please recover me");
+        // Only the flattened text survives a dead-target recovery — the
+        // builder that composed it no longer exists at delivery time.
+        assert!(last.builder_state.is_none());
+
+        // The scheduled send itself must not remain (it fired once, whether
+        // delivered or preserved) and it should also be visible in the
+        // failed-sends table for the workdir.
+        assert!(app
+            .db
+            .list_due_scheduled_sends(chrono::Utc::now())
+            .expect("list due")
+            .is_empty());
+        let failed = app
+            .db
+            .list_failed_scheduled_sends_for_workdir(workdir)
+            .expect("list failed");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].prompt, "please recover me");
     }
 }

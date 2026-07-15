@@ -4,22 +4,50 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 use tokio::process::Command;
+use tokio::sync::Semaphore;
 
 use crate::application::notification_service::{LoopFinishOutcome, NotificationService};
 use crate::daemon::process::KILL_GRACE;
 use crate::db::Database;
 use crate::domain::loops::{
-    LoopEdge, LoopNode, LoopNodeKind, LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus,
-    LoopStatus,
+    EnsembleDetails, EnsembleMember, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind,
+    LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus,
 };
 use crate::domain::models::Cli;
 
 const DEFAULT_MAX_ITERATIONS_PER_NODE: usize = 10;
 
+/// Default cap (F1) on ensemble members actually executing at once, across
+/// every loop run this engine drives — an 8-member ensemble queues past this
+/// many rather than fork-bombing the host. Overridable via
+/// [`LoopEngine::with_ensemble_concurrency_cap`]
+/// (`CanopyConfig::ensemble_concurrency_cap`).
+const DEFAULT_ENSEMBLE_CONCURRENCY_CAP: usize = 4;
+
 #[derive(Clone)]
 pub struct LoopEngine {
     db: Arc<Database>,
     notification_service: Arc<dyn NotificationService>,
+    /// Global semaphore (F1) bounding how many ensemble members run
+    /// concurrently across every loop this engine drives. Shared (not
+    /// per-run) so an 8-member ensemble in one loop can't starve another
+    /// loop's ensemble running at the same time — they queue for the same
+    /// pool of permits.
+    ensemble_concurrency: Arc<Semaphore>,
+}
+
+/// Where a spec's sequential graph cursor currently is: at a single ordinary
+/// node, or about to fan out into (or having just fanned out into) an
+/// ensemble's members. The cursor is a single value at all times — a spec
+/// never has two of these in flight — which is what lets `run_spec`'s loop
+/// stay a plain `loop { ... }` even though an `Ensemble` step internally runs
+/// N member nodes concurrently before it resolves to a single result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SpecCursor {
+    Node(String),
+    /// Ensemble id — resolves to the join's own [`NodeExecution`] once every
+    /// member has terminated (F1's wait-all join).
+    Ensemble(String),
 }
 
 enum SpecExecutionOutcome {
@@ -62,7 +90,17 @@ impl LoopEngine {
         Self {
             db,
             notification_service,
+            ensemble_concurrency: Arc::new(Semaphore::new(DEFAULT_ENSEMBLE_CONCURRENCY_CAP)),
         }
+    }
+
+    /// Override the default ensemble concurrency cap (F1) — e.g. from
+    /// `CanopyConfig::ensemble_concurrency_cap` at daemon startup. `cap` is
+    /// floored at 1 so a misconfigured `0` can't wedge every ensemble join
+    /// forever.
+    pub fn with_ensemble_concurrency_cap(mut self, cap: usize) -> Self {
+        self.ensemble_concurrency = Arc::new(Semaphore::new(cap.max(1)));
+        self
     }
 
     pub fn start_background(self: Arc<Self>, loop_id: String) {
@@ -244,37 +282,67 @@ impl LoopEngine {
         let mut completed_specs: Vec<(String, String)> = Vec::new();
 
         match &pool_id {
-            Some(pool_id) => loop {
-                if self.is_paused(&loop_id)? {
-                    return Ok(());
-                }
-                // Live pick: fresh query, not a frozen list. Only ever
-                // returns a spec whose status is `pending` (defense in
-                // depth — even if the pool's stored order were ever
-                // corrupted to place a running/completed member where a
-                // pending one belongs, this filter still won't pick it).
-                let Some(spec_id) = self.db.pool_next_pending_spec_id(pool_id)? else {
-                    break;
-                };
-                let Some(spec) = self.db.get_loop_spec(&spec_id)? else {
-                    continue;
-                };
-
-                match self
-                    .run_spec(&lp, &spec, &workdir, is_resume, Some(pool_id.as_str()))
-                    .await?
+            Some(pool_id) => {
+                // R3 (B18): a pool member can be left `running` with no live
+                // node run behind it by a path G2 boot reconcile never
+                // touches (reconcile only reconciles a loop that was itself
+                // `Running` at boot — see `reconcile_orphaned_loops`). Surface
+                // it here, before the live pick loop starts scanning, so an
+                // operator can see it — but never auto-reset it: a spec can
+                // legitimately sit `running` with no matching `loop_runs` row
+                // for a moment (between two node executions), and this check
+                // can't tell that race apart from a genuine crash-orphan.
+                // Auto-resetting would risk yanking a spec out from under a
+                // dispatch that's still actively working it. Recovery stays
+                // the documented manual path: `loop_reset` (see
+                // `pool_has_incomplete_members`'s own guard below, which
+                // leaves the loop `running` rather than completing out from
+                // under a member stuck like this).
+                for spec_id in self
+                    .db
+                    .pool_stale_running_members(pool_id, crate::system::boot_id().as_deref())?
                 {
-                    SpecExecutionOutcome::Completed { summary } => {
-                        completed_specs.push((spec.name.clone(), summary));
-                        continue;
-                    }
-                    SpecExecutionOutcome::Paused => return Ok(()),
-                    SpecExecutionOutcome::Failed(summary) => {
-                        self.fail_loop(&loop_id, Some(&spec.name), &summary)?;
+                    tracing::warn!(
+                        "Loop '{}' pool run against '{}': member spec '{}' is 'running' with no \
+                         live node run in this daemon's lifetime; leaving it as-is. Reset it via \
+                         loop_reset to resume if it's genuinely stuck.",
+                        loop_id,
+                        pool_id,
+                        spec_id
+                    );
+                }
+                loop {
+                    if self.is_paused(&loop_id)? {
                         return Ok(());
                     }
+                    // Live pick: fresh query, not a frozen list. Only ever
+                    // returns a spec whose status is `pending` (defense in
+                    // depth — even if the pool's stored order were ever
+                    // corrupted to place a running/completed member where a
+                    // pending one belongs, this filter still won't pick it).
+                    let Some(spec_id) = self.db.pool_next_pending_spec_id(pool_id)? else {
+                        break;
+                    };
+                    let Some(spec) = self.db.get_loop_spec(&spec_id)? else {
+                        continue;
+                    };
+
+                    match self
+                        .run_spec(&lp, &spec, &workdir, is_resume, Some(pool_id.as_str()))
+                        .await?
+                    {
+                        SpecExecutionOutcome::Completed { summary } => {
+                            completed_specs.push((spec.name.clone(), summary));
+                            continue;
+                        }
+                        SpecExecutionOutcome::Paused => return Ok(()),
+                        SpecExecutionOutcome::Failed(summary) => {
+                            self.fail_loop(&loop_id, Some(&spec.name), &summary)?;
+                            return Ok(());
+                        }
+                    }
                 }
-            },
+            }
             None => {
                 for spec in self.db.list_loop_specs(&loop_id)? {
                     if self.is_paused(&loop_id)? {
@@ -622,32 +690,37 @@ impl LoopEngine {
         // A spec with its own graph always uses it (full backwards
         // compatibility). Only a spec with no nodes of its own falls back to
         // the loop-level graph, so the same graph can drive every spec in
-        // the loop without repeating it per spec.
-        let (nodes, edges): (&[LoopNode], &[LoopEdge]) = if !spec_details.nodes.is_empty() {
-            (&spec_details.nodes, &spec_details.edges)
-        } else if !graph_nodes.is_empty() {
-            (&graph_nodes, &graph_edges)
-        } else {
-            let summary = format!(
+        // the loop without repeating it per spec. Ensembles (F1) follow the
+        // exact same precedence — a spec-level ensemble only exists when the
+        // spec has its own graph, so it's fetched alongside it.
+        let (nodes, edges, ensembles): (&[LoopNode], &[LoopEdge], Vec<EnsembleDetails>) =
+            if !spec_details.nodes.is_empty() {
+                let ensembles = self.db.list_ensembles_for_spec(&spec.id)?;
+                (&spec_details.nodes, &spec_details.edges, ensembles)
+            } else if !graph_nodes.is_empty() {
+                let ensembles = self.db.list_ensembles_for_loop(&lp.id)?;
+                (&graph_nodes, &graph_edges, ensembles)
+            } else {
+                let summary = format!(
                 "Spec '{}' has no nodes of its own and loop '{}' has no loop-level graph to fall back to.",
                 spec.name, lp.name
             );
-            self.db.update_loop_spec_status(
-                &spec.id,
-                LoopSpecStatus::Failed,
-                Some(chrono::Utc::now()),
-                Some(chrono::Utc::now()),
-            )?;
-            return Ok(SpecExecutionOutcome::Failed(summary));
-        };
+                self.db.update_loop_spec_status(
+                    &spec.id,
+                    LoopSpecStatus::Failed,
+                    Some(chrono::Utc::now()),
+                    Some(chrono::Utc::now()),
+                )?;
+                return Ok(SpecExecutionOutcome::Failed(summary));
+            };
 
         let nodes_by_id = nodes
             .iter()
             .map(|node| (node.id.as_str(), node))
             .collect::<HashMap<_, _>>();
         let existing_runs = self.db.list_loop_runs_for_spec(&spec.id)?;
-        let (mut current_node_id, mut previous_output, mut iterations) =
-            resolve_spec_start(nodes, edges, spec, &existing_runs)?;
+        let (mut cursor, mut previous_output, mut iterations) =
+            resolve_spec_start(nodes, edges, spec, &existing_runs, &ensembles)?;
 
         // Capture the workdir's git HEAD once, at the moment the engine
         // starts executing this spec in the *current run attempt* — never
@@ -701,21 +774,27 @@ impl LoopEngine {
                 return Ok(SpecExecutionOutcome::Paused);
             }
 
-            // Reap a `running` row left by a prior attempt at this exact node
-            // that was never finalized (crashed mid-execution, daemon
-            // restarted before its own timeout handler ran, etc.) — B12.
-            // Execution here is strictly sequential (one node run in flight
-            // per spec at a time), so anything still `running` for this
-            // node_id at this point can only be a leftover, never the
-            // legitimately active run: this iteration's own row doesn't
-            // exist yet. Left alone, its process (if any) would be abandoned
-            // right here and its stale pid would confuse this attempt's own
-            // bookkeeping.
-            if let Some(stale) = self.db.get_active_loop_run_for_node(&current_node_id)? {
-                self.terminate_run(&stale, "superseded by a new attempt at this node");
+            let budget_key = match &cursor {
+                SpecCursor::Node(node_id) => node_id.clone(),
+                SpecCursor::Ensemble(ensemble_id) => format!("ensemble:{ensemble_id}"),
+            };
+
+            // Reap a `running` row left by a prior attempt at this exact
+            // node/ensemble that was never finalized (crashed mid-execution,
+            // daemon restarted before its own timeout handler ran, etc.) —
+            // B12. Execution here is strictly sequential (one cursor step in
+            // flight per spec at a time — an `Ensemble` step's own members
+            // run concurrently with each other, but never alongside another
+            // step), so anything still `running` at this point can only be a
+            // leftover, never the legitimately active run: this iteration's
+            // own rows don't exist yet.
+            for node_id in cursor_node_ids(&cursor, &ensembles) {
+                if let Some(stale) = self.db.get_active_loop_run_for_node(&node_id)? {
+                    self.terminate_run(&stale, "superseded by a new attempt at this node");
+                }
             }
 
-            let iteration = iterations.entry(current_node_id.clone()).or_insert(0);
+            let iteration = iterations.entry(budget_key).or_insert(0);
             *iteration += 1;
             if *iteration > DEFAULT_MAX_ITERATIONS_PER_NODE {
                 // B12: the process from the last execution at this node
@@ -730,8 +809,9 @@ impl LoopEngine {
                     self.terminate_run(&run, "iteration budget exhausted");
                 }
                 let summary = format!(
-                    "Spec '{}' exceeded max iterations for node '{}'.",
-                    spec.name, current_node_id
+                    "Spec '{}' exceeded max iterations for {}.",
+                    spec.name,
+                    cursor_label(&cursor, &ensembles)
                 );
                 self.db.update_loop_spec_status(
                     &spec.id,
@@ -741,80 +821,109 @@ impl LoopEngine {
                 )?;
                 return Ok(SpecExecutionOutcome::Failed(summary));
             }
+            let iteration_value = *iteration;
 
-            let node = nodes_by_id
-                .get(current_node_id.as_str())
-                .ok_or_else(|| anyhow!("Loop node '{}' not found.", current_node_id))?;
-            let run_id = uuid::Uuid::new_v4().to_string();
-            self.db.insert_loop_run(&LoopNodeRun {
-                id: run_id.clone(),
-                loop_id: lp.id.clone(),
-                spec_id: spec.id.clone(),
-                node_id: node.id.clone(),
-                status: LoopRunStatus::Running,
-                input: previous_output.clone(),
-                output: None,
-                started_at: chrono::Utc::now(),
-                completed_at: None,
-                iteration: *iteration as i64,
-                pid: None,
-                boot_id: crate::system::boot_id(),
-            })?;
-            let execution = self
-                .execute_node(
-                    lp,
-                    spec,
-                    node,
-                    previous_output.as_ref(),
-                    spec_start_head.as_deref(),
-                    &run_id,
-                    workdir,
-                )
-                .await?;
-            let run = self
-                .db
-                .get_loop_run(&run_id)?
-                .ok_or_else(|| anyhow!("Loop run '{}' not found after execution.", run_id))?;
-            let final_execution = if run.status == LoopRunStatus::Running {
-                self.db.update_loop_run_result(
-                    &run_id,
-                    execution.status,
-                    Some(&execution.output),
-                    Some(chrono::Utc::now()),
-                )?;
-                execution
-            } else {
-                NodeExecution {
-                    status: run.status,
-                    output: run.output.unwrap_or_else(|| serde_json::json!({})),
-                    summary: execution.summary,
+            let (final_execution, from_node_id) = match &cursor {
+                SpecCursor::Node(node_id) => {
+                    let node = nodes_by_id
+                        .get(node_id.as_str())
+                        .ok_or_else(|| anyhow!("Loop node '{}' not found.", node_id))?;
+                    let run_id = uuid::Uuid::new_v4().to_string();
+                    self.db.insert_loop_run(&LoopNodeRun {
+                        id: run_id.clone(),
+                        loop_id: lp.id.clone(),
+                        spec_id: spec.id.clone(),
+                        node_id: node.id.clone(),
+                        status: LoopRunStatus::Running,
+                        input: previous_output.clone(),
+                        output: None,
+                        started_at: chrono::Utc::now(),
+                        completed_at: None,
+                        iteration: iteration_value as i64,
+                        pid: None,
+                        boot_id: crate::system::boot_id(),
+                    })?;
+                    let execution = self
+                        .execute_node(
+                            lp,
+                            spec,
+                            node,
+                            previous_output.as_ref(),
+                            spec_start_head.as_deref(),
+                            &run_id,
+                            workdir,
+                        )
+                        .await?;
+                    let run = self.db.get_loop_run(&run_id)?.ok_or_else(|| {
+                        anyhow!("Loop run '{}' not found after execution.", run_id)
+                    })?;
+                    let final_execution = if run.status == LoopRunStatus::Running {
+                        self.db.update_loop_run_result(
+                            &run_id,
+                            execution.status,
+                            Some(&execution.output),
+                            Some(chrono::Utc::now()),
+                        )?;
+                        execution
+                    } else {
+                        NodeExecution {
+                            status: run.status,
+                            output: run.output.unwrap_or_else(|| serde_json::json!({})),
+                            summary: execution.summary,
+                        }
+                    };
+
+                    if self.is_paused(&lp.id)? {
+                        return Ok(SpecExecutionOutcome::Paused);
+                    }
+
+                    if should_advance_to_next_spec(node, final_execution.status) {
+                        self.db.update_loop_spec_status(
+                            &spec.id,
+                            LoopSpecStatus::Completed,
+                            None,
+                            Some(chrono::Utc::now()),
+                        )?;
+                        self.notify_spec_completed(lp, spec, pool_id)?;
+                        return Ok(SpecExecutionOutcome::Completed {
+                            summary: final_execution.summary,
+                        });
+                    }
+
+                    (final_execution, node.id.clone())
+                }
+                SpecCursor::Ensemble(ensemble_id) => {
+                    let details = ensembles
+                        .iter()
+                        .find(|details| &details.ensemble.id == ensemble_id)
+                        .ok_or_else(|| anyhow!("Ensemble '{}' not found in graph.", ensemble_id))?;
+                    let final_execution = self
+                        .execute_ensemble(
+                            lp,
+                            spec,
+                            details,
+                            &nodes_by_id,
+                            previous_output.as_ref(),
+                            iteration_value,
+                            workdir,
+                        )
+                        .await?;
+
+                    if self.is_paused(&lp.id)? {
+                        return Ok(SpecExecutionOutcome::Paused);
+                    }
+
+                    (final_execution, details.ensemble.join_node_id.clone())
                 }
             };
 
-            if self.is_paused(&lp.id)? {
-                return Ok(SpecExecutionOutcome::Paused);
-            }
+            let next_step =
+                select_next_step(edges, &ensembles, &from_node_id, final_execution.status)?;
 
-            if should_advance_to_next_spec(node, final_execution.status) {
-                self.db.update_loop_spec_status(
-                    &spec.id,
-                    LoopSpecStatus::Completed,
-                    None,
-                    Some(chrono::Utc::now()),
-                )?;
-                self.notify_spec_completed(lp, spec, pool_id)?;
-                return Ok(SpecExecutionOutcome::Completed {
-                    summary: final_execution.summary,
-                });
-            }
-
-            let next_node_id =
-                select_next_node(edges, &node.id, final_execution.status)?.map(str::to_owned);
-
-            match next_node_id {
-                Some(next_node_id) => {
+            match next_step {
+                Some(step) => {
                     previous_output = Some(final_execution.output);
-                    current_node_id = next_node_id;
+                    cursor = step;
                 }
                 None if final_execution.status == LoopRunStatus::Pass => {
                     self.db.update_loop_spec_status(
@@ -841,6 +950,222 @@ impl LoopEngine {
         }
     }
 
+    /// Run an ensemble's members concurrently (F1), wait for every one of
+    /// them to terminate (pass, fail, or straggler timeout — never early),
+    /// and consolidate their outputs into the join's own [`NodeExecution`].
+    ///
+    /// Every member receives the exact same `previous_output` (the same
+    /// input, in parallel — the defining shape of an ensemble). Concurrency
+    /// is bounded by `self.ensemble_concurrency`, a semaphore shared across
+    /// every loop this engine drives, so an 8-member ensemble queues past the
+    /// cap rather than spawning all 8 processes at once.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_ensemble(
+        &self,
+        lp: &crate::domain::loops::Loop,
+        spec: &LoopSpec,
+        details: &EnsembleDetails,
+        nodes_by_id: &HashMap<&str, &LoopNode>,
+        previous_output: Option<&Value>,
+        iteration: usize,
+        workdir: &str,
+    ) -> Result<NodeExecution> {
+        let ensemble = &details.ensemble;
+        // 0 is a legitimate value (mirrors `run_agent_process`'s own
+        // `timeout_minutes`) — minute-granular timeouts otherwise have no way
+        // to force an immediate one in a fast test.
+        let straggler_minutes = ensemble.effective_straggler_timeout_minutes().max(0) as u64;
+
+        let mut set = tokio::task::JoinSet::new();
+        for member in &details.members {
+            let node = (*nodes_by_id
+                .get(member.node_id.as_str())
+                .ok_or_else(|| anyhow!("Ensemble member node '{}' not found.", member.node_id))?)
+            .clone();
+            let run_id = uuid::Uuid::new_v4().to_string();
+            self.db.insert_loop_run(&LoopNodeRun {
+                id: run_id.clone(),
+                loop_id: lp.id.clone(),
+                spec_id: spec.id.clone(),
+                node_id: node.id.clone(),
+                status: LoopRunStatus::Running,
+                input: previous_output.cloned(),
+                output: None,
+                started_at: chrono::Utc::now(),
+                completed_at: None,
+                iteration: iteration as i64,
+                pid: None,
+                boot_id: crate::system::boot_id(),
+            })?;
+
+            let db = Arc::clone(&self.db);
+            let lp = lp.clone();
+            let spec = spec.clone();
+            let previous_output = previous_output.cloned();
+            let workdir = workdir.to_string();
+            let semaphore = Arc::clone(&self.ensemble_concurrency);
+            let label = member_label(member);
+
+            set.spawn(async move {
+                let _permit = semaphore
+                    .acquire_owned()
+                    .await
+                    .expect("ensemble concurrency semaphore is never closed");
+                let outcome = tokio::time::timeout(
+                    std::time::Duration::from_secs(straggler_minutes * 60),
+                    execute_agent_node(&db, &lp, &spec, &node, previous_output.as_ref(), &run_id, &workdir),
+                )
+                .await;
+
+                let execution = match outcome {
+                    Ok(Ok(execution)) => match db.get_loop_run(&run_id) {
+                        Ok(Some(run)) if run.status == LoopRunStatus::Running => {
+                            let _ = db.update_loop_run_result(
+                                &run_id,
+                                execution.status,
+                                Some(&execution.output),
+                                Some(chrono::Utc::now()),
+                            );
+                            execution
+                        }
+                        Ok(Some(run)) => NodeExecution {
+                            status: run.status,
+                            output: run.output.unwrap_or_else(|| serde_json::json!({})),
+                            summary: execution.summary,
+                        },
+                        _ => execution,
+                    },
+                    // `execute_agent_node`'s own internal timeout already
+                    // killed the process and finalized the row as `Fail`
+                    // before bailing (see `run_agent_process`) — reuse that
+                    // finalized output rather than re-deriving it.
+                    Ok(Err(error)) => {
+                        let output = db
+                            .get_loop_run(&run_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|run| run.output)
+                            .unwrap_or_else(|| serde_json::json!({ "error": error.to_string() }));
+                        NodeExecution {
+                            status: LoopRunStatus::Fail,
+                            output,
+                            summary: format!(
+                                "Ensemble member '{}' failed: {error}",
+                                node.name
+                            ),
+                        }
+                    }
+                    // This ensemble's own straggler timeout elapsed before
+                    // the member's own agent timeout did (or the process is
+                    // hung past both) — the process is still running, so
+                    // kill it ourselves (B12) rather than waiting further.
+                    Err(_elapsed) => {
+                        if let Ok(Some(run)) = db.get_loop_run(&run_id) {
+                            terminate_run_row(&db, &run, "ensemble straggler timeout");
+                        }
+                        NodeExecution {
+                            status: LoopRunStatus::Fail,
+                            output: serde_json::json!({
+                                "kind": "agent",
+                                "node_id": node.id,
+                                "error": "straggler timeout",
+                                "straggler_timeout_minutes": straggler_minutes,
+                            }),
+                            summary: format!(
+                                "Ensemble member '{}' killed: straggler timeout after {straggler_minutes}m.",
+                                node.name
+                            ),
+                        }
+                    }
+                };
+                (node.id, label, execution)
+            });
+        }
+
+        // Wait-all (F1): drain every task before consolidating, regardless
+        // of arrival order, so the join can never fire while a member is
+        // still in flight.
+        let mut results: HashMap<String, (String, NodeExecution)> = HashMap::new();
+        while let Some(joined) = set.join_next().await {
+            let (node_id, label, execution) =
+                joined.map_err(|error| anyhow!("Ensemble member task panicked: {error}"))?;
+            results.insert(node_id, (label, execution));
+        }
+
+        let mut passed = 0i64;
+        let mut consolidated_doc = String::new();
+        let mut member_summaries = Vec::with_capacity(details.members.len());
+        for member in &details.members {
+            let (label, execution) = results.remove(&member.node_id).ok_or_else(|| {
+                anyhow!(
+                    "Ensemble member '{}' produced no result after wait-all.",
+                    member.node_id
+                )
+            })?;
+            let status_label = if execution.status == LoopRunStatus::Pass {
+                passed += 1;
+                "pass"
+            } else {
+                "fail"
+            };
+            consolidated_doc.push_str(&format!(
+                "## {label} [{status_label}]\n\n{}\n\n",
+                member_output_text(&execution.output)
+            ));
+            member_summaries.push(serde_json::json!({
+                "node_id": member.node_id,
+                "platform": member.platform,
+                "model": member.model,
+                "status": status_label,
+                "output": execution.output,
+            }));
+        }
+
+        let join_status = if passed >= ensemble.min_pass {
+            LoopRunStatus::Pass
+        } else {
+            LoopRunStatus::Fail
+        };
+        let join_output = serde_json::json!({
+            "kind": "join",
+            "ensemble_id": ensemble.id,
+            "members": member_summaries,
+            "passed": passed,
+            "min_pass": ensemble.min_pass,
+            "consolidated_doc": consolidated_doc,
+        });
+        self.db.insert_loop_run(&LoopNodeRun {
+            id: uuid::Uuid::new_v4().to_string(),
+            loop_id: lp.id.clone(),
+            spec_id: spec.id.clone(),
+            node_id: ensemble.join_node_id.clone(),
+            status: join_status,
+            input: previous_output.cloned(),
+            output: Some(join_output.clone()),
+            started_at: chrono::Utc::now(),
+            completed_at: Some(chrono::Utc::now()),
+            iteration: iteration as i64,
+            pid: None,
+            boot_id: crate::system::boot_id(),
+        })?;
+
+        Ok(NodeExecution {
+            status: join_status,
+            output: join_output,
+            summary: format!(
+                "Ensemble '{}' {} ({}/{} passed).",
+                ensemble.name,
+                if join_status == LoopRunStatus::Pass {
+                    "passed"
+                } else {
+                    "failed"
+                },
+                passed,
+                details.members.len(),
+            ),
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn execute_node(
         &self,
@@ -860,6 +1185,14 @@ impl LoopEngine {
             LoopNodeKind::Agent => {
                 execute_agent_node(&self.db, lp, spec, node, previous_output, run_id, workdir).await
             }
+            // A join node (F1) never reaches the single-node path: `run_spec`
+            // detects the fan-out into its ensemble before this would ever be
+            // called and runs `execute_ensemble` instead. This arm exists
+            // only so the match stays exhaustive against future callers.
+            LoopNodeKind::Join => bail!(
+                "Join node '{}' cannot execute directly; it only runs as part of ensemble fan-out.",
+                node.name
+            ),
         }
     }
 
@@ -872,15 +1205,7 @@ impl LoopEngine {
     /// status/summary update if `run` never got a pid recorded (e.g. a gate
     /// node, or an agent/check node that hadn't finished spawning yet).
     fn terminate_run(&self, run: &LoopNodeRun, reason: &str) {
-        if let Some(pid) = run.pid {
-            crate::daemon::process::terminate_process_group_async(pid, KILL_GRACE);
-        }
-        let _ = self.db.update_loop_run_result(
-            &run.id,
-            LoopRunStatus::Fail,
-            Some(&serde_json::json!({ "terminated": true, "reason": reason })),
-            Some(chrono::Utc::now()),
-        );
+        terminate_run_row(&self.db, run, reason);
     }
 
     fn is_paused(&self, loop_id: &str) -> Result<bool> {
@@ -1489,22 +1814,29 @@ fn find_entry_node(nodes: &[LoopNode], edges: &[LoopEdge], spec_name: &str) -> R
     }
 }
 
-fn select_next_node<'a>(
-    edges: &'a [LoopEdge],
+/// Resolve the next graph step from `from_node`'s outgoing edges matching
+/// `status`. Ordinarily a single matching edge (or several identical-target
+/// edges) resolves to [`SpecCursor::Node`]. Multiple *distinct* targets are
+/// ambiguous — unless they are exactly one ensemble's full member set, in
+/// which case this is F1's fan-out point and resolves to
+/// [`SpecCursor::Ensemble`] instead of erroring.
+fn select_next_step(
+    edges: &[LoopEdge],
+    ensembles: &[EnsembleDetails],
     from_node: &str,
     status: LoopRunStatus,
-) -> Result<Option<&'a str>> {
+) -> Result<Option<SpecCursor>> {
     let matching = edges
         .iter()
         .filter(|edge| edge.from_node == from_node)
         .filter(|edge| match status {
             LoopRunStatus::Pass => {
-                edge.condition == crate::domain::loops::LoopEdgeCondition::Pass
-                    || edge.condition == crate::domain::loops::LoopEdgeCondition::Always
+                edge.condition == LoopEdgeCondition::Pass
+                    || edge.condition == LoopEdgeCondition::Always
             }
             LoopRunStatus::Fail => {
-                edge.condition == crate::domain::loops::LoopEdgeCondition::Fail
-                    || edge.condition == crate::domain::loops::LoopEdgeCondition::Always
+                edge.condition == LoopEdgeCondition::Fail
+                    || edge.condition == LoopEdgeCondition::Always
             }
             LoopRunStatus::Running => false,
         })
@@ -1512,18 +1844,104 @@ fn select_next_node<'a>(
 
     match matching.as_slice() {
         [] => Ok(None),
-        [edge] => Ok(Some(edge.to_node.as_str())),
+        [edge] => Ok(Some(SpecCursor::Node(edge.to_node.clone()))),
         _ => {
             let distinct_targets = matching
                 .iter()
                 .map(|edge| edge.to_node.as_str())
                 .collect::<HashSet<_>>();
-            match distinct_targets.into_iter().collect::<Vec<_>>().as_slice() {
-                [to_node] => Ok(Some(*to_node)),
-                _ => bail!("Node '{}' has ambiguous outgoing edges.", from_node),
+            if distinct_targets.len() == 1 {
+                let to_node = *distinct_targets.iter().next().expect("len == 1");
+                return Ok(Some(SpecCursor::Node(to_node.to_string())));
             }
+            for details in ensembles {
+                let member_ids: HashSet<&str> = details
+                    .members
+                    .iter()
+                    .map(|member| member.node_id.as_str())
+                    .collect();
+                if member_ids == distinct_targets {
+                    return Ok(Some(SpecCursor::Ensemble(details.ensemble.id.clone())));
+                }
+            }
+            bail!("Node '{}' has ambiguous outgoing edges.", from_node)
         }
     }
+}
+
+/// Every node id belonging to a cursor step — one for [`SpecCursor::Node`],
+/// or every member plus the join for [`SpecCursor::Ensemble`]. Used to reap
+/// stale `running` rows (B12) across a whole ensemble fan-out, not just one
+/// node.
+fn cursor_node_ids(cursor: &SpecCursor, ensembles: &[EnsembleDetails]) -> Vec<String> {
+    match cursor {
+        SpecCursor::Node(node_id) => vec![node_id.clone()],
+        SpecCursor::Ensemble(ensemble_id) => ensembles
+            .iter()
+            .find(|details| &details.ensemble.id == ensemble_id)
+            .map(|details| {
+                details
+                    .members
+                    .iter()
+                    .map(|member| member.node_id.clone())
+                    .chain(std::iter::once(details.ensemble.join_node_id.clone()))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// Human-readable label for a cursor step, for failure summaries.
+fn cursor_label(cursor: &SpecCursor, ensembles: &[EnsembleDetails]) -> String {
+    match cursor {
+        SpecCursor::Node(node_id) => format!("node '{node_id}'"),
+        SpecCursor::Ensemble(ensemble_id) => ensembles
+            .iter()
+            .find(|details| &details.ensemble.id == ensemble_id)
+            .map(|details| format!("ensemble '{}'", details.ensemble.name))
+            .unwrap_or_else(|| format!("ensemble '{ensemble_id}'")),
+    }
+}
+
+/// Best-effort termination (B12) of `run`'s OS process, if it still has one
+/// recorded, and finalization of its DB row as `Fail`. Free-function core of
+/// [`LoopEngine::terminate_run`] — also used by ensemble member tasks, which
+/// don't have a `&LoopEngine` to call the method on.
+fn terminate_run_row(db: &Database, run: &LoopNodeRun, reason: &str) {
+    if let Some(pid) = run.pid {
+        crate::daemon::process::terminate_process_group_async(pid, KILL_GRACE);
+    }
+    let _ = db.update_loop_run_result(
+        &run.id,
+        LoopRunStatus::Fail,
+        Some(&serde_json::json!({ "terminated": true, "reason": reason })),
+        Some(chrono::Utc::now()),
+    );
+}
+
+/// `"platform"` or `"platform/model"` — the label used in an ensemble's
+/// consolidated `"## <label> [pass|fail]"` sections and in the TUI's
+/// collapsed ensemble view.
+fn member_label(member: &EnsembleMember) -> String {
+    match member.model.as_deref().map(str::trim) {
+        Some(model) if !model.is_empty() => format!("{}/{}", member.platform, model),
+        _ => member.platform.clone(),
+    }
+}
+
+/// The human-readable text to carry into an ensemble's consolidated doc for
+/// one member's output — its stdout when it produced any, the recorded
+/// error when it didn't, else the raw output JSON.
+fn member_output_text(output: &Value) -> String {
+    if let Some(stdout) = output.get("stdout").and_then(Value::as_str) {
+        if !stdout.trim().is_empty() {
+            return stdout.to_string();
+        }
+    }
+    if let Some(error) = output.get("error").and_then(Value::as_str) {
+        return format!("(error: {error})");
+    }
+    serde_json::to_string_pretty(output).unwrap_or_default()
 }
 
 fn should_advance_to_next_spec(node: &LoopNode, status: LoopRunStatus) -> bool {
@@ -1692,24 +2110,57 @@ async fn capture_workdir_head(workdir: &str) -> Option<String> {
     (!head.is_empty()).then_some(head)
 }
 
+/// The ensemble id `node_id` belongs to, whether as a member or as the join
+/// itself — used both to resume onto [`SpecCursor::Ensemble`] (rather than a
+/// single member node) and to key the iteration budget per-ensemble instead
+/// of per-member.
+fn ensemble_owning_node(node_id: &str, ensembles: &[EnsembleDetails]) -> Option<String> {
+    ensembles
+        .iter()
+        .find(|details| {
+            details.ensemble.join_node_id == node_id
+                || details
+                    .members
+                    .iter()
+                    .any(|member| member.node_id == node_id)
+        })
+        .map(|details| details.ensemble.id.clone())
+}
+
 fn resolve_spec_start(
     nodes: &[LoopNode],
     edges: &[LoopEdge],
     spec: &LoopSpec,
     existing_runs: &[LoopNodeRun],
-) -> Result<(String, Option<Value>, HashMap<String, usize>)> {
+    ensembles: &[EnsembleDetails],
+) -> Result<(SpecCursor, Option<Value>, HashMap<String, usize>)> {
     if spec.status == LoopSpecStatus::Running {
         if let Some(last_run) = existing_runs.last() {
+            // An ensemble's N members (+ its join) each get their own
+            // `loop_runs` row sharing the same `iteration` number — dedupe
+            // on (budget key, iteration) so a bounce into the ensemble
+            // still counts as exactly one iteration (F1), not N+1.
             let mut iterations = HashMap::<String, usize>::new();
+            let mut seen = HashSet::<(String, i64)>::new();
             for run in existing_runs {
-                *iterations.entry(run.node_id.clone()).or_insert(0) += 1;
+                let key = match ensemble_owning_node(&run.node_id, ensembles) {
+                    Some(ensemble_id) => format!("ensemble:{ensemble_id}"),
+                    None => run.node_id.clone(),
+                };
+                if seen.insert((key.clone(), run.iteration)) {
+                    *iterations.entry(key).or_insert(0) += 1;
+                }
             }
-            return Ok((last_run.node_id.clone(), last_run.input.clone(), iterations));
+            let cursor = match ensemble_owning_node(&last_run.node_id, ensembles) {
+                Some(ensemble_id) => SpecCursor::Ensemble(ensemble_id),
+                None => SpecCursor::Node(last_run.node_id.clone()),
+            };
+            return Ok((cursor, last_run.input.clone(), iterations));
         }
     }
 
     Ok((
-        find_entry_node(nodes, edges, &spec.name)?,
+        SpecCursor::Node(find_entry_node(nodes, edges, &spec.name)?),
         None,
         HashMap::new(),
     ))
@@ -2460,10 +2911,10 @@ mod tests {
             boot_id: None,
         }];
 
-        let (node_id, previous_output, iterations) =
-            resolve_spec_start(&details.nodes, &details.edges, &spec, &runs).unwrap();
+        let (cursor, previous_output, iterations) =
+            resolve_spec_start(&details.nodes, &details.edges, &spec, &runs, &[]).unwrap();
 
-        assert_eq!(node_id, "node-1");
+        assert_eq!(cursor, SpecCursor::Node("node-1".to_string()));
         assert_eq!(iterations.get("node-1"), Some(&1));
         assert_eq!(
             previous_output.and_then(|value| value.get("previous").cloned()),
@@ -2519,10 +2970,10 @@ mod tests {
             })
             .collect();
 
-        let (node_id, previous_output, iterations) =
-            resolve_spec_start(&details.nodes, &details.edges, &spec, &runs).unwrap();
+        let (cursor, previous_output, iterations) =
+            resolve_spec_start(&details.nodes, &details.edges, &spec, &runs, &[]).unwrap();
 
-        assert_eq!(node_id, "node-1");
+        assert_eq!(cursor, SpecCursor::Node("node-1".to_string()));
         assert!(previous_output.is_none());
         assert!(iterations.is_empty());
     }
@@ -2874,7 +3325,7 @@ mod tests {
     }
 
     #[test]
-    fn select_next_node_dedupes_identical_edges_to_same_target() {
+    fn select_next_step_dedupes_identical_edges_to_same_target() {
         let edge = |id: &str, to: &str, condition| LoopEdge {
             id: id.to_string(),
             spec_id: Some("spec".to_string()),
@@ -2896,13 +3347,13 @@ mod tests {
             ),
         ];
 
-        let next = select_next_node(&edges, "implement", LoopRunStatus::Pass).unwrap();
+        let next = select_next_step(&edges, &[], "implement", LoopRunStatus::Pass).unwrap();
 
-        assert_eq!(next, Some("review"));
+        assert_eq!(next, Some(SpecCursor::Node("review".to_string())));
     }
 
     #[test]
-    fn select_next_node_errors_on_distinct_targets() {
+    fn select_next_step_errors_on_distinct_targets() {
         let edge = |id: &str, to: &str, condition| LoopEdge {
             id: id.to_string(),
             spec_id: Some("spec".to_string()),
@@ -2924,9 +3375,71 @@ mod tests {
             ),
         ];
 
-        let err = select_next_node(&edges, "implement", LoopRunStatus::Pass).unwrap_err();
+        let err = select_next_step(&edges, &[], "implement", LoopRunStatus::Pass).unwrap_err();
 
         assert!(err.to_string().contains("ambiguous outgoing edges"));
+    }
+
+    #[test]
+    fn select_next_step_resolves_ensemble_fan_out_from_ambiguous_edges() {
+        // Three edges from the same predecessor, all targeting distinct
+        // nodes — normally ambiguous, but here the distinct targets are
+        // exactly one ensemble's full member set, so this must resolve to
+        // the ensemble instead of erroring.
+        let edge = |id: &str, to: &str| LoopEdge {
+            id: id.to_string(),
+            spec_id: Some("spec".to_string()),
+            loop_id: None,
+            from_node: "kickoff".to_string(),
+            to_node: to.to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Always,
+        };
+        let edges = vec![edge("e1", "m1"), edge("e2", "m2"), edge("e3", "m3")];
+        let ensembles = vec![ensemble_details_fixture(
+            "ens1",
+            "join1",
+            &["m1", "m2", "m3"],
+        )];
+
+        let next = select_next_step(&edges, &ensembles, "kickoff", LoopRunStatus::Pass).unwrap();
+
+        assert_eq!(next, Some(SpecCursor::Ensemble("ens1".to_string())));
+    }
+
+    fn ensemble_details_fixture(
+        ensemble_id: &str,
+        join_node_id: &str,
+        member_node_ids: &[&str],
+    ) -> crate::domain::loops::EnsembleDetails {
+        crate::domain::loops::EnsembleDetails {
+            ensemble: crate::domain::loops::Ensemble {
+                id: ensemble_id.to_string(),
+                spec_id: Some("spec".to_string()),
+                loop_id: None,
+                name: "Proposers".to_string(),
+                prompt_template: "{{spec_content}}".to_string(),
+                join_node_id: join_node_id.to_string(),
+                entry_from_node: "kickoff".to_string(),
+                entry_condition: crate::domain::loops::LoopEdgeCondition::Always,
+                min_pass: member_node_ids.len() as i64,
+                straggler_timeout_minutes: None,
+                timeout_minutes: 30,
+                on_pass_to: "arbiter".to_string(),
+                on_fail_to: None,
+                created_at: chrono::Utc::now(),
+            },
+            members: member_node_ids
+                .iter()
+                .enumerate()
+                .map(|(i, node_id)| crate::domain::loops::EnsembleMember {
+                    ensemble_id: ensemble_id.to_string(),
+                    node_id: node_id.to_string(),
+                    position: i as i64,
+                    platform: "claude".to_string(),
+                    model: None,
+                })
+                .collect(),
+        }
     }
 
     fn second_spec(loop_id: &str, id: &str, position: i64) -> LoopSpec {
@@ -3321,6 +3834,115 @@ mod tests {
         assert_ne!(
             spec_a_after.spec_start_head.as_deref(),
             Some(initial_head.as_str())
+        );
+    }
+
+    /// B18, end to end: the real incident. A pool-driven run's in-flight
+    /// member is left `running` by a daemon restart — a dangling node run
+    /// with no live process behind it — while another member sits `pending`
+    /// right behind it in the queue. G2 boot reconcile must reset the
+    /// in-flight member back to `pending` in the same pass it interrupts the
+    /// dangling run, and the resumed dispatch (what `loop_continue`'s
+    /// `retry_current_node` triggers via `resume_background`, simulated here
+    /// by calling `run_loop_dispatch` directly with `is_resume: true`) must
+    /// pick the interrupted member up FIRST — never skip straight past it to
+    /// the next queued member, which is exactly how it got orphaned in the
+    /// 2026-07-14 incident.
+    #[tokio::test]
+    async fn loop_engine_restart_recovery_runs_interrupted_pool_spec_first() {
+        let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+        init_git_repo(dir.path());
+        let initial_head = git_head(dir.path());
+
+        let mut interrupted = standalone_spec("pool-interrupted", 1);
+        interrupted.status = LoopSpecStatus::Running;
+        let next = standalone_spec("pool-next", 2);
+        db.insert_loop_spec(&interrupted).unwrap();
+        db.insert_loop_spec(&next).unwrap();
+        insert_pool_with_members(&db, "pool-1", &[&interrupted.id, &next.id]);
+
+        db.update_loop_status(
+            &loop_id,
+            LoopStatus::Running,
+            Some(chrono::Utc::now()),
+            None,
+        )
+        .unwrap();
+        db.set_loop_active_run_pool(&loop_id, Some("pool-1"))
+            .unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "loop-check".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "echo committed >> log.txt && git add -A && git commit -q -m spec && printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        // The daemon-restart artifact: a node run stuck `running` for the
+        // in-flight spec, no live process behind it (no pid, no boot_id —
+        // exactly what a dead daemon leaves for reconcile to find).
+        db.insert_loop_run(&LoopNodeRun {
+            id: "run-interrupted".to_string(),
+            loop_id: loop_id.clone(),
+            spec_id: interrupted.id.clone(),
+            node_id: "loop-check".to_string(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+        })
+        .unwrap();
+
+        // G2 boot reconcile.
+        assert_eq!(db.reconcile_orphaned_loops().unwrap(), 1);
+        let lp_after_reconcile = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp_after_reconcile.status, LoopStatus::Paused);
+        let interrupted_after_reconcile = db.get_loop_spec(&interrupted.id).unwrap().unwrap();
+        assert_eq!(
+            interrupted_after_reconcile.status,
+            LoopSpecStatus::Pending,
+            "reconcile must reset the in-flight member back to pending, not leave it running"
+        );
+
+        // `loop_continue { retry_current_node }`: resume with the loop's
+        // persisted pool context, same as `resume_background`.
+        db.update_loop_status(&loop_id, LoopStatus::Running, None, None)
+            .unwrap();
+        engine
+            .run_loop_dispatch(loop_id.clone(), Some("pool-1".to_string()), None, true)
+            .await
+            .unwrap();
+
+        let lp_final = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp_final.status, LoopStatus::Completed);
+        let interrupted_final = db.get_loop_spec(&interrupted.id).unwrap().unwrap();
+        let next_final = db.get_loop_spec(&next.id).unwrap().unwrap();
+        assert_eq!(interrupted_final.status, LoopSpecStatus::Completed);
+        assert_eq!(next_final.status, LoopSpecStatus::Completed);
+
+        // The interrupted spec ran FIRST — against the pre-existing HEAD,
+        // before anything was committed — not skipped in favor of `next`.
+        assert_eq!(
+            interrupted_final.spec_start_head.as_deref(),
+            Some(initial_head.as_str()),
+            "the interrupted spec must be the first thing the resumed run picks up"
+        );
+        assert_ne!(
+            next_final.spec_start_head.as_deref(),
+            Some(initial_head.as_str()),
+            "the next queued member must still run, but only after the interrupted one"
         );
     }
 
@@ -3751,7 +4373,7 @@ mod tests {
     // ── E2BIG resilience: spawn failure routes through fail edge ──────
 
     /// Agent spawn failure produces the correct NodeExecution shape that
-    /// `select_next_node` can route. This tests the contract between
+    /// `select_next_step` can route. This tests the contract between
     /// `run_agent_process` (which catches E2BIG / spawn errors) and the
     /// graph router (which selects the next node based on status).
     #[tokio::test]
@@ -3768,7 +4390,7 @@ mod tests {
         .await
         .expect("spawn failure must not propagate as a hard error");
 
-        // The execution must be a Fail — exactly what select_next_node matches
+        // The execution must be a Fail — exactly what select_next_step matches
         // against the Fail edge condition.
         assert_eq!(execution.status, LoopRunStatus::Fail);
         assert!(execution.summary.contains("failed to spawn"));
@@ -4847,6 +5469,694 @@ mod tests {
             !marker.exists(),
             "grandchild process should have been killed by process-group termination; \
              marker file should not exist"
+        );
+    }
+
+    // ── F1: ensemble execution (execute_ensemble) ───────────────────────
+
+    /// Writes an executable POSIX shell script at `dir/name` with `body` as
+    /// its content and returns its absolute path. Used to give each
+    /// ensemble member deterministic, script-controlled pass/fail/hang
+    /// behavior — the member's actual prompt content is irrelevant (the
+    /// script ignores stdin/argv entirely), so this sidesteps having to
+    /// reverse-engineer `render_agent_prompt`'s wrapped output as a runnable
+    /// shell script.
+    fn write_member_script(dir: &std::path::Path, name: &str, body: &str) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path.to_string_lossy().to_string()
+    }
+
+    /// A fake `.canopy/config.toml` registering one CLI entry per
+    /// `(name, binary)` pair — lets each ensemble member run its own script
+    /// under its own `platform` name, so a single ensemble can exercise
+    /// pass/fail/hang members side by side in the same run.
+    fn setup_multi_cli_home(clis: &[(&str, &str)]) -> tempfile::TempDir {
+        let fake_home = tempfile::tempdir().unwrap();
+        let canopy_dir = fake_home.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        let config = crate::domain::canopy_config::CanopyConfig {
+            configured_at: Some(chrono::Utc::now().to_rfc3339()),
+            clis: clis
+                .iter()
+                .map(|(name, binary)| crate::domain::cli_config::CliConfig {
+                    name: name.to_string(),
+                    binary: binary.to_string(),
+                    headless_mode: String::new(),
+                    model_flag: None,
+                    supports_working_dir: false,
+                    working_dir_flag: None,
+                    env_vars: std::collections::HashMap::new(),
+                    interactive_args: None,
+                    fallback_interactive_args: None,
+                    resume_args: None,
+                    session_list_cmd: None,
+                    session_resume_cmd: None,
+                    accent_color: None,
+                    yolo_flag: None,
+                    prompt_via_stdin: true,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        config.save(&canopy_dir).unwrap();
+        fake_home
+    }
+
+    /// Builds a real ensemble unit (kickoff -> N members -> join -> pass/fail
+    /// exits) directly against the DB, the same shape `loop_add_ensemble`
+    /// assembles in one MCP call — but constructed here node-by-node so
+    /// engine tests can drive it through the real `execute_ensemble` path
+    /// via `LoopEngine::run_loop` without spinning up the MCP server.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_test_ensemble(
+        db: &Database,
+        spec_id: &str,
+        kickoff_id: &str,
+        ensemble_id: &str,
+        join_id: &str,
+        members: &[(&str, &str)], // (node_id, cli_platform_name)
+        min_pass: i64,
+        straggler_timeout_minutes: Option<i64>,
+        on_pass_to: &str,
+        on_fail_to: Option<&str>,
+    ) {
+        let now = chrono::Utc::now();
+
+        db.insert_loop_node(&LoopNode {
+            id: kickoff_id.to_string(),
+            spec_id: Some(spec_id.to_string()),
+            loop_id: None,
+            name: "kickoff".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf ok",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: now,
+        })
+        .unwrap();
+
+        let member_nodes: Vec<LoopNode> = members
+            .iter()
+            .enumerate()
+            .map(|(i, (node_id, platform))| LoopNode {
+                id: node_id.to_string(),
+                spec_id: Some(spec_id.to_string()),
+                loop_id: None,
+                name: format!("member-{}", i + 1),
+                kind: LoopNodeKind::Agent,
+                config: serde_json::json!({
+                    "platform": platform,
+                    "prompt_template": "ignored by the member's test script",
+                    "timeout_minutes": 5,
+                }),
+                position: 2 + i as i64,
+                created_at: now,
+            })
+            .collect();
+
+        let join_node = LoopNode {
+            id: join_id.to_string(),
+            spec_id: Some(spec_id.to_string()),
+            loop_id: None,
+            name: "join".to_string(),
+            kind: LoopNodeKind::Join,
+            config: serde_json::json!({ "ensemble_id": ensemble_id }),
+            position: 2 + members.len() as i64,
+            created_at: now,
+        };
+
+        let mut edges = Vec::new();
+        for (node_id, _) in members {
+            edges.push(LoopEdge {
+                id: format!("{kickoff_id}->{node_id}"),
+                spec_id: Some(spec_id.to_string()),
+                loop_id: None,
+                from_node: kickoff_id.to_string(),
+                to_node: node_id.to_string(),
+                condition: LoopEdgeCondition::Always,
+            });
+            edges.push(LoopEdge {
+                id: format!("{node_id}->{join_id}"),
+                spec_id: Some(spec_id.to_string()),
+                loop_id: None,
+                from_node: node_id.to_string(),
+                to_node: join_id.to_string(),
+                condition: LoopEdgeCondition::Always,
+            });
+        }
+        edges.push(LoopEdge {
+            id: format!("{join_id}->pass"),
+            spec_id: Some(spec_id.to_string()),
+            loop_id: None,
+            from_node: join_id.to_string(),
+            to_node: on_pass_to.to_string(),
+            condition: LoopEdgeCondition::Pass,
+        });
+        if let Some(fail_to) = on_fail_to {
+            edges.push(LoopEdge {
+                id: format!("{join_id}->fail"),
+                spec_id: Some(spec_id.to_string()),
+                loop_id: None,
+                from_node: join_id.to_string(),
+                to_node: fail_to.to_string(),
+                condition: LoopEdgeCondition::Fail,
+            });
+        }
+
+        let ensemble = crate::domain::loops::Ensemble {
+            id: ensemble_id.to_string(),
+            spec_id: Some(spec_id.to_string()),
+            loop_id: None,
+            name: "Test Ensemble".to_string(),
+            prompt_template: "ignored by the member's test script".to_string(),
+            join_node_id: join_id.to_string(),
+            entry_from_node: kickoff_id.to_string(),
+            entry_condition: LoopEdgeCondition::Always,
+            min_pass,
+            straggler_timeout_minutes,
+            timeout_minutes: 5,
+            on_pass_to: on_pass_to.to_string(),
+            on_fail_to: on_fail_to.map(str::to_string),
+            created_at: now,
+        };
+        let ensemble_members: Vec<EnsembleMember> = members
+            .iter()
+            .enumerate()
+            .map(|(i, (node_id, platform))| EnsembleMember {
+                ensemble_id: ensemble_id.to_string(),
+                node_id: node_id.to_string(),
+                position: i as i64,
+                platform: platform.to_string(),
+                model: None,
+            })
+            .collect();
+
+        db.insert_ensemble_unit(
+            &ensemble,
+            &ensemble_members,
+            &member_nodes,
+            &join_node,
+            &edges,
+        )
+        .unwrap();
+    }
+
+    fn touch_marker_node(
+        id: &str,
+        spec_id: &str,
+        marker: &std::path::Path,
+        position: i64,
+    ) -> LoopNode {
+        LoopNode {
+            id: id.to_string(),
+            spec_id: Some(spec_id.to_string()),
+            loop_id: None,
+            name: id.to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": format!("touch \"{}\"", marker.display()),
+                "success_condition": "exit_code_0"
+            }),
+            position,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn join_run(db: &Database, spec_id: &str, join_id: &str) -> LoopNodeRun {
+        db.list_loop_runs_for_spec(spec_id)
+            .unwrap()
+            .into_iter()
+            .rfind(|run| run.node_id == join_id)
+            .expect("join must have produced a run row")
+    }
+
+    /// Wait-all (F1): the join must never fire before every member has
+    /// finished. A fast member (instant) and a deliberately slower member
+    /// (sleeps ~1s) run side by side; if the engine consolidated as soon as
+    /// the fast one finished, the whole ensemble would complete in well
+    /// under a second. Asserting on wall-clock elapsed time — not just the
+    /// final consolidated output — is what actually proves the wait, since
+    /// the output alone can't distinguish "waited" from "raced and got
+    /// lucky".
+    #[tokio::test]
+    async fn ensemble_execute_waits_for_slowest_member_before_joining() {
+        let (dir, db, engine, _loop_id, spec_id) = loop_fixture().unwrap();
+        let fake_home = setup_multi_cli_home(&[
+            (
+                "member-fast",
+                &write_member_script(dir.path(), "fast.sh", "printf FAST; exit 0"),
+            ),
+            (
+                "member-slow",
+                &write_member_script(dir.path(), "slow.sh", "sleep 1; printf SLOW; exit 0"),
+            ),
+        ]);
+        let pass_marker = dir.path().join("pass.marker");
+        db.insert_loop_node(&touch_marker_node("on-pass", &spec_id, &pass_marker, 100))
+            .unwrap();
+        insert_test_ensemble(
+            &db,
+            &spec_id,
+            "kickoff",
+            "ens1",
+            "join1",
+            &[("m-fast", "member-fast"), ("m-slow", "member-slow")],
+            2,
+            Some(1),
+            "on-pass",
+            None,
+        );
+
+        let _home = HomeGuard::set(fake_home.path());
+        let started = std::time::Instant::now();
+        engine
+            .run_loop("wf-test".to_string(), None, None)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        drop(_home);
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(900),
+            "join must not fire before the slow member finishes (elapsed: {elapsed:?})"
+        );
+        assert!(
+            pass_marker.exists(),
+            "ensemble must have passed and routed onward"
+        );
+
+        let join = join_run(&db, &spec_id, "join1");
+        assert_eq!(join.status, LoopRunStatus::Pass);
+        let doc = join.output.unwrap()["consolidated_doc"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(doc.contains("FAST") && doc.contains("SLOW"));
+    }
+
+    /// Concurrency cap (F1): `with_ensemble_concurrency_cap` must actually
+    /// bound how many members run at once, not just accept the value. Three
+    /// members each sleep ~0.3s; under a cap of 1 they're forced to run one
+    /// at a time, so the ensemble can only finish in >= ~0.9s. Asserting on
+    /// wall-clock elapsed time is what actually proves serialization — the
+    /// consolidated output alone can't distinguish "capped" from "raced and
+    /// got lucky", mirroring `ensemble_execute_waits_for_slowest_member_before_joining`.
+    #[tokio::test]
+    async fn ensemble_execute_respects_configured_concurrency_cap() {
+        let (dir, db, engine, _loop_id, spec_id) = loop_fixture().unwrap();
+        let engine = engine.with_ensemble_concurrency_cap(1);
+        let fake_home = setup_multi_cli_home(&[
+            (
+                "member-a",
+                &write_member_script(dir.path(), "a.sh", "sleep 0.3; printf A; exit 0"),
+            ),
+            (
+                "member-b",
+                &write_member_script(dir.path(), "b.sh", "sleep 0.3; printf B; exit 0"),
+            ),
+            (
+                "member-c",
+                &write_member_script(dir.path(), "c.sh", "sleep 0.3; printf C; exit 0"),
+            ),
+        ]);
+        let pass_marker = dir.path().join("pass.marker");
+        db.insert_loop_node(&touch_marker_node("on-pass", &spec_id, &pass_marker, 100))
+            .unwrap();
+        insert_test_ensemble(
+            &db,
+            &spec_id,
+            "kickoff",
+            "ens1",
+            "join1",
+            &[
+                ("m-a", "member-a"),
+                ("m-b", "member-b"),
+                ("m-c", "member-c"),
+            ],
+            3,
+            Some(1),
+            "on-pass",
+            None,
+        );
+
+        let _home = HomeGuard::set(fake_home.path());
+        let started = std::time::Instant::now();
+        engine
+            .run_loop("wf-test".to_string(), None, None)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        drop(_home);
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(850),
+            "a concurrency cap of 1 must serialize all three members (elapsed: {elapsed:?})"
+        );
+        assert!(
+            pass_marker.exists(),
+            "ensemble must still pass and route onward once serialized"
+        );
+
+        let join = join_run(&db, &spec_id, "join1");
+        assert_eq!(join.status, LoopRunStatus::Pass);
+        let doc = join.output.unwrap()["consolidated_doc"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(doc.contains('A') && doc.contains('B') && doc.contains('C'));
+    }
+
+    /// min_pass routing: enough members pass -> join Pass -> on_pass_to.
+    #[tokio::test]
+    async fn ensemble_execute_min_pass_met_routes_to_on_pass_to() {
+        let (dir, db, engine, _loop_id, spec_id) = loop_fixture().unwrap();
+        let fake_home = setup_multi_cli_home(&[
+            (
+                "member-ok-a",
+                &write_member_script(dir.path(), "a.sh", "exit 0"),
+            ),
+            (
+                "member-ok-b",
+                &write_member_script(dir.path(), "b.sh", "exit 0"),
+            ),
+            (
+                "member-bad",
+                &write_member_script(dir.path(), "c.sh", "exit 1"),
+            ),
+        ]);
+        let pass_marker = dir.path().join("pass.marker");
+        let fail_marker = dir.path().join("fail.marker");
+        db.insert_loop_node(&touch_marker_node("on-pass", &spec_id, &pass_marker, 100))
+            .unwrap();
+        db.insert_loop_node(&touch_marker_node("on-fail", &spec_id, &fail_marker, 101))
+            .unwrap();
+        insert_test_ensemble(
+            &db,
+            &spec_id,
+            "kickoff",
+            "ens1",
+            "join1",
+            &[
+                ("m-a", "member-ok-a"),
+                ("m-b", "member-ok-b"),
+                ("m-c", "member-bad"),
+            ],
+            2,
+            Some(1),
+            "on-pass",
+            Some("on-fail"),
+        );
+
+        let _home = HomeGuard::set(fake_home.path());
+        engine
+            .run_loop("wf-test".to_string(), None, None)
+            .await
+            .unwrap();
+        drop(_home);
+
+        let join = join_run(&db, &spec_id, "join1");
+        assert_eq!(join.status, LoopRunStatus::Pass);
+        assert_eq!(join.output.unwrap()["passed"], 2);
+        assert!(pass_marker.exists(), "must route to on_pass_to");
+        assert!(!fail_marker.exists(), "must not route to on_fail_to");
+    }
+
+    /// min_pass routing: too few members pass -> join Fail -> on_fail_to.
+    #[tokio::test]
+    async fn ensemble_execute_min_pass_not_met_routes_to_on_fail_to() {
+        let (dir, db, engine, _loop_id, spec_id) = loop_fixture().unwrap();
+        let fake_home = setup_multi_cli_home(&[
+            (
+                "member-ok",
+                &write_member_script(dir.path(), "a.sh", "exit 0"),
+            ),
+            (
+                "member-bad-a",
+                &write_member_script(dir.path(), "b.sh", "exit 1"),
+            ),
+            (
+                "member-bad-b",
+                &write_member_script(dir.path(), "c.sh", "exit 1"),
+            ),
+        ]);
+        let pass_marker = dir.path().join("pass.marker");
+        let fail_marker = dir.path().join("fail.marker");
+        db.insert_loop_node(&touch_marker_node("on-pass", &spec_id, &pass_marker, 100))
+            .unwrap();
+        db.insert_loop_node(&touch_marker_node("on-fail", &spec_id, &fail_marker, 101))
+            .unwrap();
+        insert_test_ensemble(
+            &db,
+            &spec_id,
+            "kickoff",
+            "ens1",
+            "join1",
+            &[
+                ("m-a", "member-ok"),
+                ("m-b", "member-bad-a"),
+                ("m-c", "member-bad-b"),
+            ],
+            2,
+            Some(1),
+            "on-pass",
+            Some("on-fail"),
+        );
+
+        let _home = HomeGuard::set(fake_home.path());
+        engine
+            .run_loop("wf-test".to_string(), None, None)
+            .await
+            .unwrap();
+        drop(_home);
+
+        let join = join_run(&db, &spec_id, "join1");
+        assert_eq!(join.status, LoopRunStatus::Fail);
+        assert_eq!(join.output.unwrap()["passed"], 1);
+        assert!(!pass_marker.exists(), "must not route to on_pass_to");
+        assert!(fail_marker.exists(), "must route to on_fail_to");
+    }
+
+    /// Consolidation order is deterministic (member position order), not
+    /// completion order: member 1 is the slow one here, member 2 finishes
+    /// first, but the consolidated doc must still list member 1 before
+    /// member 2.
+    #[tokio::test]
+    async fn ensemble_execute_consolidates_in_member_position_order() {
+        let (dir, db, engine, _loop_id, spec_id) = loop_fixture().unwrap();
+        let fake_home = setup_multi_cli_home(&[
+            (
+                "member-a-slow",
+                &write_member_script(dir.path(), "a.sh", "sleep 1; printf A; exit 0"),
+            ),
+            (
+                "member-b-fast",
+                &write_member_script(dir.path(), "b.sh", "printf B; exit 0"),
+            ),
+        ]);
+        let pass_marker = dir.path().join("pass.marker");
+        db.insert_loop_node(&touch_marker_node("on-pass", &spec_id, &pass_marker, 100))
+            .unwrap();
+        insert_test_ensemble(
+            &db,
+            &spec_id,
+            "kickoff",
+            "ens1",
+            "join1",
+            &[("m-a", "member-a-slow"), ("m-b", "member-b-fast")],
+            2,
+            Some(1),
+            "on-pass",
+            None,
+        );
+
+        let _home = HomeGuard::set(fake_home.path());
+        engine
+            .run_loop("wf-test".to_string(), None, None)
+            .await
+            .unwrap();
+        drop(_home);
+
+        let join = join_run(&db, &spec_id, "join1");
+        let doc = join.output.unwrap()["consolidated_doc"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let pos_a = doc
+            .find("## member-a-slow")
+            .expect("member-a-slow section must exist");
+        let pos_b = doc
+            .find("## member-b-fast")
+            .expect("member-b-fast section must exist");
+        assert!(
+            pos_a < pos_b,
+            "consolidated doc must list members in position order, not completion order"
+        );
+    }
+
+    /// Straggler kill + fail counting (B12): a member that hangs past the
+    /// ensemble's straggler timeout is killed at the OS level (not just
+    /// marked failed while the process keeps running), and counts as a
+    /// failed member in the join's tally. Both members hang here — using a
+    /// `straggler_timeout_minutes: 0` (immediate) alongside a member that's
+    /// meant to finish quickly would race the timeout against real work;
+    /// isolating the straggler behavior to every member avoids that.
+    #[tokio::test]
+    async fn ensemble_execute_straggler_timeout_kills_process_and_counts_as_fail() {
+        let (dir, db, engine, _loop_id, spec_id) = loop_fixture().unwrap();
+        let marker_a = dir.path().join("a_survived.marker");
+        let marker_b = dir.path().join("b_survived.marker");
+        let fake_home = setup_multi_cli_home(&[
+            (
+                "member-hang-a",
+                &write_member_script(
+                    dir.path(),
+                    "a.sh",
+                    &format!("sleep 3; touch \"{}\"", marker_a.display()),
+                ),
+            ),
+            (
+                "member-hang-b",
+                &write_member_script(
+                    dir.path(),
+                    "b.sh",
+                    &format!("sleep 3; touch \"{}\"", marker_b.display()),
+                ),
+            ),
+        ]);
+        let fail_marker = dir.path().join("fail.marker");
+        db.insert_loop_node(&touch_marker_node(
+            "on-pass",
+            &spec_id,
+            &dir.path().join("pass.marker"),
+            100,
+        ))
+        .unwrap();
+        db.insert_loop_node(&touch_marker_node("on-fail", &spec_id, &fail_marker, 101))
+            .unwrap();
+        insert_test_ensemble(
+            &db,
+            &spec_id,
+            "kickoff",
+            "ens1",
+            "join1",
+            &[("m-a", "member-hang-a"), ("m-b", "member-hang-b")],
+            1,
+            Some(0),
+            "on-pass",
+            Some("on-fail"),
+        );
+
+        let _home = HomeGuard::set(fake_home.path());
+        engine
+            .run_loop("wf-test".to_string(), None, None)
+            .await
+            .unwrap();
+        drop(_home);
+
+        let join = join_run(&db, &spec_id, "join1");
+        assert_eq!(
+            join.status,
+            LoopRunStatus::Fail,
+            "both members killed as stragglers -> zero passed -> join fails"
+        );
+        assert_eq!(join.output.as_ref().unwrap()["passed"], 0);
+        assert!(fail_marker.exists(), "must route to on_fail_to");
+
+        // Give the OS a moment past the members' scripted 3s sleep to prove
+        // the processes were actually killed, not merely marked failed
+        // while still running in the background.
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        assert!(
+            !marker_a.exists(),
+            "straggler member a must have been killed"
+        );
+        assert!(
+            !marker_b.exists(),
+            "straggler member b must have been killed"
+        );
+    }
+
+    /// Pool-run compatibility: a pool member spec whose own graph contains
+    /// an ensemble must run end to end through a pool dispatch exactly like
+    /// any other spec — the ensemble's join routing onward is what lets the
+    /// spec (and therefore the pool) reach completion.
+    #[tokio::test]
+    async fn ensemble_runs_end_to_end_through_a_pool_dispatch() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
+        let lp = crate::domain::loops::Loop {
+            id: "wf-pool-ensemble".to_string(),
+            name: "Loop".to_string(),
+            description: None,
+            workdir: dir.path().to_string_lossy().to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            active_run_pool_id: None,
+            on_completed: None,
+        };
+        db.insert_loop(&lp).unwrap();
+        let engine = LoopEngine::new(Arc::clone(&db), Arc::new(DefaultNotificationService));
+
+        let spec = standalone_spec("pool-ensemble-spec", 1);
+        db.insert_loop_spec(&spec).unwrap();
+        insert_pool_with_members(&db, "pool-1", &[&spec.id]);
+
+        let fake_home = setup_multi_cli_home(&[
+            (
+                "member-ok-a",
+                &write_member_script(dir.path(), "a.sh", "exit 0"),
+            ),
+            (
+                "member-ok-b",
+                &write_member_script(dir.path(), "b.sh", "exit 0"),
+            ),
+        ]);
+        db.insert_loop_node(&touch_marker_node(
+            "on-pass",
+            &spec.id,
+            &dir.path().join("pass.marker"),
+            100,
+        ))
+        .unwrap();
+        insert_test_ensemble(
+            &db,
+            &spec.id,
+            "kickoff",
+            "ens1",
+            "join1",
+            &[("m-a", "member-ok-a"), ("m-b", "member-ok-b")],
+            2,
+            Some(1),
+            "on-pass",
+            None,
+        );
+
+        let _home = HomeGuard::set(fake_home.path());
+        engine
+            .run_loop(lp.id.clone(), Some("pool-1".to_string()), None)
+            .await
+            .unwrap();
+        drop(_home);
+
+        let lp = db.get_loop(&lp.id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Completed);
+        assert_eq!(
+            db.pool_next_pending_spec_id("pool-1").unwrap(),
+            None,
+            "the ensemble-bearing spec must have been fully consumed by the pool run"
         );
     }
 }

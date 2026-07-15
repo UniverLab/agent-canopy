@@ -300,6 +300,8 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) {
         Span::styled("add section  ", Style::default().fg(Color::White)),
         Span::styled("Ctrl+X ", Style::default().fg(DIM)),
         Span::styled("remove  ", Style::default().fg(Color::White)),
+        Span::styled("Ctrl+L ", Style::default().fg(DIM)),
+        Span::styled("recall  ", Style::default().fg(Color::White)),
         Span::styled(send_label, Style::default().fg(DIM)),
         Span::styled(format!("{send_hint}  "), Style::default().fg(Color::White)),
         Span::styled("Esc  ", Style::default().fg(DIM)),

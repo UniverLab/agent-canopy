@@ -72,6 +72,54 @@ pub fn builtin_blueprint_specs() -> Vec<(&'static str, LoopNodeKind, Value)> {
     ]
 }
 
+/// An ensemble blueprint (F1): unlike [`Blueprint`] (a single node's
+/// kind+config), this is a whole ensemble's shared prompt + member list, the
+/// pieces `loop_add_ensemble`'s `blueprint` param fills in when the caller
+/// omits `prompt_template`/`members` explicitly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnsembleBlueprint {
+    pub id: String,
+    pub name: String,
+    pub prompt_template: String,
+    /// `(platform, model)` pairs, in the order members are created.
+    pub members: Vec<(String, Option<String>)>,
+    /// Suggested `min_pass`. `None` means "every member" — the same default
+    /// `loop_add_ensemble` uses when the caller doesn't pass `min_pass`.
+    pub min_pass: Option<i64>,
+    pub builtin: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+/// `(name, prompt_template, members, min_pass)` — the raw tuple shape a
+/// builtin ensemble blueprint spec is defined as, before being seeded into
+/// the `ensemble_blueprints` table as an [`EnsembleBlueprint`] row.
+pub type EnsembleBlueprintSpec = (
+    &'static str,
+    &'static str,
+    Vec<(&'static str, Option<&'static str>)>,
+    Option<i64>,
+);
+
+/// The builtin "ensemble-proposers" pattern (F1's canonical use (a)): 3 free
+/// OpenRouter models draft a solution for the same spec in parallel, so an
+/// implementer downstream spends its (potentially non-free) quota only once,
+/// on a pre-digested task instead of a blank spec.
+pub fn builtin_ensemble_blueprint_specs() -> Vec<EnsembleBlueprintSpec> {
+    vec![(
+        "ensemble-proposers",
+        "Draft a complete solution for this spec. Be concrete and specific — an \
+         implementer downstream may build directly from your draft without ever \
+         seeing this spec itself, so leave nothing implicit:\n\n{{spec_content}}\n\n\
+         Previous feedback (if any): {{previous_feedback}}",
+        vec![
+            ("openrouter", Some("deepseek/deepseek-chat-v3.1:free")),
+            ("openrouter", Some("qwen/qwen3-coder:free")),
+            ("openrouter", Some("meta-llama/llama-3.3-70b-instruct:free")),
+        ],
+        None,
+    )]
+}
+
 /// Shallow-merge `overrides` onto `template`: keys present in `overrides` win,
 /// every other key from `template` is preserved. Non-object inputs are
 /// treated as empty objects rather than rejected — callers validate node
@@ -157,6 +205,16 @@ mod tests {
         let error = validate_blueprint_deletable(&bp).unwrap_err();
         assert!(error.contains("implementer-claude"));
         assert!(error.contains("cannot be deleted"));
+    }
+
+    #[test]
+    fn builtin_ensemble_blueprint_specs_has_ensemble_proposers_with_valid_member_count() {
+        let specs = builtin_ensemble_blueprint_specs();
+        let (name, prompt_template, members, min_pass) = &specs[0];
+        assert_eq!(*name, "ensemble-proposers");
+        assert!(!prompt_template.is_empty());
+        assert!(members.len() >= 2 && members.len() <= 8);
+        assert!(min_pass.is_none());
     }
 
     #[test]

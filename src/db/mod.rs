@@ -27,6 +27,9 @@ impl Database {
         if let Err(e) = db.seed_builtin_blueprints() {
             tracing::warn!("Could not seed builtin blueprints: {e}");
         }
+        if let Err(e) = db.seed_builtin_ensemble_blueprints() {
+            tracing::warn!("Could not seed builtin ensemble blueprints: {e}");
+        }
         Ok(db)
     }
 
@@ -296,6 +299,59 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_loop_completion_hook_runs_loop_started
                 ON loop_completion_hook_runs(loop_id, started_at ASC);
 
+            -- F1: an ensemble unit -- the members and join are ordinary
+            -- loop_nodes/loop_edges rows (the engine's graph-walking code is
+            -- reused as-is); this row is what lets loop_get/loop_update_ensemble
+            -- address the whole ensemble as one thing instead of N+1 nodes.
+            CREATE TABLE IF NOT EXISTS ensembles (
+                id TEXT PRIMARY KEY,
+                spec_id TEXT REFERENCES loop_specs(id) ON DELETE CASCADE,
+                loop_id TEXT REFERENCES loops(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                prompt_template TEXT NOT NULL,
+                join_node_id TEXT NOT NULL REFERENCES loop_nodes(id) ON DELETE CASCADE,
+                entry_from_node TEXT NOT NULL REFERENCES loop_nodes(id) ON DELETE CASCADE,
+                entry_condition TEXT NOT NULL,
+                min_pass INTEGER NOT NULL,
+                straggler_timeout_minutes INTEGER,
+                timeout_minutes INTEGER NOT NULL,
+                on_pass_to TEXT NOT NULL REFERENCES loop_nodes(id) ON DELETE CASCADE,
+                on_fail_to TEXT REFERENCES loop_nodes(id) ON DELETE SET NULL,
+                created_at INTEGER NOT NULL,
+                CHECK ((spec_id IS NULL) <> (loop_id IS NULL))
+            );
+
+            CREATE TABLE IF NOT EXISTS ensemble_members (
+                ensemble_id TEXT NOT NULL REFERENCES ensembles(id) ON DELETE CASCADE,
+                node_id TEXT NOT NULL REFERENCES loop_nodes(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                platform TEXT NOT NULL,
+                model TEXT,
+                PRIMARY KEY (ensemble_id, node_id)
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_ensemble_members_position
+                ON ensemble_members(ensemble_id, position);
+
+            CREATE INDEX IF NOT EXISTS idx_ensemble_members_node
+                ON ensemble_members(node_id);
+
+            CREATE INDEX IF NOT EXISTS idx_ensembles_join_node
+                ON ensembles(join_node_id);
+
+            -- F1: ensemble blueprints -- a whole ensemble's shared prompt +
+            -- member list (unlike `blueprints`, which templates a single
+            -- node), seeded with the builtin ensemble-proposers pattern.
+            CREATE TABLE IF NOT EXISTS ensemble_blueprints (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                prompt_template TEXT NOT NULL,
+                members TEXT NOT NULL,
+                min_pass INTEGER,
+                builtin INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS pools (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -345,7 +401,22 @@ impl Database {
                 target_session_id TEXT NOT NULL,
                 workdir TEXT,
                 failed_at INTEGER NOT NULL
-            );",
+            );
+
+            -- U8: the prompt builder's last-sent prompt per project, recalled
+            -- with Ctrl+L. Insert-only with a timestamp (rather than one row
+            -- per workdir) so this can grow into a browsable history later —
+            -- today's reads take the most recent row per workdir (LIMIT 1).
+            CREATE TABLE IF NOT EXISTS last_prompts (
+                id TEXT PRIMARY KEY,
+                workdir TEXT NOT NULL,
+                prompt_text TEXT NOT NULL,
+                builder_state TEXT,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_last_prompts_workdir_created
+                ON last_prompts(workdir, created_at DESC);",
         )?;
 
         // `workdir` records which project a scheduled send targeted so a
@@ -705,9 +776,11 @@ impl Database {
 pub mod achievements;
 pub mod agent;
 pub mod blueprints;
+pub mod ensembles;
 pub mod gamification;
 pub mod group;
 pub mod intelligence;
+pub mod last_prompts;
 pub mod loops;
 pub mod pools;
 pub mod project;

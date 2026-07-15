@@ -32,10 +32,11 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
         Arc::clone(&notification_service),
     ));
     let sync_manager = Arc::new(SyncManager::new(Arc::clone(&db)));
-    let loop_engine = Arc::new(LoopEngine::new(
-        Arc::clone(&db),
-        Arc::clone(&notification_service),
-    ));
+    let canopy_config = crate::domain::canopy_config::CanopyConfig::load(&data_dir);
+    let loop_engine = Arc::new(
+        LoopEngine::new(Arc::clone(&db), Arc::clone(&notification_service))
+            .with_ensemble_concurrency_cap(canopy_config.ensemble_concurrency_cap),
+    );
     let watcher_engine = Arc::new(WatcherEngine::new(
         Arc::clone(&db),
         Arc::clone(&executor),
@@ -206,10 +207,11 @@ pub(crate) async fn run_stdio_server() -> Result<()> {
         Arc::clone(&notification_service),
     ));
     let sync_manager = Arc::new(SyncManager::new(Arc::clone(&db)));
-    let loop_engine = Arc::new(LoopEngine::new(
-        Arc::clone(&db),
-        Arc::clone(&notification_service),
-    ));
+    let canopy_config = crate::domain::canopy_config::CanopyConfig::load(&data_dir);
+    let loop_engine = Arc::new(
+        LoopEngine::new(Arc::clone(&db), Arc::clone(&notification_service))
+            .with_ensemble_concurrency_cap(canopy_config.ensemble_concurrency_cap),
+    );
     let watcher_engine = Arc::new(WatcherEngine::new(
         Arc::clone(&db),
         Arc::clone(&executor),

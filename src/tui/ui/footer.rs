@@ -159,6 +159,7 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("⇧↑↓←→", "cursor"),
             ("Ctrl+S", "send"),
             ("Ctrl+A/X", "add/memory/remove"),
+            ("Ctrl+L", "recall last"),
             ("Esc", "cancel"),
         ],
         Focus::LoopEditorDialog => vec![

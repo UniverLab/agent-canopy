@@ -153,7 +153,10 @@ impl Database {
     }
 
     /// List failed scheduled sends preserved for a given project workdir,
-    /// most recent first.
+    /// most recent first. Not yet called from production code — the
+    /// dead-target recovery path (see `data::deliver_due_scheduled_sends`)
+    /// surfaces failures via `last_prompts` instead; this stays as the read
+    /// side of `failed_scheduled_sends` for a future history browser.
     #[allow(dead_code)]
     pub fn list_failed_scheduled_sends_for_workdir(
         &self,

@@ -170,6 +170,45 @@ impl Database {
         Ok(count > 0)
     }
 
+    /// Pool members left `running` with no live node run behind them in this
+    /// daemon's lifetime — a safety net for status left stuck `running` by a
+    /// path other than G2 boot reconcile (which only ever reconciles a loop
+    /// that was itself `Running` at boot; a member corrupted to `running` by
+    /// some other route, or belonging to a loop reconcile didn't touch,
+    /// would otherwise stay silently invisible to
+    /// [`Self::pool_next_pending_spec_id`] forever). "Live in this daemon's
+    /// lifetime" means a `loop_runs` row for the spec that is still
+    /// `running` *and* stamped with the current process's boot id — matching
+    /// [`Database::reconcile_orphaned_loops`]'s own liveness test. Returned
+    /// in queue order; callers must log why before recovering one (R3: no
+    /// spec status may silently exclude a member from selection).
+    pub fn pool_stale_running_members(
+        &self,
+        pool_id: &str,
+        current_boot_id: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT pm.spec_id FROM pool_members pm
+             JOIN loop_specs ls ON ls.id = pm.spec_id
+             WHERE pm.pool_id = ?1 AND ls.status = ?2
+             AND NOT EXISTS (
+                 SELECT 1 FROM loop_runs lr
+                 WHERE lr.spec_id = pm.spec_id AND lr.status = 'running' AND lr.boot_id = ?3
+             )
+             ORDER BY pm.position ASC",
+        )?;
+        let rows = stmt.query_map(
+            params![pool_id, LoopSpecStatus::Running.as_str(), current_boot_id],
+            |row| row.get::<_, String>(0),
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn get_pool_details(&self, pool_id: &str) -> Result<Option<PoolDetails>> {
         let Some(pool) = self.get_pool(pool_id)? else {
             return Ok(None);

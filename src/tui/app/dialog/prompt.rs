@@ -86,6 +86,10 @@ pub struct SimplePromptDialog {
     pub send_at: Option<(u8, u8)>,
     /// Which unit of `send_at` is focused for editing: 0=hour, 1=minute.
     pub send_at_focus_unit: usize,
+    /// A last-prompt recall (Ctrl+L) awaiting the standard confirm pattern
+    /// because the builder currently has non-empty content. `None` once
+    /// confirmed/canceled. Not persisted across dialog openings.
+    pub pending_recall: Option<crate::db::last_prompts::LastPrompt>,
 }
 
 impl SimplePromptDialog {
@@ -114,7 +118,47 @@ impl SimplePromptDialog {
             system_content: None,
             send_at: None,
             send_at_focus_unit: 0,
+            pending_recall: None,
         }
+    }
+
+    /// True when every enabled section is blank — the state Ctrl+L's confirm
+    /// pattern treats as "safe to overwrite without asking".
+    pub fn is_empty(&self) -> bool {
+        self.enabled_sections.iter().all(|section_id| {
+            self.section_content_for_build(section_id)
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+        })
+    }
+
+    /// Replace all builder content with a single instruction section holding
+    /// `text` verbatim. Used to recall a prompt whose structured builder
+    /// state wasn't captured — a scheduled send recovered after its target
+    /// session died only has the flattened prompt string (see
+    /// `Database::insert_failed_scheduled_send`), so a faithful
+    /// section-by-section restore isn't possible.
+    pub fn load_flat_text(&mut self, text: &str) {
+        self.sections.clear();
+        self.enabled_sections.clear();
+        self.section_cursors.clear();
+        self.section_scrolls.clear();
+        self.collapsed_pastes.clear();
+        self.locked_sections.clear();
+        self.section_counters.clear();
+        self.section_counters.insert("instruction".to_string(), 2);
+
+        let cursor = text.chars().count();
+        self.sections
+            .insert("instruction_1".to_string(), text.to_string());
+        self.enabled_sections.push("instruction_1".to_string());
+        self.section_cursors
+            .insert("instruction_1".to_string(), cursor);
+        self.section_scrolls.insert("instruction_1".to_string(), 0);
+        self.focused_section = 1; // 0 is the send_at virtual field
+        self.picker_mode = SectionPickerMode::None;
+        self.at_picker = None;
     }
 
     /// Get cursor position for a section
@@ -1579,6 +1623,71 @@ mod tests {
             "look @src/lib.rs"
         );
     }
+
+    #[test]
+    fn is_empty_true_for_fresh_dialog_and_false_once_filled() {
+        let mut dialog = SimplePromptDialog::new();
+        assert!(dialog.is_empty());
+
+        dialog.set_section_content("instruction_1", "do the thing".to_string());
+        assert!(!dialog.is_empty());
+    }
+
+    #[test]
+    fn is_empty_true_when_sections_are_only_whitespace() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.set_section_content("instruction_1", "   \n  ".to_string());
+        dialog.add_section_with_content("context", "  ".to_string());
+        assert!(dialog.is_empty());
+    }
+
+    #[test]
+    fn load_flat_text_replaces_all_content_with_a_single_instruction() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.set_section_content("instruction_1", "stale draft".to_string());
+        dialog.add_section_with_content("context", "stale context".to_string());
+        dialog.lock_section("context_1");
+
+        dialog.load_flat_text("recovered prompt text");
+
+        assert_eq!(dialog.enabled_sections, vec!["instruction_1".to_string()]);
+        assert_eq!(
+            dialog.get_section_content("instruction_1"),
+            "recovered prompt text"
+        );
+        assert!(dialog.locked_sections.is_empty());
+        assert_eq!(
+            dialog.cursor("instruction_1"),
+            "recovered prompt text".chars().count()
+        );
+    }
+
+    #[test]
+    fn persisted_builder_state_round_trips_through_json() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.set_section_content("instruction_1", "ship the feature".to_string());
+        dialog.add_section_with_content("tools", "skill:code-engineering".to_string());
+        dialog.send_at = Some((14, 30));
+
+        let snapshot = PersistedBuilderState::from_dialog(&dialog);
+        let json = serde_json::to_string(&snapshot).expect("serialize");
+        let restored: PersistedBuilderState = serde_json::from_str(&json).expect("deserialize");
+
+        let mut target = SimplePromptDialog::new();
+        restored.restore_into(&mut target);
+
+        assert_eq!(
+            target.get_section_content("instruction_1"),
+            "ship the feature"
+        );
+        assert_eq!(
+            target.get_section_content("tools_1"),
+            "skill:code-engineering"
+        );
+        // send_at is intentionally not part of the snapshot — recall must not
+        // resurrect a stale schedule.
+        assert!(target.send_at.is_none());
+    }
 }
 
 /// Snapshot of `SimplePromptDialog` state used to persist the prompt builder
@@ -1626,6 +1735,54 @@ impl PromptBuilderSession {
         dialog.at_picker = None;
         dialog.system_content = None; // re-evaluated on each open
         dialog.send_at_focus_unit = 0;
+    }
+}
+
+/// JSON-serializable snapshot of the builder's structured fields, persisted
+/// per project workdir as `last_prompts.builder_state` (U8) so Ctrl+L can
+/// rebuild the builder as it was rather than pasting a flattened blob.
+///
+/// Deliberately excludes `send_at`: recalling a prompt should not silently
+/// re-arm a delivery schedule from a previous session. `picker_mode`,
+/// `at_picker`, and `system_content` are transient UI/idempotency state that
+/// `PromptBuilderSession::restore_into` also never persists.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedBuilderState {
+    pub sections: HashMap<String, String>,
+    pub enabled_sections: Vec<String>,
+    pub focused_section: usize,
+    pub section_counters: HashMap<String, usize>,
+    pub section_cursors: HashMap<String, usize>,
+    pub section_scrolls: HashMap<String, usize>,
+    pub collapsed_pastes: HashMap<String, String>,
+    pub locked_sections: HashSet<String>,
+}
+
+impl PersistedBuilderState {
+    pub fn from_dialog(dialog: &SimplePromptDialog) -> Self {
+        Self {
+            sections: dialog.sections.clone(),
+            enabled_sections: dialog.enabled_sections.clone(),
+            focused_section: dialog.focused_section,
+            section_counters: dialog.section_counters.clone(),
+            section_cursors: dialog.section_cursors.clone(),
+            section_scrolls: dialog.section_scrolls.clone(),
+            collapsed_pastes: dialog.collapsed_pastes.clone(),
+            locked_sections: dialog.locked_sections.clone(),
+        }
+    }
+
+    pub fn restore_into(&self, dialog: &mut SimplePromptDialog) {
+        dialog.sections = self.sections.clone();
+        dialog.enabled_sections = self.enabled_sections.clone();
+        dialog.focused_section = self.focused_section;
+        dialog.section_counters = self.section_counters.clone();
+        dialog.section_cursors = self.section_cursors.clone();
+        dialog.section_scrolls = self.section_scrolls.clone();
+        dialog.collapsed_pastes = self.collapsed_pastes.clone();
+        dialog.locked_sections = self.locked_sections.clone();
+        dialog.picker_mode = SectionPickerMode::None;
+        dialog.at_picker = None;
     }
 }
 

@@ -1056,21 +1056,6 @@ impl Database {
             .map_err(Into::into)
     }
 
-    /// Loops left `Running` when the daemon starts.
-    pub fn list_running_loops(&self) -> Result<Vec<Loop>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
-        let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed
-             FROM loops WHERE status = ?1",
-        )?;
-        let rows = stmt.query_map(params![LoopStatus::Running.as_str()], map_loop_row)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
-    }
-
     /// Node runs still `running` for a loop.
     pub fn list_running_loop_runs(&self, loop_id: &str) -> Result<Vec<LoopNodeRun>> {
         let conn = self
@@ -1090,15 +1075,42 @@ impl Database {
     ///
     /// No loop run survives the process that spawned it, so any loop still
     /// `Running` at startup was interrupted mid-execution by the previous
-    /// daemon. Pause it — its spec keeps its `Running` status so
-    /// `resolve_spec_start` resumes at the same node — and mark its dangling
-    /// node runs as failed/interrupted, so `loop_continue` alone is enough to
-    /// resume it (no `loop_pause` detour needed). Idempotent: a loop already
-    /// `Paused` isn't touched by a later call.
+    /// daemon. Pause it, mark its dangling node runs as failed/interrupted,
+    /// and reset its in-flight spec (loop-bound or pool member — either way
+    /// `run.spec_id` names it) from `running` back to `pending`, all in one
+    /// transaction so there is no window where the loop is recoverable but
+    /// the spec is not (B18). A spec's completed work is preserved by the
+    /// worktree/commits, not by its status, so restarting it from its entry
+    /// node on resume is safe — and required: leaving it `running` made it
+    /// invisible to pool selection (`pool_next_pending_spec_id` only ever
+    /// picks a `pending` member), permanently orphaning it. `loop_continue`
+    /// alone is enough to resume it (no `loop_pause` detour needed).
+    /// Idempotent: a loop already `Paused` isn't touched by a later call.
     pub fn reconcile_orphaned_loops(&self) -> Result<usize> {
-        let orphaned = self.list_running_loops()?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let tx = conn.unchecked_transaction()?;
+
+        let orphaned: Vec<Loop> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed
+                 FROM loops WHERE status = ?1",
+            )?;
+            let rows = stmt.query_map(params![LoopStatus::Running.as_str()], map_loop_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
         for lp in &orphaned {
-            let dangling_runs = self.list_running_loop_runs(&lp.id)?;
+            let dangling_runs: Vec<LoopNodeRun> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id
+                     FROM loop_runs WHERE loop_id = ?1 AND status = 'running'",
+                )?;
+                let rows = stmt.query_map(params![lp.id], map_loop_run_row)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
             if dangling_runs.is_empty() {
                 tracing::warn!(
                     "Reconciling orphaned loop '{}': no active node run found; pausing.",
@@ -1107,9 +1119,10 @@ impl Database {
             }
             for run in &dangling_runs {
                 tracing::warn!(
-                    "Reconciling orphaned loop '{}': was running node '{}' when the daemon last stopped; pausing loop and marking its run as interrupted.",
+                    "Reconciling orphaned loop '{}': was running node '{}' (spec '{}') when the daemon last stopped; pausing loop, marking its run as interrupted, and resetting the spec to pending.",
                     lp.id,
-                    run.node_id
+                    run.node_id,
+                    run.spec_id
                 );
                 // B12: this new daemon process never held a `Child` for
                 // `run` — it may not even share the previous process's
@@ -1134,18 +1147,40 @@ impl Database {
                         );
                     }
                 }
-                self.update_loop_run_result(
-                    &run.id,
-                    LoopRunStatus::Fail,
-                    Some(&serde_json::json!({
-                        "interrupted": true,
-                        "reason": "daemon restarted while this node was running"
-                    })),
-                    Some(Utc::now()),
+                let now = Utc::now();
+                tx.execute(
+                    "UPDATE loop_runs
+                     SET status = ?1, output = ?2, completed_at = ?3, pid = NULL
+                     WHERE id = ?4",
+                    params![
+                        LoopRunStatus::Fail.as_str(),
+                        serde_json::to_string(&serde_json::json!({
+                            "interrupted": true,
+                            "reason": "daemon restarted while this node was running"
+                        }))?,
+                        now.timestamp(),
+                        run.id,
+                    ],
+                )?;
+                // B18: same reset `reset_loop_spec_status` performs (status,
+                // started_at, completed_at, spec_start_head all cleared) —
+                // done inline here, against `tx`, rather than by calling that
+                // method, since it would try to re-lock `self.conn` and
+                // deadlock against the lock already held above.
+                tx.execute(
+                    "UPDATE loop_specs
+                     SET status = ?1, started_at = NULL, completed_at = NULL, spec_start_head = NULL
+                     WHERE id = ?2",
+                    params![LoopSpecStatus::Pending.as_str(), run.spec_id],
                 )?;
             }
-            self.update_loop_status(&lp.id, LoopStatus::Paused, None, None)?;
+            tx.execute(
+                "UPDATE loops SET status = ?1 WHERE id = ?2",
+                params![LoopStatus::Paused.as_str(), lp.id],
+            )?;
         }
+
+        tx.commit()?;
         Ok(orphaned.len())
     }
 
