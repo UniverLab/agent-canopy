@@ -1,12 +1,12 @@
 ---
 title: MCP Tools
-description: All 61 MCP tools exposed by the canopy daemon, by category.
+description: All 63 MCP tools exposed by the canopy daemon, by category.
 order: 9
 ---
 
 # MCP Tools
 
-The daemon exposes **61 MCP tools** over Streamable HTTP (port 7755) and
+The daemon exposes **63 MCP tools** over Streamable HTTP (port 7755) and
 stdio. Connect any MCP-capable AI CLI with `canopy mcp`.
 
 ## Agent management (13)
@@ -54,11 +54,12 @@ stdio. Connect any MCP-capable AI CLI with `canopy mcp`.
 | `evolve_identity` | Refine the identity over time |
 | `create_seed` / `list_seeds` / `remove_seed` | Manage the seed nursery |
 
-## Loop engine (17)
+## Loop engine (19)
 
 `loop_create`, `loop_update`, `loop_add_spec`,
 `loop_update_spec`, `loop_add_node`, `loop_update_node`,
-`loop_add_edge`, `loop_update_edge`, `loop_get`,
+`loop_add_edge`, `loop_update_edge`, `loop_add_ensemble`,
+`loop_update_ensemble`, `loop_get`,
 `loop_list`, `loop_run`, `loop_reset`, `loop_schedule_autorun`,
 `loop_pause`, `loop_continue`,
 `loop_complete_node`, `loop_report_blocker` — see

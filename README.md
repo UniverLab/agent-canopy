@@ -42,7 +42,7 @@ See [`docs/installation.md`](docs/installation.md) for all methods and first-tim
 
 Full documentation lives in [`docs/`](docs/): installation, quick start, the
 TUI, agents and seed identities, intelligence & sync, loops, the RAG
-pipeline, all 61 MCP tools, and the complete CLI reference.
+pipeline, all 63 MCP tools, and the complete CLI reference.
 
 ---
 
@@ -87,12 +87,13 @@ pipeline, all 61 MCP tools, and the complete CLI reference.
 - **Ordered Specs** — Loops contain sequenced `Spec`s, each with `Node`s connected by `Edge`s with routing conditions (`pass`/`fail`/`always`).
 - **Standalone Spec Backlog** — Specs exist independently from loops; tag them to a workdir for filtering. Managed via `spec_create`, `spec_list`, `spec_update`, `spec_delete`.
 - **Spec Pools** — Ordered queues of existing specs that a loop drains one by one. Append and reorder while a loop is running via `pool_create`, `pool_add_spec`, `pool_list`, `pool_remove_spec`, `pool_reorder`.
-- **Node Kinds** — `agent` nodes invoke CLI tools with prompt templates; `check` nodes execute shell commands; `gate` nodes validate previous output (e.g., `output_contains`).
+- **Node Kinds** — `agent` nodes invoke CLI tools with prompt templates; `check` nodes execute shell commands; `gate` nodes validate previous output (e.g., `output_contains`); `join` is the engine-managed gate that closes an ensemble.
+- **Ensembles** — `loop_add_ensemble` creates a parallel group of 2-8 agent-node members sharing one prompt, plus a wait-all join gate that consolidates their outputs and routes onward, in a single MCP call. `loop_update_ensemble` edits the shared prompt, member list, and join/exit config as one unit. See [docs/loops.md](docs/loops.md#ensembles).
 - **Node Blueprints** — Reusable `{name, kind, config}` templates referenced by name in `loop_add_node`. Five builtins seeded at startup; custom blueprints via `blueprint_create`/`blueprint_delete`/`blueprint_list`.
 - **Full Lifecycle** — Create, update, run, pause, continue (retry or skip), reset, complete nodes, and report blockers for human intervention. `loop_schedule_autorun` resumes failed/completed loops at a future time.
 - **`on_completed` Hook** — Post-completion agent execution (e.g. documentation maintenance) that fires once per completion.
 - **Template Variables** — Loop prompts support `{{loop_name}}`, `{{spec_content}}`, `{{node_id}}`, `{{previous_feedback}}`, `{{spec_start_head}}`, and more.
-- **22 MCP Tools** — Complete authoring, inspection, runtime, spec, pool, and blueprint management.
+- **24 MCP Tools** — Complete authoring, inspection, runtime, spec, pool, and blueprint management.
 
 ### 📚 Personal RAG Pipeline
 
@@ -131,7 +132,7 @@ pipeline, all 61 MCP tools, and the complete CLI reference.
 
 ---
 
-## MCP Tools (61)
+## MCP Tools (63)
 
 | Category | Tools |
 |----------|-------|
@@ -139,7 +140,7 @@ pipeline, all 61 MCP tools, and the complete CLI reference.
 | **Multi-Agent Sync** (4) | `sync_declare_intent`, `sync_report_status`, `sync_broadcast`, `sync_get_context` |
 | **Intelligence V2** (6) | `intelligence_get_context`, `intelligence_upsert`, `intelligence_search`, `intelligence_graph_walk`, `intelligence_list_projects`, `intelligence_link_projects` |
 | **Seed Identity** (5) | `get_identity`, `evolve_identity`, `create_seed`, `list_seeds`, `remove_seed` |
-| **Loop Engine** (17) | `loop_create`, `loop_update`, `loop_add_spec`, `loop_update_spec`, `loop_add_node`, `loop_update_node`, `loop_add_edge`, `loop_update_edge`, `loop_get`, `loop_list`, `loop_run`, `loop_reset`, `loop_schedule_autorun`, `loop_pause`, `loop_continue`, `loop_complete_node`, `loop_report_blocker` |
+| **Loop Engine** (19) | `loop_create`, `loop_update`, `loop_add_spec`, `loop_update_spec`, `loop_add_node`, `loop_update_node`, `loop_add_edge`, `loop_update_edge`, `loop_add_ensemble`, `loop_update_ensemble`, `loop_get`, `loop_list`, `loop_run`, `loop_reset`, `loop_schedule_autorun`, `loop_pause`, `loop_continue`, `loop_complete_node`, `loop_report_blocker` |
 | **Spec Backlog** (4) | `spec_create`, `spec_list`, `spec_update`, `spec_delete` |
 | **Spec Pools** (5) | `pool_create`, `pool_add_spec`, `pool_list`, `pool_remove_spec`, `pool_reorder` |
 | **Node Blueprints** (3) | `blueprint_list`, `blueprint_create`, `blueprint_delete` |
@@ -151,7 +152,7 @@ pipeline, all 61 MCP tools, and the complete CLI reference.
 
 ## Architecture Overview
 
-- **Daemon** — Owns the MCP server (Streamable HTTP on port 7755 + stdio), scheduler, watcher engine, and database. Exposes all 61 MCP tools.
+- **Daemon** — Owns the MCP server (Streamable HTTP on port 7755 + stdio), scheduler, watcher engine, and database. Exposes all 63 MCP tools.
 - **Scheduler** — Computes next fire times for all active tasks, sleeping until needed. Wakes instantly on changes.
 - **Watcher Engine** — Reacts to file system events, triggering tasks as defined.
 - **Executor** — Runs tasks and agents, manages locking, logs, and status.
