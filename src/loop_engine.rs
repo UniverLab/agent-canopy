@@ -16,6 +16,9 @@ use crate::domain::loops::{
 use crate::domain::models::Cli;
 
 const DEFAULT_MAX_ITERATIONS_PER_NODE: usize = 10;
+const DEFAULT_INFRA_RETRY_LIMIT: u32 = 2;
+const DEFAULT_INFRA_CRASH_MAX_SECONDS: u64 = 60;
+const DEFAULT_INFRA_BACKOFF_SECONDS: u64 = 30;
 
 /// Default cap (F1) on ensemble members actually executing at once, across
 /// every loop run this engine drives — an 8-member ensemble queues past this
@@ -828,7 +831,9 @@ impl LoopEngine {
                     let node = nodes_by_id
                         .get(node_id.as_str())
                         .ok_or_else(|| anyhow!("Loop node '{}' not found.", node_id))?;
-                    let run_id = uuid::Uuid::new_v4().to_string();
+                    let (retry_limit, crash_max_secs) = read_infra_config(node);
+                    let mut attempt: u32 = 0;
+                    let mut run_id = uuid::Uuid::new_v4().to_string();
                     self.db.insert_loop_run(&LoopNodeRun {
                         id: run_id.clone(),
                         loop_id: lp.id.clone(),
@@ -843,33 +848,76 @@ impl LoopEngine {
                         pid: None,
                         boot_id: crate::system::boot_id(),
                     })?;
-                    let execution = self
-                        .execute_node(
-                            lp,
-                            spec,
-                            node,
-                            previous_output.as_ref(),
-                            spec_start_head.as_deref(),
-                            &run_id,
-                            workdir,
-                        )
-                        .await?;
-                    let run = self.db.get_loop_run(&run_id)?.ok_or_else(|| {
-                        anyhow!("Loop run '{}' not found after execution.", run_id)
-                    })?;
+
+                    let (final_execution, run) = loop {
+                        let execution = self
+                            .execute_node(
+                                lp,
+                                spec,
+                                node,
+                                previous_output.as_ref(),
+                                spec_start_head.as_deref(),
+                                &run_id,
+                                workdir,
+                            )
+                            .await?;
+                        let run = self.db.get_loop_run(&run_id)?.ok_or_else(|| {
+                            anyhow!("Loop run '{}' not found after execution.", run_id)
+                        })?;
+
+                        let self_reported = run.status != LoopRunStatus::Running;
+                        let is_infra_crash = !self_reported
+                            && node.kind == LoopNodeKind::Agent
+                            && execution.status == LoopRunStatus::Fail
+                            && (chrono::Utc::now() - run.started_at).num_seconds() < crash_max_secs as i64
+                            && attempt < retry_limit;
+
+                        if is_infra_crash {
+                            self.db.update_loop_run_result(
+                                &run_id,
+                                LoopRunStatus::Fail,
+                                Some(&merge_attempt_marker(&execution.output, attempt, true)),
+                                Some(chrono::Utc::now()),
+                            )?;
+                            attempt += 1;
+                            tokio::time::sleep(std::time::Duration::from_secs(
+                                DEFAULT_INFRA_BACKOFF_SECONDS * 2u64.pow(attempt - 1),
+                            ))
+                            .await;
+                            run_id = uuid::Uuid::new_v4().to_string();
+                            self.db.insert_loop_run(&LoopNodeRun {
+                                id: run_id.clone(),
+                                loop_id: lp.id.clone(),
+                                spec_id: spec.id.clone(),
+                                node_id: node.id.clone(),
+                                status: LoopRunStatus::Running,
+                                input: previous_output.clone(),
+                                output: None,
+                                started_at: chrono::Utc::now(),
+                                completed_at: None,
+                                iteration: iteration_value as i64,
+                                pid: None,
+                                boot_id: crate::system::boot_id(),
+                            })?;
+                            continue;
+                        }
+
+                        break (execution, run);
+                    };
+
                     let final_execution = if run.status == LoopRunStatus::Running {
                         self.db.update_loop_run_result(
                             &run_id,
-                            execution.status,
-                            Some(&execution.output),
+                            final_execution.status,
+                            Some(&final_execution.output),
                             Some(chrono::Utc::now()),
                         )?;
-                        execution
+                        final_execution
                     } else {
                         NodeExecution {
                             status: run.status,
                             output: run.output.unwrap_or_else(|| serde_json::json!({})),
-                            summary: execution.summary,
+                            summary: final_execution.summary,
                         }
                     };
 
@@ -1299,6 +1347,29 @@ impl LoopEngine {
             .notify_spec_completed(&lp.name, &spec.name, done, total);
         Ok(())
     }
+}
+
+fn read_infra_config(node: &LoopNode) -> (u32, u64) {
+    let retry_limit = node
+        .config
+        .get("infra_retry_limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_INFRA_RETRY_LIMIT as u64) as u32;
+    let crash_max_secs = node
+        .config
+        .get("infra_crash_max_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_INFRA_CRASH_MAX_SECONDS);
+    (retry_limit, crash_max_secs)
+}
+
+fn merge_attempt_marker(output: &Value, attempt: u32, is_crash: bool) -> Value {
+    let mut obj = output.clone();
+    if let serde_json::Value::Object(ref mut map) = obj {
+        map.insert("infra_attempt".to_string(), Value::from(attempt));
+        map.insert("infra_crash".to_string(), Value::from(is_crash));
+    }
+    obj
 }
 
 async fn execute_check_node(
@@ -6158,5 +6229,153 @@ mod tests {
             None,
             "the ensemble-bearing spec must have been fully consumed by the pool run"
         );
+    }
+
+    // ── B19: infra crash retry logic ──────────────────────────────────────
+
+    /// Infra crash classification correctly identifies a non-self-reported
+    /// agent-node failure within the crash threshold as needing retry.
+    #[test]
+    fn infra_crash_classification_correct() {
+        let now = chrono::Utc::now();
+        let run = LoopNodeRun {
+            id: "run1".to_string(),
+            loop_id: "loop1".to_string(),
+            spec_id: "spec1".to_string(),
+            node_id: "node1".to_string(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: now,
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+        };
+
+        let agent_node = LoopNode {
+            id: "node1".to_string(),
+            spec_id: Some("spec1".to_string()),
+            loop_id: None,
+            name: "test-agent".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+
+        let execution = NodeExecution {
+            status: LoopRunStatus::Fail,
+            output: serde_json::json!({}),
+            summary: "crashed".to_string(),
+        };
+
+        // Scenario 1: agent node, failed, not self-reported (status=Running),
+        // within threshold → should be classified as infra crash
+        let self_reported = run.status != LoopRunStatus::Running;
+        let duration_secs = (chrono::Utc::now() - run.started_at).num_seconds();
+        let is_crash = !self_reported
+            && agent_node.kind == LoopNodeKind::Agent
+            && execution.status == LoopRunStatus::Fail
+            && duration_secs < 60;
+        assert!(is_crash, "should classify as infra crash");
+
+        // Scenario 2: check node, same conditions → should NOT be classified
+        let check_node = LoopNode {
+            id: "node2".to_string(),
+            spec_id: Some("spec1".to_string()),
+            loop_id: None,
+            name: "test-check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+        let is_crash_check = !self_reported
+            && check_node.kind == LoopNodeKind::Agent
+            && execution.status == LoopRunStatus::Fail
+            && duration_secs < 60;
+        assert!(!is_crash_check, "check node should not be classified as crash");
+
+        // Scenario 3: agent node, self-reported fail → should NOT be classified
+        let run_self_reported = LoopNodeRun {
+            status: LoopRunStatus::Fail,
+            ..run.clone()
+        };
+        let self_reported_bool = run_self_reported.status != LoopRunStatus::Running;
+        let is_crash_reported = !self_reported_bool
+            && agent_node.kind == LoopNodeKind::Agent
+            && execution.status == LoopRunStatus::Fail
+            && duration_secs < 60;
+        assert!(!is_crash_reported, "self-reported fail should not be classified as crash");
+
+        // Scenario 4: agent node, failed, slow (> 60s) → should NOT be classified
+        let old_run = LoopNodeRun {
+            started_at: now - chrono::Duration::seconds(90),
+            ..run.clone()
+        };
+        let slow_duration = (chrono::Utc::now() - old_run.started_at).num_seconds();
+        let is_crash_slow = !self_reported
+            && agent_node.kind == LoopNodeKind::Agent
+            && execution.status == LoopRunStatus::Fail
+            && slow_duration < 60;
+        assert!(!is_crash_slow, "slow fail should not be classified as crash");
+    }
+
+    /// Merging attempt marker into output JSON correctly adds tracking fields.
+    #[test]
+    fn merge_attempt_marker_adds_fields() {
+        let output = serde_json::json!({
+            "kind": "agent",
+            "exit_code": 1,
+        });
+
+        let merged = merge_attempt_marker(&output, 0, true);
+
+        assert_eq!(merged.get("infra_attempt").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(merged.get("infra_crash").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(merged.get("kind").and_then(|v| v.as_str()), Some("agent"));
+        assert_eq!(merged.get("exit_code").and_then(|v| v.as_i64()), Some(1));
+    }
+
+    /// Read infra config returns defaults when not specified.
+    #[test]
+    fn read_infra_config_applies_defaults() {
+        let node = LoopNode {
+            id: "n1".to_string(),
+            spec_id: None,
+            loop_id: None,
+            name: "test".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+
+        let (retry_limit, crash_max) = read_infra_config(&node);
+        assert_eq!(retry_limit, DEFAULT_INFRA_RETRY_LIMIT);
+        assert_eq!(crash_max, DEFAULT_INFRA_CRASH_MAX_SECONDS);
+    }
+
+    /// Read infra config respects overrides in node config.
+    #[test]
+    fn read_infra_config_respects_overrides() {
+        let node = LoopNode {
+            id: "n1".to_string(),
+            spec_id: None,
+            loop_id: None,
+            name: "test".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({
+                "infra_retry_limit": 5,
+                "infra_crash_max_seconds": 120,
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+
+        let (retry_limit, crash_max) = read_infra_config(&node);
+        assert_eq!(retry_limit, 5);
+        assert_eq!(crash_max, 120);
     }
 }
