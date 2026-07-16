@@ -42,7 +42,7 @@ See [`docs/installation.md`](docs/installation.md) for all methods and first-tim
 
 Full documentation lives in [`docs/`](docs/): installation, quick start, the
 TUI, agents and seed identities, intelligence & sync, loops, the RAG
-pipeline, all 63 MCP tools, and the complete CLI reference.
+pipeline, all 64 MCP tools, and the complete CLI reference.
 
 ---
 
@@ -63,6 +63,7 @@ pipeline, all 63 MCP tools, and the complete CLI reference.
 - **Terminal Sessions** — Raw shell sessions with per-session command history (TOML-backed), cross-session autocomplete search, and Warp-like input mode for efficient command entry.
 - **Background Agents** — Cron-scheduled and file-watcher-triggered agents with configurable timeouts, automatic retries, execution logging (5 MB rotation), and per-run status tracking.
 - **Seed Identity System** — Persistent, evolvable agent identities stored as structured TOML at `~/.canopy/seeds/<id>/identity.toml`. Each seed has a unique name, family, behavioral directives, and personality traits. Binded sessions receive the seed's prompt injection automatically. The `evolve_identity` MCP tool lets agents refine themselves over time. 4 KB size cap, case-insensitive name uniqueness, and mandatory field validation.
+- **Seed Nursery** — Collaborative workspace for creating new seed identities. Creates a temporary directory with a draft `identity.toml` and CLI-specific instruction files (e.g. `CLAUDE.md`, `AGENTS.md`) that guide the agent to interview the user and define the seed's personality. Validates and registers the seed on completion.
 - **Context Transfer** — Seamlessly transfer conversation context, prompts, and output between agents while preserving session state and scrollback history.
 - **Prompt Builder** — Structured prompt templates with configurable sections (instruction, context, resources, examples), section picker, and @-mention agent references.
 - **Launchpad** — Start new interactive sessions with previous mission recovery, mission input, and auto-injected context.
@@ -92,7 +93,7 @@ pipeline, all 63 MCP tools, and the complete CLI reference.
 - **Node Blueprints** — Reusable `{name, kind, config}` templates referenced by name in `loop_add_node`. Five builtins seeded at startup; custom blueprints via `blueprint_create`/`blueprint_delete`/`blueprint_list`.
 - **Full Lifecycle** — Create, update, run, pause, continue (retry or skip), reset, complete nodes, and report blockers for human intervention. `loop_schedule_autorun` resumes failed/completed loops at a future time.
 - **`on_completed` Hook** — Post-completion agent execution (e.g. documentation maintenance) that fires once per completion.
-- **Template Variables** — Loop prompts support `{{loop_name}}`, `{{spec_content}}`, `{{node_id}}`, `{{previous_feedback}}`, `{{spec_start_head}}`, and more.
+- **Template Variables** — Loop prompts support `{{loop_name}}`, `{{workdir}}`, `{{spec_id}}`, `{{spec_name}}`, `{{spec_content}}`, `{{node_id}}`, `{{previous_feedback}}`, and `{{spec_start_head}}` (git HEAD at spec start, for check nodes).
 - **24 MCP Tools** — Complete authoring, inspection, runtime, spec, pool, and blueprint management.
 
 ### 📚 Personal RAG Pipeline
@@ -118,6 +119,7 @@ pipeline, all 63 MCP tools, and the complete CLI reference.
 - **Context Transfer** — Two-step modal (preview → agent picker) to inject conversation context between sessions.
 - **Brian's Brain** — 3-state cellular automaton with auto-noise for idle state visualization.
 - **Whimsg** — Animated kaomoji status messages with typing effects.
+- **Gamification** — 28 achievement-style missions across 6 categories (Environment, Intelligence, Projects, Loop, Seeds, SysInfo) tracked automatically during normal TUI operation.
 
 ### 🔧 Additional Features
 
@@ -126,7 +128,7 @@ pipeline, all 63 MCP tools, and the complete CLI reference.
 - **Action Protocol Advisor** — `get_tools` MCP tool returns scope-sensitive action protocols (`session_start`, `file_write`, `test_run`, `close_session`, `multi_agent`) with risk levels and recommended tool sets.
 - **Setup Wizard** — Interactive `canopy setup` detects installed AI CLIs from a GitHub-hosted registry, configures binary paths, model flags, headless modes, environment variables, and temperature units. Generates `~/.canopy/config.toml`.
 - **MCP Wizard** — `canopy mcp` subcommand for syncing, adding, and removing MCP server entries across all detected platforms with automatic format conversion (JSON ↔ TOML).
-- **Skills Manager** — List, validate symlink integrity, and remove installed skills across platforms.
+- **Skills Manager** — Global skill directory at `~/.agents/skills/` with cross-platform symlinks. List, validate symlink integrity, and remove installed skills across platforms.
 - **Doctor Diagnostics** — `canopy doctor` checks data directory, database, config, harnesses, RAG status, file watchers, daemon process, registry connectivity, and auto-update health.
 - **Desktop Notifications** — Cross-platform alerts for task completions, failures, watcher triggers, RAG indexing events, and loop lifecycle (started, spec completed, finished with outcome, blocker, hook failure).
 
@@ -161,6 +163,8 @@ pipeline, all 63 MCP tools, and the complete CLI reference.
 - **Loop Engine** — DAG execution engine: check/gate/agent node runners, iteration limits, pause/continue, blocker reporting, spec pools, node blueprints, scheduled autorun.
 - **RAG Pipeline** — Background ingestion, language-aware chunking, embedding client, vector store, and rate-limited search.
 - **TUI** — Full-screen ratatui terminal UI for managing agents, viewing output, loops, and system metrics in real time.
+- **Gamification** — Mission tracker with 28 achievements across 6 categories, persisted in the database.
+- **Skills Manager** — Global skills directory with cross-platform symlinks and integrity validation.
 
 ---
 

@@ -30,8 +30,9 @@ no external services, no cloud account.
 |---|---|
 | **Daemon** | MCP server (Streamable HTTP + stdio), scheduler, watcher engine, database |
 | **Canopy Hub (TUI)** | Full-screen terminal UI for agents, loops and system metrics |
-| **63 MCP tools** | Agent management, sync, intelligence, seeds, loops, specs, pools, blueprints, RAG, projects |
+| **64 MCP tools** | Agent management, sync, intelligence, seeds, loops, specs, pools, blueprints, RAG, projects |
 | **Seed identities** | Persistent, evolvable agent personalities stored as TOML |
+| **Gamification** | 28 missions across 6 categories tracking usage milestones |
 
 ## How the documentation is organized
 

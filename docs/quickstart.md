@@ -49,7 +49,7 @@ canopy mcp
 The MCP wizard syncs, adds and removes canopy's MCP server entry across
 all detected platforms, converting formats automatically (JSON ↔ TOML).
 After that, your AI agents can call all
-[63 MCP tools](mcp-tools.md) — schedule background agents, store
+[64 MCP tools](mcp-tools.md) — schedule background agents, store
 knowledge, coordinate with each other.
 
 ## 5. Verify

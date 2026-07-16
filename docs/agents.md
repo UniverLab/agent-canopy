@@ -37,6 +37,22 @@ Background agents are managed from the TUI or by other agents through the
 Raw shell sessions with per-session command history (TOML-backed),
 cross-session autocomplete search and a Warp-like input mode.
 
+## Seed nursery
+
+The **seed nursery** is a collaborative workspace for creating new seed
+identities. When you select "Plant New Seed" in the TUI, Canopy creates
+a temporary directory containing:
+
+- A draft `identity.toml` with empty/default fields.
+- An instruction file (`CLAUDE.md`, `AGENTS.md`, etc.) with gardener
+  instructions that guide the selected CLI to interview the user about
+  the seed's name, directives, and traits.
+
+Once the agent finishes the interview and writes the final
+`identity.toml`, the nursery validates it (name uniqueness, field
+constraints, 4 KB size cap) and moves it to `~/.canopy/seeds/<id>/`.
+The temporary directory is cleaned up automatically.
+
 ## Seed identities
 
 A **seed** is a persistent, evolvable agent identity stored as structured

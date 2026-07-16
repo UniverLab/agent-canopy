@@ -41,6 +41,23 @@ The dialog includes a CLI picker, model picker, seed identity selector
 - **Idle visuals** — Brian's Brain cellular automaton and animated
   kaomoji status messages (whimsg).
 
+## Gamification
+
+Canopy tracks 28 achievement-style missions across six categories:
+
+| Category | Missions | Examples |
+|---|---|---|
+| **Environment** | 4 | Firefly Catcher, Harness Master, Canopy Explorer, Multitasker |
+| **Intelligence** | 6 | World Connector, Data Architect, Deep Searcher, Digital Archeologist |
+| **Projects** | 3 | Project Polyglot, The Gardener, Data Hoarder |
+| **Loop** | 4 | Automation Engineer, Pipeline Pilot, Parallel Vision, Loop Survivor |
+| **Seeds** | 4 | First Bloom, Identity Evolved, The Orchard, Deep Roots |
+| **SysInfo** | 7 | Full Throttle, Nuclear Winter, VRAM Squeezer, YOLO Pilot |
+
+Missions are checked automatically during normal TUI operation — no
+manual action required. Progress is persisted in the database and
+visible in the TUI's gamification panel.
+
 ## Projects sidebar
 
 The sidebar shows sections for the selected project:

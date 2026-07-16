@@ -6,7 +6,7 @@ order: 9
 
 # MCP Tools
 
-The daemon exposes **63 MCP tools** over Streamable HTTP (port 7755) and
+The daemon exposes **64 MCP tools** over Streamable HTTP (port 7755) and
 stdio. Connect any MCP-capable AI CLI with `canopy mcp`.
 
 ## Agent management (13)

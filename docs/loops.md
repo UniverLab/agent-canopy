@@ -29,9 +29,21 @@ Loop
 
 ## Template variables
 
-Loop prompts support `{{loop_name}}`, `{{spec_content}}`,
-`{{node_id}}`, `{{previous_feedback}}` and more — so a failing check can
-feed its output back into the retrying agent node.
+Agent node prompts support these placeholders:
+
+| Variable | Expands to |
+|---|---|
+| `{{loop_name}}` | The loop's name |
+| `{{workdir}}` | The loop's working directory |
+| `{{spec_id}}` | The spec's unique ID |
+| `{{spec_name}}` | The spec's name |
+| `{{spec_content}}` | The spec's description (falls back to name) |
+| `{{node_id}}` | The node's unique ID |
+| `{{previous_feedback}}` | JSON output of the previous node (truncated if oversized) |
+
+Check node commands additionally support `{{spec_start_head}}` — the
+git HEAD commit at the start of the spec run, useful for verifying
+that code actually changed.
 
 ## Ensembles
 
