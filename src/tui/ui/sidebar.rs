@@ -1669,9 +1669,12 @@ fn agent_card_meta<'a>(agent: &'a AgentEntry, app: &'a App) -> AgentCardMeta<'a>
             let agent = &app.interactive_agents[*index];
             AgentCardMeta {
                 accent: agent.accent_color,
-                status_color: session_status_color(
+                // Interactive agents pulse on recent output activity (unchanged).
+                status_color: pty_session_status_color(
+                    false,
                     &agent.status,
                     agent.has_recent_activity(),
+                    false,
                     app.animation_tick,
                 ),
                 agent_type: "pty",
@@ -1683,9 +1686,16 @@ fn agent_card_meta<'a>(agent: &'a AgentEntry, app: &'a App) -> AgentCardMeta<'a>
             let agent = &app.terminal_agents[*index];
             AgentCardMeta {
                 accent: agent.accent_color,
-                status_color: session_status_color(
+                // Terminal sessions pulse while a foreground command executes
+                // and go solid green at the prompt — output activity is
+                // deliberately ignored (a scrolled-by finished command must
+                // not keep pulsing; a `watch`/`tail -f` still counts as
+                // executing). Same source of truth warp uses to gate input.
+                status_color: pty_session_status_color(
+                    true,
                     &agent.status,
-                    agent.has_recent_activity(),
+                    false,
+                    agent.foreground_app_active(),
                     app.animation_tick,
                 ),
                 agent_type: "term",
@@ -1727,12 +1737,41 @@ fn agent_card_meta<'a>(agent: &'a AgentEntry, app: &'a App) -> AgentCardMeta<'a>
 /// `ACTIVITY_IDLE_THRESHOLD_MS` and `pulse_active` — never blank, B21) and
 /// holds solid green — "healthy, available" — once output has been quiet
 /// for a while. Any exit, clean or not, means the PTY is dead: red.
-fn session_status_color(status: &AgentStatus, recently_active: bool, animation_tick: u32) -> Color {
+fn session_status_color(status: &AgentStatus, pulsing: bool, animation_tick: u32) -> Color {
     match status {
-        AgentStatus::Running if recently_active => pulse_active(animation_tick),
+        AgentStatus::Running if pulsing => pulse_active(animation_tick),
         AgentStatus::Running => STATUS_RUNNING,
         AgentStatus::Exited(_) => STATUS_FAIL,
     }
+}
+
+/// Pick which signal drives a PTY-backed session's pulse, then defer to
+/// [`session_status_color`]. The two session kinds pulse on different truths:
+///
+/// * Interactive agents pulse on **recent output activity** (`recent_activity`)
+///   — the long-standing B21 behavior, kept exactly as is.
+/// * Terminal (plain shell) sessions pulse on **command execution**
+///   (`command_executing`, from `InteractiveAgent::foreground_app_active` — the
+///   same PTY foreground-process-group check warp uses to gate input) and go
+///   solid green the moment the shell returns to its prompt, *regardless* of
+///   output activity. A finished command whose output just scrolled by stops
+///   pulsing immediately; a still-running `watch`/`tail -f` keeps pulsing.
+///
+/// Whichever signal isn't selected for a kind is ignored, so callers pass
+/// `false` for it.
+fn pty_session_status_color(
+    is_terminal: bool,
+    status: &AgentStatus,
+    recent_activity: bool,
+    command_executing: bool,
+    animation_tick: u32,
+) -> Color {
+    let pulsing = if is_terminal {
+        command_executing
+    } else {
+        recent_activity
+    };
+    session_status_color(status, pulsing, animation_tick)
 }
 
 /// Alternate between `on` and the shared "off" tone on the TUI's existing
@@ -2494,6 +2533,67 @@ mod tests {
         );
         assert_eq!(
             session_status_color(&AgentStatus::Exited(0), false, 0),
+            STATUS_FAIL
+        );
+    }
+
+    #[test]
+    fn terminal_running_a_command_pulses_never_blank() {
+        // A foreground command is executing → pulse through both phases,
+        // ignoring output activity entirely.
+        let bright = pty_session_status_color(true, &AgentStatus::Running, false, true, 0);
+        let dim = pty_session_status_color(true, &AgentStatus::Running, false, true, 10);
+        assert_eq!(bright, super::super::STATUS_RUNNING_BRIGHT);
+        assert_eq!(dim, super::super::STATUS_RUNNING_DIM);
+        // Never blank across the cycle (B21).
+        assert_ne!(bright, super::super::STATUS_WAIT_OFF);
+        assert_ne!(dim, super::super::STATUS_WAIT_OFF);
+        assert_ne!(bright, dim);
+    }
+
+    #[test]
+    fn terminal_idle_at_prompt_is_solid_even_right_after_output() {
+        // No foreground command, but output just scrolled by (recent_activity
+        // true): a terminal must NOT keep pulsing — it's solid green.
+        assert_eq!(
+            pty_session_status_color(true, &AgentStatus::Running, true, false, 0),
+            STATUS_RUNNING
+        );
+        assert_eq!(
+            pty_session_status_color(true, &AgentStatus::Running, true, false, 10),
+            STATUS_RUNNING
+        );
+    }
+
+    #[test]
+    fn terminal_ignores_output_activity_command_execution_wins() {
+        // Command executing but no recent output (e.g. a blocking `sleep`):
+        // still pulsing. Output present but command finished: solid.
+        assert_eq!(
+            pty_session_status_color(true, &AgentStatus::Running, false, true, 0),
+            pulse_active(0)
+        );
+        assert_eq!(
+            pty_session_status_color(true, &AgentStatus::Running, true, false, 0),
+            STATUS_RUNNING
+        );
+    }
+
+    #[test]
+    fn interactive_agent_still_pulses_on_output_activity() {
+        // Interactive kind keeps the activity-based behavior unchanged: the
+        // command_executing signal is ignored for it.
+        assert_eq!(
+            pty_session_status_color(false, &AgentStatus::Running, true, false, 0),
+            pulse_active(0)
+        );
+        assert_eq!(
+            pty_session_status_color(false, &AgentStatus::Running, false, true, 0),
+            STATUS_RUNNING
+        );
+        // Exited stays red regardless of signals.
+        assert_eq!(
+            pty_session_status_color(false, &AgentStatus::Exited(0), true, false, 0),
             STATUS_FAIL
         );
     }
