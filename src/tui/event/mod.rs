@@ -226,6 +226,14 @@ fn dispatch_focus_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> 
 // ── Mouse: scroll wheel + Shift+Click to copy selection ─────────────
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
+    // The prompt builder is a modal overlay: it owns the mouse while open.
+    // Left-clicks on the tab bar switch the active tab; everything else is
+    // swallowed so it doesn't leak to the panel/PTY underneath.
+    if app.focus == Focus::PromptTemplateDialog {
+        handle_prompt_dialog_mouse(app, &mouse);
+        return Ok(());
+    }
+
     if handle_sidebar_mouse(app, &mouse) {
         return Ok(());
     }
@@ -242,6 +250,36 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
 
     handle_mouse_scroll(app, &mouse);
     Ok(())
+}
+
+/// Handle a mouse event while the prompt builder is open. A left-click on one
+/// of the tab-bar hit-boxes (positioned via the pure `tab_at` mapping against
+/// the origin stored during the last frame) switches the active tab; entering
+/// the Raw tab refreshes its composed-prompt preview. All other mouse events
+/// are ignored (and swallowed by the caller).
+fn handle_prompt_dialog_mouse(app: &mut App, mouse: &MouseEvent) {
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return;
+    }
+    let Some((x, y)) = app.prompt_tab_origin else {
+        return;
+    };
+    let Some(tab) =
+        crate::tui::app::dialog::SimplePromptDialog::tab_at(x, y, mouse.column, mouse.row)
+    else {
+        return;
+    };
+
+    let db = app.db.clone();
+    let workdir = app.current_workdir();
+    if let Some(dialog) = app.simple_prompt_dialog.as_mut() {
+        let entering_raw =
+            tab == crate::tui::app::dialog::PromptTab::Raw && dialog.active_tab != tab;
+        dialog.set_tab(tab);
+        if entering_raw {
+            dialog.refresh_raw_preview(&db, &workdir);
+        }
+    }
 }
 
 // ── Mouse: agent sidebar (hover, click, scroll, right-click) ────────

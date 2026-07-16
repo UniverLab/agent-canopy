@@ -389,6 +389,9 @@ pub struct App {
     /// Persisted prompt-builder sessions per agent/session (cleared on send).
     pub(crate) prompt_builder_sessions:
         HashMap<String, crate::tui::app::dialog::PromptBuilderSession>,
+    /// Tab-bar origin `(x, y)` of the prompt builder from the last frame, used
+    /// for mouse hit-testing the clickable Normal/Raw tabs.
+    pub(crate) prompt_tab_origin: Option<(u16, u16)>,
     /// Whether to send OS-level desktop notifications (agent done/failed).
     pub(crate) notifications_enabled: bool,
     /// Notification service for sending cross-platform notifications.

@@ -136,6 +136,7 @@ impl App {
                 .unwrap_or_else(|_| PromptTemplates::internal_templates()),
             simple_prompt_dialog: None,
             prompt_builder_sessions: HashMap::new(),
+            prompt_tab_origin: None,
             notifications_enabled: true,
             notification_service: Arc::new(DefaultNotificationService),
             prev_active_run_ids: std::collections::HashSet::new(),

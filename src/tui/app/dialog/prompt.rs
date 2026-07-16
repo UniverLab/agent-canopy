@@ -1,5 +1,6 @@
 use anyhow::Result;
 use chrono::Timelike;
+use ratatui::layout::Rect;
 use ratatui::style::Color;
 use std::collections::{HashMap, HashSet};
 
@@ -52,6 +53,27 @@ pub enum SendChoice {
     Now,
     Date,
 }
+
+/// Which top-of-dialog tab is active. `Normal` is the section-based form;
+/// `Raw` is a single free-text field that is sent as-is (or, when empty,
+/// previews the composed Normal-form prompt). Pilot of clickable "windows".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum PromptTab {
+    #[default]
+    Normal,
+    Raw,
+}
+
+/// Section id backing the Raw tab's free-text buffer. It deliberately lives in
+/// `sections`/`section_cursors`/`section_scrolls` (so all the existing editing
+/// machinery applies) but is NEVER added to `enabled_sections`, so it stays
+/// out of focus navigation, `is_empty`, and the composed-prompt build.
+pub const RAW_SECTION_ID: &str = "__raw__";
+
+/// Display label (with padding) of the Normal tab in the tab bar.
+pub const TAB_NORMAL_LABEL: &str = " Normal ";
+/// Display label (with padding) of the Raw tab in the tab bar.
+pub const TAB_RAW_LABEL: &str = " Raw ";
 
 /// Inline date-time picker state for the send control (U11). Opened with
 /// Enter on `send: date`, preseeded with the current local time.
@@ -192,6 +214,13 @@ pub struct SimplePromptDialog {
     /// because the builder currently has non-empty content. `None` once
     /// confirmed/canceled. Not persisted across dialog openings.
     pub pending_recall: Option<crate::db::last_prompts::LastPrompt>,
+    /// Active tab at the top of the dialog (Normal form vs Raw free-text).
+    pub active_tab: PromptTab,
+    /// Cached composed-prompt string shown as the read-only preview when the
+    /// Raw tab is active and its buffer is empty. Recomputed on entering the
+    /// Raw tab (the Normal form can't change while Raw is shown). Transient —
+    /// never persisted.
+    pub raw_preview: Option<String>,
 }
 
 impl SimplePromptDialog {
@@ -225,6 +254,8 @@ impl SimplePromptDialog {
             send_edit: None,
             send_error: None,
             pending_recall: None,
+            active_tab: PromptTab::Normal,
+            raw_preview: None,
         }
     }
 
@@ -1451,6 +1482,97 @@ impl SimplePromptDialog {
         }
     }
 
+    // ── Tabs & Raw mode ─────────────────────────────────────────────────
+
+    /// The Raw tab's free-text buffer (empty string when never touched).
+    pub fn raw_text(&self) -> &str {
+        self.sections
+            .get(RAW_SECTION_ID)
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
+    /// True when the Raw buffer is blank (whitespace-only counts as empty).
+    /// The empty state is what triggers the composed-prompt preview.
+    pub fn raw_is_empty(&self) -> bool {
+        self.raw_text().trim().is_empty()
+    }
+
+    /// Switch to a specific tab. Focus lands on the tab's first editable field
+    /// (Raw → the raw buffer; Normal → the first section), never on the send
+    /// control. No-op transient state (`raw_preview`) is cleared so the caller
+    /// can recompute it when needed.
+    pub fn set_tab(&mut self, tab: PromptTab) {
+        if self.active_tab == tab {
+            return;
+        }
+        self.active_tab = tab;
+        self.raw_preview = None;
+        match tab {
+            PromptTab::Raw => {
+                // Raw has two focus targets: the buffer (index 1) and the send
+                // control (index 0). Land on the buffer, ready to type.
+                self.focused_section = 1;
+                let end = self.raw_text().chars().count();
+                self.section_cursors
+                    .entry(RAW_SECTION_ID.to_string())
+                    .or_insert(end);
+            }
+            PromptTab::Normal => self.focus_first_section(),
+        }
+    }
+
+    /// Toggle between the Normal and Raw tabs.
+    pub fn toggle_tab(&mut self) {
+        let next = match self.active_tab {
+            PromptTab::Normal => PromptTab::Raw,
+            PromptTab::Raw => PromptTab::Normal,
+        };
+        self.set_tab(next);
+    }
+
+    /// The exact string a "send" produces given the active tab:
+    /// Raw + non-empty buffer → the raw text verbatim (no XML/system wrapping);
+    /// otherwise the composed Normal-form prompt (identical to sending from the
+    /// Normal tab, and to what the Raw-empty preview shows).
+    pub fn resolve_outgoing_prompt(&self, db: &Database, current_workdir: &Path) -> Result<String> {
+        if self.active_tab == PromptTab::Raw && !self.raw_is_empty() {
+            return Ok(self.raw_text().to_string());
+        }
+        self.build_prompt_with_resolved_resources(db, current_workdir)
+    }
+
+    /// Compute the composed-prompt preview string (best-effort) and cache it in
+    /// `raw_preview`. Called when entering the Raw tab; the Normal form can't
+    /// change while Raw is shown, so the cache stays faithful.
+    pub fn refresh_raw_preview(&mut self, db: &Database, current_workdir: &Path) {
+        self.raw_preview = self
+            .build_prompt_with_resolved_resources(db, current_workdir)
+            .ok();
+    }
+
+    /// Hit-boxes for the two tab labels, laid out left-to-right from `(x, y)`.
+    /// Pure geometry so the render and the mouse handler agree, and so the
+    /// click→tab mapping is unit-testable without any event plumbing.
+    pub fn tab_hitboxes(x: u16, y: u16) -> [(PromptTab, Rect); 2] {
+        let normal_w = TAB_NORMAL_LABEL.chars().count() as u16;
+        let raw_w = TAB_RAW_LABEL.chars().count() as u16;
+        [
+            (PromptTab::Normal, Rect::new(x, y, normal_w, 1)),
+            (PromptTab::Raw, Rect::new(x + normal_w, y, raw_w, 1)),
+        ]
+    }
+
+    /// Map a click at `(col, row)` to the tab whose hit-box contains it, given
+    /// the tab bar origin `(x, y)`. Pure — the unit test for mouse switching.
+    pub fn tab_at(x: u16, y: u16, col: u16, row: u16) -> Option<PromptTab> {
+        Self::tab_hitboxes(x, y)
+            .into_iter()
+            .find_map(|(tab, rect)| {
+                (row == rect.y && col >= rect.x && col < rect.x + rect.width).then_some(tab)
+            })
+    }
+
     fn should_collapse_paste(text: &str) -> bool {
         text.lines().count() > 1 || text.chars().count() > 200
     }
@@ -1974,6 +2096,116 @@ mod tests {
         assert_eq!(target.focused_section, 1);
         assert_eq!(target.focused_section_name(), Some("instruction_1"));
     }
+
+    // ── Tabs & Raw mode ─────────────────────────────────────────────────
+
+    #[test]
+    fn toggle_tab_flips_active_tab_and_focus() {
+        let mut dialog = SimplePromptDialog::new();
+        assert_eq!(dialog.active_tab, PromptTab::Normal);
+        assert_eq!(dialog.focused_section, 1);
+
+        dialog.toggle_tab();
+        assert_eq!(dialog.active_tab, PromptTab::Raw);
+        // Raw lands focus on the raw buffer (index 1), not the send control.
+        assert_eq!(dialog.focused_section, 1);
+
+        dialog.toggle_tab();
+        assert_eq!(dialog.active_tab, PromptTab::Normal);
+        assert_eq!(dialog.focused_section, 1);
+    }
+
+    #[test]
+    fn tab_at_maps_clicks_to_the_right_tab() {
+        // Tab bar origin at (2, 1). " Normal " spans cols 2..9, " Raw " 10..14.
+        let x = 2;
+        let y = 1;
+        assert_eq!(
+            SimplePromptDialog::tab_at(x, y, 3, 1),
+            Some(PromptTab::Normal)
+        );
+        assert_eq!(
+            SimplePromptDialog::tab_at(x, y, 9, 1),
+            Some(PromptTab::Normal)
+        );
+        assert_eq!(
+            SimplePromptDialog::tab_at(x, y, 10, 1),
+            Some(PromptTab::Raw)
+        );
+        assert_eq!(
+            SimplePromptDialog::tab_at(x, y, 13, 1),
+            Some(PromptTab::Raw)
+        );
+        // Left of the bar, right of the bar, and a different row all miss.
+        assert_eq!(SimplePromptDialog::tab_at(x, y, 1, 1), None);
+        assert_eq!(SimplePromptDialog::tab_at(x, y, 20, 1), None);
+        assert_eq!(SimplePromptDialog::tab_at(x, y, 3, 2), None);
+    }
+
+    #[test]
+    fn raw_non_empty_send_produces_exactly_the_raw_text() {
+        let temp = tempdir().unwrap();
+        let db = Database::new(&temp.path().join("canopy.db")).unwrap();
+        let workdir = temp.path().to_path_buf();
+
+        let mut dialog = SimplePromptDialog::new();
+        // Non-raw content that WOULD be composed if we were on the Normal tab —
+        // proves the raw path bypasses XML/system composition entirely.
+        dialog.set_section_content("instruction_1", "compose me".to_string());
+        dialog.system_content = Some("SYSTEM PROTOCOL".to_string());
+        dialog.set_tab(PromptTab::Raw);
+        dialog
+            .sections
+            .insert(RAW_SECTION_ID.to_string(), "/compact".to_string());
+
+        let out = dialog.resolve_outgoing_prompt(&db, &workdir).unwrap();
+        assert_eq!(out, "/compact");
+        assert!(!out.contains("SYSTEM"));
+        assert!(!out.contains("[INSTRUCTIONS]"));
+    }
+
+    #[test]
+    fn raw_empty_preview_and_send_equal_the_composed_prompt() {
+        let temp = tempdir().unwrap();
+        let db = Database::new(&temp.path().join("canopy.db")).unwrap();
+        let workdir = temp.path().to_path_buf();
+
+        let mut dialog = SimplePromptDialog::new();
+        dialog.set_section_content("instruction_1", "do the thing".to_string());
+        let composed = dialog
+            .build_prompt_with_resolved_resources(&db, &workdir)
+            .unwrap();
+
+        dialog.set_tab(PromptTab::Raw);
+        assert!(dialog.raw_is_empty());
+
+        // Sending from the empty Raw tab sends the composed prompt verbatim.
+        let out = dialog.resolve_outgoing_prompt(&db, &workdir).unwrap();
+        assert_eq!(out, composed);
+
+        // The cached preview shows exactly that same composed string.
+        dialog.refresh_raw_preview(&db, &workdir);
+        assert_eq!(dialog.raw_preview.as_deref(), Some(composed.as_str()));
+    }
+
+    #[test]
+    fn raw_buffer_and_active_tab_survive_session_round_trip() {
+        let mut source = SimplePromptDialog::new();
+        source.set_tab(PromptTab::Raw);
+        source.sections.insert(
+            RAW_SECTION_ID.to_string(),
+            "/compact when quota back".to_string(),
+        );
+
+        let session = PromptBuilderSession::from_dialog(&source);
+        let mut target = SimplePromptDialog::new();
+        session.restore_into(&mut target);
+
+        assert_eq!(target.active_tab, PromptTab::Raw);
+        assert_eq!(target.raw_text(), "/compact when quota back");
+        // Restoring the Raw tab lands focus on the buffer, not the send control.
+        assert_eq!(target.focused_section, 1);
+    }
 }
 
 /// Snapshot of `SimplePromptDialog` state used to persist the prompt builder
@@ -1989,6 +2221,9 @@ pub struct PromptBuilderSession {
     pub locked_sections: HashSet<String>,
     pub send_choice: SendChoice,
     pub send_at: Option<chrono::NaiveDateTime>,
+    /// Which tab was active when the builder was hidden. The Raw buffer itself
+    /// rides along inside `sections` under `RAW_SECTION_ID`.
+    pub active_tab: PromptTab,
 }
 
 impl PromptBuilderSession {
@@ -2003,6 +2238,7 @@ impl PromptBuilderSession {
             locked_sections: dialog.locked_sections.clone(),
             send_choice: dialog.send_choice,
             send_at: dialog.send_at,
+            active_tab: dialog.active_tab,
         }
     }
 
@@ -2016,16 +2252,22 @@ impl PromptBuilderSession {
         dialog.locked_sections = self.locked_sections.clone();
         dialog.send_choice = self.send_choice;
         dialog.send_at = self.send_at;
+        dialog.active_tab = self.active_tab;
         // A reopened builder always starts in the first section, regardless of
         // where focus sat when the session was captured — the send control is
-        // the last stop of the cycle, never the entry point.
-        dialog.focus_first_section();
+        // the last stop of the cycle, never the entry point. On the Raw tab
+        // that first stop is instead the raw buffer (focus index 1).
+        match self.active_tab {
+            PromptTab::Raw => dialog.focused_section = 1,
+            PromptTab::Normal => dialog.focus_first_section(),
+        }
         // Reset transient UI state (not persisted across openings)
         dialog.picker_mode = SectionPickerMode::None;
         dialog.at_picker = None;
         dialog.system_content = None; // re-evaluated on each open
         dialog.send_edit = None;
         dialog.send_error = None;
+        dialog.raw_preview = None; // recomputed when the Raw tab is shown
     }
 }
 

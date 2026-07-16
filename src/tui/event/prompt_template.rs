@@ -51,37 +51,60 @@ pub fn handle_prompt_template_key(
         return Ok(());
     }
 
-    if handle_section_picker_key(dialog, &db, &workdir, code)? {
+    // Ctrl+E toggles between the Normal and Raw tabs from any focus. Entering
+    // the Raw tab (re)computes the composed-prompt preview for its empty state.
+    if code == KeyCode::Char('e') && modifiers.contains(KeyModifiers::CONTROL) {
+        let entering_raw = dialog.active_tab == crate::tui::app::dialog::PromptTab::Normal;
+        dialog.toggle_tab();
+        if entering_raw {
+            dialog.refresh_raw_preview(&db, &workdir);
+        }
         return Ok(());
     }
 
-    // Determine the focused section name (None when send_at is focused).
-    let section_name = focused_section_name(dialog);
-
-    // Only expand collapsed pastes when entering text or doing edit operations
-    // (not for navigation keys like arrows, tab, etc.)
-    if should_expand_on_key(code, modifiers) {
-        if let Some(ref name) = section_name {
-            dialog.expand_collapsed_paste(name);
-        }
-    }
-
-    if let Some(ref name) = section_name {
-        if handle_at_picker_key(dialog, code, modifiers, name, field_width) {
+    let action = if dialog.active_tab == crate::tui::app::dialog::PromptTab::Raw {
+        handle_raw_tab_key(
+            dialog,
+            code,
+            modifiers,
+            field_width,
+            &db,
+            &workdir,
+            app.keyboard_enhancement_active,
+        )
+    } else {
+        if handle_section_picker_key(dialog, &db, &workdir, code)? {
             return Ok(());
         }
-    }
 
-    let action = handle_dialog_key(
-        dialog,
-        code,
-        modifiers,
-        section_name.as_deref(),
-        field_width,
-        &db,
-        &workdir,
-        app.keyboard_enhancement_active,
-    )?;
+        // Determine the focused section name (None when send_at is focused).
+        let section_name = focused_section_name(dialog);
+
+        // Only expand collapsed pastes when entering text or doing edit
+        // operations (not for navigation keys like arrows, tab, etc.)
+        if should_expand_on_key(code, modifiers) {
+            if let Some(ref name) = section_name {
+                dialog.expand_collapsed_paste(name);
+            }
+        }
+
+        if let Some(ref name) = section_name {
+            if handle_at_picker_key(dialog, code, modifiers, name, field_width) {
+                return Ok(());
+            }
+        }
+
+        handle_dialog_key(
+            dialog,
+            code,
+            modifiers,
+            section_name.as_deref(),
+            field_width,
+            &db,
+            &workdir,
+            app.keyboard_enhancement_active,
+        )?
+    };
 
     match action {
         PromptAction::None => {}
@@ -556,6 +579,193 @@ fn push_at_picker_query(dialog: &mut SimplePromptDialog, c: char, modifiers: Key
     picker.queue_search();
 }
 
+/// The send control (focus index 0) key handling, shared by both tabs. When
+/// the inline date-time picker is open, arrows edit and Enter confirms;
+/// otherwise the selector toggles now/date and navigates back into the fields.
+fn handle_send_control_key(
+    dialog: &mut SimplePromptDialog,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    is_shift: bool,
+) -> PromptAction {
+    // Inline date-time picker open: arrows edit, Enter confirms, Esc abandons.
+    if dialog.send_edit.is_some() {
+        return match code {
+            KeyCode::Esc => {
+                dialog.send_edit_cancel();
+                PromptAction::None
+            }
+            KeyCode::Up => {
+                dialog.send_edit_adjust(1);
+                PromptAction::None
+            }
+            KeyCode::Down => {
+                dialog.send_edit_adjust(-1);
+                PromptAction::None
+            }
+            KeyCode::Left | KeyCode::BackTab => {
+                dialog.send_edit_move(-1);
+                PromptAction::None
+            }
+            KeyCode::Right | KeyCode::Tab => {
+                dialog.send_edit_move(1);
+                PromptAction::None
+            }
+            KeyCode::Enter => {
+                dialog.send_edit_confirm();
+                PromptAction::None
+            }
+            KeyCode::Backspace => {
+                dialog.clear_send_at();
+                PromptAction::None
+            }
+            // Typed digits write the focused field directly and auto-advance
+            // when it fills (U11); arrows keep working.
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                if let Some(digit) = c.to_digit(10) {
+                    dialog.send_edit_type_digit(digit);
+                }
+                PromptAction::None
+            }
+            _ => PromptAction::None,
+        };
+    }
+
+    // Selector: lateral arrows toggle now ↔ date, Enter opens the picker on
+    // date, Shift+↑/↓ and Tab return to the fields above.
+    match code {
+        KeyCode::Esc => PromptAction::Close,
+        KeyCode::Left | KeyCode::Right => {
+            dialog.send_toggle();
+            PromptAction::None
+        }
+        KeyCode::Enter => {
+            if dialog.send_choice == crate::tui::app::dialog::SendChoice::Date {
+                dialog.send_begin_edit();
+            }
+            PromptAction::None
+        }
+        KeyCode::Backspace => {
+            dialog.clear_send_at();
+            PromptAction::None
+        }
+        KeyCode::Char('k') if modifiers.contains(KeyModifiers::CONTROL) => {
+            PromptAction::CancelNextScheduled
+        }
+        KeyCode::Up if is_shift => {
+            dialog.focus_prev();
+            PromptAction::None
+        }
+        KeyCode::Down if is_shift => {
+            dialog.focus_next();
+            PromptAction::None
+        }
+        KeyCode::Tab => {
+            dialog.focus_next();
+            PromptAction::None
+        }
+        KeyCode::BackTab => {
+            // wrap to last section
+            dialog.focused_section = dialog.total_focusable() - 1;
+            PromptAction::None
+        }
+        _ => PromptAction::None,
+    }
+}
+
+/// Key handling for the Raw tab. Two focus targets only: the raw buffer
+/// (focus index ≥ 1) and the send control (focus index 0). No sections,
+/// pickers, or @-resources — just a plain multi-line text field plus the
+/// shared send control. Sending resolves through `resolve_outgoing_prompt`,
+/// so a non-empty buffer is sent verbatim and an empty one sends the composed
+/// Normal-form prompt.
+#[allow(clippy::too_many_arguments)]
+fn handle_raw_tab_key(
+    dialog: &mut SimplePromptDialog,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    field_width: usize,
+    db: &Database,
+    workdir: &Path,
+    keyboard_enhancement: bool,
+) -> PromptAction {
+    let is_shift = modifiers.contains(KeyModifiers::SHIFT);
+
+    // Send control focus. After delegating, clamp focus back into {0, 1}
+    // because the raw tab only has those two stops (Normal-tab navigation may
+    // have parked the shared handler on a higher section index).
+    if dialog.focused_section == 0 {
+        let action = handle_send_control_key(dialog, code, modifiers, is_shift);
+        if dialog.focused_section > 1 {
+            dialog.focused_section = 1;
+        }
+        return action;
+    }
+
+    let raw = crate::tui::app::dialog::RAW_SECTION_ID;
+    match code {
+        KeyCode::Esc => PromptAction::Close,
+
+        // Ctrl+S always sends; Shift+Enter sends when the terminal can report it.
+        KeyCode::Char('s') if modifiers.contains(KeyModifiers::CONTROL) => {
+            build_prompt_action(dialog, db, workdir)
+        }
+        KeyCode::Enter if should_send_on_shift_enter(keyboard_enhancement, is_shift) => {
+            build_prompt_action(dialog, db, workdir)
+        }
+        // Plain Enter inserts a newline — the raw field is multi-line.
+        KeyCode::Enter if modifiers.is_empty() => {
+            dialog.insert_newline_at_cursor(raw, field_width);
+            PromptAction::None
+        }
+
+        // Navigation: move to the send control (the only other stop).
+        KeyCode::Tab | KeyCode::BackTab => {
+            dialog.focused_section = 0;
+            PromptAction::None
+        }
+        KeyCode::Up if is_shift => {
+            dialog.focused_section = 0;
+            PromptAction::None
+        }
+        KeyCode::Down if is_shift => {
+            dialog.focused_section = 0;
+            PromptAction::None
+        }
+
+        // Cursor movement inside the raw buffer.
+        KeyCode::Left => {
+            dialog.move_cursor_left(raw, field_width);
+            PromptAction::None
+        }
+        KeyCode::Right => {
+            dialog.move_cursor_right(raw, field_width);
+            PromptAction::None
+        }
+        KeyCode::Up => {
+            dialog.move_cursor_up(raw, field_width);
+            PromptAction::None
+        }
+        KeyCode::Down => {
+            dialog.move_cursor_down(raw, field_width);
+            PromptAction::None
+        }
+
+        // Text input.
+        KeyCode::Char(c) => {
+            if let Some(ch) = normalize_prompt_char_input(c, modifiers) {
+                dialog.insert_char_at_cursor(raw, ch, field_width);
+            }
+            PromptAction::None
+        }
+        KeyCode::Backspace => {
+            dialog.backspace_at_cursor(raw, field_width);
+            PromptAction::None
+        }
+        _ => PromptAction::None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_dialog_key(
     dialog: &mut SimplePromptDialog,
@@ -578,90 +788,7 @@ fn handle_dialog_key(
 
     // ── send control (focus index 0, U11) ───────────────────────────────
     if is_send_at {
-        // Inline date-time picker open: arrows edit, Enter confirms,
-        // Esc abandons back to the selector.
-        if dialog.send_edit.is_some() {
-            return match code {
-                KeyCode::Esc => {
-                    dialog.send_edit_cancel();
-                    Ok(PromptAction::None)
-                }
-                KeyCode::Up => {
-                    dialog.send_edit_adjust(1);
-                    Ok(PromptAction::None)
-                }
-                KeyCode::Down => {
-                    dialog.send_edit_adjust(-1);
-                    Ok(PromptAction::None)
-                }
-                KeyCode::Left | KeyCode::BackTab => {
-                    dialog.send_edit_move(-1);
-                    Ok(PromptAction::None)
-                }
-                KeyCode::Right | KeyCode::Tab => {
-                    dialog.send_edit_move(1);
-                    Ok(PromptAction::None)
-                }
-                KeyCode::Enter => {
-                    dialog.send_edit_confirm();
-                    Ok(PromptAction::None)
-                }
-                KeyCode::Backspace => {
-                    dialog.clear_send_at();
-                    Ok(PromptAction::None)
-                }
-                // Typed digits write the focused field directly and
-                // auto-advance when it fills (U11); arrows keep working.
-                KeyCode::Char(c) if c.is_ascii_digit() => {
-                    if let Some(digit) = c.to_digit(10) {
-                        dialog.send_edit_type_digit(digit);
-                    }
-                    Ok(PromptAction::None)
-                }
-                _ => Ok(PromptAction::None),
-            };
-        }
-
-        // Selector: lateral arrows toggle now ↔ date, Enter opens the
-        // picker on date, Shift+↑/↓ and Tab return to the sections.
-        return match code {
-            KeyCode::Esc => Ok(PromptAction::Close),
-            KeyCode::Left | KeyCode::Right => {
-                dialog.send_toggle();
-                Ok(PromptAction::None)
-            }
-            KeyCode::Enter => {
-                if dialog.send_choice == crate::tui::app::dialog::SendChoice::Date {
-                    dialog.send_begin_edit();
-                }
-                Ok(PromptAction::None)
-            }
-            KeyCode::Backspace => {
-                dialog.clear_send_at();
-                Ok(PromptAction::None)
-            }
-            KeyCode::Char('k') if modifiers.contains(KeyModifiers::CONTROL) => {
-                Ok(PromptAction::CancelNextScheduled)
-            }
-            KeyCode::Up if is_shift => {
-                dialog.focus_prev();
-                Ok(PromptAction::None)
-            }
-            KeyCode::Down if is_shift => {
-                dialog.focus_next();
-                Ok(PromptAction::None)
-            }
-            KeyCode::Tab => {
-                dialog.focus_next();
-                Ok(PromptAction::None)
-            }
-            KeyCode::BackTab => {
-                // wrap to last section
-                dialog.focused_section = dialog.total_focusable() - 1;
-                Ok(PromptAction::None)
-            }
-            _ => Ok(PromptAction::None),
-        };
+        return Ok(handle_send_control_key(dialog, code, modifiers, is_shift));
     }
 
     // ── Section field keys ──────────────────────────────────────────────
@@ -820,7 +947,9 @@ fn is_instruction_section(section_name: &str) -> bool {
 }
 
 fn build_prompt_action(dialog: &SimplePromptDialog, db: &Database, workdir: &Path) -> PromptAction {
-    let Ok(prompt) = dialog.build_prompt_with_resolved_resources(db, workdir) else {
+    // Raw tab with a non-empty buffer sends the text verbatim; otherwise the
+    // composed Normal-form prompt (see `resolve_outgoing_prompt`).
+    let Ok(prompt) = dialog.resolve_outgoing_prompt(db, workdir) else {
         return PromptAction::None;
     };
 
@@ -1161,6 +1290,52 @@ mod recall_last_prompt_tests {
     fn ctrl_l(app: &mut App) {
         handle_prompt_template_key(app, KeyCode::Char('l'), KeyModifiers::CONTROL)
             .expect("ctrl+l handled");
+    }
+
+    fn ctrl_e(app: &mut App) {
+        handle_prompt_template_key(app, KeyCode::Char('e'), KeyModifiers::CONTROL)
+            .expect("ctrl+e handled");
+    }
+
+    #[test]
+    fn ctrl_e_toggles_between_normal_and_raw_tabs() {
+        use crate::tui::app::dialog::PromptTab;
+        let (mut app, _dir) = test_app();
+        app.open_simple_prompt_dialog(None);
+        assert_eq!(
+            app.simple_prompt_dialog.as_ref().unwrap().active_tab,
+            PromptTab::Normal
+        );
+
+        ctrl_e(&mut app);
+        assert_eq!(
+            app.simple_prompt_dialog.as_ref().unwrap().active_tab,
+            PromptTab::Raw
+        );
+
+        ctrl_e(&mut app);
+        assert_eq!(
+            app.simple_prompt_dialog.as_ref().unwrap().active_tab,
+            PromptTab::Normal
+        );
+    }
+
+    #[test]
+    fn typing_in_the_raw_tab_fills_the_raw_buffer_only() {
+        use crate::tui::app::dialog::PromptTab;
+        let (mut app, _dir) = test_app();
+        app.open_simple_prompt_dialog(None);
+        ctrl_e(&mut app); // → Raw
+
+        for ch in "/compact".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+
+        let dialog = app.simple_prompt_dialog.as_ref().unwrap();
+        assert_eq!(dialog.active_tab, PromptTab::Raw);
+        assert_eq!(dialog.raw_text(), "/compact");
+        // The Normal-form instruction section is untouched by raw typing.
+        assert_eq!(dialog.get_section_content("instruction_1"), "");
     }
 
     #[test]

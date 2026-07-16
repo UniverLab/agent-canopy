@@ -149,7 +149,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     if app.simple_prompt_dialog.is_some() {
-        dialogs::draw_simple_prompt_dialog(frame, app);
+        let tab_origin = dialogs::draw_simple_prompt_dialog(frame, app);
+        app.prompt_tab_origin = tab_origin;
     }
 
     if app.loop_editor_dialog.is_some() {
