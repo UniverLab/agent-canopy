@@ -80,7 +80,14 @@ impl App {
         }
 
         // Detect background task completions: was active last tick, gone now.
-        if self.notifications_enabled {
+        //
+        // The daemon's executor (`notify_result`) is the single owner of
+        // desktop notifications for background-agent runs — when it's alive it
+        // fires the completion toast, so the TUI must stay silent to avoid a
+        // duplicate toast for the same run. This TUI-side sender exists only as
+        // a fallback for a daemonless TUI (no daemon process detected), so it
+        // still surfaces completions when nothing else would.
+        if self.notifications_enabled && !self.daemon_running {
             for finished_id in &prev_ids {
                 if !self.active_runs.contains_key(finished_id.as_str()) {
                     if self.db.get_agent(finished_id).ok().flatten().is_none() {
