@@ -62,8 +62,11 @@ pub fn handle_paste(app: &mut App, text: &str) {
             // Multi-line pastes are collapsed to a placeholder while keeping the real text.
             let field_width = super::prompt_template::prompt_field_width(app);
             if let Some(dialog) = &mut app.simple_prompt_dialog {
-                if dialog.enabled_sections.len() > dialog.focused_section {
-                    let section_name = dialog.enabled_sections[dialog.focused_section].clone();
+                // Resolve the focused section through the offset-aware mapper
+                // (focus index 0 is the send control, sections start at 1).
+                // Indexing enabled_sections[focused_section] directly pasted
+                // into the NEXT section — never where the cursor was.
+                if let Some(section_name) = dialog.focused_section_name().map(str::to_string) {
                     if text.contains('\n') || text.chars().count() > 200 {
                         // Preserve newlines for collapsed multi-line paste
                         let clean = text.replace('\r', "");
@@ -187,5 +190,55 @@ mod tests {
 
         assert_eq!(input_buffer_text(&app.terminal_agents[0]), "");
         assert_eq!(input_buffer_text(&app.terminal_agents[1]), "");
+    }
+
+    /// Regression guard: paste must land in the FOCUSED section. The old
+    /// code indexed `enabled_sections[focused_section]` without the +1
+    /// send-control offset, so pasting while editing the first section
+    /// dumped the text into the section below it.
+    #[test]
+    fn prompt_builder_paste_lands_in_the_focused_section() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+
+        let mut dialog = crate::tui::app::dialog::SimplePromptDialog::new();
+        dialog.add_section_with_content("context", String::new());
+        dialog.focused_section = 1; // first section (instruction_1)
+        app.simple_prompt_dialog = Some(dialog);
+        app.focus = Focus::PromptTemplateDialog;
+
+        handle_paste(&mut app, "pasted-here");
+
+        let dialog = app.simple_prompt_dialog.as_ref().unwrap();
+        assert_eq!(dialog.get_section_content("instruction_1"), "pasted-here");
+        assert_eq!(dialog.get_section_content("context_1"), "");
+    }
+
+    /// A large paste still collapses to a placeholder, in the focused
+    /// section, at the cursor.
+    #[test]
+    fn prompt_builder_large_paste_collapses_in_focused_section() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+
+        let mut dialog = crate::tui::app::dialog::SimplePromptDialog::new();
+        dialog.add_section_with_content("context", String::new());
+        dialog.focused_section = 1;
+        app.simple_prompt_dialog = Some(dialog);
+        app.focus = Focus::PromptTemplateDialog;
+
+        let big = "line one\nline two\nline three\n";
+        handle_paste(&mut app, big);
+
+        let dialog = app.simple_prompt_dialog.as_ref().unwrap();
+        assert!(
+            dialog
+                .get_section_content("instruction_1")
+                .contains("[Pasted ~"),
+            "multi-line paste should collapse to a placeholder"
+        );
+        assert_eq!(dialog.get_section_content("context_1"), "");
     }
 }
