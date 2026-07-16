@@ -265,7 +265,8 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) {
         .collect();
 
     let total_sections_height: u16 = section_heights.iter().sum();
-    let total_height = 2 + 1 + 1 + total_sections_height + 1;
+    // borders(2) + hint(1) + gap(1) + sections + gap(1) + send line(1).
+    let total_height = 2 + 1 + 1 + total_sections_height + 1 + 1;
 
     // Cap dialog height — leave at least 4 rows margin, minimum 10 rows.
     let max_dialog_h = frame_area.height.saturating_sub(2).max(1);
@@ -316,75 +317,104 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) {
     };
     frame.render_widget(Paragraph::new(instructions), instructions_area);
 
-    // ── Send-at field (virtual section at focus index 0) ────────────────
-    let send_at_y = inner.y + 1;
-    let send_at_is_focused = dialog.focused_section == 0 && !dialog.enabled_sections.is_empty();
-    let send_at_bg = if send_at_is_focused {
-        Color::Rgb(40, 40, 40)
-    } else {
-        Color::Rgb(30, 30, 30)
-    };
-    let send_at_label_style = if send_at_is_focused {
-        Style::default().fg(accent).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(accent)
-    };
-    let send_at_label = generate_top_border("Schedule", inner.width, send_at_label_style);
-    let send_at_label_area = ratatui::layout::Rect {
-        x: inner.x,
-        y: send_at_y,
-        width: inner.width,
-        height: 1,
-    };
-    frame.render_widget(Paragraph::new(send_at_label), send_at_label_area);
+    // ── Send control (virtual focus index 0, U11) ───────────────────────
+    // A single ghost line centered at the BOTTOM of the dialog — no box.
+    // States: `send: now` / `send: date` selector (←→ toggles), inline
+    // date-time picker while editing, `send: 2026-07-16 08:30` once picked.
+    let send_is_focused = dialog.focused_section == 0 && !dialog.enabled_sections.is_empty();
+    let send_y = inner.y + inner.height.saturating_sub(1);
 
-    // Render send_at content
-    let send_at_display = dialog.send_at_display();
-    let send_at_hint = " ↑↓ adjust  ←→ unit  Backspace clear";
-    let pending_suffix = match pending_scheduled.first() {
-        Some(next) => {
-            let next_local = next.fire_at.with_timezone(&chrono::Local);
+    let mut send_spans: Vec<Span> = Vec::new();
+    let ghost = Style::default().fg(DIM);
+    let lit = Style::default().fg(accent).add_modifier(Modifier::BOLD);
+    let label_style = if send_is_focused { lit } else { ghost };
+
+    if let Some(edit) = dialog.send_edit.as_ref() {
+        // Inline picker: highlight the focused field.
+        send_spans.push(Span::styled("send: ", label_style));
+        let field_style = |idx: usize| {
+            if edit.field == idx {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            }
+        };
+        let v = edit.value;
+        send_spans.push(Span::styled(v.format("%Y").to_string(), field_style(0)));
+        send_spans.push(Span::styled("-", ghost));
+        send_spans.push(Span::styled(v.format("%m").to_string(), field_style(1)));
+        send_spans.push(Span::styled("-", ghost));
+        send_spans.push(Span::styled(v.format("%d").to_string(), field_style(2)));
+        send_spans.push(Span::styled(" ", ghost));
+        send_spans.push(Span::styled(v.format("%H").to_string(), field_style(3)));
+        send_spans.push(Span::styled(":", ghost));
+        send_spans.push(Span::styled(v.format("%M").to_string(), field_style(4)));
+        send_spans.push(Span::styled(
+            "  ↑↓ adjust · ←→ field · Enter ok · Esc cancel",
+            ghost,
+        ));
+    } else if send_is_focused {
+        send_spans.push(Span::styled("‹ ", ghost));
+        send_spans.push(Span::styled(
+            format!("send: {}", dialog.send_display()),
+            lit,
+        ));
+        send_spans.push(Span::styled(" ›", ghost));
+        let hint = match (dialog.send_choice, dialog.send_at) {
+            (crate::tui::app::dialog::SendChoice::Date, None) => "  Enter: pick date & time",
+            (crate::tui::app::dialog::SendChoice::Date, Some(_)) => {
+                "  Enter: edit · Backspace: now"
+            }
+            _ => "  ←→ change",
+        };
+        send_spans.push(Span::styled(hint, ghost));
+    } else {
+        send_spans.push(Span::styled(
+            format!("send: {}", dialog.send_display()),
+            ghost,
+        ));
+    }
+
+    if let Some(error) = dialog.send_error.as_ref() {
+        send_spans.push(Span::styled(
+            format!("  ⚠ {error}"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    if let Some(next) = pending_scheduled.first() {
+        let next_local = next.fire_at.with_timezone(&chrono::Local);
+        send_spans.push(Span::styled(
             format!(
-                "   {} scheduled → {} (Ctrl+K cancel)",
+                "  · {} scheduled → {} (Ctrl+K cancel)",
                 pending_scheduled.len(),
                 next_local.format("%H:%M")
-            )
-        }
-        None => String::new(),
-    };
-    let send_at_text = format!("  {send_at_display}{send_at_hint}{pending_suffix}");
-    let send_at_content_style = Style::default()
-        .fg(if send_at_is_focused {
-            Color::White
-        } else {
-            DIM
-        })
-        .bg(send_at_bg);
-    let send_at_paragraph = Paragraph::new(Line::from(Span::styled(
-        send_at_text,
-        send_at_content_style,
-    )));
-    let send_at_content_area = ratatui::layout::Rect {
-        x: inner.x + 1,
-        y: send_at_y + 1,
-        width: inner.width.saturating_sub(2),
-        height: 1,
-    };
-    frame.render_widget(send_at_paragraph, send_at_content_area);
+            ),
+            ghost,
+        ));
+    }
 
-    let send_at_border = generate_bottom_border(inner.width, send_at_label_style);
-    let send_at_border_area = ratatui::layout::Rect {
-        x: inner.x,
-        y: send_at_y + 2,
-        width: inner.width,
+    let send_text_width: usize = send_spans.iter().map(|s| s.content.chars().count()).sum();
+    let send_x = inner.x
+        + inner
+            .width
+            .saturating_sub(send_text_width as u16)
+            .saturating_div(2);
+    let send_area = ratatui::layout::Rect {
+        x: send_x,
+        y: send_y,
+        width: inner.width.saturating_sub(send_x - inner.x),
         height: 1,
     };
-    frame.render_widget(Paragraph::new(send_at_border), send_at_border_area);
+    frame.render_widget(Paragraph::new(Line::from(send_spans)), send_area);
 
     // ── Scroll computation ─────────────────────────────────────────────────
-    // sections_available_h = inner height minus hint(1) + send_at(3) + blank(1).
-    let sections_top = send_at_y + 4;
-    let sections_available_h = inner.height.saturating_sub(5);
+    // sections_available_h = inner height minus hint(1) + gap(1) at the top
+    // and gap(1) + send line(1) at the bottom.
+    let sections_top = inner.y + 2;
+    let sections_available_h = inner.height.saturating_sub(4);
     let mut picker_anchor_area: Option<ratatui::layout::Rect> = None;
 
     // Work backwards from focused_section to find the first section that fits.

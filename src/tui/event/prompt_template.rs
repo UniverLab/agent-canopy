@@ -10,8 +10,9 @@ enum PromptAction {
     None,
     Close,
     Send(String),
-    /// Schedule the prompt for later delivery at the given (hour, minute).
-    ScheduleSend(String, u8, u8),
+    /// Schedule the prompt for later delivery at the given local date-time
+    /// (picked in the builder's send control, U11).
+    ScheduleSend(String, chrono::NaiveDateTime),
     /// Cancel the soonest pending scheduled send for the current target session.
     CancelNextScheduled,
     /// Recall the current project's last prompt (Ctrl+L).
@@ -86,8 +87,8 @@ pub fn handle_prompt_template_key(
         PromptAction::None => {}
         PromptAction::Close => app.close_simple_prompt_dialog(),
         PromptAction::Send(prompt) => submit_prompt(app, &prompt),
-        PromptAction::ScheduleSend(prompt, hour, minute) => {
-            schedule_send_prompt(app, &prompt, hour, minute);
+        PromptAction::ScheduleSend(prompt, when) => {
+            schedule_send_prompt(app, &prompt, when);
         }
         PromptAction::CancelNextScheduled => cancel_next_scheduled_send(app),
         PromptAction::RecallLastPrompt => recall_last_prompt(app),
@@ -121,11 +122,17 @@ fn resolve_picker_workdir(app: &App) -> PathBuf {
 }
 
 fn focused_section_name(dialog: &mut SimplePromptDialog) -> Option<String> {
+    // Focus index 0 is the send control — it is a real focus target, not a
+    // section. The pre-U11 version of this function clamped focus 0 back to
+    // section 1 on every keypress, which made the send control impossible
+    // to operate (its advertised keys never fired).
+    if dialog.focused_section == 0 {
+        return None;
+    }
     let last_index = dialog.enabled_sections.len().checked_sub(1)?;
 
-    // Adjust focused_section: section indices start at 1 (send_at is 0).
-    let section_idx = dialog.focused_section.saturating_sub(1);
-    let section_idx = section_idx.min(last_index);
+    // Clamp a stale over-the-end focus (e.g. after removing a section).
+    let section_idx = (dialog.focused_section - 1).min(last_index);
     dialog.focused_section = section_idx + 1; // keep the offset
     dialog.enabled_sections.get(section_idx).cloned()
 }
@@ -569,24 +576,56 @@ fn handle_dialog_key(
     let is_shift = modifiers.contains(KeyModifiers::SHIFT);
     let is_send_at = dialog.focused_section == 0 && !dialog.enabled_sections.is_empty();
 
-    // ── send_at field editing (focus index 0) ───────────────────────────
+    // ── send control (focus index 0, U11) ───────────────────────────────
     if is_send_at {
+        // Inline date-time picker open: arrows edit, Enter confirms,
+        // Esc abandons back to the selector.
+        if dialog.send_edit.is_some() {
+            return match code {
+                KeyCode::Esc => {
+                    dialog.send_edit_cancel();
+                    Ok(PromptAction::None)
+                }
+                KeyCode::Up => {
+                    dialog.send_edit_adjust(1);
+                    Ok(PromptAction::None)
+                }
+                KeyCode::Down => {
+                    dialog.send_edit_adjust(-1);
+                    Ok(PromptAction::None)
+                }
+                KeyCode::Left | KeyCode::BackTab => {
+                    dialog.send_edit_move(-1);
+                    Ok(PromptAction::None)
+                }
+                KeyCode::Right | KeyCode::Tab => {
+                    dialog.send_edit_move(1);
+                    Ok(PromptAction::None)
+                }
+                KeyCode::Enter => {
+                    dialog.send_edit_confirm();
+                    Ok(PromptAction::None)
+                }
+                KeyCode::Backspace => {
+                    dialog.clear_send_at();
+                    Ok(PromptAction::None)
+                }
+                _ => Ok(PromptAction::None),
+            };
+        }
+
+        // Selector: lateral arrows toggle now ↔ date, Enter opens the
+        // picker on date, Shift+↑/↓ and Tab return to the sections.
         return match code {
             KeyCode::Esc => Ok(PromptAction::Close),
-            KeyCode::Up => {
-                dialog.send_at_increment();
+            KeyCode::Left | KeyCode::Right => {
+                dialog.send_toggle();
                 Ok(PromptAction::None)
             }
-            KeyCode::Down => {
-                dialog.send_at_decrement();
-                Ok(PromptAction::None)
-            }
-            KeyCode::Left => {
-                dialog.send_at_move_focus(-1);
-                Ok(PromptAction::None)
-            }
-            KeyCode::Right => {
-                dialog.send_at_move_focus(1);
+            KeyCode::Enter => {
+                if dialog.send_choice == crate::tui::app::dialog::SendChoice::Date {
+                    dialog.send_begin_edit();
+                }
                 Ok(PromptAction::None)
             }
             KeyCode::Backspace => {
@@ -595,6 +634,14 @@ fn handle_dialog_key(
             }
             KeyCode::Char('k') if modifiers.contains(KeyModifiers::CONTROL) => {
                 Ok(PromptAction::CancelNextScheduled)
+            }
+            KeyCode::Up if is_shift => {
+                dialog.focus_prev();
+                Ok(PromptAction::None)
+            }
+            KeyCode::Down if is_shift => {
+                dialog.focus_next();
+                Ok(PromptAction::None)
             }
             KeyCode::Tab => {
                 dialog.focus_next();
@@ -630,21 +677,21 @@ fn handle_dialog_key(
             handle_enter_key(dialog, modifiers, section_name, field_width, db, workdir)
         }
 
-        // Navigation: Tab / Shift+Tab / Shift+Up/Down move between fields.
-        KeyCode::Tab if dialog.focused_section < dialog.total_focusable() - 1 => {
+        // Navigation: Tab / Shift+Tab / Shift+Up/Down move between fields in
+        // visual order, wrapping through the send control at the bottom.
+        KeyCode::Tab => {
             dialog.focus_next();
             Ok(PromptAction::None)
         }
-        KeyCode::Tab => Ok(PromptAction::None),
-        KeyCode::BackTab if dialog.focused_section > 0 => {
+        KeyCode::BackTab => {
             dialog.focus_prev();
             Ok(PromptAction::None)
         }
-        KeyCode::Up if is_shift && dialog.focused_section > 0 => {
+        KeyCode::Up if is_shift => {
             dialog.focus_prev();
             Ok(PromptAction::None)
         }
-        KeyCode::Down if is_shift && dialog.focused_section < dialog.total_focusable() - 1 => {
+        KeyCode::Down if is_shift => {
             dialog.focus_next();
             Ok(PromptAction::None)
         }
@@ -769,9 +816,11 @@ fn build_prompt_action(dialog: &SimplePromptDialog, db: &Database, workdir: &Pat
         return PromptAction::None;
     };
 
-    match dialog.send_at {
-        Some((hour, minute)) => PromptAction::ScheduleSend(prompt, hour, minute),
-        None => PromptAction::Send(prompt),
+    match (dialog.send_choice, dialog.send_at) {
+        (crate::tui::app::dialog::SendChoice::Date, Some(when)) => {
+            PromptAction::ScheduleSend(prompt, when)
+        }
+        _ => PromptAction::Send(prompt),
     }
 }
 
@@ -931,30 +980,19 @@ fn selected_session_target(app: &App) -> Option<(String, String)> {
     Some((agent.id.clone(), agent.working_dir.clone()))
 }
 
-fn schedule_send_prompt(app: &mut App, prompt: &str, hour: u8, minute: u8) {
+fn schedule_send_prompt(app: &mut App, prompt: &str, when: chrono::NaiveDateTime) {
     let session_key = app.current_prompt_session_key();
 
     // Resolve the target session ID/workdir from the currently selected agent.
     let (target_session_id, target_workdir) = selected_session_target(app).unwrap_or_default();
 
-    // Compute fire time: today if the time hasn't passed, tomorrow otherwise.
-    let now = chrono::Local::now();
-    let fire_time = {
-        let today = now.date_naive();
-        let fire_naive = today.and_hms_opt(hour as u32, minute as u32, 0).unwrap();
-        let fire_local = fire_naive.and_local_timezone(chrono::Local).unwrap();
-        if fire_local <= now {
-            // Time has passed today → schedule for tomorrow.
-            (today + chrono::Duration::days(1))
-                .and_hms_opt(hour as u32, minute as u32, 0)
-                .unwrap()
-                .and_local_timezone(chrono::Local)
-                .unwrap()
-                .with_timezone(&chrono::Utc)
-        } else {
-            fire_local.with_timezone(&chrono::Utc)
-        }
-    };
+    // `when` is a full local date-time picked in the builder (U11) and was
+    // validated as future by the picker; resolve DST ambiguity leniently.
+    let fire_time = when
+        .and_local_timezone(chrono::Local)
+        .earliest()
+        .unwrap_or_else(chrono::Local::now)
+        .with_timezone(&chrono::Utc);
 
     // Persist the scheduled send.
     let id = format!("ss-{}", uuid::Uuid::new_v4());
@@ -1236,120 +1274,156 @@ mod keyboard_capability_tests {
 
 #[cfg(test)]
 mod send_at_tests {
-    use crate::tui::app::dialog::SimplePromptDialog;
+    use crate::tui::app::dialog::{SendChoice, SimplePromptDialog};
 
     #[test]
-    fn send_at_starts_unset() {
+    fn send_control_starts_on_now() {
         let dialog = SimplePromptDialog::new();
+        assert_eq!(dialog.send_choice, SendChoice::Now);
         assert!(dialog.send_at.is_none());
-        assert_eq!(dialog.send_at_display(), "now (unset)");
+        assert!(dialog.send_edit.is_none());
+        assert_eq!(dialog.send_display(), "now");
     }
 
     #[test]
-    fn send_at_increment_creates_default_time() {
+    fn lateral_toggle_switches_now_and_date() {
         let mut dialog = SimplePromptDialog::new();
-        // Focused on send_at (focus 0), press Up to increment hour.
-        dialog.focused_section = 0;
-        dialog.send_at_increment();
-        assert!(dialog.send_at.is_some());
-        let (h, m) = dialog.send_at.unwrap();
-        assert!(h < 24);
-        assert_eq!(m, 0);
+        dialog.send_toggle();
+        assert_eq!(dialog.send_choice, SendChoice::Date);
+        assert_eq!(dialog.send_display(), "date");
+        // Toggling back to now discards any picked time.
+        dialog.send_at = Some(chrono::Local::now().naive_local() + chrono::Duration::hours(2));
+        dialog.send_toggle();
+        assert_eq!(dialog.send_choice, SendChoice::Now);
+        assert!(dialog.send_at.is_none());
+        assert_eq!(dialog.send_display(), "now");
     }
 
     #[test]
-    fn send_at_increment_hour_wraps() {
+    fn begin_edit_preseeds_current_local_time() {
         let mut dialog = SimplePromptDialog::new();
-        dialog.send_at = Some((23, 0));
-        dialog.send_at_focus_unit = 0;
-        dialog.send_at_increment();
-        assert_eq!(dialog.send_at, Some((0, 0)));
+        dialog.send_toggle(); // → date
+        dialog.send_begin_edit();
+        let edit = dialog.send_edit.expect("picker open");
+        assert_eq!(edit.field, 0);
+        let now = chrono::Local::now().naive_local();
+        let delta = (now - edit.value).num_seconds().abs();
+        assert!(delta < 120, "picker must preseed the current time");
     }
 
     #[test]
-    fn send_at_increment_minute_wraps() {
+    fn edit_adjust_uses_calendar_math() {
         let mut dialog = SimplePromptDialog::new();
-        dialog.send_at = Some((10, 59));
-        dialog.send_at_focus_unit = 1;
-        dialog.send_at_increment();
-        assert_eq!(dialog.send_at, Some((10, 0)));
+        dialog.send_toggle();
+        dialog.send_begin_edit();
+        let base = chrono::NaiveDate::from_ymd_opt(2026, 1, 31)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap();
+        dialog.send_edit.as_mut().unwrap().value = base;
+        // +1 month from Jan 31 clamps to Feb 28 instead of panicking.
+        dialog.send_edit.as_mut().unwrap().field = 1;
+        dialog.send_edit_adjust(1);
+        let v = dialog.send_edit.unwrap().value;
+        assert_eq!(v.date().to_string(), "2026-02-28");
+        // Minute adjustment carries across the hour.
+        dialog.send_edit.as_mut().unwrap().field = 4;
+        dialog.send_edit.as_mut().unwrap().value = base;
+        dialog.send_edit_adjust(-1);
+        let v = dialog.send_edit.unwrap().value;
+        assert_eq!(v.format("%H:%M").to_string(), "09:59");
     }
 
     #[test]
-    fn send_at_decrement_hour_wraps() {
+    fn confirm_rejects_past_times_with_inline_hint() {
         let mut dialog = SimplePromptDialog::new();
-        dialog.send_at = Some((0, 0));
-        dialog.send_at_focus_unit = 0;
-        dialog.send_at_decrement();
-        assert_eq!(dialog.send_at, Some((23, 0)));
+        dialog.send_toggle();
+        dialog.send_begin_edit();
+        dialog.send_edit.as_mut().unwrap().value =
+            chrono::Local::now().naive_local() - chrono::Duration::hours(1);
+        assert!(!dialog.send_edit_confirm());
+        assert!(dialog.send_error.is_some());
+        assert!(dialog.send_at.is_none());
+        assert!(dialog.send_edit.is_some(), "picker stays open to fix it");
     }
 
     #[test]
-    fn send_at_decrement_minute_wraps() {
+    fn confirm_accepts_future_time_and_displays_it() {
         let mut dialog = SimplePromptDialog::new();
-        dialog.send_at = Some((10, 0));
-        dialog.send_at_focus_unit = 1;
-        dialog.send_at_decrement();
-        assert_eq!(dialog.send_at, Some((10, 59)));
+        dialog.send_toggle();
+        dialog.send_begin_edit();
+        let future = chrono::Local::now().naive_local() + chrono::Duration::hours(3);
+        dialog.send_edit.as_mut().unwrap().value = future;
+        assert!(dialog.send_edit_confirm());
+        assert_eq!(dialog.send_at, Some(future));
+        assert!(dialog.send_edit.is_none());
+        assert!(dialog.send_error.is_none());
+        assert_eq!(
+            dialog.send_display(),
+            future.format("%Y-%m-%d %H:%M").to_string()
+        );
     }
 
     #[test]
-    fn send_at_move_focus_between_hour_and_minute() {
+    fn cancel_without_confirmed_time_returns_to_now() {
         let mut dialog = SimplePromptDialog::new();
-        dialog.send_at = Some((14, 30));
-        dialog.send_at_focus_unit = 0; // hour
-        dialog.send_at_move_focus(1); // → minute
-        assert_eq!(dialog.send_at_focus_unit, 1);
-        dialog.send_at_move_focus(1); // already at minute, no change
-        assert_eq!(dialog.send_at_focus_unit, 1);
-        dialog.send_at_move_focus(-1); // → hour
-        assert_eq!(dialog.send_at_focus_unit, 0);
-        dialog.send_at_move_focus(-1); // already at hour, no change
-        assert_eq!(dialog.send_at_focus_unit, 0);
+        dialog.send_toggle();
+        dialog.send_begin_edit();
+        dialog.send_edit_cancel();
+        assert!(dialog.send_edit.is_none());
+        assert_eq!(dialog.send_choice, SendChoice::Now);
+        // But a previously confirmed time survives a later canceled edit.
+        dialog.send_toggle();
+        dialog.send_begin_edit();
+        let future = chrono::Local::now().naive_local() + chrono::Duration::hours(3);
+        dialog.send_edit.as_mut().unwrap().value = future;
+        assert!(dialog.send_edit_confirm());
+        dialog.send_begin_edit();
+        dialog.send_edit_cancel();
+        assert_eq!(dialog.send_choice, SendChoice::Date);
+        assert_eq!(dialog.send_at, Some(future));
     }
 
     #[test]
-    fn send_at_clear_resets() {
+    fn clear_send_at_resets_everything() {
         let mut dialog = SimplePromptDialog::new();
-        dialog.send_at = Some((14, 30));
+        dialog.send_toggle();
+        dialog.send_begin_edit();
+        let future = chrono::Local::now().naive_local() + chrono::Duration::hours(3);
+        dialog.send_edit.as_mut().unwrap().value = future;
+        dialog.send_edit_confirm();
         dialog.clear_send_at();
+        assert_eq!(dialog.send_choice, SendChoice::Now);
         assert!(dialog.send_at.is_none());
-        assert_eq!(dialog.send_at_display(), "now (unset)");
+        assert!(dialog.send_edit.is_none());
+        assert_eq!(dialog.send_display(), "now");
     }
 
     #[test]
-    fn send_at_display_formats_correctly() {
+    fn focus_starts_on_first_section_and_wraps_through_send_control() {
         let mut dialog = SimplePromptDialog::new();
-        dialog.send_at = Some((9, 5));
-        assert_eq!(dialog.send_at_display(), "09:05");
-        dialog.send_at = Some((14, 30));
-        assert_eq!(dialog.send_at_display(), "14:30");
-    }
+        // Opens on the first section, not on the send control.
+        assert_eq!(dialog.focused_section, 1);
+        assert_eq!(dialog.total_focusable(), 2); // send control + instruction_1
 
-    #[test]
-    fn focus_navigation_includes_send_at() {
-        let mut dialog = SimplePromptDialog::new();
-        // Start at send_at (focus 0).
+        // Down from the last section reaches the send control (visually below).
+        dialog.focus_next();
         assert_eq!(dialog.focused_section, 0);
-        assert_eq!(dialog.total_focusable(), 2); // send_at + instruction_1
-
+        // Down from the send control wraps to the first section.
         dialog.focus_next();
-        assert_eq!(dialog.focused_section, 1); // instruction_1
-
-        dialog.focus_next();
-        assert_eq!(dialog.focused_section, 1); // already at end
-
+        assert_eq!(dialog.focused_section, 1);
+        // Up from the first section wraps down to the send control.
         dialog.focus_prev();
-        assert_eq!(dialog.focused_section, 0); // back to send_at
-
+        assert_eq!(dialog.focused_section, 0);
+        // Up from the send control goes to the last section.
         dialog.focus_prev();
-        assert_eq!(dialog.focused_section, 0); // already at start
+        assert_eq!(dialog.focused_section, 1);
     }
 
     #[test]
-    fn focused_section_name_returns_none_for_send_at() {
+    fn focused_section_name_returns_none_for_send_control() {
         let mut dialog = SimplePromptDialog::new();
-        dialog.focused_section = 0; // send_at
+        dialog.focused_section = 0; // send control
         assert!(dialog.focused_section_name().is_none());
 
         dialog.focused_section = 1; // instruction_1

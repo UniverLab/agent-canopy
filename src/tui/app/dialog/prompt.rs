@@ -44,6 +44,34 @@ pub struct ProjectPickerEntry {
     pub path: String,
 }
 
+/// The send control's selector value (U11): lateral arrows toggle between
+/// sending immediately and scheduling a date-time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SendChoice {
+    #[default]
+    Now,
+    Date,
+}
+
+/// Inline date-time picker state for the send control (U11). Opened with
+/// Enter on `send: date`, preseeded with the current local time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SendAtEdit {
+    pub value: chrono::NaiveDateTime,
+    /// Focused field: 0=year, 1=month, 2=day, 3=hour, 4=minute.
+    pub field: usize,
+}
+
+/// Month arithmetic for the send picker: ±N months with day clamping
+/// (chrono's checked add/sub semantics — Jan 31 + 1 month = Feb 28/29).
+fn add_months(value: chrono::NaiveDateTime, delta: i64) -> Option<chrono::NaiveDateTime> {
+    if delta >= 0 {
+        value.checked_add_months(chrono::Months::new(delta as u32))
+    } else {
+        value.checked_sub_months(chrono::Months::new(delta.unsigned_abs() as u32))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RagScope<'a> {
     Global,
@@ -80,12 +108,16 @@ pub struct SimplePromptDialog {
     /// protocol is read before the task. None = omit. Set once per workdir
     /// session (idempotent).
     pub system_content: Option<String>,
-    /// Scheduled delivery time. `None` = send immediately (default).
-    /// Stored as `(hour, minute)` in 24h format; date is always "today"
-    /// (or tomorrow if the time has already passed — computed at send time).
-    pub send_at: Option<(u8, u8)>,
-    /// Which unit of `send_at` is focused for editing: 0=hour, 1=minute.
-    pub send_at_focus_unit: usize,
+    /// Send-timing selector (U11): `now` sends immediately, `date`
+    /// schedules the delivery at `send_at`.
+    pub send_choice: SendChoice,
+    /// Confirmed scheduled delivery, local wall-clock (U11). Only honored
+    /// when `send_choice` is [`SendChoice::Date`].
+    pub send_at: Option<chrono::NaiveDateTime>,
+    /// Inline date-time picker state while the user is editing (U11).
+    pub send_edit: Option<SendAtEdit>,
+    /// Inline validation hint for the send control (e.g. past time picked).
+    pub send_error: Option<String>,
     /// A last-prompt recall (Ctrl+L) awaiting the standard confirm pattern
     /// because the builder currently has non-empty content. `None` once
     /// confirmed/canceled. Not persisted across dialog openings.
@@ -106,7 +138,9 @@ impl SimplePromptDialog {
         Self {
             sections,
             enabled_sections: vec!["instruction_1".to_string()],
-            focused_section: 0,
+            // Focus starts on the first section — the send control (virtual
+            // index 0) sits at the bottom and is reached by wrapping (U11).
+            focused_section: 1,
             prev_focus: None,
             picker_mode: SectionPickerMode::None,
             section_counters: counters,
@@ -116,8 +150,10 @@ impl SimplePromptDialog {
             collapsed_pastes: HashMap::new(),
             locked_sections: HashSet::new(),
             system_content: None,
+            send_choice: SendChoice::Now,
             send_at: None,
-            send_at_focus_unit: 0,
+            send_edit: None,
+            send_error: None,
             pending_recall: None,
         }
     }
@@ -1152,19 +1188,29 @@ impl SimplePromptDialog {
         1 + self.enabled_sections.len()
     }
 
-    /// Move focus to the next field. When leaving send_at, shift section
-    /// indices down by 1 so they remain contiguous.
+    /// Move focus to the next field in VISUAL order (U11): sections top to
+    /// bottom, then the send control at the bottom, then wrap to the first
+    /// section. The send control keeps focus index 0 internally.
     pub fn focus_next(&mut self) {
-        if self.focused_section < self.total_focusable() - 1 {
-            self.focused_section += 1;
-        }
+        let sections = self.enabled_sections.len();
+        self.focused_section = match self.focused_section {
+            0 if sections > 0 => 1,
+            0 => 0,
+            i if i >= sections => 0,
+            i => i + 1,
+        };
     }
 
-    /// Move focus to the previous field.
+    /// Move focus to the previous field in VISUAL order (see
+    /// [`Self::focus_next`]): from the send control up to the last section,
+    /// from the first section wrap down to the send control.
     pub fn focus_prev(&mut self) {
-        if self.focused_section > 0 {
-            self.focused_section -= 1;
-        }
+        let sections = self.enabled_sections.len();
+        self.focused_section = match self.focused_section {
+            0 => sections,
+            1 => 0,
+            i => i - 1,
+        };
     }
 
     /// Map the focus index to an `enabled_sections` index.
@@ -1184,48 +1230,105 @@ impl SimplePromptDialog {
             .map(String::as_str)
     }
 
-    /// Increment the focused unit of `send_at` (hour or minute).
-    pub fn send_at_increment(&mut self) {
-        let (ref mut hour, ref mut minute) = self
-            .send_at
-            .get_or_insert_with(|| (chrono::Local::now().hour() as u8, 0));
-        match self.send_at_focus_unit {
-            0 => *hour = (*hour + 1) % 24,
-            _ => *minute = (*minute + 1) % 60,
+    /// Toggle the send selector between `now` and `date` (lateral arrows,
+    /// U11). Leaving `date` discards any picked time and open picker.
+    pub fn send_toggle(&mut self) {
+        self.send_error = None;
+        self.send_choice = match self.send_choice {
+            SendChoice::Now => SendChoice::Date,
+            SendChoice::Date => {
+                self.send_at = None;
+                self.send_edit = None;
+                SendChoice::Now
+            }
+        };
+    }
+
+    /// Open the inline date-time picker (Enter on `send: date`), preseeded
+    /// with the already-picked time or the current local time (U11).
+    pub fn send_begin_edit(&mut self) {
+        self.send_error = None;
+        let seed = self.send_at.unwrap_or_else(|| {
+            let now = chrono::Local::now().naive_local();
+            now.with_second(0)
+                .and_then(|t| t.with_nanosecond(0))
+                .unwrap_or(now)
+        });
+        self.send_edit = Some(SendAtEdit {
+            value: seed,
+            field: 0,
+        });
+    }
+
+    /// Move the picker's focused field (0=year … 4=minute).
+    pub fn send_edit_move(&mut self, delta: isize) {
+        if let Some(edit) = self.send_edit.as_mut() {
+            let next = edit.field as isize + delta;
+            edit.field = next.clamp(0, 4) as usize;
         }
     }
 
-    /// Decrement the focused unit of `send_at` (hour or minute).
-    pub fn send_at_decrement(&mut self) {
-        let (ref mut hour, ref mut minute) = self
-            .send_at
-            .get_or_insert_with(|| (chrono::Local::now().hour() as u8, 0));
-        match self.send_at_focus_unit {
-            0 => *hour = (*hour + 23) % 24,
-            _ => *minute = (*minute + 59) % 60,
+    /// Adjust the picker's focused field by `delta` with real calendar math
+    /// (months/days carry correctly).
+    pub fn send_edit_adjust(&mut self, delta: i64) {
+        let Some(edit) = self.send_edit.as_mut() else {
+            return;
+        };
+        self.send_error = None;
+        let value = edit.value;
+        let adjusted = match edit.field {
+            0 => add_months(value, delta * 12),
+            1 => add_months(value, delta),
+            2 => Some(value + chrono::Duration::days(delta)),
+            3 => Some(value + chrono::Duration::hours(delta)),
+            _ => Some(value + chrono::Duration::minutes(delta)),
+        };
+        if let Some(adjusted) = adjusted {
+            edit.value = adjusted;
         }
     }
 
-    /// Move focus between hour/minute within send_at.
-    pub fn send_at_move_focus(&mut self, delta: isize) {
-        if delta < 0 && self.send_at_focus_unit > 0 {
-            self.send_at_focus_unit -= 1;
-        } else if delta > 0 && self.send_at_focus_unit < 1 {
-            self.send_at_focus_unit += 1;
+    /// Confirm the picker (Enter): a future time is stored and displayed
+    /// inline; a past time is rejected with an inline hint (U11).
+    pub fn send_edit_confirm(&mut self) -> bool {
+        let Some(edit) = self.send_edit else {
+            return false;
+        };
+        if edit.value <= chrono::Local::now().naive_local() {
+            self.send_error = Some("picked time is in the past".to_string());
+            return false;
+        }
+        self.send_at = Some(edit.value);
+        self.send_choice = SendChoice::Date;
+        self.send_edit = None;
+        self.send_error = None;
+        true
+    }
+
+    /// Cancel the picker (Esc): back to `now` unless a time was already
+    /// confirmed earlier.
+    pub fn send_edit_cancel(&mut self) {
+        self.send_edit = None;
+        self.send_error = None;
+        if self.send_at.is_none() {
+            self.send_choice = SendChoice::Now;
         }
     }
 
-    /// Clear the send_at schedule (set to immediate).
+    /// Clear the schedule entirely (Backspace): send immediately.
     pub fn clear_send_at(&mut self) {
+        self.send_choice = SendChoice::Now;
         self.send_at = None;
-        self.send_at_focus_unit = 0;
+        self.send_edit = None;
+        self.send_error = None;
     }
 
-    /// Format the send_at value for display.
-    pub fn send_at_display(&self) -> String {
-        match self.send_at {
-            Some((h, m)) => format!("{h:02}:{m:02}"),
-            None => "now (unset)".to_string(),
+    /// The send control's inline value text (U11).
+    pub fn send_display(&self) -> String {
+        match (self.send_choice, self.send_at) {
+            (SendChoice::Now, _) => "now".to_string(),
+            (SendChoice::Date, Some(at)) => at.format("%Y-%m-%d %H:%M").to_string(),
+            (SendChoice::Date, None) => "date".to_string(),
         }
     }
 
@@ -1667,7 +1770,13 @@ mod tests {
         let mut dialog = SimplePromptDialog::new();
         dialog.set_section_content("instruction_1", "ship the feature".to_string());
         dialog.add_section_with_content("tools", "skill:code-engineering".to_string());
-        dialog.send_at = Some((14, 30));
+        dialog.send_choice = SendChoice::Date;
+        dialog.send_at = Some(
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 20)
+                .unwrap()
+                .and_hms_opt(14, 30, 0)
+                .unwrap(),
+        );
 
         let snapshot = PersistedBuilderState::from_dialog(&dialog);
         let json = serde_json::to_string(&snapshot).expect("serialize");
@@ -1702,7 +1811,8 @@ pub struct PromptBuilderSession {
     pub section_scrolls: HashMap<String, usize>,
     pub collapsed_pastes: HashMap<String, String>,
     pub locked_sections: HashSet<String>,
-    pub send_at: Option<(u8, u8)>,
+    pub send_choice: SendChoice,
+    pub send_at: Option<chrono::NaiveDateTime>,
 }
 
 impl PromptBuilderSession {
@@ -1716,6 +1826,7 @@ impl PromptBuilderSession {
             section_scrolls: dialog.section_scrolls.clone(),
             collapsed_pastes: dialog.collapsed_pastes.clone(),
             locked_sections: dialog.locked_sections.clone(),
+            send_choice: dialog.send_choice,
             send_at: dialog.send_at,
         }
     }
@@ -1729,12 +1840,14 @@ impl PromptBuilderSession {
         dialog.section_scrolls = self.section_scrolls.clone();
         dialog.collapsed_pastes = self.collapsed_pastes.clone();
         dialog.locked_sections = self.locked_sections.clone();
+        dialog.send_choice = self.send_choice;
         dialog.send_at = self.send_at;
         // Reset transient UI state (not persisted across openings)
         dialog.picker_mode = SectionPickerMode::None;
         dialog.at_picker = None;
         dialog.system_content = None; // re-evaluated on each open
-        dialog.send_at_focus_unit = 0;
+        dialog.send_edit = None;
+        dialog.send_error = None;
     }
 }
 
