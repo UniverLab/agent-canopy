@@ -142,6 +142,7 @@ a workdir for filtering:
 | `spec_list` | List specs (filterable by workdir, status) |
 | `spec_update` | Update a spec's name, description, or workdir tag |
 | `spec_delete` | Delete an unbound spec |
+| `spec_set_status` | Admin transition: complete, skip, or reopen a standalone spec |
 
 The TUI sidebar shows backlog specs under the **Backlog** section,
 filtered to the selected project's workdir.

@@ -65,7 +65,7 @@ stdio. Connect any MCP-capable AI CLI with `canopy mcp`.
 `loop_complete_node`, `loop_report_blocker` — see
 [Loops](loops.md).
 
-## Spec backlog (4)
+## Spec backlog (5)
 
 | Tool | Description |
 |---|---|
@@ -73,6 +73,7 @@ stdio. Connect any MCP-capable AI CLI with `canopy mcp`.
 | `spec_list` | List specs, filterable by workdir and status |
 | `spec_update` | Update a spec's name, description, or workdir tag |
 | `spec_delete` | Delete an unbound spec |
+| `spec_set_status` | Admin transition: complete, skip, or reopen a standalone spec |
 
 ## Spec pools (5)
 

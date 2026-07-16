@@ -132,7 +132,7 @@ pipeline, all 63 MCP tools, and the complete CLI reference.
 
 ---
 
-## MCP Tools (63)
+## MCP Tools (64)
 
 | Category | Tools |
 |----------|-------|
@@ -141,7 +141,7 @@ pipeline, all 63 MCP tools, and the complete CLI reference.
 | **Intelligence V2** (6) | `intelligence_get_context`, `intelligence_upsert`, `intelligence_search`, `intelligence_graph_walk`, `intelligence_list_projects`, `intelligence_link_projects` |
 | **Seed Identity** (5) | `get_identity`, `evolve_identity`, `create_seed`, `list_seeds`, `remove_seed` |
 | **Loop Engine** (19) | `loop_create`, `loop_update`, `loop_add_spec`, `loop_update_spec`, `loop_add_node`, `loop_update_node`, `loop_add_edge`, `loop_update_edge`, `loop_add_ensemble`, `loop_update_ensemble`, `loop_get`, `loop_list`, `loop_run`, `loop_reset`, `loop_schedule_autorun`, `loop_pause`, `loop_continue`, `loop_complete_node`, `loop_report_blocker` |
-| **Spec Backlog** (4) | `spec_create`, `spec_list`, `spec_update`, `spec_delete` |
+| **Spec Backlog** (5) | `spec_create`, `spec_list`, `spec_update`, `spec_delete`, `spec_set_status` |
 | **Spec Pools** (5) | `pool_create`, `pool_add_spec`, `pool_list`, `pool_remove_spec`, `pool_reorder` |
 | **Node Blueprints** (3) | `blueprint_list`, `blueprint_create`, `blueprint_delete` |
 | **Project** (2) | `project_search`, `project_update` |
@@ -152,7 +152,7 @@ pipeline, all 63 MCP tools, and the complete CLI reference.
 
 ## Architecture Overview
 
-- **Daemon** — Owns the MCP server (Streamable HTTP on port 7755 + stdio), scheduler, watcher engine, and database. Exposes all 63 MCP tools.
+- **Daemon** — Owns the MCP server (Streamable HTTP on port 7755 + stdio), scheduler, watcher engine, and database. Exposes all 64 MCP tools.
 - **Scheduler** — Computes next fire times for all active tasks, sleeping until needed. Wakes instantly on changes.
 - **Watcher Engine** — Reacts to file system events, triggering tasks as defined.
 - **Executor** — Runs tasks and agents, manages locking, logs, and status.
