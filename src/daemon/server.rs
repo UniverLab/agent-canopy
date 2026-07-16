@@ -89,6 +89,7 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
     let handler_scheduler_notify = Arc::clone(&scheduler_notify);
     let handler_sync_manager = Arc::clone(&sync_manager);
     let handler_loop_engine = Arc::clone(&loop_engine);
+    let handler_ingestion = Arc::clone(&ingestion);
 
     let ct = tokio_util::sync::CancellationToken::new();
 
@@ -102,6 +103,7 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
                 Arc::clone(&handler_loop_engine),
                 Arc::clone(&notification_service),
                 Arc::clone(&handler_sync_manager),
+                Arc::clone(&handler_ingestion),
                 port,
             ))
         },
@@ -254,6 +256,7 @@ pub(crate) async fn run_stdio_server() -> Result<()> {
         loop_engine,
         Arc::clone(&notification_service),
         sync_manager,
+        Arc::clone(&ingestion),
         0,
     );
 

@@ -615,7 +615,9 @@ impl IngestionManager {
     /// If the configured model changed since last call, the client is recreated.
     /// This is the sole load point: the model is never loaded eagerly at
     /// startup, only here, on the first query or indexing pass that needs it.
-    async fn get_embedding_client(
+    /// `pub(crate)` so `rag_search` shares the same cache (B22) instead of
+    /// building throwaway clients that dodge the model-loaded status.
+    pub(crate) async fn get_embedding_client(
         &self,
         config: &crate::domain::canopy_config::CanopyConfig,
     ) -> anyhow::Result<Arc<dyn EmbeddingClient>> {

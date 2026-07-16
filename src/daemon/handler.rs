@@ -1096,6 +1096,10 @@ pub struct TaskTriggerHandler {
     pub loop_engine: Arc<LoopEngine>,
     pub notification_service: Arc<dyn NotificationService>,
     pub sync_manager: Arc<SyncManager>,
+    /// Shared RAG ingestion manager: rag_search must acquire its embedding
+    /// client through this cache (B22) so queries reuse the loaded model and
+    /// keep the persisted model-loaded status truthful.
+    pub ingestion: Arc<crate::rag::ingestion::IngestionManager>,
     /// Rate limiters for rag_search (10 calls/min). Keyed by agent_id.
     pub rag_limiters: Arc<tokio::sync::Mutex<std::collections::HashMap<String, RateLimiter>>>,
     pub start_time: std::time::Instant,
@@ -1191,6 +1195,7 @@ impl TaskTriggerHandler {
         loop_engine: Arc<LoopEngine>,
         notification_service: Arc<dyn NotificationService>,
         sync_manager: Arc<SyncManager>,
+        ingestion: Arc<crate::rag::ingestion::IngestionManager>,
         port: u16,
     ) -> Self {
         Self {
@@ -1201,6 +1206,7 @@ impl TaskTriggerHandler {
             loop_engine,
             notification_service,
             sync_manager,
+            ingestion,
             rag_limiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             start_time: std::time::Instant::now(),
             port,
@@ -4377,7 +4383,11 @@ impl TaskTriggerHandler {
             Err(e) => return Ok(error_result(&format!("Unknown model dimensions: {e}"))),
         };
 
-        let embedding_client = match crate::rag::embedding_client::client_from_config(&config) {
+        // B22: go through the shared ingestion cache instead of building a
+        // throwaway client — queries reuse the already-loaded model (no
+        // reload per search) and the persisted model-loaded status flips to
+        // "ready" for the CLI/TUI, exactly like an indexing pass does.
+        let embedding_client = match self.ingestion.get_embedding_client(&config).await {
             Ok(client) => client,
             Err(e) => return Ok(error_result(&format!("Embedding client error: {e}"))),
         };
