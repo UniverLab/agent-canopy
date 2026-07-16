@@ -7,6 +7,14 @@ use crate::tui::app::types::{AgentEntry, App, Focus};
 
 // ── Paste handling (bracketed paste) ─────────────────────────────────
 
+/// Normalize all line-ending conventions (`\r\n`, bare `\r`) to `\n`.
+/// Bracketed-paste terminals and Windows clipboards routinely deliver line
+/// breaks as `\r\n` or bare `\r`; treating anything but `\n` as "not a
+/// newline" silently drops line breaks instead of preserving them.
+fn normalize_line_endings(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 /// Handle pasted text — uses bracketed paste to send text to the PTY without
 /// triggering multiple Enter key presses. Preserves newlines for code/YAML/etc.
 pub fn handle_paste(app: &mut App, text: &str) {
@@ -58,6 +66,10 @@ pub fn handle_paste(app: &mut App, text: &str) {
             }
         }
         Focus::NewAgentDialog | Focus::PromptTemplateDialog => {
+            // Normalize FIRST so every downstream decision (collapse
+            // threshold, collapsed-vs-inline branch) sees real newlines
+            // regardless of the clipboard's line-ending convention.
+            let text = normalize_line_endings(text);
             // Insert pasted text into the SimplePromptDialog sections.
             // Multi-line pastes are collapsed to a placeholder while keeping the real text.
             let field_width = super::prompt_template::prompt_field_width(app);
@@ -67,12 +79,14 @@ pub fn handle_paste(app: &mut App, text: &str) {
                 // Indexing enabled_sections[focused_section] directly pasted
                 // into the NEXT section — never where the cursor was.
                 if let Some(section_name) = dialog.focused_section_name().map(str::to_string) {
-                    if text.contains('\n') || text.chars().count() > 200 {
+                    // "Multi-line" means more than one logical line — a lone
+                    // trailing newline stays inline (as a space), it should
+                    // not produce a collapse placeholder.
+                    if text.lines().count() > 1 || text.chars().count() > 200 {
                         // Preserve newlines for collapsed multi-line paste
-                        let clean = text.replace('\r', "");
-                        dialog.insert_collapsed_paste_at_cursor(&section_name, &clean, field_width);
+                        dialog.insert_collapsed_paste_at_cursor(&section_name, &text, field_width);
                     } else {
-                        let clean = text.replace('\n', " ").replace('\r', "");
+                        let clean = text.replace('\n', " ");
                         dialog.insert_text_at_cursor(&section_name, &clean, field_width);
                     }
                 }
@@ -81,8 +95,7 @@ pub fn handle_paste(app: &mut App, text: &str) {
             // there too. Newlines are preserved as hard breaks (the renderer
             // wraps with `prompt_visual_line_count` math).
             if let Some(dialog) = &mut app.new_agent_dialog {
-                let clean = text.replace('\r', "");
-                super::new_agent_dialog::insert_prompt_text(dialog, &clean);
+                super::new_agent_dialog::insert_prompt_text(dialog, &text);
             }
         }
         _ => {
@@ -240,5 +253,95 @@ mod tests {
             "multi-line paste should collapse to a placeholder"
         );
         assert_eq!(dialog.get_section_content("context_1"), "");
+    }
+
+    /// B30 regression: a paste whose line breaks arrive as bare `\r` (common
+    /// with bracketed paste) or `\r\n` (Windows clipboards) must preserve
+    /// newlines identically to a `\n`-delimited paste — not have them
+    /// silently deleted.
+    #[test]
+    fn prompt_builder_paste_preserves_line_breaks_regardless_of_line_ending() {
+        let variants: [(&str, &str); 3] = [
+            ("lf", "line one\nline two\nline three"),
+            ("crlf", "line one\r\nline two\r\nline three"),
+            ("cr", "line one\rline two\rline three"),
+        ];
+
+        let mut resolved_contents = Vec::new();
+        let mut placeholders = Vec::new();
+
+        for (_label, text) in variants {
+            let db = test_db();
+            let data_dir = tempdir().expect("create data dir");
+            let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+            app.focus = Focus::PromptTemplateDialog;
+            app.simple_prompt_dialog = Some(crate::tui::app::dialog::SimplePromptDialog::new());
+
+            handle_paste(&mut app, text);
+
+            let dialog = app.simple_prompt_dialog.as_ref().unwrap();
+            let placeholder = dialog.get_section_content("instruction_1");
+            assert!(
+                placeholder.contains("[Pasted ~3 lines]"),
+                "expected a 3-line collapse placeholder, got {placeholder:?}"
+            );
+            let resolved = dialog
+                .section_content_for_build("instruction_1")
+                .unwrap()
+                .to_string();
+            assert_eq!(
+                resolved, "line one\nline two\nline three",
+                "resolved content should have normalized newlines"
+            );
+
+            let composed = dialog
+                .build_prompt_with_resolved_resources(&db, data_dir.path())
+                .expect("build prompt");
+            // push_xml_item indents every content line with four spaces.
+            assert!(
+                composed.contains("line one\n    line two\n    line three"),
+                "composed prompt should preserve line breaks"
+            );
+
+            placeholders.push(placeholder);
+            resolved_contents.push(composed);
+        }
+
+        assert_eq!(placeholders[0], placeholders[1]);
+        assert_eq!(placeholders[1], placeholders[2]);
+        assert_eq!(resolved_contents[0], resolved_contents[1]);
+        assert_eq!(resolved_contents[1], resolved_contents[2]);
+    }
+
+    /// B30 regression: a single-line paste with a trailing `\r` (or `\r\n`)
+    /// must not collapse and must not retain the stray carriage return.
+    #[test]
+    fn single_line_paste_with_cr_stays_inline_and_clean() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.focus = Focus::PromptTemplateDialog;
+        app.simple_prompt_dialog = Some(crate::tui::app::dialog::SimplePromptDialog::new());
+
+        handle_paste(&mut app, "single line\r");
+
+        let dialog = app.simple_prompt_dialog.as_ref().unwrap();
+        assert_eq!(dialog.get_section_content("instruction_1"), "single line ");
+    }
+
+    /// B30 regression: the new-agent dialog's paste path must apply the same
+    /// normalization instead of stripping bare `\r` line breaks outright.
+    #[test]
+    fn new_agent_dialog_paste_preserves_cr_only_line_breaks() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.focus = Focus::NewAgentDialog;
+        app.new_agent_dialog = Some(crate::tui::app::dialog::NewAgentDialog::new(None));
+
+        handle_paste(&mut app, "first line\rsecond line");
+
+        let dialog = app.new_agent_dialog.as_ref().unwrap();
+        assert_eq!(dialog.prompt, "first line\nsecond line");
     }
 }
