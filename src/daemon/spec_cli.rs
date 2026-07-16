@@ -35,39 +35,35 @@ pub enum SpecAction {
 
 pub async fn handle_spec_action(action: SpecAction) -> Result<()> {
     let (spec_id, status, reason) = match action {
-        SpecAction::Complete { spec_id, reason } => {
-            (spec_id, LoopSpecStatus::Completed, reason)
-        }
-        SpecAction::Skip { spec_id, reason } => {
-            (spec_id, LoopSpecStatus::Skipped, reason)
-        }
-        SpecAction::Reopen { spec_id, reason } => {
-            (spec_id, LoopSpecStatus::Pending, reason)
-        }
+        SpecAction::Complete { spec_id, reason } => (spec_id, LoopSpecStatus::Completed, reason),
+        SpecAction::Skip { spec_id, reason } => (spec_id, LoopSpecStatus::Skipped, reason),
+        SpecAction::Reopen { spec_id, reason } => (spec_id, LoopSpecStatus::Pending, reason),
     };
 
     let db = Database::new(&ensure_data_dir()?)?;
     match db.set_spec_admin_status(&spec_id, status, &reason)? {
         SpecAdminStatusOutcome::Success => {
-            println!("Spec '{}' set to '{}': {}", spec_id, status.as_str(), reason);
+            println!(
+                "Spec '{}' set to '{}': {}",
+                spec_id,
+                status.as_str(),
+                reason
+            );
             Ok(())
         }
-        SpecAdminStatusOutcome::NotFound => {
-            Err(anyhow::anyhow!("Spec '{}' not found.", spec_id))
-        }
-        SpecAdminStatusOutcome::NotStandalone(loop_id) => {
-            Err(anyhow::anyhow!(
-                "Spec '{}' is bound to loop '{}'; spec_set_status only administers standalone specs.",
-                spec_id, loop_id
-            ))
-        }
-        SpecAdminStatusOutcome::ActiveRun { loop_id, run_id } => {
-            Err(anyhow::anyhow!(
-                "Spec '{}' is attached to an active run (loop '{}', run '{}'); \
+        SpecAdminStatusOutcome::NotFound => Err(anyhow::anyhow!("Spec '{}' not found.", spec_id)),
+        SpecAdminStatusOutcome::NotStandalone(loop_id) => Err(anyhow::anyhow!(
+            "Spec '{}' is bound to loop '{}'; spec_set_status only administers standalone specs.",
+            spec_id,
+            loop_id
+        )),
+        SpecAdminStatusOutcome::ActiveRun { loop_id, run_id } => Err(anyhow::anyhow!(
+            "Spec '{}' is attached to an active run (loop '{}', run '{}'); \
                  it cannot be administratively transitioned while running.",
-                spec_id, loop_id, run_id
-            ))
-        }
+            spec_id,
+            loop_id,
+            run_id
+        )),
     }
 }
 

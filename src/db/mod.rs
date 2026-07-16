@@ -787,8 +787,12 @@ impl Database {
             if !has_column {
                 let sql = match column {
                     "completed_via" => "ALTER TABLE loop_specs ADD COLUMN completed_via TEXT",
-                    "completed_via_reason" => "ALTER TABLE loop_specs ADD COLUMN completed_via_reason TEXT",
-                    "completed_via_at" => "ALTER TABLE loop_specs ADD COLUMN completed_via_at INTEGER",
+                    "completed_via_reason" => {
+                        "ALTER TABLE loop_specs ADD COLUMN completed_via_reason TEXT"
+                    }
+                    "completed_via_at" => {
+                        "ALTER TABLE loop_specs ADD COLUMN completed_via_at INTEGER"
+                    }
                     _ => "",
                 };
                 if !sql.is_empty() {

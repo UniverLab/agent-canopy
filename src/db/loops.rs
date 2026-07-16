@@ -311,12 +311,11 @@ impl Database {
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
 
         // 1. Check if spec exists
-        let mut stmt = conn.prepare(
-            "SELECT id, loop_id FROM loop_specs WHERE id = ?1",
-        )?;
-        let (_, loop_id): (String, Option<String>) = match stmt.query_row(params![spec_id], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        }).optional()? {
+        let mut stmt = conn.prepare("SELECT id, loop_id FROM loop_specs WHERE id = ?1")?;
+        let (_, loop_id): (String, Option<String>) = match stmt
+            .query_row(params![spec_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()?
+        {
             Some(row) => row,
             None => return Ok(SpecAdminStatusOutcome::NotFound),
         };
@@ -327,7 +326,7 @@ impl Database {
         }
 
         // 3. Check for active loop run
-        if let Some(run) = self.get_active_loop_run_for_spec(spec_id)? {
+        if let Some(run) = active_loop_run_for_spec_locked(&conn, spec_id)? {
             return Ok(SpecAdminStatusOutcome::ActiveRun {
                 loop_id: run.loop_id,
                 run_id: run.id,
@@ -336,9 +335,9 @@ impl Database {
 
         // 4. Update the spec with admin status
         let now = Utc::now().timestamp();
-        let completed_at = match status {
-            LoopSpecStatus::Pending => None,
-            _ => Some(now),
+        let (completed_at, completed_via_at) = match status {
+            LoopSpecStatus::Pending => (None, None),
+            _ => (Some(now), Some(now)),
         };
 
         conn.execute(
@@ -350,7 +349,7 @@ impl Database {
                 status.as_str(),
                 completed_at,
                 reason,
-                now,
+                completed_via_at,
                 spec_id,
             ],
         )?;
@@ -895,17 +894,7 @@ impl Database {
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
-        let mut stmt = conn.prepare(
-            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id
-             FROM loop_runs
-             WHERE spec_id = ?1 AND status = 'running'
-             ORDER BY started_at DESC
-             LIMIT 1",
-        )?;
-
-        stmt.query_row(params![spec_id], map_loop_run_row)
-            .optional()
-            .map_err(Into::into)
+        active_loop_run_for_spec_locked(&conn, spec_id).map_err(Into::into)
     }
 
     /// Every node run still `running` across every loop — used at daemon
@@ -1434,6 +1423,21 @@ fn map_loop_edge_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoopEdge> {
         to_node: row.get(4)?,
         condition,
     })
+}
+
+fn active_loop_run_for_spec_locked(
+    conn: &rusqlite::Connection,
+    spec_id: &str,
+) -> rusqlite::Result<Option<LoopNodeRun>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id
+         FROM loop_runs
+         WHERE spec_id = ?1 AND status = 'running'
+         ORDER BY started_at DESC
+         LIMIT 1",
+    )?;
+    stmt.query_row(params![spec_id], map_loop_run_row)
+        .optional()
 }
 
 fn map_loop_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoopNodeRun> {

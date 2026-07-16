@@ -122,7 +122,12 @@ fn handle_loop_info(db: &Database, id_or_name: &str) -> Result<()> {
             } else {
                 ""
             };
-            println!(" {} {}{}", spec_status_icon(spec.status), spec.name, admin_tag);
+            println!(
+                " {} {}{}",
+                spec_status_icon(spec.status),
+                spec.name,
+                admin_tag
+            );
         }
     } else if !all_runs.is_empty() {
         // No specs are bound to this loop directly — it's draining a pool
@@ -138,7 +143,12 @@ fn handle_loop_info(db: &Database, id_or_name: &str) -> Result<()> {
                 } else {
                     ""
                 };
-                println!(" {} {}{}", spec_status_icon(spec.status), spec.name, admin_tag);
+                println!(
+                    " {} {}{}",
+                    spec_status_icon(spec.status),
+                    spec.name,
+                    admin_tag
+                );
             }
         }
     } else {

@@ -2,7 +2,7 @@ use super::*;
 use crate::db::intelligence::{IntelligenceNodeInput, IntelligenceRelationInput};
 use crate::domain::loops::{
     Loop, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind, LoopNodeRun, LoopRunStatus,
-    LoopSpec, LoopSpecStatus, LoopStatus,
+    LoopSpec, LoopSpecStatus, LoopStatus, SpecAdminStatusOutcome,
 };
 use crate::domain::models::{Agent, Cli, RunLog, RunStatus, Trigger, TriggerType, WatchEvent};
 use crate::domain::pools::Pool;
@@ -3225,4 +3225,157 @@ fn backfill_recreates_missing_project_nodes() {
         db.list_intelligence_projects(None, 10).expect("list").len(),
         1
     );
+}
+
+// ── B25: Administrative spec completion ──────────────────────────────
+
+#[test]
+fn set_spec_admin_status_transitions_each_status() {
+    let db = test_db();
+
+    for target_status in &[
+        LoopSpecStatus::Completed,
+        LoopSpecStatus::Skipped,
+        LoopSpecStatus::Pending,
+    ] {
+        let mut spec = sample_loop_spec("unused", &format!("spec-{:?}", target_status), 1);
+        spec.loop_id = None;
+        db.insert_loop_spec(&spec).unwrap();
+
+        let outcome = db
+            .set_spec_admin_status(&spec.id, *target_status, "test reason")
+            .unwrap();
+
+        assert!(
+            matches!(outcome, SpecAdminStatusOutcome::Success),
+            "transition to {:?} failed",
+            target_status
+        );
+
+        let spec_after = db.get_loop_spec(&spec.id).unwrap().unwrap();
+        assert_eq!(spec_after.status, *target_status);
+        assert_eq!(
+            spec_after.completed_via,
+            Some("admin".to_string()),
+            "completed_via should be 'admin' for {:?}",
+            target_status
+        );
+        assert_eq!(
+            spec_after.completed_via_reason,
+            Some("test reason".to_string()),
+            "completed_via_reason should match for {:?}",
+            target_status
+        );
+
+        if *target_status != LoopSpecStatus::Pending {
+            assert!(
+                spec_after.completed_via_at.is_some(),
+                "completed_via_at should be set for {:?}",
+                target_status
+            );
+        } else {
+            assert!(
+                spec_after.completed_via_at.is_none(),
+                "completed_via_at should be None for Pending"
+            );
+        }
+    }
+}
+
+#[test]
+fn set_spec_admin_status_rejects_missing_spec() {
+    let db = test_db();
+    let outcome = db
+        .set_spec_admin_status("nonexistent", LoopSpecStatus::Completed, "reason")
+        .unwrap();
+    assert!(
+        matches!(outcome, SpecAdminStatusOutcome::NotFound),
+        "should reject missing spec"
+    );
+}
+
+#[test]
+fn set_spec_admin_status_rejects_loop_bound_spec() {
+    let db = test_db();
+    let lp = sample_loop("loop-bound-test");
+    db.insert_loop(&lp).unwrap();
+
+    let spec = sample_loop_spec(&lp.id, "spec-bound", 1);
+    db.insert_loop_spec(&spec).unwrap();
+
+    let outcome = db
+        .set_spec_admin_status(&spec.id, LoopSpecStatus::Completed, "reason")
+        .unwrap();
+
+    assert!(
+        matches!(outcome, SpecAdminStatusOutcome::NotStandalone(ref id) if id == &lp.id),
+        "should reject loop-bound spec"
+    );
+}
+
+#[test]
+fn set_spec_admin_status_rejects_active_run() {
+    let db = test_db();
+    let mut spec = sample_loop_spec("unused", "spec-with-run", 1);
+    spec.loop_id = None;
+    db.insert_loop_spec(&spec).unwrap();
+
+    let lp = sample_loop("loop-for-run");
+    db.insert_loop(&lp).unwrap();
+
+    let node = sample_loop_node(&spec.id, "node-for-run", 1);
+    db.insert_loop_node(&node).unwrap();
+
+    let run = LoopNodeRun {
+        id: "run-active".to_string(),
+        loop_id: lp.id.clone(),
+        spec_id: spec.id.clone(),
+        node_id: node.id,
+        status: LoopRunStatus::Running,
+        input: None,
+        output: None,
+        started_at: Utc::now(),
+        completed_at: None,
+        iteration: 1,
+        pid: None,
+        boot_id: None,
+    };
+    db.insert_loop_run(&run).unwrap();
+
+    let outcome = db
+        .set_spec_admin_status(&spec.id, LoopSpecStatus::Completed, "reason")
+        .unwrap();
+
+    assert!(
+        matches!(outcome, SpecAdminStatusOutcome::ActiveRun { ref loop_id, ref run_id }
+            if loop_id == &lp.id && run_id == "run-active"),
+        "should reject spec with active run"
+    );
+}
+
+#[test]
+fn set_spec_admin_status_propagates_to_pool_selection() {
+    let db = test_db();
+    let mut spec = sample_loop_spec("unused", "spec-pool-prop", 1);
+    spec.loop_id = None;
+    db.insert_loop_spec(&spec).unwrap();
+
+    let pool = Pool {
+        id: "pool-test".to_string(),
+        name: "pool-test".to_string(),
+        created_at: Utc::now(),
+    };
+    db.insert_pool(&pool).unwrap();
+    db.append_pool_member("pool-test", &spec.id).unwrap();
+
+    let before = db.pool_next_pending_spec_id("pool-test").unwrap();
+    assert_eq!(before.as_deref(), Some(spec.id.as_str()));
+
+    let outcome = db
+        .set_spec_admin_status(&spec.id, LoopSpecStatus::Completed, "reason")
+        .unwrap();
+    assert!(matches!(outcome, SpecAdminStatusOutcome::Success));
+
+    let after = db.pool_next_pending_spec_id("pool-test").unwrap();
+    assert_eq!(after, None, "pool should not select completed spec anymore");
 }

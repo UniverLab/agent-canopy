@@ -454,9 +454,7 @@ fn validate_spec_set_status_target(status: &str) -> Result<LoopSpecStatus, Strin
         "pending" => Ok(LoopSpecStatus::Pending),
         "completed" => Ok(LoopSpecStatus::Completed),
         "skipped" => Ok(LoopSpecStatus::Skipped),
-        _ => Err(
-            "Spec set_status target must be one of: pending, completed, skipped.".to_string(),
-        ),
+        _ => Err("Spec set_status target must be one of: pending, completed, skipped.".to_string()),
     }
 }
 
@@ -2831,8 +2829,8 @@ impl TaskTriggerHandler {
             .map_err(internal_error)? {
             SpecAdminStatusOutcome::Success => {
                 Ok(success_result(&format!(
-                    "Spec '{spec_id}' set to '{:?}' (admin): {reason}",
-                    status
+                    "Spec '{spec_id}' set to '{}' (admin): {reason}",
+                    status.as_str()
                 )))
             },
             SpecAdminStatusOutcome::NotFound => {
