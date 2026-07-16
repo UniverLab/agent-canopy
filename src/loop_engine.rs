@@ -860,6 +860,7 @@ impl LoopEngine {
                         iteration: iteration_value as i64,
                         pid: None,
                         boot_id: crate::system::boot_id(),
+                        session_id: None,
                     })?;
 
                     let (final_execution, run) = loop {
@@ -912,6 +913,7 @@ impl LoopEngine {
                                 iteration: iteration_value as i64,
                                 pid: None,
                                 boot_id: crate::system::boot_id(),
+                                session_id: None,
                             })?;
                             continue;
                         }
@@ -1058,6 +1060,7 @@ impl LoopEngine {
                 iteration: iteration as i64,
                 pid: None,
                 boot_id: crate::system::boot_id(),
+                session_id: None,
             })?;
 
             let db = Arc::clone(&self.db);
@@ -1209,6 +1212,7 @@ impl LoopEngine {
             iteration: iteration as i64,
             pid: None,
             boot_id: crate::system::boot_id(),
+            session_id: None,
         })?;
 
         Ok(NodeExecution {
@@ -3079,6 +3083,7 @@ mod tests {
             iteration: 1,
             pid: None,
             boot_id: None,
+            session_id: None,
         }];
 
         let (cursor, previous_output, iterations) =
@@ -3140,6 +3145,7 @@ mod tests {
                 iteration: i + 1,
                 pid: None,
                 boot_id: None,
+                session_id: None,
             })
             .collect();
 
@@ -4094,6 +4100,7 @@ mod tests {
             iteration: 1,
             pid: None,
             boot_id: None,
+            session_id: None,
         })
         .unwrap();
 
@@ -5051,6 +5058,7 @@ mod tests {
             iteration: 1,
             pid: None,
             boot_id: None,
+            session_id: None,
         })
         .unwrap();
 
@@ -6658,6 +6666,7 @@ mod tests {
             iteration: 1,
             pid: None,
             boot_id: None,
+            session_id: None,
         };
 
         let agent_node = LoopNode {

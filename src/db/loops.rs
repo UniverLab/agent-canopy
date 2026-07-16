@@ -841,8 +841,8 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         conn.execute(
-            "INSERT INTO loop_runs (id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO loop_runs (id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id, session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 &run.id,
                 &run.loop_id,
@@ -862,6 +862,7 @@ impl Database {
                 run.iteration,
                 run.pid,
                 &run.boot_id,
+                &run.session_id,
             ],
         )?;
         Ok(())
@@ -905,7 +906,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id
+            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id, session_id
              FROM loop_runs WHERE status = 'running'",
         )?;
         let rows = stmt.query_map(params![], map_loop_run_row)?;
@@ -919,7 +920,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id
+            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id, session_id
              FROM loop_runs WHERE spec_id = ?1 ORDER BY started_at ASC, iteration ASC",
         )?;
         let rows = stmt.query_map(params![spec_id], map_loop_run_row)?;
@@ -940,7 +941,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id
+            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id, session_id
              FROM loop_runs WHERE loop_id = ?1 ORDER BY started_at ASC, iteration ASC",
         )?;
         let rows = stmt.query_map(params![loop_id], map_loop_run_row)?;
@@ -955,7 +956,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id
+            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id, session_id
              FROM loop_runs WHERE id = ?1",
         )?;
 
@@ -970,7 +971,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id
+            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id, session_id
              FROM loop_runs
              WHERE node_id = ?1 AND status = 'running'
              ORDER BY started_at DESC
@@ -1113,7 +1114,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id
+            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id, session_id
              FROM loop_runs WHERE loop_id = ?1 AND status = 'running'",
         )?;
         let rows = stmt.query_map(params![loop_id], map_loop_run_row)?;
@@ -1155,7 +1156,7 @@ impl Database {
         for lp in &orphaned {
             let dangling_runs: Vec<LoopNodeRun> = {
                 let mut stmt = tx.prepare(
-                    "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id
+                    "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id, session_id
                      FROM loop_runs WHERE loop_id = ?1 AND status = 'running'",
                 )?;
                 let rows = stmt.query_map(params![lp.id], map_loop_run_row)?;
@@ -1430,7 +1431,7 @@ fn active_loop_run_for_spec_locked(
     spec_id: &str,
 ) -> rusqlite::Result<Option<LoopNodeRun>> {
     let mut stmt = conn.prepare(
-        "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id
+        "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id, session_id
          FROM loop_runs
          WHERE spec_id = ?1 AND status = 'running'
          ORDER BY started_at DESC
@@ -1465,6 +1466,7 @@ fn map_loop_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoopNodeRun> {
         iteration: row.get(9)?,
         pid: row.get(10)?,
         boot_id: row.get(11)?,
+        session_id: row.get(12)?,
     })
 }
 

@@ -275,7 +275,8 @@ impl Database {
                 completed_at INTEGER,
                 iteration INTEGER NOT NULL DEFAULT 1,
                 pid INTEGER,
-                boot_id TEXT
+                boot_id TEXT,
+                session_id TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_loop_runs_spec_started
@@ -791,6 +792,24 @@ impl Database {
                 conn.execute(&sql, [])
                     .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
             }
+        }
+
+        // `session_id` (RS1): the harness session id that served a node run,
+        // captured per-platform (set-at-spawn for platforms that accept a
+        // caller-chosen id, list-after-run for those that can enumerate their
+        // sessions). Older databases predate the column; NULL on existing rows
+        // (no session identity was ever captured for them). Additive — the
+        // foundation for resume mode (RS2).
+        let has_session_id: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loop_runs') WHERE name = 'session_id'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_session_id {
+            conn.execute("ALTER TABLE loop_runs ADD COLUMN session_id TEXT", [])
+                .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
         }
 
         // `completed_via`/`completed_via_reason`/`completed_via_at` (B25):

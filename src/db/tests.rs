@@ -915,6 +915,7 @@ fn loop_run_roundtrip_preserves_json_payloads() {
         iteration: 2,
         pid: Some(4242),
         boot_id: Some("boot-abc".to_string()),
+        session_id: None,
     };
 
     db.insert_loop(&lp).unwrap();
@@ -1067,6 +1068,7 @@ fn reconcile_orphaned_loops_pauses_running_loop_and_interrupts_its_run() {
         iteration: 1,
         pid: None,
         boot_id: None,
+        session_id: None,
     };
 
     db.insert_loop(&lp).unwrap();
@@ -1147,6 +1149,7 @@ fn reconcile_orphaned_loops_resets_pool_member_spec_to_pending() {
         iteration: 1,
         pid: None,
         boot_id: None,
+        session_id: None,
     })
     .unwrap();
 
@@ -1208,6 +1211,7 @@ fn pool_stale_running_members_flags_only_the_member_with_no_live_run() {
         iteration: 1,
         pid: None,
         boot_id: Some("boot-current".to_string()),
+        session_id: None,
     })
     .unwrap();
 
@@ -1238,6 +1242,7 @@ fn reconcile_orphaned_loops_is_idempotent() {
         iteration: 1,
         pid: None,
         boot_id: None,
+        session_id: None,
     };
 
     db.insert_loop(&lp).unwrap();
@@ -1309,6 +1314,7 @@ async fn reconcile_orphaned_loops_kills_survivor_pid_from_same_boot() {
         iteration: 1,
         pid: Some(pid),
         boot_id: Some(current_boot_id),
+        session_id: None,
     };
 
     db.insert_loop(&lp).unwrap();
@@ -1363,6 +1369,7 @@ fn reconcile_orphaned_loops_skips_kill_for_mismatched_boot_id() {
         // machine right now, but also never allowed to be signaled.
         pid: Some(1),
         boot_id: Some("some-other-boot-that-is-not-current".to_string()),
+        session_id: None,
     };
 
     db.insert_loop(&lp).unwrap();
@@ -3339,6 +3346,7 @@ fn set_spec_admin_status_rejects_active_run() {
         iteration: 1,
         pid: None,
         boot_id: None,
+        session_id: None,
     };
     db.insert_loop_run(&run).unwrap();
 

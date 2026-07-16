@@ -502,6 +502,15 @@ pub struct LoopNodeRun {
     /// same PID after a reboot recycled the PID space — only meaningful
     /// together with a matching current boot id. See B12.
     pub boot_id: Option<String>,
+    /// The harness session id that served this node run, captured per
+    /// platform metadata (RS1): generated and set at spawn for platforms
+    /// that accept a caller-chosen id (`session_id_set_flag`), or read back
+    /// from the platform's session listing after the run
+    /// (`session_list_cmd`). `None` for platforms that expose no session
+    /// identity, and for every run recorded before this field existed. The
+    /// foundation for resume mode (RS2): without it there is nothing to
+    /// resume.
+    pub session_id: Option<String>,
 }
 
 /// One firing of a loop's `on_completed` hook (N2). Deliberately its own

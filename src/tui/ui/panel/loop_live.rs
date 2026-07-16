@@ -1041,6 +1041,7 @@ mod tests {
             iteration: 1,
             pid: None,
             boot_id: None,
+            session_id: None,
         })
         .unwrap();
     }

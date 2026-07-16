@@ -467,6 +467,7 @@ mod tests {
             iteration,
             pid: None,
             boot_id: None,
+            session_id: None,
         }
     }
 
