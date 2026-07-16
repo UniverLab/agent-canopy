@@ -263,7 +263,9 @@ impl SimplePromptDialog {
         self.section_cursors.insert(unique_id.clone(), cursor_pos);
         self.section_scrolls.insert(unique_id.clone(), 0);
         self.collapsed_pastes.remove(&unique_id);
-        self.focused_section = self.enabled_sections.len() - 1;
+        // Focus the newly added section: enabled_sections index (len-1) maps to
+        // focus index (len) because focus 0 is the virtual send control.
+        self.focused_section = self.enabled_sections.len();
         unique_id
     }
 
@@ -1796,6 +1798,30 @@ mod tests {
         // send_at is intentionally not part of the snapshot — recall must not
         // resurrect a stale schedule.
         assert!(target.send_at.is_none());
+    }
+
+    #[test]
+    fn add_section_focuses_the_new_section_with_cursor_at_start() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.add_section("goal");
+
+        // Focus must land IN the newly created section, ready to type.
+        let focused = dialog
+            .focused_section_name()
+            .expect("a section is focused, not the send control")
+            .to_string();
+        assert!(
+            focused.starts_with("goal"),
+            "expected focus on the new goal section, got {focused}"
+        );
+        // Cursor sits at position 0 of the empty new section.
+        assert_eq!(dialog.cursor(&focused), 0);
+
+        // A second added section also grabs focus (not the previous one).
+        dialog.add_section("constraints");
+        let focused = dialog.focused_section_name().unwrap().to_string();
+        assert!(focused.starts_with("constraints"));
+        assert_eq!(dialog.cursor(&focused), 0);
     }
 }
 
