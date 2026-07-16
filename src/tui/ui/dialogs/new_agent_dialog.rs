@@ -267,40 +267,44 @@ fn build_dialog_lines(
 }
 
 fn dialog_header_lines(dialog: &NewAgentDialog, accent: Color) -> Vec<Line<'static>> {
-    vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  Type:  ", Style::default().fg(DIM)),
-            selector_span(
-                task_type_label(dialog.task_type),
-                TYPE_FIELD,
-                dialog.is_edit_mode(),
-                accent,
-                dialog.field,
-            ),
-        ]),
-        Line::from(""),
-    ]
+    let mut type_row = vec![Span::styled("  Type:  ", Style::default().fg(DIM))];
+    type_row.extend(selector_spans(
+        task_type_label(dialog.task_type),
+        TYPE_FIELD,
+        dialog.is_edit_mode(),
+        accent,
+        dialog.field,
+    ));
+    vec![Line::from(""), Line::from(type_row), Line::from("")]
 }
 
-fn selector_span(
+fn selector_spans(
     value: &str,
     field: usize,
     locked: bool,
     accent: Color,
     current_field: usize,
-) -> Span<'static> {
+) -> Vec<Span<'static>> {
     if locked {
-        return Span::styled(
+        return vec![Span::styled(
             format!("  {value}  "),
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
-        );
+        )];
     }
 
-    Span::styled(
-        format!(" ◀ {value} ▶ "),
-        focus_style(current_field, field, accent),
-    )
+    // Discreet ‹ › lateral selectors, matching the prompt builder's send
+    // control: arrows are dim when the field is unfocused and take the accent
+    // color when it is focused; the value keeps the field's focus styling.
+    let arrow_style = if current_field == field {
+        Style::default().fg(accent)
+    } else {
+        Style::default().fg(DIM)
+    };
+    vec![
+        Span::styled(" ‹ ", arrow_style),
+        Span::styled(value.to_string(), focus_style(current_field, field, accent)),
+        Span::styled(" › ", arrow_style),
+    ]
 }
 
 fn focus_style(current_field: usize, field: usize, accent: Color) -> Style {
@@ -424,16 +428,14 @@ fn append_background_sections(
 }
 
 fn interactive_mode_row(dialog: &NewAgentDialog, accent: Color) -> Line<'static> {
-    let mut spans = vec![
-        Span::styled("  Session:  ", Style::default().fg(DIM)),
-        selector_span(
-            interactive_mode_label(dialog.task_mode),
-            INTERACTIVE_MODE_FIELD,
-            false,
-            accent,
-            dialog.field,
-        ),
-    ];
+    let mut spans = vec![Span::styled("  Session:  ", Style::default().fg(DIM))];
+    spans.extend(selector_spans(
+        interactive_mode_label(dialog.task_mode),
+        INTERACTIVE_MODE_FIELD,
+        false,
+        accent,
+        dialog.field,
+    ));
 
     if dialog.resume_unconfigured() && !dialog.has_session_picker() {
         spans.push(Span::styled(
@@ -453,19 +455,15 @@ fn interactive_mode_row(dialog: &NewAgentDialog, accent: Color) -> Line<'static>
 }
 
 fn append_trigger_section(lines: &mut Vec<Line<'static>>, dialog: &NewAgentDialog, accent: Color) {
-    push_spaced_row(
-        lines,
-        Line::from(vec![
-            Span::styled("  Trigger:", Style::default().fg(DIM)),
-            selector_span(
-                background_trigger_label(dialog.background_trigger),
-                BACKGROUND_TRIGGER_FIELD,
-                dialog.is_edit_mode(),
-                accent,
-                dialog.field,
-            ),
-        ]),
-    );
+    let mut trigger_row = vec![Span::styled("  Trigger:", Style::default().fg(DIM))];
+    trigger_row.extend(selector_spans(
+        background_trigger_label(dialog.background_trigger),
+        BACKGROUND_TRIGGER_FIELD,
+        dialog.is_edit_mode(),
+        accent,
+        dialog.field,
+    ));
+    push_spaced_row(lines, Line::from(trigger_row));
 }
 
 fn append_cli_section(
@@ -899,13 +897,15 @@ fn append_identity_section(
 ) {
     let label = identity_label(dialog);
     let locked = dialog.seed_options.len() <= 1;
-    push_spaced_row(
-        lines,
-        Line::from(vec![
-            Span::styled("  Identity: ", Style::default().fg(DIM)),
-            selector_span(&label, identity_field, locked, accent, dialog.field),
-        ]),
-    );
+    let mut identity_row = vec![Span::styled("  Identity: ", Style::default().fg(DIM))];
+    identity_row.extend(selector_spans(
+        &label,
+        identity_field,
+        locked,
+        accent,
+        dialog.field,
+    ));
+    push_spaced_row(lines, Line::from(identity_row));
 }
 
 fn identity_label(dialog: &NewAgentDialog) -> String {
@@ -1122,5 +1122,39 @@ mod tests {
         let h = dialog_height(&d, &[]);
         // base 15 + 1 label row + 3 input rows = 19 when no pickers / no dir entries
         assert!(h >= 19, "expected >= 19, got {h}");
+    }
+
+    fn spans_text(spans: &[Span<'static>]) -> String {
+        spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn selector_uses_discreet_angle_glyphs_not_solid_triangles() {
+        // Focused and unfocused variants both use the ‹ › glyphs, never ◀ ▶.
+        for current in [TYPE_FIELD, INTERACTIVE_MODE_FIELD] {
+            let text = spans_text(&selector_spans(
+                "Background",
+                TYPE_FIELD,
+                false,
+                Color::Cyan,
+                current,
+            ));
+            assert!(text.contains('‹') && text.contains('›'), "got {text:?}");
+            assert!(!text.contains('◀') && !text.contains('▶'), "got {text:?}");
+            assert!(text.contains("Background"));
+        }
+    }
+
+    #[test]
+    fn locked_selector_has_no_lateral_arrows() {
+        let text = spans_text(&selector_spans(
+            "Interactive",
+            TYPE_FIELD,
+            true,
+            Color::Cyan,
+            TYPE_FIELD,
+        ));
+        assert!(!text.contains('‹') && !text.contains('›'));
+        assert!(!text.contains('◀') && !text.contains('▶'));
     }
 }

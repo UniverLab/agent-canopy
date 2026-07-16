@@ -202,6 +202,94 @@ fn active_send_shortcut_label(keyboard_enhancement_active: bool) -> (&'static st
     }
 }
 
+/// One entry in the prompt builder's shortcut/help bar.
+struct ShortcutHint {
+    /// Dim key label, includes its trailing space (e.g. `"Ctrl+A "`).
+    key: String,
+    /// White description, includes trailing padding (e.g. `"add section  "`).
+    desc: String,
+    /// Keep-priority: lower is more important. On a narrow window the
+    /// highest-priority-number entries are dropped first. `Ctrl+S send` (1)
+    /// and `Esc hide` (2) are never dropped.
+    priority: u8,
+}
+
+impl ShortcutHint {
+    fn width(&self) -> usize {
+        self.key.chars().count() + self.desc.chars().count()
+    }
+}
+
+/// All shortcut hints in left-to-right DISPLAY order. Priority (keep→drop):
+/// Ctrl+S send, Esc hide, Shift+↑↓ navigate, Ctrl+L recall, @ file,
+/// Ctrl+A add section, Ctrl+X remove.
+fn all_shortcut_hints(send_label: &str, send_hint: &str) -> Vec<ShortcutHint> {
+    vec![
+        ShortcutHint {
+            key: "Shift+↑↓ ".to_string(),
+            desc: "navigate  ".to_string(),
+            priority: 3,
+        },
+        ShortcutHint {
+            key: "@ ".to_string(),
+            desc: "file  ".to_string(),
+            priority: 5,
+        },
+        ShortcutHint {
+            key: "Ctrl+A ".to_string(),
+            desc: "add section  ".to_string(),
+            priority: 6,
+        },
+        ShortcutHint {
+            key: "Ctrl+X ".to_string(),
+            desc: "remove  ".to_string(),
+            priority: 7,
+        },
+        ShortcutHint {
+            key: "Ctrl+L ".to_string(),
+            desc: "recall  ".to_string(),
+            priority: 4,
+        },
+        ShortcutHint {
+            key: send_label.to_string(),
+            desc: format!("{send_hint}  "),
+            priority: 1,
+        },
+        ShortcutHint {
+            key: "Esc  ".to_string(),
+            desc: "hide".to_string(),
+            priority: 2,
+        },
+    ]
+}
+
+/// Pure function: pick which shortcut hints fit into `width` columns, in
+/// display order, dropping the least important first. `Ctrl+S send` and
+/// `Esc hide` (priority ≤ 2) are always kept even when they overflow.
+fn select_shortcut_hints(width: usize, send_label: &str, send_hint: &str) -> Vec<ShortcutHint> {
+    let mut hints = all_shortcut_hints(send_label, send_hint);
+    loop {
+        let total: usize = hints.iter().map(ShortcutHint::width).sum();
+        if total <= width {
+            break;
+        }
+        // Drop the least important (highest priority number) droppable entry.
+        let victim = hints
+            .iter()
+            .enumerate()
+            .filter(|(_, hint)| hint.priority > 2)
+            .max_by_key(|(_, hint)| hint.priority)
+            .map(|(idx, _)| idx);
+        match victim {
+            Some(idx) => {
+                hints.remove(idx);
+            }
+            None => break, // only the two mandatory hints remain
+        }
+    }
+    hints
+}
+
 pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) {
     let Some(dialog) = &app.simple_prompt_dialog else {
         return;
@@ -288,26 +376,20 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Draw hint line
+    // Draw hint line — rendered by priority so the most important shortcuts
+    // (Ctrl+S send, Esc hide) survive on narrow windows instead of scrolling
+    // off the end.
     let (send_label, send_hint) = active_send_shortcut_label(app.keyboard_enhancement_active);
-    let instructions = Line::from(vec![
-        Span::styled("↑↓ ", Style::default().fg(DIM)),
-        Span::styled("fields  ", Style::default().fg(Color::White)),
-        Span::styled("Shift+↑↓ ", Style::default().fg(DIM)),
-        Span::styled("navigate  ", Style::default().fg(Color::White)),
-        Span::styled("@ ", Style::default().fg(DIM)),
-        Span::styled("file  ", Style::default().fg(Color::White)),
-        Span::styled("Ctrl+A ", Style::default().fg(DIM)),
-        Span::styled("add section  ", Style::default().fg(Color::White)),
-        Span::styled("Ctrl+X ", Style::default().fg(DIM)),
-        Span::styled("remove  ", Style::default().fg(Color::White)),
-        Span::styled("Ctrl+L ", Style::default().fg(DIM)),
-        Span::styled("recall  ", Style::default().fg(Color::White)),
-        Span::styled(send_label, Style::default().fg(DIM)),
-        Span::styled(format!("{send_hint}  "), Style::default().fg(Color::White)),
-        Span::styled("Esc  ", Style::default().fg(DIM)),
-        Span::styled("hide", Style::default().fg(Color::White)),
-    ]);
+    let hint_spans: Vec<Span> = select_shortcut_hints(inner.width as usize, send_label, send_hint)
+        .into_iter()
+        .flat_map(|hint| {
+            [
+                Span::styled(hint.key, Style::default().fg(DIM)),
+                Span::styled(hint.desc, Style::default().fg(Color::White)),
+            ]
+        })
+        .collect();
+    let instructions = Line::from(hint_spans);
 
     let instructions_area = ratatui::layout::Rect {
         x: inner.x,
@@ -709,5 +791,64 @@ mod tests {
         let styled = vec![("ab".to_string(), None)];
         let lines = wrap_styled_content(styled, Some(2), 40, Color::Black);
         assert_eq!(line_text(&lines[0]), "ab ");
+    }
+
+    fn hint_keys(width: usize) -> Vec<String> {
+        select_shortcut_hints(width, "Ctrl+S ", "send")
+            .iter()
+            .map(|hint| hint.key.trim().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn shortcut_bar_shows_every_hint_at_full_width() {
+        let keys = hint_keys(200);
+        assert_eq!(
+            keys,
+            vec![
+                "Shift+↑↓",
+                "@",
+                "Ctrl+A",
+                "Ctrl+X",
+                "Ctrl+L",
+                "Ctrl+S",
+                "Esc"
+            ]
+        );
+        // The removed "↑↓ fields" entry must not reappear.
+        assert!(!keys.iter().any(|k| k == "↑↓"));
+    }
+
+    #[test]
+    fn shortcut_bar_keeps_only_send_and_hide_when_very_narrow() {
+        // Even below the width the two mandatory hints need, they stay visible.
+        assert_eq!(hint_keys(10), vec!["Ctrl+S", "Esc"]);
+        assert_eq!(hint_keys(1), vec!["Ctrl+S", "Esc"]);
+    }
+
+    #[test]
+    fn shortcut_bar_drops_least_important_first_at_medium_width() {
+        // 45 cols fits navigate(19) + send(13) + hide(9) = 41, but not recall.
+        let keys = hint_keys(45);
+        assert_eq!(keys, vec!["Shift+↑↓", "Ctrl+S", "Esc"]);
+        assert!(!keys.iter().any(|k| k == "@"));
+        assert!(!keys.iter().any(|k| k == "Ctrl+L"));
+    }
+
+    #[test]
+    fn shortcut_bar_preserves_display_order_after_dropping_middle_hints() {
+        // 60 cols keeps navigate + recall but not @ file (dropped by priority),
+        // and the survivors stay in left-to-right display order.
+        let keys = hint_keys(60);
+        assert_eq!(keys, vec!["Shift+↑↓", "Ctrl+L", "Ctrl+S", "Esc"]);
+    }
+
+    #[test]
+    fn shortcut_bar_always_keeps_the_two_mandatory_hints() {
+        for width in [0usize, 5, 22, 50, 99, 300] {
+            let keys = hint_keys(width);
+            assert!(keys.contains(&"Ctrl+S".to_string()), "width {width}");
+            assert!(keys.contains(&"Esc".to_string()), "width {width}");
+        }
     }
 }
