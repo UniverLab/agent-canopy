@@ -38,13 +38,32 @@ pub trait NotificationService: Send + Sync {
     /// Send a notification about a nursery (seed creation) failure.
     fn notify_nursery_failed(&self, error_msg: &str);
 
-    /// Send a notification when a loop run actually begins executing (a
-    /// fresh dispatch or a resume alike — anything that starts driving the
-    /// loop's graph).
-    fn notify_loop_started(&self, loop_name: &str, spec_count: usize);
+    /// Send a notification when a loop run actually begins executing.
+    ///
+    /// `resumed` distinguishes a fresh launch ("Started") from picking up
+    /// where a prior run left off ("Resumed") — a reset+rerun or an autorun
+    /// resume shouldn't read as the loop starting from scratch again.
+    /// `first_pending` names the spec this dispatch will work first, when
+    /// known.
+    fn notify_loop_started(
+        &self,
+        loop_name: &str,
+        spec_count: usize,
+        resumed: bool,
+        first_pending: Option<&str>,
+    );
 
     /// Send a notification each time a spec within a loop reaches `completed`.
-    fn notify_spec_completed(&self, loop_name: &str, spec_name: &str, done: usize, total: usize);
+    /// `next_pending` names the spec that will run next (if any), so the toast
+    /// says both what just finished and what's coming.
+    fn notify_spec_completed(
+        &self,
+        loop_name: &str,
+        spec_name: &str,
+        done: usize,
+        total: usize,
+        next_pending: Option<&str>,
+    );
 
     /// Send a notification when a loop run reaches a terminal state
     /// (completed, failed, or blocked).
@@ -112,13 +131,33 @@ impl NotificationService for DefaultNotificationService {
         send_notification("Seed creation failed", error_msg, NotificationLevel::Error);
     }
 
-    fn notify_loop_started(&self, loop_name: &str, spec_count: usize) {
-        let body = format!("Started · {spec_count} specs");
+    fn notify_loop_started(
+        &self,
+        loop_name: &str,
+        spec_count: usize,
+        resumed: bool,
+        first_pending: Option<&str>,
+    ) {
+        let verb = if resumed { "Resumed" } else { "Started" };
+        let next = first_pending
+            .map(|name| format!(" · next: {name}"))
+            .unwrap_or_default();
+        let body = format!("{verb} · {spec_count} specs{next}");
         send_notification(loop_name, &body, NotificationLevel::Info);
     }
 
-    fn notify_spec_completed(&self, loop_name: &str, spec_name: &str, done: usize, total: usize) {
-        let body = format!("{spec_name} ✓ · {done}/{total}");
+    fn notify_spec_completed(
+        &self,
+        loop_name: &str,
+        spec_name: &str,
+        done: usize,
+        total: usize,
+        next_pending: Option<&str>,
+    ) {
+        let next = next_pending
+            .map(|name| format!(" · next: {name}"))
+            .unwrap_or_default();
+        let body = format!("{spec_name} ✓ · {done}/{total}{next}");
         send_notification(loop_name, &body, NotificationLevel::Success);
     }
 

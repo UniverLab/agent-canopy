@@ -275,9 +275,20 @@ impl LoopEngine {
         // `loop_run`, a cron/watch trigger) and a resume (`loop_continue`,
         // autorun's auto-reset-and-resume) alike — every path that reaches
         // this function is a run actually starting to execute.
-        let (_, total_specs) = self.spec_progress(&loop_id, pool_id.as_deref())?;
-        self.notification_service
-            .notify_loop_started(&lp.name, total_specs);
+        let (done, total_specs) = self.spec_progress(&loop_id, pool_id.as_deref())?;
+        // "Resumed" vs "Started": a resume of an in-flight run (autorun /
+        // loop_continue), or any dispatch where prior specs already completed,
+        // shouldn't read as the loop starting over from scratch. The first
+        // spec this dispatch will work is surfaced so the toast says what's
+        // next, not just a count.
+        let resumed = is_resume || done > 0;
+        let first_pending = self.first_pending_spec_name(&loop_id, pool_id.as_deref())?;
+        self.notification_service.notify_loop_started(
+            &lp.name,
+            total_specs,
+            resumed,
+            first_pending.as_deref(),
+        );
 
         // Specs this dispatch itself completes — never specs that were
         // already `completed`/`skipped` before this run started (those are
@@ -1338,7 +1349,9 @@ impl LoopEngine {
     }
 
     /// Fire the spec-completed notification for `spec`, which the caller has
-    /// already marked `completed` in the database.
+    /// already marked `completed` in the database. Carries the next spec this
+    /// run will pick up (if any) so the toast leads with progress *and* what's
+    /// coming next.
     fn notify_spec_completed(
         &self,
         lp: &crate::domain::loops::Loop,
@@ -1346,9 +1359,45 @@ impl LoopEngine {
         pool_id: Option<&str>,
     ) -> Result<()> {
         let (done, total) = self.spec_progress(&lp.id, pool_id)?;
-        self.notification_service
-            .notify_spec_completed(&lp.name, &spec.name, done, total);
+        let next_pending = self.first_pending_spec_name(&lp.id, pool_id)?;
+        self.notification_service.notify_spec_completed(
+            &lp.name,
+            &spec.name,
+            done,
+            total,
+            next_pending.as_deref(),
+        );
         Ok(())
+    }
+
+    /// Name of the next spec this run will work: the pool's next pending
+    /// member for a pool run, else the loop's first `running`-or-`pending`
+    /// bound spec in position order. `None` when nothing is left to do.
+    fn first_pending_spec_name(
+        &self,
+        loop_id: &str,
+        pool_id: Option<&str>,
+    ) -> Result<Option<String>> {
+        match pool_id {
+            Some(pool_id) => {
+                let Some(spec_id) = self.db.pool_next_pending_spec_id(pool_id)? else {
+                    return Ok(None);
+                };
+                Ok(self.db.get_loop_spec(&spec_id)?.map(|spec| spec.name))
+            }
+            None => {
+                let specs = self.db.list_loop_specs(loop_id)?;
+                let next = specs
+                    .iter()
+                    .find(|spec| spec.status == LoopSpecStatus::Running)
+                    .or_else(|| {
+                        specs
+                            .iter()
+                            .find(|spec| spec.status == LoopSpecStatus::Pending)
+                    });
+                Ok(next.map(|spec| spec.name.clone()))
+            }
+        }
     }
 }
 
@@ -2349,12 +2398,15 @@ mod tests {
         LoopStarted {
             loop_name: String,
             spec_count: usize,
+            resumed: bool,
+            first_pending: Option<String>,
         },
         SpecCompleted {
             loop_name: String,
             spec_name: String,
             done: usize,
             total: usize,
+            next_pending: Option<String>,
         },
         LoopFinishedCompleted {
             loop_name: String,
@@ -2395,13 +2447,21 @@ mod tests {
         }
         fn notify_nursery_failed(&self, _error_msg: &str) {}
 
-        fn notify_loop_started(&self, loop_name: &str, spec_count: usize) {
+        fn notify_loop_started(
+            &self,
+            loop_name: &str,
+            spec_count: usize,
+            resumed: bool,
+            first_pending: Option<&str>,
+        ) {
             self.events
                 .lock()
                 .unwrap()
                 .push(RecordedNotification::LoopStarted {
                     loop_name: loop_name.to_string(),
                     spec_count,
+                    resumed,
+                    first_pending: first_pending.map(str::to_string),
                 });
         }
 
@@ -2411,6 +2471,7 @@ mod tests {
             spec_name: &str,
             done: usize,
             total: usize,
+            next_pending: Option<&str>,
         ) {
             self.events
                 .lock()
@@ -2420,6 +2481,7 @@ mod tests {
                     spec_name: spec_name.to_string(),
                     done,
                     total,
+                    next_pending: next_pending.map(str::to_string),
                 });
         }
 
@@ -4783,12 +4845,15 @@ mod tests {
                 RecordedNotification::LoopStarted {
                     loop_name: "Loop".to_string(),
                     spec_count: 1,
+                    resumed: false,
+                    first_pending: Some("Spec".to_string()),
                 },
                 RecordedNotification::SpecCompleted {
                     loop_name: "Loop".to_string(),
                     spec_name: "Spec".to_string(),
                     done: 1,
                     total: 1,
+                    next_pending: None,
                 },
                 RecordedNotification::LoopFinishedCompleted {
                     loop_name: "Loop".to_string(),
@@ -4829,6 +4894,8 @@ mod tests {
                 RecordedNotification::LoopStarted {
                     loop_name: "Loop".to_string(),
                     spec_count: 1,
+                    resumed: false,
+                    first_pending: Some("Spec".to_string()),
                 },
                 RecordedNotification::LoopFinishedFailed {
                     loop_name: "Loop".to_string(),

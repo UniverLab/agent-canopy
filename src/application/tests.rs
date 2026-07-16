@@ -51,8 +51,8 @@ mod test {
         service.notify_nursery_failed("identity.toml not found");
 
         // Test loop lifecycle notifications (return ())
-        service.notify_loop_started("R4 loop", 19);
-        service.notify_spec_completed("R4 loop", "R4", 11, 19);
+        service.notify_loop_started("R4 loop", 19, false, Some("R4"));
+        service.notify_spec_completed("R4 loop", "R4", 11, 19, Some("R5"));
         service.notify_loop_finished(
             "R4 loop",
             LoopFinishOutcome::Completed {

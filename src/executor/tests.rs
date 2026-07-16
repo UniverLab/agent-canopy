@@ -102,13 +102,21 @@ impl NotificationService for RecordingNotifier {
         self.push(&format!("agent_failed:{id}"));
     }
     fn notify_nursery_failed(&self, _error_msg: &str) {}
-    fn notify_loop_started(&self, _loop_name: &str, _spec_count: usize) {}
+    fn notify_loop_started(
+        &self,
+        _loop_name: &str,
+        _spec_count: usize,
+        _resumed: bool,
+        _first_pending: Option<&str>,
+    ) {
+    }
     fn notify_spec_completed(
         &self,
         _loop_name: &str,
         _spec_name: &str,
         _done: usize,
         _total: usize,
+        _next_pending: Option<&str>,
     ) {
     }
     fn notify_loop_finished(
