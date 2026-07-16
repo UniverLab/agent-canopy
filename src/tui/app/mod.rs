@@ -157,6 +157,7 @@ impl App {
             playground_selected: 0,
             playground_last_search: std::time::Instant::now(),
             playground_search_pending: false,
+            playground_search_rx: None,
             playground_last_executed_query: String::new(),
             playground_detail_mode: false,
             playground_scroll: 0,
@@ -213,6 +214,7 @@ impl App {
         self.tick_atmosphere();
         self.tick_missions()?;
         self.resize_interactive_agents();
+        self.poll_playground_search();
         self.refresh_playground_search()?;
         if let Some(dialog) = self.simple_prompt_dialog.as_mut() {
             dialog.tick_at_picker();
@@ -243,7 +245,10 @@ impl App {
         blend_system_info(&mut self.system_info, &self.system_info_target, blend);
     }
 
-    /// Perform debounced RAG search in playground mode
+    /// Perform debounced RAG search in playground mode. The search itself
+    /// (embedding-model load + embed + vector search) runs on a worker
+    /// thread (B23) — this only spawns it; [`Self::poll_playground_search`]
+    /// applies the results when they arrive, so the UI never blocks.
     fn refresh_playground_search(&mut self) -> Result<()> {
         const PLAYGROUND_SEARCH_DEBOUNCE_MS: u128 = 2_000;
 
@@ -251,6 +256,11 @@ impl App {
             return Ok(());
         }
         if !self.playground_search_pending {
+            return Ok(());
+        }
+        // One search at a time: results of the in-flight one arrive first,
+        // and pending stays true, so a newer query re-triggers right after.
+        if self.playground_search_rx.is_some() {
             return Ok(());
         }
 
@@ -273,7 +283,39 @@ impl App {
             return Ok(());
         }
 
-        if let Ok(results) = self.rag_vector_search(&query, 50) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = playground_vector_search(&query, 50);
+            let _ = tx.send((query, outcome));
+        });
+        self.playground_search_rx = Some(rx);
+        Ok(())
+    }
+
+    /// Apply a finished background playground search, if any (B23). Called
+    /// from the tick loop; never blocks.
+    fn poll_playground_search(&mut self) {
+        let Some(rx) = &self.playground_search_rx else {
+            return;
+        };
+        let (executed_query, outcome) = match rx.try_recv() {
+            Ok(message) => message,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.playground_search_rx = None;
+                self.playground_search_pending = false;
+                return;
+            }
+        };
+        self.playground_search_rx = None;
+
+        // Playground closed (Esc) while the search ran: abandon the result.
+        if !self.playground_active {
+            self.playground_search_pending = false;
+            return;
+        }
+
+        if let Ok(results) = outcome {
             let month_ago = chrono::Utc::now().timestamp() - 30 * 24 * 3600;
             for result in &results {
                 if result.distance.is_some_and(|d| d < 0.2) {
@@ -288,9 +330,12 @@ impl App {
             self.playground_results = results;
             self.playground_selected = 0;
         }
-        self.playground_last_executed_query = query;
-        self.playground_search_pending = false;
-        Ok(())
+        self.playground_last_executed_query = executed_query;
+        // Leave pending=true if the user kept typing (query changed while
+        // the search ran) so the debounce re-triggers with the newer query.
+        self.playground_search_pending =
+            self.playground_query.trim() != self.playground_last_executed_query;
+        self.playground_last_search = std::time::Instant::now();
     }
 
     // ── Navigation ──────────────────────────────────────────────
@@ -1105,30 +1150,6 @@ impl App {
         self.rag_file_status = self.db.rag_per_file_status().unwrap_or_default();
 
         Ok(())
-    }
-
-    fn rag_vector_search(
-        &self,
-        query: &str,
-        top_k: usize,
-    ) -> anyhow::Result<Vec<crate::rag::vector_store::SearchResult>> {
-        let canopy_dir = dirs::home_dir()
-            .map(|h| h.join(".canopy"))
-            .ok_or_else(|| anyhow::anyhow!("No home directory"))?;
-        let config = crate::domain::canopy_config::CanopyConfig::load(&canopy_dir);
-        let model = config.embeddings_model.trim();
-        if model.is_empty() {
-            return Ok(Vec::new());
-        }
-        let dimensions = crate::rag::embedding_client::model_dimensions(model)?;
-        let rt = tokio::runtime::Handle::try_current()
-            .map_err(|_| anyhow::anyhow!("No tokio runtime"))?;
-        rt.block_on(async {
-            let store = crate::rag::vector_store::VectorStore::new(dimensions).await?;
-            let embedder = crate::rag::embedding_client::client_from_config(&config)?;
-            let query_vec = embedder.embed(query)?;
-            store.search_similar(&query_vec, top_k).await
-        })
     }
 
     pub fn selected_agent(&self) -> Option<&AgentEntry> {
@@ -2725,6 +2746,34 @@ fn blend_system_info(
     current.power_watts = blend_optional_f32(current.power_watts, target.power_watts, t);
     current.power_limit_watts = target.power_limit_watts;
     current.power_source = target.power_source;
+}
+
+/// Worker-thread body of the playground search (B23): loads/uses an
+/// embedding client and queries the vector store on its own current-thread
+/// runtime — a cold lazy model can take seconds to load, and none of that
+/// may run on the UI thread.
+fn playground_vector_search(
+    query: &str,
+    top_k: usize,
+) -> anyhow::Result<Vec<crate::rag::vector_store::SearchResult>> {
+    let canopy_dir = dirs::home_dir()
+        .map(|h| h.join(".canopy"))
+        .ok_or_else(|| anyhow::anyhow!("No home directory"))?;
+    let config = crate::domain::canopy_config::CanopyConfig::load(&canopy_dir);
+    let model = config.embeddings_model.trim();
+    if model.is_empty() {
+        return Ok(Vec::new());
+    }
+    let dimensions = crate::rag::embedding_client::model_dimensions(model)?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let store = crate::rag::vector_store::VectorStore::new(dimensions).await?;
+        let embedder = crate::rag::embedding_client::client_from_config(&config)?;
+        let query_vec = embedder.embed(query)?;
+        store.search_similar(&query_vec, top_k).await
+    })
 }
 
 fn spawn_system_monitor(

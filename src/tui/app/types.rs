@@ -422,6 +422,12 @@ pub struct App {
     pub(crate) playground_selected: usize,
     pub(crate) playground_last_search: std::time::Instant,
     pub(crate) playground_search_pending: bool,
+    /// In-flight background playground search (B23): receiving end of the
+    /// worker thread running embed+search off the UI thread, tagged with the
+    /// query it executed. `Some` while a search is executing — the TUI keeps
+    /// rendering and polling instead of blocking on the model load.
+    pub(crate) playground_search_rx:
+        Option<std::sync::mpsc::Receiver<(String, anyhow::Result<Vec<SearchResult>>)>>,
     pub(crate) playground_last_executed_query: String,
     /// Whether the playground is showing a single chunk in detail mode.
     pub(crate) playground_detail_mode: bool,
