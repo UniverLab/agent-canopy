@@ -49,7 +49,7 @@ fn handle_loop_list(db: &Database, workdir: Option<&str>) -> Result<()> {
     println!("\n\x1b[1m── Canopy Loops ───────────────────────────────────────────────\x1b[0m\n");
     for lp in &loops {
         let specs = db.list_loop_specs(&lp.id)?;
-        let (done, total) = spec_progress(&specs);
+        let (done, total) = loop_progress(db, lp, &specs)?;
 
         let mut line = format!(
             " {} {}  \x1b[90m{}\x1b[0m  {:<9} {done}/{total}",
@@ -223,6 +223,28 @@ fn spec_progress(specs: &[LoopSpec]) -> (usize, usize) {
         .filter(|s| s.status == LoopSpecStatus::Completed)
         .count();
     (done, specs.len())
+}
+
+/// `done/total` progress for a loop's `loop list` row. A pool-driven run binds
+/// no specs of its own (`loop_specs.loop_id` stays null for pool members), so
+/// counting `bound_specs` renders a misleading `0/0`. When the loop's row
+/// carries an `active_run_pool_id`, count that pool's members instead —
+/// mirroring `LoopEngine::spec_progress`, which the running engine uses for the
+/// same loop. Falls back to the bound specs for ordinary (non-pool) loops.
+fn loop_progress(db: &Database, lp: &Loop, bound_specs: &[LoopSpec]) -> Result<(usize, usize)> {
+    let Some(pool_id) = lp.active_run_pool_id.as_deref() else {
+        return Ok(spec_progress(bound_specs));
+    };
+    let ids = db.list_pool_member_spec_ids(pool_id)?;
+    let mut done = 0;
+    for id in &ids {
+        if let Some(spec) = db.get_loop_spec(id)? {
+            if spec.status == LoopSpecStatus::Completed {
+                done += 1;
+            }
+        }
+    }
+    Ok((done, ids.len()))
 }
 
 /// The spec a loop is actively working through: the one currently `running`,
@@ -488,6 +510,54 @@ mod tests {
     #[test]
     fn spec_progress_empty_is_zero_of_zero() {
         assert_eq!(spec_progress(&[]), (0, 0));
+    }
+
+    #[test]
+    fn loop_progress_counts_pool_members_when_active_run_pool_id_set() {
+        use crate::domain::pools::Pool;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(&dir.path().join("t.db")).unwrap();
+
+        // A pool-driven loop binds no specs of its own, so counting bound
+        // specs would render a misleading 0/0.
+        let mut lp = make_loop("loop-1", "pool-loop", LoopStatus::Running);
+        lp.active_run_pool_id = Some("pool-1".to_string());
+        db.insert_loop(&lp).unwrap();
+        db.insert_pool(&Pool {
+            id: "pool-1".to_string(),
+            name: "P".to_string(),
+            created_at: Utc::now(),
+        })
+        .unwrap();
+
+        // Two standalone pool members (loop_id: None, like real ones): one
+        // completed, one pending.
+        for (id, status) in [
+            ("spec-a", LoopSpecStatus::Completed),
+            ("spec-b", LoopSpecStatus::Pending),
+        ] {
+            let mut spec = make_spec("pool", id, 0, status);
+            spec.id = id.to_string();
+            spec.loop_id = None;
+            db.insert_loop_spec(&spec).unwrap();
+            db.append_pool_member("pool-1", id).unwrap();
+        }
+
+        // Bound specs empty; pool progress is 1/2.
+        assert_eq!(loop_progress(&db, &lp, &[]).unwrap(), (1, 2));
+    }
+
+    #[test]
+    fn loop_progress_falls_back_to_bound_specs_without_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(&dir.path().join("t.db")).unwrap();
+        let lp = make_loop("loop-2", "bound", LoopStatus::Running);
+        let specs = vec![
+            make_spec("loop-2", "a", 0, LoopSpecStatus::Completed),
+            make_spec("loop-2", "b", 1, LoopSpecStatus::Pending),
+        ];
+        assert_eq!(loop_progress(&db, &lp, &specs).unwrap(), (1, 2));
     }
 
     #[test]

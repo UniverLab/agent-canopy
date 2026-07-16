@@ -163,25 +163,28 @@ fn send_macos(title: &str, body: &str) {
 }
 
 fn send_wsl(title: &str, body: &str) {
-    // Clear stale notifications and show the new toast in a single PowerShell process
-    // to avoid a race condition where two spawned processes interfere with each other.
+    // Do NOT `.Clear()` here: clearing the notifier before every show wiped the
+    // entire Canopy history from the Action Center on each toast, so an
+    // unattended run of overnight events left nothing to review by morning —
+    // each new toast erased all the ones before it. Startup cleanup lives in
+    // `clear_stale_notifications` (called once from the TUI); individual sends
+    // must be additive. The expiry is a full day (not 30s) for the same reason:
+    // a background event fired at 2am must still be in the Action Center when a
+    // human looks at 9am, rather than having evaporated.
     let ps_script = format!(
         concat!(
             "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ",
             "ContentType = WindowsRuntime] > $null; ",
-            "try {{ [Windows.UI.Notifications.ToastNotificationManager]::",
-            "CreateToastNotifier('{}').Clear() }} catch {{}}; ",
             "$template = [Windows.UI.Notifications.ToastNotificationManager]::",
             "GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02); ",
             "$nodes = $template.GetElementsByTagName('text'); ",
             "$nodes.Item(0).AppendChild($template.CreateTextNode('{}')) > $null; ",
             "$nodes.Item(1).AppendChild($template.CreateTextNode('{}')) > $null; ",
             "$toast = [Windows.UI.Notifications.ToastNotification]::new($template); ",
-            "$toast.ExpirationTime = [DateTimeOffset]::UtcNow.Add([TimeSpan]::FromSeconds(30)); ",
+            "$toast.ExpirationTime = [DateTimeOffset]::UtcNow.Add([TimeSpan]::FromHours(24)); ",
             "[Windows.UI.Notifications.ToastNotificationManager]::",
             "CreateToastNotifier('{}').Show($toast)"
         ),
-        ps_escape(APP_ID),
         ps_escape(title),
         ps_escape(body),
         ps_escape(APP_ID),
