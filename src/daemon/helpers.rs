@@ -43,18 +43,17 @@ pub(crate) fn notify_run_result(
     notification_service: &Arc<dyn NotificationService>,
     id: &str,
     result: Result<i32, anyhow::Error>,
-    failure_msg: &str,
 ) {
     match result {
         Ok(code) => {
+            // Runs that actually started are notified by the executor's own
+            // notify_result — toasting here again double-notified every
+            // manual run.
             tracing::info!("Manual run '{}' finished (exit {})", id, code);
-            if code == 0 {
-                notification_service.notify_task_completed(id, true, Some(code));
-            } else {
-                notification_service.notify_task_failed(id, code, failure_msg);
-            }
         }
         Err(e) => {
+            // The run never started, so the executor never got the chance to
+            // notify — this is the only place that can surface the failure.
             tracing::error!("Manual run '{}' failed: {}", id, e);
             notification_service.notify_task_failed(id, 1, &e.to_string());
         }

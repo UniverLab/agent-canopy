@@ -1554,12 +1554,7 @@ impl TaskTriggerHandler {
 
         tokio::spawn(async move {
             let result = executor.execute_agent(&agent, true).await;
-            notify_run_result(
-                &notification_service,
-                &agent_id,
-                result,
-                "Manual run failed",
-            );
+            notify_run_result(&notification_service, &agent_id, result);
         });
 
         Ok(success_result(&format!(
