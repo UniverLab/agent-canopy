@@ -249,6 +249,12 @@ pub struct App {
     pub(crate) terminal_agents: Vec<InteractiveAgent>,
     /// Sessions orphaned during auto-resume (can be revived or dismissed).
     pub(crate) orphaned_sessions: Vec<crate::db::session::InteractiveSession>,
+    /// Gate: pending scheduled sends are held (not delivered) until the
+    /// startup restore runs — auto-resume reassigns each schedule onto its
+    /// resumed session id and drops schedules whose session is gone. Without
+    /// this, the first refresh (before sessions resume) would see zero live
+    /// sessions and prematurely treat every due schedule as dead.
+    pub(crate) scheduled_sends_restored: bool,
 
     // Split group state
     pub(crate) split_groups: Vec<crate::domain::models::SplitGroup>,

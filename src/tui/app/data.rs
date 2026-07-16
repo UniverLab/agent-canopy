@@ -198,6 +198,12 @@ impl App {
     /// session. If the target session is dead/missing, send a desktop
     /// notification and keep the prompt recoverable via the last-prompt recall.
     pub(super) fn deliver_due_scheduled_sends(&mut self) {
+        // Hold delivery until the startup restore has run: the first refresh
+        // happens before sessions auto-resume, so acting now would see no live
+        // sessions and wrongly declare every due schedule dead.
+        if !self.scheduled_sends_restored {
+            return;
+        }
         let now = chrono::Utc::now();
         let due = match self.db.list_due_scheduled_sends(now) {
             Ok(due) => due,
@@ -323,6 +329,9 @@ mod tests {
     #[test]
     fn dead_target_scheduled_send_becomes_the_projects_last_prompt() {
         let (mut app, _dir) = test_app();
+        // Simulate a running (post-restore) app whose target session died mid
+        // run: the delivery gate is open and the schedule survived restore.
+        app.scheduled_sends_restored = true;
         let workdir = "/home/user/dead-target-project";
         let fire_at = chrono::Utc::now() - chrono::Duration::minutes(1);
 
@@ -365,5 +374,70 @@ mod tests {
             .expect("list failed");
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].prompt, "please recover me");
+    }
+
+    /// Before the startup restore runs, the delivery gate is closed: a due
+    /// schedule must be left completely untouched (not delivered, not
+    /// preserved) so a session that is still resuming isn't wrongly declared
+    /// dead during the pre-resume window.
+    #[test]
+    fn delivery_is_held_until_scheduled_sends_are_restored() {
+        let (mut app, _dir) = test_app();
+        assert!(!app.scheduled_sends_restored);
+        let fire_at = chrono::Utc::now() - chrono::Duration::minutes(5);
+        app.db
+            .insert_scheduled_send("ss-held", "later", "resuming-session", None, fire_at)
+            .expect("insert scheduled send");
+
+        app.deliver_due_scheduled_sends();
+
+        // Still pending, and NOT shunted into the failed table.
+        assert_eq!(
+            app.db
+                .list_due_scheduled_sends(chrono::Utc::now())
+                .expect("list due")
+                .len(),
+            1
+        );
+        assert!(app
+            .db
+            .list_failed_scheduled_sends_for_workdir("resuming-session")
+            .expect("list failed")
+            .is_empty());
+    }
+
+    /// On startup, a pending schedule whose target session was not resumed
+    /// (it no longer exists) is dropped silently — no failed record, no
+    /// last-prompt recall — and the delivery gate opens.
+    #[test]
+    fn restore_drops_schedules_for_sessions_that_no_longer_exist() {
+        let (mut app, _dir) = test_app();
+        let workdir = "/home/user/gone-project";
+        let fire_at = chrono::Utc::now() - chrono::Duration::minutes(1);
+        app.db
+            .insert_scheduled_send("ss-gone", "orphan", "gone-session", Some(workdir), fire_at)
+            .expect("insert scheduled send");
+        // No sessions were resumed.
+        assert!(app.interactive_agents.is_empty());
+
+        app.restore_scheduled_sends();
+
+        assert!(app.scheduled_sends_restored);
+        // Dropped silently: gone from the schedule, and never preserved.
+        assert!(app
+            .db
+            .list_due_scheduled_sends(chrono::Utc::now())
+            .expect("list due")
+            .is_empty());
+        assert!(app
+            .db
+            .list_failed_scheduled_sends_for_workdir(workdir)
+            .expect("list failed")
+            .is_empty());
+        assert!(app
+            .db
+            .get_last_prompt_for_workdir(workdir)
+            .expect("query last prompt")
+            .is_none());
     }
 }

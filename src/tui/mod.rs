@@ -78,6 +78,9 @@ pub fn run_tui() -> Result<()> {
     }
     // Auto-resume previously active terminal sessions
     app.auto_resume_terminal_sessions();
+    // Now that sessions are resumed (and their schedules reassigned), open the
+    // scheduled-send delivery gate and drop schedules whose session is gone.
+    app.restore_scheduled_sends();
 
     // Setup terminal
     enable_raw_mode()?;

@@ -60,6 +60,7 @@ impl App {
             interactive_agents: Vec::new(),
             terminal_agents: Vec::new(),
             orphaned_sessions: Vec::new(),
+            scheduled_sends_restored: false,
             split_groups: Vec::new(),
             active_split_id: None,
             split_right_focused: false,
@@ -2438,7 +2439,32 @@ impl App {
             &session.session_type,
             current_boot_id,
         );
+        // The resumed session gets a fresh runtime id; move any pending
+        // scheduled sends from the old id onto it so they survive the restart.
+        if let Err(e) = self.db.reassign_scheduled_sends(&session.id, &agent.id) {
+            tracing::warn!(
+                "Failed to reassign scheduled sends for resumed session '{}': {e}",
+                session.name
+            );
+        }
         self.interactive_agents.push(agent);
+    }
+
+    /// Finalize scheduled-send restore after auto-resume: any pending schedule
+    /// whose target session was not resumed (its session no longer exists) is
+    /// dropped silently, then the delivery gate opens so due schedules — past
+    /// due ones included — fire on the next tick. Idempotent; safe to call once
+    /// on startup even when there are no sessions.
+    pub fn restore_scheduled_sends(&mut self) {
+        let live_ids: Vec<String> = self
+            .interactive_agents
+            .iter()
+            .map(|agent| agent.id.clone())
+            .collect();
+        if let Err(e) = self.db.drop_scheduled_sends_missing_targets(&live_ids) {
+            tracing::warn!("Failed to drop scheduled sends for missing sessions: {e}");
+        }
+        self.scheduled_sends_restored = true;
     }
 
     fn resume_terminal_session(

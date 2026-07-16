@@ -110,6 +110,45 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Re-point every scheduled send from `old_target` to `new_target`. Called
+    /// when an interactive session is auto-resumed after a TUI restart: the
+    /// resumed session gets a fresh runtime id, so pending schedules must be
+    /// moved onto it or they would look orphaned and never fire. Returns the
+    /// number of rows moved.
+    pub fn reassign_scheduled_sends(&self, old_target: &str, new_target: &str) -> Result<usize> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE scheduled_sends SET target_session_id = ?2 WHERE target_session_id = ?1",
+            params![old_target, new_target],
+        )?;
+        Ok(rows)
+    }
+
+    /// Silently delete every scheduled send whose target session is not in
+    /// `live_targets`. Used on startup, after auto-resume, to drop schedules
+    /// whose session no longer exists (never resumed). Returns rows deleted.
+    /// An empty `live_targets` drops all pending scheduled sends.
+    pub fn drop_scheduled_sends_missing_targets(&self, live_targets: &[String]) -> Result<usize> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        if live_targets.is_empty() {
+            let rows = conn.execute("DELETE FROM scheduled_sends", [])?;
+            return Ok(rows);
+        }
+        // Build a `(?,?,…)` placeholder list for the IN clause.
+        let placeholders = vec!["?"; live_targets.len()].join(",");
+        let sql =
+            format!("DELETE FROM scheduled_sends WHERE target_session_id NOT IN ({placeholders})");
+        let params = rusqlite::params_from_iter(live_targets.iter());
+        let rows = conn.execute(&sql, params)?;
+        Ok(rows)
+    }
+
     fn row_to_scheduled_send(row: &rusqlite::Row) -> rusqlite::Result<ScheduledSend> {
         Ok(ScheduledSend {
             id: row.get(0)?,
@@ -250,6 +289,76 @@ mod tests {
             .unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, "ss-4");
+    }
+
+    #[test]
+    fn reassign_moves_pending_sends_to_the_resumed_session_id() {
+        let db = test_db();
+        let fire = Utc::now() + chrono::Duration::hours(2);
+        db.insert_scheduled_send("ss-r1", "keep me", "old-id", Some("/proj"), fire)
+            .unwrap();
+        db.insert_scheduled_send("ss-r2", "unrelated", "other-id", None, fire)
+            .unwrap();
+
+        let moved = db.reassign_scheduled_sends("old-id", "new-id").unwrap();
+        assert_eq!(moved, 1);
+        // The reassigned send now belongs to the resumed session id.
+        assert!(db
+            .list_pending_scheduled_sends_for_session("old-id")
+            .unwrap()
+            .is_empty());
+        let pending = db
+            .list_pending_scheduled_sends_for_session("new-id")
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "ss-r1");
+        // The unrelated send is untouched.
+        assert_eq!(
+            db.list_pending_scheduled_sends_for_session("other-id")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn drop_missing_targets_removes_only_gone_sessions() {
+        let db = test_db();
+        let fire = Utc::now() + chrono::Duration::hours(1);
+        db.insert_scheduled_send("ss-live", "deliver", "session-live", None, fire)
+            .unwrap();
+        db.insert_scheduled_send("ss-gone", "orphan", "session-gone", None, fire)
+            .unwrap();
+
+        let live = vec!["session-live".to_string()];
+        let dropped = db.drop_scheduled_sends_missing_targets(&live).unwrap();
+        assert_eq!(dropped, 1);
+        assert_eq!(
+            db.list_pending_scheduled_sends_for_session("session-live")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(db
+            .list_pending_scheduled_sends_for_session("session-gone")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn drop_missing_targets_with_no_live_sessions_clears_all() {
+        let db = test_db();
+        let fire = Utc::now() + chrono::Duration::hours(1);
+        db.insert_scheduled_send("ss-x", "x", "s1", None, fire)
+            .unwrap();
+        db.insert_scheduled_send("ss-y", "y", "s2", None, fire)
+            .unwrap();
+        let dropped = db.drop_scheduled_sends_missing_targets(&[]).unwrap();
+        assert_eq!(dropped, 2);
+        assert!(db
+            .list_due_scheduled_sends(Utc::now() + chrono::Duration::days(1))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
