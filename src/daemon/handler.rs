@@ -52,7 +52,7 @@ use crate::domain::blueprints::{merge_blueprint_config, validate_blueprint_delet
 use crate::domain::loops::{
     validate_spec_description_template, Ensemble, EnsembleMember, Loop, LoopDetails, LoopEdge,
     LoopEdgeCondition, LoopNode, LoopNodeKind, LoopNodeRun, LoopResetOutcome, LoopRunStatus,
-    LoopSpec, LoopSpecStatus, LoopStatus,
+    LoopSpec, LoopSpecStatus, LoopStatus, SpecAdminStatusOutcome,
 };
 use crate::domain::models::{Agent, Trigger};
 use crate::domain::pools::{Pool, PoolDetails};
@@ -445,6 +445,17 @@ fn validate_spec_status(status: &str) -> Result<LoopSpecStatus, String> {
         "skipped" => Ok(LoopSpecStatus::Skipped),
         _ => Err(
             "Spec status must be one of: pending, running, completed, failed, skipped.".to_string(),
+        ),
+    }
+}
+
+fn validate_spec_set_status_target(status: &str) -> Result<LoopSpecStatus, String> {
+    match status.trim().to_lowercase().as_str() {
+        "pending" => Ok(LoopSpecStatus::Pending),
+        "completed" => Ok(LoopSpecStatus::Completed),
+        "skipped" => Ok(LoopSpecStatus::Skipped),
+        _ => Err(
+            "Spec set_status target must be one of: pending, completed, skipped.".to_string(),
         ),
     }
 }
@@ -887,7 +898,7 @@ fn build_spec_update_response(spec_id: &str) -> CallToolResult {
 /// (unassigned) spec has never run. Compare [`loop_spec_details_json`],
 /// which adds that runtime detail for specs already inside a loop.
 fn spec_summary_json(spec: &LoopSpec) -> serde_json::Value {
-    serde_json::json!({
+    let mut obj = serde_json::json!({
         "id": spec.id,
         "loop_id": spec.loop_id,
         "name": spec.name,
@@ -896,7 +907,11 @@ fn spec_summary_json(spec: &LoopSpec) -> serde_json::Value {
         "position": spec.position,
         "parallelizable": spec.parallelizable,
         "status": spec.status.as_str(),
-    })
+    });
+    if let Some(via) = &spec.completed_via {
+        obj["completed_via"] = serde_json::json!(via);
+    }
+    obj
 }
 
 fn blueprint_json(blueprint: &Blueprint) -> serde_json::Value {
@@ -2572,6 +2587,9 @@ impl TaskTriggerHandler {
             completed_at: None,
             spec_start_head: None,
             workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
         };
         self.db.insert_loop_spec(&spec).map_err(internal_error)?;
 
@@ -2686,6 +2704,9 @@ impl TaskTriggerHandler {
             completed_at: None,
             spec_start_head: None,
             workdir,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
         };
         self.db.insert_loop_spec(&spec).map_err(internal_error)?;
 
@@ -2781,6 +2802,55 @@ impl TaskTriggerHandler {
             .map_err(internal_error)?;
 
         Ok(build_spec_update_response(spec_id))
+    }
+
+    #[tool(
+        name = "spec_set_status",
+        description = "Administratively transition a standalone spec's status (completed, skipped, or pending). Rejects if the spec is bound to a loop or has an active run."
+    )]
+    async fn spec_set_status(
+        &self,
+        Parameters(params): Parameters<SpecSetStatusParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let spec_id = params.spec_id.trim();
+        if let Err(e) = validate_spec_exists(&self.db, spec_id) {
+            return Ok(error_result(&e));
+        }
+
+        let status = match validate_spec_set_status_target(params.status.as_str()) {
+            Ok(s) => s,
+            Err(e) => return Ok(error_result(&e)),
+        };
+
+        let reason = params.reason.trim();
+        if reason.is_empty() {
+            return Ok(error_result("Reason must not be empty."));
+        }
+
+        match self.db.set_spec_admin_status(spec_id, status, reason)
+            .map_err(internal_error)? {
+            SpecAdminStatusOutcome::Success => {
+                Ok(success_result(&format!(
+                    "Spec '{spec_id}' set to '{:?}' (admin): {reason}",
+                    status
+                )))
+            },
+            SpecAdminStatusOutcome::NotFound => {
+                Ok(error_result(&format!("Spec '{spec_id}' not found.")))
+            },
+            SpecAdminStatusOutcome::NotStandalone(loop_id) => {
+                Ok(error_result(&format!(
+                    "Spec '{spec_id}' is bound to loop '{loop_id}'; spec_set_status only \
+                     administers standalone specs."
+                )))
+            },
+            SpecAdminStatusOutcome::ActiveRun { loop_id, run_id } => {
+                Ok(error_result(&format!(
+                    "Spec '{spec_id}' is attached to an active run (loop '{loop_id}', run '{run_id}'); \
+                     it cannot be administratively transitioned while running."
+                )))
+            },
+        }
     }
 
     #[tool(
@@ -4980,6 +5050,9 @@ mod tests {
             completed_at: None,
             spec_start_head: None,
             workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
         })
         .unwrap();
         let now = chrono::Utc::now();
@@ -5138,6 +5211,9 @@ mod tests {
             completed_at: Some(chrono::Utc::now()),
             spec_start_head: None,
             workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
         }
     }
 
@@ -5283,6 +5359,9 @@ mod tests {
             completed_at: Some(chrono::Utc::now()),
             spec_start_head: None,
             workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
         };
         db.insert_loop_spec(&standalone("pool-done", 1, LoopSpecStatus::Completed))
             .unwrap();
@@ -5596,6 +5675,9 @@ mod tests {
             completed_at: None,
             spec_start_head: None,
             workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
         }
     }
 

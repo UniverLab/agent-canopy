@@ -154,6 +154,20 @@ pub enum LoopResetOutcome {
     },
 }
 
+#[derive(Debug, Clone)]
+pub enum SpecAdminStatusOutcome {
+    Success,
+    NotFound,
+    /// Spec is bound to a loop (not standalone); spec_set_status only
+    /// administers standalone specs.
+    NotStandalone(String),
+    /// Spec has an active run and cannot be administratively transitioned.
+    ActiveRun {
+        loop_id: String,
+        run_id: String,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoopSpecStatus {
@@ -421,6 +435,17 @@ pub struct LoopSpec {
     /// loop decides the actual workdir.
     #[serde(default)]
     pub workdir: Option<String>,
+    /// How the spec was last transitioned to its current status (`admin` for
+    /// administrative transitions). `None` means the status change was
+    /// engine-driven or the spec was never administratively touched.
+    #[serde(default)]
+    pub completed_via: Option<String>,
+    /// Reason for the most recent administrative status transition.
+    #[serde(default)]
+    pub completed_via_reason: Option<String>,
+    /// Timestamp of the most recent administrative status transition.
+    #[serde(default)]
+    pub completed_via_at: Option<DateTime<Utc>>,
 }
 
 /// A node in either a spec's graph or a loop's top-level graph.

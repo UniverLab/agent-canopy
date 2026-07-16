@@ -2305,6 +2305,9 @@ mod tests {
             completed_at: None,
             spec_start_head: None,
             workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
         };
 
         db.insert_loop(&lp)?;
@@ -2475,6 +2478,9 @@ mod tests {
             completed_at: None,
             spec_start_head: None,
             workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
         };
 
         db.insert_loop(&lp)?;
@@ -2958,6 +2964,9 @@ mod tests {
             completed_at: None,
             spec_start_head: None,
             workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
         };
         let details = crate::domain::loops::LoopSpecDetails {
             spec: spec.clone(),
@@ -3013,6 +3022,9 @@ mod tests {
             completed_at: None,
             spec_start_head: None,
             workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
         };
         let details = crate::domain::loops::LoopSpecDetails {
             spec: spec.clone(),
@@ -3072,6 +3084,9 @@ mod tests {
             completed_at: None,
             spec_start_head: None,
             workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
         };
         let node = |id: &str, position: i64| LoopNode {
             id: id.to_string(),
@@ -3146,6 +3161,9 @@ mod tests {
             completed_at: None,
             spec_start_head: None,
             workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
         };
         let node = LoopNode {
             id: "node-1".to_string(),
@@ -3224,6 +3242,9 @@ mod tests {
             completed_at: None,
             spec_start_head: None,
             workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
         };
         let node = LoopNode {
             id: "node-1".to_string(),
@@ -3534,6 +3555,9 @@ mod tests {
             completed_at: None,
             spec_start_head: None,
             workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
         }
     }
 
@@ -3839,6 +3863,9 @@ mod tests {
             completed_at: None,
             spec_start_head: None,
             workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
         }
     }
 
@@ -4530,6 +4557,9 @@ mod tests {
             completed_at: None,
             spec_start_head: None,
             workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
         };
         let node = LoopNode {
             id: "node-1".to_string(),

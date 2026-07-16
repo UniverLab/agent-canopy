@@ -117,7 +117,12 @@ fn handle_loop_info(db: &Database, id_or_name: &str) -> Result<()> {
     println!("\n\x1b[1m── Specs ──────────────────────────────────────────────────────\x1b[0m");
     if !specs.is_empty() {
         for spec in &specs {
-            println!(" {} {}", spec_status_icon(spec.status), spec.name);
+            let admin_tag = if spec.completed_via.as_deref() == Some("admin") {
+                " (admin)"
+            } else {
+                ""
+            };
+            println!(" {} {}{}", spec_status_icon(spec.status), spec.name, admin_tag);
         }
     } else if !all_runs.is_empty() {
         // No specs are bound to this loop directly — it's draining a pool
@@ -128,7 +133,12 @@ fn handle_loop_info(db: &Database, id_or_name: &str) -> Result<()> {
         println!(" (pool-driven — showing specs worked so far, not the full queue)");
         for spec_id in distinct_spec_ids_in_order(&all_runs) {
             if let Some(spec) = db.get_loop_spec(spec_id)? {
-                println!(" {} {}", spec_status_icon(spec.status), spec.name);
+                let admin_tag = if spec.completed_via.as_deref() == Some("admin") {
+                    " (admin)"
+                } else {
+                    ""
+                };
+                println!(" {} {}{}", spec_status_icon(spec.status), spec.name, admin_tag);
             }
         }
     } else {
@@ -448,6 +458,9 @@ mod tests {
             completed_at: None,
             spec_start_head: None,
             workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
         }
     }
 

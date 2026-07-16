@@ -120,6 +120,9 @@ fn sample_loop_spec(loop_id: &str, id: &str, position: i64) -> LoopSpec {
         completed_at: None,
         spec_start_head: None,
         workdir: None,
+        completed_via: None,
+        completed_via_reason: None,
+        completed_via_at: None,
     }
 }
 
@@ -793,6 +796,9 @@ fn loop_specs_migration_relaxes_loop_id_and_adds_workdir_and_is_idempotent() {
         completed_at: None,
         spec_start_head: None,
         workdir: Some("/tmp/project".to_string()),
+        completed_via: None,
+        completed_via_reason: None,
+        completed_via_at: None,
     })
     .unwrap();
     let standalone = db.get_loop_spec("standalone-spec").unwrap().unwrap();
@@ -815,6 +821,9 @@ fn sample_standalone_spec(id: &str, workdir: Option<&str>) -> LoopSpec {
         completed_at: None,
         spec_start_head: None,
         workdir: workdir.map(str::to_string),
+        completed_via: None,
+        completed_via_reason: None,
+        completed_via_at: None,
     }
 }
 

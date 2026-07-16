@@ -225,7 +225,10 @@ impl Database {
                 started_at INTEGER,
                 completed_at INTEGER,
                 spec_start_head TEXT,
-                workdir TEXT
+                workdir TEXT,
+                completed_via TEXT,
+                completed_via_reason TEXT,
+                completed_via_at INTEGER
             );
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_loop_specs_position
@@ -766,6 +769,32 @@ impl Database {
                 };
                 conn.execute(&sql, [])
                     .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+            }
+        }
+
+        // `completed_via`/`completed_via_reason`/`completed_via_at` (B25):
+        // administrative spec status transitions, recorded with provenance
+        // and reason. Older databases predate these columns; NULL on existing
+        // rows (all existing completions are engine-driven).
+        for column in ["completed_via", "completed_via_reason", "completed_via_at"] {
+            let has_column: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('loop_specs') WHERE name = ?1",
+                    [column],
+                    |row| Ok(row.get::<_, i32>(0)? > 0),
+                )
+                .unwrap_or(false);
+            if !has_column {
+                let sql = match column {
+                    "completed_via" => "ALTER TABLE loop_specs ADD COLUMN completed_via TEXT",
+                    "completed_via_reason" => "ALTER TABLE loop_specs ADD COLUMN completed_via_reason TEXT",
+                    "completed_via_at" => "ALTER TABLE loop_specs ADD COLUMN completed_via_at INTEGER",
+                    _ => "",
+                };
+                if !sql.is_empty() {
+                    conn.execute(sql, [])
+                        .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+                }
             }
         }
 

@@ -399,6 +399,16 @@ pub struct SpecUpdateParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SpecSetStatusParams {
+    /// Existing spec ID.
+    pub spec_id: String,
+    /// Target status: `completed`, `skipped`, or `pending` (reopen).
+    pub status: String,
+    /// Reason for the administrative transition.
+    pub reason: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SpecDeleteParams {
     /// Existing spec ID.
     pub spec_id: String,

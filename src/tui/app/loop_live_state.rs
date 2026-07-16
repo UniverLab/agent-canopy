@@ -410,6 +410,9 @@ mod tests {
             completed_at: None,
             spec_start_head: None,
             workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
         }
     }
 
@@ -563,6 +566,9 @@ mod tests {
             completed_at: None,
             spec_start_head: None,
             workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
         };
         let ps2 = LoopSpec {
             id: "ps2".to_string(),
@@ -576,6 +582,9 @@ mod tests {
             completed_at: None,
             spec_start_head: None,
             workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
         };
         db.insert_loop_spec(&ps1).unwrap();
         db.insert_loop_spec(&ps2).unwrap();

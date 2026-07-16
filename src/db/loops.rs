@@ -8,7 +8,7 @@ use crate::db::Database;
 use crate::domain::loops::{
     Loop, LoopCompletionHook, LoopCompletionHookRun, LoopDetails, LoopEdge, LoopEdgeCondition,
     LoopNode, LoopNodeKind, LoopNodeRun, LoopResetOutcome, LoopRunStatus, LoopSpec,
-    LoopSpecDetails, LoopSpecStatus, LoopStatus,
+    LoopSpecDetails, LoopSpecStatus, LoopStatus, SpecAdminStatusOutcome,
 };
 use crate::domain::models::Trigger;
 
@@ -297,6 +297,67 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Administratively transition a standalone spec's status. The transition
+    /// is recorded with provenance (completed_via = 'admin') and the given reason.
+    pub fn set_spec_admin_status(
+        &self,
+        spec_id: &str,
+        status: LoopSpecStatus,
+        reason: &str,
+    ) -> Result<SpecAdminStatusOutcome> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+
+        // 1. Check if spec exists
+        let mut stmt = conn.prepare(
+            "SELECT id, loop_id FROM loop_specs WHERE id = ?1",
+        )?;
+        let (_, loop_id): (String, Option<String>) = match stmt.query_row(params![spec_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        }).optional()? {
+            Some(row) => row,
+            None => return Ok(SpecAdminStatusOutcome::NotFound),
+        };
+
+        // 2. Reject if spec is bound to a loop (not standalone)
+        if let Some(loop_id) = loop_id {
+            return Ok(SpecAdminStatusOutcome::NotStandalone(loop_id));
+        }
+
+        // 3. Check for active loop run
+        if let Some(run) = self.get_active_loop_run_for_spec(spec_id)? {
+            return Ok(SpecAdminStatusOutcome::ActiveRun {
+                loop_id: run.loop_id,
+                run_id: run.id,
+            });
+        }
+
+        // 4. Update the spec with admin status
+        let now = Utc::now().timestamp();
+        let completed_at = match status {
+            LoopSpecStatus::Pending => None,
+            _ => Some(now),
+        };
+
+        conn.execute(
+            "UPDATE loop_specs
+             SET status = ?1, completed_at = ?2, completed_via = 'admin',
+                 completed_via_reason = ?3, completed_via_at = ?4
+             WHERE id = ?5",
+            params![
+                status.as_str(),
+                completed_at,
+                reason,
+                now,
+                spec_id,
+            ],
+        )?;
+
+        Ok(SpecAdminStatusOutcome::Success)
+    }
+
     /// The single state-transition path behind `loop_reset` — resets a loop
     /// (and, without `specs`, every non-completed spec) back to `pending` so
     /// it can be relaunched. Shared by the `loop_reset` MCP tool and the
@@ -412,7 +473,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head, workdir
+            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head, workdir, completed_via, completed_via_reason, completed_via_at
              FROM loop_specs WHERE loop_id = ?1 ORDER BY position ASC",
         )?;
         let rows = stmt.query_map(params![loop_id], map_loop_spec_row)?;
@@ -427,7 +488,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head, workdir
+            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head, workdir, completed_via, completed_via_reason, completed_via_at
              FROM loop_specs WHERE id = ?1",
         )?;
 
@@ -464,7 +525,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head, workdir
+            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head, workdir, completed_via, completed_via_reason, completed_via_at
              FROM loop_specs
              WHERE (?1 IS NULL OR workdir = ?1)
                AND (?2 IS NULL OR status = ?2)
@@ -1318,6 +1379,12 @@ fn map_loop_spec_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoopSpec> {
             .transpose()?,
         spec_start_head: row.get(9)?,
         workdir: row.get(10)?,
+        completed_via: row.get(11)?,
+        completed_via_reason: row.get(12)?,
+        completed_via_at: row
+            .get::<_, Option<i64>>(13)?
+            .map(from_timestamp)
+            .transpose()?,
     })
 }
 

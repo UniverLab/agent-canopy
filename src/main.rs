@@ -34,6 +34,7 @@ use daemon::cli::{handle_daemon_action, DaemonAction};
 use daemon::doctor::run_doctor;
 use daemon::loop_cli::{handle_loop_action, LoopAction};
 use daemon::rag_cli::{handle_rag_action, RagAction};
+use daemon::spec_cli::{handle_spec_action, SpecAction};
 use daemon::server::{run_http_server, run_stdio_server};
 use std::path::PathBuf;
 
@@ -82,6 +83,11 @@ enum Commands {
         #[command(subcommand)]
         action: LoopAction,
     },
+    /// Manage standalone specs.
+    Spec {
+        #[command(subcommand)]
+        action: SpecAction,
+    },
     /// Run a stdio sidecar proxy that injects canopy identity headers.
     Bridge {
         /// Agent session ID to bind this bridge process.
@@ -127,6 +133,7 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Rag { action }) => handle_rag_action(action).await,
         Some(Commands::Loop { action }) => handle_loop_action(action).await,
+        Some(Commands::Spec { action }) => handle_spec_action(action).await,
         Some(Commands::Bridge {
             agent_id,
             port,

@@ -1007,6 +1007,9 @@ mod tests {
             completed_at: None,
             spec_start_head: None,
             workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
         })
         .unwrap();
 

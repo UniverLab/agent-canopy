@@ -961,6 +961,9 @@ mod tests {
             completed_at: None,
             spec_start_head: None,
             workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
         })
         .unwrap();
         db.insert_loop_node(&LoopNode {
@@ -1059,6 +1062,9 @@ mod tests {
             completed_at: None,
             spec_start_head: None,
             workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
         };
         db.insert_loop_spec(&standalone("pool-done", 1, LoopSpecStatus::Completed))
             .unwrap();
