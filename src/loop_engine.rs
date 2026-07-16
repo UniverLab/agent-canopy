@@ -15,7 +15,9 @@ use crate::domain::loops::{
 };
 use crate::domain::models::Cli;
 
-const DEFAULT_MAX_ITERATIONS_PER_NODE: usize = 10;
+// Five bounces of the same (spec,node) pair is enough signal that a spec
+// needs a human or a redesign; ten burned entire quota windows ping-ponging.
+const DEFAULT_MAX_ITERATIONS_PER_NODE: usize = 5;
 const DEFAULT_INFRA_RETRY_LIMIT: u32 = 2;
 const DEFAULT_INFRA_CRASH_MAX_SECONDS: u64 = 60;
 const DEFAULT_INFRA_BACKOFF_SECONDS: u64 = 30;
@@ -3696,11 +3698,12 @@ mod tests {
     #[tokio::test]
     async fn loop_engine_iteration_budget_resets_between_specs_on_loop_graph() {
         // A single loop-level node that self-loops on failure, gated by a
-        // counter file shared across the whole run. It fails 9 times then
-        // passes on the 10th call — exactly the per-node iteration cap. If
-        // spec 2's budget carried over from spec 1 instead of resetting, its
-        // first attempt would already read as iteration 11 and the spec
-        // would fail before the check command ever runs again.
+        // counter file shared across the whole run. It fails budget-1 times
+        // then passes on the budget-th call — exactly the per-node iteration
+        // cap. If spec 2's budget carried over from spec 1 instead of
+        // resetting, its first attempt would already read as one past the
+        // cap and the spec would fail before the check command ever runs
+        // again.
         let (_dir, db, engine, loop_id, spec1_id) = loop_fixture().unwrap();
         let spec2 = second_spec(&loop_id, "spec-2", 2);
         db.insert_loop_spec(&spec2).unwrap();
@@ -3712,7 +3715,9 @@ mod tests {
             name: "flaky".to_string(),
             kind: LoopNodeKind::Check,
             config: serde_json::json!({
-                "command": "n=$(cat counter.txt 2>/dev/null || echo 0); n=$((n+1)); echo $n > counter.txt; test $n -ge 10",
+                "command": format!(
+                    "n=$(cat counter.txt 2>/dev/null || echo 0); n=$((n+1)); echo $n > counter.txt; test $n -ge {DEFAULT_MAX_ITERATIONS_PER_NODE}"
+                ),
                 "success_condition": "exit_code_0"
             }),
             position: 1,
@@ -3737,13 +3742,14 @@ mod tests {
         let spec1 = db.get_loop_spec(&spec1_id).unwrap().unwrap();
         let spec1_runs = db.list_loop_runs_for_spec(&spec1_id).unwrap();
         assert_eq!(spec1.status, LoopSpecStatus::Completed);
-        assert_eq!(spec1_runs.len(), 10);
+        assert_eq!(spec1_runs.len(), DEFAULT_MAX_ITERATIONS_PER_NODE);
 
         let spec2_saved = db.get_loop_spec(&spec2.id).unwrap().unwrap();
         let spec2_runs = db.list_loop_runs_for_spec(&spec2.id).unwrap();
         assert_eq!(spec2_saved.status, LoopSpecStatus::Completed);
-        // Fresh budget: the counter file is already at 10 from spec 1, so
-        // spec 2's first (and only) fresh-budget attempt passes immediately.
+        // Fresh budget: the counter file is already at the cap from spec 1,
+        // so spec 2's first (and only) fresh-budget attempt passes
+        // immediately.
         assert_eq!(spec2_runs.len(), 1);
     }
 
