@@ -610,6 +610,14 @@ fn handle_dialog_key(
                     dialog.clear_send_at();
                     Ok(PromptAction::None)
                 }
+                // Typed digits write the focused field directly and
+                // auto-advance when it fills (U11); arrows keep working.
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    if let Some(digit) = c.to_digit(10) {
+                        dialog.send_edit_type_digit(digit);
+                    }
+                    Ok(PromptAction::None)
+                }
                 _ => Ok(PromptAction::None),
             };
         }
@@ -1428,5 +1436,92 @@ mod send_at_tests {
 
         dialog.focused_section = 1; // instruction_1
         assert_eq!(dialog.focused_section_name(), Some("instruction_1"));
+    }
+
+    use chrono::{Datelike, NaiveDate};
+
+    fn picker_at(dialog: &mut SimplePromptDialog, base: NaiveDate) {
+        dialog.send_toggle(); // → date
+        dialog.send_begin_edit();
+        dialog.send_edit.as_mut().unwrap().value = base.and_hms_opt(10, 30, 0).unwrap();
+    }
+
+    fn type_digits(dialog: &mut SimplePromptDialog, digits: &str) {
+        for c in digits.chars() {
+            dialog.send_edit_type_digit(c.to_digit(10).unwrap());
+        }
+    }
+
+    #[test]
+    fn typing_four_digits_sets_year_and_auto_advances_to_month() {
+        let mut dialog = SimplePromptDialog::new();
+        picker_at(&mut dialog, NaiveDate::from_ymd_opt(2000, 5, 15).unwrap());
+        type_digits(&mut dialog, "2026");
+        let edit = dialog.send_edit.unwrap();
+        assert_eq!(edit.value.year(), 2026);
+        // Year is 4 digits wide → focus moves on to the month field.
+        assert_eq!(edit.field, 1);
+    }
+
+    #[test]
+    fn typing_two_digits_sets_month_and_advances() {
+        let mut dialog = SimplePromptDialog::new();
+        picker_at(&mut dialog, NaiveDate::from_ymd_opt(2026, 12, 15).unwrap());
+        // Jump straight to the month field, then type "07".
+        dialog.send_edit.as_mut().unwrap().field = 1;
+        dialog.send_edit.as_mut().unwrap().typed = 0;
+        dialog.send_edit.as_mut().unwrap().typed_len = 0;
+        type_digits(&mut dialog, "07");
+        let edit = dialog.send_edit.unwrap();
+        assert_eq!(edit.value.month(), 7);
+        assert_eq!(edit.field, 2); // advanced to day
+    }
+
+    #[test]
+    fn partial_digit_then_arrow_still_adjusts() {
+        let mut dialog = SimplePromptDialog::new();
+        picker_at(&mut dialog, NaiveDate::from_ymd_opt(2020, 5, 15).unwrap());
+        // One digit of the 4-wide year: 2020 → 2 (field not full yet).
+        type_digits(&mut dialog, "2");
+        assert_eq!(dialog.send_edit.unwrap().value.year(), 2);
+        // Arrow up on the year field adds a year — arrows keep working.
+        dialog.send_edit_adjust(1);
+        assert_eq!(dialog.send_edit.unwrap().value.year(), 3);
+        // A digit after the arrow starts a fresh number (accumulator cleared).
+        type_digits(&mut dialog, "9");
+        assert_eq!(dialog.send_edit.unwrap().value.year(), 9);
+    }
+
+    #[test]
+    fn invalid_month_thirteen_clamps_to_twelve() {
+        // Documented choice: an out-of-range typed component is CLAMPED into
+        // its valid range (month 13 → 12), matching the arrow adjust math.
+        let mut dialog = SimplePromptDialog::new();
+        picker_at(&mut dialog, NaiveDate::from_ymd_opt(2026, 6, 15).unwrap());
+        dialog.send_edit.as_mut().unwrap().field = 1;
+        dialog.send_edit.as_mut().unwrap().typed = 0;
+        dialog.send_edit.as_mut().unwrap().typed_len = 0;
+        type_digits(&mut dialog, "13");
+        assert_eq!(dialog.send_edit.unwrap().value.month(), 12);
+    }
+
+    #[test]
+    fn typing_full_date_time_sequence_fills_every_field() {
+        let mut dialog = SimplePromptDialog::new();
+        picker_at(&mut dialog, NaiveDate::from_ymd_opt(2000, 1, 1).unwrap());
+        // year(4) month(2) day(2) hour(2) minute(2), auto-advancing each time.
+        type_digits(&mut dialog, "2026"); // year
+        type_digits(&mut dialog, "07"); // month
+        type_digits(&mut dialog, "20"); // day
+        type_digits(&mut dialog, "14"); // hour
+        type_digits(&mut dialog, "35"); // minute
+        let v = dialog.send_edit.unwrap().value;
+        assert_eq!(
+            v,
+            NaiveDate::from_ymd_opt(2026, 7, 20)
+                .unwrap()
+                .and_hms_opt(14, 35, 0)
+                .unwrap()
+        );
     }
 }

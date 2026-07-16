@@ -60,6 +60,22 @@ pub struct SendAtEdit {
     pub value: chrono::NaiveDateTime,
     /// Focused field: 0=year, 1=month, 2=day, 3=hour, 4=minute.
     pub field: usize,
+    /// In-progress numeric accumulator for the focused field while the user is
+    /// typing digits (U11): the running value and how many digits have been
+    /// entered since the field was (re)started. Reset on field change and on
+    /// arrow adjust so a fresh digit always starts a new number.
+    pub typed: u32,
+    pub typed_len: u8,
+}
+
+/// Digits a field accepts before it is "full" and auto-advances: the year is
+/// 4 digits wide, every other field is 2.
+fn field_digit_width(field: usize) -> u8 {
+    if field == 0 {
+        4
+    } else {
+        2
+    }
 }
 
 /// Month arithmetic for the send picker: ±N months with day clamping
@@ -69,6 +85,60 @@ fn add_months(value: chrono::NaiveDateTime, delta: i64) -> Option<chrono::NaiveD
         value.checked_add_months(chrono::Months::new(delta as u32))
     } else {
         value.checked_sub_months(chrono::Months::new(delta.unsigned_abs() as u32))
+    }
+}
+
+/// Number of days in a given month (handles leap years).
+fn days_in_month(year: i32, month: u32) -> u32 {
+    let (next_year, next_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    match (
+        chrono::NaiveDate::from_ymd_opt(year, month, 1),
+        chrono::NaiveDate::from_ymd_opt(next_year, next_month, 1),
+    ) {
+        (Some(first), Some(next)) => (next - first).num_days() as u32,
+        _ => 28,
+    }
+}
+
+/// Set one component (year/month/day/hour/minute) of `value` to `num`, clamping
+/// it into that component's valid range and clamping the day to the resulting
+/// month length. Returns `None` only if chrono still rejects the date, in which
+/// case the caller keeps the previous value.
+fn with_field(
+    value: chrono::NaiveDateTime,
+    field: usize,
+    num: u32,
+) -> Option<chrono::NaiveDateTime> {
+    use chrono::{Datelike, NaiveDate, Timelike};
+    let date = value.date();
+    let time = value.time();
+    match field {
+        0 => {
+            let year = num.clamp(1, 9999) as i32;
+            let day = date.day().min(days_in_month(year, date.month()));
+            NaiveDate::from_ymd_opt(year, date.month(), day).map(|d| d.and_time(time))
+        }
+        1 => {
+            let month = num.clamp(1, 12);
+            let day = date.day().min(days_in_month(date.year(), month));
+            NaiveDate::from_ymd_opt(date.year(), month, day).map(|d| d.and_time(time))
+        }
+        2 => {
+            let day = num.clamp(1, days_in_month(date.year(), date.month()));
+            NaiveDate::from_ymd_opt(date.year(), date.month(), day).map(|d| d.and_time(time))
+        }
+        3 => {
+            let hour = num.min(23);
+            date.and_hms_opt(hour, time.minute(), time.second())
+        }
+        _ => {
+            let minute = num.min(59);
+            date.and_hms_opt(time.hour(), minute, time.second())
+        }
     }
 }
 
@@ -1259,24 +1329,32 @@ impl SimplePromptDialog {
         self.send_edit = Some(SendAtEdit {
             value: seed,
             field: 0,
+            typed: 0,
+            typed_len: 0,
         });
     }
 
-    /// Move the picker's focused field (0=year … 4=minute).
+    /// Move the picker's focused field (0=year … 4=minute). Changing field
+    /// clears any half-typed number so the next digit starts fresh.
     pub fn send_edit_move(&mut self, delta: isize) {
         if let Some(edit) = self.send_edit.as_mut() {
             let next = edit.field as isize + delta;
             edit.field = next.clamp(0, 4) as usize;
+            edit.typed = 0;
+            edit.typed_len = 0;
         }
     }
 
     /// Adjust the picker's focused field by `delta` with real calendar math
-    /// (months/days carry correctly).
+    /// (months/days carry correctly). Arrows and typing coexist: an arrow
+    /// clears the digit accumulator so a following digit starts a new number.
     pub fn send_edit_adjust(&mut self, delta: i64) {
         let Some(edit) = self.send_edit.as_mut() else {
             return;
         };
         self.send_error = None;
+        edit.typed = 0;
+        edit.typed_len = 0;
         let value = edit.value;
         let adjusted = match edit.field {
             0 => add_months(value, delta * 12),
@@ -1287,6 +1365,37 @@ impl SimplePromptDialog {
         };
         if let Some(adjusted) = adjusted {
             edit.value = adjusted;
+        }
+    }
+
+    /// Type a digit into the picker's focused field (U11). Digits accumulate
+    /// within the field (year 4 wide, others 2); when the field fills it
+    /// auto-advances to the next field, and a digit typed into an already-full
+    /// field restarts that field. The resulting component is clamped into its
+    /// valid range on the fly (e.g. month `13` → `12`), mirroring the clamping
+    /// the arrow-based `send_edit_adjust` already performs.
+    pub fn send_edit_type_digit(&mut self, digit: u32) {
+        self.send_error = None;
+        let Some(edit) = self.send_edit.as_mut() else {
+            return;
+        };
+        let field = edit.field;
+        let width = field_digit_width(field);
+        // A digit landing on an already-full field starts the number over.
+        if edit.typed_len >= width {
+            edit.typed = 0;
+            edit.typed_len = 0;
+        }
+        edit.typed = edit.typed * 10 + digit;
+        edit.typed_len += 1;
+        if let Some(updated) = with_field(edit.value, field, edit.typed) {
+            edit.value = updated;
+        }
+        // Field full → auto-advance to the next field (clamped at minute).
+        if edit.typed_len >= width {
+            edit.field = (field + 1).min(4);
+            edit.typed = 0;
+            edit.typed_len = 0;
         }
     }
 
