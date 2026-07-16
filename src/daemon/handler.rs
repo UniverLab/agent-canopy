@@ -1737,6 +1737,13 @@ impl TaskTriggerHandler {
         }
 
         self.db.upsert_agent(&agent).map_err(internal_error)?;
+        // Success-notification opt-in (B27) lives outside the agent row's
+        // upserted columns, so set it separately when the caller provided it.
+        if let Some(notify_on_success) = params.notify_on_success {
+            self.db
+                .set_agent_notify_on_success(&agent.id, notify_on_success)
+                .map_err(internal_error)?;
+        }
         if agent.is_cron() {
             self.scheduler_notify.notify_one();
         }

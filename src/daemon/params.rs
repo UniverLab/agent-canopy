@@ -78,6 +78,11 @@ pub struct TaskUpdateParams {
     pub recursive: Option<bool>,
     /// Enable or disable the agent.
     pub enabled: Option<bool>,
+    /// Opt this agent into a desktop toast on every *successful* run. When
+    /// false (the default), successful scheduled/watch runs stay silent and
+    /// only failures notify — so a frequent agent can't spam notifications.
+    /// Manual `agent_run` executions always report success regardless.
+    pub notify_on_success: Option<bool>,
 }
 
 // ── Shared parameter types ─────────────────────────────────────────────

@@ -25,8 +25,22 @@ impl AgentRepository for Database {
             None => (None, None),
         };
 
+        // Upsert via ON CONFLICT (not INSERT OR REPLACE): a replace would
+        // delete the existing row and re-insert with column defaults, wiping
+        // `notify_on_success` (B27) — which is deliberately absent from
+        // `AGENT_COLUMNS` so it's owned solely by `set_agent_notify_on_success`
+        // and survives every agent edit. Updating in place preserves it.
+        let set_clause = AGENT_COLUMNS
+            .split(", ")
+            .filter(|col| *col != "id")
+            .map(|col| format!("{col} = excluded.{col}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         conn.execute(
-            &format!("INSERT OR REPLACE INTO agents ({AGENT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"),
+            &format!(
+                "INSERT INTO agents ({AGENT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
+                 ON CONFLICT(id) DO UPDATE SET {set_clause}"
+            ),
             params![
                 &agent.id,
                 &agent.prompt,
@@ -215,6 +229,39 @@ impl AgentRepository for Database {
 }
 
 impl Database {
+    /// Whether `id`'s agent has opted into success notifications (B27).
+    /// Failures always notify regardless; this flag only governs whether a
+    /// *successful* scheduled/watch run fires a toast. Stored outside
+    /// `AGENT_COLUMNS` so `upsert_agent` never touches it; a missing agent
+    /// reads as `false`.
+    pub fn agent_notify_on_success(&self, id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let flag: Option<bool> = conn
+            .query_row(
+                "SELECT notify_on_success FROM agents WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(flag.unwrap_or(false))
+    }
+
+    /// Set (or clear) an agent's success-notification opt-in (B27).
+    pub fn set_agent_notify_on_success(&self, id: &str, notify: bool) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        conn.execute(
+            "UPDATE agents SET notify_on_success = ?1 WHERE id = ?2",
+            params![notify, id],
+        )?;
+        Ok(())
+    }
+
     /// Lists agents matching `where_clause`, silently skipping any row whose
     /// `trigger_config` (or other fields) fails to decode. Healthy agents are
     /// never affected; a corrupt row is simply absent here — callers that

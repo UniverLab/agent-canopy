@@ -447,6 +447,7 @@ mod tests {
             debounce_seconds: None,
             recursive: None,
             enabled: None,
+            notify_on_success: None,
         };
         assert!(!watcher_restart_needed(&params));
 
@@ -551,6 +552,7 @@ mod tests {
             debounce_seconds: None,
             recursive: None,
             enabled: None,
+            notify_on_success: None,
         };
 
         apply_scalar_updates(&mut agent, &params).unwrap();
@@ -592,6 +594,7 @@ mod tests {
             debounce_seconds: None,
             recursive: None,
             enabled: Some(false),
+            notify_on_success: None,
         };
 
         apply_scalar_updates(&mut agent, &params).unwrap();
@@ -633,6 +636,7 @@ mod tests {
             debounce_seconds: None,
             recursive: None,
             enabled: None,
+            notify_on_success: None,
         };
 
         apply_scalar_updates(&mut agent, &params).unwrap();
@@ -813,6 +817,7 @@ mod tests {
             debounce_seconds: None,
             recursive: None,
             enabled: None,
+            notify_on_success: None,
         };
 
         let result = apply_trigger_updates(&mut agent, &params, &crate::scheduler::validate_cron);

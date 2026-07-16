@@ -46,6 +46,10 @@ struct ExecutionContext<'a> {
     trigger_type: TriggerType,
     /// True when this execution was triggered by a file-watch event.
     is_watch: bool,
+    /// True when a human invoked this run directly (a forced `agent_run`),
+    /// as opposed to the scheduler or a watch event firing it. Drives the
+    /// success-notification policy (B27): manual runs always report success.
+    is_manual: bool,
 }
 
 /// Agent execution engine.
@@ -179,17 +183,26 @@ impl Executor {
     }
 
     /// Send success/failure notification if the agent still exists.
-    fn notify_result(&self, agent: &Agent, result: &CliRunResult, is_watch: bool) {
+    ///
+    /// Failure-first policy (B27): a failed run always notifies. A *successful*
+    /// run notifies only when a human ran it directly (`is_manual`) or the
+    /// agent opted in via `notify_on_success` — otherwise a frequent cron/watch
+    /// agent (e.g. a */15min schedule) would bury the Action Center under ~96
+    /// success toasts a day.
+    fn notify_result(&self, agent: &Agent, result: &CliRunResult, is_watch: bool, is_manual: bool) {
         let agent_still_exists = self.db.get_agent(&agent.id).ok().flatten().is_some();
         if !agent_still_exists {
             return;
         }
         if result.success {
-            self.notification_service.notify_task_completed(
-                &agent.id,
-                true,
-                Some(result.exit_code),
-            );
+            let opted_in = self.db.agent_notify_on_success(&agent.id).unwrap_or(false);
+            if is_manual || opted_in {
+                self.notification_service.notify_task_completed(
+                    &agent.id,
+                    true,
+                    Some(result.exit_code),
+                );
+            }
         } else if is_watch {
             self.notification_service.notify_agent_failed(
                 &agent.id,
@@ -237,7 +250,7 @@ impl Executor {
 
         let is_watch = ctx.is_watch || agent.is_watch();
         self.finalize_run(agent, &run_id, &result, is_watch);
-        self.notify_result(agent, &result, ctx.is_watch);
+        self.notify_result(agent, &result, ctx.is_watch, ctx.is_manual);
 
         Ok(result.exit_code)
     }
@@ -278,6 +291,9 @@ impl Executor {
             },
             trigger_type,
             is_watch: false,
+            // A forced execution is a human running the agent on demand
+            // (`agent_run`); the scheduler's cron tick passes `force = false`.
+            is_manual: force,
         };
 
         self.run_agent(agent, ctx).await
@@ -299,6 +315,7 @@ impl Executor {
             event_type: Some(event_type),
             trigger_type: TriggerType::Watch,
             is_watch: true,
+            is_manual: false,
         };
 
         self.run_agent(agent, ctx).await

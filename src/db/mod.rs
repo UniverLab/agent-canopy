@@ -57,7 +57,8 @@ impl Database {
                 last_run_at TEXT,
                 last_run_ok BOOLEAN,
                 last_triggered_at TEXT,
-                trigger_count INTEGER NOT NULL DEFAULT 0
+                trigger_count INTEGER NOT NULL DEFAULT 0,
+                notify_on_success BOOLEAN NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS runs (
@@ -509,6 +510,26 @@ impl Database {
         if !has_enable_at {
             conn.execute("ALTER TABLE agents ADD COLUMN enable_at TEXT", [])
                 .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // Per-agent opt-in to success notifications (B27). Failures always
+        // notify; scheduled/watch successes stay silent unless this is set,
+        // so a frequent cron agent can't spam the Action Center. Older
+        // databases predate the column; default 0 keeps every existing agent
+        // on the quiet-on-success policy.
+        let has_notify_on_success: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('agents') WHERE name = 'notify_on_success'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_notify_on_success {
+            conn.execute(
+                "ALTER TABLE agents ADD COLUMN notify_on_success BOOLEAN NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
         }
 
         // Loops gained optional cron/watch triggers; older databases predate the
