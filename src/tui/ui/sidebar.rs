@@ -1722,13 +1722,14 @@ fn agent_card_meta<'a>(agent: &'a AgentEntry, app: &'a App) -> AgentCardMeta<'a>
 
 /// Status color for an interactive/terminal session card. Blue is reserved
 /// for background agents (see `agent_status` in `panel/details.rs`) — a PTY
-/// is either alive (green) or dead (red). A running session blinks green
-/// while it's registering activity (see `ACTIVITY_IDLE_THRESHOLD_MS`) and
+/// is either alive (green) or dead (red). A running session pulses between
+/// dim and bright green while it's registering activity (see
+/// `ACTIVITY_IDLE_THRESHOLD_MS` and `pulse_active` — never blank, B21) and
 /// holds solid green — "healthy, available" — once output has been quiet
 /// for a while. Any exit, clean or not, means the PTY is dead: red.
 fn session_status_color(status: &AgentStatus, recently_active: bool, animation_tick: u32) -> Color {
     match status {
-        AgentStatus::Running if recently_active => pulse(STATUS_RUNNING, animation_tick),
+        AgentStatus::Running if recently_active => pulse_active(animation_tick),
         AgentStatus::Running => STATUS_RUNNING,
         AgentStatus::Exited(_) => STATUS_FAIL,
     }
@@ -1742,6 +1743,17 @@ fn pulse(on: Color, animation_tick: u32) -> Color {
         on
     } else {
         super::STATUS_WAIT_OFF
+    }
+}
+
+/// Working-session heartbeat (B21): alternate between an illuminated green
+/// and a muted gray-green on the shared animation tick. Unlike [`pulse`],
+/// neither phase is blank — the indicator breathes, it never disappears.
+fn pulse_active(animation_tick: u32) -> Color {
+    if (animation_tick / 10).is_multiple_of(2) {
+        super::STATUS_RUNNING_BRIGHT
+    } else {
+        super::STATUS_RUNNING_DIM
     }
 }
 
@@ -2442,8 +2454,13 @@ mod tests {
     fn running_session_with_recent_activity_is_working_green() {
         assert_eq!(
             session_status_color(&AgentStatus::Running, true, 0),
-            pulse(STATUS_RUNNING, 0)
+            pulse_active(0)
         );
+        // Neither pulse phase may be blank — the indicator must never
+        // disappear (B21).
+        assert_ne!(pulse_active(0), super::super::STATUS_WAIT_OFF);
+        assert_ne!(pulse_active(10), super::super::STATUS_WAIT_OFF);
+        assert_ne!(pulse_active(0), pulse_active(10));
     }
 
     #[test]

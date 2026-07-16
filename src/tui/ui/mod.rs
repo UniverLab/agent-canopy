@@ -26,6 +26,11 @@ pub(crate) const BG_HOVER: Color = Color::Rgb(30, 30, 30);
 pub(crate) const INTERACTIVE_COLOR: Color = Color::Rgb(102, 187, 106);
 pub(crate) const STATUS_DISABLED: Color = Color::Rgb(120, 120, 120);
 pub(crate) const STATUS_RUNNING: Color = Color::Rgb(76, 175, 80);
+// Active-session pulse phases (B21): a working PTY breathes between a
+// muted gray-green and an illuminated green — never blank, so the
+// indicator reads as a heartbeat instead of the status bar flickering out.
+pub(crate) const STATUS_RUNNING_DIM: Color = Color::Rgb(74, 102, 77);
+pub(crate) const STATUS_RUNNING_BRIGHT: Color = Color::Rgb(129, 230, 133);
 pub(crate) const STATUS_OK: Color = Color::Rgb(66, 165, 245);
 pub(crate) const STATUS_FAIL: Color = Color::Rgb(229, 57, 53);
 pub(crate) const STATUS_WAIT_ON: Color = Color::Rgb(255, 255, 0);

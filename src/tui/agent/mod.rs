@@ -147,6 +147,10 @@ pub struct InteractiveAgent {
     pub input_buffer: Arc<Mutex<String>>,
     /// Tracks when the PTY last received output (for detecting idle/waiting state).
     pub(crate) last_output_at: Arc<Mutex<DateTime<Utc>>>,
+    /// Output arriving before this instant does not count as activity (B21):
+    /// a PTY resize (entering a section, layout change) makes every TUI app
+    /// repaint, and that repaint burst must not light up the activity pulse.
+    pub(crate) activity_suppressed_until: Arc<Mutex<DateTime<Utc>>>,
     /// Tracks when the user last viewed/focused this agent.
     last_viewed_at: Arc<Mutex<DateTime<Utc>>>,
     /// Whether the exit notification has already been sent (avoids repeats).
@@ -264,6 +268,8 @@ impl InteractiveAgent {
 
         let last_output_at = Arc::new(Mutex::new(Utc::now()));
         let last_output_at_clone = Arc::clone(&last_output_at);
+        let activity_suppressed_until = Arc::new(Mutex::new(Utc::now()));
+        let suppressed_until_clone = Arc::clone(&activity_suppressed_until);
 
         // Background thread: read PTY output → feed into vt100 parser
         std::thread::spawn(move || {
@@ -275,9 +281,18 @@ impl InteractiveAgent {
                         if let Ok(mut parser) = vt_clone.lock() {
                             parser.process(&tmp[..n]);
                         }
-                        // Stamp last output time so is_waiting_for_input() can detect idle
-                        if let Ok(mut t) = last_output_at_clone.lock() {
-                            *t = Utc::now();
+                        // Stamp last output time so is_waiting_for_input()
+                        // can detect idle — unless this output falls inside a
+                        // post-resize suppression window (a repaint, not real
+                        // activity — B21).
+                        let suppressed = suppressed_until_clone
+                            .lock()
+                            .map(|until| Utc::now() < *until)
+                            .unwrap_or(false);
+                        if !suppressed {
+                            if let Ok(mut t) = last_output_at_clone.lock() {
+                                *t = Utc::now();
+                            }
                         }
                     }
                 }
@@ -306,6 +321,7 @@ impl InteractiveAgent {
             prompt_history: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_PROMPT_HISTORY))),
             input_buffer: Arc::new(Mutex::new(String::new())),
             last_output_at,
+            activity_suppressed_until,
             last_viewed_at: Arc::new(Mutex::new(Utc::now())),
             exit_notified: false,
             warp_mode: false,
@@ -369,6 +385,8 @@ impl InteractiveAgent {
 
         let last_output_at = Arc::new(Mutex::new(Utc::now()));
         let last_output_at_clone = Arc::clone(&last_output_at);
+        let activity_suppressed_until = Arc::new(Mutex::new(Utc::now()));
+        let suppressed_until_clone = Arc::clone(&activity_suppressed_until);
 
         std::thread::spawn(move || {
             let mut tmp = [0u8; 4096];
@@ -379,8 +397,16 @@ impl InteractiveAgent {
                         if let Ok(mut parser) = vt_clone.lock() {
                             parser.process(&tmp[..n]);
                         }
-                        if let Ok(mut t) = last_output_at_clone.lock() {
-                            *t = Utc::now();
+                        // See the sibling reader thread above: repaint bursts
+                        // inside a post-resize window are not activity (B21).
+                        let suppressed = suppressed_until_clone
+                            .lock()
+                            .map(|until| Utc::now() < *until)
+                            .unwrap_or(false);
+                        if !suppressed {
+                            if let Ok(mut t) = last_output_at_clone.lock() {
+                                *t = Utc::now();
+                            }
                         }
                     }
                 }
@@ -411,6 +437,7 @@ impl InteractiveAgent {
             prompt_history: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_PROMPT_HISTORY))),
             input_buffer: Arc::new(Mutex::new(String::new())),
             last_output_at,
+            activity_suppressed_until,
             last_viewed_at: Arc::new(Mutex::new(Utc::now())),
             exit_notified: false,
             warp_mode: true,
@@ -491,6 +518,12 @@ impl InteractiveAgent {
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.last_pty_cols = cols;
         self.last_pty_rows = rows;
+        // A resize makes the app repaint; that output burst is not activity.
+        // Suppress activity stamping briefly so switching sections doesn't
+        // light up every session's pulse (B21).
+        if let Ok(mut until) = self.activity_suppressed_until.lock() {
+            *until = Utc::now() + chrono::Duration::seconds(1);
+        }
         // Resize the actual PTY so the process knows about the new size
         if let Ok(m) = self.master.lock() {
             let _ = m.resize(PtySize {
