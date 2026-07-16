@@ -1428,21 +1428,32 @@ async fn execute_check_node(
             if let Some(pid) = pid {
                 crate::daemon::process::terminate_process_group_async(pid as i64, KILL_GRACE);
             }
+            let output = serde_json::json!({
+                "kind": "check",
+                "loop_id": lp.id,
+                "spec_id": spec.id,
+                "node_id": node.id,
+                "command": command,
+                "error": "timed out",
+                "timeout_seconds": timeout_seconds,
+            });
             let _ = db.update_loop_run_result(
                 run_id,
                 LoopRunStatus::Fail,
-                Some(&serde_json::json!({
-                    "kind": "check",
-                    "loop_id": lp.id,
-                    "spec_id": spec.id,
-                    "node_id": node.id,
-                    "command": command,
-                    "error": "timed out",
-                    "timeout_seconds": timeout_seconds,
-                })),
+                Some(&output),
                 Some(chrono::Utc::now()),
             );
-            bail!("Check node '{}' timed out.", node.name);
+            // B28: a timeout is a check fail, not a hard error — it must
+            // route through the fail edge like any other check failure,
+            // never abort the whole spec.
+            return Ok(NodeExecution {
+                status: LoopRunStatus::Fail,
+                output,
+                summary: format!(
+                    "Check node '{}' timed out after {timeout_seconds}s.",
+                    node.name
+                ),
+            });
         }
     };
 
@@ -1648,9 +1659,10 @@ async fn spawn_and_wait_cli_process(
 /// rather than propagating a hard error — routed through the graph's fail
 /// edge for resilience triage, never aborting the whole loop run.
 ///
-/// A timeout still propagates as a hard error (unchanged from before this
-/// function was split out of the shared spawn core), after recording the run
-/// as failed so it doesn't linger `running` in the DB forever.
+/// A timeout (B28) is likewise a failed `NodeExecution`, not a hard error:
+/// it exceeds `infra_crash_max_seconds` by definition, so it's always a
+/// semantic fail routed through the fail edge like any other, never an
+/// infra-crash retry.
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_process(
     db: &Database,
@@ -1672,20 +1684,28 @@ async fn run_agent_process(
     match outcome {
         Err(error) => Ok(agent_spawn_failure(node, cli, model, error)),
         Ok(CliProcessOutcome::TimedOut) => {
+            let output = serde_json::json!({
+                "kind": "agent",
+                "node_id": node.id,
+                "cli": cli.as_str(),
+                "model": model,
+                "error": "timed out",
+                "timeout_minutes": timeout_minutes,
+            });
             let _ = db.update_loop_run_result(
                 run_id,
                 LoopRunStatus::Fail,
-                Some(&serde_json::json!({
-                    "kind": "agent",
-                    "node_id": node.id,
-                    "cli": cli.as_str(),
-                    "model": model,
-                    "error": "timed out",
-                    "timeout_minutes": timeout_minutes,
-                })),
+                Some(&output),
                 Some(chrono::Utc::now()),
             );
-            bail!("Agent node '{}' timed out.", node.name);
+            Ok(NodeExecution {
+                status: LoopRunStatus::Fail,
+                output,
+                summary: format!(
+                    "Agent node '{}' timed out after {timeout_minutes}m.",
+                    node.name
+                ),
+            })
         }
         Ok(CliProcessOutcome::Finished {
             exit_code,
@@ -4970,10 +4990,12 @@ mod tests {
             &db, &run_id, &cli, &strategy, &node, &prompt, None, "/tmp", 0,
         )
         .await;
-        assert!(
-            result.is_err(),
-            "a timed-out agent process must propagate as a hard error"
-        );
+        // B28: a timeout resolves as a failed `NodeExecution`, not a hard
+        // error — it must be routable through the graph's fail edge rather
+        // than aborting the whole spec.
+        let execution = result.expect("a timed-out agent process must not be a hard error");
+        assert_eq!(execution.status, LoopRunStatus::Fail);
+        assert_eq!(execution.output["error"], "timed out");
 
         // Wait out the grace period (plus a margin) before checking — the
         // kill is `SIGTERM` now, `SIGKILL` after `KILL_GRACE` on a detached
@@ -4984,6 +5006,282 @@ mod tests {
         assert!(
             !marker.exists(),
             "agent process should have been killed on timeout; marker file should not exist"
+        );
+    }
+
+    // ── B28: timeout-as-fail routing ────────────────────────────────────
+
+    /// An agent node that times out must resolve as a FAIL that traverses
+    /// its fail edge — not abort the whole spec. The fail edge routes to a
+    /// recovery node whose marker file only appears if the loop actually
+    /// kept running past the timeout.
+    #[tokio::test]
+    async fn agent_node_timeout_with_fail_edge_traverses_it() {
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        let marker = dir.path().join("recovered.marker");
+
+        let fake_home = setup_multi_cli_home(&[(
+            "hang-cli",
+            &write_member_script(dir.path(), "hang.sh", "sleep 5"),
+        )]);
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-agent-timeout".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "slow-agent".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({
+                "platform": "hang-cli",
+                "prompt_template": "ignored by the test script",
+                "timeout_minutes": 0,
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-recovery".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "recovery".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": format!("touch \"{}\"", marker.display()),
+                "success_condition": "exit_code_0"
+            }),
+            position: 2,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        db.insert_loop_edge(&LoopEdge {
+            id: "edge-fail".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "node-agent-timeout".to_string(),
+            to_node: "node-recovery".to_string(),
+            condition: LoopEdgeCondition::Fail,
+        })
+        .unwrap();
+
+        let _home = HomeGuard::set(fake_home.path());
+        let result = engine.run_loop(loop_id.clone(), None, None).await;
+        drop(_home);
+        result.unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Completed);
+        assert_eq!(spec.status, LoopSpecStatus::Completed);
+        assert!(
+            marker.exists(),
+            "fail edge must have been traversed after the agent node timed out"
+        );
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        let timeout_run = runs
+            .iter()
+            .find(|r| r.node_id == "node-agent-timeout")
+            .unwrap();
+        assert_eq!(timeout_run.status, LoopRunStatus::Fail);
+        assert_eq!(timeout_run.output.as_ref().unwrap()["error"], "timed out");
+    }
+
+    /// An agent node that times out with no fail edge must fail the spec
+    /// (and the loop) cleanly — same as any other dead-end fail — rather
+    /// than propagating a hard error out of `run_loop`.
+    #[tokio::test]
+    async fn agent_node_timeout_without_fail_edge_fails_spec_cleanly() {
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        let fake_home = setup_multi_cli_home(&[(
+            "hang-cli",
+            &write_member_script(dir.path(), "hang.sh", "sleep 5"),
+        )]);
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-agent-timeout".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "slow-agent".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({
+                "platform": "hang-cli",
+                "prompt_template": "ignored by the test script",
+                "timeout_minutes": 0,
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let _home = HomeGuard::set(fake_home.path());
+        let result = engine.run_loop(loop_id.clone(), None, None).await;
+        drop(_home);
+        result.unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Failed);
+        assert_eq!(spec.status, LoopSpecStatus::Failed);
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        let timeout_run = runs
+            .iter()
+            .find(|r| r.node_id == "node-agent-timeout")
+            .unwrap();
+        assert_eq!(timeout_run.status, LoopRunStatus::Fail);
+        assert_eq!(timeout_run.output.as_ref().unwrap()["error"], "timed out");
+    }
+
+    /// A check node that times out must behave exactly like any other check
+    /// fail: it traverses its fail edge instead of aborting the spec.
+    #[tokio::test]
+    async fn check_node_timeout_behaves_as_check_fail() {
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        let marker = dir.path().join("recovered.marker");
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-check-timeout".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "slow-check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "sleep 5",
+                "success_condition": "exit_code_0",
+                "timeout_seconds": 0,
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-recovery".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "recovery".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": format!("touch \"{}\"", marker.display()),
+                "success_condition": "exit_code_0"
+            }),
+            position: 2,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        db.insert_loop_edge(&LoopEdge {
+            id: "edge-fail".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "node-check-timeout".to_string(),
+            to_node: "node-recovery".to_string(),
+            condition: LoopEdgeCondition::Fail,
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Completed);
+        assert_eq!(spec.status, LoopSpecStatus::Completed);
+        assert!(
+            marker.exists(),
+            "fail edge must have been traversed after the check node timed out"
+        );
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        let timeout_run = runs
+            .iter()
+            .find(|r| r.node_id == "node-check-timeout")
+            .unwrap();
+        assert_eq!(timeout_run.status, LoopRunStatus::Fail);
+        assert_eq!(timeout_run.output.as_ref().unwrap()["error"], "timed out");
+    }
+
+    /// An ensemble member whose own agent timeout fires (not the ensemble's
+    /// straggler watchdog) must count as a member fail with the "timed out"
+    /// marker intact — and must never prevent the join from resolving.
+    /// `min_pass: 1` alongside one passing member proves the join still
+    /// reaches quorum despite the timed-out member.
+    #[tokio::test]
+    async fn ensemble_member_agent_timeout_counts_as_member_fail_without_killing_join() {
+        let (dir, db, engine, _loop_id, spec_id) = loop_fixture().unwrap();
+
+        let fake_home = setup_multi_cli_home(&[
+            (
+                "hang-member",
+                &write_member_script(dir.path(), "hang.sh", "sleep 5"),
+            ),
+            (
+                "member-ok",
+                &write_member_script(dir.path(), "ok.sh", "exit 0"),
+            ),
+        ]);
+
+        let pass_marker = dir.path().join("pass.marker");
+        db.insert_loop_node(&touch_marker_node("on-pass", &spec_id, &pass_marker, 100))
+            .unwrap();
+        insert_test_ensemble(
+            &db,
+            &spec_id,
+            "kickoff",
+            "ens1",
+            "join1",
+            &[("m-hang", "hang-member"), ("m-ok", "member-ok")],
+            1,       // min_pass: only one member needs to pass
+            Some(5), // generous straggler window — the member's own timeout must fire first
+            "on-pass",
+            None,
+        );
+
+        // Force the hanging member's own agent timeout to fire immediately,
+        // well before the ensemble's straggler watchdog would.
+        db.update_loop_node_details(
+            "m-hang",
+            None,
+            None,
+            Some(&serde_json::json!({
+                "platform": "hang-member",
+                "prompt_template": "ignored by the test script",
+                "timeout_minutes": 0,
+            })),
+            None,
+        )
+        .unwrap();
+
+        let _home = HomeGuard::set(fake_home.path());
+        engine
+            .run_loop("wf-test".to_string(), None, None)
+            .await
+            .unwrap();
+        drop(_home);
+
+        assert!(
+            pass_marker.exists(),
+            "join must pass and route onward despite one member timing out"
+        );
+
+        let join = join_run(&db, &spec_id, "join1");
+        assert_eq!(join.status, LoopRunStatus::Pass);
+        assert_eq!(join.output.as_ref().unwrap()["passed"], 1);
+
+        let hang_run = db
+            .list_loop_runs_for_spec(&spec_id)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.node_id == "m-hang")
+            .unwrap();
+        assert_eq!(hang_run.status, LoopRunStatus::Fail);
+        assert_eq!(
+            hang_run.output.as_ref().unwrap()["error"],
+            "timed out",
+            "member's own agent timeout must be recorded as such, not a straggler kill"
         );
     }
 
