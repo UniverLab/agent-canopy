@@ -1176,6 +1176,28 @@ mod recall_last_prompt_tests {
     }
 
     #[test]
+    fn fresh_open_focuses_the_first_section() {
+        let (mut app, _dir) = test_app();
+        app.open_simple_prompt_dialog(None);
+        let dialog = app.simple_prompt_dialog.as_ref().unwrap();
+        assert_eq!(dialog.focused_section, 1);
+        assert!(dialog.focused_section_name().is_some());
+    }
+
+    #[test]
+    fn open_with_initial_content_focuses_first_section_not_send_control() {
+        let (mut app, _dir) = test_app();
+        let mut content = std::collections::HashMap::new();
+        content.insert("instruction".to_string(), "prefilled task".to_string());
+        app.open_simple_prompt_dialog(Some(content));
+
+        let dialog = app.simple_prompt_dialog.as_ref().unwrap();
+        // Previously this path parked focus on the send control (index 0).
+        assert_eq!(dialog.focused_section, 1);
+        assert!(dialog.focused_section_name().is_some());
+    }
+
+    #[test]
     fn ctrl_l_recalls_immediately_into_an_empty_builder() {
         let (mut app, _dir) = test_app();
         let workdir = app.current_workdir().to_string_lossy().to_string();

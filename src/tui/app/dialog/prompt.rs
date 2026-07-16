@@ -1260,6 +1260,14 @@ impl SimplePromptDialog {
         1 + self.enabled_sections.len()
     }
 
+    /// Focus the first enabled section, ready to type. The send control lives
+    /// at focus index 0 and is the LAST stop of the navigation cycle — never
+    /// the first — so every open path (fresh, reopen, restored session) starts
+    /// here (focus index 1 = first section).
+    pub fn focus_first_section(&mut self) {
+        self.focused_section = usize::from(!self.enabled_sections.is_empty());
+    }
+
     /// Move focus to the next field in VISUAL order (U11): sections top to
     /// bottom, then the send control at the bottom, then wrap to the first
     /// section. The send control keeps focus index 0 internally.
@@ -1932,6 +1940,40 @@ mod tests {
         assert!(focused.starts_with("constraints"));
         assert_eq!(dialog.cursor(&focused), 0);
     }
+
+    #[test]
+    fn new_dialog_focuses_the_first_section() {
+        let dialog = SimplePromptDialog::new();
+        assert_eq!(dialog.focused_section, 1);
+        assert_eq!(dialog.focused_section_name(), Some("instruction_1"));
+    }
+
+    #[test]
+    fn restored_session_focuses_first_section_regardless_of_persisted_focus() {
+        let mut source = SimplePromptDialog::new();
+        source.add_section("goal");
+        // Pretend the user left focus parked on the send control (index 0).
+        source.focused_section = 0;
+        let session = PromptBuilderSession::from_dialog(&source);
+
+        let mut target = SimplePromptDialog::new();
+        session.restore_into(&mut target);
+        assert_eq!(target.focused_section, 1);
+        assert!(target.focused_section_name().is_some());
+    }
+
+    #[test]
+    fn recalled_persisted_state_focuses_first_section_regardless_of_persisted_focus() {
+        let mut source = SimplePromptDialog::new();
+        source.focused_section = 0; // persisted on the send control
+        let snapshot = PersistedBuilderState::from_dialog(&source);
+
+        let mut target = SimplePromptDialog::new();
+        target.focused_section = 0;
+        snapshot.restore_into(&mut target);
+        assert_eq!(target.focused_section, 1);
+        assert_eq!(target.focused_section_name(), Some("instruction_1"));
+    }
 }
 
 /// Snapshot of `SimplePromptDialog` state used to persist the prompt builder
@@ -1940,7 +1982,6 @@ mod tests {
 pub struct PromptBuilderSession {
     pub sections: HashMap<String, String>,
     pub enabled_sections: Vec<String>,
-    pub focused_section: usize,
     pub section_counters: HashMap<String, usize>,
     pub section_cursors: HashMap<String, usize>,
     pub section_scrolls: HashMap<String, usize>,
@@ -1955,7 +1996,6 @@ impl PromptBuilderSession {
         Self {
             sections: dialog.sections.clone(),
             enabled_sections: dialog.enabled_sections.clone(),
-            focused_section: dialog.focused_section,
             section_counters: dialog.section_counters.clone(),
             section_cursors: dialog.section_cursors.clone(),
             section_scrolls: dialog.section_scrolls.clone(),
@@ -1969,7 +2009,6 @@ impl PromptBuilderSession {
     pub fn restore_into(&self, dialog: &mut SimplePromptDialog) {
         dialog.sections = self.sections.clone();
         dialog.enabled_sections = self.enabled_sections.clone();
-        dialog.focused_section = self.focused_section;
         dialog.section_counters = self.section_counters.clone();
         dialog.section_cursors = self.section_cursors.clone();
         dialog.section_scrolls = self.section_scrolls.clone();
@@ -1977,6 +2016,10 @@ impl PromptBuilderSession {
         dialog.locked_sections = self.locked_sections.clone();
         dialog.send_choice = self.send_choice;
         dialog.send_at = self.send_at;
+        // A reopened builder always starts in the first section, regardless of
+        // where focus sat when the session was captured — the send control is
+        // the last stop of the cycle, never the entry point.
+        dialog.focus_first_section();
         // Reset transient UI state (not persisted across openings)
         dialog.picker_mode = SectionPickerMode::None;
         dialog.at_picker = None;
@@ -2023,12 +2066,14 @@ impl PersistedBuilderState {
     pub fn restore_into(&self, dialog: &mut SimplePromptDialog) {
         dialog.sections = self.sections.clone();
         dialog.enabled_sections = self.enabled_sections.clone();
-        dialog.focused_section = self.focused_section;
         dialog.section_counters = self.section_counters.clone();
         dialog.section_cursors = self.section_cursors.clone();
         dialog.section_scrolls = self.section_scrolls.clone();
         dialog.collapsed_pastes = self.collapsed_pastes.clone();
         dialog.locked_sections = self.locked_sections.clone();
+        // A recalled prompt opens focused on the first section, ready to type —
+        // never on the send control (focus 0), whatever was persisted.
+        dialog.focus_first_section();
         dialog.picker_mode = SectionPickerMode::None;
         dialog.at_picker = None;
     }

@@ -130,9 +130,13 @@ impl App {
                     dialog.add_section_with_content(&section_name, section_content);
                 }
             }
-            dialog.focused_section = 0;
         }
         dialog.migrate_legacy_sections(current_project_path.as_deref());
+        // Every open path lands the cursor in the first instruction, ready to
+        // type; the send control (focus 0) is the last stop of the cycle, so it
+        // must never be the initial focus — not on a fresh open, a reopen, or a
+        // restored/recalled session.
+        dialog.focus_first_section();
         dialog.prev_focus = Some(prev_focus);
         self.simple_prompt_dialog = Some(dialog);
         self.focus = super::super::types::Focus::PromptTemplateDialog;
