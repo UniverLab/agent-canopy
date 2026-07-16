@@ -831,7 +831,7 @@ impl LoopEngine {
                     let node = nodes_by_id
                         .get(node_id.as_str())
                         .ok_or_else(|| anyhow!("Loop node '{}' not found.", node_id))?;
-                    let (retry_limit, crash_max_secs) = read_infra_config(node);
+                    let (retry_limit, crash_max_secs, backoff_secs) = read_infra_config(node);
                     let mut attempt: u32 = 0;
                     let mut run_id = uuid::Uuid::new_v4().to_string();
                     self.db.insert_loop_run(&LoopNodeRun {
@@ -869,7 +869,8 @@ impl LoopEngine {
                         let is_infra_crash = !self_reported
                             && node.kind == LoopNodeKind::Agent
                             && execution.status == LoopRunStatus::Fail
-                            && (chrono::Utc::now() - run.started_at).num_seconds() < crash_max_secs as i64
+                            && (chrono::Utc::now() - run.started_at).num_seconds()
+                                < crash_max_secs as i64
                             && attempt < retry_limit;
 
                         if is_infra_crash {
@@ -881,7 +882,7 @@ impl LoopEngine {
                             )?;
                             attempt += 1;
                             tokio::time::sleep(std::time::Duration::from_secs(
-                                DEFAULT_INFRA_BACKOFF_SECONDS * 2u64.pow(attempt - 1),
+                                backoff_secs * 2u64.pow(attempt - 1),
                             ))
                             .await;
                             run_id = uuid::Uuid::new_v4().to_string();
@@ -1349,7 +1350,7 @@ impl LoopEngine {
     }
 }
 
-fn read_infra_config(node: &LoopNode) -> (u32, u64) {
+fn read_infra_config(node: &LoopNode) -> (u32, u64, u64) {
     let retry_limit = node
         .config
         .get("infra_retry_limit")
@@ -1360,7 +1361,12 @@ fn read_infra_config(node: &LoopNode) -> (u32, u64) {
         .get("infra_crash_max_seconds")
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_INFRA_CRASH_MAX_SECONDS);
-    (retry_limit, crash_max_secs)
+    let backoff_secs = node
+        .config
+        .get("infra_backoff_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_INFRA_BACKOFF_SECONDS);
+    (retry_limit, crash_max_secs, backoff_secs)
 }
 
 fn merge_attempt_marker(output: &Value, attempt: u32, is_crash: bool) -> Value {
@@ -6295,7 +6301,10 @@ mod tests {
             && check_node.kind == LoopNodeKind::Agent
             && execution.status == LoopRunStatus::Fail
             && duration_secs < 60;
-        assert!(!is_crash_check, "check node should not be classified as crash");
+        assert!(
+            !is_crash_check,
+            "check node should not be classified as crash"
+        );
 
         // Scenario 3: agent node, self-reported fail → should NOT be classified
         let run_self_reported = LoopNodeRun {
@@ -6307,19 +6316,25 @@ mod tests {
             && agent_node.kind == LoopNodeKind::Agent
             && execution.status == LoopRunStatus::Fail
             && duration_secs < 60;
-        assert!(!is_crash_reported, "self-reported fail should not be classified as crash");
+        assert!(
+            !is_crash_reported,
+            "self-reported fail should not be classified as crash"
+        );
 
         // Scenario 4: agent node, failed, slow (> 60s) → should NOT be classified
         let old_run = LoopNodeRun {
             started_at: now - chrono::Duration::seconds(90),
-            ..run.clone()
+            ..run
         };
         let slow_duration = (chrono::Utc::now() - old_run.started_at).num_seconds();
         let is_crash_slow = !self_reported
             && agent_node.kind == LoopNodeKind::Agent
             && execution.status == LoopRunStatus::Fail
             && slow_duration < 60;
-        assert!(!is_crash_slow, "slow fail should not be classified as crash");
+        assert!(
+            !is_crash_slow,
+            "slow fail should not be classified as crash"
+        );
     }
 
     /// Merging attempt marker into output JSON correctly adds tracking fields.
@@ -6332,8 +6347,14 @@ mod tests {
 
         let merged = merge_attempt_marker(&output, 0, true);
 
-        assert_eq!(merged.get("infra_attempt").and_then(|v| v.as_u64()), Some(0));
-        assert_eq!(merged.get("infra_crash").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            merged.get("infra_attempt").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        assert_eq!(
+            merged.get("infra_crash").and_then(|v| v.as_bool()),
+            Some(true)
+        );
         assert_eq!(merged.get("kind").and_then(|v| v.as_str()), Some("agent"));
         assert_eq!(merged.get("exit_code").and_then(|v| v.as_i64()), Some(1));
     }
@@ -6352,9 +6373,10 @@ mod tests {
             created_at: chrono::Utc::now(),
         };
 
-        let (retry_limit, crash_max) = read_infra_config(&node);
+        let (retry_limit, crash_max, backoff) = read_infra_config(&node);
         assert_eq!(retry_limit, DEFAULT_INFRA_RETRY_LIMIT);
         assert_eq!(crash_max, DEFAULT_INFRA_CRASH_MAX_SECONDS);
+        assert_eq!(backoff, DEFAULT_INFRA_BACKOFF_SECONDS);
     }
 
     /// Read infra config respects overrides in node config.
@@ -6369,13 +6391,256 @@ mod tests {
             config: serde_json::json!({
                 "infra_retry_limit": 5,
                 "infra_crash_max_seconds": 120,
+                "infra_backoff_seconds": 0,
             }),
             position: 1,
             created_at: chrono::Utc::now(),
         };
 
-        let (retry_limit, crash_max) = read_infra_config(&node);
+        let (retry_limit, crash_max, backoff) = read_infra_config(&node);
         assert_eq!(retry_limit, 5);
         assert_eq!(crash_max, 120);
+        assert_eq!(backoff, 0);
+    }
+
+    /// B19: check node nonzero exit is NOT retried as infra crash.
+    #[tokio::test]
+    async fn infra_crash_check_node_nonzero_exit_not_retried() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "exit 1",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        db.insert_loop_edge(&LoopEdge {
+            id: "edge-self".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "node-check".to_string(),
+            to_node: "node-check".to_string(),
+            condition: LoopEdgeCondition::Fail,
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+
+        assert_eq!(spec.status, LoopSpecStatus::Failed);
+        assert_eq!(
+            runs.len(),
+            DEFAULT_MAX_ITERATIONS_PER_NODE,
+            "check node should retry through edge, not infra retry"
+        );
+    }
+
+    /// B19: infra crash retry exhausted routes to fail edge.
+    #[tokio::test]
+    async fn infra_crash_retry_exhausted_routes_to_fail_edge() {
+        let fake_home = setup_test_cli_home();
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-implement".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "implement".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({
+                // test-cli = /bin/sh -c <prompt>: always crashes fast with
+                // no self-report — the infra-crash signature.
+                "platform": "test-cli",
+                "prompt_template": "exit 1",
+                "infra_retry_limit": 1,
+                "infra_crash_max_seconds": 60,
+                "infra_backoff_seconds": 0,
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-fix".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "fix".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf FIXED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 2,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        db.insert_loop_edge(&LoopEdge {
+            id: "edge-fail".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "node-implement".to_string(),
+            to_node: "node-fix".to_string(),
+            condition: LoopEdgeCondition::Fail,
+        })
+        .unwrap();
+
+        let _home = HomeGuard::set(fake_home.path());
+        let result = engine.run_loop(loop_id.clone(), None, None).await;
+        drop(_home);
+        result.unwrap();
+
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+
+        assert_eq!(spec.status, LoopSpecStatus::Completed);
+
+        let implement_runs: Vec<_> = runs
+            .iter()
+            .filter(|r| r.node_id == "node-implement")
+            .collect();
+        let fix_runs: Vec<_> = runs.iter().filter(|r| r.node_id == "node-fix").collect();
+
+        assert_eq!(
+            implement_runs.len(),
+            2,
+            "implement should run twice: initial attempt + 1 infra retry"
+        );
+        assert!(
+            implement_runs.iter().any(|r| {
+                r.output
+                    .as_ref()
+                    .and_then(|o| o.get("infra_crash"))
+                    .and_then(|v| v.as_bool())
+                    == Some(true)
+            }),
+            "one implement attempt should carry the infra_crash marker"
+        );
+        assert_eq!(fix_runs.len(), 1, "fix should run once");
+        assert_eq!(fix_runs[0].status, LoopRunStatus::Pass);
+    }
+
+    /// B19: an agent that crashes once (fast, no self-report) and succeeds on
+    /// the in-place retry completes the spec without traversing any edge, and
+    /// the run history shows both attempts with infra markers.
+    #[tokio::test]
+    async fn infra_crash_then_success_retries_same_node_in_place() {
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        // A fake CLI binary that ignores the rendered prompt entirely: it
+        // fails fast on the first invocation and succeeds on the second
+        // (marker file tracks invocations). Registered as its own platform
+        // in a fixture canopy config, since node prompts are wrapped in a
+        // [LOOP CONTEXT] preamble that a plain `sh -c` cannot execute.
+        let marker = dir.path().join("infra-marker");
+        let script = dir.path().join("flaky-cli");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nif [ -f \"{m}\" ]; then exit 0; else touch \"{m}\"; exit 1; fi\n",
+                m = marker.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let fake_home = tempfile::tempdir().unwrap();
+        let canopy_dir = fake_home.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        let config = crate::domain::canopy_config::CanopyConfig {
+            configured_at: Some(chrono::Utc::now().to_rfc3339()),
+            clis: vec![crate::domain::cli_config::CliConfig {
+                name: "flaky-cli".to_string(),
+                binary: script.to_string_lossy().to_string(),
+                headless_mode: "-c".to_string(),
+                model_flag: None,
+                supports_working_dir: false,
+                working_dir_flag: None,
+                env_vars: std::collections::HashMap::new(),
+                interactive_args: None,
+                fallback_interactive_args: None,
+                resume_args: None,
+                session_list_cmd: None,
+                session_resume_cmd: None,
+                accent_color: None,
+                yolo_flag: None,
+                prompt_via_stdin: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        config.save(&canopy_dir).unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-flaky".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "flaky".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({
+                "platform": "flaky-cli",
+                "prompt_template": "ignored",
+                "infra_retry_limit": 2,
+                "infra_crash_max_seconds": 60,
+                "infra_backoff_seconds": 0,
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let _home = HomeGuard::set(fake_home.path());
+        let result = engine.run_loop(loop_id.clone(), None, None).await;
+        drop(_home);
+        result.unwrap();
+
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(
+            spec.status,
+            LoopSpecStatus::Completed,
+            "spec should complete after the in-place retry succeeds"
+        );
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        let flaky_runs: Vec<_> = runs.iter().filter(|r| r.node_id == "node-flaky").collect();
+        assert_eq!(
+            flaky_runs.len(),
+            2,
+            "crash + successful retry should leave two run rows"
+        );
+
+        let crash_run = flaky_runs
+            .iter()
+            .find(|r| r.status == LoopRunStatus::Fail)
+            .expect("one run should be the classified crash");
+        let crash_output = crash_run.output.as_ref().unwrap();
+        assert_eq!(
+            crash_output.get("infra_crash").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            crash_output.get("infra_attempt").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        assert!(
+            flaky_runs.iter().any(|r| r.status == LoopRunStatus::Pass),
+            "the retry should pass"
+        );
     }
 }
