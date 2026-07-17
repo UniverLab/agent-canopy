@@ -313,6 +313,7 @@ impl Cli {
             session_list_cmd: cli_config.session_list_cmd.clone(),
             session_list_format_args: cli_config.session_list_format_args.clone(),
             session_id_pattern: cli_config.session_id_pattern.clone(),
+            session_resume_cmd: cli_config.session_resume_cmd.clone(),
         })
     }
 

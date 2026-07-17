@@ -46,6 +46,14 @@ pub struct CliStrategy {
     ///
     /// [`CliConfig::session_id_pattern`]: super::cli_config::CliConfig::session_id_pattern
     pub session_id_pattern: Option<String>,
+    /// Headless flag that resumes a specific session by id (RS2), e.g.
+    /// `"--session"` (opencode/mimo/kilo), `"--resume"` (qwen/claude), or
+    /// `"--fork"` (cn). The id is appended as the next argument, before the
+    /// prompt. When absent, the platform has no verified by-id headless
+    /// resume and every run cold-starts. See [`CliConfig::session_resume_cmd`].
+    ///
+    /// [`CliConfig::session_resume_cmd`]: super::cli_config::CliConfig::session_resume_cmd
+    pub session_resume_cmd: Option<String>,
 }
 
 /// Resolve the executable path for a CLI's configured `binary`.
@@ -124,6 +132,57 @@ impl CliStrategy {
         working_dir: Option<&str>,
         session_id: Option<&str>,
     ) -> Result<Command> {
+        // Cold start: inject the set-at-spawn flag + id only when both the
+        // registry flag and a caller-minted id exist.
+        let session_arg = match (self.session_id_set_flag.as_deref(), session_id) {
+            (Some(flag), Some(id)) => Some((flag, id)),
+            _ => None,
+        };
+        self.build_headless_command(prompt, model, working_dir, session_arg)
+    }
+
+    /// Build a headless command that RESUMES an existing session by id (RS2).
+    /// Identical argv layout to a cold start except the registry's
+    /// `session_resume_cmd` flag + `session_id` are injected before the
+    /// prompt, in place of the set-at-spawn flag. Errors (never silently cold
+    /// starts) when the platform has no `session_resume_cmd` — callers must
+    /// gate on [`Self::supports_resume_by_id`] first, so reaching here without
+    /// it is a bug.
+    pub fn build_resume_command(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        model: Option<&str>,
+        working_dir: Option<&str>,
+    ) -> Result<Command> {
+        let flag = self.session_resume_cmd.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "CLI '{}' has no session_resume_cmd; cannot resume by id",
+                self.binary
+            )
+        })?;
+        self.build_headless_command(prompt, model, working_dir, Some((flag, session_id)))
+    }
+
+    /// Whether this platform can resume a specific session by id in headless
+    /// mode (RS2) — i.e. the registry gives it a `session_resume_cmd`.
+    pub fn supports_resume_by_id(&self) -> bool {
+        self.session_resume_cmd.is_some()
+    }
+
+    /// Shared core for every headless spawn (cold or resume). `session_arg`,
+    /// when `Some((flag, id))`, injects that flag + id immediately before the
+    /// positional prompt so the id can never be mistaken for the prompt. The
+    /// cold path passes the set-at-spawn flag; the resume path passes the
+    /// resume flag; a plain `build_command` passes `None`. Keeping this one
+    /// function means the cold layout is byte-identical whichever caller runs.
+    fn build_headless_command(
+        &self,
+        prompt: &str,
+        model: Option<&str>,
+        working_dir: Option<&str>,
+        session_arg: Option<(&str, &str)>,
+    ) -> Result<Command> {
         let resolved = resolve_binary(&self.binary)?;
         let mut cmd = Command::new(resolved);
 
@@ -147,13 +206,10 @@ impl CliStrategy {
             cmd.arg(arg);
         }
 
-        // Set the session id at spawn time (RS1), when both the id and the
-        // CLI's flag for it exist. Before the positional prompt so the id
-        // can never be mistaken for it.
-        if let Some(sid) = session_id {
-            if let Some(ref flag) = self.session_id_set_flag {
-                cmd.arg(flag).arg(sid);
-            }
+        // Inject the session flag + id (set-at-spawn for a cold start, or the
+        // resume-by-id flag for a resume) before the positional prompt.
+        if let Some((flag, id)) = session_arg {
+            cmd.arg(flag).arg(id);
         }
 
         // Deliver the prompt via stdin (backed by an anonymous temp file) or
@@ -282,6 +338,7 @@ mod tests {
             session_list_cmd: None,
             session_list_format_args: None,
             session_id_pattern: None,
+            session_resume_cmd: None,
         }
     }
 
@@ -533,6 +590,56 @@ mod tests {
         // The prompt/headless/model flags must never appear on a list command.
         assert!(!cmd_str.contains("--headless"));
         assert!(!cmd_str.contains("--model"));
+    }
+
+    #[test]
+    fn supports_resume_by_id_follows_session_resume_cmd() {
+        let mut s = sample_strategy();
+        assert!(!s.supports_resume_by_id());
+        s.session_resume_cmd = Some("--session".to_string());
+        assert!(s.supports_resume_by_id());
+    }
+
+    #[test]
+    fn build_resume_command_injects_resume_flag_and_id_before_prompt() {
+        let mut s = sample_strategy();
+        s.session_resume_cmd = Some("--session".to_string());
+        let cmd = s
+            .build_resume_command("ses_abc", "the prompt", None, None)
+            .unwrap();
+        let cmd_str = format!("{:?}", cmd);
+        assert!(cmd_str.contains("--session"));
+        assert!(cmd_str.contains("ses_abc"));
+        // The resume flag+id must precede the positional prompt.
+        let flag_at = cmd_str.find("--session").unwrap();
+        let prompt_at = cmd_str.find("the prompt").unwrap();
+        assert!(
+            flag_at < prompt_at,
+            "resume flag+id must come before prompt"
+        );
+    }
+
+    #[test]
+    fn build_resume_command_errors_without_session_resume_cmd() {
+        let s = sample_strategy();
+        let err = s
+            .build_resume_command("ses_abc", "p", None, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("session_resume_cmd"));
+    }
+
+    #[test]
+    fn build_resume_command_never_uses_set_at_spawn_flag() {
+        // A platform can have BOTH a set-at-spawn flag and a resume flag;
+        // resume must use the resume flag, not mint via the set-at-spawn one.
+        let mut s = sample_strategy();
+        s.session_id_set_flag = Some("--session-id".to_string());
+        s.session_resume_cmd = Some("--resume".to_string());
+        let cmd = s.build_resume_command("ses_xyz", "p", None, None).unwrap();
+        let cmd_str = format!("{:?}", cmd);
+        assert!(cmd_str.contains("--resume"));
+        assert!(cmd_str.contains("ses_xyz"));
+        assert!(!cmd_str.contains("--session-id"));
     }
 
     #[test]

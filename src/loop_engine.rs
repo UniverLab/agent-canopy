@@ -792,6 +792,15 @@ impl LoopEngine {
             None,
         )?;
 
+        // RS2: session ids captured for each node during THIS dispatch, so a
+        // fail-edge bounce back to a node can resume its prior session instead
+        // of cold-starting. In-memory only and local to this call — a restart,
+        // reset, or fresh dispatch starts with an empty map and therefore cold,
+        // which is exactly the freshness guarantee we want. Keyed by node_id;
+        // being local to one spec's run also means a session never leaks across
+        // specs.
+        let mut resumable_sessions: HashMap<String, String> = HashMap::new();
+
         loop {
             if self.is_paused(&lp.id)? {
                 return Ok(SpecExecutionOutcome::Paused);
@@ -853,6 +862,11 @@ impl LoopEngine {
                         .ok_or_else(|| anyhow!("Loop node '{}' not found.", node_id))?;
                     let (retry_limit, crash_max_secs, backoff_secs) = read_infra_config(node);
                     let mut attempt: u32 = 0;
+                    // RS2: resume candidate for this attempt. On the first
+                    // visit to a node the map is empty → `None` → cold start.
+                    // On a fail-edge bounce it holds the session captured on the
+                    // node's previous run in this dispatch → resume.
+                    let mut resume_candidate = resumable_sessions.get(node_id.as_str()).cloned();
                     let mut run_id = uuid::Uuid::new_v4().to_string();
                     self.db.insert_loop_run(&LoopNodeRun {
                         id: run_id.clone(),
@@ -880,6 +894,7 @@ impl LoopEngine {
                                 spec_start_head.as_deref(),
                                 &run_id,
                                 workdir,
+                                resume_candidate.as_deref(),
                             )
                             .await?;
                         let run = self.db.get_loop_run(&run_id)?.ok_or_else(|| {
@@ -906,6 +921,11 @@ impl LoopEngine {
                                 backoff_secs * 2u64.pow(attempt - 1),
                             ))
                             .await;
+                            // B19: retry resuming the crashed attempt's own
+                            // session if it managed to create one before dying;
+                            // an infra crash at spawn usually created none, so
+                            // this is normally `None` → the retry cold-starts.
+                            resume_candidate = run.session_id.clone();
                             run_id = uuid::Uuid::new_v4().to_string();
                             self.db.insert_loop_run(&LoopNodeRun {
                                 id: run_id.clone(),
@@ -927,6 +947,14 @@ impl LoopEngine {
 
                         break (execution, run);
                     };
+
+                    // RS2: remember this node's captured session so a later
+                    // fail-edge bounce back to it resumes instead of cold
+                    // starting. A resumed run recorded the same id it continued;
+                    // a cold run recorded whatever it captured (or nothing).
+                    if let Some(sid) = run.session_id.clone() {
+                        resumable_sessions.insert(node.id.clone(), sid);
+                    }
 
                     let final_execution = if run.status == LoopRunStatus::Running {
                         self.db.update_loop_run_result(
@@ -1085,7 +1113,19 @@ impl LoopEngine {
                     .expect("ensemble concurrency semaphore is never closed");
                 let outcome = tokio::time::timeout(
                     std::time::Duration::from_secs(straggler_minutes * 60),
-                    execute_agent_node(&db, &lp, &spec, &node, previous_output.as_ref(), &run_id, &workdir),
+                    // Ensemble members always cold-start (RS2 is scoped to the
+                    // sequential fail-edge bounce path; ensemble fan-out is not
+                    // a single-node re-run).
+                    execute_agent_node(
+                        &db,
+                        &lp,
+                        &spec,
+                        &node,
+                        previous_output.as_ref(),
+                        &run_id,
+                        &workdir,
+                        None,
+                    ),
                 )
                 .await;
 
@@ -1240,6 +1280,7 @@ impl LoopEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn execute_node(
         &self,
         lp: &crate::domain::loops::Loop,
@@ -1249,6 +1290,7 @@ impl LoopEngine {
         spec_start_head: Option<&str>,
         run_id: &str,
         workdir: &str,
+        resume_session_id: Option<&str>,
     ) -> Result<NodeExecution> {
         match node.kind {
             LoopNodeKind::Check => {
@@ -1256,7 +1298,17 @@ impl LoopEngine {
             }
             LoopNodeKind::Gate => execute_gate_node(node, previous_output),
             LoopNodeKind::Agent => {
-                execute_agent_node(&self.db, lp, spec, node, previous_output, run_id, workdir).await
+                execute_agent_node(
+                    &self.db,
+                    lp,
+                    spec,
+                    node,
+                    previous_output,
+                    run_id,
+                    workdir,
+                    resume_session_id,
+                )
+                .await
             }
             // A join node (F1) never reaches the single-node path: `run_spec`
             // detects the fan-out into its ensemble before this would ever be
@@ -1557,6 +1609,48 @@ async fn execute_check_node(
     })
 }
 
+/// Force stdin prompt delivery for an oversized prompt. Node outputs are
+/// arbitrarily large (e.g. a full `cargo test` log), and the composed prompt
+/// embeds previous_output via `{{previous_feedback}}`. Even after elision the
+/// total can exceed Linux's MAX_ARG_STRLEN (128KiB), crashing the spawn with
+/// E2BIG — the temp-file + stdin transport has no size cliff.
+fn sized_strategy(
+    base: &crate::domain::cli_strategy::CliStrategy,
+    prompt: &str,
+) -> crate::domain::cli_strategy::CliStrategy {
+    if prompt.len() > ARGV_SAFETY_THRESHOLD && !base.prompt_via_stdin {
+        base.with_stdin_forced()
+    } else {
+        base.clone()
+    }
+}
+
+/// If the agent finalized its own run row (called `loop_complete_node` /
+/// `loop_report_blocker`), turn that self-reported status into the node's
+/// result; otherwise `None` so the caller uses the process-derived execution.
+fn self_reported_execution(run: Option<&LoopNodeRun>, node: &LoopNode) -> Option<NodeExecution> {
+    let run = run?;
+    if run.status == LoopRunStatus::Running {
+        return None;
+    }
+    Some(NodeExecution {
+        status: run.status,
+        output: run.output.clone().unwrap_or_else(|| serde_json::json!({})),
+        summary: format!("Agent node '{}' reported its own result.", node.name),
+    })
+}
+
+/// Execute an agent node, RESUMING its captured session (RS2) when the engine
+/// hands down a `resume_session_id` for a re-run of this node (a fail-edge
+/// bounce, or a B19 infra retry of an attempt that had created a session) and
+/// the node opts in and the platform supports headless resume-by-id.
+///
+/// A resumed spawn gets only the incremental prompt (new feedback + the
+/// report contract), continues the same session (recorded on the new run row,
+/// capture skipped), and — if the resume flag is rejected / crashes at spawn —
+/// falls back to a byte-identical cold start whose verdict the node then uses.
+/// Every other case cold-starts exactly as before.
+#[allow(clippy::too_many_arguments)]
 async fn execute_agent_node(
     db: &Arc<Database>,
     lp: &crate::domain::loops::Loop,
@@ -1565,6 +1659,7 @@ async fn execute_agent_node(
     previous_output: Option<&Value>,
     run_id: &str,
     workdir: &str,
+    resume_session_id: Option<&str>,
 ) -> Result<NodeExecution> {
     let cli_name = node
         .config
@@ -1575,6 +1670,79 @@ async fn execute_agent_node(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("Agent node '{}' is missing a platform/cli.", node.name))?;
     let cli = Cli::resolve(Some(cli_name)).map_err(anyhow::Error::msg)?;
+    let model = node.config.get("model").and_then(Value::as_str);
+    let timeout_minutes = node
+        .config
+        .get("timeout_minutes")
+        .and_then(Value::as_u64)
+        .unwrap_or(30);
+    let base_strategy = cli.strategy();
+
+    // Per-node opt-out: `resume: false` forces cold starts. Default is to
+    // resume whenever the engine offers a session and the platform supports it.
+    let node_allows_resume = node.config.get("resume").and_then(Value::as_bool) != Some(false);
+
+    // ── RS2 resume attempt ──────────────────────────────────────────────
+    if let Some(sid) = resume_session_id {
+        if node_allows_resume && base_strategy.supports_resume_by_id() {
+            let resume_template = node
+                .config
+                .get("resume_prompt")
+                .and_then(Value::as_str)
+                .unwrap_or(RESUME_PROMPT_DEFAULT);
+            let resume_prompt = render_resume_prompt(
+                lp,
+                spec,
+                node,
+                resume_template,
+                previous_output,
+                workdir,
+                run_id,
+            );
+            let strategy = sized_strategy(&base_strategy, &resume_prompt);
+            let execution = run_agent_process(
+                db,
+                run_id,
+                &cli,
+                &strategy,
+                node,
+                &resume_prompt,
+                model,
+                workdir,
+                timeout_minutes,
+                Some(sid),
+            )
+            .await?;
+
+            let run = db.get_loop_run(run_id)?;
+            // The resumed agent self-reported → route its verdict normally.
+            if let Some(reported) = self_reported_execution(run.as_ref(), node) {
+                return Ok(reported);
+            }
+            // Resume flag rejected / crashed at spawn (quick, non-self-reported
+            // failure)? Fall back to a cold start whose result the node uses.
+            // A resumed run that did real work and then failed (slow, or a
+            // timeout) is a genuine fail and routes normally — never redone.
+            let (_, crash_max_secs, _) = read_infra_config(node);
+            let elapsed = run
+                .as_ref()
+                .map(|r| (chrono::Utc::now() - r.started_at).num_seconds())
+                .unwrap_or(i64::MAX);
+            let resume_failed_at_spawn =
+                execution.status == LoopRunStatus::Fail && elapsed < crash_max_secs as i64;
+            if !resume_failed_at_spawn {
+                return Ok(execution);
+            }
+            tracing::warn!(
+                run_id,
+                node = %node.name,
+                "resume failed at spawn; falling back to a cold start"
+            );
+            // fall through to the cold path below
+        }
+    }
+
+    // ── Cold start (byte-identical to the pre-RS2 path) ─────────────────
     let prompt_template = node
         .config
         .get("prompt_template")
@@ -1589,25 +1757,7 @@ async fn execute_agent_node(
         workdir,
         run_id,
     );
-    let model = node.config.get("model").and_then(Value::as_str);
-    let timeout_minutes = node
-        .config
-        .get("timeout_minutes")
-        .and_then(Value::as_u64)
-        .unwrap_or(30);
-
-    let mut strategy = cli.strategy();
-
-    // Node outputs are arbitrarily large (e.g. a full `cargo test` log), and
-    // the composed prompt embeds previous_output via `{{previous_feedback}}`.
-    // Even after elision, the total prompt can exceed Linux's
-    // MAX_ARG_STRLEN (128KiB), crashing the spawn with E2BIG. Force stdin
-    // delivery when the prompt is large — the temp-file + stdin transport
-    // has no size cliff.
-    if prompt.len() > ARGV_SAFETY_THRESHOLD && !strategy.prompt_via_stdin {
-        *strategy = strategy.with_stdin_forced();
-    }
-
+    let strategy = sized_strategy(&base_strategy, &prompt);
     let execution = run_agent_process(
         db,
         run_id,
@@ -1618,19 +1768,13 @@ async fn execute_agent_node(
         model,
         workdir,
         timeout_minutes,
+        None,
     )
     .await?;
 
-    if let Some(run) = db.get_loop_run(run_id)? {
-        if run.status != LoopRunStatus::Running {
-            return Ok(NodeExecution {
-                status: run.status,
-                output: run.output.unwrap_or_else(|| serde_json::json!({})),
-                summary: format!("Agent node '{}' reported its own result.", node.name),
-            });
-        }
+    if let Some(reported) = self_reported_execution(db.get_loop_run(run_id)?.as_ref(), node) {
+        return Ok(reported);
     }
-
     Ok(execution)
 }
 
@@ -1668,6 +1812,7 @@ enum CliProcessOutcome {
 /// leave it running indefinitely (`Command::output` gives the caller no
 /// handle to kill), which is exactly what let a `mimo run` child outlive its
 /// node run by 42+ minutes in the 2026-07-12 incident.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_and_wait_cli_process(
     strategy: &crate::domain::cli_strategy::CliStrategy,
     prompt: &str,
@@ -1675,11 +1820,20 @@ async fn spawn_and_wait_cli_process(
     workdir: &str,
     timeout_minutes: u64,
     session_id: Option<&str>,
+    resume_session_id: Option<&str>,
     on_pid: impl FnOnce(u32),
 ) -> Result<CliProcessOutcome, String> {
-    let mut command = strategy
-        .build_command_with_session(prompt, model, Some(workdir), session_id)
-        .map_err(|error| error.to_string())?;
+    // A resume (RS2) uses the by-id resume flag and continues an existing
+    // session; a cold start uses the set-at-spawn flag (if any). The two are
+    // mutually exclusive — the caller passes at most one.
+    let mut command = match resume_session_id {
+        Some(sid) => strategy
+            .build_resume_command(sid, prompt, model, Some(workdir))
+            .map_err(|error| error.to_string())?,
+        None => strategy
+            .build_command_with_session(prompt, model, Some(workdir), session_id)
+            .map_err(|error| error.to_string())?,
+    };
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
 
@@ -1737,15 +1891,29 @@ async fn run_agent_process(
     model: Option<&str>,
     workdir: &str,
     timeout_minutes: u64,
+    resume_session_id: Option<&str>,
 ) -> Result<NodeExecution> {
+    // Resume (RS2): the run continues an existing session. Record that same
+    // id on this run row and SKIP capture entirely — set-at-spawn must not
+    // mint a new UUID and list-after-run must not diff, because a resume
+    // creates no new session to find. When resuming, `session_id`/
+    // `pre_session_ids` stay `None` so neither capture path runs.
+    if let Some(sid) = resume_session_id {
+        let _ = db.set_loop_run_session_id(run_id, sid);
+    }
+
     // Set-at-spawn session id capture (RS1): when the platform accepts a
     // caller-chosen session id, mint one and record it on the run row
     // before spawning — the id is known without parsing any output, and
-    // stays valid for resume however the run ends.
-    let session_id = strategy
-        .session_id_set_flag
-        .as_ref()
-        .map(|_| uuid::Uuid::new_v4().to_string());
+    // stays valid for resume however the run ends. Never on a resumed spawn.
+    let session_id = if resume_session_id.is_none() {
+        strategy
+            .session_id_set_flag
+            .as_ref()
+            .map(|_| uuid::Uuid::new_v4().to_string())
+    } else {
+        None
+    };
     if let Some(sid) = session_id.as_deref() {
         let _ = db.set_loop_run_session_id(run_id, sid);
     }
@@ -1754,9 +1922,13 @@ async fn run_agent_process(
     // can't set the id at spawn but do expose a session-list command, snapshot
     // the set of session ids BEFORE spawning so the new one can be diffed out
     // after the run. Skipped entirely when set-at-spawn already applied
-    // (`session_id.is_some()`), which takes strict precedence. Best-effort: a
-    // failed snapshot (`None`) just disables capture for this run.
-    let pre_session_ids = if session_id.is_none() && strategy.can_capture_session_after_run() {
+    // (`session_id.is_some()`), which takes strict precedence, or when this is
+    // a resumed spawn. Best-effort: a failed snapshot (`None`) just disables
+    // capture for this run.
+    let pre_session_ids = if resume_session_id.is_none()
+        && session_id.is_none()
+        && strategy.can_capture_session_after_run()
+    {
         list_session_ids(strategy, workdir).await
     } else {
         None
@@ -1769,6 +1941,7 @@ async fn run_agent_process(
         workdir,
         timeout_minutes,
         session_id.as_deref(),
+        resume_session_id,
         |pid| {
             let _ = db.set_loop_run_pid(run_id, pid as i64, crate::system::boot_id().as_deref());
         },
@@ -1989,6 +2162,7 @@ async fn run_completion_hook_process(
         model,
         workdir,
         timeout_minutes,
+        None,
         None,
         |pid| {
             let _ = db.set_loop_completion_hook_run_pid(
@@ -2365,6 +2539,43 @@ fn render_agent_prompt(
         run_id,
         node.id
     )
+}
+
+/// Default incremental prompt for a RESUMED agent run (RS2). Deliberately
+/// omits the full `[LOOP CONTEXT]`/`[SPEC]` block that a cold start renders:
+/// the resumed session already holds all of that in its own history, so
+/// re-sending it wastes tokens and can confuse the model into re-reading the
+/// whole task. Only the new feedback and a one-line reminder of the reporting
+/// contract are sent. Overridable per node via the `resume_prompt` config key.
+const RESUME_PROMPT_DEFAULT: &str = "# [CONTINUE]\nYou are resuming your existing session for this task. The full task context is already in your session history — only the new feedback is included below. Address it, then report.\n\n# [PREVIOUS FEEDBACK]\n{{previous_feedback}}\n\n# [REPORTING]\nWhen you finish, call loop_complete_node with run_id=\"{{run_id}}\", node_id=\"{{node_id}}\", status=\"pass\"|\"fail\", a concise summary, and your output.\nIf you are blocked and need human intervention, call loop_report_blocker with run_id=\"{{run_id}}\", node_id=\"{{node_id}}\" and the blocker description.\n";
+
+/// Render a resumed run's incremental prompt (RS2) from `template` (the node's
+/// `resume_prompt` or [`RESUME_PROMPT_DEFAULT`]). Same `{{previous_feedback}}`
+/// bounding as [`render_agent_prompt`], plus the run/node/spec placeholders the
+/// reporting contract needs — but never `{{spec_content}}`, since a resume must
+/// not re-render the spec block the session already has.
+fn render_resume_prompt(
+    lp: &crate::domain::loops::Loop,
+    spec: &LoopSpec,
+    node: &LoopNode,
+    template: &str,
+    previous_output: Option<&Value>,
+    workdir: &str,
+    run_id: &str,
+) -> String {
+    let previous_feedback = previous_output
+        .map(|value| serde_json::to_string_pretty(value).unwrap_or_default())
+        .unwrap_or_else(|| "(none)".to_string());
+    let previous_feedback = bound_previous_feedback(previous_feedback);
+    template
+        .replace("{{loop_name}}", &lp.name)
+        .replace("{{workdir}}", workdir)
+        .replace("{{spec_id}}", &spec.id)
+        .replace("{{spec_name}}", &spec.name)
+        .replace("{{node}}", &node.name)
+        .replace("{{node_id}}", &node.id)
+        .replace("{{run_id}}", run_id)
+        .replace("{{previous_feedback}}", &previous_feedback)
 }
 
 /// Render the `on_completed` hook's prompt template (N2). The hook has no
@@ -3555,6 +3766,7 @@ mod tests {
             session_list_cmd: None,
             session_list_format_args: None,
             session_id_pattern: None,
+            session_resume_cmd: None,
         }
     }
 
@@ -3595,7 +3807,7 @@ mod tests {
         strategy.session_id_set_flag = Some("--session-id".to_string());
 
         run_agent_process(
-            &db, "run-sid", &cli, &strategy, &node, "prompt", None, "/tmp", 1,
+            &db, "run-sid", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
         )
         .await
         .unwrap();
@@ -3624,6 +3836,7 @@ mod tests {
             None,
             "/tmp",
             1,
+            None,
         )
         .await
         .unwrap();
@@ -3694,6 +3907,7 @@ esac
             session_list_cmd: Some("list".to_string()),
             session_list_format_args: None,
             session_id_pattern: Some(r#""id"\s*:\s*"([^"]+)""#.to_string()),
+            session_resume_cmd: None,
         }
     }
 
@@ -3713,7 +3927,7 @@ esac
         let cli = Cli::new("fake");
 
         let execution = run_agent_process(
-            &db, "run-cap", &cli, &strategy, &node, "prompt", None, "/tmp", 1,
+            &db, "run-cap", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
         )
         .await
         .unwrap();
@@ -3752,6 +3966,7 @@ esac
             None,
             "/tmp",
             1,
+            None,
         )
         .await
         .unwrap();
@@ -3792,6 +4007,7 @@ esac
             None,
             "/tmp",
             1,
+            None,
         )
         .await
         .unwrap();
@@ -3834,6 +4050,7 @@ esac
             None,
             "/tmp",
             1,
+            None,
         )
         .await
         .unwrap();
@@ -3842,6 +4059,338 @@ esac
         let sid = run.session_id.expect("set-at-spawn must record an id");
         uuid::Uuid::parse_str(&sid)
             .expect("recorded id must be the set-at-spawn uuid, not a listed session id");
+    }
+
+    // ── RS2: resume on fail-edge bounce ─────────────────────────────────
+
+    /// Fake CLI that records its full argv (one arg per line, `===` between
+    /// invocations) to `$ARGV_FILE`. When resuming (its argv contains
+    /// `$RESUME_FLAG`) and `$FAIL_RESUME` is set, it exits nonzero at once to
+    /// simulate a rejected resume flag; otherwise it prints `done` and exits 0.
+    fn write_argv_echo_cli(dir: &std::path::Path) -> std::path::PathBuf {
+        let script = dir.join("argv-echo-cli");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+{
+  for a in "$@"; do printf '%s\n' "$a"; done
+  printf '===\n'
+} >> "$ARGV_FILE"
+is_resume=0
+for a in "$@"; do [ "$a" = "$RESUME_FLAG" ] && is_resume=1; done
+if [ "$is_resume" = "1" ] && [ -n "$FAIL_RESUME" ]; then
+  echo "resume rejected" >&2
+  exit 1
+fi
+echo done
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    /// Write a `~/.canopy/config.toml` fixture holding a single CLI named
+    /// `resume-cli` backed by the argv-echo script, so `Cli::strategy()`
+    /// resolves it under a [`HomeGuard`].
+    fn write_resume_cli_home(cli: crate::domain::cli_config::CliConfig) -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        let canopy_dir = home.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        let config = crate::domain::canopy_config::CanopyConfig {
+            configured_at: Some(chrono::Utc::now().to_rfc3339()),
+            clis: vec![cli],
+            ..Default::default()
+        };
+        config.save(&canopy_dir).unwrap();
+        home
+    }
+
+    /// Build the `resume-cli` [`CliConfig`] for the argv-echo binary.
+    fn argv_cli_config(
+        binary: &std::path::Path,
+        env: HashMap<String, String>,
+        resume: Option<&str>,
+        set_flag: Option<&str>,
+        list_cmd: Option<&str>,
+    ) -> crate::domain::cli_config::CliConfig {
+        crate::domain::cli_config::CliConfig {
+            name: "resume-cli".into(),
+            binary: binary.to_string_lossy().into_owned(),
+            headless_mode: "run".into(),
+            env_vars: env,
+            session_resume_cmd: resume.map(str::to_string),
+            session_id_set_flag: set_flag.map(str::to_string),
+            session_list_cmd: list_cmd.map(str::to_string),
+            session_list_format_args: list_cmd.map(|_| "--format json".to_string()),
+            session_id_pattern: list_cmd.map(|_| r#""id"\s*:\s*"([^"]+)""#.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// An agent node driven by the `resume-cli` platform, with optional extra
+    /// config keys merged in (e.g. `{"resume": false}`).
+    fn resume_agent_node(extra: Value) -> LoopNode {
+        let mut config = serde_json::json!({ "platform": "resume-cli" });
+        if let Value::Object(extra) = extra {
+            for (k, v) in extra {
+                config[k] = v;
+            }
+        }
+        LoopNode {
+            id: "node-impl".to_string(),
+            spec_id: Some("sid-spec".to_string()),
+            loop_id: None,
+            name: "impl".to_string(),
+            kind: LoopNodeKind::Agent,
+            config,
+            position: 1,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Drive `execute_agent_node` once against the argv-echo CLI, returning the
+    /// node execution, the (re-read) run row, and the recorded argv text.
+    async fn run_resume_agent_node(
+        node_extra: Value,
+        resume_session_id: Option<&str>,
+        set_flag: Option<&str>,
+        list_cmd: Option<&str>,
+        fail_resume: bool,
+    ) -> (NodeExecution, LoopNodeRun, String) {
+        let (dir, db, _engine, loop_id) = bare_loop_fixture().unwrap();
+        seed_agent_run(&db, &loop_id, "run-r");
+        let argv_file = dir.path().join("argv.log");
+        let script = write_argv_echo_cli(dir.path());
+        let mut env = HashMap::new();
+        env.insert(
+            "ARGV_FILE".to_string(),
+            argv_file.to_string_lossy().into_owned(),
+        );
+        env.insert("RESUME_FLAG".to_string(), "--resume".to_string());
+        if fail_resume {
+            env.insert("FAIL_RESUME".to_string(), "1".to_string());
+        }
+        let cli = argv_cli_config(&script, env, Some("--resume"), set_flag, list_cmd);
+        let home = write_resume_cli_home(cli);
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        let spec = db.get_loop_spec("sid-spec").unwrap().unwrap();
+        let node = resume_agent_node(node_extra);
+
+        let guard = HomeGuard::set(home.path());
+        let execution = execute_agent_node(
+            &db,
+            &lp,
+            &spec,
+            &node,
+            None,
+            "run-r",
+            dir.path().to_str().unwrap(),
+            resume_session_id,
+        )
+        .await
+        .unwrap();
+        drop(guard);
+
+        let run = db.get_loop_run("run-r").unwrap().unwrap();
+        let argv = std::fs::read_to_string(&argv_file).unwrap_or_default();
+        (execution, run, argv)
+    }
+
+    #[tokio::test]
+    async fn resume_uses_resume_flag_and_incremental_prompt() {
+        let (execution, run, argv) =
+            run_resume_agent_node(Value::Null, Some("ses_prev"), None, None, false).await;
+        assert_eq!(execution.status, LoopRunStatus::Pass);
+        assert!(argv.contains("--resume"), "resume flag must be passed");
+        assert!(argv.contains("ses_prev"), "the resumed id must be passed");
+        // Incremental prompt: the resume continuation marker, but NOT the full
+        // cold `[SPEC]` block the session already holds.
+        assert!(argv.contains("[CONTINUE]"), "resume prompt must be sent");
+        assert!(
+            !argv.contains("# [SPEC]"),
+            "a resume must not re-render the full spec block"
+        );
+        // The resumed run records the SAME session id; capture is skipped.
+        assert_eq!(run.session_id.as_deref(), Some("ses_prev"));
+    }
+
+    #[tokio::test]
+    async fn resume_false_config_forces_cold_start() {
+        let (execution, _run, argv) = run_resume_agent_node(
+            serde_json::json!({ "resume": false }),
+            Some("ses_prev"),
+            None,
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(execution.status, LoopRunStatus::Pass);
+        assert!(
+            !argv.contains("--resume"),
+            "resume:false must force a cold start"
+        );
+        assert!(
+            argv.contains("# [SPEC]"),
+            "cold start renders the full spec"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_visit_without_session_is_cold() {
+        // No resume_session_id offered (first visit to the node) → cold.
+        let (execution, _run, argv) =
+            run_resume_agent_node(Value::Null, None, None, None, false).await;
+        assert_eq!(execution.status, LoopRunStatus::Pass);
+        assert!(!argv.contains("--resume"));
+        assert!(argv.contains("# [SPEC]"));
+    }
+
+    #[tokio::test]
+    async fn resume_failure_falls_back_to_cold_and_verdict_from_cold_run() {
+        // The resume attempt is rejected at spawn (FAIL_RESUME); the engine
+        // must fall back to a cold start whose (passing) verdict the node uses.
+        let (execution, _run, argv) =
+            run_resume_agent_node(Value::Null, Some("ses_prev"), None, None, true).await;
+        assert_eq!(
+            execution.status,
+            LoopRunStatus::Pass,
+            "verdict must come from the cold fallback run"
+        );
+        assert!(argv.contains("--resume"), "the resume attempt ran first");
+        assert!(
+            argv.contains("# [SPEC]"),
+            "the cold fallback ran and rendered the full spec"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_skips_set_at_spawn_and_list_capture() {
+        // Platform has BOTH a set-at-spawn flag and a session-list command, so
+        // a cold start would either mint a uuid or diff a session list. On a
+        // resume, neither may run: the run row must keep exactly the resumed id.
+        let (execution, run, argv) = run_resume_agent_node(
+            Value::Null,
+            Some("ses_prev"),
+            Some("--set"),
+            Some("list"),
+            false,
+        )
+        .await;
+        assert_eq!(execution.status, LoopRunStatus::Pass);
+        assert_eq!(
+            run.session_id.as_deref(),
+            Some("ses_prev"),
+            "resumed run keeps the resumed id — no set-at-spawn uuid, no listed id"
+        );
+        assert!(
+            !argv.contains("--set"),
+            "set-at-spawn flag must not be injected on a resumed spawn"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounce_resumes_second_visit_after_cold_first_visit() {
+        // Integration: an agent node that passes into a check that fails once
+        // (bouncing back to the agent) then passes. The agent's first visit is
+        // cold and captures a session (via set-at-spawn); the bounce resumes it.
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        let argv_file = dir.path().join("argv.log");
+        let counter = dir.path().join("counter");
+        let script = write_argv_echo_cli(dir.path());
+        let mut env = HashMap::new();
+        env.insert(
+            "ARGV_FILE".to_string(),
+            argv_file.to_string_lossy().into_owned(),
+        );
+        env.insert("RESUME_FLAG".to_string(), "--resume".to_string());
+        // set-at-spawn capture on the cold run gives the bounce something to
+        // resume; resume-by-id enables the bounce itself.
+        let cli = argv_cli_config(&script, env, Some("--resume"), Some("--set"), None);
+        let home = write_resume_cli_home(cli);
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-impl".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "impl".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({ "platform": "resume-cli" }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        // Gate check: fails its first run (bounce), passes the second.
+        db.insert_loop_node(&LoopNode {
+            id: "node-gate".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "gate".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": format!(
+                    "n=$(cat \"{c}\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"{c}\"; [ \"$n\" -ge 2 ] && printf APPROVED || exit 1",
+                    c = counter.display(),
+                ),
+                "success_condition": "exit_code_0"
+            }),
+            position: 2,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "edge-impl-gate".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "node-impl".to_string(),
+            to_node: "node-gate".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Pass,
+        })
+        .unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "edge-gate-impl".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "node-gate".to_string(),
+            to_node: "node-impl".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Fail,
+        })
+        .unwrap();
+
+        let guard = HomeGuard::set(home.path());
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        drop(guard);
+
+        // Two runs of the agent node: the first cold, the second resumed.
+        let mut impl_runs: Vec<LoopNodeRun> = db
+            .list_loop_runs_for_spec(&spec_id)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.node_id == "node-impl")
+            .collect();
+        impl_runs.sort_by_key(|r| r.started_at);
+        assert_eq!(impl_runs.len(), 2, "agent node must have run twice");
+        let first_sid = impl_runs[0]
+            .session_id
+            .clone()
+            .expect("cold first run captures a set-at-spawn session id");
+        assert_eq!(
+            impl_runs[1].session_id.as_deref(),
+            Some(first_sid.as_str()),
+            "the bounce must resume — and record — the first run's session id"
+        );
+
+        let argv = std::fs::read_to_string(&argv_file).unwrap();
+        assert!(
+            argv.contains("--set"),
+            "the first (cold) visit sets a session id at spawn"
+        );
+        assert!(
+            argv.contains("--resume") && argv.contains(&first_sid),
+            "the second visit resumes the first run's session by id"
+        );
     }
 
     #[tokio::test]
@@ -3856,7 +4405,7 @@ esac
         let node = sample_agent_node();
 
         let execution = run_agent_process(
-            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1,
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
         )
         .await
         .expect("spawn failure must not propagate as a hard error");
@@ -3888,6 +4437,7 @@ esac
             None,
             "/tmp",
             1,
+            None,
         )
         .await
         .unwrap();
@@ -3932,6 +4482,7 @@ esac
             None,
             "/tmp",
             1,
+            None,
         )
         .await
         .unwrap();
@@ -5047,7 +5598,7 @@ esac
         let node = sample_agent_node();
 
         let execution = run_agent_process(
-            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1,
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
         )
         .await
         .expect("spawn failure must not propagate as a hard error");
@@ -5168,6 +5719,7 @@ esac
             None,
             "/tmp",
             1,
+            None,
         )
         .await;
         let result = execution.expect("stdin delivery must not fail");
@@ -5191,6 +5743,7 @@ esac
             None,
             "/tmp",
             1,
+            None,
         )
         .await
         .expect("spawn failure must not propagate as hard error");
@@ -5531,7 +6084,7 @@ esac
         let prompt = format!("sleep 5; touch \"{}\"", marker.display());
 
         let result = run_agent_process(
-            &db, &run_id, &cli, &strategy, &node, &prompt, None, "/tmp", 0,
+            &db, &run_id, &cli, &strategy, &node, &prompt, None, "/tmp", 0, None,
         )
         .await;
         // B28: a timeout resolves as a failed `NodeExecution`, not a hard
