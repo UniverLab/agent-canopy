@@ -247,7 +247,8 @@ fn all_shortcut_hints(send_label: &str, send_hint: &str) -> Vec<ShortcutHint> {
             priority: 7,
         },
         ShortcutHint {
-            key: "Ctrl+E ".to_string(),
+            // Ctrl+E still works as an unadvertised alias.
+            key: "Shift+←→ ".to_string(),
             desc: "tabs  ".to_string(),
             priority: 8,
         },
@@ -851,21 +852,36 @@ fn draw_raw_tab_content(
     let section_bg = Color::Rgb(30, 30, 30);
 
     if raw_empty {
-        // Read-only preview, dimmed. Clamp to the visible height with a tail.
+        // Read-only preview, dimmed. ↑↓/PgUp/PgDn scroll it; edge markers show
+        // how much is hidden above and below the window.
         let preview = dialog
             .raw_preview
             .as_deref()
             .unwrap_or("(nothing to preview yet)");
         let all_lines: Vec<&str> = preview.lines().collect();
-        let mut lines: Vec<Line> = all_lines
-            .iter()
-            .take(avail_h.saturating_sub(1).max(1))
-            .map(|l| Line::from(Span::styled((*l).to_string(), Style::default().fg(DIM))))
-            .collect();
-        let shown = lines.len();
-        if all_lines.len() > shown {
+        let scroll = dialog
+            .raw_preview_scroll
+            .min(all_lines.len().saturating_sub(1));
+        let mut lines: Vec<Line> = Vec::new();
+        if scroll > 0 {
             lines.push(Line::from(Span::styled(
-                format!("… (+{} lines)", all_lines.len() - shown),
+                format!("… (−{scroll} lines above)"),
+                Style::default().fg(accent),
+            )));
+        }
+        let body_h = avail_h.saturating_sub(lines.len()).saturating_sub(1).max(1);
+        let shown = all_lines.len().min(scroll + body_h) - scroll;
+        lines.extend(
+            all_lines
+                .iter()
+                .skip(scroll)
+                .take(body_h)
+                .map(|l| Line::from(Span::styled((*l).to_string(), Style::default().fg(DIM)))),
+        );
+        let below = all_lines.len().saturating_sub(scroll + shown);
+        if below > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("… (+{below} lines, ↑↓ scroll)"),
                 Style::default().fg(accent),
             )));
         }
@@ -961,7 +977,7 @@ mod tests {
                 "@",
                 "Ctrl+A",
                 "Ctrl+X",
-                "Ctrl+E",
+                "Shift+←→",
                 "Ctrl+L",
                 "Ctrl+S",
                 "Esc"

@@ -51,9 +51,15 @@ pub fn handle_prompt_template_key(
         return Ok(());
     }
 
-    // Ctrl+E toggles between the Normal and Raw tabs from any focus. Entering
-    // the Raw tab (re)computes the composed-prompt preview for its empty state.
-    if code == KeyCode::Char('e') && modifiers.contains(KeyModifiers::CONTROL) {
+    // Ctrl+E and Shift+←/→ toggle between the Normal and Raw tabs from any
+    // focus — except while the date-time picker is open, where lateral arrows
+    // move between its fields. Entering the Raw tab (re)computes the
+    // composed-prompt preview for its empty state.
+    let shift_tab_switch = matches!(code, KeyCode::Left | KeyCode::Right)
+        && modifiers.contains(KeyModifiers::SHIFT)
+        && dialog.send_edit.is_none();
+    if (code == KeyCode::Char('e') && modifiers.contains(KeyModifiers::CONTROL)) || shift_tab_switch
+    {
         let entering_raw = dialog.active_tab == crate::tui::app::dialog::PromptTab::Normal;
         dialog.toggle_tab();
         if entering_raw {
@@ -587,6 +593,8 @@ fn handle_send_control_key(
     code: KeyCode,
     modifiers: KeyModifiers,
     is_shift: bool,
+    db: &Database,
+    workdir: &Path,
 ) -> PromptAction {
     // Inline date-time picker open: arrows edit, Enter confirms, Esc abandons.
     if dialog.send_edit.is_some() {
@@ -594,6 +602,17 @@ fn handle_send_control_key(
             KeyCode::Esc => {
                 dialog.send_edit_cancel();
                 PromptAction::None
+            }
+            // Ctrl+S sends without leaving the picker: the in-progress edit is
+            // confirmed first; an invalid time keeps the picker open showing
+            // its error instead of sending.
+            KeyCode::Char('s') if modifiers.contains(KeyModifiers::CONTROL) => {
+                dialog.send_edit_confirm();
+                if dialog.send_edit.is_some() {
+                    PromptAction::None
+                } else {
+                    build_prompt_action(dialog, db, workdir)
+                }
             }
             KeyCode::Up => {
                 dialog.send_edit_adjust(1);
@@ -635,6 +654,11 @@ fn handle_send_control_key(
     // date, Shift+↑/↓ and Tab return to the fields above.
     match code {
         KeyCode::Esc => PromptAction::Close,
+        // Ctrl+S sends from the send control too — it must work from every
+        // focus, not force the user back into a section first.
+        KeyCode::Char('s') if modifiers.contains(KeyModifiers::CONTROL) => {
+            build_prompt_action(dialog, db, workdir)
+        }
         KeyCode::Left | KeyCode::Right => {
             dialog.send_toggle();
             PromptAction::None
@@ -695,7 +719,7 @@ fn handle_raw_tab_key(
     // because the raw tab only has those two stops (Normal-tab navigation may
     // have parked the shared handler on a higher section index).
     if dialog.focused_section == 0 {
-        let action = handle_send_control_key(dialog, code, modifiers, is_shift);
+        let action = handle_send_control_key(dialog, code, modifiers, is_shift, db, workdir);
         if dialog.focused_section > 1 {
             dialog.focused_section = 1;
         }
@@ -730,6 +754,25 @@ fn handle_raw_tab_key(
         }
         KeyCode::Down if is_shift => {
             dialog.focused_section = 0;
+            PromptAction::None
+        }
+
+        // With an empty buffer the tab shows the read-only preview: vertical
+        // keys scroll it instead of moving a cursor there is nothing to edit.
+        KeyCode::Up if dialog.raw_is_empty() => {
+            dialog.scroll_raw_preview(-1);
+            PromptAction::None
+        }
+        KeyCode::Down if dialog.raw_is_empty() => {
+            dialog.scroll_raw_preview(1);
+            PromptAction::None
+        }
+        KeyCode::PageUp if dialog.raw_is_empty() => {
+            dialog.scroll_raw_preview(-10);
+            PromptAction::None
+        }
+        KeyCode::PageDown if dialog.raw_is_empty() => {
+            dialog.scroll_raw_preview(10);
             PromptAction::None
         }
 
@@ -788,7 +831,9 @@ fn handle_dialog_key(
 
     // ── send control (focus index 0, U11) ───────────────────────────────
     if is_send_at {
-        return Ok(handle_send_control_key(dialog, code, modifiers, is_shift));
+        return Ok(handle_send_control_key(
+            dialog, code, modifiers, is_shift, db, workdir,
+        ));
     }
 
     // ── Section field keys ──────────────────────────────────────────────

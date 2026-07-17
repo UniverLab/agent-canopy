@@ -221,6 +221,9 @@ pub struct SimplePromptDialog {
     /// Raw tab (the Normal form can't change while Raw is shown). Transient —
     /// never persisted.
     pub raw_preview: Option<String>,
+    /// Vertical scroll offset (in preview lines) for the read-only raw
+    /// preview. Reset whenever the preview is recomputed. Transient.
+    pub raw_preview_scroll: usize,
 }
 
 impl SimplePromptDialog {
@@ -256,6 +259,7 @@ impl SimplePromptDialog {
             pending_recall: None,
             active_tab: PromptTab::Normal,
             raw_preview: None,
+            raw_preview_scroll: 0,
         }
     }
 
@@ -1549,6 +1553,19 @@ impl SimplePromptDialog {
         self.raw_preview = self
             .build_prompt_with_resolved_resources(db, current_workdir)
             .ok();
+        self.raw_preview_scroll = 0;
+    }
+
+    /// Scroll the read-only raw preview by `delta` lines (negative = up),
+    /// clamped to the preview's line count so it can always be scrolled back.
+    pub fn scroll_raw_preview(&mut self, delta: isize) {
+        let max = self
+            .raw_preview
+            .as_deref()
+            .map(|preview| preview.lines().count().saturating_sub(1))
+            .unwrap_or(0);
+        let next = self.raw_preview_scroll.saturating_add_signed(delta);
+        self.raw_preview_scroll = next.min(max);
     }
 
     /// Hit-boxes for the two tab labels, laid out left-to-right from `(x, y)`.
