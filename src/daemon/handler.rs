@@ -245,6 +245,152 @@ fn member_node_config(
     })
 }
 
+/// Validated inputs for assembling one ensemble unit — see
+/// [`build_ensemble_unit`]. All wiring targets (`entry_from_node`,
+/// `on_pass_to`, `on_fail_to`) must already have been checked to exist in the
+/// target graph by the caller.
+struct EnsembleUnitSpec<'a> {
+    spec_id: Option<String>,
+    loop_id: Option<String>,
+    name: &'a str,
+    prompt_template: &'a str,
+    members: &'a [(String, Option<String>)],
+    entry_from_node: &'a str,
+    entry_condition: LoopEdgeCondition,
+    on_pass_to: &'a str,
+    on_fail_to: Option<&'a str>,
+    min_pass: i64,
+    timeout_minutes: i64,
+    straggler_timeout_minutes: Option<i64>,
+    start_position: i64,
+}
+
+/// The concrete graph pieces of one ensemble unit, all with fresh ids: the
+/// join node, member nodes, wiring edges (entry fan-out, member→join fan-in,
+/// join exit routing), the ensemble row, and its member rows.
+#[derive(Debug)]
+struct BuiltEnsembleUnit {
+    ensemble: Ensemble,
+    members: Vec<EnsembleMember>,
+    member_nodes: Vec<LoopNode>,
+    join_node: LoopNode,
+    edges: Vec<LoopEdge>,
+}
+
+/// Assemble an ensemble unit from validated inputs. Shared by
+/// `loop_add_ensemble` and `loop_copy_ensemble` so the two can never drift in
+/// how members, the join, and the wiring are laid out. Purely constructs
+/// in-memory values (fresh ids, no runtime state) — persistence is the
+/// caller's `insert_ensemble_unit`.
+fn build_ensemble_unit(spec: &EnsembleUnitSpec) -> BuiltEnsembleUnit {
+    let ensemble_id = uuid::Uuid::new_v4().to_string();
+    let join_node_id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now();
+    let mut next_position = spec.start_position;
+
+    let mut member_nodes = Vec::with_capacity(spec.members.len());
+    let mut ensemble_members = Vec::with_capacity(spec.members.len());
+    let mut edges = Vec::new();
+
+    for (index, (platform, model)) in spec.members.iter().enumerate() {
+        let node_id = uuid::Uuid::new_v4().to_string();
+        member_nodes.push(LoopNode {
+            id: node_id.clone(),
+            spec_id: spec.spec_id.clone(),
+            loop_id: spec.loop_id.clone(),
+            name: format!("{} [{}]", spec.name, index + 1),
+            kind: LoopNodeKind::Agent,
+            config: member_node_config(
+                platform,
+                model.as_deref(),
+                spec.prompt_template,
+                spec.timeout_minutes,
+            ),
+            position: next_position,
+            created_at: now,
+        });
+        edges.push(LoopEdge {
+            id: uuid::Uuid::new_v4().to_string(),
+            spec_id: spec.spec_id.clone(),
+            loop_id: spec.loop_id.clone(),
+            from_node: spec.entry_from_node.to_string(),
+            to_node: node_id.clone(),
+            condition: spec.entry_condition,
+        });
+        edges.push(LoopEdge {
+            id: uuid::Uuid::new_v4().to_string(),
+            spec_id: spec.spec_id.clone(),
+            loop_id: spec.loop_id.clone(),
+            from_node: node_id.clone(),
+            to_node: join_node_id.clone(),
+            condition: LoopEdgeCondition::Always,
+        });
+        ensemble_members.push(EnsembleMember {
+            ensemble_id: ensemble_id.clone(),
+            node_id,
+            position: index as i64,
+            platform: platform.clone(),
+            model: model.clone(),
+        });
+        next_position += 1;
+    }
+
+    let join_node = LoopNode {
+        id: join_node_id.clone(),
+        spec_id: spec.spec_id.clone(),
+        loop_id: spec.loop_id.clone(),
+        name: format!("{} (join)", spec.name),
+        kind: LoopNodeKind::Join,
+        config: serde_json::json!({ "ensemble_id": ensemble_id }),
+        position: next_position,
+        created_at: now,
+    };
+
+    edges.push(LoopEdge {
+        id: uuid::Uuid::new_v4().to_string(),
+        spec_id: spec.spec_id.clone(),
+        loop_id: spec.loop_id.clone(),
+        from_node: join_node_id.clone(),
+        to_node: spec.on_pass_to.to_string(),
+        condition: LoopEdgeCondition::Pass,
+    });
+    if let Some(on_fail_to) = spec.on_fail_to {
+        edges.push(LoopEdge {
+            id: uuid::Uuid::new_v4().to_string(),
+            spec_id: spec.spec_id.clone(),
+            loop_id: spec.loop_id.clone(),
+            from_node: join_node_id.clone(),
+            to_node: on_fail_to.to_string(),
+            condition: LoopEdgeCondition::Fail,
+        });
+    }
+
+    let ensemble = Ensemble {
+        id: ensemble_id,
+        spec_id: spec.spec_id.clone(),
+        loop_id: spec.loop_id.clone(),
+        name: spec.name.to_string(),
+        prompt_template: spec.prompt_template.to_string(),
+        join_node_id,
+        entry_from_node: spec.entry_from_node.to_string(),
+        entry_condition: spec.entry_condition,
+        min_pass: spec.min_pass,
+        straggler_timeout_minutes: spec.straggler_timeout_minutes,
+        timeout_minutes: spec.timeout_minutes,
+        on_pass_to: spec.on_pass_to.to_string(),
+        on_fail_to: spec.on_fail_to.map(str::to_string),
+        created_at: now,
+    };
+
+    BuiltEnsembleUnit {
+        ensemble,
+        members: ensemble_members,
+        member_nodes,
+        join_node,
+        edges,
+    }
+}
+
 fn validate_loop_exists(db: &Database, loop_id: &str) -> Result<(), String> {
     db.get_loop(loop_id)
         .map_err(|e| e.to_string())?
@@ -933,6 +1079,408 @@ fn build_id_result(id: &str, key: &str) -> CallToolResult {
     CallToolResult::success(vec![Content::text(
         serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap_or_default(),
     )])
+}
+
+/// Return an arbitrary JSON value as a tool result — used by the copy tools
+/// (`loop_copy_node`/`loop_copy_ensemble`) whose response carries an explicit
+/// old→new id mapping and a wiring report, not just a single id.
+fn build_json_result(value: &serde_json::Value) -> CallToolResult {
+    CallToolResult::success(vec![Content::text(
+        serde_json::to_string_pretty(value).unwrap_or_default(),
+    )])
+}
+
+/// A graph target split into `(spec_id, loop_id, existing_nodes)` — exactly one
+/// of the ids is set. Returned by [`graph_target_parts`].
+type GraphParts = (Option<String>, Option<String>, Vec<LoopNode>);
+
+/// Resolve the target graph for a copy: an explicit `spec_id`/`loop_id`, or —
+/// when both are absent — the source's own graph. Cross-graph copies are
+/// allowed; the source graph is only a default, never a constraint.
+fn resolve_copy_target(
+    db: &Database,
+    spec_id: Option<&str>,
+    loop_id: Option<&str>,
+    source_spec_id: &Option<String>,
+    source_loop_id: &Option<String>,
+) -> Result<GraphTarget, String> {
+    let spec_id = spec_id.map(str::trim).filter(|s| !s.is_empty());
+    let loop_id = loop_id.map(str::trim).filter(|s| !s.is_empty());
+    match (spec_id, loop_id) {
+        (Some(_), Some(_)) => Err("Provide at most one of spec_id or loop_id.".to_string()),
+        (Some(spec_id), None) => {
+            validate_spec_exists(db, spec_id)?;
+            Ok(GraphTarget::Spec(spec_id.to_string()))
+        }
+        (None, Some(loop_id)) => {
+            validate_loop_exists(db, loop_id)?;
+            Ok(GraphTarget::Loop(loop_id.to_string()))
+        }
+        (None, None) => {
+            if let Some(spec_id) = source_spec_id {
+                Ok(GraphTarget::Spec(spec_id.clone()))
+            } else if let Some(loop_id) = source_loop_id {
+                Ok(GraphTarget::Loop(loop_id.clone()))
+            } else {
+                Err(
+                    "Source belongs to no graph and no target spec_id/loop_id was given."
+                        .to_string(),
+                )
+            }
+        }
+    }
+}
+
+/// Split a [`GraphTarget`] into `(spec_id, loop_id)` (exactly one set) plus the
+/// target graph's current nodes — used by the copy planners to place the copy
+/// at the next free position and to validate wiring targets against that graph.
+fn graph_target_parts(db: &Database, target: &GraphTarget) -> Result<GraphParts, String> {
+    match target {
+        GraphTarget::Spec(spec_id) => {
+            let nodes = db.list_loop_nodes(spec_id).map_err(|e| e.to_string())?;
+            Ok((Some(spec_id.clone()), None, nodes))
+        }
+        GraphTarget::Loop(loop_id) => {
+            let nodes = db
+                .list_loop_nodes_for_loop(loop_id)
+                .map_err(|e| e.to_string())?;
+            Ok((None, Some(loop_id.clone()), nodes))
+        }
+    }
+}
+
+/// A planned single-node copy: the new node, its optional wiring edges, and a
+/// report of the wiring actually applied. Pure of side effects — the caller
+/// persists it with [`Database::insert_node_with_edges`]. Split out from
+/// `loop_copy_node` so the copy/override/wiring logic is unit-testable with
+/// just a `Database`.
+#[derive(Debug)]
+struct NodeCopyPlan {
+    source_id: String,
+    node: LoopNode,
+    edges: Vec<LoopEdge>,
+    wiring: serde_json::Map<String, serde_json::Value>,
+}
+
+fn plan_node_copy(db: &Database, params: &LoopCopyNodeParams) -> Result<NodeCopyPlan, String> {
+    let source_id = params.source_node_id.trim();
+    let source = validate_node_exists(db, source_id)?;
+    if source.kind == LoopNodeKind::Join {
+        return Err(
+            "Cannot copy a join node directly; copy its ensemble with loop_copy_ensemble."
+                .to_string(),
+        );
+    }
+    if let Err(e) = validate_node_not_ensemble_owned(db, source_id) {
+        return Err(format!(
+            "Cannot copy an ensemble-owned node directly; copy the whole ensemble with loop_copy_ensemble instead. {e}"
+        ));
+    }
+
+    let target = resolve_copy_target(
+        db,
+        params.spec_id.as_deref(),
+        params.loop_id.as_deref(),
+        &source.spec_id,
+        &source.loop_id,
+    )?;
+    let (spec_id, loop_id, existing_nodes) = graph_target_parts(db, &target)?;
+
+    // Copy the source config, then shallow-merge any override keys over it.
+    let mut config = source.config.clone();
+    if let Some(overrides) = &params.config_overrides {
+        match config.as_object_mut() {
+            Some(map) => {
+                for (key, value) in overrides {
+                    map.insert(key.clone(), value.clone());
+                }
+            }
+            None => config = serde_json::Value::Object(overrides.clone()),
+        }
+    }
+    validate_node_config(source.kind, &config)?;
+
+    let name = params
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(source.name.as_str())
+        .to_string();
+
+    let new_id = uuid::Uuid::new_v4().to_string();
+    let next_position = existing_nodes
+        .last()
+        .map(|node| node.position + 1)
+        .unwrap_or(1);
+    let node = LoopNode {
+        id: new_id.clone(),
+        spec_id: spec_id.clone(),
+        loop_id: loop_id.clone(),
+        name,
+        kind: source.kind,
+        config,
+        position: next_position,
+        created_at: chrono::Utc::now(),
+    };
+
+    let node_exists = |id: &str| existing_nodes.iter().any(|n| n.id == id);
+    let mut edges = Vec::new();
+    let mut wiring = serde_json::Map::new();
+
+    if let Some(from) = params
+        .entry_from_node
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if !node_exists(from) {
+            return Err(format!(
+                "entry_from_node '{from}' not found in the target graph."
+            ));
+        }
+        let condition = match params.entry_condition.as_deref() {
+            Some(value) => validate_edge_condition(value)?,
+            None => LoopEdgeCondition::Always,
+        };
+        edges.push(LoopEdge {
+            id: uuid::Uuid::new_v4().to_string(),
+            spec_id: spec_id.clone(),
+            loop_id: loop_id.clone(),
+            from_node: from.to_string(),
+            to_node: new_id.clone(),
+            condition,
+        });
+        wiring.insert("entry_from_node".into(), serde_json::json!(from));
+        wiring.insert(
+            "entry_condition".into(),
+            serde_json::json!(condition.as_str()),
+        );
+    }
+    for (field, target_node, cond) in [
+        ("on_pass_to", &params.on_pass_to, LoopEdgeCondition::Pass),
+        ("on_fail_to", &params.on_fail_to, LoopEdgeCondition::Fail),
+    ] {
+        if let Some(to) = target_node
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if !node_exists(to) {
+                return Err(format!("{field} '{to}' not found in the target graph."));
+            }
+            edges.push(LoopEdge {
+                id: uuid::Uuid::new_v4().to_string(),
+                spec_id: spec_id.clone(),
+                loop_id: loop_id.clone(),
+                from_node: new_id.clone(),
+                to_node: to.to_string(),
+                condition: cond,
+            });
+            wiring.insert(field.to_string(), serde_json::json!(to));
+        }
+    }
+
+    Ok(NodeCopyPlan {
+        source_id: source_id.to_string(),
+        node,
+        edges,
+        wiring,
+    })
+}
+
+/// The `note` line a `loop_copy_node` response carries. An unwired copy is a
+/// valid outcome, but callers must never assume edges exist — so the note says
+/// so explicitly and points at how to wire it.
+fn node_copy_note(source_id: &str, new_id: &str, wired: bool) -> String {
+    if wired {
+        format!("Copied node config from '{source_id}' into a new node '{new_id}'.")
+    } else {
+        format!(
+            "Unwired copy of '{source_id}': the new node '{new_id}' has NO incoming or \
+             outgoing edges yet. Wire it with loop_add_edge, or pass \
+             entry_from_node/on_pass_to/on_fail_to."
+        )
+    }
+}
+
+/// A planned ensemble copy: the fully-built new unit plus the metadata needed
+/// to report the old→new id mapping and the applied wiring. Pure of side
+/// effects — the caller persists `built` with [`Database::insert_ensemble_unit`].
+#[derive(Debug)]
+struct EnsembleCopyPlan {
+    source_ensemble_id: String,
+    source_join_node_id: String,
+    /// Source member node ids in position order — paired with the new member
+    /// nodes for the mapping when members were not replaced.
+    source_member_node_ids: Vec<String>,
+    members_replaced: bool,
+    built: BuiltEnsembleUnit,
+    entry_from_node: String,
+    entry_condition: LoopEdgeCondition,
+    on_pass_to: String,
+    on_fail_to: Option<String>,
+}
+
+fn plan_ensemble_copy(
+    db: &Database,
+    params: &LoopCopyEnsembleParams,
+) -> Result<EnsembleCopyPlan, String> {
+    let source_id = params.source_ensemble_id.trim();
+    let details = db
+        .get_ensemble_details(source_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Ensemble '{source_id}' not found."))?;
+    let source = &details.ensemble;
+
+    let target = resolve_copy_target(
+        db,
+        params.spec_id.as_deref(),
+        params.loop_id.as_deref(),
+        &source.spec_id,
+        &source.loop_id,
+    )?;
+    let (spec_id, loop_id, existing_nodes) = graph_target_parts(db, &target)?;
+    let node_exists = |id: &str| existing_nodes.iter().any(|n| n.id == id);
+
+    let name = params
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{} (copy)", source.name));
+    let prompt_template = params
+        .prompt_template
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(source.prompt_template.as_str())
+        .to_string();
+
+    let members_replaced = params.members.is_some();
+    let members: Vec<(String, Option<String>)> = match &params.members {
+        Some(explicit) => validate_ensemble_members(explicit)?,
+        None => details
+            .members
+            .iter()
+            .map(|m| (m.platform.clone(), m.model.clone()))
+            .collect(),
+    };
+
+    let entry_from_node = params
+        .from_node
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(source.entry_from_node.as_str())
+        .to_string();
+    let entry_condition = match params
+        .condition
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(value) => validate_edge_condition(value)?,
+        None => source.entry_condition,
+    };
+    let on_pass_to = params
+        .on_pass_to
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(source.on_pass_to.as_str())
+        .to_string();
+    let on_fail_to = match params
+        .on_fail_to
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(value) => Some(value.to_string()),
+        None => source.on_fail_to.clone(),
+    };
+
+    // Wiring targets must exist in the TARGET graph (respecting the target
+    // loop's own validation for a cross-loop copy) and must not be
+    // ensemble-owned — the same rules loop_add_ensemble enforces.
+    for (label, id) in [("from_node", &entry_from_node), ("on_pass_to", &on_pass_to)] {
+        if !node_exists(id) {
+            return Err(format!(
+                "Wiring node '{id}' ({label}) not found in the target graph. Pass {label} \
+                 that exists there (required for a cross-graph copy)."
+            ));
+        }
+        if let Err(e) = validate_node_not_ensemble_owned(db, id) {
+            return Err(format!(
+                "Cannot wire an ensemble to an ensemble-owned node ({label}): {e}"
+            ));
+        }
+    }
+    if let Some(fail) = &on_fail_to {
+        if !node_exists(fail) {
+            return Err(format!(
+                "Wiring node '{fail}' (on_fail_to) not found in the target graph."
+            ));
+        }
+        if let Err(e) = validate_node_not_ensemble_owned(db, fail) {
+            return Err(format!(
+                "Cannot wire an ensemble to an ensemble-owned node (on_fail_to): {e}"
+            ));
+        }
+    }
+
+    let min_pass = params.min_pass.unwrap_or(source.min_pass);
+    if min_pass < 1 || min_pass > members.len() as i64 {
+        return Err(format!(
+            "min_pass must be between 1 and {} (the member count), got {min_pass}.",
+            members.len()
+        ));
+    }
+    let timeout_minutes = params.timeout_minutes.unwrap_or(source.timeout_minutes);
+    if timeout_minutes < 0 {
+        return Err("timeout_minutes must not be negative.".to_string());
+    }
+    let straggler_timeout_minutes = params
+        .straggler_timeout_minutes
+        .or(source.straggler_timeout_minutes);
+    if let Some(straggler) = straggler_timeout_minutes {
+        if straggler < 0 {
+            return Err("straggler_timeout_minutes must not be negative.".to_string());
+        }
+    }
+
+    let start_position = existing_nodes
+        .last()
+        .map(|node| node.position + 1)
+        .unwrap_or(1);
+    let built = build_ensemble_unit(&EnsembleUnitSpec {
+        spec_id,
+        loop_id,
+        name: &name,
+        prompt_template: &prompt_template,
+        members: &members,
+        entry_from_node: &entry_from_node,
+        entry_condition,
+        on_pass_to: &on_pass_to,
+        on_fail_to: on_fail_to.as_deref(),
+        min_pass,
+        timeout_minutes,
+        straggler_timeout_minutes,
+        start_position,
+    });
+
+    Ok(EnsembleCopyPlan {
+        source_ensemble_id: source.id.clone(),
+        source_join_node_id: source.join_node_id.clone(),
+        source_member_node_ids: details.members.iter().map(|m| m.node_id.clone()).collect(),
+        members_replaced,
+        built,
+        entry_from_node,
+        entry_condition,
+        on_pass_to,
+        on_fail_to,
+    })
 }
 
 struct SpecRunInfo {
@@ -3420,120 +3968,143 @@ impl TaskTriggerHandler {
             GraphTarget::Spec(spec_id) => (Some(spec_id.clone()), None),
             GraphTarget::Loop(loop_id) => (None, Some(loop_id.clone())),
         };
-        let mut next_position = existing_nodes
+        let start_position = existing_nodes
             .last()
             .map(|node| node.position + 1)
             .unwrap_or(1);
 
-        let ensemble_id = uuid::Uuid::new_v4().to_string();
-        let join_node_id = uuid::Uuid::new_v4().to_string();
-        let now = chrono::Utc::now();
-
-        let mut member_nodes = Vec::with_capacity(members.len());
-        let mut ensemble_members = Vec::with_capacity(members.len());
-        let mut edges = Vec::new();
-
-        for (index, (platform, model)) in members.iter().enumerate() {
-            let node_id = uuid::Uuid::new_v4().to_string();
-            member_nodes.push(LoopNode {
-                id: node_id.clone(),
-                spec_id: spec_id.clone(),
-                loop_id: loop_id.clone(),
-                name: format!("{name} [{}]", index + 1),
-                kind: LoopNodeKind::Agent,
-                config: member_node_config(
-                    platform,
-                    model.as_deref(),
-                    prompt_template,
-                    timeout_minutes,
-                ),
-                position: next_position,
-                created_at: now,
-            });
-            edges.push(LoopEdge {
-                id: uuid::Uuid::new_v4().to_string(),
-                spec_id: spec_id.clone(),
-                loop_id: loop_id.clone(),
-                from_node: from_node.to_string(),
-                to_node: node_id.clone(),
-                condition,
-            });
-            edges.push(LoopEdge {
-                id: uuid::Uuid::new_v4().to_string(),
-                spec_id: spec_id.clone(),
-                loop_id: loop_id.clone(),
-                from_node: node_id.clone(),
-                to_node: join_node_id.clone(),
-                condition: LoopEdgeCondition::Always,
-            });
-            ensemble_members.push(EnsembleMember {
-                ensemble_id: ensemble_id.clone(),
-                node_id,
-                position: index as i64,
-                platform: platform.clone(),
-                model: model.clone(),
-            });
-            next_position += 1;
-        }
-
-        let join_node = LoopNode {
-            id: join_node_id.clone(),
-            spec_id: spec_id.clone(),
-            loop_id: loop_id.clone(),
-            name: format!("{name} (join)"),
-            kind: LoopNodeKind::Join,
-            config: serde_json::json!({ "ensemble_id": ensemble_id }),
-            position: next_position,
-            created_at: now,
-        };
-
-        edges.push(LoopEdge {
-            id: uuid::Uuid::new_v4().to_string(),
-            spec_id: spec_id.clone(),
-            loop_id: loop_id.clone(),
-            from_node: join_node_id.clone(),
-            to_node: on_pass_to.to_string(),
-            condition: LoopEdgeCondition::Pass,
-        });
-        if let Some(on_fail_to) = on_fail_to {
-            edges.push(LoopEdge {
-                id: uuid::Uuid::new_v4().to_string(),
-                spec_id: spec_id.clone(),
-                loop_id: loop_id.clone(),
-                from_node: join_node_id.clone(),
-                to_node: on_fail_to.to_string(),
-                condition: LoopEdgeCondition::Fail,
-            });
-        }
-
-        let ensemble = Ensemble {
-            id: ensemble_id,
+        let built = build_ensemble_unit(&EnsembleUnitSpec {
             spec_id,
             loop_id,
-            name: name.to_string(),
-            prompt_template: prompt_template.to_string(),
-            join_node_id,
-            entry_from_node: from_node.to_string(),
+            name,
+            prompt_template,
+            members: &members,
+            entry_from_node: from_node,
             entry_condition: condition,
+            on_pass_to,
+            on_fail_to,
             min_pass,
-            straggler_timeout_minutes: params.straggler_timeout_minutes,
             timeout_minutes,
-            on_pass_to: on_pass_to.to_string(),
-            on_fail_to: on_fail_to.map(str::to_string),
-            created_at: now,
-        };
+            straggler_timeout_minutes: params.straggler_timeout_minutes,
+            start_position,
+        });
 
         self.db
             .insert_ensemble_unit(
-                &ensemble,
-                &ensemble_members,
-                &member_nodes,
-                &join_node,
-                &edges,
+                &built.ensemble,
+                &built.members,
+                &built.member_nodes,
+                &built.join_node,
+                &built.edges,
             )
             .map_err(internal_error)?;
 
-        Ok(build_id_result(&ensemble.id, "ensemble_id"))
+        Ok(build_id_result(&built.ensemble.id, "ensemble_id"))
+    }
+
+    #[tool(
+        name = "loop_copy_node",
+        description = "Duplicate a loop node's CONFIG (never its runtime state) into a graph — the source's own by default, or a different spec/loop for a cross-loop copy. Optional overrides: name, and config_overrides shallow-merged over the copied config (e.g. swap prompt_template, platform, model, timeout_minutes). Optional wiring: entry_from_node/entry_condition (incoming edge) and on_pass_to/on_fail_to (outgoing edges). All ids are new. An unwired copy is valid and is reported as such — no edges are assumed."
+    )]
+    async fn loop_copy_node(
+        &self,
+        Parameters(params): Parameters<LoopCopyNodeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let plan = match plan_node_copy(&self.db, &params) {
+            Ok(plan) => plan,
+            Err(e) => return Ok(error_result(&e)),
+        };
+
+        self.db
+            .insert_node_with_edges(&plan.node, &plan.edges)
+            .map_err(internal_error)?;
+
+        let wired = !plan.edges.is_empty();
+        let mut mapping = serde_json::Map::new();
+        mapping.insert(plan.source_id.clone(), serde_json::json!(plan.node.id));
+        let note = node_copy_note(&plan.source_id, &plan.node.id, wired);
+        Ok(build_json_result(&serde_json::json!({
+            "node_id": plan.node.id,
+            "mapping": mapping,
+            "wired": wired,
+            "wiring": plan.wiring,
+            "copied_runtime_state": false,
+            "note": note,
+        })))
+    }
+
+    #[tool(
+        name = "loop_copy_ensemble",
+        description = "Duplicate a whole ensemble unit (members + join + shared prompt) — CONFIG only, never runtime state — in one call. Optional overrides: name, prompt_template (e.g. swap a proposer prompt for a review prompt), members (2-8 replacement), min_pass, timeout_minutes, straggler_timeout_minutes, and wiring (from_node/condition entry, on_pass_to/on_fail_to exit). Wiring defaults to the source's; for a cross-loop copy pass wiring that exists in the target graph. Every id is new; the response returns the full old→new id mapping and the wiring actually applied."
+    )]
+    async fn loop_copy_ensemble(
+        &self,
+        Parameters(params): Parameters<LoopCopyEnsembleParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let plan = match plan_ensemble_copy(&self.db, &params) {
+            Ok(plan) => plan,
+            Err(e) => return Ok(error_result(&e)),
+        };
+        let built = &plan.built;
+
+        self.db
+            .insert_ensemble_unit(
+                &built.ensemble,
+                &built.members,
+                &built.member_nodes,
+                &built.join_node,
+                &built.edges,
+            )
+            .map_err(internal_error)?;
+
+        // Full old→new id mapping. Member nodes map by position only when the
+        // members weren't replaced (otherwise there's no 1:1 correspondence).
+        let mut mapping = serde_json::Map::new();
+        mapping.insert(
+            plan.source_ensemble_id.clone(),
+            serde_json::json!(built.ensemble.id),
+        );
+        mapping.insert(
+            plan.source_join_node_id.clone(),
+            serde_json::json!(built.join_node.id),
+        );
+        if !plan.members_replaced {
+            for (old_id, new_node) in plan
+                .source_member_node_ids
+                .iter()
+                .zip(built.member_nodes.iter())
+            {
+                mapping.insert(old_id.clone(), serde_json::json!(new_node.id));
+            }
+        }
+        let new_member_node_ids: Vec<&str> = built
+            .member_nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect();
+
+        Ok(build_json_result(&serde_json::json!({
+            "ensemble_id": built.ensemble.id,
+            "join_node_id": built.join_node.id,
+            "mapping": mapping,
+            "members_replaced": plan.members_replaced,
+            "member_node_ids": new_member_node_ids,
+            "wiring": {
+                "entry_from_node": plan.entry_from_node,
+                "entry_condition": plan.entry_condition.as_str(),
+                "on_pass_to": plan.on_pass_to,
+                "on_fail_to": plan.on_fail_to,
+            },
+            "copied_runtime_state": false,
+            "note": format!(
+                "Copied ensemble '{}' as '{}' — wired from '{}' to '{}'{}.",
+                plan.source_ensemble_id,
+                built.ensemble.id,
+                plan.entry_from_node,
+                plan.on_pass_to,
+                plan.on_fail_to.as_deref().map(|f| format!(" (fail → '{f}')")).unwrap_or_default(),
+            ),
+        })))
     }
 
     #[tool(
@@ -5045,14 +5616,16 @@ impl ServerHandler for TaskTriggerHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_skip_next_spec, header_str, loop_details_json, loop_run_status_guard,
-        missing_sync_identity_error, perform_loop_reset, resolve_graph_target,
-        resolve_node_kind_and_config, resolve_reported_run, validate_blueprint_exists,
-        validate_ensemble_members, validate_node_config, validate_node_not_ensemble_owned,
-        validate_pool_exists, validate_pool_member_removable, validate_pool_not_consumed,
-        validate_pool_reorder, validate_pool_reorder_locking, validate_spec_deletable,
-        validate_spec_exists, EnsembleMemberParams, MISSING_SYNC_IDENTITY_MESSAGE,
+        build_ensemble_unit, handle_skip_next_spec, header_str, loop_details_json,
+        loop_run_status_guard, missing_sync_identity_error, node_copy_note, perform_loop_reset,
+        plan_ensemble_copy, plan_node_copy, resolve_graph_target, resolve_node_kind_and_config,
+        resolve_reported_run, validate_blueprint_exists, validate_ensemble_members,
+        validate_node_config, validate_node_not_ensemble_owned, validate_pool_exists,
+        validate_pool_member_removable, validate_pool_not_consumed, validate_pool_reorder,
+        validate_pool_reorder_locking, validate_spec_deletable, validate_spec_exists,
+        BuiltEnsembleUnit, EnsembleMemberParams, EnsembleUnitSpec, MISSING_SYNC_IDENTITY_MESSAGE,
     };
+    use crate::daemon::params::{LoopCopyEnsembleParams, LoopCopyNodeParams};
     use crate::db::Database;
     use crate::domain::blueprints::Blueprint;
     use crate::domain::loops::{
@@ -6356,5 +6929,378 @@ mod tests {
         let details = db.get_loop_details(&loop_id).unwrap().unwrap();
         let json = loop_details_json(&db, &details).unwrap();
         assert_eq!(json["autorun_at"].as_str().unwrap(), at.to_rfc3339());
+    }
+
+    // ── U10: copy nodes and ensembles ────────────────────────────────
+
+    fn u10_check(
+        id: &str,
+        spec_id: Option<&str>,
+        loop_id: Option<&str>,
+        position: i64,
+    ) -> LoopNode {
+        LoopNode {
+            id: id.to_string(),
+            spec_id: spec_id.map(str::to_string),
+            loop_id: loop_id.map(str::to_string),
+            name: id.to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "true"}),
+            position,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn u10_agent(
+        id: &str,
+        spec_id: Option<&str>,
+        loop_id: Option<&str>,
+        position: i64,
+        config: serde_json::Value,
+    ) -> LoopNode {
+        LoopNode {
+            id: id.to_string(),
+            spec_id: spec_id.map(str::to_string),
+            loop_id: loop_id.map(str::to_string),
+            name: id.to_string(),
+            kind: LoopNodeKind::Agent,
+            config,
+            position,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// A persisted source ensemble ("proposers"): two members (claude, codex/o1),
+    /// wired `from` → members → join → `to`.
+    fn u10_source_ensemble(
+        db: &Database,
+        spec_id: Option<&str>,
+        loop_id: Option<&str>,
+        from: &str,
+        to: &str,
+    ) -> BuiltEnsembleUnit {
+        let members = [
+            ("claude".to_string(), None),
+            ("codex".to_string(), Some("o1".to_string())),
+        ];
+        let built = build_ensemble_unit(&EnsembleUnitSpec {
+            spec_id: spec_id.map(str::to_string),
+            loop_id: loop_id.map(str::to_string),
+            name: "proposers",
+            prompt_template: "propose a solution",
+            members: &members,
+            entry_from_node: from,
+            entry_condition: LoopEdgeCondition::Always,
+            on_pass_to: to,
+            on_fail_to: None,
+            min_pass: 2,
+            timeout_minutes: 30,
+            straggler_timeout_minutes: None,
+            start_position: 10,
+        });
+        db.insert_ensemble_unit(
+            &built.ensemble,
+            &built.members,
+            &built.member_nodes,
+            &built.join_node,
+            &built.edges,
+        )
+        .unwrap();
+        built
+    }
+
+    #[test]
+    fn loop_copy_node_applies_overrides_and_wiring() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("t.db")).unwrap();
+        insert_test_loop(&db, "loop-1");
+        db.insert_loop_node(&u10_agent(
+            "impl",
+            None,
+            Some("loop-1"),
+            1,
+            serde_json::json!({"platform":"claude","prompt_template":"implement it","timeout_minutes":30}),
+        ))
+        .unwrap();
+        db.insert_loop_node(&u10_check("gate", None, Some("loop-1"), 2))
+            .unwrap();
+
+        let params: LoopCopyNodeParams = serde_json::from_value(serde_json::json!({
+            "source_node_id": "impl",
+            "loop_id": "loop-1",
+            "name": "review",
+            "config_overrides": {"prompt_template": "review it", "platform": "codex"},
+            "on_pass_to": "gate"
+        }))
+        .unwrap();
+        let plan = plan_node_copy(&db, &params).unwrap();
+
+        assert_ne!(plan.node.id, "impl", "the copy must have a fresh id");
+        assert_eq!(plan.node.name, "review");
+        assert_eq!(plan.node.kind, LoopNodeKind::Agent);
+        // Overridden keys win; untouched source keys are preserved.
+        assert_eq!(plan.node.config["prompt_template"], "review it");
+        assert_eq!(plan.node.config["platform"], "codex");
+        assert_eq!(plan.node.config["timeout_minutes"], 30);
+        assert_eq!(plan.node.loop_id.as_deref(), Some("loop-1"));
+        assert!(plan.node.spec_id.is_none());
+        // One outgoing pass edge to the wiring target.
+        assert_eq!(plan.edges.len(), 1);
+        assert_eq!(plan.edges[0].from_node, plan.node.id);
+        assert_eq!(plan.edges[0].to_node, "gate");
+        assert_eq!(plan.edges[0].condition.as_str(), "pass");
+        assert_eq!(plan.wiring.get("on_pass_to").unwrap(), "gate");
+    }
+
+    #[test]
+    fn loop_copy_node_unwired_copy_is_valid_and_reported() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("t.db")).unwrap();
+        insert_test_loop(&db, "loop-1");
+        db.insert_loop_node(&u10_agent(
+            "impl",
+            None,
+            Some("loop-1"),
+            1,
+            serde_json::json!({"platform":"claude"}),
+        ))
+        .unwrap();
+
+        // No wiring, no target override → copy into the source's own graph.
+        let params: LoopCopyNodeParams =
+            serde_json::from_value(serde_json::json!({"source_node_id": "impl"})).unwrap();
+        let plan = plan_node_copy(&db, &params).unwrap();
+
+        assert!(plan.edges.is_empty(), "an unwired copy creates no edges");
+        assert!(plan.wiring.is_empty());
+        assert_eq!(plan.node.loop_id.as_deref(), Some("loop-1"));
+        assert_eq!(plan.node.config["platform"], "claude");
+        assert_ne!(plan.node.id, "impl");
+
+        // The response note must flag the unwired state explicitly.
+        let note = node_copy_note(&plan.source_id, &plan.node.id, false);
+        assert!(note.contains("Unwired copy"), "{note}");
+        assert!(note.contains("loop_add_edge"), "{note}");
+    }
+
+    #[test]
+    fn loop_copy_node_rejects_ensemble_owned_source() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("t.db")).unwrap();
+        insert_test_loop(&db, "loop-1");
+        db.insert_loop_node(&u10_check("kickoff", None, Some("loop-1"), 1))
+            .unwrap();
+        db.insert_loop_node(&u10_agent(
+            "arbiter",
+            None,
+            Some("loop-1"),
+            2,
+            serde_json::json!({"platform":"claude"}),
+        ))
+        .unwrap();
+        let src = u10_source_ensemble(&db, None, Some("loop-1"), "kickoff", "arbiter");
+
+        // A member node can't be copied directly — must go through the ensemble.
+        let params: LoopCopyNodeParams = serde_json::from_value(serde_json::json!({
+            "source_node_id": src.members[0].node_id
+        }))
+        .unwrap();
+        let err = plan_node_copy(&db, &params).unwrap_err();
+        assert!(err.contains("loop_copy_ensemble"), "{err}");
+    }
+
+    #[test]
+    fn loop_copy_ensemble_overrides_prompt_and_rewires() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("t.db")).unwrap();
+        insert_test_loop(&db, "loop-1");
+        db.insert_loop_node(&u10_check("kickoff", None, Some("loop-1"), 1))
+            .unwrap();
+        db.insert_loop_node(&u10_agent(
+            "arbiter",
+            None,
+            Some("loop-1"),
+            2,
+            serde_json::json!({"platform":"claude"}),
+        ))
+        .unwrap();
+        db.insert_loop_node(&u10_check("review_from", None, Some("loop-1"), 3))
+            .unwrap();
+        db.insert_loop_node(&u10_check("review_next", None, Some("loop-1"), 4))
+            .unwrap();
+        let src = u10_source_ensemble(&db, None, Some("loop-1"), "kickoff", "arbiter");
+
+        // Canonical use: copy the proposer ensemble, swap in a review prompt,
+        // rewire it after the gates.
+        let params: LoopCopyEnsembleParams = serde_json::from_value(serde_json::json!({
+            "source_ensemble_id": src.ensemble.id,
+            "prompt_template": "review the proposal",
+            "from_node": "review_from",
+            "condition": "pass",
+            "on_pass_to": "review_next"
+        }))
+        .unwrap();
+        let plan = plan_ensemble_copy(&db, &params).unwrap();
+
+        assert_ne!(plan.built.ensemble.id, src.ensemble.id);
+        assert_eq!(plan.built.ensemble.prompt_template, "review the proposal");
+        assert_eq!(plan.entry_from_node, "review_from");
+        assert_eq!(plan.entry_condition.as_str(), "pass");
+        assert_eq!(plan.on_pass_to, "review_next");
+        assert!(!plan.members_replaced);
+        assert_eq!(plan.built.member_nodes.len(), 2);
+        for node in &plan.built.member_nodes {
+            // The shared prompt propagates to every member node's config.
+            assert_eq!(node.config["prompt_template"], "review the proposal");
+            assert!(
+                !src.member_nodes.iter().any(|m| m.id == node.id),
+                "member node ids must be fresh"
+            );
+        }
+
+        // Persisting the plan yields a resolvable ensemble with the same members.
+        db.insert_ensemble_unit(
+            &plan.built.ensemble,
+            &plan.built.members,
+            &plan.built.member_nodes,
+            &plan.built.join_node,
+            &plan.built.edges,
+        )
+        .unwrap();
+        let details = db
+            .get_ensemble_details(&plan.built.ensemble.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(details.members.len(), 2);
+        assert_eq!(details.members[0].platform, "claude");
+        assert_eq!(details.members[1].platform, "codex");
+    }
+
+    #[test]
+    fn loop_copy_ensemble_cross_loop_requires_and_uses_target_wiring() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("t.db")).unwrap();
+        insert_test_loop(&db, "loop-1");
+        db.insert_loop_node(&u10_check("kickoff", None, Some("loop-1"), 1))
+            .unwrap();
+        db.insert_loop_node(&u10_agent(
+            "arbiter",
+            None,
+            Some("loop-1"),
+            2,
+            serde_json::json!({"platform":"claude"}),
+        ))
+        .unwrap();
+        let src = u10_source_ensemble(&db, None, Some("loop-1"), "kickoff", "arbiter");
+
+        insert_test_loop(&db, "loop-2");
+        db.insert_loop_node(&u10_check("k2", None, Some("loop-2"), 1))
+            .unwrap();
+        db.insert_loop_node(&u10_agent(
+            "a2",
+            None,
+            Some("loop-2"),
+            2,
+            serde_json::json!({"platform":"claude"}),
+        ))
+        .unwrap();
+
+        // Cross-loop copy without wiring: the source's entry/exit nodes don't
+        // exist in loop-2, so it must be refused with an actionable message.
+        let bad: LoopCopyEnsembleParams = serde_json::from_value(serde_json::json!({
+            "source_ensemble_id": src.ensemble.id,
+            "loop_id": "loop-2"
+        }))
+        .unwrap();
+        let err = plan_ensemble_copy(&db, &bad).unwrap_err();
+        assert!(err.contains("not found in the target graph"), "{err}");
+
+        // With target wiring, the whole unit lands in loop-2's graph.
+        let ok: LoopCopyEnsembleParams = serde_json::from_value(serde_json::json!({
+            "source_ensemble_id": src.ensemble.id,
+            "loop_id": "loop-2",
+            "from_node": "k2",
+            "on_pass_to": "a2"
+        }))
+        .unwrap();
+        let plan = plan_ensemble_copy(&db, &ok).unwrap();
+        assert_eq!(plan.built.ensemble.loop_id.as_deref(), Some("loop-2"));
+        assert!(plan.built.ensemble.spec_id.is_none());
+        assert_eq!(plan.built.join_node.loop_id.as_deref(), Some("loop-2"));
+        for node in &plan.built.member_nodes {
+            assert_eq!(node.loop_id.as_deref(), Some("loop-2"));
+        }
+        assert_eq!(plan.entry_from_node, "k2");
+        assert_eq!(plan.on_pass_to, "a2");
+    }
+
+    #[test]
+    fn loop_copy_ensemble_copies_config_only_no_runtime_state() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("t.db")).unwrap();
+        insert_test_loop(&db, "loop-1");
+        db.insert_loop_spec(&standalone_spec("spec-src")).unwrap();
+        db.insert_loop_node(&u10_check("kickoff", Some("spec-src"), None, 1))
+            .unwrap();
+        db.insert_loop_node(&u10_agent(
+            "arbiter",
+            Some("spec-src"),
+            None,
+            2,
+            serde_json::json!({"platform":"claude"}),
+        ))
+        .unwrap();
+        let src = u10_source_ensemble(&db, Some("spec-src"), None, "kickoff", "arbiter");
+
+        // A completed run attached to a SOURCE member node: runtime state that
+        // must never be carried into the copy.
+        let source_member = src.members[0].node_id.clone();
+        db.insert_loop_run(&LoopNodeRun {
+            id: "run-src".to_string(),
+            loop_id: "loop-1".to_string(),
+            spec_id: "spec-src".to_string(),
+            node_id: source_member,
+            status: LoopRunStatus::Pass,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: Some(chrono::Utc::now()),
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        })
+        .unwrap();
+
+        let params: LoopCopyEnsembleParams = serde_json::from_value(serde_json::json!({
+            "source_ensemble_id": src.ensemble.id
+        }))
+        .unwrap();
+        let plan = plan_ensemble_copy(&db, &params).unwrap();
+        db.insert_ensemble_unit(
+            &plan.built.ensemble,
+            &plan.built.members,
+            &plan.built.member_nodes,
+            &plan.built.join_node,
+            &plan.built.edges,
+        )
+        .unwrap();
+
+        // Every copied node has a fresh identity...
+        for node in &plan.built.member_nodes {
+            assert!(!src.member_nodes.iter().any(|m| m.id == node.id));
+        }
+        // ...and NO run was copied: the only run is still the original, and
+        // none reference the new member nodes.
+        let runs = db.list_loop_runs_for_spec("spec-src").unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, "run-src");
+        let new_ids: Vec<&str> = plan
+            .built
+            .member_nodes
+            .iter()
+            .map(|n| n.id.as_str())
+            .collect();
+        assert!(!runs.iter().any(|r| new_ids.contains(&r.node_id.as_str())));
     }
 }

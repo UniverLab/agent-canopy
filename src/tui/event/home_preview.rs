@@ -263,6 +263,13 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
                 app.open_edit_dialog();
             }
         }
+        KeyCode::Char('d')
+            if app.sidebar_mode == SidebarMode::Projects
+                && app.projects_panel_focus == ProjectsPanelFocus::Loops =>
+        {
+            // U10: duplicate the highlighted loop node in place.
+            let _ = app.duplicate_selected_loop_node();
+        }
         KeyCode::Char('d') if !app.agents_rag_focused => {
             let _ = app.toggle_enable();
         }

@@ -771,6 +771,51 @@ impl Database {
         Ok(())
     }
 
+    /// Insert a node together with any edges wiring it, in one transaction, so
+    /// a copy (`loop_copy_node`) can never leave a node half-wired. Every edge
+    /// and the node must target the same single graph (spec or loop).
+    pub fn insert_node_with_edges(&self, node: &LoopNode, edges: &[LoopEdge]) -> Result<()> {
+        validate_single_target(node.spec_id.as_deref(), node.loop_id.as_deref())?;
+        for edge in edges {
+            validate_single_target(edge.spec_id.as_deref(), edge.loop_id.as_deref())?;
+        }
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO loop_nodes (id, spec_id, loop_id, name, kind, config, position, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                &node.id,
+                &node.spec_id,
+                &node.loop_id,
+                &node.name,
+                node.kind.as_str(),
+                serde_json::to_string(&node.config)?,
+                node.position,
+                node.created_at.timestamp(),
+            ],
+        )?;
+        for edge in edges {
+            tx.execute(
+                "INSERT INTO loop_edges (id, spec_id, loop_id, from_node, to_node, condition)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    &edge.id,
+                    &edge.spec_id,
+                    &edge.loop_id,
+                    &edge.from_node,
+                    &edge.to_node,
+                    edge.condition.as_str(),
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn list_loop_edges(&self, spec_id: &str) -> Result<Vec<LoopEdge>> {
         let conn = self
             .conn

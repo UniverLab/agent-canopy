@@ -587,6 +587,77 @@ pub struct LoopUpdateEnsembleParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopCopyNodeParams {
+    /// Node to copy. Only its config is copied — never any runtime state
+    /// (runs, iterations, statuses). Cannot be an ensemble member/join node
+    /// (copy those with loop_copy_ensemble).
+    pub source_node_id: String,
+    /// Target spec ID for the copy. Provide at most one of spec_id/loop_id;
+    /// omit both to copy into the source node's own graph.
+    pub spec_id: Option<String>,
+    /// Target loop ID (the loop's top-level graph). Cross-loop copy is
+    /// allowed. Provide at most one of spec_id/loop_id; omit both to copy into
+    /// the source node's own graph.
+    pub loop_id: Option<String>,
+    /// New node name. Defaults to the source node's name.
+    pub name: Option<String>,
+    /// Config keys to shallow-merge over the copied config — e.g. swap an
+    /// agent's prompt with {"prompt_template": "..."}, or override
+    /// platform/model/timeout_minutes/command/value.
+    pub config_overrides: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Optional incoming wiring: create an edge from this existing node in the
+    /// target graph to the copy. Omit to leave the copy without an entry edge.
+    pub entry_from_node: Option<String>,
+    /// Condition for the entry edge (pass/fail/always). Defaults to always.
+    /// Ignored unless entry_from_node is set.
+    pub entry_condition: Option<String>,
+    /// Optional outgoing edge: wire the copy to this node on a `pass` result.
+    pub on_pass_to: Option<String>,
+    /// Optional outgoing edge: wire the copy to this node on a `fail` result.
+    pub on_fail_to: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopCopyEnsembleParams {
+    /// Ensemble to copy. Members, join config, and shared prompt are copied
+    /// (config only — never runtime state). Every id in the copy is new.
+    pub source_ensemble_id: String,
+    /// Target spec ID for the copy. Provide at most one of spec_id/loop_id;
+    /// omit both to copy into the source ensemble's own graph.
+    pub spec_id: Option<String>,
+    /// Target loop ID (the loop's top-level graph). Cross-loop copy is
+    /// allowed. Provide at most one of spec_id/loop_id; omit both to copy into
+    /// the source ensemble's own graph.
+    pub loop_id: Option<String>,
+    /// New ensemble name. Defaults to the source name with a " (copy)" suffix.
+    pub name: Option<String>,
+    /// New shared prompt for every member — e.g. swap a proposer prompt for a
+    /// review prompt. Defaults to the source's prompt.
+    pub prompt_template: Option<String>,
+    /// Replacement member list (2-8). Defaults to the source's members.
+    pub members: Option<Vec<EnsembleMemberParams>>,
+    /// New pass threshold. Defaults to the source's (clamped to the member
+    /// count).
+    pub min_pass: Option<i64>,
+    /// New shared member agent timeout in minutes. Defaults to the source's.
+    pub timeout_minutes: Option<i64>,
+    /// New straggler timeout in minutes. Defaults to the source's.
+    pub straggler_timeout_minutes: Option<i64>,
+    /// Entry wiring override: the node the copy is wired from. Defaults to the
+    /// source's entry node — required for a cross-graph copy where that node
+    /// doesn't exist in the target.
+    pub from_node: Option<String>,
+    /// Entry routing condition (pass/fail/always). Defaults to the source's.
+    pub condition: Option<String>,
+    /// `pass` exit target node ID. Defaults to the source's — required for a
+    /// cross-graph copy where the source's target doesn't exist there.
+    pub on_pass_to: Option<String>,
+    /// `fail` exit target node ID. Defaults to the source's (which may be
+    /// none).
+    pub on_fail_to: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PoolCreateParams {
     /// Human-readable pool name.
     pub name: String,

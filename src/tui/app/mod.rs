@@ -1460,6 +1460,62 @@ impl App {
         Ok(())
     }
 
+    /// U10: duplicate the highlighted loop node — a fresh, unwired copy of its
+    /// config into the same graph — then open the editor on the copy so its
+    /// prompt/config can be tweaked (the closest thing the TUI has to a
+    /// creation flow to pre-fill). Ensemble member/join nodes are
+    /// engine-managed, so duplicating a whole ensemble is left to the
+    /// `loop_copy_ensemble` MCP tool and this is a no-op for those.
+    pub fn duplicate_selected_loop_node(&mut self) -> Result<()> {
+        let Some(node) = self.selected_loop_node() else {
+            return Ok(());
+        };
+        let node = node.clone();
+
+        // Ensemble-owned (member or join) nodes can't be copied as plain
+        // nodes — that would break the "no nested ensembles" invariant.
+        if node.kind == LoopNodeKind::Join
+            || self.db.get_ensemble_by_member_node(&node.id)?.is_some()
+            || self.db.get_ensemble_by_join_node(&node.id)?.is_some()
+        {
+            return Ok(());
+        }
+
+        let siblings = match (&node.spec_id, &node.loop_id) {
+            (Some(spec_id), _) => self.db.list_loop_nodes(spec_id)?,
+            (None, Some(loop_id)) => self.db.list_loop_nodes_for_loop(loop_id)?,
+            (None, None) => return Ok(()),
+        };
+        let next_position = siblings.last().map(|n| n.position + 1).unwrap_or(1);
+
+        let copy = crate::domain::loops::LoopNode {
+            id: uuid::Uuid::new_v4().to_string(),
+            spec_id: node.spec_id.clone(),
+            loop_id: node.loop_id.clone(),
+            name: format!("{} (copy)", node.name),
+            kind: node.kind,
+            config: node.config,
+            position: next_position,
+            created_at: chrono::Utc::now(),
+        };
+        self.db.insert_loop_node(&copy)?;
+        self.refresh_loops()?;
+
+        // Pre-fill the editor with the copy's config (identical to the
+        // source's) so the user can immediately adjust it.
+        let (title, help, buffer, mode) = self.build_editor_dialog_content(&copy);
+        self.loop_editor_dialog = Some(crate::tui::app::types::LoopEditorDialog::new(
+            copy.id.clone(),
+            copy.name,
+            title,
+            help,
+            buffer,
+            mode,
+        ));
+        self.focus = Focus::LoopEditorDialog;
+        Ok(())
+    }
+
     fn build_editor_dialog_content(
         &self,
         node: &crate::domain::loops::LoopNode,
@@ -3512,5 +3568,71 @@ mod tests {
         app.select_prev();
         assert_eq!(app.projects_panel_focus, ProjectsPanelFocus::Loops);
         assert_eq!(app.selected_loop_id.as_deref(), Some("l-active"));
+    }
+
+    #[test]
+    fn duplicate_selected_loop_node_copies_config_and_opens_editor() {
+        use crate::domain::loops::{LoopNode, LoopNodeKind, LoopSpec, LoopSpecStatus, LoopStatus};
+        use crate::tui::app::types::Focus;
+
+        let db = test_db();
+        db.insert_loop(&make_loop("loop-1", "Loop", LoopStatus::Draft))
+            .unwrap();
+        db.insert_loop_spec(&LoopSpec {
+            id: "spec-a".to_string(),
+            loop_id: Some("loop-1".to_string()),
+            name: "spec-a".to_string(),
+            description: None,
+            position: 0,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "impl".to_string(),
+            spec_id: Some("spec-a".to_string()),
+            loop_id: None,
+            name: "implement".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "claude", "prompt_template": "do it"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.selected_loop_id = Some("loop-1".to_string());
+        app.loop_details = db.get_loop_details("loop-1").unwrap();
+        app.loop_selected_spec = 0;
+        app.loop_selected_node = 0;
+        assert_eq!(app.selected_loop_node().unwrap().id, "impl");
+
+        app.duplicate_selected_loop_node().unwrap();
+
+        // The editor opens pre-filled on the new copy.
+        assert!(matches!(app.focus, Focus::LoopEditorDialog));
+        let dialog = app.loop_editor_dialog.as_ref().unwrap();
+        assert!(
+            dialog.node_name.ends_with("(copy)"),
+            "expected a copy name, got '{}'",
+            dialog.node_name
+        );
+        assert_ne!(dialog.node_id, "impl", "the copy must have a fresh id");
+
+        // A second node now exists on the spec with the source's config.
+        let nodes = db.list_loop_nodes("spec-a").unwrap();
+        assert_eq!(nodes.len(), 2);
+        let copy = nodes.iter().find(|n| n.id != "impl").unwrap();
+        assert_eq!(copy.name, "implement (copy)");
+        assert_eq!(copy.config["platform"], "claude");
+        assert_eq!(copy.config["prompt_template"], "do it");
     }
 }
