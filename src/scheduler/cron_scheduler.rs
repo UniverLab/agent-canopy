@@ -1138,8 +1138,19 @@ mod tests {
         }
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         assert_eq!(
-            lp.active_run_pool_id, None,
-            "a genuinely finished pool run must clear the persisted run context"
+            lp.status,
+            LoopStatus::Completed,
+            "the resumed pool run must reach genuine completion"
+        );
+        // B31: the run context survives genuine completion as last-run data
+        // so `loop list` / `loop info` keep rendering the finished loop's
+        // real n/n queue progress. B8's anti-pollution guarantee is upheld at
+        // launch time (every path re-persists this before the first spec),
+        // not by clearing it on completion.
+        assert_eq!(
+            lp.active_run_pool_id.as_deref(),
+            Some("pool-1"),
+            "a genuinely finished pool run keeps the persisted run context for progress display"
         );
     }
 

@@ -310,14 +310,18 @@ pub struct Loop {
     /// instead of relying on a blindly polling cron.
     #[serde(default)]
     pub autorun_at: Option<DateTime<Utc>>,
-    /// The pool a run against this loop is currently drawing from, persisted
-    /// the moment that run starts (`None` for a bound-spec run). Interrupted
-    /// runs (a quota failure, a daemon restart) leave this set so every
-    /// resume path — scheduled autorun, `loop_reset` — knows which pool to
-    /// pick up rather than falling back to the loop's (often empty) bound
-    /// specs. Cleared only when a run finishes genuinely (nothing pending or
-    /// running left), so a later fresh `loop_run` against a different pool
-    /// isn't polluted by a stale value.
+    /// The pool a run against this loop is currently — or most recently —
+    /// drew from, persisted the moment that run starts (`None` for a
+    /// bound-spec run). Interrupted runs (a quota failure, a daemon restart)
+    /// leave this set so every resume path — scheduled autorun, `loop_reset`
+    /// — knows which pool to pick up rather than falling back to the loop's
+    /// (often empty) bound specs. It survives genuine completion too (B31),
+    /// giving a finished pool-driven loop the only link back to the queue it
+    /// ran so `loop list` / `loop info` can render its real `n/n` progress
+    /// instead of `0/0`. A stale value never pollutes a later run: every
+    /// launch path overwrites this field before the first spec executes, so
+    /// a fresh `loop_run` against a different pool (or a bound-spec run,
+    /// which writes `None`) replaces it.
     #[serde(default)]
     pub active_run_pool_id: Option<String>,
     /// Optional post-completion hook (N2): an agent-node-style config the

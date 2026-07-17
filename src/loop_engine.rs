@@ -407,10 +407,17 @@ impl LoopEngine {
             }
         }
 
-        // The run is genuinely finished — clear the persisted run context so
-        // a later fresh `loop_run` against a different pool isn't polluted
-        // by this one.
-        self.db.set_loop_active_run_pool(&loop_id, None)?;
+        // The run is genuinely finished, but keep `active_run_pool_id` as
+        // last-run context rather than clearing it (B31): a finished
+        // pool-driven loop with no bound specs of its own would otherwise
+        // lose the only link back to the queue it ran, so `loop list` /
+        // `loop info` render a misleading `0/0` instead of its real `n/n`
+        // (`loop_progress` in `daemon/loop_cli.rs` reads this field). B8's
+        // anti-pollution guarantee is unaffected: every launch path
+        // re-persists this field before the first spec runs (the
+        // unconditional `set_loop_active_run_pool` above), so a later fresh
+        // `loop_run` against a different pool — or a bound-spec run (`None`)
+        // — overwrites this value rather than inheriting it.
         self.db.update_loop_status(
             &loop_id,
             LoopStatus::Completed,
@@ -4731,7 +4738,7 @@ esac
     }
 
     #[tokio::test]
-    async fn loop_engine_pool_run_persists_context_and_clears_it_on_genuine_completion() {
+    async fn loop_engine_pool_run_retains_context_on_genuine_completion_for_progress() {
         let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
 
         let spec = standalone_spec("pool-spec", 1);
@@ -4760,10 +4767,26 @@ esac
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         assert_eq!(lp.status, LoopStatus::Completed);
+        // B31: a genuinely finished pool run keeps its `active_run_pool_id`
+        // as last-run context so `loop list` / `loop info` can still render
+        // its real progress instead of a misleading `0/0`. B8's
+        // anti-pollution guarantee is upheld elsewhere: every launch path
+        // re-persists this field before the first spec runs, so a later
+        // fresh `loop_run` against a different pool overwrites it.
         assert_eq!(
-            lp.active_run_pool_id, None,
-            "a genuinely finished pool run must clear the persisted run context so a later \
-             fresh loop_run against a different pool isn't polluted by this one"
+            lp.active_run_pool_id.as_deref(),
+            Some("pool-1"),
+            "a genuinely finished pool run must keep the run context so its queue progress \
+             stays queryable"
+        );
+        // The progress the CLI/MCP surfaces (mirrored by `loop_progress` in
+        // `daemon/loop_cli.rs`) is a real `1/1`, not `0/0`.
+        assert_eq!(
+            engine
+                .spec_progress(&loop_id, lp.active_run_pool_id.as_deref())
+                .unwrap(),
+            (1, 1),
+            "completed pool loop must report n/n progress, not 0/0"
         );
     }
 

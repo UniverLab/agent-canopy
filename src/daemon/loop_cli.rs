@@ -555,6 +555,37 @@ mod tests {
     }
 
     #[test]
+    fn loop_progress_shows_n_of_n_for_completed_pool_loop() {
+        use crate::domain::pools::Pool;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(&dir.path().join("t.db")).unwrap();
+
+        // B31: a finished pool-driven loop keeps its `active_run_pool_id`, so
+        // even in a terminal status it must still render its real n/n queue
+        // progress rather than the 0/0 a bound-spec count would produce.
+        let mut lp = make_loop("loop-done", "pool-loop", LoopStatus::Completed);
+        lp.active_run_pool_id = Some("pool-1".to_string());
+        db.insert_loop(&lp).unwrap();
+        db.insert_pool(&Pool {
+            id: "pool-1".to_string(),
+            name: "P".to_string(),
+            created_at: Utc::now(),
+        })
+        .unwrap();
+
+        for id in ["spec-a", "spec-b"] {
+            let mut spec = make_spec("pool", id, 0, LoopSpecStatus::Completed);
+            spec.id = id.to_string();
+            spec.loop_id = None;
+            db.insert_loop_spec(&spec).unwrap();
+            db.append_pool_member("pool-1", id).unwrap();
+        }
+
+        assert_eq!(loop_progress(&db, &lp, &[]).unwrap(), (2, 2));
+    }
+
+    #[test]
     fn loop_progress_falls_back_to_bound_specs_without_pool() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::new(&dir.path().join("t.db")).unwrap();
