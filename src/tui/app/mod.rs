@@ -2550,6 +2550,30 @@ impl App {
                 session.boot_id.as_deref(),
                 current_boot_id.as_deref(),
             ) {
+                // The stored PID is alive on the same boot — but that alone is
+                // NOT proof of a session-lock conflict. Two benign cases used
+                // to permanently orphan healthy sessions here:
+                //  * quick TUI close→reopen: the old CLI got its HUP and is
+                //    still in the middle of dying;
+                //  * PID recycling: the number now belongs to an unrelated
+                //    process.
+                // Only a live process that actually IS this CLI, and that
+                // survives a short grace period, is a genuine conflict.
+                let pid = session.pid.unwrap_or(0);
+                if !process_outlives_grace(pid, &session.cli) {
+                    tracing::info!(
+                        "Auto-resuming session '{}': stored pid {pid} was recycled or exited during grace",
+                        session.name
+                    );
+                    self.resume_interactive_session(
+                        session,
+                        &canopy_config,
+                        cols,
+                        rows,
+                        current_boot_id.as_deref(),
+                    );
+                    continue;
+                }
                 tracing::warn!(
                     "Skipping auto-resume of session '{}': old process (pid {:?}) is still alive (same boot)",
                     session.name,
@@ -2614,6 +2638,43 @@ fn process_is_alive(pid: i64) -> bool {
 #[cfg(not(unix))]
 fn process_is_alive(_pid: i64) -> bool {
     false
+}
+
+/// Whether the live process behind `pid` is actually an instance of `cli`.
+/// `/proc/<pid>/comm` holds the executable's basename truncated to 15 bytes —
+/// if it doesn't match, the PID was recycled by an unrelated process and the
+/// session it came from is long gone.
+#[cfg(target_os = "linux")]
+fn process_matches_cli(pid: i64, cli: &str) -> bool {
+    let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) else {
+        return false;
+    };
+    let want: String = cli.chars().take(15).collect();
+    comm.trim() == want
+}
+
+/// Without procfs there is no cheap identity check — assume the PID is the
+/// CLI so the conservative (grace-then-orphan) path handles it.
+#[cfg(not(target_os = "linux"))]
+fn process_matches_cli(_pid: i64, _cli: &str) -> bool {
+    true
+}
+
+/// A stored-PID conflict is genuine only if the process is really this CLI
+/// and it outlives a short grace window. A quick TUI close→reopen leaves the
+/// old CLI mid-death for well under a second — waiting briefly turns what
+/// used to be a permanent orphaning into a normal resume.
+fn process_outlives_grace(pid: i64, cli: &str) -> bool {
+    if pid <= 0 || !process_matches_cli(pid, cli) {
+        return false;
+    }
+    for _ in 0..10 {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        if !process_is_alive(pid) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Whether an interactive session should be auto-resumed on startup.
@@ -2913,7 +2974,11 @@ fn log_contains_spawn(log_up: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_resumed_session_args, process_is_alive, should_resume_session};
+    #[cfg(target_os = "linux")]
+    use super::process_matches_cli;
+    use super::{
+        build_resumed_session_args, process_is_alive, process_outlives_grace, should_resume_session,
+    };
     use crate::db::session::InteractiveSession;
     use crate::db::Database;
     use crate::tui::app::types::App;
@@ -3151,6 +3216,49 @@ mod tests {
             Some("some-stored-boot-id"),
             None,
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_process_matches_cli_detects_recycled_pids() {
+        // Our own PID is alive but its comm is the test binary, not "claude" —
+        // exactly the recycled-PID case that must NOT orphan a session.
+        let own_pid = std::process::id() as i64;
+        assert!(!process_matches_cli(own_pid, "claude"));
+
+        // And it does match its own real comm.
+        let own_comm = std::fs::read_to_string(format!("/proc/{own_pid}/comm"))
+            .expect("read own comm")
+            .trim()
+            .to_string();
+        assert!(process_matches_cli(own_pid, &own_comm));
+    }
+
+    #[test]
+    fn test_process_outlives_grace_false_for_dead_or_recycled_pids() {
+        // A PID nothing owns: resume immediately, no grace wait.
+        assert!(!process_outlives_grace(-1, "claude"));
+        // A live PID whose comm is another binary (recycled): also no wait.
+        assert!(!process_outlives_grace(std::process::id() as i64, "claude"));
+    }
+
+    #[test]
+    fn test_process_outlives_grace_waits_out_a_dying_process() {
+        // A child that exits shortly after we check: the grace loop must
+        // observe the death and report "no conflict" instead of orphaning.
+        // The child is reaped on a side thread — an unreaped zombie would
+        // still answer kill(pid, 0). (In production the contended PID never
+        // belongs to a child of the new TUI, so there is no zombie window.)
+        let mut child = std::process::Command::new("sleep")
+            .arg("0.3")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id() as i64;
+        let reaper = std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        assert!(!process_outlives_grace(pid, "sleep"));
+        reaper.join().expect("join reaper");
     }
 
     // ── Sidebar: loops/backlog/history sections ─────────────────────
