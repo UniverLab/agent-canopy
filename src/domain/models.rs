@@ -309,6 +309,7 @@ impl Cli {
             working_dir_flag: cli_config.working_dir_flag.clone(),
             env_vars: cli_config.env_vars.clone(),
             prompt_via_stdin: cli_config.prompt_via_stdin,
+            session_id_set_flag: cli_config.session_id_set_flag.clone(),
         })
     }
 

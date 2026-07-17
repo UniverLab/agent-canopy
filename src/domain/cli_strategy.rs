@@ -25,6 +25,11 @@ pub struct CliStrategy {
     ///
     /// [`CliConfig::prompt_via_stdin`]: super::cli_config::CliConfig::prompt_via_stdin
     pub prompt_via_stdin: bool,
+    /// Flag that sets the session id when spawning a new headless session
+    /// (RS1). See [`CliConfig::session_id_set_flag`].
+    ///
+    /// [`CliConfig::session_id_set_flag`]: super::cli_config::CliConfig::session_id_set_flag
+    pub session_id_set_flag: Option<String>,
 }
 
 /// Resolve the executable path for a CLI's configured `binary`.
@@ -87,6 +92,22 @@ impl CliStrategy {
         model: Option<&str>,
         working_dir: Option<&str>,
     ) -> Result<Command> {
+        self.build_command_with_session(prompt, model, working_dir, None)
+    }
+
+    /// [`build_command`], additionally injecting a caller-chosen session id
+    /// via the registry's `session_id_set_flag` (RS1 set-at-spawn capture).
+    /// The id is silently dropped when the CLI has no such flag — callers
+    /// decide whether to mint one by checking `session_id_set_flag` first.
+    ///
+    /// [`build_command`]: Self::build_command
+    pub fn build_command_with_session(
+        &self,
+        prompt: &str,
+        model: Option<&str>,
+        working_dir: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<Command> {
         let resolved = resolve_binary(&self.binary)?;
         let mut cmd = Command::new(resolved);
 
@@ -108,6 +129,15 @@ impl CliStrategy {
         // Add headless mode flags (before prompt)
         for arg in shell_words::split(&self.headless_mode).unwrap_or_default() {
             cmd.arg(arg);
+        }
+
+        // Set the session id at spawn time (RS1), when both the id and the
+        // CLI's flag for it exist. Before the positional prompt so the id
+        // can never be mistaken for it.
+        if let Some(sid) = session_id {
+            if let Some(ref flag) = self.session_id_set_flag {
+                cmd.arg(flag).arg(sid);
+            }
         }
 
         // Deliver the prompt via stdin (backed by an anonymous temp file) or
@@ -167,6 +197,7 @@ mod tests {
             working_dir_flag: Some("--workdir".to_string()),
             env_vars,
             prompt_via_stdin: false,
+            session_id_set_flag: None,
         }
     }
 
@@ -288,6 +319,44 @@ mod tests {
         let output = cmd.output().await.unwrap();
         assert!(output.status.success());
         assert_eq!(String::from_utf8(output.stdout).unwrap(), huge_prompt);
+    }
+
+    #[test]
+    fn build_command_with_session_injects_set_flag_and_id() {
+        let mut strategy = sample_strategy();
+        strategy.session_id_set_flag = Some("--session-id".to_string());
+        let cmd = strategy
+            .build_command_with_session(
+                "p",
+                None,
+                None,
+                Some("11111111-2222-3333-4444-555555555555"),
+            )
+            .unwrap();
+        let cmd_str = format!("{:?}", cmd);
+        assert!(cmd_str.contains("--session-id"));
+        assert!(cmd_str.contains("11111111-2222-3333-4444-555555555555"));
+    }
+
+    #[test]
+    fn build_command_with_session_without_flag_drops_id() {
+        // sample_strategy has no session_id_set_flag: the id must be
+        // silently dropped, never passed as a stray argument.
+        let strategy = sample_strategy();
+        let cmd = strategy
+            .build_command_with_session("p", None, None, Some("sid-123"))
+            .unwrap();
+        let cmd_str = format!("{:?}", cmd);
+        assert!(!cmd_str.contains("sid-123"));
+    }
+
+    #[test]
+    fn build_command_never_injects_session_flag_without_id() {
+        let mut strategy = sample_strategy();
+        strategy.session_id_set_flag = Some("--session-id".to_string());
+        let cmd = strategy.build_command("p", None, None).unwrap();
+        let cmd_str = format!("{:?}", cmd);
+        assert!(!cmd_str.contains("--session-id"));
     }
 
     #[test]

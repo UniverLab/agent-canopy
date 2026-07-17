@@ -42,6 +42,14 @@ pub struct CliConfig {
     /// The session ID is appended as the next argument.
     #[serde(default)]
     pub session_resume_cmd: Option<String>,
+    /// Flag that SETS the session id when spawning a NEW headless session,
+    /// e.g. `"--session-id"` on claude/gemini/qwen/copilot. Canopy mints a
+    /// UUID, passes it after this flag, and records it on the loop run so
+    /// the session can be resumed later. Preferred capture strategy: the id
+    /// is known before the process even starts, so nothing has to be parsed
+    /// from output or session listings.
+    #[serde(default)]
+    pub session_id_set_flag: Option<String>,
     /// RGB accent color for this CLI's agents in the TUI.
     #[serde(default)]
     pub accent_color: Option<[u8; 3]>,
@@ -230,6 +238,7 @@ mod tests {
             resume_args: None,
             session_list_cmd: None,
             session_resume_cmd: None,
+            session_id_set_flag: None,
             accent_color: None,
             yolo_flag: None,
             instruction_file: None,

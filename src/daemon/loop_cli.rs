@@ -193,11 +193,17 @@ fn handle_loop_info(db: &Database, id_or_name: &str) -> Result<()> {
         let node_name = db
             .get_loop_node(&run.node_id)?
             .map_or_else(|| run.node_id.clone(), |n| n.name);
+        let sid = run
+            .session_id
+            .as_deref()
+            .map(|sid| format!("  sid {}", sid.chars().take(8).collect::<String>()))
+            .unwrap_or_default();
         println!(
-            " {} {}  {}",
+            " {} {}  {}{}",
             run_status_icon(run.status),
             node_name,
-            format_dt(run.started_at)
+            format_dt(run.started_at),
+            sid
         );
     }
 

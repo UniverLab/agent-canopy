@@ -1667,10 +1667,11 @@ async fn spawn_and_wait_cli_process(
     model: Option<&str>,
     workdir: &str,
     timeout_minutes: u64,
+    session_id: Option<&str>,
     on_pid: impl FnOnce(u32),
 ) -> Result<CliProcessOutcome, String> {
     let mut command = strategy
-        .build_command(prompt, model, Some(workdir))
+        .build_command_with_session(prompt, model, Some(workdir), session_id)
         .map_err(|error| error.to_string())?;
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
@@ -1730,11 +1731,30 @@ async fn run_agent_process(
     workdir: &str,
     timeout_minutes: u64,
 ) -> Result<NodeExecution> {
-    let outcome =
-        spawn_and_wait_cli_process(strategy, prompt, model, workdir, timeout_minutes, |pid| {
+    // Set-at-spawn session id capture (RS1): when the platform accepts a
+    // caller-chosen session id, mint one and record it on the run row
+    // before spawning — the id is known without parsing any output, and
+    // stays valid for resume however the run ends.
+    let session_id = strategy
+        .session_id_set_flag
+        .as_ref()
+        .map(|_| uuid::Uuid::new_v4().to_string());
+    if let Some(sid) = session_id.as_deref() {
+        let _ = db.set_loop_run_session_id(run_id, sid);
+    }
+
+    let outcome = spawn_and_wait_cli_process(
+        strategy,
+        prompt,
+        model,
+        workdir,
+        timeout_minutes,
+        session_id.as_deref(),
+        |pid| {
             let _ = db.set_loop_run_pid(run_id, pid as i64, crate::system::boot_id().as_deref());
-        })
-        .await;
+        },
+    )
+    .await;
 
     match outcome {
         Err(error) => Ok(agent_spawn_failure(node, cli, model, error)),
@@ -1833,15 +1853,22 @@ async fn run_completion_hook_process(
     workdir: &str,
     timeout_minutes: u64,
 ) -> HookExecution {
-    let outcome =
-        spawn_and_wait_cli_process(strategy, prompt, model, workdir, timeout_minutes, |pid| {
+    let outcome = spawn_and_wait_cli_process(
+        strategy,
+        prompt,
+        model,
+        workdir,
+        timeout_minutes,
+        None,
+        |pid| {
             let _ = db.set_loop_completion_hook_run_pid(
                 hook_run_id,
                 pid as i64,
                 crate::system::boot_id().as_deref(),
             );
-        })
-        .await;
+        },
+    )
+    .await;
 
     match outcome {
         Err(error) => HookExecution {
@@ -3394,7 +3421,85 @@ mod tests {
             working_dir_flag: None,
             env_vars: HashMap::new(),
             prompt_via_stdin: false,
+            session_id_set_flag: None,
         }
+    }
+
+    /// Seed a spec + agent node + `running` run under `loop_id` so
+    /// `run_agent_process` tests can read the run row back (`loop_runs`
+    /// enforces foreign keys). Returns the inserted node.
+    fn seed_agent_run(db: &Database, loop_id: &str, run_id: &str) -> LoopNode {
+        let spec = standalone_spec("sid-spec", 1);
+        db.insert_loop_spec(&spec).unwrap();
+        let mut node = sample_agent_node();
+        node.spec_id = Some(spec.id.clone());
+        db.insert_loop_node(&node).unwrap();
+        db.insert_loop_run(&LoopNodeRun {
+            id: run_id.to_string(),
+            loop_id: loop_id.to_string(),
+            spec_id: spec.id,
+            node_id: node.id.clone(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        })
+        .unwrap();
+        node
+    }
+
+    #[tokio::test]
+    async fn run_agent_process_records_set_at_spawn_session_id() {
+        let (_dir, db, _engine, loop_id) = bare_loop_fixture().unwrap();
+        let node = seed_agent_run(&db, &loop_id, "run-sid");
+        let cli = Cli::new("test-cli");
+        let mut strategy = sample_strategy("/bin/echo");
+        strategy.session_id_set_flag = Some("--session-id".to_string());
+
+        run_agent_process(
+            &db, "run-sid", &cli, &strategy, &node, "prompt", None, "/tmp", 1,
+        )
+        .await
+        .unwrap();
+
+        let run = db.get_loop_run("run-sid").unwrap().unwrap();
+        let sid = run
+            .session_id
+            .expect("set-at-spawn platform must record a session id");
+        uuid::Uuid::parse_str(&sid).expect("recorded session id must be a uuid");
+    }
+
+    #[tokio::test]
+    async fn run_agent_process_leaves_session_id_null_without_set_flag() {
+        let (_dir, db, _engine, loop_id) = bare_loop_fixture().unwrap();
+        let node = seed_agent_run(&db, &loop_id, "run-nosid");
+        let cli = Cli::new("test-cli");
+        let strategy = sample_strategy("/bin/echo");
+
+        run_agent_process(
+            &db,
+            "run-nosid",
+            &cli,
+            &strategy,
+            &node,
+            "prompt",
+            None,
+            "/tmp",
+            1,
+        )
+        .await
+        .unwrap();
+
+        let run = db.get_loop_run("run-nosid").unwrap().unwrap();
+        assert_eq!(
+            run.session_id, None,
+            "no set flag and no capture: session_id must stay NULL"
+        );
     }
 
     #[tokio::test]

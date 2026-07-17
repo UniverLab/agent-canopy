@@ -886,6 +886,20 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Record the harness session id captured for a node run (RS1), so the
+    /// session can be resumed later (RS2/RS3).
+    pub fn set_loop_run_session_id(&self, run_id: &str, session_id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE loop_runs SET session_id = ?1 WHERE id = ?2",
+            params![session_id, run_id],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// The active (`running`) node run for `spec_id`, if any. Mirrors
     /// [`Self::get_active_loop_run_for_node`] but scoped to a whole spec —
     /// used by `loop_reset`, which resets a spec wholesale rather than one

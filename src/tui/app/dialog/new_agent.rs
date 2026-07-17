@@ -927,6 +927,7 @@ mod tests {
             resume_args: Some("--continue".into()),
             session_list_cmd: cmd.map(|s| s.to_string()),
             session_resume_cmd: Some("--conversation".into()),
+            session_id_set_flag: None,
             accent_color: None,
             yolo_flag: None,
             instruction_file: None,
