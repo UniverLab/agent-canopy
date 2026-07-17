@@ -171,6 +171,143 @@ fn test_mark_orphaned_terminal_sessions_clears_idle_records() {
     assert!(db.get_active_terminal_sessions().unwrap().is_empty());
 }
 
+// ── B32: unrecoverable interactive sessions close instead of orphaning ──
+
+#[test]
+fn mark_session_closed_retires_active_session_to_completed() {
+    let db = test_db();
+    db.insert_interactive_session(
+        "sess-dead",
+        "s",
+        "claude",
+        "/tmp",
+        None,
+        None,
+        "interactive",
+        None,
+    )
+    .unwrap();
+    assert_eq!(db.get_active_sessions().unwrap().len(), 1);
+
+    db.mark_session_closed("sess-dead").unwrap();
+
+    // Gone from the active sidebar list, never surfaces as a red orphan, and
+    // the row is kept for history in the terminal `completed` status.
+    assert!(db.get_active_sessions().unwrap().is_empty());
+    assert!(db.get_orphaned_sessions().unwrap().is_empty());
+    assert_eq!(
+        db.get_interactive_session_status("sess-dead").unwrap(),
+        Some("completed".to_string())
+    );
+}
+
+#[test]
+fn mark_session_closed_is_noop_for_non_active_session() {
+    let db = test_db();
+    db.insert_interactive_session(
+        "sess-resumed",
+        "s",
+        "claude",
+        "/tmp",
+        None,
+        None,
+        "interactive",
+        None,
+    )
+    .unwrap();
+    db.mark_session_resumed("sess-resumed").unwrap();
+
+    // Guarded to `active` rows: a session already resumed elsewhere is left
+    // untouched rather than being clobbered to `completed`.
+    db.mark_session_closed("sess-resumed").unwrap();
+    assert_eq!(
+        db.get_interactive_session_status("sess-resumed").unwrap(),
+        Some("resumed".to_string())
+    );
+}
+
+#[test]
+fn close_orphaned_interactive_sessions_sweeps_historic_orphans() {
+    let db = test_db();
+    // A historic orphan (written before orphaning was removed) plus a healthy
+    // active session that must be left alone.
+    db.insert_interactive_session(
+        "sess-old",
+        "old",
+        "claude",
+        "/tmp",
+        None,
+        None,
+        "interactive",
+        None,
+    )
+    .unwrap();
+    db.mark_session_orphaned("sess-old").unwrap();
+    db.insert_interactive_session(
+        "sess-live",
+        "live",
+        "claude",
+        "/tmp",
+        None,
+        None,
+        "interactive",
+        None,
+    )
+    .unwrap();
+    assert_eq!(db.get_orphaned_sessions().unwrap().len(), 1);
+
+    let swept = db.close_orphaned_interactive_sessions().unwrap();
+    assert_eq!(swept, 1);
+
+    // The orphan row disappears from the orphaned list (now `completed`, kept
+    // for history); the active session is untouched.
+    assert!(db.get_orphaned_sessions().unwrap().is_empty());
+    assert_eq!(
+        db.get_interactive_session_status("sess-old").unwrap(),
+        Some("completed".to_string())
+    );
+    assert_eq!(
+        db.get_interactive_session_status("sess-live").unwrap(),
+        Some("active".to_string())
+    );
+}
+
+#[test]
+fn scheduled_sends_for_closed_session_are_dropped_on_missing_target_restore() {
+    let db = test_db();
+    db.insert_interactive_session(
+        "sess-x",
+        "s",
+        "claude",
+        "/tmp",
+        None,
+        None,
+        "interactive",
+        None,
+    )
+    .unwrap();
+    db.insert_scheduled_send("ss-x", "ping", "sess-x", None, Utc::now())
+        .unwrap();
+    assert_eq!(
+        db.list_pending_scheduled_sends_for_session("sess-x")
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // The session is closed as unrecoverable, so it is not resumed and never
+    // joins the live-agent set. `restore_scheduled_sends`' missing-target drop
+    // (modelled here with an empty live list) then discards its schedules —
+    // the same path a session with a missing target already takes.
+    db.mark_session_closed("sess-x").unwrap();
+    let dropped = db.drop_scheduled_sends_missing_targets(&[]).unwrap();
+    assert_eq!(dropped, 1);
+    assert!(db
+        .list_pending_scheduled_sends_for_session("sess-x")
+        .unwrap()
+        .is_empty());
+}
+
 // ── Sync message lifecycle ───────────────────────────────────────
 
 #[test]

@@ -2412,16 +2412,20 @@ impl App {
                     }
                     Err(e2) => {
                         tracing::warn!(
-                            "Fresh-session fallback also failed for '{}': {e2}; marking orphaned",
+                            "Fresh-session fallback also failed for '{}': {e2}; closing session",
                             session.name
                         );
                         // Neither the resume nor the fresh-launch attempt could
                         // start this CLI (binary missing, no resume flag and the
                         // original args no longer work, etc.) — leaving the row
-                        // 'active' would strand it invisibly forever. Orphan it
-                        // so the TUI's orphaned-sessions view can revive or
-                        // dismiss it, preserving its workdir and CLI.
-                        let _ = self.db.mark_session_orphaned(&session.id);
+                        // 'active' would strand it invisibly forever. There is
+                        // no session-admin surface to revive it, so an
+                        // unrecoverable session is simply dead: mark it closed
+                        // (B32) so it disappears from the sidebar instead of
+                        // lingering as a red, un-enterable orphan. The row is
+                        // kept for history; `restore_scheduled_sends` drops any
+                        // schedules that targeted it.
+                        let _ = self.db.mark_session_closed(&session.id);
                         return;
                     }
                 }
@@ -2530,6 +2534,21 @@ impl App {
     }
 
     pub fn auto_resume_sessions(&mut self) {
+        // Startup sweep (B32): retire any row still in the removed `orphaned`
+        // status to `completed` so historic red orphan cards disappear. Runs
+        // here, before this function's own resume attempts and before
+        // `restore_scheduled_sends` (see `tui/mod.rs` startup order): a swept
+        // session is not resumed, so it never joins `interactive_agents`, and
+        // `restore_scheduled_sends`'s missing-target drop then discards any
+        // `scheduled_sends` that still pointed at it.
+        match self.db.close_orphaned_interactive_sessions() {
+            Ok(n) if n > 0 => {
+                tracing::info!("Closed {n} orphaned interactive session(s) on startup");
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("Failed to sweep orphaned interactive sessions: {e}"),
+        }
+
         let Ok(sessions) = self.db.get_active_sessions() else {
             return;
         };
@@ -2575,13 +2594,19 @@ impl App {
                     continue;
                 }
                 tracing::warn!(
-                    "Skipping auto-resume of session '{}': old process (pid {:?}) is still alive (same boot)",
+                    "Skipping auto-resume of session '{}': old process (pid {:?}) is still alive (same boot); closing session",
                     session.name,
                     session.pid
                 );
-                // Per-session orphan marking — only this session is stranded
-                // if we crash right here, not every remaining active session.
-                let _ = self.db.mark_session_orphaned(&session.id);
+                // A genuine session-lock conflict: the old CLI is still alive
+                // and holding the lock, so this instance can never take the
+                // session over. With no session-admin surface to hand it back,
+                // it's dead to us — mark it closed (B32) so it drops from the
+                // sidebar rather than lingering as a red orphan. Per-session,
+                // so a crash right here strands at most this one row. The row
+                // is kept for history; `restore_scheduled_sends` drops any
+                // schedules that targeted it.
+                let _ = self.db.mark_session_closed(&session.id);
                 continue;
             }
             self.resume_interactive_session(

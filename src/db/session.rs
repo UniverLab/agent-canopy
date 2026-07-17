@@ -62,6 +62,16 @@ impl Database {
         Ok(result)
     }
 
+    /// Get the status of an interactive session by id (`None` if no such row).
+    /// Test-only inspection helper (B32) for asserting status transitions.
+    #[cfg(test)]
+    pub fn get_interactive_session_status(&self, session_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut stmt = conn.prepare("SELECT status FROM interactive_sessions WHERE id = ?1")?;
+        let result = stmt.query_row(params![session_id], |row| row.get(0)).ok();
+        Ok(result)
+    }
+
     /// Get the working directory for an interactive session by id.
     pub fn get_session_workdir(&self, session_id: &str) -> Result<Option<String>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -183,11 +193,12 @@ impl Database {
     /// still 'active', so it's a no-op if the session was already resumed
     /// or handled elsewhere.
     ///
-    /// Called per-session, at the moment each session is decided, rather
-    /// than as a mass pre-pass over every active row (the old
-    /// `mark_orphaned_sessions` behavior) — a crash mid-resume-loop then
-    /// strands at most the one session being processed instead of every
-    /// session that hadn't been looked at yet.
+    /// Retained as a test-only fixture (B32): the product no longer orphans
+    /// interactive sessions — an unrecoverable session is closed via
+    /// [`Self::mark_session_closed`] instead — but tests still need a way to
+    /// synthesize a historic `orphaned` row to exercise the startup sweep in
+    /// [`Self::close_orphaned_interactive_sessions`].
+    #[cfg(test)]
     pub fn mark_session_orphaned(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         conn.execute(
@@ -195,6 +206,37 @@ impl Database {
             params![id],
         )?;
         Ok(())
+    }
+
+    /// Mark a single active session closed (`completed`) — the terminal state
+    /// for a session auto-resume could not recover. There is no session-admin
+    /// surface to revive an unrecoverable session, so rather than leaving it
+    /// as a red, un-enterable `orphaned` row it simply becomes a finished
+    /// session and disappears from the sidebar. The row is kept for history;
+    /// only its status changes. Guarded to `active` rows like
+    /// `mark_session_resumed`, so it's a no-op if the session was already
+    /// resumed or finished elsewhere.
+    pub fn mark_session_closed(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        conn.execute(
+            "UPDATE interactive_sessions SET status = 'completed' WHERE id = ?1 AND status = 'active'",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Startup sweep: move any interactive session still in the retired
+    /// `orphaned` status to `completed`, so historic red orphan rows written
+    /// before orphaning was removed disappear from the sidebar. Returns the
+    /// number of rows swept. Rows are kept for history — only the status
+    /// changes.
+    pub fn close_orphaned_interactive_sessions(&self) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let rows = conn.execute(
+            "UPDATE interactive_sessions SET status = 'completed' WHERE status = 'orphaned'",
+            [],
+        )?;
+        Ok(rows)
     }
 
     /// Mark a single session 'resumed', once its replacement process has
