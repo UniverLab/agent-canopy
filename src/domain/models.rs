@@ -310,6 +310,9 @@ impl Cli {
             env_vars: cli_config.env_vars.clone(),
             prompt_via_stdin: cli_config.prompt_via_stdin,
             session_id_set_flag: cli_config.session_id_set_flag.clone(),
+            session_list_cmd: cli_config.session_list_cmd.clone(),
+            session_list_format_args: cli_config.session_list_format_args.clone(),
+            session_id_pattern: cli_config.session_id_pattern.clone(),
         })
     }
 

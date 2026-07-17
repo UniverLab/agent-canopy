@@ -1743,6 +1743,18 @@ async fn run_agent_process(
         let _ = db.set_loop_run_session_id(run_id, sid);
     }
 
+    // List-after-run session id capture (RS1 phase 2): for platforms that
+    // can't set the id at spawn but do expose a session-list command, snapshot
+    // the set of session ids BEFORE spawning so the new one can be diffed out
+    // after the run. Skipped entirely when set-at-spawn already applied
+    // (`session_id.is_some()`), which takes strict precedence. Best-effort: a
+    // failed snapshot (`None`) just disables capture for this run.
+    let pre_session_ids = if session_id.is_none() && strategy.can_capture_session_after_run() {
+        list_session_ids(strategy, workdir).await
+    } else {
+        None
+    };
+
     let outcome = spawn_and_wait_cli_process(
         strategy,
         prompt,
@@ -1755,6 +1767,17 @@ async fn run_agent_process(
         },
     )
     .await;
+
+    // Attribute the session the run just created (RS1 phase 2). Only when a
+    // pre-snapshot was taken AND the process actually started — a spawn `Err`
+    // means nothing ran, so there's nothing new to attribute. Never affects
+    // the verdict: capture only ever writes `session_id`, and any failure
+    // leaves it NULL.
+    if let Some(pre) = pre_session_ids {
+        if outcome.is_ok() {
+            capture_session_id_after_run(db, run_id, strategy, workdir, &pre).await;
+        }
+    }
 
     match outcome {
         Err(error) => Ok(agent_spawn_failure(node, cli, model, error)),
@@ -1823,6 +1846,106 @@ fn agent_spawn_failure(
             "error": message,
         }),
         summary: format!("Agent node '{}' failed to spawn: {}", node.name, message),
+    }
+}
+
+/// Hard cap on how long a session-list invocation may run during
+/// list-after-run capture (RS1 phase 2). Capture is best-effort and must
+/// never stall a run's bookkeeping, so a slow/hung list command is abandoned
+/// (its process group killed via `kill_on_drop`) and the id left NULL.
+const SESSION_LIST_TIMEOUT_SECS: u64 = 10;
+
+/// Run the platform's session-list command (cwd = node workdir) with a short
+/// timeout and return the extracted set of session ids. `None` means the
+/// capability isn't configured, or the command failed / timed out — capture
+/// is best-effort, so callers treat `None` as "leave the id NULL", never an
+/// error. Registry-driven end to end: the subcommand, the machine-readable
+/// args, and the id regex all come from the platform config.
+async fn list_session_ids(
+    strategy: &crate::domain::cli_strategy::CliStrategy,
+    workdir: &str,
+) -> Option<std::collections::HashSet<String>> {
+    let mut cmd = match strategy.build_session_list_command(workdir) {
+        Ok(Some(cmd)) => cmd,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::warn!(%error, "session id capture: could not build session-list command");
+            return None;
+        }
+    };
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            tracing::warn!(%error, "session id capture: session-list command failed to spawn");
+            return None;
+        }
+    };
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(SESSION_LIST_TIMEOUT_SECS),
+        child.wait_with_output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            Some(strategy.extract_session_ids(&stdout))
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "session id capture: session-list command errored");
+            None
+        }
+        Err(_elapsed) => {
+            // Dropping the future drops the Child; `kill_on_drop` (set in
+            // `build_session_list_command`) reaps the process group.
+            tracing::warn!(
+                timeout_secs = SESSION_LIST_TIMEOUT_SECS,
+                "session id capture: session-list command timed out"
+            );
+            None
+        }
+    }
+}
+
+/// After a run finishes, list the platform's sessions again and attribute the
+/// single id that wasn't in `pre` to this run via `set_loop_run_session_id`.
+/// A diff of exactly one is recorded; zero or many is logged and the id left
+/// NULL (non-fatal). Same-platform parallel runs can race and produce
+/// multiple new ids — that's logged, not solved. Never touches the verdict.
+async fn capture_session_id_after_run(
+    db: &Database,
+    run_id: &str,
+    strategy: &crate::domain::cli_strategy::CliStrategy,
+    workdir: &str,
+    pre: &std::collections::HashSet<String>,
+) {
+    let Some(post) = list_session_ids(strategy, workdir).await else {
+        tracing::warn!(
+            run_id,
+            "session id capture: post-run session list unavailable; leaving session_id NULL"
+        );
+        return;
+    };
+    let new: Vec<&String> = post.difference(pre).collect();
+    match new.as_slice() {
+        [only] => {
+            if let Err(error) = db.set_loop_run_session_id(run_id, only) {
+                tracing::warn!(run_id, %error, "session id capture: failed to persist session id");
+            }
+        }
+        [] => tracing::warn!(
+            run_id,
+            "session id capture: no new session appeared; leaving session_id NULL"
+        ),
+        many => tracing::warn!(
+            run_id,
+            candidates = many.len(),
+            "session id capture: multiple new sessions (same-platform parallel runs?); \
+             cannot attribute, leaving session_id NULL"
+        ),
     }
 }
 
@@ -3422,6 +3545,9 @@ mod tests {
             env_vars: HashMap::new(),
             prompt_via_stdin: false,
             session_id_set_flag: None,
+            session_list_cmd: None,
+            session_list_format_args: None,
+            session_id_pattern: None,
         }
     }
 
@@ -3500,6 +3626,215 @@ mod tests {
             run.session_id, None,
             "no set flag and no capture: session_id must stay NULL"
         );
+    }
+
+    /// Writes a fake session-aware CLI as an executable shell script with two
+    /// modes dispatched on its first arg. `list` prints the ids in
+    /// `$STATEFILE` as opencode-family JSON (`[{"id":"..."}]`), or exits 1
+    /// when `$FAIL_LIST` is set. `run` is the agent invocation (headless mode
+    /// is `run`); it appends `$APPEND_ID` to `$STATEFILE` when set (simulating
+    /// the CLI creating a new session), then exits 0. This lets one binary
+    /// serve as both the agent process and the session list the capture diffs
+    /// — exactly how the real CLIs behave.
+    fn write_fake_session_cli(dir: &std::path::Path) -> std::path::PathBuf {
+        let script = dir.join("fake-session-cli");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+case "$1" in
+  list)
+    [ -n "$FAIL_LIST" ] && exit 1
+    printf '['
+    sep=""
+    if [ -f "$STATEFILE" ]; then
+      while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        printf '%s{"id":"%s"}' "$sep" "$line"
+        sep=","
+      done < "$STATEFILE"
+    fi
+    printf ']\n'
+    ;;
+  run)
+    [ -n "$APPEND_ID" ] && echo "$APPEND_ID" >> "$STATEFILE"
+    echo done
+    ;;
+esac
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    /// Strategy for the fake session CLI: `run` headless mode, `list` session
+    /// command, opencode-family id pattern. `env` carries the fixture's
+    /// `STATEFILE`/`APPEND_ID`/`FAIL_LIST` toggles to both invocations.
+    fn fake_session_strategy(
+        binary: &std::path::Path,
+        env: HashMap<String, String>,
+    ) -> crate::domain::cli_strategy::CliStrategy {
+        crate::domain::cli_strategy::CliStrategy {
+            binary: binary.to_string_lossy().to_string(),
+            headless_mode: "run".to_string(),
+            model_flag: None,
+            supports_working_dir: false,
+            working_dir_flag: None,
+            env_vars: env,
+            prompt_via_stdin: false,
+            session_id_set_flag: None,
+            session_list_cmd: Some("list".to_string()),
+            session_list_format_args: None,
+            session_id_pattern: Some(r#""id"\s*:\s*"([^"]+)""#.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_agent_process_captures_new_session_id_after_run() {
+        let (_dir, db, _engine, loop_id) = bare_loop_fixture().unwrap();
+        let node = seed_agent_run(&db, &loop_id, "run-cap");
+        let scratch = tempdir().unwrap();
+        let statefile = scratch.path().join("sessions");
+        std::fs::write(&statefile, "ses_pre_existing\n").unwrap();
+        let script = write_fake_session_cli(scratch.path());
+
+        let mut env = HashMap::new();
+        env.insert("STATEFILE".to_string(), statefile.to_string_lossy().into());
+        env.insert("APPEND_ID".to_string(), "ses_brand_new".to_string());
+        let strategy = fake_session_strategy(&script, env);
+        let cli = Cli::new("fake");
+
+        let execution = run_agent_process(
+            &db, "run-cap", &cli, &strategy, &node, "prompt", None, "/tmp", 1,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(execution.status, LoopRunStatus::Pass);
+        let run = db.get_loop_run("run-cap").unwrap().unwrap();
+        assert_eq!(
+            run.session_id.as_deref(),
+            Some("ses_brand_new"),
+            "the single new session in the after-list must be attributed to the run"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_agent_process_no_new_session_leaves_session_id_null() {
+        let (_dir, db, _engine, loop_id) = bare_loop_fixture().unwrap();
+        let node = seed_agent_run(&db, &loop_id, "run-nonew");
+        let scratch = tempdir().unwrap();
+        let statefile = scratch.path().join("sessions");
+        std::fs::write(&statefile, "ses_pre_existing\n").unwrap();
+        let script = write_fake_session_cli(scratch.path());
+
+        // No APPEND_ID: the run creates no session, so the diff is empty.
+        let mut env = HashMap::new();
+        env.insert("STATEFILE".to_string(), statefile.to_string_lossy().into());
+        let strategy = fake_session_strategy(&script, env);
+        let cli = Cli::new("fake");
+
+        let execution = run_agent_process(
+            &db,
+            "run-nonew",
+            &cli,
+            &strategy,
+            &node,
+            "prompt",
+            None,
+            "/tmp",
+            1,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(execution.status, LoopRunStatus::Pass);
+        let run = db.get_loop_run("run-nonew").unwrap().unwrap();
+        assert_eq!(
+            run.session_id, None,
+            "no new session in the diff must leave session_id NULL"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_agent_process_list_failure_leaves_null_and_verdict_unaffected() {
+        let (_dir, db, _engine, loop_id) = bare_loop_fixture().unwrap();
+        let node = seed_agent_run(&db, &loop_id, "run-listfail");
+        let scratch = tempdir().unwrap();
+        let statefile = scratch.path().join("sessions");
+        std::fs::write(&statefile, "ses_pre_existing\n").unwrap();
+        let script = write_fake_session_cli(scratch.path());
+
+        // FAIL_LIST makes every `list` invocation exit non-zero. Capture must
+        // silently give up (NULL) while the run's own verdict is untouched.
+        let mut env = HashMap::new();
+        env.insert("STATEFILE".to_string(), statefile.to_string_lossy().into());
+        env.insert("APPEND_ID".to_string(), "ses_brand_new".to_string());
+        env.insert("FAIL_LIST".to_string(), "1".to_string());
+        let strategy = fake_session_strategy(&script, env);
+        let cli = Cli::new("fake");
+
+        let execution = run_agent_process(
+            &db,
+            "run-listfail",
+            &cli,
+            &strategy,
+            &node,
+            "prompt",
+            None,
+            "/tmp",
+            1,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            execution.status,
+            LoopRunStatus::Pass,
+            "a broken session-list command must never change the run verdict"
+        );
+        let run = db.get_loop_run("run-listfail").unwrap().unwrap();
+        assert_eq!(run.session_id, None, "capture failure must leave NULL");
+    }
+
+    #[tokio::test]
+    async fn run_agent_process_set_at_spawn_skips_list_capture() {
+        // A platform with BOTH a set-at-spawn flag and a list command must
+        // use set-at-spawn (uuid, known before spawn) and never run the list
+        // diff — set-at-spawn takes strict precedence.
+        let (_dir, db, _engine, loop_id) = bare_loop_fixture().unwrap();
+        let node = seed_agent_run(&db, &loop_id, "run-precedence");
+        let scratch = tempdir().unwrap();
+        let statefile = scratch.path().join("sessions");
+        std::fs::write(&statefile, "ses_pre_existing\n").unwrap();
+        let script = write_fake_session_cli(scratch.path());
+
+        let mut env = HashMap::new();
+        env.insert("STATEFILE".to_string(), statefile.to_string_lossy().into());
+        env.insert("APPEND_ID".to_string(), "ses_brand_new".to_string());
+        let mut strategy = fake_session_strategy(&script, env);
+        strategy.session_id_set_flag = Some("--session-id".to_string());
+        let cli = Cli::new("fake");
+
+        run_agent_process(
+            &db,
+            "run-precedence",
+            &cli,
+            &strategy,
+            &node,
+            "prompt",
+            None,
+            "/tmp",
+            1,
+        )
+        .await
+        .unwrap();
+
+        let run = db.get_loop_run("run-precedence").unwrap().unwrap();
+        let sid = run.session_id.expect("set-at-spawn must record an id");
+        uuid::Uuid::parse_str(&sid)
+            .expect("recorded id must be the set-at-spawn uuid, not a listed session id");
     }
 
     #[tokio::test]

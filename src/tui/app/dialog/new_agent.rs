@@ -928,6 +928,8 @@ mod tests {
             session_list_cmd: cmd.map(|s| s.to_string()),
             session_resume_cmd: Some("--conversation".into()),
             session_id_set_flag: None,
+            session_list_format_args: None,
+            session_id_pattern: None,
             accent_color: None,
             yolo_flag: None,
             instruction_file: None,

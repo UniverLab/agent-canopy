@@ -50,6 +50,30 @@ pub struct CliConfig {
     /// from output or session listings.
     #[serde(default)]
     pub session_id_set_flag: Option<String>,
+    /// Extra args appended to [`session_list_cmd`] to make its output
+    /// machine-readable and stable, e.g. `"--format json"` (opencode/mimo/
+    /// kilo) or `"--json"` (cn). Used by the list-after-run session id
+    /// capture (RS1 phase 2): platforms that cannot set the id at spawn but
+    /// can list their sessions get their id diffed out of two list snapshots.
+    /// Optional — capture only runs when this and [`session_id_pattern`] are
+    /// both set (and [`session_id_set_flag`] is not, which takes precedence).
+    ///
+    /// [`session_list_cmd`]: Self::session_list_cmd
+    /// [`session_id_pattern`]: Self::session_id_pattern
+    /// [`session_id_set_flag`]: Self::session_id_set_flag
+    #[serde(default)]
+    pub session_list_format_args: Option<String>,
+    /// Regex applied to the session-list command's stdout to extract session
+    /// ids for list-after-run capture (RS1 phase 2). Capture group 1 is the
+    /// id when the pattern has one; otherwise the whole match. Kept generic
+    /// so nothing platform-specific leaks into Rust — every supported CLI
+    /// emits JSON with an `"id"` key, so the shared value
+    /// `"id"\s*:\s*"([^"]+)"` works for all of them. Optional; see
+    /// [`session_list_format_args`] for when capture runs.
+    ///
+    /// [`session_list_format_args`]: Self::session_list_format_args
+    #[serde(default)]
+    pub session_id_pattern: Option<String>,
     /// RGB accent color for this CLI's agents in the TUI.
     #[serde(default)]
     pub accent_color: Option<[u8; 3]>,
@@ -239,6 +263,8 @@ mod tests {
             session_list_cmd: None,
             session_resume_cmd: None,
             session_id_set_flag: None,
+            session_list_format_args: None,
+            session_id_pattern: None,
             accent_color: None,
             yolo_flag: None,
             instruction_file: None,

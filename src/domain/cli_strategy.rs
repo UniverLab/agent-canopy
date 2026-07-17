@@ -30,6 +30,22 @@ pub struct CliStrategy {
     ///
     /// [`CliConfig::session_id_set_flag`]: super::cli_config::CliConfig::session_id_set_flag
     pub session_id_set_flag: Option<String>,
+    /// Subcommand/args to list this platform's sessions, e.g. `"session
+    /// list"` or `"ls"`. Drives list-after-run session id capture (RS1
+    /// phase 2). See [`CliConfig::session_list_cmd`].
+    ///
+    /// [`CliConfig::session_list_cmd`]: super::cli_config::CliConfig::session_list_cmd
+    pub session_list_cmd: Option<String>,
+    /// Extra args that make the session list machine-readable (e.g.
+    /// `"--format json"`). See [`CliConfig::session_list_format_args`].
+    ///
+    /// [`CliConfig::session_list_format_args`]: super::cli_config::CliConfig::session_list_format_args
+    pub session_list_format_args: Option<String>,
+    /// Regex extracting session ids from the list output. See
+    /// [`CliConfig::session_id_pattern`].
+    ///
+    /// [`CliConfig::session_id_pattern`]: super::cli_config::CliConfig::session_id_pattern
+    pub session_id_pattern: Option<String>,
 }
 
 /// Resolve the executable path for a CLI's configured `binary`.
@@ -177,6 +193,71 @@ impl CliStrategy {
 
         Ok(cmd)
     }
+
+    /// Whether list-after-run session id capture (RS1 phase 2) applies to
+    /// this platform: it exposes a session-list command AND an id-extraction
+    /// pattern, and has NO set-at-spawn flag. Set-at-spawn takes strict
+    /// precedence — when it exists the id is known before the process starts,
+    /// so the engine must never fall back to diffing session lists.
+    pub fn can_capture_session_after_run(&self) -> bool {
+        self.session_id_set_flag.is_none()
+            && self.session_list_cmd.is_some()
+            && self.session_id_pattern.is_some()
+    }
+
+    /// Build the registry-defined session-list command, to be run with the
+    /// node's workdir as cwd (several CLIs scope their session list to the
+    /// current project). Returns `Ok(None)` when the platform has no
+    /// `session_list_cmd`. Only listing args are added — never the prompt,
+    /// model, headless, or session-id-set flags — so this can never start a
+    /// real session or consume model quota.
+    pub fn build_session_list_command(&self, working_dir: &str) -> Result<Option<Command>> {
+        let Some(list_cmd) = self.session_list_cmd.as_deref() else {
+            return Ok(None);
+        };
+        let resolved = resolve_binary(&self.binary)?;
+        let mut cmd = Command::new(resolved);
+
+        #[cfg(unix)]
+        cmd.process_group(0);
+        cmd.kill_on_drop(true);
+
+        for (key, value) in &self.env_vars {
+            cmd.env(key, value);
+        }
+        for arg in shell_words::split(list_cmd).unwrap_or_default() {
+            cmd.arg(arg);
+        }
+        if let Some(fmt) = self.session_list_format_args.as_deref() {
+            for arg in shell_words::split(fmt).unwrap_or_default() {
+                cmd.arg(arg);
+            }
+        }
+        cmd.current_dir(working_dir);
+        cmd.stdin(std::process::Stdio::null());
+        Ok(Some(cmd))
+    }
+
+    /// Extract the set of session ids from list-command output using the
+    /// registry-configured `session_id_pattern`. Capture group 1 is the id
+    /// when the pattern has one; otherwise the whole match. Returns an empty
+    /// set when no pattern is configured or it fails to compile — capture is
+    /// best-effort and never surfaces an error to the run.
+    pub fn extract_session_ids(&self, output: &str) -> std::collections::HashSet<String> {
+        let mut ids = std::collections::HashSet::new();
+        let Some(pattern) = self.session_id_pattern.as_deref() else {
+            return ids;
+        };
+        let Ok(re) = regex::Regex::new(pattern) else {
+            return ids;
+        };
+        for caps in re.captures_iter(output) {
+            if let Some(m) = caps.get(1).or_else(|| caps.get(0)) {
+                ids.insert(m.as_str().to_string());
+            }
+        }
+        ids
+    }
 }
 
 #[cfg(test)]
@@ -198,6 +279,9 @@ mod tests {
             env_vars,
             prompt_via_stdin: false,
             session_id_set_flag: None,
+            session_list_cmd: None,
+            session_list_format_args: None,
+            session_id_pattern: None,
         }
     }
 
@@ -372,6 +456,83 @@ mod tests {
         assert!(cmd_str.contains("claude-3"));
         assert!(cmd_str.contains("--workdir"));
         assert!(cmd_str.contains("/home/project"));
+    }
+
+    #[test]
+    fn can_capture_session_after_run_requires_list_and_pattern_without_set_flag() {
+        let mut s = sample_strategy();
+        assert!(!s.can_capture_session_after_run(), "nothing configured");
+
+        s.session_list_cmd = Some("session list".to_string());
+        assert!(!s.can_capture_session_after_run(), "pattern still missing");
+
+        s.session_id_pattern = Some("\"id\"\\s*:\\s*\"([^\"]+)\"".to_string());
+        assert!(s.can_capture_session_after_run(), "list + pattern present");
+
+        // Set-at-spawn takes precedence and disables list-after-run capture.
+        s.session_id_set_flag = Some("--session-id".to_string());
+        assert!(!s.can_capture_session_after_run(), "set-at-spawn wins");
+    }
+
+    #[test]
+    fn extract_session_ids_pulls_id_key_from_opencode_family_json() {
+        let mut s = sample_strategy();
+        s.session_id_pattern = Some("\"id\"\\s*:\\s*\"([^\"]+)\"".to_string());
+        // Real opencode/mimo/kilo shape: a JSON array whose objects also carry
+        // a `projectId` (which must NOT be mistaken for `id`).
+        let output = r#"[
+          {"id": "ses_AAA", "projectId": "hexhexhex", "directory": "/x"},
+          {"id": "ses_BBB", "projectId": "hexhexhex", "directory": "/y"}
+        ]"#;
+        let ids = s.extract_session_ids(output);
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains("ses_AAA"));
+        assert!(ids.contains("ses_BBB"));
+    }
+
+    #[test]
+    fn extract_session_ids_pulls_id_key_from_cn_json() {
+        let mut s = sample_strategy();
+        s.session_id_pattern = Some("\"id\"\\s*:\\s*\"([^\"]+)\"".to_string());
+        // Real cn shape: an object wrapping a `sessions` array.
+        let output = r#"{"sessions": [
+          {"id": "8ae15a84-fec0-43b4-9cb8-47293662302e", "title": "x"},
+          {"id": "633286f6-0820-46a5-8c8f-ed315faa5e49", "title": "y"}
+        ]}"#;
+        let ids = s.extract_session_ids(output);
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains("8ae15a84-fec0-43b4-9cb8-47293662302e"));
+    }
+
+    #[test]
+    fn extract_session_ids_empty_without_pattern() {
+        let s = sample_strategy();
+        assert!(s.extract_session_ids(r#"[{"id":"ses_X"}]"#).is_empty());
+    }
+
+    #[test]
+    fn build_session_list_command_none_without_list_cmd() {
+        let s = sample_strategy();
+        assert!(s.build_session_list_command("/tmp").unwrap().is_none());
+    }
+
+    #[test]
+    fn build_session_list_command_appends_format_args_and_sets_cwd() {
+        let mut s = sample_strategy();
+        s.session_list_cmd = Some("session list".to_string());
+        s.session_list_format_args = Some("--format json".to_string());
+        let cmd = s
+            .build_session_list_command("/tmp/project")
+            .unwrap()
+            .expect("list command must be built");
+        let cmd_str = format!("{:?}", cmd);
+        assert!(cmd_str.contains("session"));
+        assert!(cmd_str.contains("list"));
+        assert!(cmd_str.contains("--format"));
+        assert!(cmd_str.contains("json"));
+        // The prompt/headless/model flags must never appear on a list command.
+        assert!(!cmd_str.contains("--headless"));
+        assert!(!cmd_str.contains("--model"));
     }
 
     #[test]
