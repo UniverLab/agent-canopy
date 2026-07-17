@@ -210,11 +210,65 @@ const MODEL_PROVIDERS: &[(&str, &str)] = &[
 /// Newest models listed per provider in `agent_models`.
 const MODELS_PER_PROVIDER: usize = 8;
 
+/// Cap on how many providers a single (platform-scoped) listing renders, so a
+/// universal-gateway platform mapped to many providers still can't blow past
+/// MCP result size limits: at most `MAX_PROVIDERS * MODELS_PER_PROVIDER` lines.
+const MAX_PROVIDERS: usize = 12;
+
+/// Human-readable name for a provider slug — the curated display name when we
+/// have one, otherwise a title-cased fallback so platform-native providers
+/// (e.g. `opencode-go`) still render nicely.
+fn provider_display(slug: &str) -> String {
+    if let Some((_, display)) = MODEL_PROVIDERS.iter().find(|(s, _)| *s == slug) {
+        return (*display).to_string();
+    }
+    slug.split(['-', '_'])
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Format the cached models.dev catalog: newest models per major provider.
 pub(crate) fn format_catalog_models(catalog: &crate::domain::models_db::ModelCatalog) -> String {
+    let providers: Vec<(&str, String)> = MODEL_PROVIDERS
+        .iter()
+        .map(|(slug, display)| (*slug, (*display).to_string()))
+        .collect();
+    format_models_for_providers(catalog, &providers)
+}
+
+/// Format only the models available to `provider_slugs` (a platform's mapped
+/// providers), newest-first per provider, bounded by [`MAX_PROVIDERS`].
+pub(crate) fn format_platform_models(
+    catalog: &crate::domain::models_db::ModelCatalog,
+    provider_slugs: &[&str],
+) -> String {
+    let providers: Vec<(&str, String)> = provider_slugs
+        .iter()
+        .map(|slug| (*slug, provider_display(slug)))
+        .collect();
+    format_models_for_providers(catalog, &providers)
+}
+
+/// Shared renderer: newest [`MODELS_PER_PROVIDER`] models for each listed
+/// provider that has any, skipping empty providers, capped at [`MAX_PROVIDERS`]
+/// non-empty providers.
+fn format_models_for_providers(
+    catalog: &crate::domain::models_db::ModelCatalog,
+    providers: &[(&str, String)],
+) -> String {
     let mut sections = Vec::new();
 
-    for (slug, display) in MODEL_PROVIDERS {
+    for (slug, display) in providers {
+        if sections.len() >= MAX_PROVIDERS {
+            break;
+        }
         let mut models: Vec<_> = catalog
             .models
             .iter()

@@ -103,6 +103,19 @@ pub struct IdParam {
     pub id: String,
 }
 
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct TaskModelsParams {
+    /// Optional platform/CLI name (e.g. "opencode", "claude") to return only
+    /// the models available to that configured platform. Omit for the full
+    /// provider list.
+    #[serde(default)]
+    pub platform: Option<String>,
+    /// When true, force a fresh fetch from models.dev instead of serving a
+    /// still-fresh local cache — use this to pick up newly published models.
+    #[serde(default)]
+    pub refresh: Option<bool>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct AgentScheduleEnableParams {
     /// Agent ID.

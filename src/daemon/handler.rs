@@ -35,8 +35,9 @@ where
 use crate::application::notification_service::NotificationService;
 use crate::application::ports::{AgentRepository, RunRepository, StateRepository};
 use crate::daemon::handler_formatting::{
-    format_agent_info, format_catalog_models, format_log_output, format_temporal_agents,
-    format_uptime, internal_error, make_log_path, recent_runs_output, resolve_log_path,
+    format_agent_info, format_catalog_models, format_log_output, format_platform_models,
+    format_temporal_agents, format_uptime, internal_error, make_log_path, recent_runs_output,
+    resolve_log_path,
 };
 use crate::daemon::handler_helpers::{
     apply_scalar_updates, apply_trigger_updates, handle_timed_out_run, load_bound_seed_identity,
@@ -1620,30 +1621,75 @@ impl TaskTriggerHandler {
     /// List available AI models.
     #[tool(
         name = "agent_models",
-        description = "List common AI models available for use with agents. Returns provider/model strings that can be passed to the model field of agent_add or agent_watch."
+        description = "List AI models available for use with agents. Pass an optional `platform` (e.g. \"opencode\") to filter to the models that platform can reach; pass `refresh: true` to force a fresh models.dev fetch. Returns model ids that can be passed to the model field of agent_add or agent_watch, plus cache provenance (source: cache|live|stale, fetched_at)."
     )]
-    async fn task_models(&self) -> Result<CallToolResult, McpError> {
+    async fn task_models(
+        &self,
+        Parameters(params): Parameters<TaskModelsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let force_refresh = params.refresh.unwrap_or(false);
         // The catalog load touches disk and possibly the network; keep it off
         // the async executor.
-        let catalog = tokio::task::spawn_blocking(crate::domain::models_db::load_catalog)
-            .await
-            .ok()
-            .flatten();
+        let load = tokio::task::spawn_blocking(move || {
+            crate::domain::models_db::load_catalog_with_source(force_refresh)
+        })
+        .await
+        .ok()
+        .flatten();
 
-        let Some(catalog) = catalog else {
+        let Some(load) = load else {
             return Ok(error_result(
                 "Model catalog unavailable: could not reach models.dev and no local \
                  cache exists at ~/.canopy/models_cache.json. Omit the model field to \
                  use the CLI's default, or retry once network access is restored.",
             ));
         };
+        let crate::domain::models_db::CatalogLoad { catalog, source } = load;
 
+        // Optional platform filter, validated against the platforms actually
+        // configured in canopy (registry-driven) when that config is present.
+        let platform = params
+            .platform
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty());
+
+        let listing = match platform {
+            Some(platform) => {
+                if let Some(err) = validate_platform_configured(platform) {
+                    return Ok(error_result(&err));
+                }
+                let providers = crate::domain::models_db::providers_for_cli(platform);
+                if providers.is_empty() {
+                    return Ok(error_result(&format!(
+                        "No known model providers are mapped for platform '{platform}'. \
+                         Omit `platform` to list all providers.",
+                    )));
+                }
+                format!(
+                    "Models available to platform '{platform}' (providers: {}):\n{}",
+                    providers.join(", "),
+                    format_platform_models(&catalog, providers)
+                )
+            }
+            None => format!(
+                "Available models (use the model id as the model field):\n{}",
+                format_catalog_models(&catalog)
+            ),
+        };
+
+        let stale_hint = if source == crate::domain::models_db::CatalogSource::Stale {
+            " (models.dev was unreachable — this cache may be out of date; retry with refresh: true)"
+        } else {
+            ""
+        };
         let result = format!(
-            "Available models (use the model id as the model field):\n\
-             {}\n\n\
-             Note: Model availability depends on the CLI's configured API keys.\n\
+            "{listing}\n\n\
+             Source: {}{stale_hint} · fetched_at: {}\n\
+             Note: model availability also depends on the CLI's configured API keys. \
              If model is omitted, the CLI uses its own default.",
-            format_catalog_models(&catalog)
+            source.as_str(),
+            format_system_time(catalog.fetched_at),
         );
 
         Ok(CallToolResult::success(vec![Content::text(result)]))
@@ -4502,6 +4548,31 @@ impl TaskTriggerHandler {
             let _ = self.db.set_state("gamification:digital_archeologist", "1");
         }
     }
+}
+
+/// Validate a requested `agent_models` platform against the CLIs actually
+/// configured in canopy (registry-driven, from `~/.canopy/config.toml`).
+/// Returns `Some(error_message)` if config exists and the platform isn't among
+/// the configured CLIs; `None` when the platform is configured, or when no
+/// config is present yet (stay lenient rather than rejecting everything).
+fn validate_platform_configured(platform: &str) -> Option<String> {
+    let home = dirs::home_dir()?;
+    let config = crate::domain::canopy_config::CanopyConfig::load(&home.join(".canopy"));
+    let configured = config.cli_names();
+    if configured.is_empty() || configured.contains(&platform) {
+        return None;
+    }
+    Some(format!(
+        "Platform '{platform}' is not configured in canopy. Configured platforms: {}. \
+         Omit `platform` to list all providers.",
+        configured.join(", ")
+    ))
+}
+
+/// Format a `SystemTime` as an RFC 3339 / ISO 8601 UTC timestamp for the
+/// `agent_models` cache metadata.
+fn format_system_time(time: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339()
 }
 
 /// Find and skip `loop_id`'s currently `running` spec — its own bound spec,
