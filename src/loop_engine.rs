@@ -901,47 +901,33 @@ impl LoopEngine {
                             anyhow!("Loop run '{}' not found after execution.", run_id)
                         })?;
 
-                        let self_reported = run.status != LoopRunStatus::Running;
-                        let is_infra_crash = !self_reported
-                            && node.kind == LoopNodeKind::Agent
-                            && execution.status == LoopRunStatus::Fail
-                            && (chrono::Utc::now() - run.started_at).num_seconds()
-                                < crash_max_secs as i64
-                            && attempt < retry_limit;
-
-                        if is_infra_crash {
-                            self.db.update_loop_run_result(
-                                &run_id,
-                                LoopRunStatus::Fail,
-                                Some(&merge_attempt_marker(&execution.output, attempt, true)),
-                                Some(chrono::Utc::now()),
-                            )?;
-                            attempt += 1;
-                            tokio::time::sleep(std::time::Duration::from_secs(
-                                backoff_secs * 2u64.pow(attempt - 1),
-                            ))
-                            .await;
+                        if is_infra_crash(
+                            node,
+                            &execution,
+                            &run,
+                            attempt,
+                            retry_limit,
+                            crash_max_secs,
+                        ) {
                             // B19: retry resuming the crashed attempt's own
                             // session if it managed to create one before dying;
                             // an infra crash at spawn usually created none, so
                             // this is normally `None` → the retry cold-starts.
                             resume_candidate = run.session_id.clone();
-                            run_id = uuid::Uuid::new_v4().to_string();
-                            self.db.insert_loop_run(&LoopNodeRun {
-                                id: run_id.clone(),
-                                loop_id: lp.id.clone(),
-                                spec_id: spec.id.clone(),
-                                node_id: node.id.clone(),
-                                status: LoopRunStatus::Running,
-                                input: previous_output.clone(),
-                                output: None,
-                                started_at: chrono::Utc::now(),
-                                completed_at: None,
-                                iteration: iteration_value as i64,
-                                pid: None,
-                                boot_id: crate::system::boot_id(),
-                                session_id: None,
-                            })?;
+                            run_id = begin_infra_retry(
+                                &self.db,
+                                lp,
+                                spec,
+                                node,
+                                previous_output.as_ref(),
+                                iteration_value as i64,
+                                &run_id,
+                                &execution.output,
+                                attempt,
+                                backoff_secs,
+                            )
+                            .await?;
+                            attempt += 1;
                             continue;
                         }
 
@@ -1111,49 +1097,94 @@ impl LoopEngine {
                     .acquire_owned()
                     .await
                     .expect("ensemble concurrency semaphore is never closed");
+                // B26: give the member the same B19 infra-crash retry as a
+                // lone agent node — a quick, non-self-reported crash retries
+                // the SAME member in place (doubling backoff, fresh
+                // marker-carrying run rows) up to the limit, without touching
+                // join/quorum semantics. The whole retry sequence runs inside
+                // the ONE straggler timeout below, so a member still crashing
+                // and backing off when the straggler window expires is counted
+                // as failed deterministically (never silently abandoned) and
+                // whatever attempt is live is killed. Members cold-start on
+                // their first attempt (RS2 is scoped to the sequential bounce
+                // path); a crashed attempt that captured a session is resumed
+                // on retry, exactly like B19+RS2 for a lone node.
                 let outcome = tokio::time::timeout(
                     std::time::Duration::from_secs(straggler_minutes * 60),
-                    // Ensemble members always cold-start (RS2 is scoped to the
-                    // sequential fail-edge bounce path; ensemble fan-out is not
-                    // a single-node re-run).
-                    execute_agent_node(
-                        &db,
-                        &lp,
-                        &spec,
-                        &node,
-                        previous_output.as_ref(),
-                        &run_id,
-                        &workdir,
-                        None,
-                    ),
+                    async {
+                        let (retry_limit, crash_max_secs, backoff_secs) = read_infra_config(&node);
+                        let mut attempt: u32 = 0;
+                        let mut member_run_id = run_id.clone();
+                        let mut resume_candidate: Option<String> = None;
+                        loop {
+                            let execution = execute_agent_node(
+                                &db,
+                                &lp,
+                                &spec,
+                                &node,
+                                previous_output.as_ref(),
+                                &member_run_id,
+                                &workdir,
+                                resume_candidate.as_deref(),
+                            )
+                            .await?;
+                            let run = db.get_loop_run(&member_run_id)?.ok_or_else(|| {
+                                anyhow!("Loop run '{}' not found after execution.", member_run_id)
+                            })?;
+                            if is_infra_crash(
+                                &node,
+                                &execution,
+                                &run,
+                                attempt,
+                                retry_limit,
+                                crash_max_secs,
+                            ) {
+                                resume_candidate = run.session_id.clone();
+                                member_run_id = begin_infra_retry(
+                                    &db,
+                                    &lp,
+                                    &spec,
+                                    &node,
+                                    previous_output.as_ref(),
+                                    iteration as i64,
+                                    &member_run_id,
+                                    &execution.output,
+                                    attempt,
+                                    backoff_secs,
+                                )
+                                .await?;
+                                attempt += 1;
+                                continue;
+                            }
+                            break Ok::<_, anyhow::Error>((execution, run, member_run_id.clone()));
+                        }
+                    },
                 )
                 .await;
 
                 let execution = match outcome {
-                    Ok(Ok(execution)) => match db.get_loop_run(&run_id) {
-                        Ok(Some(run)) if run.status == LoopRunStatus::Running => {
+                    Ok(Ok((execution, run, final_run_id))) => {
+                        if run.status == LoopRunStatus::Running {
                             let _ = db.update_loop_run_result(
-                                &run_id,
+                                &final_run_id,
                                 execution.status,
                                 Some(&execution.output),
                                 Some(chrono::Utc::now()),
                             );
                             execution
+                        } else {
+                            NodeExecution {
+                                status: run.status,
+                                output: run.output.unwrap_or_else(|| serde_json::json!({})),
+                                summary: execution.summary,
+                            }
                         }
-                        Ok(Some(run)) => NodeExecution {
-                            status: run.status,
-                            output: run.output.unwrap_or_else(|| serde_json::json!({})),
-                            summary: execution.summary,
-                        },
-                        _ => execution,
-                    },
-                    // `execute_agent_node`'s own internal timeout already
-                    // killed the process and finalized the row as `Fail`
-                    // before bailing (see `run_agent_process`) — reuse that
-                    // finalized output rather than re-deriving it.
+                    }
+                    // A DB error (or other hard error) from within the retry
+                    // loop — reuse the finalized row output if there is one.
                     Ok(Err(error)) => {
                         let output = db
-                            .get_loop_run(&run_id)
+                            .get_active_loop_run_for_node(&node.id)
                             .ok()
                             .flatten()
                             .and_then(|run| run.output)
@@ -1161,18 +1192,18 @@ impl LoopEngine {
                         NodeExecution {
                             status: LoopRunStatus::Fail,
                             output,
-                            summary: format!(
-                                "Ensemble member '{}' failed: {error}",
-                                node.name
-                            ),
+                            summary: format!("Ensemble member '{}' failed: {error}", node.name),
                         }
                     }
-                    // This ensemble's own straggler timeout elapsed before
-                    // the member's own agent timeout did (or the process is
-                    // hung past both) — the process is still running, so
-                    // kill it ourselves (B12) rather than waiting further.
+                    // This ensemble's own straggler timeout elapsed before the
+                    // member resolved (still executing, or still retrying/
+                    // backing off). Kill whichever attempt is live now (B12) —
+                    // located by node id, since retries advance the run id —
+                    // and count the member as failed deterministically. A
+                    // member caught mid-backoff has no live run and is simply
+                    // recorded as failed.
                     Err(_elapsed) => {
-                        if let Ok(Some(run)) = db.get_loop_run(&run_id) {
+                        if let Ok(Some(run)) = db.get_active_loop_run_for_node(&node.id) {
                             terminate_run_row(&db, &run, "ensemble straggler timeout");
                         }
                         NodeExecution {
@@ -1490,6 +1521,79 @@ fn merge_attempt_marker(output: &Value, attempt: u32, is_crash: bool) -> Value {
         map.insert("infra_crash".to_string(), Value::from(is_crash));
     }
     obj
+}
+
+/// B19 infra-crash decision for one agent attempt: a non-self-reported,
+/// quick (within `crash_max_secs`) nonzero-exit failure of an AGENT node with
+/// retry budget still left. A self-reported result, a Check/Gate node, a
+/// semantic pass, or a failure past the crash window is never an infra crash.
+///
+/// Shared by the sequential node path ([`LoopEngine::run_spec`]) and, since
+/// B26, by ensemble members ([`LoopEngine::execute_ensemble`]) — both use the
+/// identical rule so a crashed member is retried exactly like a lone node and
+/// only counts as failed for the join once its retries are exhausted.
+fn is_infra_crash(
+    node: &LoopNode,
+    execution: &NodeExecution,
+    run: &LoopNodeRun,
+    attempt: u32,
+    retry_limit: u32,
+    crash_max_secs: u64,
+) -> bool {
+    let self_reported = run.status != LoopRunStatus::Running;
+    !self_reported
+        && node.kind == LoopNodeKind::Agent
+        && execution.status == LoopRunStatus::Fail
+        && (chrono::Utc::now() - run.started_at).num_seconds() < crash_max_secs as i64
+        && attempt < retry_limit
+}
+
+/// Persist a crashed agent attempt with B19 `infra_attempt`/`infra_crash`
+/// markers, wait the doubling backoff (`backoff_secs * 2^attempt`), then
+/// insert a fresh `Running` run row for the retry and return its id. `attempt`
+/// is the zero-based index of the attempt that just crashed. Shared by the
+/// sequential node path and ensemble members (B26) so every infra retry — no
+/// matter which path — leaves the same distinct, marker-carrying run rows.
+#[allow(clippy::too_many_arguments)]
+async fn begin_infra_retry(
+    db: &Database,
+    lp: &crate::domain::loops::Loop,
+    spec: &LoopSpec,
+    node: &LoopNode,
+    previous_output: Option<&Value>,
+    iteration: i64,
+    crashed_run_id: &str,
+    crashed_output: &Value,
+    attempt: u32,
+    backoff_secs: u64,
+) -> Result<String> {
+    db.update_loop_run_result(
+        crashed_run_id,
+        LoopRunStatus::Fail,
+        Some(&merge_attempt_marker(crashed_output, attempt, true)),
+        Some(chrono::Utc::now()),
+    )?;
+    tokio::time::sleep(std::time::Duration::from_secs(
+        backoff_secs * 2u64.pow(attempt),
+    ))
+    .await;
+    let run_id = uuid::Uuid::new_v4().to_string();
+    db.insert_loop_run(&LoopNodeRun {
+        id: run_id.clone(),
+        loop_id: lp.id.clone(),
+        spec_id: spec.id.clone(),
+        node_id: node.id.clone(),
+        status: LoopRunStatus::Running,
+        input: previous_output.cloned(),
+        output: None,
+        started_at: chrono::Utc::now(),
+        completed_at: None,
+        iteration,
+        pid: None,
+        boot_id: crate::system::boot_id(),
+        session_id: None,
+    })?;
+    Ok(run_id)
 }
 
 async fn execute_check_node(
@@ -4160,7 +4264,6 @@ echo done
         fail_resume: bool,
     ) -> (NodeExecution, LoopNodeRun, String) {
         let (dir, db, _engine, loop_id) = bare_loop_fixture().unwrap();
-        seed_agent_run(&db, &loop_id, "run-r");
         let argv_file = dir.path().join("argv.log");
         let script = write_argv_echo_cli(dir.path());
         let mut env = HashMap::new();
@@ -4174,12 +4277,18 @@ echo done
         }
         let cli = argv_cli_config(&script, env, Some("--resume"), set_flag, list_cmd);
         let home = write_resume_cli_home(cli);
-
-        let lp = db.get_loop(&loop_id).unwrap().unwrap();
-        let spec = db.get_loop_spec("sid-spec").unwrap().unwrap();
         let node = resume_agent_node(node_extra);
 
+        // Acquire the HomeGuard lock BEFORE seeding the run row: the
+        // resume-failure fallback compares the run's age against
+        // `infra_crash_max_seconds`, so `started_at` must be stamped right
+        // before the spawn. Seeding first and then blocking on the (shared,
+        // serialized) HomeGuard under a loaded full suite could otherwise
+        // inflate the measured age past the window and defeat the fallback.
         let guard = HomeGuard::set(home.path());
+        seed_agent_run(&db, &loop_id, "run-r");
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        let spec = db.get_loop_spec("sid-spec").unwrap().unwrap();
         let execution = execute_agent_node(
             &db,
             &lp,
@@ -7584,6 +7693,355 @@ echo done
         assert!(
             !marker_b.exists(),
             "straggler member b must have been killed"
+        );
+    }
+
+    // ── B26: ensemble member infra-crash retry ──────────────────────────
+
+    /// Like [`insert_test_ensemble`], but merges `member_config` into every
+    /// member node's config — used by the B26 tests to set
+    /// `infra_backoff_seconds: 0` so retries don't actually sleep.
+    fn insert_infra_ensemble(
+        db: &Database,
+        spec_id: &str,
+        members: &[(&str, &str)],
+        min_pass: i64,
+        straggler_timeout_minutes: Option<i64>,
+        member_config: &Value,
+    ) {
+        let now = chrono::Utc::now();
+        db.insert_loop_node(&LoopNode {
+            id: "kickoff".to_string(),
+            spec_id: Some(spec_id.to_string()),
+            loop_id: None,
+            name: "kickoff".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({ "command": "printf ok", "success_condition": "exit_code_0" }),
+            position: 1,
+            created_at: now,
+        })
+        .unwrap();
+
+        let member_nodes: Vec<LoopNode> = members
+            .iter()
+            .enumerate()
+            .map(|(i, (node_id, platform))| {
+                let mut config = serde_json::json!({
+                    "platform": platform,
+                    "prompt_template": "ignored by the member's test script",
+                    "timeout_minutes": 5,
+                });
+                if let Value::Object(extra) = member_config {
+                    for (k, v) in extra {
+                        config[k] = v.clone();
+                    }
+                }
+                LoopNode {
+                    id: node_id.to_string(),
+                    spec_id: Some(spec_id.to_string()),
+                    loop_id: None,
+                    name: format!("member-{}", i + 1),
+                    kind: LoopNodeKind::Agent,
+                    config,
+                    position: 2 + i as i64,
+                    created_at: now,
+                }
+            })
+            .collect();
+
+        let join_node = LoopNode {
+            id: "join1".to_string(),
+            spec_id: Some(spec_id.to_string()),
+            loop_id: None,
+            name: "join".to_string(),
+            kind: LoopNodeKind::Join,
+            config: serde_json::json!({ "ensemble_id": "ens1" }),
+            position: 2 + members.len() as i64,
+            created_at: now,
+        };
+
+        let mut edges = Vec::new();
+        for (node_id, _) in members {
+            edges.push(LoopEdge {
+                id: format!("kickoff->{node_id}"),
+                spec_id: Some(spec_id.to_string()),
+                loop_id: None,
+                from_node: "kickoff".to_string(),
+                to_node: node_id.to_string(),
+                condition: LoopEdgeCondition::Always,
+            });
+            edges.push(LoopEdge {
+                id: format!("{node_id}->join1"),
+                spec_id: Some(spec_id.to_string()),
+                loop_id: None,
+                from_node: node_id.to_string(),
+                to_node: "join1".to_string(),
+                condition: LoopEdgeCondition::Always,
+            });
+        }
+        edges.push(LoopEdge {
+            id: "join1->pass".to_string(),
+            spec_id: Some(spec_id.to_string()),
+            loop_id: None,
+            from_node: "join1".to_string(),
+            to_node: "done".to_string(),
+            condition: LoopEdgeCondition::Pass,
+        });
+
+        // Terminal marker node so a passing join has somewhere to route.
+        db.insert_loop_node(&LoopNode {
+            id: "done".to_string(),
+            spec_id: Some(spec_id.to_string()),
+            loop_id: None,
+            name: "done".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({ "command": "printf ok", "success_condition": "exit_code_0" }),
+            position: 200,
+            created_at: now,
+        })
+        .unwrap();
+
+        let ensemble = crate::domain::loops::Ensemble {
+            id: "ens1".to_string(),
+            spec_id: Some(spec_id.to_string()),
+            loop_id: None,
+            name: "Test Ensemble".to_string(),
+            prompt_template: "ignored by the member's test script".to_string(),
+            join_node_id: "join1".to_string(),
+            entry_from_node: "kickoff".to_string(),
+            entry_condition: LoopEdgeCondition::Always,
+            min_pass,
+            straggler_timeout_minutes,
+            timeout_minutes: 5,
+            on_pass_to: "done".to_string(),
+            on_fail_to: None,
+            created_at: now,
+        };
+        let ensemble_members: Vec<EnsembleMember> = members
+            .iter()
+            .enumerate()
+            .map(|(i, (node_id, platform))| EnsembleMember {
+                ensemble_id: "ens1".to_string(),
+                node_id: node_id.to_string(),
+                position: i as i64,
+                platform: platform.to_string(),
+                model: None,
+            })
+            .collect();
+
+        db.insert_ensemble_unit(
+            &ensemble,
+            &ensemble_members,
+            &member_nodes,
+            &join_node,
+            &edges,
+        )
+        .unwrap();
+    }
+
+    fn member_runs(db: &Database, spec_id: &str, node_id: &str) -> Vec<LoopNodeRun> {
+        let mut runs: Vec<LoopNodeRun> = db
+            .list_loop_runs_for_spec(spec_id)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.node_id == node_id)
+            .collect();
+        runs.sort_by_key(|r| r.started_at);
+        runs
+    }
+
+    /// A crashed member (fast nonzero exit, no self-report) is retried in
+    /// place like a lone agent node (B19); succeeding on the retry makes it
+    /// count as a pass, so with a second healthy member the join passes 2/2.
+    /// (Two members because ensemble fan-out needs more than one entry edge.)
+    #[tokio::test]
+    async fn ensemble_member_infra_crash_then_succeeds_on_retry_join_passes() {
+        let (dir, db, engine, _loop_id, spec_id) = loop_fixture().unwrap();
+        let counter = dir.path().join("flap.counter");
+        // Crashes (exit 1) on the first attempt, passes (exit 0) on the retry.
+        let flap = write_member_script(
+            dir.path(),
+            "flap.sh",
+            &format!(
+                "n=$(cat \"{c}\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"{c}\"; [ \"$n\" -ge 2 ] && exit 0 || exit 1",
+                c = counter.display(),
+            ),
+        );
+        let fake_home = setup_multi_cli_home(&[
+            ("member-flap", &flap),
+            (
+                "member-ok",
+                &write_member_script(dir.path(), "ok.sh", "exit 0"),
+            ),
+        ]);
+        insert_infra_ensemble(
+            &db,
+            &spec_id,
+            &[("m-flap", "member-flap"), ("m-ok", "member-ok")],
+            2,
+            Some(1),
+            &serde_json::json!({ "infra_backoff_seconds": 0 }),
+        );
+
+        let _home = HomeGuard::set(fake_home.path());
+        engine
+            .run_loop("wf-test".to_string(), None, None)
+            .await
+            .unwrap();
+        drop(_home);
+
+        let join = join_run(&db, &spec_id, "join1");
+        assert_eq!(
+            join.status,
+            LoopRunStatus::Pass,
+            "flaky member passed on retry, healthy member passed -> 2/2 -> join passes"
+        );
+        assert_eq!(join.output.as_ref().unwrap()["passed"], 2);
+
+        let runs = member_runs(&db, &spec_id, "m-flap");
+        assert_eq!(runs.len(), 2, "one crash + one successful retry = two rows");
+        assert_eq!(runs[0].status, LoopRunStatus::Fail);
+        assert_eq!(
+            runs[0].output.as_ref().unwrap()["infra_crash"],
+            serde_json::Value::Bool(true),
+            "the crashed attempt carries the B19 infra_crash marker"
+        );
+        assert_eq!(runs[0].output.as_ref().unwrap()["infra_attempt"], 0);
+        assert_eq!(runs[1].status, LoopRunStatus::Pass);
+    }
+
+    /// A member that keeps crashing exhausts its retry budget (default 2 → 3
+    /// attempts) and only then counts as a member fail. With min_pass=2 and a
+    /// second, healthy member, the join arithmetic is 1/2 → Fail.
+    #[tokio::test]
+    async fn ensemble_member_infra_retries_exhausted_counts_as_member_fail() {
+        let (dir, db, engine, _loop_id, spec_id) = loop_fixture().unwrap();
+        let fake_home = setup_multi_cli_home(&[
+            (
+                "member-dead",
+                &write_member_script(dir.path(), "dead.sh", "exit 1"),
+            ),
+            (
+                "member-ok",
+                &write_member_script(dir.path(), "ok.sh", "exit 0"),
+            ),
+        ]);
+        insert_infra_ensemble(
+            &db,
+            &spec_id,
+            &[("m-dead", "member-dead"), ("m-ok", "member-ok")],
+            2,
+            Some(1),
+            &serde_json::json!({ "infra_backoff_seconds": 0 }),
+        );
+
+        let _home = HomeGuard::set(fake_home.path());
+        engine
+            .run_loop("wf-test".to_string(), None, None)
+            .await
+            .unwrap();
+        drop(_home);
+
+        let join = join_run(&db, &spec_id, "join1");
+        assert_eq!(
+            join.status,
+            LoopRunStatus::Fail,
+            "one member permanently down -> 1/2 -> join fails"
+        );
+        assert_eq!(join.output.as_ref().unwrap()["passed"], 1);
+
+        // retry_limit default 2 -> attempts 0,1,2 -> three distinct run rows,
+        // the first two carrying infra_crash markers.
+        let dead = member_runs(&db, &spec_id, "m-dead");
+        assert_eq!(
+            dead.len(),
+            3,
+            "two retries after the first crash = three rows"
+        );
+        assert!(dead.iter().all(|r| r.status == LoopRunStatus::Fail));
+        assert_eq!(
+            dead[0].output.as_ref().unwrap()["infra_crash"],
+            serde_json::Value::Bool(true)
+        );
+        assert_eq!(
+            dead[1].output.as_ref().unwrap()["infra_crash"],
+            serde_json::Value::Bool(true)
+        );
+        assert_eq!(dead[0].output.as_ref().unwrap()["infra_attempt"], 0);
+        assert_eq!(dead[1].output.as_ref().unwrap()["infra_attempt"], 1);
+    }
+
+    /// Straggler-window interaction (documented behavior): the ensemble's
+    /// straggler timeout bounds the ENTIRE retry sequence, not a single
+    /// attempt. When the window expires before a member resolves (still
+    /// executing, or mid-backoff between retries), the member is counted as
+    /// failed deterministically and its live attempt killed — never left to
+    /// retry past the window, never silently abandoned.
+    ///
+    /// Chosen/documented behavior: fail-deterministically-on-window-expiry.
+    /// The members here have infra retry enabled but each sleeps well past the
+    /// zero-length straggler window, so the window always expires first — the
+    /// retry loop is dropped mid-attempt and both members resolve to Fail
+    /// (0/2), exactly as a lone straggler would, rather than being retried out
+    /// past the window or hanging the join. (Sleeping members make the kill
+    /// deterministic; a fast-exiting member could race a zero-length window.)
+    #[tokio::test]
+    async fn ensemble_member_straggler_window_bounds_the_retry_sequence() {
+        let (dir, db, engine, _loop_id, spec_id) = loop_fixture().unwrap();
+        let marker = dir.path().join("retried.marker");
+        // Would crash (exit 1) after a 3s sleep and then, on a retry, create a
+        // marker — but the zero-length straggler window kills it long before
+        // either its crash or any retry can happen.
+        let flap = write_member_script(
+            dir.path(),
+            "flap.sh",
+            &format!("sleep 3; touch \"{}\"; exit 1", marker.display()),
+        );
+        let fake_home = setup_multi_cli_home(&[
+            ("member-flap", &flap),
+            (
+                "member-slow-ok",
+                &write_member_script(dir.path(), "ok.sh", "sleep 3; exit 0"),
+            ),
+        ]);
+        insert_infra_ensemble(
+            &db,
+            &spec_id,
+            &[("m-flap", "member-flap"), ("m-ok", "member-slow-ok")],
+            1,
+            Some(0), // zero-length window: expires before either member resolves
+            &serde_json::json!({ "infra_backoff_seconds": 0 }),
+        );
+
+        let _home = HomeGuard::set(fake_home.path());
+        engine
+            .run_loop("wf-test".to_string(), None, None)
+            .await
+            .unwrap();
+        drop(_home);
+
+        let join = join_run(&db, &spec_id, "join1");
+        assert_eq!(
+            join.status,
+            LoopRunStatus::Fail,
+            "straggler window expired before any member resolved -> 0/2 -> join fails"
+        );
+        assert_eq!(join.output.as_ref().unwrap()["passed"], 0);
+
+        // Deterministic resolution: no member run row is left Running.
+        assert!(
+            member_runs(&db, &spec_id, "m-flap")
+                .iter()
+                .all(|r| r.status != LoopRunStatus::Running),
+            "the straggler-timed-out member must be resolved, not abandoned Running"
+        );
+
+        // Prove the member was actually cut off (not retried past the window):
+        // its script's post-sleep side effect must never have run.
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        assert!(
+            !marker.exists(),
+            "the straggler-killed member must not have run past the window (no retry)"
         );
     }
 
