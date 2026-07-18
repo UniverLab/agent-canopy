@@ -207,13 +207,18 @@ fn handle_loop_info(db: &Database, id_or_name: &str) -> Result<()> {
                 .unwrap_or_default(),
             _ => String::new(),
         };
+        // B37: a node that moved git HEAD without `commit_rights` was failed
+        // by the engine, not by its own verdict — say so, otherwise the run
+        // reads as an ordinary fail and the operator hunts the wrong cause.
+        let commit_note = commit_rights_note(run.output.as_ref());
         println!(
-            " {} {}  {}{}{}",
+            " {} {}  {}{}{}{}",
             run_status_icon(run.status),
             node_name,
             format_dt(run.started_at),
             sid,
-            group_note
+            group_note,
+            commit_note
         );
     }
 
@@ -229,6 +234,24 @@ fn handle_loop_info(db: &Database, id_or_name: &str) -> Result<()> {
     }
     println!();
     Ok(())
+}
+
+/// The `loop info` annotation for a run the engine failed on a commit-rights
+/// violation (B37), or an empty string for every other run. Reads the marker
+/// the engine writes into the run's output rather than re-running git, so it
+/// stays true long after the fact.
+fn commit_rights_note(output: Option<&serde_json::Value>) -> String {
+    let Some(violation) = output.and_then(|o| o.get("commit_rights_violation")) else {
+        return String::new();
+    };
+    let head_after = violation
+        .get("head_after")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    format!(
+        "  \x1b[31m(no commit rights — committed {})\x1b[0m",
+        head_after.chars().take(8).collect::<String>()
+    )
 }
 
 /// Count of specs that have reached a final `completed` state, alongside the

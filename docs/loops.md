@@ -101,6 +101,52 @@ the ensemble's shared budget. The TUI loop view renders an ensemble
 collapsed as one box (`name [N models]` + quorum) with live per-member
 state while running, expandable on inspect.
 
+## Commit rights
+
+Most graphs want exactly one node to land work in git — a committer at
+the end of the chain — while every earlier node leaves its changes
+uncommitted so the reviewers downstream have a real diff to review.
+Asking for that in the prompt does not hold: three different models
+have committed anyway against an explicit, capitalised "you have no
+commit rights" rule, and each time the reviewers that followed were
+handed an empty diff and the quality gate quietly became a no-op.
+
+So the engine enforces it. Mark the committer in its **node config**:
+
+```
+commit_rights: true
+```
+
+The engine records `git rev-parse HEAD` before and after every node it
+runs and compares the two. A node without `commit_rights` that moved
+HEAD is a deterministic **fail**, whatever the node itself reported —
+it routes through the `fail` edge like any other failure, and the
+reason (`Node 'X' committed but has no commit rights: HEAD moved
+a1b2c3 -> d4e5f6`) lands in the run output, in `canopy loop info`, and
+in the next node's `{{previous_feedback}}`.
+
+Three things are deliberate:
+
+- **Enforcement is opt-in per graph.** It activates only once some node
+  in the graph declares `commit_rights: true`. A graph that designates
+  nobody can't be told apart from one written before this key existed,
+  so enforcing there would fail the very node it relies on to land
+  work. Existing graphs are unchanged until you name a committer.
+- **Rights are explicit configuration**, never inferred from a node's
+  name, kind, or prompt. Nodes without the key have no commit rights.
+- **The engine never undoes the commit.** It reports and routes; it
+  will not `reset`, `revert`, or rewrite your history, because the
+  unauthorized commit usually contains the *correct* work made by the
+  wrong node, and an unattended daemon rewriting history is a far worse
+  failure than the one it is fixing. Both hashes are in the output —
+  undo it yourself if it doesn't belong.
+
+Ensemble members are checked as a group rather than individually: they
+run concurrently against one workdir, so a moved HEAD can't be
+attributed to a single member, and the quorum fails as a whole.
+Non-git workdirs are unaffected, as is any node that edits files
+without committing — the normal case.
+
 ## Lifecycle
 
 Create → run → (pause / continue) → complete. `loop_continue`

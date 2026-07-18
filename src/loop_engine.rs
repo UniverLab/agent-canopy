@@ -766,6 +766,10 @@ impl LoopEngine {
             .iter()
             .map(|node| (node.id.as_str(), node))
             .collect::<HashMap<_, _>>();
+        // B37: whether this graph designates a committer at all. Resolved
+        // once from whichever graph won the precedence above, so a spec-level
+        // graph and the loop-level fallback each answer for themselves.
+        let enforce_commit_rights = graph_enforces_commit_rights(nodes);
         let existing_runs = self.db.list_loop_runs_for_spec(&spec.id)?;
         let (mut cursor, mut previous_output, mut iterations) =
             resolve_spec_start(nodes, edges, spec, &existing_runs, &ensembles)?;
@@ -944,6 +948,16 @@ impl LoopEngine {
                         session_id: None,
                     })?;
 
+                    // B37: baseline HEAD for this node's whole visit, infra
+                    // retries included — a retry that commits is as much a
+                    // violation as a first attempt that does.
+                    let commit_watch = CommitRightsWatch::begin(
+                        enforce_commit_rights,
+                        node_has_commit_rights(node),
+                        workdir,
+                    )
+                    .await;
+
                     let (final_execution, run) = loop {
                         let execution = self
                             .execute_node(
@@ -1018,6 +1032,41 @@ impl LoopEngine {
                         }
                     };
 
+                    // B37: applied AFTER the node's own verdict is settled,
+                    // so it overrides every way a node can report success —
+                    // a clean exit code, or a `loop_complete_node` self-report
+                    // of `pass`. A node that moved history without the right
+                    // to fails, and the fail is persisted on the run row so
+                    // `canopy loop info` shows it.
+                    let final_execution = match &commit_watch {
+                        Some(watch) => match watch.violation(workdir).await {
+                            Some(head_after) => {
+                                let violation = commit_rights_failure(
+                                    &format!("Node '{}'", node.name),
+                                    &node.id,
+                                    &watch.head_before,
+                                    &head_after,
+                                    final_execution.output,
+                                );
+                                tracing::warn!(
+                                    node = %node.name,
+                                    head_before = %watch.head_before,
+                                    head_after = %head_after,
+                                    "node committed but has no commit rights"
+                                );
+                                self.db.update_loop_run_result(
+                                    &run_id,
+                                    LoopRunStatus::Fail,
+                                    Some(&violation.output),
+                                    Some(chrono::Utc::now()),
+                                )?;
+                                violation
+                            }
+                            None => final_execution,
+                        },
+                        None => final_execution,
+                    };
+
                     if self.is_paused(&lp.id)? {
                         return Ok(SpecExecutionOutcome::Paused);
                     }
@@ -1051,6 +1100,7 @@ impl LoopEngine {
                             previous_output.as_ref(),
                             iteration_value,
                             workdir,
+                            enforce_commit_rights,
                         )
                         .await?;
 
@@ -1114,12 +1164,25 @@ impl LoopEngine {
         previous_output: Option<&Value>,
         iteration: usize,
         workdir: &str,
+        enforce_commit_rights: bool,
     ) -> Result<NodeExecution> {
         let ensemble = &details.ensemble;
         // 0 is a legitimate value (mirrors `run_agent_process`'s own
         // `timeout_minutes`) — minute-granular timeouts otherwise have no way
         // to force an immediate one in a fast test.
         let straggler_minutes = ensemble.effective_straggler_timeout_minutes().max(0) as u64;
+
+        // B37: members run concurrently against one workdir, so a moved HEAD
+        // cannot be attributed to a single member — enforcement is therefore
+        // at ensemble granularity, and the quorum fails as a whole. Skipped
+        // if any member is itself a designated committer.
+        let any_member_may_commit = details.members.iter().any(|member| {
+            nodes_by_id
+                .get(member.node_id.as_str())
+                .is_some_and(|node| node_has_commit_rights(node))
+        });
+        let commit_watch =
+            CommitRightsWatch::begin(enforce_commit_rights, any_member_may_commit, workdir).await;
 
         let mut set = tokio::task::JoinSet::new();
         for member in &details.members {
@@ -1337,23 +1400,8 @@ impl LoopEngine {
             "min_pass": ensemble.min_pass,
             "consolidated_doc": consolidated_doc,
         });
-        self.db.insert_loop_run(&LoopNodeRun {
-            id: uuid::Uuid::new_v4().to_string(),
-            loop_id: lp.id.clone(),
-            spec_id: spec.id.clone(),
-            node_id: ensemble.join_node_id.clone(),
-            status: join_status,
-            input: previous_output.cloned(),
-            output: Some(join_output.clone()),
-            started_at: chrono::Utc::now(),
-            completed_at: Some(chrono::Utc::now()),
-            iteration: iteration as i64,
-            pid: None,
-            boot_id: crate::system::boot_id(),
-            session_id: None,
-        })?;
 
-        Ok(NodeExecution {
+        let mut execution = NodeExecution {
             status: join_status,
             output: join_output,
             summary: format!(
@@ -1367,7 +1415,46 @@ impl LoopEngine {
                 passed,
                 details.members.len(),
             ),
-        })
+        };
+
+        // B37: a quorum that moved HEAD fails regardless of how its members
+        // voted — the work already landed, so whatever the members reviewed
+        // is no longer the diff under review.
+        if let Some(watch) = &commit_watch {
+            if let Some(head_after) = watch.violation(workdir).await {
+                tracing::warn!(
+                    ensemble = %ensemble.name,
+                    head_before = %watch.head_before,
+                    head_after = %head_after,
+                    "ensemble member committed but has no commit rights"
+                );
+                execution = commit_rights_failure(
+                    &format!("Ensemble '{}' (one of its members)", ensemble.name),
+                    &ensemble.join_node_id,
+                    &watch.head_before,
+                    &head_after,
+                    execution.output,
+                );
+            }
+        }
+
+        self.db.insert_loop_run(&LoopNodeRun {
+            id: uuid::Uuid::new_v4().to_string(),
+            loop_id: lp.id.clone(),
+            spec_id: spec.id.clone(),
+            node_id: ensemble.join_node_id.clone(),
+            status: execution.status,
+            input: previous_output.cloned(),
+            output: Some(execution.output.clone()),
+            started_at: chrono::Utc::now(),
+            completed_at: Some(chrono::Utc::now()),
+            iteration: iteration as i64,
+            pid: None,
+            boot_id: crate::system::boot_id(),
+            session_id: None,
+        })?;
+
+        Ok(execution)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2794,6 +2881,107 @@ async fn capture_workdir_head(workdir: &str) -> Option<String> {
     (!head.is_empty()).then_some(head)
 }
 
+/// Whether this node is a designated committer (B37): explicit graph
+/// configuration, `commit_rights: true`, never inferred from the node's name,
+/// kind, or prompt. Absent the key, a node has no commit rights.
+fn node_has_commit_rights(node: &LoopNode) -> bool {
+    node.config.get("commit_rights").and_then(Value::as_bool) == Some(true)
+}
+
+/// Whether a graph opts into commit-rights enforcement (B37) — i.e. whether
+/// any of its nodes declares `commit_rights: true`.
+///
+/// Enforcement is per-graph opt-in on purpose. A graph that designates nobody
+/// cannot be told apart from one whose committer simply predates this key, so
+/// enforcing there would fail exactly the node the graph relies on to land
+/// work. Once ONE node declares the right, the graph's intent is unambiguous
+/// and every other node in it is held to it.
+fn graph_enforces_commit_rights(nodes: &[LoopNode]) -> bool {
+    nodes.iter().any(node_has_commit_rights)
+}
+
+/// A pre/post `git rev-parse HEAD` comparison around one node's execution
+/// (B37). Deterministic and cheap — two `git rev-parse` calls, no LLM — and
+/// entirely absent (`begin` yields `None`) for the cases that must not change
+/// behavior: graphs that designate no committer, the designated committer
+/// itself, and non-git workdirs.
+///
+/// A prompt-level "you have no commit rights" rule has been broken by three
+/// different models (a haiku implementer on 2026-07-16, an
+/// opencode/mimo-v2.5-free implementer committing `21109a5` on 2026-07-18
+/// against a caps-locked HARD RULE). The cascade is what makes it costly: the
+/// work lands in history, the reviewer ensemble then reviews an empty or
+/// formatting-only working diff, and the graph's quality gate silently becomes
+/// a no-op.
+struct CommitRightsWatch {
+    head_before: String,
+}
+
+impl CommitRightsWatch {
+    /// Start watching, or `None` if there is nothing to watch.
+    async fn begin(enforced: bool, may_commit: bool, workdir: &str) -> Option<Self> {
+        if !enforced || may_commit {
+            return None;
+        }
+        capture_workdir_head(workdir)
+            .await
+            .map(|head_before| Self { head_before })
+    }
+
+    /// The HEAD the watched node left behind, if it moved history. `None`
+    /// when HEAD is unchanged — including a node that edited files without
+    /// committing, which is the normal, unaffected case.
+    async fn violation(&self, workdir: &str) -> Option<String> {
+        let head_after = capture_workdir_head(workdir).await?;
+        (head_after != self.head_before).then_some(head_after)
+    }
+}
+
+/// Turn a detected commit-rights violation into the node's actual result: a
+/// deterministic FAIL carrying the reason, routed through the fail edge like
+/// any other failure.
+///
+/// Deliberately reports and routes only. The engine never reverts, resets, or
+/// otherwise rewrites the user's history — an automatic `git reset` on a
+/// misbehaving agent risks destroying real work (the commit is frequently the
+/// *correct* work, made by the wrong node), and history rewriting is not
+/// something an unattended daemon should ever do on its own. Undoing is left
+/// to the operator, who now has both hashes in the run output.
+fn commit_rights_failure(
+    label: &str,
+    node_id: &str,
+    head_before: &str,
+    head_after: &str,
+    node_output: Value,
+) -> NodeExecution {
+    let message = format!(
+        "{label} committed but has no commit rights: HEAD moved {head_before} -> {head_after}. \
+         Only a node configured with `commit_rights: true` may move git history. \
+         The commit was left in place — undo it yourself if it does not belong there."
+    );
+    // Built by hand rather than with `json!` so the node's own output moves
+    // in whole — it can be a full review document, and this runs on a path
+    // that is already reporting a failure.
+    let mut output = serde_json::Map::new();
+    output.insert(
+        "commit_rights_violation".to_string(),
+        serde_json::json!({
+            "node": label,
+            "node_id": node_id,
+            "head_before": head_before,
+            "head_after": head_after,
+            "message": message,
+        }),
+    );
+    output.insert("node_output".to_string(), node_output);
+
+    NodeExecution {
+        output: Value::Object(output),
+        summary: message,
+        status: LoopRunStatus::Fail,
+    }
+}
+
 /// The ensemble id `node_id` belongs to, whether as a member or as the join
 /// itself — used both to resume onto [`SpecCursor::Ensemble`] (rather than a
 /// single member node) and to key the iteration budget per-ensemble instead
@@ -3134,6 +3322,10 @@ mod tests {
             assert!(status.success(), "git {:?} failed", args);
         };
         run(&["init", "-q"]);
+        // Repo-local identity so a node that shells out to `git commit`
+        // works regardless of the machine's global git config.
+        run(&["config", "user.name", "Test"]);
+        run(&["config", "user.email", "test@example.com"]);
         std::fs::write(path.join("README.md"), "test").unwrap();
         run(&["add", "."]);
         run(&["commit", "-q", "-m", "init"]);
@@ -3233,6 +3425,246 @@ mod tests {
         assert_eq!(lp.status, LoopStatus::Completed);
         assert_eq!(spec.status, LoopSpecStatus::Completed);
         assert_eq!(spec.spec_start_head, None);
+    }
+
+    // ── B37: node-level commit rights, enforced by the engine ────────────
+
+    /// A node whose command runs in the workdir. `commit_rights` is attached
+    /// verbatim when `Some`, and omitted entirely when `None` — the two cases
+    /// that decide whether the graph opts into enforcement at all.
+    fn rights_node(
+        spec_id: &str,
+        id: &str,
+        command: &str,
+        commit_rights: Option<bool>,
+        position: i64,
+    ) -> LoopNode {
+        let mut config = serde_json::json!({
+            "command": command,
+            "success_condition": "exit_code_0"
+        });
+        if let Some(rights) = commit_rights {
+            config["commit_rights"] = serde_json::json!(rights);
+        }
+        LoopNode {
+            id: id.to_string(),
+            spec_id: Some(spec_id.to_string()),
+            loop_id: None,
+            name: id.to_string(),
+            kind: LoopNodeKind::Check,
+            config,
+            position,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    const COMMIT_CMD: &str = "git commit -q --allow-empty -m 'unauthorized'";
+
+    #[tokio::test]
+    async fn node_without_commit_rights_that_commits_fails_and_routes_via_fail_edge() {
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        init_git_repo(dir.path());
+        let head_before = git_head(dir.path());
+
+        // `worker` exits 0 and reports success — but commits. `committer`
+        // (never reached) is what makes this graph enforce commit rights.
+        db.insert_loop_node(&rights_node(&spec_id, "worker", COMMIT_CMD, None, 1))
+            .unwrap();
+        db.insert_loop_node(&rights_node(&spec_id, "committer", "true", Some(true), 2))
+            .unwrap();
+        db.insert_loop_node(&rights_node(&spec_id, "triage", "true", None, 3))
+            .unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "e-pass".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "worker".to_string(),
+            to_node: "committer".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Pass,
+        })
+        .unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "e-fail".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "worker".to_string(),
+            to_node: "triage".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Fail,
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        let worker = runs.iter().find(|r| r.node_id == "worker").unwrap();
+        assert_eq!(
+            worker.status,
+            LoopRunStatus::Fail,
+            "committing without commit rights must be a deterministic fail"
+        );
+        let violation = worker
+            .output
+            .as_ref()
+            .and_then(|o| o.get("commit_rights_violation"))
+            .expect("the violation must be recorded on the run's output");
+        assert_eq!(
+            violation.get("head_before").and_then(|v| v.as_str()),
+            Some(head_before.as_str())
+        );
+        assert_eq!(
+            violation.get("head_after").and_then(|v| v.as_str()),
+            Some(git_head(dir.path()).as_str())
+        );
+        assert!(
+            violation
+                .get("message")
+                .and_then(|v| v.as_str())
+                .is_some_and(|m| m.contains("no commit rights")),
+            "the reason must be stated in plain words"
+        );
+
+        // Routed through the fail edge like any other failure — never
+        // silently accepted, and never onward to the committer.
+        assert!(
+            runs.iter().any(|r| r.node_id == "triage"),
+            "the fail edge must have been taken"
+        );
+        assert!(
+            !runs.iter().any(|r| r.node_id == "committer"),
+            "the pass edge must not have been taken"
+        );
+
+        // The unauthorized commit is reported, never rewritten away.
+        assert_ne!(git_head(dir.path()), head_before);
+    }
+
+    #[tokio::test]
+    async fn designated_committer_that_commits_passes() {
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        init_git_repo(dir.path());
+
+        db.insert_loop_node(&rights_node(
+            &spec_id,
+            "committer",
+            COMMIT_CMD,
+            Some(true),
+            1,
+        ))
+        .unwrap();
+
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(spec.status, LoopSpecStatus::Completed);
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        assert_eq!(runs[0].status, LoopRunStatus::Pass);
+        assert!(runs[0]
+            .output
+            .as_ref()
+            .is_none_or(|o| o.get("commit_rights_violation").is_none()));
+    }
+
+    #[tokio::test]
+    async fn node_that_changes_files_without_committing_is_unaffected() {
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        init_git_repo(dir.path());
+        let head_before = git_head(dir.path());
+
+        db.insert_loop_node(&rights_node(
+            &spec_id,
+            "worker",
+            "printf changed > README.md",
+            None,
+            1,
+        ))
+        .unwrap();
+        db.insert_loop_node(&rights_node(&spec_id, "committer", "true", Some(true), 2))
+            .unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "e-pass".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "worker".to_string(),
+            to_node: "committer".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Pass,
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(spec.status, LoopSpecStatus::Completed);
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        let worker = runs.iter().find(|r| r.node_id == "worker").unwrap();
+        assert_eq!(worker.status, LoopRunStatus::Pass);
+        assert_eq!(git_head(dir.path()), head_before);
+    }
+
+    #[tokio::test]
+    async fn graph_designating_no_committer_keeps_todays_behavior() {
+        // Enforcement is opt-in per graph: without a single `commit_rights`
+        // node there is no way to tell the designated committer from a
+        // violator, so an existing graph must behave exactly as before.
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        init_git_repo(dir.path());
+
+        db.insert_loop_node(&rights_node(&spec_id, "worker", COMMIT_CMD, None, 1))
+            .unwrap();
+
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(spec.status, LoopSpecStatus::Completed);
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        assert_eq!(runs[0].status, LoopRunStatus::Pass);
+    }
+
+    #[tokio::test]
+    async fn commit_rights_enforcement_skips_non_git_workdirs() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&rights_node(&spec_id, "worker", "true", None, 1))
+            .unwrap();
+        db.insert_loop_node(&rights_node(&spec_id, "committer", "true", Some(true), 2))
+            .unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "e-pass".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "worker".to_string(),
+            to_node: "committer".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Pass,
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(spec.status, LoopSpecStatus::Completed);
+    }
+
+    #[test]
+    fn commit_rights_are_explicit_configuration_only() {
+        let named_committer = rights_node("s", "Commit and push", "true", None, 1);
+        assert!(
+            !node_has_commit_rights(&named_committer),
+            "a node's name must never grant it commit rights"
+        );
+        assert!(!graph_enforces_commit_rights(std::slice::from_ref(
+            &named_committer
+        )));
+
+        let designated = rights_node("s", "committer", "true", Some(true), 1);
+        assert!(node_has_commit_rights(&designated));
+        assert!(graph_enforces_commit_rights(&[named_committer, designated]));
+
+        assert!(!node_has_commit_rights(&rights_node(
+            "s",
+            "n",
+            "true",
+            Some(false),
+            1
+        )));
     }
 
     // ── B10: spec_start_head frozen-per-attempt, amend-proof ─────────────
