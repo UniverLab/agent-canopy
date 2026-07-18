@@ -12,6 +12,9 @@ use crate::tui::ui::dialogs::section_picker::draw_section_picker_modal;
 #[allow(unused_imports)]
 use super::{BG_SELECTED, ERROR_COLOR, INTERACTIVE_COLOR};
 
+/// Max rows the scheduled-sends list panel shows at once before it scrolls (B33).
+const SCHEDULED_LIST_MAX_ROWS: usize = 4;
+
 /// Apply styling to collapsed paste blocks, making them stand out with accent color.
 fn style_collapsed_paste_blocks(
     render_text: &str,
@@ -222,10 +225,11 @@ impl ShortcutHint {
 }
 
 /// All shortcut hints in left-to-right DISPLAY order. Priority (keep→drop):
-/// Ctrl+S send, Esc hide, Shift+↑↓ navigate, Ctrl+L recall, @ file,
-/// Ctrl+A add section, Ctrl+X remove.
-fn all_shortcut_hints(send_label: &str, send_hint: &str) -> Vec<ShortcutHint> {
-    vec![
+/// Ctrl+S send, Esc hide, Shift+↑↓ navigate, Ctrl+L recall, Ctrl+P scheduled,
+/// @ file, Ctrl+A add section, Ctrl+X remove. The `Ctrl+P scheduled` hint only
+/// appears when the selected session actually has pending scheduled sends.
+fn all_shortcut_hints(send_label: &str, send_hint: &str, has_scheduled: bool) -> Vec<ShortcutHint> {
+    let mut hints = vec![
         ShortcutHint {
             key: "Shift+↑↓ ".to_string(),
             desc: "navigate  ".to_string(),
@@ -267,14 +271,33 @@ fn all_shortcut_hints(send_label: &str, send_hint: &str) -> Vec<ShortcutHint> {
             desc: "hide".to_string(),
             priority: 2,
         },
-    ]
+    ];
+    // Advertise the scheduled-list entry point only when it does something —
+    // inserted just before the send/hide pair so it reads next to recall.
+    if has_scheduled {
+        let insert_at = hints.len().saturating_sub(2);
+        hints.insert(
+            insert_at,
+            ShortcutHint {
+                key: "Ctrl+P ".to_string(),
+                desc: "scheduled  ".to_string(),
+                priority: 4,
+            },
+        );
+    }
+    hints
 }
 
 /// Pure function: pick which shortcut hints fit into `width` columns, in
 /// display order, dropping the least important first. `Ctrl+S send` and
 /// `Esc hide` (priority ≤ 2) are always kept even when they overflow.
-fn select_shortcut_hints(width: usize, send_label: &str, send_hint: &str) -> Vec<ShortcutHint> {
-    let mut hints = all_shortcut_hints(send_label, send_hint);
+fn select_shortcut_hints(
+    width: usize,
+    send_label: &str,
+    send_hint: &str,
+    has_scheduled: bool,
+) -> Vec<ShortcutHint> {
+    let mut hints = all_shortcut_hints(send_label, send_hint, has_scheduled);
     loop {
         let total: usize = hints.iter().map(ShortcutHint::width).sum();
         if total <= width {
@@ -324,6 +347,26 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) -> Option<(u16, u
         .as_deref()
         .and_then(|id| app.db.list_pending_scheduled_sends_for_session(id).ok())
         .unwrap_or_default();
+
+    // Scheduled-sends list panel geometry (B33). The panel sits just above the
+    // bottom send control, one row per pending send, and only exists when the
+    // selected session actually has pending sends. A selection is only honored
+    // (highlighted, scrolled into view) while there is a list to browse.
+    let list_selected = dialog
+        .scheduled_list_selected
+        .filter(|_| !pending_scheduled.is_empty());
+    let (list_visible_rows, list_scroll) =
+        crate::tui::app::dialog::SimplePromptDialog::scheduled_list_view(
+            pending_scheduled.len(),
+            SCHEDULED_LIST_MAX_ROWS,
+            list_selected,
+        );
+    // Panel height: a label/top-border row plus one row per visible entry.
+    let list_panel_height: u16 = if pending_scheduled.is_empty() {
+        0
+    } else {
+        1 + list_visible_rows as u16
+    };
 
     // Use 65% of terminal width (responsive, not edge-to-edge)
     let percent_x = 65u16;
@@ -379,8 +422,10 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) -> Option<(u16, u
         PromptTab::Normal => total_sections_height,
         PromptTab::Raw => raw_content_height,
     };
-    // borders(2) + tab bar(1) + hint(1) + gap(1) + content + gap(1) + send(1).
-    let total_height = 2 + 1 + 1 + 1 + content_height + 1 + 1;
+    // borders(2) + tab bar(1) + hint(1) + gap(1) + content + gap(1) +
+    // scheduled-list panel + send(1). The panel is 0-height when there are no
+    // pending sends, so the layout is byte-for-byte unchanged in that case.
+    let total_height = 2 + 1 + 1 + 1 + content_height + 1 + list_panel_height + 1;
 
     // Cap dialog height — leave at least 4 rows margin, minimum 10 rows.
     let max_dialog_h = frame_area.height.saturating_sub(2).max(1);
@@ -438,15 +483,20 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) -> Option<(u16, u
     // shortcuts (Ctrl+S send, Esc hide) survive on narrow windows instead of
     // scrolling off the end.
     let (send_label, send_hint) = active_send_shortcut_label(app.keyboard_enhancement_active);
-    let hint_spans: Vec<Span> = select_shortcut_hints(inner.width as usize, send_label, send_hint)
-        .into_iter()
-        .flat_map(|hint| {
-            [
-                Span::styled(hint.key, Style::default().fg(DIM)),
-                Span::styled(hint.desc, Style::default().fg(Color::White)),
-            ]
-        })
-        .collect();
+    let hint_spans: Vec<Span> = select_shortcut_hints(
+        inner.width as usize,
+        send_label,
+        send_hint,
+        !pending_scheduled.is_empty(),
+    )
+    .into_iter()
+    .flat_map(|hint| {
+        [
+            Span::styled(hint.key, Style::default().fg(DIM)),
+            Span::styled(hint.desc, Style::default().fg(Color::White)),
+        ]
+    })
+    .collect();
     let instructions = Line::from(hint_spans);
 
     let instructions_area = ratatui::layout::Rect {
@@ -524,17 +574,8 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) -> Option<(u16, u
             Style::default().fg(Color::Yellow),
         ));
     }
-    if let Some(next) = pending_scheduled.first() {
-        let next_local = next.fire_at.with_timezone(&chrono::Local);
-        send_spans.push(Span::styled(
-            format!(
-                "  · {} scheduled → {} (Ctrl+K cancel)",
-                pending_scheduled.len(),
-                next_local.format("%H:%M")
-            ),
-            ghost,
-        ));
-    }
+    // Pending scheduled sends now render as a dedicated LIST panel above the
+    // send line (see `draw_scheduled_list`), not crammed onto this bar (B33).
 
     let send_text_width: usize = send_spans.iter().map(|s| s.content.chars().count()).sum();
     let send_x = inner.x
@@ -555,12 +596,13 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) -> Option<(u16, u
     // preview when empty); the Normal tab draws its scrolling section stack.
     let mut picker_anchor_area: Option<ratatui::layout::Rect> = None;
     if dialog.active_tab == PromptTab::Raw {
-        draw_raw_tab_content(frame, dialog, accent, inner, field_width);
+        draw_raw_tab_content(frame, dialog, accent, inner, field_width, list_panel_height);
     } else {
         // sections_available_h = inner height minus tab(1) + hint(1) + gap(1) at the
-        // top and gap(1) + send line(1) at the bottom.
+        // top and gap(1) + send line(1) at the bottom, and the scheduled-list
+        // panel (B33) reserved just above the send line.
         let sections_top = inner.y + 3;
-        let sections_available_h = inner.height.saturating_sub(5);
+        let sections_available_h = inner.height.saturating_sub(5 + list_panel_height);
 
         // Work backwards from focused_section to find the first section that fits.
         // focused_section 0 = send_at (handled above), sections start at index 1.
@@ -582,8 +624,9 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) -> Option<(u16, u
             start
         };
 
-        // Scroll indicators
-        let inner_bottom = inner.y + inner.height;
+        // Scroll indicators. The effective bottom excludes the scheduled-list
+        // panel (B33) so sections never draw over it.
+        let inner_bottom = inner.y + inner.height.saturating_sub(list_panel_height);
         if start_idx > 0 {
             let arrow = Span::styled(" ▲ ", Style::default().fg(accent));
             let a = ratatui::layout::Rect {
@@ -798,6 +841,24 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) -> Option<(u16, u
         }
     } // end Normal-tab content region
 
+    // ── Scheduled-sends list panel (B33) ─────────────────────────────────
+    // A compact list of pending scheduled sends, one row each, docked just
+    // above the send line. Navigable/selectable via keyboard (Ctrl+P).
+    if list_panel_height > 0 {
+        let panel_top = inner.y + inner.height.saturating_sub(1 + list_panel_height);
+        draw_scheduled_list(
+            frame,
+            &pending_scheduled,
+            list_selected,
+            list_scroll,
+            list_visible_rows,
+            dialog.editing_scheduled_id.as_deref(),
+            accent,
+            inner,
+            panel_top,
+        );
+    }
+
     // Draw @ file picker dropdown if active
     if dialog.at_picker.is_some() {
         let anchor = picker_anchor_area.unwrap_or(inner);
@@ -820,9 +881,11 @@ fn draw_raw_tab_content(
     accent: Color,
     inner: ratatui::layout::Rect,
     field_width: usize,
+    list_panel_height: u16,
 ) {
     let content_top = inner.y + 3;
-    let content_bottom = inner.y + inner.height.saturating_sub(2); // leave send line
+    // Leave the send line plus the scheduled-list panel (B33) at the bottom.
+    let content_bottom = inner.y + inner.height.saturating_sub(2 + list_panel_height);
     let avail_h = content_bottom.saturating_sub(content_top).max(1) as usize;
 
     // Header/label line (row 2, the gap row above the field).
@@ -911,6 +974,79 @@ fn draw_raw_tab_content(
     }
 }
 
+/// One scheduled-list row's text: `MM-DD HH:MM  <first line of prompt>`,
+/// truncated to `width`. Pure so the rendered row and its tests agree.
+fn scheduled_row_text(fire_local: chrono::NaiveDateTime, prompt: &str, width: usize) -> String {
+    let preview = prompt.lines().next().unwrap_or("").trim();
+    let full = format!("{}  {}", fire_local.format("%m-%d %H:%M"), preview);
+    truncate_str(&full, width)
+}
+
+/// Draw the pending-scheduled-sends list panel (B33): a labeled top border,
+/// then one row per visible entry (fire time + prompt preview). The selected
+/// row (only set while the list has keyboard focus) is drawn reversed.
+#[allow(clippy::too_many_arguments)]
+fn draw_scheduled_list(
+    frame: &mut Frame,
+    pending: &[crate::db::scheduled_sends::ScheduledSend],
+    selected: Option<usize>,
+    scroll: usize,
+    visible_rows: usize,
+    editing_id: Option<&str>,
+    accent: Color,
+    inner: ratatui::layout::Rect,
+    panel_top: u16,
+) {
+    let editing = editing_id.is_some_and(|id| pending.iter().any(|send| send.id == id));
+    let label = if editing {
+        format!(" Scheduled sends ({}) — editing ", pending.len())
+    } else {
+        format!(" Scheduled sends ({}) · Ctrl+P browse ", pending.len())
+    };
+    let label_style = Style::default().fg(accent).add_modifier(Modifier::BOLD);
+    frame.render_widget(
+        Paragraph::new(generate_top_border(&label, inner.width, label_style)),
+        ratatui::layout::Rect {
+            x: inner.x,
+            y: panel_top,
+            width: inner.width,
+            height: 1,
+        },
+    );
+
+    let row_width = inner.width.saturating_sub(2) as usize;
+    for row in 0..visible_rows {
+        let idx = scroll + row;
+        let Some(send) = pending.get(idx) else {
+            break;
+        };
+        let fire_local = send.fire_at.with_timezone(&chrono::Local).naive_local();
+        let text = scheduled_row_text(fire_local, &send.prompt, row_width);
+        let is_selected = selected == Some(idx);
+        let style = if is_selected {
+            Style::default()
+                .fg(accent)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let marker = if is_selected { "› " } else { "  " };
+        let line = Line::from(vec![
+            Span::styled(marker, Style::default().fg(accent)),
+            Span::styled(text, style),
+        ]);
+        frame.render_widget(
+            Paragraph::new(line),
+            ratatui::layout::Rect {
+                x: inner.x,
+                y: panel_top + 1 + row as u16,
+                width: inner.width,
+                height: 1,
+            },
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -961,7 +1097,14 @@ mod tests {
     }
 
     fn hint_keys(width: usize) -> Vec<String> {
-        select_shortcut_hints(width, "Ctrl+S ", "send")
+        select_shortcut_hints(width, "Ctrl+S ", "send", false)
+            .iter()
+            .map(|hint| hint.key.trim().to_string())
+            .collect()
+    }
+
+    fn hint_keys_scheduled(width: usize) -> Vec<String> {
+        select_shortcut_hints(width, "Ctrl+S ", "send", true)
             .iter()
             .map(|hint| hint.key.trim().to_string())
             .collect()
@@ -985,6 +1128,43 @@ mod tests {
         );
         // The removed "↑↓ fields" entry must not reappear.
         assert!(!keys.iter().any(|k| k == "↑↓"));
+    }
+
+    #[test]
+    fn shortcut_bar_advertises_ctrl_p_only_when_sends_are_pending() {
+        // With pending sends, Ctrl+P appears (between recall and send); without,
+        // it never does.
+        let with = hint_keys_scheduled(200);
+        assert_eq!(
+            with,
+            vec![
+                "Shift+↑↓",
+                "@",
+                "Ctrl+A",
+                "Ctrl+X",
+                "Shift+←→",
+                "Ctrl+L",
+                "Ctrl+P",
+                "Ctrl+S",
+                "Esc"
+            ]
+        );
+        assert!(!hint_keys(200).iter().any(|k| k == "Ctrl+P"));
+    }
+
+    #[test]
+    fn scheduled_row_text_shows_time_and_truncated_preview() {
+        let fire = chrono::NaiveDate::from_ymd_opt(2026, 7, 20)
+            .unwrap()
+            .and_hms_opt(14, 5, 0)
+            .unwrap();
+        // Only the first line of the prompt is previewed.
+        let row = scheduled_row_text(fire, "run the build\nthen deploy", 40);
+        assert_eq!(row, "07-20 14:05  run the build");
+        // Narrow widths truncate with an ellipsis and never overflow.
+        let narrow = scheduled_row_text(fire, "a very long prompt line here", 18);
+        assert!(narrow.chars().count() <= 18);
+        assert!(narrow.starts_with("07-20 14:05"));
     }
 
     #[test]

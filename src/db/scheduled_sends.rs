@@ -291,6 +291,74 @@ mod tests {
         assert_eq!(pending[0].id, "ss-4");
     }
 
+    /// Edit-in-place (B33): re-confirming an edited scheduled send REPLACES the
+    /// existing row (delete old + insert edited) rather than adding a duplicate,
+    /// so the pending count is unchanged and the content is updated.
+    #[test]
+    fn edit_in_place_replaces_without_duplicating() {
+        let db = test_db();
+        let fire = Utc::now() + chrono::Duration::hours(2);
+        db.insert_scheduled_send("ss-edit", "original text", "session-1", Some("/proj"), fire)
+            .unwrap();
+
+        // The delete+insert path the edit flow uses.
+        assert!(db.delete_scheduled_send("ss-edit").unwrap());
+        db.insert_scheduled_send(
+            "ss-edit-new",
+            "edited text",
+            "session-1",
+            Some("/proj"),
+            fire,
+        )
+        .unwrap();
+
+        let pending = db
+            .list_pending_scheduled_sends_for_session("session-1")
+            .unwrap();
+        assert_eq!(pending.len(), 1, "editing must not create a duplicate");
+        assert_eq!(pending[0].prompt, "edited text");
+        assert_eq!(pending[0].id, "ss-edit-new");
+    }
+
+    /// Cancelling a selected list entry (B33) removes exactly that one, leaving
+    /// the surrounding entries — the list is ordered soonest-first, so index 1
+    /// is the middle send.
+    #[test]
+    fn cancel_selected_removes_only_that_entry() {
+        let db = test_db();
+        let base = Utc::now() + chrono::Duration::hours(1);
+        db.insert_scheduled_send("ss-a", "first", "session-x", None, base)
+            .unwrap();
+        db.insert_scheduled_send(
+            "ss-b",
+            "second",
+            "session-x",
+            None,
+            base + chrono::Duration::hours(1),
+        )
+        .unwrap();
+        db.insert_scheduled_send(
+            "ss-c",
+            "third",
+            "session-x",
+            None,
+            base + chrono::Duration::hours(2),
+        )
+        .unwrap();
+
+        let pending = db
+            .list_pending_scheduled_sends_for_session("session-x")
+            .unwrap();
+        assert_eq!(pending[1].id, "ss-b");
+        assert!(db.delete_scheduled_send(&pending[1].id).unwrap());
+
+        let remaining = db
+            .list_pending_scheduled_sends_for_session("session-x")
+            .unwrap();
+        let ids: Vec<&str> = remaining.iter().map(|send| send.id.as_str()).collect();
+        assert_eq!(ids, vec!["ss-a", "ss-c"]);
+    }
+
     #[test]
     fn reassign_moves_pending_sends_to_the_resumed_session_id() {
         let db = test_db();

@@ -28,6 +28,29 @@ pub fn handle_prompt_template_key(
     let db = app.db.clone();
     let workdir = resolve_picker_workdir(app);
 
+    // Scheduled-sends list interactions (B33) need app-level DB access, so they
+    // run before the dialog is borrowed mutably. They never fire while the
+    // recall confirm overlay is up — that overlay owns every key.
+    let recall_open = app
+        .simple_prompt_dialog
+        .as_ref()
+        .is_some_and(|d| d.pending_recall.is_some());
+    if !recall_open {
+        let list_focused = app
+            .simple_prompt_dialog
+            .as_ref()
+            .is_some_and(|d| d.scheduled_list_selected.is_some());
+        if list_focused {
+            handle_scheduled_list_key(app, code, modifiers);
+            return Ok(());
+        }
+        // Ctrl+P moves focus INTO the pending-sends list (no-op when empty).
+        if code == KeyCode::Char('p') && modifiers.contains(KeyModifiers::CONTROL) {
+            enter_scheduled_list(app);
+            return Ok(());
+        }
+    }
+
     let Some(dialog) = app.simple_prompt_dialog.as_mut() else {
         app.focus = Focus::Agent;
         return Ok(());
@@ -119,7 +142,7 @@ pub fn handle_prompt_template_key(
         PromptAction::ScheduleSend(prompt, when) => {
             schedule_send_prompt(app, &prompt, when);
         }
-        PromptAction::CancelNextScheduled => cancel_next_scheduled_send(app),
+        PromptAction::CancelNextScheduled => cancel_scheduled_send(app),
         PromptAction::RecallLastPrompt => recall_last_prompt(app),
     }
 
@@ -1165,6 +1188,19 @@ fn selected_session_target(app: &App) -> Option<(String, String)> {
 fn schedule_send_prompt(app: &mut App, prompt: &str, when: chrono::NaiveDateTime) {
     let session_key = app.current_prompt_session_key();
 
+    // Edit-in-place (B33): when the builder is editing an existing scheduled
+    // send, re-confirming REPLACES it — delete the old row first, then insert
+    // the edited one below, so the list count stays the same (no duplicate).
+    let editing_id = app
+        .simple_prompt_dialog
+        .as_ref()
+        .and_then(|d| d.editing_scheduled_id.clone());
+    if let Some(old_id) = editing_id.as_deref() {
+        if let Err(e) = app.db.delete_scheduled_send(old_id) {
+            tracing::warn!("Failed to replace scheduled send '{old_id}': {e}");
+        }
+    }
+
     // Resolve the target session ID/workdir from the currently selected agent.
     let (target_session_id, target_workdir) = selected_session_target(app).unwrap_or_default();
 
@@ -1212,9 +1248,11 @@ fn schedule_send_prompt(app: &mut App, prompt: &str, when: chrono::NaiveDateTime
     );
 }
 
-/// Cancel the soonest pending scheduled send targeting the currently
-/// selected interactive session. No-op if there is none.
-fn cancel_next_scheduled_send(app: &mut App) {
+/// Cancel a pending scheduled send targeting the currently selected
+/// interactive session (Ctrl+K). When a list entry is selected (the user is
+/// browsing the scheduled-list panel, B33) that entry is canceled; otherwise it
+/// falls back to the soonest pending send. No-op if there is none.
+fn cancel_scheduled_send(app: &mut App) {
     let Some((target_session_id, _)) = selected_session_target(app) else {
         return;
     };
@@ -1230,11 +1268,20 @@ fn cancel_next_scheduled_send(app: &mut App) {
         }
     };
 
-    let Some(next) = pending.first() else {
+    if pending.is_empty() {
         return;
-    };
+    }
 
-    match app.db.delete_scheduled_send(&next.id) {
+    // A live list selection targets that row; with nothing selected the list is
+    // ordered soonest-first, so index 0 is the soonest send.
+    let selected = app
+        .simple_prompt_dialog
+        .as_ref()
+        .and_then(|d| d.scheduled_list_selected);
+    let idx = selected.unwrap_or(0).min(pending.len() - 1);
+    let target_id = pending[idx].id.clone();
+
+    match app.db.delete_scheduled_send(&target_id) {
         Ok(true) => {
             crate::domain::notification::send_notification(
                 "Scheduled send canceled",
@@ -1243,7 +1290,92 @@ fn cancel_next_scheduled_send(app: &mut App) {
             );
         }
         Ok(false) => {}
-        Err(e) => tracing::warn!("Failed to cancel scheduled send '{}': {e}", next.id),
+        Err(e) => tracing::warn!("Failed to cancel scheduled send '{target_id}': {e}"),
+    }
+
+    // Re-clamp the list selection against the shortened list (or drop out of
+    // list-browse mode when the last entry was just canceled).
+    if selected.is_some() {
+        let remaining = pending.len().saturating_sub(1);
+        if let Some(dialog) = app.simple_prompt_dialog.as_mut() {
+            dialog.scheduled_list_selected = (remaining > 0).then(|| idx.min(remaining - 1));
+        }
+    }
+}
+
+/// Move keyboard focus into the pending-scheduled-sends list (B33), selecting
+/// the first (soonest) entry. No-op when the selected session has no pending
+/// sends — there is nothing to browse.
+fn enter_scheduled_list(app: &mut App) {
+    let Some((target_session_id, _)) = selected_session_target(app) else {
+        return;
+    };
+    let has_pending = app
+        .db
+        .list_pending_scheduled_sends_for_session(&target_session_id)
+        .map(|pending| !pending.is_empty())
+        .unwrap_or(false);
+    if !has_pending {
+        return;
+    }
+    if let Some(dialog) = app.simple_prompt_dialog.as_mut() {
+        dialog.scheduled_list_selected = Some(0);
+    }
+}
+
+/// Handle a key while the scheduled-sends list panel has focus (B33): arrows
+/// move the selection, Enter loads the selected send into the Raw tab for
+/// in-place editing, Ctrl+K cancels the selected send, and Esc/Ctrl+P leave the
+/// list. The list content is read live from the DB so it always reflects state.
+fn handle_scheduled_list_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+    let Some((target_session_id, _)) = selected_session_target(app) else {
+        clear_scheduled_list_focus(app);
+        return;
+    };
+    let pending = app
+        .db
+        .list_pending_scheduled_sends_for_session(&target_session_id)
+        .unwrap_or_default();
+    if pending.is_empty() {
+        clear_scheduled_list_focus(app);
+        return;
+    }
+
+    let sel = app
+        .simple_prompt_dialog
+        .as_ref()
+        .and_then(|d| d.scheduled_list_selected)
+        .unwrap_or(0)
+        .min(pending.len() - 1);
+    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+
+    match code {
+        KeyCode::Up => set_scheduled_list_selection(app, sel.saturating_sub(1)),
+        KeyCode::Down => set_scheduled_list_selection(app, (sel + 1).min(pending.len() - 1)),
+        KeyCode::Esc => clear_scheduled_list_focus(app),
+        KeyCode::Char('p') if ctrl => clear_scheduled_list_focus(app),
+        KeyCode::Char('k') if ctrl => cancel_scheduled_send(app),
+        KeyCode::Enter => {
+            let send = &pending[sel];
+            let fire_local = send.fire_at.with_timezone(&chrono::Local).naive_local();
+            let (id, prompt) = (send.id.clone(), send.prompt.clone());
+            if let Some(dialog) = app.simple_prompt_dialog.as_mut() {
+                dialog.load_scheduled_for_edit(&id, &prompt, fire_local);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn set_scheduled_list_selection(app: &mut App, index: usize) {
+    if let Some(dialog) = app.simple_prompt_dialog.as_mut() {
+        dialog.scheduled_list_selected = Some(index);
+    }
+}
+
+fn clear_scheduled_list_focus(app: &mut App) {
+    if let Some(dialog) = app.simple_prompt_dialog.as_mut() {
+        dialog.scheduled_list_selected = None;
     }
 }
 

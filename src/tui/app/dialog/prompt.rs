@@ -224,6 +224,15 @@ pub struct SimplePromptDialog {
     /// Vertical scroll offset (in preview lines) for the read-only raw
     /// preview. Reset whenever the preview is recomputed. Transient.
     pub raw_preview_scroll: usize,
+    /// Selected row in the pending-scheduled-sends list panel (B33). `Some(i)`
+    /// means the list region has keyboard focus and row `i` is highlighted;
+    /// `None` means the list (if shown) is idle and keys go to the normal
+    /// fields. Transient — recomputed against the live DB list on each frame.
+    pub scheduled_list_selected: Option<usize>,
+    /// When set, a re-confirmed schedule UPDATES this existing scheduled-send
+    /// row in place (delete + re-insert) instead of creating a duplicate — the
+    /// select-to-edit flow (B33). Transient; cleared once the builder closes.
+    pub editing_scheduled_id: Option<String>,
 }
 
 impl SimplePromptDialog {
@@ -260,6 +269,8 @@ impl SimplePromptDialog {
             active_tab: PromptTab::Normal,
             raw_preview: None,
             raw_preview_scroll: 0,
+            scheduled_list_selected: None,
+            editing_scheduled_id: None,
         }
     }
 
@@ -1590,6 +1601,65 @@ impl SimplePromptDialog {
             })
     }
 
+    // ── Scheduled-sends list panel (B33) ────────────────────────────────
+
+    /// Load a queued scheduled send into the Raw tab for in-place editing.
+    /// A scheduled send stores a single already-resolved string, which the
+    /// Normal field-stack cannot un-compose — so the Raw free-text field is its
+    /// natural home. Switches to the Raw tab, loads the prompt (cursor at end),
+    /// preseeds the send control with the entry's fire time, and records the id
+    /// so re-confirming a schedule replaces that row instead of duplicating it.
+    pub fn load_scheduled_for_edit(
+        &mut self,
+        id: &str,
+        prompt: &str,
+        fire_local: chrono::NaiveDateTime,
+    ) {
+        self.active_tab = PromptTab::Raw;
+        self.raw_preview = None;
+        self.raw_preview_scroll = 0;
+        self.sections
+            .insert(RAW_SECTION_ID.to_string(), prompt.to_string());
+        let end = prompt.chars().count();
+        self.section_cursors.insert(RAW_SECTION_ID.to_string(), end);
+        // Raw's first focus target is the buffer (index 1), never the send control.
+        self.focused_section = 1;
+        self.editing_scheduled_id = Some(id.to_string());
+        self.send_choice = SendChoice::Date;
+        self.send_at = Some(fire_local);
+        self.send_edit = None;
+        self.send_error = None;
+        // Editing takes over from browsing: release the list focus.
+        self.scheduled_list_selected = None;
+    }
+
+    /// Pure geometry for the scheduled-sends list panel: given the total number
+    /// of pending entries, the panel's max visible rows, and the current
+    /// selection, return `(visible_rows, scroll_offset)` so the selected row
+    /// stays in view. Kept pure (like `tab_hitboxes`) so render and tests agree.
+    pub fn scheduled_list_view(
+        total: usize,
+        max_rows: usize,
+        selected: Option<usize>,
+    ) -> (usize, usize) {
+        if total == 0 || max_rows == 0 {
+            return (0, 0);
+        }
+        let visible = total.min(max_rows);
+        let scroll = match selected {
+            Some(sel) => {
+                let sel = sel.min(total - 1);
+                if sel < visible {
+                    0
+                } else {
+                    (sel + 1 - visible).min(total - visible)
+                }
+            }
+            None => 0,
+        };
+        (visible, scroll)
+    }
+
     fn should_collapse_paste(text: &str) -> bool {
         text.lines().count() > 1 || text.chars().count() > 200
     }
@@ -2205,6 +2275,74 @@ mod tests {
         assert_eq!(dialog.raw_preview.as_deref(), Some(composed.as_str()));
     }
 
+    // ── Scheduled-sends list panel (B33) ────────────────────────────────
+
+    #[test]
+    fn scheduled_list_view_no_scroll_when_all_rows_fit() {
+        // 3 entries, panel shows up to 4 → everything visible, never scrolled.
+        assert_eq!(
+            SimplePromptDialog::scheduled_list_view(3, 4, Some(2)),
+            (3, 0)
+        );
+        assert_eq!(SimplePromptDialog::scheduled_list_view(3, 4, None), (3, 0));
+    }
+
+    #[test]
+    fn scheduled_list_view_scrolls_to_keep_selection_in_view() {
+        // 6 entries, 3 visible rows. Selecting row 4 scrolls so it is the last
+        // visible row (offset 2 → rows 2,3,4).
+        assert_eq!(
+            SimplePromptDialog::scheduled_list_view(6, 3, Some(4)),
+            (3, 2)
+        );
+        // The last row never scrolls past the end (offset clamps to total-visible).
+        assert_eq!(
+            SimplePromptDialog::scheduled_list_view(6, 3, Some(5)),
+            (3, 3)
+        );
+        // Early rows keep the panel pinned to the top.
+        assert_eq!(
+            SimplePromptDialog::scheduled_list_view(6, 3, Some(1)),
+            (3, 0)
+        );
+    }
+
+    #[test]
+    fn scheduled_list_view_empty_is_zero() {
+        assert_eq!(SimplePromptDialog::scheduled_list_view(0, 4, None), (0, 0));
+        assert_eq!(
+            SimplePromptDialog::scheduled_list_view(5, 0, Some(1)),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn load_scheduled_for_edit_loads_raw_and_records_editing_id() {
+        let mut dialog = SimplePromptDialog::new();
+        // Some pre-existing Normal-form content that must be bypassed.
+        dialog.set_section_content("instruction_1", "compose me".to_string());
+        dialog.scheduled_list_selected = Some(2);
+
+        let fire = chrono::NaiveDate::from_ymd_opt(2030, 1, 2)
+            .unwrap()
+            .and_hms_opt(9, 15, 0)
+            .unwrap();
+        dialog.load_scheduled_for_edit("ss-42", "deliver this later", fire);
+
+        assert_eq!(dialog.active_tab, PromptTab::Raw);
+        assert_eq!(dialog.raw_text(), "deliver this later");
+        assert_eq!(
+            dialog.cursor(RAW_SECTION_ID),
+            "deliver this later".chars().count()
+        );
+        assert_eq!(dialog.editing_scheduled_id.as_deref(), Some("ss-42"));
+        assert_eq!(dialog.send_choice, SendChoice::Date);
+        assert_eq!(dialog.send_at, Some(fire));
+        // Focus lands on the raw buffer, and the list focus is released.
+        assert_eq!(dialog.focused_section, 1);
+        assert!(dialog.scheduled_list_selected.is_none());
+    }
+
     #[test]
     fn raw_buffer_and_active_tab_survive_session_round_trip() {
         let mut source = SimplePromptDialog::new();
@@ -2285,6 +2423,8 @@ impl PromptBuilderSession {
         dialog.send_edit = None;
         dialog.send_error = None;
         dialog.raw_preview = None; // recomputed when the Raw tab is shown
+        dialog.scheduled_list_selected = None; // list focus never persists
+        dialog.editing_scheduled_id = None; // a reopened builder isn't mid-edit
     }
 }
 
