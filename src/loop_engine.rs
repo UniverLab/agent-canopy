@@ -327,6 +327,31 @@ impl LoopEngine {
                         spec_id
                     );
                 }
+                // B35: When resuming (retry_current_node), re-dispatch the
+                // spec that was already `running` before falling through to
+                // the pending-picker. Without this, pool_next_pending_spec_id
+                // skips the running spec (it only picks `pending`) and the
+                // loop advances to the next queue member, stranding the
+                // original spec in `running` with no active run.
+                if is_resume {
+                    if let Some(running_spec_id) = self.db.pool_running_spec_id(pool_id)? {
+                        if let Some(spec) = self.db.get_loop_spec(&running_spec_id)? {
+                            match self
+                                .run_spec(&lp, &spec, &workdir, is_resume, Some(pool_id.as_str()))
+                                .await?
+                            {
+                                SpecExecutionOutcome::Completed { summary } => {
+                                    completed_specs.push((spec.name.clone(), summary));
+                                }
+                                SpecExecutionOutcome::Paused => return Ok(()),
+                                SpecExecutionOutcome::Failed(summary) => {
+                                    self.fail_loop(&loop_id, Some(&spec.name), &summary)?;
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                }
                 loop {
                     if self.is_paused(&loop_id)? {
                         return Ok(());

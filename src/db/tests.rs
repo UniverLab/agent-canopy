@@ -3844,3 +3844,163 @@ fn set_spec_admin_status_propagates_to_pool_selection() {
     let after = db.pool_next_pending_spec_id("pool-test").unwrap();
     assert_eq!(after, None, "pool should not select completed spec anymore");
 }
+
+#[test]
+fn pool_running_spec_id_returns_first_running_member() {
+    let db = test_db();
+    let lp = sample_loop("wf-pool-running");
+    db.insert_loop(&lp).unwrap();
+
+    let mut spec_a = sample_loop_spec("unused", "spec-a", 1);
+    spec_a.loop_id = None;
+    spec_a.status = LoopSpecStatus::Running;
+    let mut spec_b = sample_loop_spec("unused", "spec-b", 2);
+    spec_b.loop_id = None;
+    spec_b.status = LoopSpecStatus::Pending;
+    db.insert_loop_spec(&spec_a).unwrap();
+    db.insert_loop_spec(&spec_b).unwrap();
+
+    db.insert_pool(&Pool {
+        id: "pool-1".to_string(),
+        name: "pool-1".to_string(),
+        created_at: Utc::now(),
+    })
+    .unwrap();
+    db.append_pool_member("pool-1", &spec_a.id, None).unwrap();
+    db.append_pool_member("pool-1", &spec_b.id, None).unwrap();
+
+    assert_eq!(
+        db.pool_running_spec_id("pool-1").unwrap().as_deref(),
+        Some(spec_a.id.as_str())
+    );
+}
+
+#[test]
+fn pool_running_spec_id_returns_none_when_no_running_member() {
+    let db = test_db();
+    let lp = sample_loop("wf-pool-no-running");
+    db.insert_loop(&lp).unwrap();
+
+    let mut spec = sample_loop_spec("unused", "spec-p", 1);
+    spec.loop_id = None;
+    spec.status = LoopSpecStatus::Pending;
+    db.insert_loop_spec(&spec).unwrap();
+
+    db.insert_pool(&Pool {
+        id: "pool-1".to_string(),
+        name: "pool-1".to_string(),
+        created_at: Utc::now(),
+    })
+    .unwrap();
+    db.append_pool_member("pool-1", &spec.id, None).unwrap();
+
+    assert_eq!(db.pool_running_spec_id("pool-1").unwrap(), None);
+}
+
+#[test]
+fn reconcile_stranded_pool_specs_resets_running_spec_with_no_active_run() {
+    let db = test_db();
+    let mut lp = sample_loop("wf-stranded");
+    lp.status = LoopStatus::Paused;
+    lp.active_run_pool_id = Some("pool-1".to_string());
+    db.insert_loop(&lp).unwrap();
+
+    let mut spec = sample_loop_spec("unused", "spec-stranded", 1);
+    spec.loop_id = None;
+    spec.status = LoopSpecStatus::Running;
+    db.insert_loop_spec(&spec).unwrap();
+
+    db.insert_pool(&Pool {
+        id: "pool-1".to_string(),
+        name: "pool-1".to_string(),
+        created_at: Utc::now(),
+    })
+    .unwrap();
+    db.append_pool_member("pool-1", &spec.id, None).unwrap();
+
+    assert_eq!(db.reconcile_stranded_pool_specs().unwrap(), 1);
+
+    let spec_after = db.get_loop_spec(&spec.id).unwrap().unwrap();
+    assert_eq!(spec_after.status, LoopSpecStatus::Pending);
+    assert!(spec_after.started_at.is_none());
+    assert!(spec_after.spec_start_head.is_none());
+}
+
+#[test]
+fn reconcile_stranded_pool_specs_preserves_spec_with_active_run_in_current_boot() {
+    let db = test_db();
+    let mut lp = sample_loop("wf-stranded-live");
+    lp.status = LoopStatus::Paused;
+    lp.active_run_pool_id = Some("pool-1".to_string());
+    db.insert_loop(&lp).unwrap();
+
+    let mut spec = sample_loop_spec("unused", "spec-live", 1);
+    spec.loop_id = None;
+    spec.status = LoopSpecStatus::Running;
+    db.insert_loop_spec(&spec).unwrap();
+
+    db.insert_pool(&Pool {
+        id: "pool-1".to_string(),
+        name: "pool-1".to_string(),
+        created_at: Utc::now(),
+    })
+    .unwrap();
+    db.append_pool_member("pool-1", &spec.id, None).unwrap();
+
+    let node = sample_loop_node(&spec.id, "node-live", 1);
+    db.insert_loop_node(&node).unwrap();
+    db.insert_loop_run(&LoopNodeRun {
+        id: "run-live".to_string(),
+        loop_id: lp.id,
+        spec_id: spec.id.clone(),
+        node_id: node.id,
+        status: LoopRunStatus::Running,
+        input: None,
+        output: None,
+        started_at: Utc::now(),
+        completed_at: None,
+        iteration: 1,
+        pid: None,
+        boot_id: Some(crate::system::boot_id().unwrap_or_default()),
+        session_id: None,
+    })
+    .unwrap();
+
+    assert_eq!(
+        db.reconcile_stranded_pool_specs().unwrap(),
+        0,
+        "spec with active run in current boot must not be reset"
+    );
+
+    let spec_after = db.get_loop_spec(&spec.id).unwrap().unwrap();
+    assert_eq!(spec_after.status, LoopSpecStatus::Running);
+}
+
+#[test]
+fn reconcile_stranded_pool_specs_is_idempotent() {
+    let db = test_db();
+    let mut lp = sample_loop("wf-stranded-idem");
+    lp.status = LoopStatus::Paused;
+    lp.active_run_pool_id = Some("pool-1".to_string());
+    db.insert_loop(&lp).unwrap();
+
+    let mut spec = sample_loop_spec("unused", "spec-idem", 1);
+    spec.loop_id = None;
+    spec.status = LoopSpecStatus::Running;
+    db.insert_loop_spec(&spec).unwrap();
+
+    db.insert_pool(&Pool {
+        id: "pool-1".to_string(),
+        name: "pool-1".to_string(),
+        created_at: Utc::now(),
+    })
+    .unwrap();
+    db.append_pool_member("pool-1", &spec.id, None).unwrap();
+
+    assert_eq!(db.reconcile_stranded_pool_specs().unwrap(), 1);
+    assert_eq!(
+        db.reconcile_stranded_pool_specs().unwrap(),
+        0,
+        "second pass must find nothing to reset"
+    );
+}

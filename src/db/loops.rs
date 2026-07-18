@@ -1294,6 +1294,79 @@ impl Database {
         Ok(orphaned.len())
     }
 
+    /// Reset pool-member specs stuck `running` with no active node run in
+    /// this daemon's lifetime back to `pending`. Covers the gap between
+    /// `reconcile_orphaned_loops` (which only touches loops that were
+    /// themselves `Running` at boot) and a pool member left `running` by a
+    /// path that paused the loop without resetting the spec (e.g. a
+    /// BLOCKER-reported spec that was never cleaned up). Called at server
+    /// startup after `reconcile_orphaned_loops`.
+    pub fn reconcile_stranded_pool_specs(&self) -> Result<usize> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let tx = conn.unchecked_transaction()?;
+
+        let paused_loops: Vec<(String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, active_run_pool_id FROM loops
+                 WHERE status = ?1 AND active_run_pool_id IS NOT NULL",
+            )?;
+            let rows = stmt.query_map(params![LoopStatus::Paused.as_str()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let mut reset_count = 0;
+        let boot_id = crate::system::boot_id();
+        let current_boot_id = boot_id.as_deref();
+
+        for (loop_id, pool_id) in &paused_loops {
+            let stranded_specs: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT pm.spec_id FROM pool_members pm
+                     JOIN loop_specs ls ON ls.id = pm.spec_id
+                     WHERE pm.pool_id = ?1 AND ls.status = ?2
+                     AND NOT EXISTS (
+                         SELECT 1 FROM loop_runs lr
+                         WHERE lr.spec_id = pm.spec_id
+                         AND lr.status = 'running'
+                         AND lr.boot_id = ?3
+                     )
+                     ORDER BY pm.position ASC",
+                )?;
+                let rows = stmt.query_map(
+                    params![pool_id, LoopSpecStatus::Running.as_str(), current_boot_id],
+                    |row| row.get::<_, String>(0),
+                )?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+
+            for spec_id in &stranded_specs {
+                tracing::warn!(
+                    "Reconciling stranded pool spec '{}' in loop '{}': \
+                     was 'running' with no active node run in this daemon's \
+                     lifetime; resetting to pending.",
+                    spec_id,
+                    loop_id
+                );
+                tx.execute(
+                    "UPDATE loop_specs
+                     SET status = ?1, started_at = NULL, completed_at = NULL,
+                         spec_start_head = NULL
+                     WHERE id = ?2",
+                    params![LoopSpecStatus::Pending.as_str(), spec_id],
+                )?;
+                reset_count += 1;
+            }
+        }
+
+        tx.commit()?;
+        Ok(reset_count)
+    }
+
     pub fn get_loop_details(&self, loop_id: &str) -> Result<Option<LoopDetails>> {
         let Some(lp) = self.get_loop(loop_id)? else {
             return Ok(None);

@@ -4951,7 +4951,9 @@ impl TaskTriggerHandler {
         }
 
         match params.action.trim() {
-            "retry_current_node" => {}
+            "retry_current_node" => {
+                handle_retry_current_node(&self.db, &params.loop_id)?;
+            }
             "skip_next_spec" => handle_skip_next_spec(&self.db, &params.loop_id)?,
             _ => {
                 return Ok(error_result(
@@ -5288,6 +5290,23 @@ fn handle_skip_next_spec(db: &Database, loop_id: &str) -> Result<(), McpError> {
         Some(chrono::Utc::now()),
     )
     .map_err(internal_error)?;
+    Ok(())
+}
+
+/// Validate that a running spec exists for `retry_current_node` — the same
+/// lookup shape as [`handle_skip_next_spec`] but only checks, never mutates.
+fn handle_retry_current_node(db: &Database, loop_id: &str) -> Result<(), McpError> {
+    let bound_running = db
+        .list_loop_specs(loop_id)
+        .map_err(internal_error)?
+        .into_iter()
+        .find(|spec| spec.status == LoopSpecStatus::Running);
+    if bound_running.is_none() && pool_running_spec(db, loop_id)?.is_none() {
+        return Err(McpError::invalid_params(
+            "No running spec found to retry from this paused loop.",
+            None,
+        ));
+    }
     Ok(())
 }
 
@@ -5732,15 +5751,15 @@ impl ServerHandler for TaskTriggerHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_ensemble_unit, handle_skip_next_spec, header_str, loop_details_json,
-        loop_run_status_guard, missing_sync_identity_error, node_copy_note, perform_loop_reset,
-        plan_ensemble_copy, plan_node_copy, resolve_graph_target, resolve_node_kind_and_config,
-        resolve_reported_run, validate_blueprint_exists, validate_ensemble_members,
-        validate_node_config, validate_node_not_ensemble_owned, validate_pool_exists,
-        validate_pool_member_removable, validate_pool_not_consumed, validate_pool_reorder,
-        validate_pool_reorder_locking, validate_spec_deletable, validate_spec_exists,
-        BuiltEnsembleUnit, EnsembleMemberParams, EnsembleUnitSpec, TaskTriggerHandler,
-        MISSING_SYNC_IDENTITY_MESSAGE,
+        build_ensemble_unit, handle_retry_current_node, handle_skip_next_spec, header_str,
+        loop_details_json, loop_run_status_guard, missing_sync_identity_error, node_copy_note,
+        perform_loop_reset, plan_ensemble_copy, plan_node_copy, resolve_graph_target,
+        resolve_node_kind_and_config, resolve_reported_run, validate_blueprint_exists,
+        validate_ensemble_members, validate_node_config, validate_node_not_ensemble_owned,
+        validate_pool_exists, validate_pool_member_removable, validate_pool_not_consumed,
+        validate_pool_reorder, validate_pool_reorder_locking, validate_spec_deletable,
+        validate_spec_exists, BuiltEnsembleUnit, EnsembleMemberParams, EnsembleUnitSpec,
+        TaskTriggerHandler, MISSING_SYNC_IDENTITY_MESSAGE,
     };
     use crate::daemon::params::{
         LoopCopyEnsembleParams, LoopCopyNodeParams, LoopRunParams, PoolAddSpecParams,
@@ -7055,6 +7074,36 @@ mod tests {
 
         let error = handle_skip_next_spec(&db, "loop-owner").unwrap_err();
         assert!(error.message.contains("No running spec found"));
+    }
+
+    /// B35: `retry_current_node` must error when no spec is running in
+    /// either the loop's bound specs or its pool — same validation shape as
+    /// `skip_next_spec`.
+    #[test]
+    fn retry_current_node_errors_when_no_running_spec() {
+        let (_dir, db) = pool_test_db();
+        insert_test_loop(&db, "loop-owner");
+        let error = handle_retry_current_node(&db, "loop-owner").unwrap_err();
+        assert!(error.message.contains("No running spec found"));
+    }
+
+    /// B35: `retry_current_node` must find the running spec through the
+    /// loop's persisted `active_run_pool_id` (pool member has `loop_id: None`).
+    #[test]
+    fn retry_current_node_finds_running_pool_member() {
+        let (_dir, db) = pool_test_db();
+        insert_test_loop(&db, "loop-owner");
+        db.set_loop_active_run_pool("loop-owner", Some("pool-1"))
+            .unwrap();
+
+        db.insert_loop_spec(&running_spec("spec-a")).unwrap();
+        db.insert_loop_spec(&standalone_spec("spec-b")).unwrap();
+        insert_pool(&db, "pool-1");
+        db.append_pool_member("pool-1", "spec-a", None).unwrap();
+        db.append_pool_member("pool-1", "spec-b", None).unwrap();
+
+        // Should succeed without error — a running spec exists.
+        assert!(handle_retry_current_node(&db, "loop-owner").is_ok());
     }
 
     #[test]

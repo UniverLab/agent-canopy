@@ -312,6 +312,26 @@ impl Database {
         .map_err(Into::into)
     }
 
+    /// The pool's first RUNNING member, in queue order — used by
+    /// `retry_current_node` to re-dispatch the same spec that was paused on,
+    /// rather than falling through to the next pending member.
+    pub fn pool_running_spec_id(&self, pool_id: &str) -> Result<Option<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        conn.query_row(
+            "SELECT pm.spec_id FROM pool_members pm
+             JOIN loop_specs ls ON ls.id = pm.spec_id
+             WHERE pm.pool_id = ?1 AND ls.status = ?2
+             ORDER BY pm.position ASC LIMIT 1",
+            params![pool_id, LoopSpecStatus::Running.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     /// Whether `pool_id` still has a member that isn't `completed`/`skipped`
     /// (i.e. `pending` or stuck `running`). Used by the loop engine as a
     /// guard against marking a pool run's loop `completed` when

@@ -69,6 +69,17 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
         Err(e) => tracing::error!("Failed to reconcile orphaned loops: {}", e),
     }
 
+    match db.reconcile_stranded_pool_specs() {
+        Ok(count) if count > 0 => {
+            tracing::warn!(
+                "Reconciled {} stranded pool spec(s) left running by a previous daemon",
+                count
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::error!("Failed to reconcile stranded pool specs: {}", e),
+    }
+
     if let Err(e) = watcher_engine.reload_from_db().await {
         tracing::error!("Failed to reload watchers: {}", e);
     }
@@ -232,6 +243,17 @@ pub(crate) async fn run_stdio_server() -> Result<()> {
         }
         Ok(_) => {}
         Err(e) => tracing::error!("Failed to reconcile orphaned loops: {}", e),
+    }
+
+    match db.reconcile_stranded_pool_specs() {
+        Ok(count) if count > 0 => {
+            tracing::warn!(
+                "Reconciled {} stranded pool spec(s) left running by a previous daemon",
+                count
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::error!("Failed to reconcile stranded pool specs: {}", e),
     }
 
     startup_personal_rag(Arc::clone(&ingestion), &data_dir).await;
