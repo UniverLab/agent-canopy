@@ -1269,7 +1269,7 @@ fn reconcile_orphaned_loops_resets_pool_member_spec_to_pending() {
         created_at: Utc::now(),
     })
     .unwrap();
-    db.append_pool_member("pool-1", &spec.id).unwrap();
+    db.append_pool_member("pool-1", &spec.id, None).unwrap();
 
     let node = sample_loop_node(&spec.id, "node-orphan-pool", 1);
     db.insert_loop_node(&node).unwrap();
@@ -1329,8 +1329,8 @@ fn pool_stale_running_members_flags_only_the_member_with_no_live_run() {
         created_at: Utc::now(),
     })
     .unwrap();
-    db.append_pool_member("pool-1", &stale.id).unwrap();
-    db.append_pool_member("pool-1", &live.id).unwrap();
+    db.append_pool_member("pool-1", &stale.id, None).unwrap();
+    db.append_pool_member("pool-1", &live.id, None).unwrap();
 
     // `live`'s node run genuinely belongs to the current daemon's boot.
     let node = sample_loop_node(&live.id, "node-live", 1);
@@ -1576,9 +1576,9 @@ fn pool_and_members_round_trip_through_insert_and_get_details() {
     }
     db.insert_pool(&sample_pool("pool-1")).unwrap();
 
-    db.append_pool_member("pool-1", "spec-a").unwrap();
-    db.append_pool_member("pool-1", "spec-b").unwrap();
-    db.append_pool_member("pool-1", "spec-c").unwrap();
+    db.append_pool_member("pool-1", "spec-a", None).unwrap();
+    db.append_pool_member("pool-1", "spec-b", None).unwrap();
+    db.append_pool_member("pool-1", "spec-c", None).unwrap();
     assert_eq!(
         db.list_pool_member_spec_ids("pool-1").unwrap(),
         vec!["spec-a", "spec-b", "spec-c"]
@@ -1622,7 +1622,7 @@ fn reorder_pool_members_replaces_positions_in_given_order() {
     }
     db.insert_pool(&sample_pool("pool-1")).unwrap();
     for id in ["spec-a", "spec-b", "spec-c"] {
-        db.append_pool_member("pool-1", id).unwrap();
+        db.append_pool_member("pool-1", id, None).unwrap();
     }
 
     let order = vec![
@@ -1640,7 +1640,9 @@ fn append_pool_member_rejects_nonexistent_spec() {
     let db = test_db();
     db.insert_pool(&sample_pool("pool-1")).unwrap();
 
-    let error = db.append_pool_member("pool-1", "ghost-spec").unwrap_err();
+    let error = db
+        .append_pool_member("pool-1", "ghost-spec", None)
+        .unwrap_err();
     assert!(
         error.to_string().to_lowercase().contains("foreign key"),
         "{error}"
@@ -1653,11 +1655,328 @@ fn deleting_a_spec_cascades_its_pool_membership() {
     db.insert_loop_spec(&sample_standalone_spec("spec-a", None))
         .unwrap();
     db.insert_pool(&sample_pool("pool-1")).unwrap();
-    db.append_pool_member("pool-1", "spec-a").unwrap();
+    db.append_pool_member("pool-1", "spec-a", None).unwrap();
 
     db.delete_loop_spec("spec-a").unwrap();
 
     assert!(db.list_pool_member_spec_ids("pool-1").unwrap().is_empty());
+}
+
+// ── RS3: context groups within a queue ──────────────────────────
+
+/// Seed a `loop_runs` row for `spec_id`/`node_id` carrying `session_id`, then
+/// stamp `spec_id`'s terminal status — the shape a completed/failed grouped
+/// sibling leaves behind for `group_session_for_node` to read.
+fn seed_group_sibling(
+    db: &Database,
+    loop_id: &str,
+    spec_id: &str,
+    node_id: &str,
+    session_id: Option<&str>,
+    status: LoopSpecStatus,
+) {
+    let run = LoopNodeRun {
+        id: format!("run-{spec_id}-{node_id}"),
+        loop_id: loop_id.to_string(),
+        spec_id: spec_id.to_string(),
+        node_id: node_id.to_string(),
+        status: LoopRunStatus::Pass,
+        input: None,
+        output: None,
+        started_at: Utc::now(),
+        completed_at: Some(Utc::now()),
+        iteration: 1,
+        pid: None,
+        boot_id: None,
+        session_id: session_id.map(str::to_string),
+    };
+    db.insert_loop_run(&run).unwrap();
+    db.update_loop_spec_status(spec_id, status, Some(Utc::now()), Some(Utc::now()))
+        .unwrap();
+}
+
+/// Scaffold a loop with two grouped members (`spec-a`, `spec-b`) and one
+/// grouped/ungrouped setup, returning the db. Both share a single loop-level
+/// node id `node-impl`.
+fn rs3_fixture() -> Database {
+    let db = test_db();
+    let lp = sample_loop("wf-rs3");
+    db.insert_loop(&lp).unwrap();
+    for id in ["spec-a", "spec-b", "spec-c"] {
+        db.insert_loop_spec(&sample_standalone_spec(id, None))
+            .unwrap();
+    }
+    // A loop-level node the runs can reference (loop_runs FK to loop_nodes).
+    let mut node = sample_loop_node("spec-a", "node-impl", 1);
+    node.spec_id = None;
+    node.loop_id = Some(lp.id.clone());
+    db.insert_loop_node(&node).unwrap();
+    let mut review = sample_loop_node("spec-a", "node-review", 2);
+    review.spec_id = None;
+    review.loop_id = Some(lp.id);
+    db.insert_loop_node(&review).unwrap();
+    db.insert_pool(&sample_pool("pool-1")).unwrap();
+    db
+}
+
+#[test]
+fn group_name_persists_through_add_and_reorder() {
+    let db = rs3_fixture();
+    db.append_pool_member("pool-1", "spec-a", Some("ctx"))
+        .unwrap();
+    db.append_pool_member("pool-1", "spec-b", Some("ctx"))
+        .unwrap();
+    db.append_pool_member("pool-1", "spec-c", None).unwrap();
+
+    // Groups are readable per member and in list order.
+    assert_eq!(
+        db.pool_member_group("pool-1", "spec-a").unwrap().as_deref(),
+        Some("ctx")
+    );
+    assert_eq!(db.pool_member_group("pool-1", "spec-c").unwrap(), None);
+    assert_eq!(
+        db.list_pool_member_groups("pool-1").unwrap(),
+        vec![
+            ("spec-a".to_string(), Some("ctx".to_string())),
+            ("spec-b".to_string(), Some("ctx".to_string())),
+            ("spec-c".to_string(), None),
+        ]
+    );
+
+    // Reorder must move rows AND preserve each row's group_name.
+    db.reorder_pool_members(
+        "pool-1",
+        &[
+            "spec-c".to_string(),
+            "spec-a".to_string(),
+            "spec-b".to_string(),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        db.list_pool_member_groups("pool-1").unwrap(),
+        vec![
+            ("spec-c".to_string(), None),
+            ("spec-a".to_string(), Some("ctx".to_string())),
+            ("spec-b".to_string(), Some("ctx".to_string())),
+        ]
+    );
+}
+
+#[test]
+fn group_session_for_node_returns_completed_siblings_session() {
+    let db = rs3_fixture();
+    db.append_pool_member("pool-1", "spec-a", Some("ctx"))
+        .unwrap();
+    db.append_pool_member("pool-1", "spec-b", Some("ctx"))
+        .unwrap();
+    seed_group_sibling(
+        &db,
+        "wf-rs3",
+        "spec-a",
+        "node-impl",
+        Some("ses-a"),
+        LoopSpecStatus::Completed,
+    );
+
+    // spec-b's first visit to node-impl inherits spec-a's warm session.
+    assert_eq!(
+        db.group_session_for_node("pool-1", "ctx", "spec-b", "node-impl")
+            .unwrap()
+            .as_deref(),
+        Some("ses-a")
+    );
+    // A node the sibling never ran → no session → cold start.
+    assert_eq!(
+        db.group_session_for_node("pool-1", "ctx", "spec-b", "node-review")
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn group_session_taint_on_failed_nearest_sibling() {
+    let db = rs3_fixture();
+    // Three grouped siblings: a completed, then a failed, then the current one.
+    db.append_pool_member("pool-1", "spec-a", Some("ctx"))
+        .unwrap();
+    db.append_pool_member("pool-1", "spec-b", Some("ctx"))
+        .unwrap();
+    db.append_pool_member("pool-1", "spec-c", Some("ctx"))
+        .unwrap();
+    seed_group_sibling(
+        &db,
+        "wf-rs3",
+        "spec-a",
+        "node-impl",
+        Some("ses-a"),
+        LoopSpecStatus::Completed,
+    );
+    // The nearest sibling to spec-c FAILED (even if it captured a session).
+    seed_group_sibling(
+        &db,
+        "wf-rs3",
+        "spec-b",
+        "node-impl",
+        Some("ses-b"),
+        LoopSpecStatus::Failed,
+    );
+
+    // Taint: the broken chain forces a cold start — the earlier completed
+    // spec-a session is NOT resurrected across the failure.
+    assert_eq!(
+        db.group_session_for_node("pool-1", "ctx", "spec-c", "node-impl")
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn group_session_is_independent_per_node() {
+    let db = rs3_fixture();
+    db.append_pool_member("pool-1", "spec-a", Some("ctx"))
+        .unwrap();
+    db.append_pool_member("pool-1", "spec-b", Some("ctx"))
+        .unwrap();
+    // spec-a completed after capturing a DISTINCT session on each node.
+    let run_impl = LoopNodeRun {
+        id: "run-a-impl".to_string(),
+        loop_id: "wf-rs3".to_string(),
+        spec_id: "spec-a".to_string(),
+        node_id: "node-impl".to_string(),
+        status: LoopRunStatus::Pass,
+        input: None,
+        output: None,
+        started_at: Utc::now(),
+        completed_at: Some(Utc::now()),
+        iteration: 1,
+        pid: None,
+        boot_id: None,
+        session_id: Some("ses-impl".to_string()),
+    };
+    db.insert_loop_run(&run_impl).unwrap();
+    let run_review = LoopNodeRun {
+        id: "run-a-review".to_string(),
+        node_id: "node-review".to_string(),
+        session_id: Some("ses-review".to_string()),
+        ..run_impl
+    };
+    db.insert_loop_run(&run_review).unwrap();
+    db.update_loop_spec_status(
+        "spec-a",
+        LoopSpecStatus::Completed,
+        Some(Utc::now()),
+        Some(Utc::now()),
+    )
+    .unwrap();
+
+    // Implementer and reviewer sessions stay independent.
+    assert_eq!(
+        db.group_session_for_node("pool-1", "ctx", "spec-b", "node-impl")
+            .unwrap()
+            .as_deref(),
+        Some("ses-impl")
+    );
+    assert_eq!(
+        db.group_session_for_node("pool-1", "ctx", "spec-b", "node-review")
+            .unwrap()
+            .as_deref(),
+        Some("ses-review")
+    );
+}
+
+#[test]
+fn ungrouped_and_cross_group_members_never_cross_resume() {
+    let db = rs3_fixture();
+    // spec-a grouped "ctx", spec-b ungrouped, spec-c in a DIFFERENT group.
+    db.append_pool_member("pool-1", "spec-a", Some("ctx"))
+        .unwrap();
+    db.append_pool_member("pool-1", "spec-b", None).unwrap();
+    db.append_pool_member("pool-1", "spec-c", Some("other"))
+        .unwrap();
+    seed_group_sibling(
+        &db,
+        "wf-rs3",
+        "spec-a",
+        "node-impl",
+        Some("ses-a"),
+        LoopSpecStatus::Completed,
+    );
+
+    // An ungrouped member never inherits (queried with its own — absent — group).
+    assert_eq!(db.pool_member_group("pool-1", "spec-b").unwrap(), None);
+    // A member in another group does not see "ctx"'s session.
+    assert_eq!(
+        db.group_session_for_node("pool-1", "other", "spec-c", "node-impl")
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn group_name_column_is_added_to_a_pre_rs3_pool_members_table() {
+    // Simulate a pre-RS3 database whose `pool_members` predates `group_name`.
+    let tmp = NamedTempFile::new().expect("create temp file");
+    let path = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+
+    {
+        let conn = rusqlite::Connection::open(&path).expect("open raw db");
+        conn.execute_batch(
+            "CREATE TABLE loops (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                workdir TEXT NOT NULL,
+                status TEXT NOT NULL,
+                trigger_type TEXT,
+                trigger_config TEXT,
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER,
+                autorun_at INTEGER,
+                spec_pool TEXT
+             );
+             CREATE TABLE loop_specs (
+                id TEXT PRIMARY KEY,
+                loop_id TEXT REFERENCES loops(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                description TEXT,
+                position INTEGER NOT NULL,
+                parallelizable INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER,
+                workdir TEXT
+             );
+             CREATE TABLE pools (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+             );
+             -- Pre-RS3 pool_members: no group_name column.
+             CREATE TABLE pool_members (
+                pool_id TEXT NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
+                spec_id TEXT NOT NULL REFERENCES loop_specs(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                PRIMARY KEY (pool_id, spec_id)
+             );
+             INSERT INTO loop_specs (id, loop_id, name, position, status)
+                 VALUES ('legacy-spec', NULL, 'Spec', 1, 'pending');
+             INSERT INTO pools (id, name, created_at) VALUES ('pool-1', 'Pool', 0);
+             INSERT INTO pool_members (pool_id, spec_id, position)
+                 VALUES ('pool-1', 'legacy-spec', 1);",
+        )
+        .expect("seed pre-RS3 schema");
+    }
+
+    // Migration adds the nullable column; the pre-existing row reads back as
+    // ungrouped (NULL), and re-running init stays safe (idempotent guard).
+    let db = Database::new(&path).expect("open pre-RS3 db, running migration");
+    assert_eq!(db.pool_member_group("pool-1", "legacy-spec").unwrap(), None);
+    drop(db);
+    let db = Database::new(&path).expect("re-open is idempotent");
+    assert_eq!(db.pool_member_group("pool-1", "legacy-spec").unwrap(), None);
 }
 
 #[test]
@@ -1711,7 +2030,8 @@ fn pools_migration_is_idempotent_and_a_pre_r4_database_opens_cleanly() {
     let lp = db.get_loop("legacy-loop").unwrap().unwrap();
     assert_eq!(lp.name, "Legacy");
     db.insert_pool(&sample_pool("pool-1")).unwrap();
-    db.append_pool_member("pool-1", "legacy-spec").unwrap();
+    db.append_pool_member("pool-1", "legacy-spec", None)
+        .unwrap();
     assert_eq!(
         db.list_pool_member_spec_ids("pool-1").unwrap(),
         vec!["legacy-spec"]
@@ -3511,7 +3831,7 @@ fn set_spec_admin_status_propagates_to_pool_selection() {
         created_at: Utc::now(),
     };
     db.insert_pool(&pool).unwrap();
-    db.append_pool_member("pool-test", &spec.id).unwrap();
+    db.append_pool_member("pool-test", &spec.id, None).unwrap();
 
     let before = db.pool_next_pending_spec_id("pool-test").unwrap();
     assert_eq!(before.as_deref(), Some(spec.id.as_str()));

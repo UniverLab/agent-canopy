@@ -801,6 +801,19 @@ impl LoopEngine {
         // specs.
         let mut resumable_sessions: HashMap<String, String> = HashMap::new();
 
+        // RS3: the context group this spec belongs to within the running
+        // queue, if any. Only pool/queue runs carry a group (a loop's own
+        // bound specs never do — `pool_id` is `None` there), so ungrouped and
+        // non-queue specs never cross-resume. This is the ONE deliberate
+        // exception to RS2's "first visit is cold" rule: the first visit of a
+        // grouped spec to a node resumes the session captured by the previous
+        // successfully-completed grouped sibling on that same node (see the
+        // seed below and [`Database::group_session_for_node`]).
+        let spec_group = match pool_id {
+            Some(pid) => self.db.pool_member_group(pid, &spec.id)?,
+            None => None,
+        };
+
         loop {
             if self.is_paused(&lp.id)? {
                 return Ok(SpecExecutionOutcome::Paused);
@@ -867,6 +880,28 @@ impl LoopEngine {
                     // On a fail-edge bounce it holds the session captured on the
                     // node's previous run in this dispatch → resume.
                     let mut resume_candidate = resumable_sessions.get(node_id.as_str()).cloned();
+
+                    // RS3 group-session handoff: a grouped spec's FIRST visit to
+                    // this node (nothing yet in `resumable_sessions` for it)
+                    // resumes the group's live session for this node — the
+                    // session captured by the previous successfully-completed
+                    // grouped sibling on the same node. Derived from the DB so a
+                    // daemon restart mid-queue keeps group context. Taint is
+                    // enforced inside `group_session_for_node`: a failed nearest
+                    // sibling yields `None` here, so this spec cold-starts and
+                    // its fresh session becomes the group's new session. Bounces
+                    // (map already populated) keep RS2's in-dispatch session and
+                    // never re-consult the group.
+                    if resume_candidate.is_none() {
+                        if let (Some(group), Some(pid)) = (spec_group.as_deref(), pool_id) {
+                            resume_candidate = self.db.group_session_for_node(
+                                pid,
+                                group,
+                                &spec.id,
+                                node_id.as_str(),
+                            )?;
+                        }
+                    }
                     let mut run_id = uuid::Uuid::new_v4().to_string();
                     self.db.insert_loop_run(&LoopNodeRun {
                         id: run_id.clone(),
@@ -4502,6 +4537,120 @@ echo done
         );
     }
 
+    /// Build a loop with a single loop-level agent node backed by the argv-echo
+    /// `resume-cli` (set-at-spawn capture + resume-by-id), queue `member_specs`
+    /// into `pool-1`, run the pool, and hand back the argv log path plus the db.
+    /// Each grouped member shares the one loop-level node id `node-impl`, which
+    /// is exactly what a warm-context queue looks like: several small specs
+    /// draining one loop graph.
+    async fn run_grouped_pool(
+        member_specs: &[(&str, Option<&str>)],
+    ) -> (Arc<Database>, std::path::PathBuf) {
+        let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+        let argv_file = dir.path().join("argv.log");
+        let script = write_argv_echo_cli(dir.path());
+        let mut env = HashMap::new();
+        env.insert(
+            "ARGV_FILE".to_string(),
+            argv_file.to_string_lossy().into_owned(),
+        );
+        env.insert("RESUME_FLAG".to_string(), "--resume".to_string());
+        // set-at-spawn capture on a cold run; resume-by-id for the handoff.
+        let cli = argv_cli_config(&script, env, Some("--resume"), Some("--set"), None);
+        let home = write_resume_cli_home(cli);
+
+        for (position, (spec_id, _)) in member_specs.iter().enumerate() {
+            db.insert_loop_spec(&standalone_spec(spec_id, (position as i64) + 1))
+                .unwrap();
+        }
+        insert_pool_with_grouped_members(&db, "pool-1", member_specs);
+
+        // Loop-level agent node: every pool member with no graph of its own
+        // drains this shared node, so grouped siblings share the node id.
+        db.insert_loop_node(&LoopNode {
+            id: "node-impl".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "impl".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({ "platform": "resume-cli" }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let guard = HomeGuard::set(home.path());
+        engine
+            .run_loop(loop_id.clone(), Some("pool-1".to_string()), None)
+            .await
+            .unwrap();
+        drop(guard);
+
+        // Keep `dir` alive until after the run (workdir + argv log live in it).
+        let argv_file = std::fs::canonicalize(&argv_file).unwrap_or(argv_file);
+        std::mem::forget(dir);
+        (db, argv_file)
+    }
+
+    fn impl_session(db: &Database, spec_id: &str) -> Option<String> {
+        db.list_loop_runs_for_spec(spec_id)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.node_id == "node-impl")
+            .and_then(|r| r.session_id)
+    }
+
+    #[tokio::test]
+    async fn grouped_spec_resumes_prior_siblings_session() {
+        // RS3 positive handoff: spec-a cold-starts and captures a session;
+        // spec-b in the same group resumes it on its first node run and records
+        // the SAME session id — the ONE exception to RS2's "first visit cold".
+        let (db, argv_file) =
+            run_grouped_pool(&[("spec-a", Some("ctx")), ("spec-b", Some("ctx"))]).await;
+
+        assert_eq!(
+            db.get_loop_spec("spec-a").unwrap().unwrap().status,
+            LoopSpecStatus::Completed
+        );
+        assert_eq!(
+            db.get_loop_spec("spec-b").unwrap().unwrap().status,
+            LoopSpecStatus::Completed
+        );
+
+        let sid_a = impl_session(&db, "spec-a").expect("spec-a cold-start captures a session");
+        let sid_b = impl_session(&db, "spec-b").expect("spec-b records a session");
+        assert_eq!(
+            sid_b, sid_a,
+            "the grouped sibling must continue — and record — spec-a's session"
+        );
+
+        let argv = std::fs::read_to_string(&argv_file).unwrap();
+        assert!(
+            argv.contains("--resume") && argv.contains(&sid_a),
+            "spec-b's first visit resumes spec-a's session by id"
+        );
+    }
+
+    #[tokio::test]
+    async fn ungrouped_specs_never_cross_resume() {
+        // RS7: with no group, each spec cold-starts — spec-b mints its OWN
+        // set-at-spawn session and never touches spec-a's.
+        let (db, argv_file) = run_grouped_pool(&[("spec-a", None), ("spec-b", None)]).await;
+
+        let sid_a = impl_session(&db, "spec-a").expect("spec-a captures a session");
+        let sid_b = impl_session(&db, "spec-b").expect("spec-b captures its own session");
+        assert_ne!(
+            sid_a, sid_b,
+            "ungrouped specs must not share a session across the queue"
+        );
+
+        let argv = std::fs::read_to_string(&argv_file).unwrap();
+        assert!(
+            !argv.contains("--resume"),
+            "no resume flag may appear for an ungrouped queue"
+        );
+    }
+
     #[tokio::test]
     async fn run_agent_process_reports_spawn_failure_as_node_fail_not_hard_error() {
         // Simulates the E2BIG incident: the process fails to spawn. This
@@ -5078,7 +5227,26 @@ echo done
         })
         .unwrap();
         for spec_id in member_ids {
-            db.append_pool_member(pool_id, spec_id).unwrap();
+            db.append_pool_member(pool_id, spec_id, None).unwrap();
+        }
+    }
+
+    /// RS3 variant of [`insert_pool_with_members`]: each member is `(spec_id,
+    /// group_name)`, so a test can queue grouped and ungrouped members side by
+    /// side.
+    fn insert_pool_with_grouped_members(
+        db: &Database,
+        pool_id: &str,
+        members: &[(&str, Option<&str>)],
+    ) {
+        db.insert_pool(&crate::domain::pools::Pool {
+            id: pool_id.to_string(),
+            name: pool_id.to_string(),
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        for (spec_id, group) in members {
+            db.append_pool_member(pool_id, spec_id, *group).unwrap();
         }
     }
 
@@ -5580,7 +5748,7 @@ echo done
         wait_for_file(&started_marker).await;
         // spec_a is mid-run (blocked on the gate). Append spec_b to the pool
         // now, while the run is in flight.
-        db.append_pool_member("pool-1", &spec_b.id).unwrap();
+        db.append_pool_member("pool-1", &spec_b.id, None).unwrap();
         std::fs::write(&go_marker, "").unwrap();
 
         handle.await.unwrap().unwrap();

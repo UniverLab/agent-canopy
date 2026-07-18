@@ -669,6 +669,13 @@ pub struct QueueAddSpecParams {
     pub queue_id: String,
     /// Existing spec ID to append to the end of the queue.
     pub spec_id: String,
+    /// Optional context group. Specs sharing a group in the same queue reuse
+    /// one warm harness session: a grouped spec resumes the session captured
+    /// by the previous successfully-completed sibling in the group instead of
+    /// re-analyzing the repo from cold. Omit for an independent, ungrouped
+    /// member.
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -710,6 +717,10 @@ pub struct PoolAddSpecParams {
     pub pool_id: String,
     /// Existing spec ID to append to the end of the pool's queue.
     pub spec_id: String,
+    /// Optional context group (RS3). Specs sharing a group in the same queue
+    /// reuse one warm harness session. Omit for an ungrouped member.
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

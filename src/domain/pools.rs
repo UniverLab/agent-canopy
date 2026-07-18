@@ -18,4 +18,9 @@ pub struct Pool {
 pub struct PoolDetails {
     pub pool: Pool,
     pub members: Vec<LoopSpec>,
+    /// RS3 context group label per member spec id. Absent/`None` for ungrouped
+    /// members. Kept as a side map so `members` stays a plain `Vec<LoopSpec>`
+    /// (pool membership never mutates the spec itself — the group lives on the
+    /// membership row).
+    pub member_groups: std::collections::HashMap<String, Option<String>>,
 }

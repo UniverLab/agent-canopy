@@ -865,6 +865,9 @@ fn pool_details_json(details: &PoolDetails) -> serde_json::Value {
             .map(|(index, spec)| {
                 let mut value = spec_summary_json(spec);
                 value["queue_position"] = serde_json::json!(index + 1);
+                if let Some(Some(group)) = details.member_groups.get(&spec.id) {
+                    value["group"] = serde_json::json!(group);
+                }
                 value
             })
             .collect::<Vec<_>>(),
@@ -4455,6 +4458,7 @@ impl TaskTriggerHandler {
         &self,
         queue_id: &str,
         spec_id: &str,
+        group: Option<&str>,
     ) -> Result<CallToolResult, McpError> {
         let queue_id = queue_id.trim();
         if let Err(e) = validate_pool_exists(&self.db, queue_id) {
@@ -4474,12 +4478,18 @@ impl TaskTriggerHandler {
             )));
         }
 
+        // An all-whitespace or empty `group` is treated as ungrouped.
+        let group = group.map(str::trim).filter(|g| !g.is_empty());
+
         self.db
-            .append_pool_member(queue_id, spec_id)
+            .append_pool_member(queue_id, spec_id, group)
             .map_err(internal_error)?;
 
+        let group_note = group
+            .map(|g| format!(" in group '{g}'"))
+            .unwrap_or_default();
         Ok(success_result(&format!(
-            "Spec '{spec_id}' added to queue '{queue_id}'."
+            "Spec '{spec_id}' added to queue '{queue_id}'{group_note}."
         )))
     }
 
@@ -4588,7 +4598,7 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<QueueAddSpecParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.do_queue_add_spec(&params.queue_id, &params.spec_id)
+        self.do_queue_add_spec(&params.queue_id, &params.spec_id, params.group.as_deref())
             .await
     }
 
@@ -4646,7 +4656,7 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<PoolAddSpecParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.do_queue_add_spec(&params.pool_id, &params.spec_id)
+        self.do_queue_add_spec(&params.pool_id, &params.spec_id, params.group.as_deref())
             .await
     }
 
@@ -6130,7 +6140,7 @@ mod tests {
         })
         .unwrap();
         for spec_id in ["pool-done", "pool-failed", "pool-pending"] {
-            db.append_pool_member("pool-1", spec_id).unwrap();
+            db.append_pool_member("pool-1", spec_id, None).unwrap();
         }
 
         let result = perform_loop_reset(&db, &loop_id, None).unwrap();
@@ -6555,6 +6565,7 @@ mod tests {
             .queue_add_spec(Parameters(QueueAddSpecParams {
                 queue_id: "queue-1".to_string(),
                 spec_id: "spec-a".to_string(),
+                group: None,
             }))
             .await
             .unwrap();
@@ -6562,6 +6573,7 @@ mod tests {
             .pool_add_spec(Parameters(PoolAddSpecParams {
                 pool_id: "queue-1".to_string(),
                 spec_id: "spec-b".to_string(),
+                group: None,
             }))
             .await
             .unwrap();
@@ -6583,7 +6595,7 @@ mod tests {
         let (_dir, db, handler) = queue_test_handler();
         db.insert_loop_spec(&standalone_spec("spec-a")).unwrap();
         insert_pool(&db, "queue-1");
-        db.append_pool_member("queue-1", "spec-a").unwrap();
+        db.append_pool_member("queue-1", "spec-a", None).unwrap();
 
         let all_via_queue = handler
             .queue_list(Parameters(QueueListParams { queue_id: None }))
@@ -6694,9 +6706,9 @@ mod tests {
         }
         insert_pool(&db, "pool-1");
 
-        db.append_pool_member("pool-1", "spec-a").unwrap();
-        db.append_pool_member("pool-1", "spec-b").unwrap();
-        db.append_pool_member("pool-1", "spec-c").unwrap();
+        db.append_pool_member("pool-1", "spec-a", None).unwrap();
+        db.append_pool_member("pool-1", "spec-b", None).unwrap();
+        db.append_pool_member("pool-1", "spec-c", None).unwrap();
 
         assert_eq!(
             db.list_pool_member_spec_ids("pool-1").unwrap(),
@@ -6732,7 +6744,7 @@ mod tests {
         }
         insert_pool(&db, "pool-1");
         for id in ["spec-a", "spec-b", "spec-c"] {
-            db.append_pool_member("pool-1", id).unwrap();
+            db.append_pool_member("pool-1", id, None).unwrap();
         }
 
         let current = db.list_pool_member_spec_ids("pool-1").unwrap();
@@ -6934,8 +6946,8 @@ mod tests {
         db.insert_loop_spec(&standalone_spec("spec-a")).unwrap();
         db.insert_loop_spec(&standalone_spec("spec-b")).unwrap();
         insert_pool(&db, "pool-1");
-        db.append_pool_member("pool-1", "spec-a").unwrap();
-        db.append_pool_member("pool-1", "spec-b").unwrap();
+        db.append_pool_member("pool-1", "spec-a", None).unwrap();
+        db.append_pool_member("pool-1", "spec-b", None).unwrap();
 
         assert!(validate_pool_not_consumed(&db, "pool-1", "loop-requesting").is_ok());
     }
@@ -6945,7 +6957,7 @@ mod tests {
         let (_dir, db) = pool_test_db();
         db.insert_loop_spec(&running_spec("spec-a")).unwrap();
         insert_pool(&db, "pool-1");
-        db.append_pool_member("pool-1", "spec-a").unwrap();
+        db.append_pool_member("pool-1", "spec-a", None).unwrap();
         insert_test_loop(&db, "loop-other");
         insert_test_node(&db, "node-1", "spec-a");
         db.insert_loop_run(&loop_run_row(
@@ -6970,7 +6982,7 @@ mod tests {
         let (_dir, db) = pool_test_db();
         db.insert_loop_spec(&running_spec("spec-a")).unwrap();
         insert_pool(&db, "pool-1");
-        db.append_pool_member("pool-1", "spec-a").unwrap();
+        db.append_pool_member("pool-1", "spec-a", None).unwrap();
         insert_test_loop(&db, "loop-owner");
         insert_test_node(&db, "node-1", "spec-a");
         db.insert_loop_run(&loop_run_row(
@@ -7000,8 +7012,8 @@ mod tests {
         db.insert_loop_spec(&running_spec("spec-a")).unwrap();
         db.insert_loop_spec(&standalone_spec("spec-b")).unwrap();
         insert_pool(&db, "pool-1");
-        db.append_pool_member("pool-1", "spec-a").unwrap();
-        db.append_pool_member("pool-1", "spec-b").unwrap();
+        db.append_pool_member("pool-1", "spec-a", None).unwrap();
+        db.append_pool_member("pool-1", "spec-b", None).unwrap();
 
         handle_skip_next_spec(&db, "loop-owner").unwrap();
 
@@ -7026,7 +7038,7 @@ mod tests {
         db.insert_loop_spec(&bound).unwrap();
         db.insert_loop_spec(&running_spec("spec-pool")).unwrap();
         insert_pool(&db, "pool-1");
-        db.append_pool_member("pool-1", "spec-pool").unwrap();
+        db.append_pool_member("pool-1", "spec-pool", None).unwrap();
 
         handle_skip_next_spec(&db, "loop-owner").unwrap();
 
@@ -7073,7 +7085,7 @@ mod tests {
         db.insert_loop_spec(&standalone_spec("spec-c")).unwrap();
         insert_pool(&db, "pool-1");
         for id in ["spec-a", "spec-b", "spec-c"] {
-            db.append_pool_member("pool-1", id).unwrap();
+            db.append_pool_member("pool-1", id, None).unwrap();
         }
         let current = db.list_pool_member_spec_ids("pool-1").unwrap();
 
@@ -7099,7 +7111,7 @@ mod tests {
         db.insert_loop_spec(&standalone_spec("spec-b")).unwrap();
         insert_pool(&db, "pool-1");
         for id in ["spec-a", "spec-b"] {
-            db.append_pool_member("pool-1", id).unwrap();
+            db.append_pool_member("pool-1", id, None).unwrap();
         }
         let current = db.list_pool_member_spec_ids("pool-1").unwrap();
 
@@ -7117,7 +7129,7 @@ mod tests {
         db.insert_loop_spec(&standalone_spec("spec-c")).unwrap();
         insert_pool(&db, "pool-1");
         for id in ["spec-a", "spec-b", "spec-c"] {
-            db.append_pool_member("pool-1", id).unwrap();
+            db.append_pool_member("pool-1", id, None).unwrap();
         }
         let current = db.list_pool_member_spec_ids("pool-1").unwrap();
 
@@ -7135,7 +7147,7 @@ mod tests {
         let (_dir, db) = pool_test_db();
         db.insert_loop_spec(&running_spec("spec-a")).unwrap();
         insert_pool(&db, "pool-1");
-        db.append_pool_member("pool-1", "spec-a").unwrap();
+        db.append_pool_member("pool-1", "spec-a", None).unwrap();
 
         let error = validate_pool_member_removable(&db, "pool-1", "spec-a").unwrap_err();
         assert!(error.contains("spec-a"), "{error}");

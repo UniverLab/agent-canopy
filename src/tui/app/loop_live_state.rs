@@ -590,8 +590,8 @@ mod tests {
         db.insert_loop_spec(&ps1).unwrap();
         db.insert_loop_spec(&ps2).unwrap();
 
-        db.append_pool_member("pool1", "ps1").unwrap();
-        db.append_pool_member("pool1", "ps2").unwrap();
+        db.append_pool_member("pool1", "ps1", None).unwrap();
+        db.append_pool_member("pool1", "ps2", None).unwrap();
 
         // Set the loop's active pool.
         let mut lp_with_pool = lp.clone();

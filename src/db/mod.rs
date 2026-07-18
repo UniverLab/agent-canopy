@@ -367,6 +367,7 @@ impl Database {
                 pool_id TEXT NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
                 spec_id TEXT NOT NULL REFERENCES loop_specs(id) ON DELETE CASCADE,
                 position INTEGER NOT NULL,
+                group_name TEXT,
                 PRIMARY KEY (pool_id, spec_id)
             );
 
@@ -840,6 +841,24 @@ impl Database {
                         .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
                 }
             }
+        }
+
+        // `group_name` (RS3): the optional context group a queue member belongs
+        // to. Grouped members share a warm harness session — the first agent
+        // node of a grouped spec resumes the session captured by the previous
+        // successfully-completed grouped sibling instead of cold-starting.
+        // Older databases predate the column; NULL on existing rows (every
+        // legacy member is ungrouped and never cross-resumes). Additive.
+        let has_group_name: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('pool_members') WHERE name = 'group_name'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_group_name {
+            conn.execute("ALTER TABLE pool_members ADD COLUMN group_name TEXT", [])
+                .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
         }
 
         Ok(())

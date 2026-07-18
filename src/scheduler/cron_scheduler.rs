@@ -1081,7 +1081,7 @@ mod tests {
         })
         .unwrap();
         for spec_id in ["pool-done", "pool-failed", "pool-pending"] {
-            db.append_pool_member("pool-1", spec_id).unwrap();
+            db.append_pool_member("pool-1", spec_id, None).unwrap();
         }
         // No bound specs on the loop itself — this is what the real incident
         // hit: a `loop_run { pool_id }` launch never binds specs to the loop.

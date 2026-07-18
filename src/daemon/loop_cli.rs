@@ -198,12 +198,22 @@ fn handle_loop_info(db: &Database, id_or_name: &str) -> Result<()> {
             .as_deref()
             .map(|sid| format!("  sid {}", sid.chars().take(8).collect::<String>()))
             .unwrap_or_default();
+        // RS3: flag a run that continued a context group's warm session (its
+        // session id was first captured by a grouped sibling on this node).
+        let group_note = match (lp.active_run_pool_id.as_deref(), run.session_id.as_deref()) {
+            (Some(pool_id), Some(session_id)) => db
+                .group_resume_source(pool_id, &run.spec_id, &run.node_id, session_id)?
+                .map(|group| format!("  \x1b[36m(resumed group {group})\x1b[0m"))
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
         println!(
-            " {} {}  {}{}",
+            " {} {}  {}{}{}",
             run_status_icon(run.status),
             node_name,
             format_dt(run.started_at),
-            sid
+            sid,
+            group_note
         );
     }
 
@@ -547,7 +557,7 @@ mod tests {
             spec.id = id.to_string();
             spec.loop_id = None;
             db.insert_loop_spec(&spec).unwrap();
-            db.append_pool_member("pool-1", id).unwrap();
+            db.append_pool_member("pool-1", id, None).unwrap();
         }
 
         // Bound specs empty; pool progress is 1/2.
@@ -579,7 +589,7 @@ mod tests {
             spec.id = id.to_string();
             spec.loop_id = None;
             db.insert_loop_spec(&spec).unwrap();
-            db.append_pool_member("pool-1", id).unwrap();
+            db.append_pool_member("pool-1", id, None).unwrap();
         }
 
         assert_eq!(loop_progress(&db, &lp, &[]).unwrap(), (2, 2));
