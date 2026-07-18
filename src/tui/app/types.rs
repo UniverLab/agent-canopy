@@ -392,6 +392,9 @@ pub struct App {
     /// Tab-bar origin `(x, y)` of the prompt builder from the last frame, used
     /// for mouse hit-testing the clickable Normal/Raw tabs.
     pub(crate) prompt_tab_origin: Option<(u16, u16)>,
+    /// Raw tab content region `Rect` from the last frame, used for mouse
+    /// wheel hit-testing the scrollable content area.
+    pub(crate) prompt_raw_content_rect: Option<ratatui::layout::Rect>,
     /// Whether to send OS-level desktop notifications (agent done/failed).
     pub(crate) notifications_enabled: bool,
     /// Notification service for sending cross-platform notifications.

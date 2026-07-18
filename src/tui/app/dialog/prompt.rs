@@ -224,6 +224,11 @@ pub struct SimplePromptDialog {
     /// Vertical scroll offset (in preview lines) for the read-only raw
     /// preview. Reset whenever the preview is recomputed. Transient.
     pub raw_preview_scroll: usize,
+    /// Wheel-driven scroll offset for the editable raw buffer (view-only,
+    /// separate from the cursor). `None` means cursor-follow is in effect;
+    /// `Some(n)` means the user scrolled with the wheel and the view is
+    /// pinned at line `n` until the next cursor movement clears it.
+    pub raw_edit_scroll: Option<usize>,
     /// Selected row in the pending-scheduled-sends list panel (B33). `Some(i)`
     /// means the list region has keyboard focus and row `i` is highlighted;
     /// `None` means the list (if shown) is idle and keys go to the normal
@@ -269,6 +274,7 @@ impl SimplePromptDialog {
             active_tab: PromptTab::Normal,
             raw_preview: None,
             raw_preview_scroll: 0,
+            raw_edit_scroll: None,
             scheduled_list_selected: None,
             editing_scheduled_id: None,
         }
@@ -1523,6 +1529,7 @@ impl SimplePromptDialog {
         }
         self.active_tab = tab;
         self.raw_preview = None;
+        self.raw_edit_scroll = None;
         match tab {
             PromptTab::Raw => {
                 // Raw has two focus targets: the buffer (index 1) and the send
@@ -1579,6 +1586,17 @@ impl SimplePromptDialog {
         self.raw_preview_scroll = next.min(max);
     }
 
+    /// Wheel-scroll the editable raw buffer by `delta` lines (negative = up).
+    /// The scroll is clamped to `[0, max]` where `max = total_lines - avail_h`,
+    /// and stored separately from the cursor so the cursor is never moved by
+    /// a wheel event (view-only, satisfying FR 4).
+    pub fn scroll_raw_edit(&mut self, delta: isize, total_lines: usize, avail_h: usize) {
+        let max_scroll = total_lines.saturating_sub(avail_h);
+        let current = self.raw_edit_scroll.unwrap_or(0);
+        let next = current.saturating_add_signed(delta);
+        self.raw_edit_scroll = Some(next.min(max_scroll));
+    }
+
     /// Hit-boxes for the two tab labels, laid out left-to-right from `(x, y)`.
     /// Pure geometry so the render and the mouse handler agree, and so the
     /// click→tab mapping is unit-testable without any event plumbing.
@@ -1599,6 +1617,27 @@ impl SimplePromptDialog {
             .find_map(|(tab, rect)| {
                 (row == rect.y && col >= rect.x && col < rect.x + rect.width).then_some(tab)
             })
+    }
+
+    /// Pure geometry for the Raw tab's scrollable content region, mirroring
+    /// `draw_raw_tab_content`'s `content_area`. The `inner` rect is the
+    /// dialog's inner area (border excluded); `list_panel_height` is the
+    /// scheduled-sends panel rows (0 when no pending sends). Used by the
+    /// mouse-wheel hit test to decide whether a scroll event targets the
+    /// Raw content.
+    pub fn raw_content_rect(
+        inner: ratatui::layout::Rect,
+        list_panel_height: u16,
+    ) -> ratatui::layout::Rect {
+        let content_top = inner.y + 3;
+        let content_bottom = inner.y + inner.height.saturating_sub(2 + list_panel_height);
+        let avail_h = content_bottom.saturating_sub(content_top).max(1);
+        ratatui::layout::Rect {
+            x: inner.x + 1,
+            y: content_top,
+            width: inner.width.saturating_sub(2),
+            height: avail_h,
+        }
     }
 
     // ── Scheduled-sends list panel (B33) ────────────────────────────────
@@ -2360,6 +2399,85 @@ mod tests {
         assert_eq!(target.raw_text(), "/compact when quota back");
         // Restoring the Raw tab lands focus on the buffer, not the send control.
         assert_eq!(target.focused_section, 1);
+    }
+
+    // ── Raw-tab mouse-wheel scrolling (U13) ────────────────────────────────
+
+    #[test]
+    fn raw_content_rect_matches_draw_geometry() {
+        // A typical inner rect (border excluded). The content area should
+        // start 3 rows below inner.y (tab bar + hint + gap) and end 2 rows
+        // above inner.bottom (send line + gap), minus the list panel.
+        let inner = ratatui::layout::Rect::new(5, 3, 60, 30);
+        let rect = SimplePromptDialog::raw_content_rect(inner, 0);
+        assert_eq!(rect.x, 6); // inner.x + 1
+        assert_eq!(rect.y, 6); // inner.y + 3
+        assert_eq!(rect.width, 58); // inner.width - 2
+        // height = inner.height - 2 (send+gap) - 3 (top) = 30 - 5 = 25
+        assert_eq!(rect.height, 25);
+    }
+
+    #[test]
+    fn raw_content_rect_with_list_panel() {
+        let inner = ratatui::layout::Rect::new(0, 0, 60, 20);
+        let rect = SimplePromptDialog::raw_content_rect(inner, 3);
+        // bottom = 20 - (2 + 3) = 15; top = 3; height = 15 - 3 = 12
+        assert_eq!(rect.height, 12);
+    }
+
+    #[test]
+    fn raw_content_rect_small_dialog() {
+        // Minimum-size dialog: inner height 6 (borders + tab + hint + gap + content + gap + send).
+        let inner = ratatui::layout::Rect::new(0, 0, 40, 6);
+        let rect = SimplePromptDialog::raw_content_rect(inner, 0);
+        // bottom = 6 - 2 = 4; top = 3; height = max(4-3, 1) = 1
+        assert_eq!(rect.height, 1);
+        assert!(rect.width > 0);
+    }
+
+    #[test]
+    fn scroll_raw_edit_clamps_at_zero() {
+        let mut dialog = SimplePromptDialog::new();
+        assert!(dialog.raw_edit_scroll.is_none());
+        dialog.scroll_raw_edit(-5, 100, 20);
+        // Clamped to 0 (cannot scroll above the first line).
+        assert_eq!(dialog.raw_edit_scroll, Some(0));
+    }
+
+    #[test]
+    fn scroll_raw_edit_clamps_at_max() {
+        let mut dialog = SimplePromptDialog::new();
+        // total_lines = 50, avail_h = 10 → max_scroll = 40
+        dialog.scroll_raw_edit(100, 50, 10);
+        assert_eq!(dialog.raw_edit_scroll, Some(40));
+    }
+
+    #[test]
+    fn scroll_raw_edit_accumulates() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.scroll_raw_edit(3, 100, 20);
+        assert_eq!(dialog.raw_edit_scroll, Some(3));
+        dialog.scroll_raw_edit(2, 100, 20);
+        assert_eq!(dialog.raw_edit_scroll, Some(5));
+        dialog.scroll_raw_edit(-1, 100, 20);
+        assert_eq!(dialog.raw_edit_scroll, Some(4));
+    }
+
+    #[test]
+    fn raw_edit_scroll_cleared_on_tab_switch() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.set_tab(PromptTab::Raw);
+        dialog.raw_edit_scroll = Some(5);
+        dialog.set_tab(PromptTab::Normal);
+        assert!(dialog.raw_edit_scroll.is_none());
+        dialog.set_tab(PromptTab::Raw);
+        assert!(dialog.raw_edit_scroll.is_none());
+    }
+
+    #[test]
+    fn raw_edit_scroll_initially_none() {
+        let dialog = SimplePromptDialog::new();
+        assert!(dialog.raw_edit_scroll.is_none());
     }
 }
 

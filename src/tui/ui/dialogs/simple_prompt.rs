@@ -323,7 +323,7 @@ fn select_shortcut_hints(
 /// Draw the prompt builder. Returns the tab bar's origin `(x, y)` so the caller
 /// can store it for mouse hit-testing the clickable Normal/Raw tabs, or `None`
 /// when the dialog is not open.
-pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) -> Option<(u16, u16)> {
+pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) -> Option<((u16, u16), Option<ratatui::layout::Rect>)> {
     let dialog = app.simple_prompt_dialog.as_ref()?;
 
     // Get agent accent color
@@ -868,7 +868,12 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) -> Option<(u16, u
     // Draw picker modal if open
     draw_section_picker_modal(frame, app, accent, &dialog.picker_mode);
 
-    Some((inner.x, inner.y))
+    let content_rect = if dialog.active_tab == PromptTab::Raw {
+        Some(crate::tui::app::dialog::SimplePromptDialog::raw_content_rect(inner, list_panel_height))
+    } else {
+        None
+    };
+    Some(((inner.x, inner.y), content_rect))
 }
 
 /// Draw the Raw tab's content region: a single free-text field spanning the
@@ -958,12 +963,14 @@ fn draw_raw_tab_content(
         let cursor_idx = dialog
             .cursor(crate::tui::app::dialog::RAW_SECTION_ID)
             .min(text.chars().count());
-        // Cursor-follow scroll computed from the cursor's visual line.
+        // Cursor-follow scroll computed from the cursor's visual line,
+        // overridden by wheel scroll when the user has scrolled with the mouse.
         let prefix: String = text.chars().take(cursor_idx).collect();
         let cursor_line =
             crate::tui::app::dialog::SimplePromptDialog::visual_line_count(&prefix, field_width)
                 .saturating_sub(1);
-        let scroll = cursor_line.saturating_sub(avail_h.saturating_sub(1)) as u16;
+        let base_scroll = cursor_line.saturating_sub(avail_h.saturating_sub(1));
+        let scroll = dialog.raw_edit_scroll.unwrap_or(base_scroll) as u16;
 
         let styled = dialog.get_file_reference_with_styling(text, accent);
         let wrapped = wrap_styled_content(styled, Some(cursor_idx), field_width, section_bg);

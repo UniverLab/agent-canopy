@@ -149,8 +149,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     if app.simple_prompt_dialog.is_some() {
-        let tab_origin = dialogs::draw_simple_prompt_dialog(frame, app);
-        app.prompt_tab_origin = tab_origin;
+        let result = dialogs::draw_simple_prompt_dialog(frame, app);
+        if let Some((tab_origin, content_rect)) = result {
+            app.prompt_tab_origin = Some(tab_origin);
+            app.prompt_raw_content_rect = content_rect;
+        }
     }
 
     if app.loop_editor_dialog.is_some() {

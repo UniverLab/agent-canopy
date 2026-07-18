@@ -802,18 +802,22 @@ fn handle_raw_tab_key(
         // Cursor movement inside the raw buffer.
         KeyCode::Left => {
             dialog.move_cursor_left(raw, field_width);
+            dialog.raw_edit_scroll = None;
             PromptAction::None
         }
         KeyCode::Right => {
             dialog.move_cursor_right(raw, field_width);
+            dialog.raw_edit_scroll = None;
             PromptAction::None
         }
         KeyCode::Up => {
             dialog.move_cursor_up(raw, field_width);
+            dialog.raw_edit_scroll = None;
             PromptAction::None
         }
         KeyCode::Down => {
             dialog.move_cursor_down(raw, field_width);
+            dialog.raw_edit_scroll = None;
             PromptAction::None
         }
 

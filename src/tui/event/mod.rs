@@ -255,30 +255,75 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
 /// Handle a mouse event while the prompt builder is open. A left-click on one
 /// of the tab-bar hit-boxes (positioned via the pure `tab_at` mapping against
 /// the origin stored during the last frame) switches the active tab; entering
-/// the Raw tab refreshes its composed-prompt preview. All other mouse events
-/// are ignored (and swallowed by the caller).
+/// the Raw tab refreshes its composed-prompt preview. ScrollUp/ScrollDown
+/// events over the Raw tab's content region scroll the preview or the editable
+/// buffer without moving the cursor (view-only). All other mouse events are
+/// ignored (and swallowed by the caller).
 fn handle_prompt_dialog_mouse(app: &mut App, mouse: &MouseEvent) {
-    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-        return;
-    }
-    let Some((x, y)) = app.prompt_tab_origin else {
-        return;
-    };
-    let Some(tab) =
-        crate::tui::app::dialog::SimplePromptDialog::tab_at(x, y, mouse.column, mouse.row)
-    else {
-        return;
-    };
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some((x, y)) = app.prompt_tab_origin else {
+                return;
+            };
+            let Some(tab) =
+                crate::tui::app::dialog::SimplePromptDialog::tab_at(x, y, mouse.column, mouse.row)
+            else {
+                return;
+            };
 
-    let db = app.db.clone();
-    let workdir = app.current_workdir();
-    if let Some(dialog) = app.simple_prompt_dialog.as_mut() {
-        let entering_raw =
-            tab == crate::tui::app::dialog::PromptTab::Raw && dialog.active_tab != tab;
-        dialog.set_tab(tab);
-        if entering_raw {
-            dialog.refresh_raw_preview(&db, &workdir);
+            let db = app.db.clone();
+            let workdir = app.current_workdir();
+            if let Some(dialog) = app.simple_prompt_dialog.as_mut() {
+                let entering_raw =
+                    tab == crate::tui::app::dialog::PromptTab::Raw && dialog.active_tab != tab;
+                dialog.set_tab(tab);
+                if entering_raw {
+                    dialog.refresh_raw_preview(&db, &workdir);
+                }
+            }
         }
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let Some(dialog) = app.simple_prompt_dialog.as_ref() else {
+                return;
+            };
+            if dialog.active_tab != crate::tui::app::dialog::PromptTab::Raw {
+                return;
+            }
+            let Some(content_rect) = app.prompt_raw_content_rect else {
+                return;
+            };
+            if !rect_contains_point(content_rect, mouse.column, mouse.row) {
+                return;
+            }
+            // Skip if the @-picker overlay is open (it draws over the content area).
+            if dialog.at_picker.is_some() {
+                return;
+            }
+            let delta: isize = match mouse.kind {
+                MouseEventKind::ScrollUp => -1,
+                MouseEventKind::ScrollDown => 1,
+                _ => unreachable!(),
+            };
+            let (is_empty, raw_text) = app
+                .simple_prompt_dialog
+                .as_ref()
+                .map_or((false, String::new()), |d| {
+                    (d.raw_is_empty(), d.raw_text().to_string())
+                });
+            let field_width = prompt_template::prompt_field_width(app);
+            let dialog = app.simple_prompt_dialog.as_mut().unwrap();
+            if is_empty {
+                dialog.scroll_raw_preview(delta);
+            } else {
+                let total_lines =
+                    crate::tui::app::dialog::SimplePromptDialog::visual_line_count(
+                        &raw_text, field_width,
+                    );
+                let avail_h = content_rect.height as usize;
+                dialog.scroll_raw_edit(delta, total_lines, avail_h);
+            }
+        }
+        _ => {}
     }
 }
 
