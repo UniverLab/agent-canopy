@@ -624,27 +624,27 @@ impl LoopEngine {
             Some(pool_id) => {
                 let total = self.db.list_pool_member_spec_ids(pool_id)?.len();
                 Ok(format!(
-                    "Loop '{}' has no specs to run: pool '{}' has {} member(s), none pending \
-                     (all already completed/skipped, or the pool is empty). Add pending specs \
-                     to the pool, or pass a different pool_id.",
+                    "Loop '{}' has no specs to run: queue '{}' has {} member(s), none pending \
+                     (all already completed/skipped, or the queue is empty). Add pending specs \
+                     to the queue, or pass a different queue_id.",
                     lp.name, pool_id, total
                 ))
             }
             None => {
                 let mut message = format!(
-                    "Loop '{}' has no specs to run: it has 0 bound specs and no pool_id was \
+                    "Loop '{}' has no specs to run: it has 0 bound specs and no queue_id was \
                      given.",
                     lp.name
                 );
                 match &lp.active_run_pool_id {
                     Some(last_pool) => {
                         message.push_str(&format!(
-                            " Its last run drew from pool '{last_pool}' — pass pool_id: \
+                            " Its last run drew from queue '{last_pool}' — pass queue_id: \
                              \"{last_pool}\" to relaunch against it."
                         ));
                     }
                     None => {
-                        message.push_str(" Pass pool_id to run it against a pool instead.");
+                        message.push_str(" Pass queue_id to run it against a queue instead.");
                     }
                 }
                 Ok(message)

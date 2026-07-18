@@ -135,7 +135,7 @@ fn handle_loop_info(db: &Database, id_or_name: &str) -> Result<()> {
         // run_loop`), so there's no fixed queue to show. Reconstruct what
         // ran so far from `loop_runs`, which always records the real
         // `loop_id` regardless of pool membership.
-        println!(" (pool-driven — showing specs worked so far, not the full queue)");
+        println!(" (queue-driven — showing specs worked so far, not the full queue)");
         for spec_id in distinct_spec_ids_in_order(&all_runs) {
             if let Some(spec) = db.get_loop_spec(spec_id)? {
                 let admin_tag = if spec.completed_via.as_deref() == Some("admin") {

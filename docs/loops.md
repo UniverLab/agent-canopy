@@ -159,23 +159,27 @@ a workdir for filtering:
 The TUI sidebar shows backlog specs under the **Backlog** section,
 filtered to the selected project's workdir.
 
-## Spec pools
+## Spec queues
 
-A **pool** is an ordered queue of existing specs decoupled from any one
-loop. When a loop runs against a pool, it drains the pool's pending
+A **queue** is an ordered list of existing specs decoupled from any one
+loop. When a loop runs against a queue, it drains the queue's pending
 specs (in queue order) through the loop's graph instead of its own
 bound specs:
 
 | Tool | Description |
 |---|---|
-| `pool_create` | Create an empty pool |
-| `pool_add_spec` | Append a spec to the end of a pool's queue |
-| `pool_list` | List a pool's members (or all pools) |
-| `pool_remove_spec` | Remove a spec from a pool |
-| `pool_reorder` | Full replacement of a pool's queue order |
+| `queue_create` | Create an empty queue |
+| `queue_add_spec` | Append a spec to the end of a queue |
+| `queue_list` | List a queue's members (or all queues) |
+| `queue_remove_spec` | Remove a spec from a queue |
+| `queue_reorder` | Full replacement of a queue's order |
 
-Pool membership is unaffected by `loop_run` — specs stay standalone.
-The `loop info` CLI and `loop_get` MCP tool show pool-driven progress
+Pass a queue to `loop_run` via `queue_id` (the deprecated `pool_id`
+still works). The former `pool_*` tool names remain as deprecated
+back-compat aliases of the `queue_*` tools above.
+
+Queue membership is unaffected by `loop_run` — specs stay standalone.
+The `loop info` CLI and `loop_get` MCP tool show queue-driven progress
 by reconstructing what ran from the run history.
 
 ## The 24 MCP tools

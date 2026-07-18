@@ -87,14 +87,14 @@ pipeline, all 64 MCP tools, and the complete CLI reference.
 
 - **Ordered Specs** — Loops contain sequenced `Spec`s, each with `Node`s connected by `Edge`s with routing conditions (`pass`/`fail`/`always`).
 - **Standalone Spec Backlog** — Specs exist independently from loops; tag them to a workdir for filtering. Managed via `spec_create`, `spec_list`, `spec_update`, `spec_delete`.
-- **Spec Pools** — Ordered queues of existing specs that a loop drains one by one. Append and reorder while a loop is running via `pool_create`, `pool_add_spec`, `pool_list`, `pool_remove_spec`, `pool_reorder`.
+- **Spec Queues** — Ordered queues of existing specs that a loop drains one by one. Append and reorder while a loop is running via `queue_create`, `queue_add_spec`, `queue_list`, `queue_remove_spec`, `queue_reorder`. (The old `pool_*` names remain as deprecated back-compat aliases.)
 - **Node Kinds** — `agent` nodes invoke CLI tools with prompt templates; `check` nodes execute shell commands; `gate` nodes validate previous output (e.g., `output_contains`); `join` is the engine-managed gate that closes an ensemble.
 - **Ensembles** — `loop_add_ensemble` creates a parallel group of 2-8 agent-node members sharing one prompt, plus a wait-all join gate that consolidates their outputs and routes onward, in a single MCP call. `loop_update_ensemble` edits the shared prompt, member list, and join/exit config as one unit. See [docs/loops.md](docs/loops.md#ensembles).
 - **Node Blueprints** — Reusable `{name, kind, config}` templates referenced by name in `loop_add_node`. Five builtins seeded at startup; custom blueprints via `blueprint_create`/`blueprint_delete`/`blueprint_list`.
 - **Full Lifecycle** — Create, update, run, pause, continue (retry or skip), reset, complete nodes, and report blockers for human intervention. `loop_schedule_autorun` resumes failed/completed loops at a future time.
 - **`on_completed` Hook** — Post-completion agent execution (e.g. documentation maintenance) that fires once per completion.
 - **Template Variables** — Loop prompts support `{{loop_name}}`, `{{workdir}}`, `{{spec_id}}`, `{{spec_name}}`, `{{spec_content}}`, `{{node_id}}`, `{{previous_feedback}}`, and `{{spec_start_head}}` (git HEAD at spec start, for check nodes).
-- **24 MCP Tools** — Complete authoring, inspection, runtime, spec, pool, and blueprint management.
+- **24 MCP Tools** — Complete authoring, inspection, runtime, spec, queue, and blueprint management.
 
 ### 📚 Personal RAG Pipeline
 
@@ -144,7 +144,7 @@ pipeline, all 64 MCP tools, and the complete CLI reference.
 | **Seed Identity** (5) | `get_identity`, `evolve_identity`, `create_seed`, `list_seeds`, `remove_seed` |
 | **Loop Engine** (19) | `loop_create`, `loop_update`, `loop_add_spec`, `loop_update_spec`, `loop_add_node`, `loop_update_node`, `loop_add_edge`, `loop_update_edge`, `loop_add_ensemble`, `loop_update_ensemble`, `loop_get`, `loop_list`, `loop_run`, `loop_reset`, `loop_schedule_autorun`, `loop_pause`, `loop_continue`, `loop_complete_node`, `loop_report_blocker` |
 | **Spec Backlog** (5) | `spec_create`, `spec_list`, `spec_update`, `spec_delete`, `spec_set_status` |
-| **Spec Pools** (5) | `pool_create`, `pool_add_spec`, `pool_list`, `pool_remove_spec`, `pool_reorder` |
+| **Spec Queues** (5) | `queue_create`, `queue_add_spec`, `queue_list`, `queue_remove_spec`, `queue_reorder` (deprecated `pool_*` aliases still resolve) |
 | **Node Blueprints** (3) | `blueprint_list`, `blueprint_create`, `blueprint_delete` |
 | **Project** (2) | `project_search`, `project_update` |
 | **RAG** (1) | `rag_search` |
@@ -160,7 +160,7 @@ pipeline, all 64 MCP tools, and the complete CLI reference.
 - **Executor** — Runs tasks and agents, manages locking, logs, and status.
 - **Intelligence V2** — Project-scoped knowledge graph with node/edge CRUD, graph walk, project relationships.
 - **Sync Manager** — Per-workdir in-memory broadcast channels (64 capacity), DB persistence, and intelligence node auto-upsert.
-- **Loop Engine** — DAG execution engine: check/gate/agent node runners, iteration limits, pause/continue, blocker reporting, spec pools, node blueprints, scheduled autorun.
+- **Loop Engine** — DAG execution engine: check/gate/agent node runners, iteration limits, pause/continue, blocker reporting, spec queues, node blueprints, scheduled autorun.
 - **RAG Pipeline** — Background ingestion, language-aware chunking, embedding client, vector store, and rate-limited search.
 - **TUI** — Full-screen ratatui terminal UI for managing agents, viewing output, loops, and system metrics in real time.
 - **Gamification** — Mission tracker with 28 achievements across 6 categories, persisted in the database.

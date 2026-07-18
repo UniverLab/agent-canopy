@@ -75,15 +75,17 @@ stdio. Connect any MCP-capable AI CLI with `canopy mcp`.
 | `spec_delete` | Delete an unbound spec |
 | `spec_set_status` | Admin transition: complete, skip, or reopen a standalone spec |
 
-## Spec pools (5)
+## Spec queues (5)
 
 | Tool | Description |
 |---|---|
-| `pool_create` | Create an ordered queue of specs |
-| `pool_add_spec` | Append a spec to the end of a pool's queue |
-| `pool_list` | List a pool's members, or all pools |
-| `pool_remove_spec` | Remove a spec from a pool |
-| `pool_reorder` | Full replacement of a pool's queue order |
+| `queue_create` | Create an ordered queue of specs |
+| `queue_add_spec` | Append a spec to the end of a queue |
+| `queue_list` | List a queue's members, or all queues |
+| `queue_remove_spec` | Remove a spec from a queue |
+| `queue_reorder` | Full replacement of a queue's order |
+
+The former `pool_*` tool names (`pool_create`, `pool_add_spec`, `pool_list`, `pool_remove_spec`, `pool_reorder`) still resolve as deprecated aliases of the `queue_*` tools above.
 
 ## Node blueprints (3)
 

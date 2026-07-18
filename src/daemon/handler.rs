@@ -736,7 +736,7 @@ fn resolve_node_kind_and_config(
 fn validate_pool_exists(db: &Database, pool_id: &str) -> Result<Pool, String> {
     db.get_pool(pool_id)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Pool '{pool_id}' not found."))
+        .ok_or_else(|| format!("Queue '{pool_id}' not found."))
 }
 
 /// Refuse to start a pool run when one of the pool's specs is already
@@ -770,7 +770,7 @@ fn validate_pool_not_consumed(
         if owner_loop_id.as_deref() != Some(requesting_loop_id) {
             let owner = owner_loop_id.unwrap_or_else(|| "another loop".to_string());
             return Err(format!(
-                "Pool '{pool_id}' spec '{spec_id}' is already running under loop '{owner}'; wait for it to finish, or pause that loop, before starting a new run against this pool."
+                "Queue '{pool_id}' spec '{spec_id}' is already running under loop '{owner}'; wait for it to finish, or pause that loop, before starting a new run against this queue."
             ));
         }
     }
@@ -785,7 +785,7 @@ fn validate_pool_not_consumed(
 fn validate_pool_reorder(current: &[String], spec_ids: &[String]) -> Result<(), String> {
     if spec_ids.len() != current.len() {
         return Err(format!(
-            "Reorder must list all {} pool spec(s) exactly once; got {}.",
+            "Reorder must list all {} queue spec(s) exactly once; got {}.",
             current.len(),
             spec_ids.len()
         ));
@@ -797,7 +797,7 @@ fn validate_pool_reorder(current: &[String], spec_ids: &[String]) -> Result<(), 
             return Err(format!("Reorder lists spec '{id}' more than once."));
         }
         if !current.iter().any(|existing| existing == id) {
-            return Err(format!("Pool has no spec '{id}'."));
+            return Err(format!("Queue has no spec '{id}'."));
         }
     }
     Ok(())
@@ -816,7 +816,7 @@ fn validate_pool_member_removable(
     if let Some(spec) = db.get_loop_spec(spec_id).map_err(|e| e.to_string())? {
         if spec.status == LoopSpecStatus::Running {
             return Err(format!(
-                "Spec '{spec_id}' is currently running and cannot be removed from pool '{pool_id}'; wait for it to finish, or pause the loop, first."
+                "Spec '{spec_id}' is currently running and cannot be removed from queue '{pool_id}'; wait for it to finish, or pause the loop, first."
             ));
         }
     }
@@ -4422,16 +4422,22 @@ impl TaskTriggerHandler {
         )))
     }
 
-    #[tool(
-        name = "pool_create",
-        description = "Create a pool: an ordered queue of existing specs, decoupled from any one loop."
-    )]
-    async fn pool_create(
-        &self,
-        Parameters(params): Parameters<PoolCreateParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let name = params.name.trim();
-        if let Err(e) = validate_non_empty(name, "Pool name") {
+    // ---- Queue tools (Q1) --------------------------------------------------
+    //
+    // A "queue" is an ordered list of existing specs, decoupled from any one
+    // loop. The `queue_*` tools below are the primary surface; the `pool_*`
+    // tools further down are DEPRECATED thin aliases kept for back-compat.
+    // Both call the shared `do_queue_*` helpers so there is exactly one
+    // implementation and one place that routes: alias in, one handler out.
+    //
+    // NOTE: the DB/engine layer still speaks "pool" internally (the `pools`
+    // table, `insert_pool`, `list_pool_member_spec_ids`, `validate_pool_*`,
+    // etc.). That is deliberate — Q1 renames only the MCP/user surface, never
+    // the storage layer. The helpers keep `pool`-named DB calls unchanged.
+
+    async fn do_queue_create(&self, name: &str) -> Result<CallToolResult, McpError> {
+        let name = name.trim();
+        if let Err(e) = validate_non_empty(name, "Queue name") {
             return Ok(error_result(&e));
         }
 
@@ -4442,71 +4448,57 @@ impl TaskTriggerHandler {
         };
         self.db.insert_pool(&pool).map_err(internal_error)?;
 
-        Ok(build_id_result(&pool.id, "pool_id"))
+        Ok(build_id_result(&pool.id, "queue_id"))
     }
 
-    #[tool(
-        name = "pool_add_spec",
-        description = "Append an existing spec to the end of a pool's queue."
-    )]
-    async fn pool_add_spec(
+    async fn do_queue_add_spec(
         &self,
-        Parameters(params): Parameters<PoolAddSpecParams>,
+        queue_id: &str,
+        spec_id: &str,
     ) -> Result<CallToolResult, McpError> {
-        let pool_id = params.pool_id.trim();
-        if let Err(e) = validate_pool_exists(&self.db, pool_id) {
+        let queue_id = queue_id.trim();
+        if let Err(e) = validate_pool_exists(&self.db, queue_id) {
             return Ok(error_result(&e));
         }
-        let spec_id = params.spec_id.trim();
+        let spec_id = spec_id.trim();
         if let Err(e) = validate_spec_exists(&self.db, spec_id) {
             return Ok(error_result(&e));
         }
         let already_member = self
             .db
-            .pool_has_member(pool_id, spec_id)
+            .pool_has_member(queue_id, spec_id)
             .map_err(internal_error)?;
         if already_member {
             return Ok(error_result(&format!(
-                "Spec '{spec_id}' is already in pool '{pool_id}'."
+                "Spec '{spec_id}' is already in queue '{queue_id}'."
             )));
         }
 
         self.db
-            .append_pool_member(pool_id, spec_id)
+            .append_pool_member(queue_id, spec_id)
             .map_err(internal_error)?;
 
         Ok(success_result(&format!(
-            "Spec '{spec_id}' added to pool '{pool_id}'."
+            "Spec '{spec_id}' added to queue '{queue_id}'."
         )))
     }
 
-    #[tool(
-        name = "pool_list",
-        description = "List a pool's ordered members, or every pool (summary only) if pool_id is omitted."
-    )]
-    async fn pool_list(
-        &self,
-        Parameters(params): Parameters<PoolListParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let pool_id = params
-            .pool_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
+    async fn do_queue_list(&self, queue_id: Option<&str>) -> Result<CallToolResult, McpError> {
+        let queue_id = queue_id.map(str::trim).filter(|s| !s.is_empty());
 
-        let body = match pool_id {
-            Some(pool_id) => {
-                let details = match self.db.get_pool_details(pool_id) {
+        let body = match queue_id {
+            Some(queue_id) => {
+                let details = match self.db.get_pool_details(queue_id) {
                     Ok(Some(details)) => details,
-                    Ok(None) => return Ok(error_result(&format!("Pool '{pool_id}' not found."))),
+                    Ok(None) => return Ok(error_result(&format!("Queue '{queue_id}' not found."))),
                     Err(e) => return Err(internal_error(e.to_string())),
                 };
-                serde_json::json!({ "pool": pool_details_json(&details) })
+                serde_json::json!({ "queue": pool_details_json(&details) })
             }
             None => {
                 let pools = self.db.list_pools().map_err(internal_error)?;
                 serde_json::json!({
-                    "pools": pools
+                    "queues": pools
                         .iter()
                         .map(|pool| serde_json::json!({
                             "id": pool.id,
@@ -4522,65 +4514,175 @@ impl TaskTriggerHandler {
         )]))
     }
 
+    async fn do_queue_remove_spec(
+        &self,
+        queue_id: &str,
+        spec_id: &str,
+    ) -> Result<CallToolResult, McpError> {
+        let queue_id = queue_id.trim();
+        if let Err(e) = validate_pool_exists(&self.db, queue_id) {
+            return Ok(error_result(&e));
+        }
+        let spec_id = spec_id.trim();
+        if let Err(e) = validate_pool_member_removable(&self.db, queue_id, spec_id) {
+            return Ok(error_result(&e));
+        }
+        let removed = self
+            .db
+            .remove_pool_member(queue_id, spec_id)
+            .map_err(internal_error)?;
+        if !removed {
+            return Ok(error_result(&format!(
+                "Queue '{queue_id}' has no spec '{spec_id}'."
+            )));
+        }
+
+        Ok(success_result(&format!(
+            "Spec '{spec_id}' removed from queue '{queue_id}'."
+        )))
+    }
+
+    async fn do_queue_reorder(
+        &self,
+        queue_id: &str,
+        spec_ids: &[String],
+    ) -> Result<CallToolResult, McpError> {
+        let queue_id = queue_id.trim();
+        if let Err(e) = validate_pool_exists(&self.db, queue_id) {
+            return Ok(error_result(&e));
+        }
+        let current = self
+            .db
+            .list_pool_member_spec_ids(queue_id)
+            .map_err(internal_error)?;
+        if let Err(e) = validate_pool_reorder(&current, spec_ids) {
+            return Ok(error_result(&e));
+        }
+        if let Err(e) = validate_pool_reorder_locking(&self.db, &current, spec_ids) {
+            return Ok(error_result(&e));
+        }
+
+        self.db
+            .reorder_pool_members(queue_id, spec_ids)
+            .map_err(internal_error)?;
+
+        Ok(success_result(&format!("Queue '{queue_id}' reordered.")))
+    }
+
+    #[tool(
+        name = "queue_create",
+        description = "Create a queue: an ordered list of existing specs, decoupled from any one loop."
+    )]
+    async fn queue_create(
+        &self,
+        Parameters(params): Parameters<QueueCreateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.do_queue_create(&params.name).await
+    }
+
+    #[tool(
+        name = "queue_add_spec",
+        description = "Append an existing spec to the end of a queue."
+    )]
+    async fn queue_add_spec(
+        &self,
+        Parameters(params): Parameters<QueueAddSpecParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.do_queue_add_spec(&params.queue_id, &params.spec_id)
+            .await
+    }
+
+    #[tool(
+        name = "queue_list",
+        description = "List a queue's ordered members, or every queue (summary only) if queue_id is omitted."
+    )]
+    async fn queue_list(
+        &self,
+        Parameters(params): Parameters<QueueListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.do_queue_list(params.queue_id.as_deref()).await
+    }
+
+    #[tool(
+        name = "queue_remove_spec",
+        description = "Remove a spec from a queue."
+    )]
+    async fn queue_remove_spec(
+        &self,
+        Parameters(params): Parameters<QueueRemoveSpecParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.do_queue_remove_spec(&params.queue_id, &params.spec_id)
+            .await
+    }
+
+    #[tool(
+        name = "queue_reorder",
+        description = "Reorder a queue. `spec_ids` must list every queue member exactly once, in the desired order — a total replacement, not a partial swap."
+    )]
+    async fn queue_reorder(
+        &self,
+        Parameters(params): Parameters<QueueReorderParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.do_queue_reorder(&params.queue_id, &params.spec_ids)
+            .await
+    }
+
+    #[tool(
+        name = "pool_create",
+        description = "DEPRECATED: use queue_create instead. Create a queue: an ordered list of existing specs, decoupled from any one loop."
+    )]
+    async fn pool_create(
+        &self,
+        Parameters(params): Parameters<PoolCreateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.do_queue_create(&params.name).await
+    }
+
+    #[tool(
+        name = "pool_add_spec",
+        description = "DEPRECATED: use queue_add_spec instead. Append an existing spec to the end of a queue."
+    )]
+    async fn pool_add_spec(
+        &self,
+        Parameters(params): Parameters<PoolAddSpecParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.do_queue_add_spec(&params.pool_id, &params.spec_id)
+            .await
+    }
+
+    #[tool(
+        name = "pool_list",
+        description = "DEPRECATED: use queue_list instead. List a queue's ordered members, or every queue (summary only) if pool_id is omitted."
+    )]
+    async fn pool_list(
+        &self,
+        Parameters(params): Parameters<PoolListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.do_queue_list(params.pool_id.as_deref()).await
+    }
+
     #[tool(
         name = "pool_remove_spec",
-        description = "Remove a spec from a pool's queue."
+        description = "DEPRECATED: use queue_remove_spec instead. Remove a spec from a queue."
     )]
     async fn pool_remove_spec(
         &self,
         Parameters(params): Parameters<PoolRemoveSpecParams>,
     ) -> Result<CallToolResult, McpError> {
-        let pool_id = params.pool_id.trim();
-        if let Err(e) = validate_pool_exists(&self.db, pool_id) {
-            return Ok(error_result(&e));
-        }
-        let spec_id = params.spec_id.trim();
-        if let Err(e) = validate_pool_member_removable(&self.db, pool_id, spec_id) {
-            return Ok(error_result(&e));
-        }
-        let removed = self
-            .db
-            .remove_pool_member(pool_id, spec_id)
-            .map_err(internal_error)?;
-        if !removed {
-            return Ok(error_result(&format!(
-                "Pool '{pool_id}' has no spec '{spec_id}'."
-            )));
-        }
-
-        Ok(success_result(&format!(
-            "Spec '{spec_id}' removed from pool '{pool_id}'."
-        )))
+        self.do_queue_remove_spec(&params.pool_id, &params.spec_id)
+            .await
     }
 
     #[tool(
         name = "pool_reorder",
-        description = "Reorder a pool's queue. `spec_ids` must list every pool member exactly once, in the desired order — a total replacement, not a partial swap."
+        description = "DEPRECATED: use queue_reorder instead. Reorder a queue. `spec_ids` must list every queue member exactly once, in the desired order — a total replacement, not a partial swap."
     )]
     async fn pool_reorder(
         &self,
         Parameters(params): Parameters<PoolReorderParams>,
     ) -> Result<CallToolResult, McpError> {
-        let pool_id = params.pool_id.trim();
-        if let Err(e) = validate_pool_exists(&self.db, pool_id) {
-            return Ok(error_result(&e));
-        }
-        let current = self
-            .db
-            .list_pool_member_spec_ids(pool_id)
-            .map_err(internal_error)?;
-        if let Err(e) = validate_pool_reorder(&current, &params.spec_ids) {
-            return Ok(error_result(&e));
-        }
-        if let Err(e) = validate_pool_reorder_locking(&self.db, &current, &params.spec_ids) {
-            return Ok(error_result(&e));
-        }
-
-        self.db
-            .reorder_pool_members(pool_id, &params.spec_ids)
-            .map_err(internal_error)?;
-
-        Ok(success_result(&format!("Pool '{pool_id}' reordered.")))
+        self.do_queue_reorder(&params.pool_id, &params.spec_ids)
+            .await
     }
 
     #[tool(
@@ -4632,7 +4734,7 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "loop_run",
-        description = "Run a loop in the background, spec by spec. With `pool_id`, runs the pool's pending specs (in queue order) through the loop's graph instead of the loop's own bound specs. `workdir` overrides the loop's workdir for this run only."
+        description = "Run a loop in the background, spec by spec. With `queue_id`, runs the queue's pending specs (in queue order) through the loop's graph instead of the loop's own bound specs. (`pool_id` is a deprecated alias for `queue_id`; `queue_id` wins if both are set.) `workdir` overrides the loop's workdir for this run only."
     )]
     async fn loop_run(
         &self,
@@ -4653,9 +4755,13 @@ impl TaskTriggerHandler {
             return Ok(error_result(&message));
         }
 
+        // `queue_id` is the current surface name; `pool_id` is the deprecated
+        // alias. Prefer `queue_id`, fall back to `pool_id`. Everything
+        // downstream (engine, db) keeps its internal `pool_id` naming.
         let pool_id = params
-            .pool_id
+            .queue_id
             .as_deref()
+            .or(params.pool_id.as_deref())
             .map(str::trim)
             .filter(|value| !value.is_empty());
         if let Some(pool_id) = pool_id {
@@ -5623,9 +5729,13 @@ mod tests {
         validate_node_config, validate_node_not_ensemble_owned, validate_pool_exists,
         validate_pool_member_removable, validate_pool_not_consumed, validate_pool_reorder,
         validate_pool_reorder_locking, validate_spec_deletable, validate_spec_exists,
-        BuiltEnsembleUnit, EnsembleMemberParams, EnsembleUnitSpec, MISSING_SYNC_IDENTITY_MESSAGE,
+        BuiltEnsembleUnit, EnsembleMemberParams, EnsembleUnitSpec, TaskTriggerHandler,
+        MISSING_SYNC_IDENTITY_MESSAGE,
     };
-    use crate::daemon::params::{LoopCopyEnsembleParams, LoopCopyNodeParams};
+    use crate::daemon::params::{
+        LoopCopyEnsembleParams, LoopCopyNodeParams, LoopRunParams, PoolAddSpecParams,
+        PoolCreateParams, PoolListParams, QueueAddSpecParams, QueueCreateParams, QueueListParams,
+    };
     use crate::db::Database;
     use crate::domain::blueprints::Blueprint;
     use crate::domain::loops::{
@@ -6338,6 +6448,242 @@ mod tests {
             created_at: chrono::Utc::now(),
         })
         .unwrap();
+    }
+
+    /// Build a fully-wired `TaskTriggerHandler` over an in-memory-ish temp DB
+    /// so the queue/pool `#[tool]` methods (and their shared `do_queue_*`
+    /// helpers) can be exercised end-to-end.
+    fn queue_test_handler() -> (
+        tempfile::TempDir,
+        std::sync::Arc<Database>,
+        TaskTriggerHandler,
+    ) {
+        use crate::application::notification_service::{
+            DefaultNotificationService, NotificationService,
+        };
+        use crate::executor::Executor;
+        use crate::loop_engine::LoopEngine;
+        use crate::rag::ingestion::IngestionManager;
+        use crate::sync_manager::SyncManager;
+        use crate::watchers::WatcherEngine;
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
+        let notif: Arc<dyn NotificationService> = Arc::new(DefaultNotificationService);
+        let executor = Arc::new(Executor::new(Arc::clone(&db), Arc::clone(&notif)));
+        let sync_manager = Arc::new(SyncManager::new(Arc::clone(&db)));
+        let loop_engine = Arc::new(LoopEngine::new(Arc::clone(&db), Arc::clone(&notif)));
+        let watcher_engine = Arc::new(WatcherEngine::new(
+            Arc::clone(&db),
+            Arc::clone(&executor),
+            Arc::clone(&loop_engine),
+        ));
+        let ingestion = Arc::new(IngestionManager::new(
+            Arc::clone(&db),
+            dir.path().to_path_buf(),
+        ));
+        let handler = TaskTriggerHandler::new(
+            Arc::clone(&db),
+            executor,
+            watcher_engine,
+            Arc::new(Notify::new()),
+            loop_engine,
+            notif,
+            sync_manager,
+            ingestion,
+            0,
+        );
+        (dir, db, handler)
+    }
+
+    fn result_text(result: &rmcp::model::CallToolResult) -> String {
+        format!("{:?}", result.content)
+    }
+
+    /// Q1: the primary `queue_create` and the deprecated `pool_create` alias
+    /// must both route to the same `do_queue_create` helper, both emit the
+    /// `queue_id` result key (never the old `pool_id`), and both persist a real
+    /// queue row.
+    #[tokio::test]
+    async fn queue_create_and_pool_alias_route_to_same_handler() {
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let (_dir, db, handler) = queue_test_handler();
+
+        let via_queue = handler
+            .queue_create(Parameters(QueueCreateParams {
+                name: "Primary".to_string(),
+            }))
+            .await
+            .unwrap();
+        let via_pool = handler
+            .pool_create(Parameters(PoolCreateParams {
+                name: "Alias".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        for text in [result_text(&via_queue), result_text(&via_pool)] {
+            assert!(text.contains("queue_id"), "expected queue_id key: {text}");
+            assert!(
+                !text.contains("pool_id"),
+                "result must not leak pool_id: {text}"
+            );
+        }
+
+        let pools = db.list_pools().unwrap();
+        assert!(pools.iter().any(|p| p.name == "Primary"));
+        assert!(pools.iter().any(|p| p.name == "Alias"));
+    }
+
+    /// Q1: `queue_add_spec` and its `pool_add_spec` alias share one handler —
+    /// adding via either path lands the spec in the same underlying queue and
+    /// returns queue-worded confirmation.
+    #[tokio::test]
+    async fn queue_add_spec_and_pool_alias_are_equivalent() {
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let (_dir, db, handler) = queue_test_handler();
+        for id in ["spec-a", "spec-b"] {
+            db.insert_loop_spec(&standalone_spec(id)).unwrap();
+        }
+        insert_pool(&db, "queue-1");
+
+        let via_queue = handler
+            .queue_add_spec(Parameters(QueueAddSpecParams {
+                queue_id: "queue-1".to_string(),
+                spec_id: "spec-a".to_string(),
+            }))
+            .await
+            .unwrap();
+        let via_pool = handler
+            .pool_add_spec(Parameters(PoolAddSpecParams {
+                pool_id: "queue-1".to_string(),
+                spec_id: "spec-b".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        assert!(result_text(&via_queue).contains("added to queue"));
+        assert!(result_text(&via_pool).contains("added to queue"));
+        assert_eq!(
+            db.list_pool_member_spec_ids("queue-1").unwrap(),
+            vec!["spec-a", "spec-b"]
+        );
+    }
+
+    /// Q1: `queue_list` emits the queue-worded payload keys (`queue`/`queues`),
+    /// and the `pool_list` alias produces the identical payload.
+    #[tokio::test]
+    async fn queue_list_and_pool_alias_use_queue_keys() {
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let (_dir, db, handler) = queue_test_handler();
+        db.insert_loop_spec(&standalone_spec("spec-a")).unwrap();
+        insert_pool(&db, "queue-1");
+        db.append_pool_member("queue-1", "spec-a").unwrap();
+
+        let all_via_queue = handler
+            .queue_list(Parameters(QueueListParams { queue_id: None }))
+            .await
+            .unwrap();
+        let all_via_pool = handler
+            .pool_list(Parameters(PoolListParams { pool_id: None }))
+            .await
+            .unwrap();
+        assert_eq!(result_text(&all_via_queue), result_text(&all_via_pool));
+        assert!(result_text(&all_via_queue).contains("queues"));
+
+        let one = handler
+            .queue_list(Parameters(QueueListParams {
+                queue_id: Some("queue-1".to_string()),
+            }))
+            .await
+            .unwrap();
+        let text = result_text(&one);
+        assert!(text.contains("queue"), "{text}");
+        assert!(
+            !text.contains("\\\"pool\\\""),
+            "must not use pool key: {text}"
+        );
+    }
+
+    /// Q1: `loop_run` accepts the deprecated `pool_id` as an alias for
+    /// `queue_id`. Routing an empty queue through it surfaces the (queue-worded)
+    /// empty-launch error naming that queue — proof the id resolved.
+    #[tokio::test]
+    async fn loop_run_accepts_pool_id_alias() {
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let (dir, db, handler) = queue_test_handler();
+        db.insert_loop(&Loop {
+            id: "loop-1".to_string(),
+            name: "loop-1".to_string(),
+            description: None,
+            workdir: dir.path().to_string_lossy().to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            active_run_pool_id: None,
+            on_completed: None,
+        })
+        .unwrap();
+        insert_pool(&db, "queue-empty");
+
+        let result = handler
+            .loop_run(Parameters(LoopRunParams {
+                loop_id: "loop-1".to_string(),
+                queue_id: None,
+                pool_id: Some("queue-empty".to_string()),
+                workdir: None,
+            }))
+            .await
+            .unwrap();
+        let text = result_text(&result);
+        assert!(text.contains("queue-empty"), "pool_id must resolve: {text}");
+    }
+
+    /// Q1: when both `queue_id` and `pool_id` are set, `queue_id` wins.
+    #[tokio::test]
+    async fn loop_run_prefers_queue_id_over_pool_id() {
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let (dir, db, handler) = queue_test_handler();
+        db.insert_loop(&Loop {
+            id: "loop-1".to_string(),
+            name: "loop-1".to_string(),
+            description: None,
+            workdir: dir.path().to_string_lossy().to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            active_run_pool_id: None,
+            on_completed: None,
+        })
+        .unwrap();
+        insert_pool(&db, "queue-win");
+        insert_pool(&db, "queue-lose");
+
+        let result = handler
+            .loop_run(Parameters(LoopRunParams {
+                loop_id: "loop-1".to_string(),
+                queue_id: Some("queue-win".to_string()),
+                pool_id: Some("queue-lose".to_string()),
+                workdir: None,
+            }))
+            .await
+            .unwrap();
+        let text = result_text(&result);
+        assert!(text.contains("queue-win"), "queue_id must win: {text}");
+        assert!(!text.contains("queue-lose"), "pool_id must lose: {text}");
     }
 
     #[test]
