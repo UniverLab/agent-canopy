@@ -103,7 +103,7 @@ pub fn validate_ensembles_in_graph(
         }
         if !node_exists(&ensemble.join_node_id) {
             return Err(format!(
-                "{label}'s join node '{}' is missing from this graph.",
+                "{label}'s quorum node '{}' is missing from this graph.",
                 ensemble.join_node_id
             ));
         }
@@ -126,7 +126,7 @@ pub fn validate_ensembles_in_graph(
             LoopEdgeCondition::Pass,
         ) {
             return Err(format!(
-                "{label}'s join has no pass edge to its on_pass_to target."
+                "{label}'s quorum has no pass edge to its on_pass_to target."
             ));
         }
         for member in &details.members {
@@ -152,7 +152,7 @@ pub fn validate_ensembles_in_graph(
                 LoopEdgeCondition::Always,
             ) {
                 return Err(format!(
-                    "{label}'s member '{}' is not wired to the join — every member must route to the join.",
+                    "{label}'s member '{}' is not wired to the quorum — every member must route to the quorum.",
                     member.node_id
                 ));
             }

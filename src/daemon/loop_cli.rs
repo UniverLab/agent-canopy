@@ -164,7 +164,7 @@ fn handle_loop_info(db: &Database, id_or_name: &str) -> Result<()> {
         if let Some(run) = current_running_run(&all_runs) {
             let node = db.get_loop_node(&run.node_id)?;
             let node_name = node.as_ref().map_or(run.node_id.as_str(), |n| &n.name);
-            let node_kind = node.as_ref().map_or("?", |n| n.kind.as_str());
+            let node_kind = node.as_ref().map_or("?", |n| n.kind.display_str());
             let elapsed = format_elapsed(Utc::now() - run.started_at);
             println!(
                 "\n\x1b[1m── Current Node ───────────────────────────────────────────────\x1b[0m"

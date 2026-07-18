@@ -22,8 +22,8 @@ Loop
   - `agent` — invokes a CLI tool with a prompt template.
   - `check` — executes a shell command.
   - `gate` — validates previous output (e.g. `output_contains`).
-  - `join` — engine-managed; closes an [ensemble](#ensembles), never created
-    directly.
+  - `quorum` — engine-managed node that closes an
+    [ensemble](#ensembles), never created directly.
 - **Edges** — connect nodes with routing conditions: `pass`, `fail`,
   `always`.
 
@@ -48,7 +48,7 @@ that code actually changed.
 ## Ensembles
 
 An **ensemble** is a group of 2-8 `agent` nodes that receive the same
-prompt in parallel, plus a `join` gate that waits for every member
+prompt in parallel, plus a quorum that waits for every member
 before routing onward. It replaces what would otherwise be N member
 nodes, N prompts, and 2N+2 edges wired by hand — `loop_add_ensemble`
 creates the whole unit in one call:
@@ -69,36 +69,36 @@ loop_add_ensemble {
 ```
 
 Canonical uses: (a) N cheap/free models draft a solution in parallel,
-the join consolidates their proposals, and an arbiter (or the
+the quorum consolidates their proposals, and an arbiter (or the
 implementer itself) receives all of them and implements the consensus
 — expensive quota is spent once, on a pre-digested task; (b) 2-3 free
-reviewer models review the same diff in parallel and the join
+reviewer models review the same diff in parallel and the quorum
 consolidates their findings into one verdict.
 
 Members are homogeneous by design in v1 — they differ only by
 `platform`/`model`, share the one prompt, and can't be edited
 individually. `loop_update_ensemble` changes the shared prompt
-(propagated to every member), the member list, join config
+(propagated to every member), the member list, quorum config
 (`min_pass`, `straggler_timeout_minutes`), and exit wiring, all
 without touching member nodes directly. `loop_get` returns the
-ensemble as one unit (`ensemble_id`, members, join config) alongside
+ensemble as one unit (`ensemble_id`, members, quorum config) alongside
 its expanded nodes.
 
-The join fires only once every member branch has terminated
+The quorum fires only once every member branch has terminated
 (pass, fail, or straggler timeout past
 `straggler_timeout_minutes`, which kills the still-running process
 and counts it as a fail) — it never fires early. Its consolidated
 output is one document with a `## <platform/model> [pass|fail]`
-section per member, in member order. The join reports pass when at
+section per member, in member order. The quorum reports pass when at
 least `min_pass` members passed. Member execution is capped by a
 global concurrency limit (default 4) so an 8-member ensemble queues
 rather than forking every member at once.
 
 Members are agent nodes only, and nested ensembles (an ensemble wired
-into another ensemble's members or join) are rejected. A bounce back
+into another ensemble's members or quorum) are rejected. A bounce back
 into an ensemble re-runs every member and costs one iteration against
 the ensemble's shared budget. The TUI loop view renders an ensemble
-collapsed as one box (`name [N models]` + join) with live per-member
+collapsed as one box (`name [N models]` + quorum) with live per-member
 state while running, expandable on inspect.
 
 ## Lifecycle

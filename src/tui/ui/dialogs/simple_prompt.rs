@@ -323,7 +323,10 @@ fn select_shortcut_hints(
 /// Draw the prompt builder. Returns the tab bar's origin `(x, y)` so the caller
 /// can store it for mouse hit-testing the clickable Normal/Raw tabs, or `None`
 /// when the dialog is not open.
-pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) -> Option<((u16, u16), Option<ratatui::layout::Rect>)> {
+pub fn draw_simple_prompt_dialog(
+    frame: &mut Frame,
+    app: &App,
+) -> Option<((u16, u16), Option<ratatui::layout::Rect>)> {
     let dialog = app.simple_prompt_dialog.as_ref()?;
 
     // Get agent accent color
@@ -869,7 +872,9 @@ pub fn draw_simple_prompt_dialog(frame: &mut Frame, app: &App) -> Option<((u16, 
     draw_section_picker_modal(frame, app, accent, &dialog.picker_mode);
 
     let content_rect = if dialog.active_tab == PromptTab::Raw {
-        Some(crate::tui::app::dialog::SimplePromptDialog::raw_content_rect(inner, list_panel_height))
+        Some(
+            crate::tui::app::dialog::SimplePromptDialog::raw_content_rect(inner, list_panel_height),
+        )
     } else {
         None
     };

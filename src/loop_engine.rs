@@ -1305,7 +1305,7 @@ impl LoopEngine {
             LoopRunStatus::Fail
         };
         let join_output = serde_json::json!({
-            "kind": "join",
+            "kind": "quorum",
             "ensemble_id": ensemble.id,
             "members": member_summaries,
             "passed": passed,
@@ -1376,12 +1376,12 @@ impl LoopEngine {
                 )
                 .await
             }
-            // A join node (F1) never reaches the single-node path: `run_spec`
+            // A quorum node (F1) never reaches the single-node path: `run_spec`
             // detects the fan-out into its ensemble before this would ever be
             // called and runs `execute_ensemble` instead. This arm exists
             // only so the match stays exhaustive against future callers.
             LoopNodeKind::Join => bail!(
-                "Join node '{}' cannot execute directly; it only runs as part of ensemble fan-out.",
+                "Quorum node '{}' cannot execute directly; it only runs as part of ensemble fan-out.",
                 node.name
             ),
         }
@@ -7366,7 +7366,7 @@ echo done
             id: join_id.to_string(),
             spec_id: Some(spec_id.to_string()),
             loop_id: None,
-            name: "join".to_string(),
+            name: "quorum".to_string(),
             kind: LoopNodeKind::Join,
             config: serde_json::json!({ "ensemble_id": ensemble_id }),
             position: 2 + members.len() as i64,
@@ -7921,7 +7921,7 @@ echo done
             id: "join1".to_string(),
             spec_id: Some(spec_id.to_string()),
             loop_id: None,
-            name: "join".to_string(),
+            name: "quorum".to_string(),
             kind: LoopNodeKind::Join,
             config: serde_json::json!({ "ensemble_id": "ens1" }),
             position: 2 + members.len() as i64,

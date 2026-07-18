@@ -315,10 +315,10 @@ fn handle_prompt_dialog_mouse(app: &mut App, mouse: &MouseEvent) {
             if is_empty {
                 dialog.scroll_raw_preview(delta);
             } else {
-                let total_lines =
-                    crate::tui::app::dialog::SimplePromptDialog::visual_line_count(
-                        &raw_text, field_width,
-                    );
+                let total_lines = crate::tui::app::dialog::SimplePromptDialog::visual_line_count(
+                    &raw_text,
+                    field_width,
+                );
                 let avail_h = content_rect.height as usize;
                 dialog.scroll_raw_edit(delta, total_lines, avail_h);
             }

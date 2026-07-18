@@ -339,7 +339,7 @@ fn build_ensemble_unit(spec: &EnsembleUnitSpec) -> BuiltEnsembleUnit {
         id: join_node_id.clone(),
         spec_id: spec.spec_id.clone(),
         loop_id: spec.loop_id.clone(),
-        name: format!("{} (join)", spec.name),
+        name: format!("{} (quorum)", spec.name),
         kind: LoopNodeKind::Join,
         config: serde_json::json!({ "ensemble_id": ensemble_id }),
         position: next_position,
@@ -539,13 +539,13 @@ fn validate_node_kind(kind: &str) -> Result<LoopNodeKind, String> {
         .ok_or_else(|| "Loop node kind must be one of: agent, check, gate.".to_string())
 }
 
-/// `loop_add_node`/`loop_update_node`'s `kind: "join"` guard — a join node is
+/// `loop_add_node`/`loop_update_node`'s `kind: "join"` guard — a quorum node is
 /// engine-managed and only ever created as part of `loop_add_ensemble`'s
 /// one-call expansion, never directly.
 fn validate_not_join_kind(kind: LoopNodeKind) -> Result<(), String> {
     if kind == LoopNodeKind::Join {
         return Err(
-            "Loop node kind 'join' is engine-managed; it can only be created via loop_add_ensemble."
+            "Loop node kind 'quorum' is engine-managed; it can only be created via loop_add_ensemble."
                 .to_string(),
         );
     }
@@ -553,9 +553,9 @@ fn validate_not_join_kind(kind: LoopNodeKind) -> Result<(), String> {
 }
 
 /// Refuse to edit a node directly with `loop_update_node`/`loop_add_edge` if
-/// it belongs to an ensemble (member or join) — F1's "individual member
+/// it belongs to an ensemble (member or quorum) — F1's "individual member
 /// overrides are NOT supported in v1": the ensemble is homogeneous by
-/// design, so every edit to a member/join goes through
+/// design, so every edit to a member/quorum goes through
 /// `loop_update_ensemble`, never a direct node/edge tool.
 fn validate_node_not_ensemble_owned(db: &Database, node_id: &str) -> Result<(), String> {
     if let Some(details) = db
@@ -572,7 +572,7 @@ fn validate_node_not_ensemble_owned(db: &Database, node_id: &str) -> Result<(), 
         .map_err(|e| e.to_string())?
     {
         return Err(format!(
-            "Node '{node_id}' is the join of ensemble '{}' ('{}'); edit it via loop_update_ensemble instead.",
+            "Node '{node_id}' is the quorum of ensemble '{}' ('{}'); edit it via loop_update_ensemble instead.",
             details.ensemble.id, details.ensemble.name
         ));
     }
@@ -1170,7 +1170,7 @@ fn plan_node_copy(db: &Database, params: &LoopCopyNodeParams) -> Result<NodeCopy
     let source = validate_node_exists(db, source_id)?;
     if source.kind == LoopNodeKind::Join {
         return Err(
-            "Cannot copy a join node directly; copy its ensemble with loop_copy_ensemble."
+            "Cannot copy a quorum node directly; copy its ensemble with loop_copy_ensemble."
                 .to_string(),
         );
     }
@@ -3810,7 +3810,7 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "loop_add_ensemble",
-        description = "Create an ensemble in ONE call: N (2-8) parallel agent-node members sharing one prompt, plus the join gate that waits for all of them, consolidates their outputs, and routes onward. Members differ only by platform/model. (Formerly called 'fusion' — retired to avoid colliding with OpenRouter's fusion technology.)"
+        description = "Create an ensemble in ONE call: N (2-8) parallel agent-node members sharing one prompt, plus the quorum that waits for all of them, consolidates their outputs, and routes onward. Members differ only by platform/model. (Formerly called 'fusion' — retired to avoid colliding with OpenRouter's fusion technology.)"
     )]
     async fn loop_add_ensemble(
         &self,
@@ -3921,7 +3921,7 @@ impl TaskTriggerHandler {
         }
         if let Err(e) = validate_node_not_ensemble_owned(&self.db, on_pass_to) {
             return Ok(error_result(&format!(
-                "Cannot wire an ensemble's exit into another ensemble's members/join (nested ensembles are not supported): {e}"
+                "Cannot wire an ensemble's exit into another ensemble's members/quorum (nested ensembles are not supported): {e}"
             )));
         }
 
@@ -3938,7 +3938,7 @@ impl TaskTriggerHandler {
             }
             if let Err(e) = validate_node_not_ensemble_owned(&self.db, on_fail_to) {
                 return Ok(error_result(&format!(
-                    "Cannot wire an ensemble's exit into another ensemble's members/join (nested ensembles are not supported): {e}"
+                "Cannot wire an ensemble's exit into another ensemble's members/quorum (nested ensembles are not supported): {e}"
                 )));
             }
         }
@@ -4038,7 +4038,7 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "loop_copy_ensemble",
-        description = "Duplicate a whole ensemble unit (members + join + shared prompt) — CONFIG only, never runtime state — in one call. Optional overrides: name, prompt_template (e.g. swap a proposer prompt for a review prompt), members (2-8 replacement), min_pass, timeout_minutes, straggler_timeout_minutes, and wiring (from_node/condition entry, on_pass_to/on_fail_to exit). Wiring defaults to the source's; for a cross-loop copy pass wiring that exists in the target graph. Every id is new; the response returns the full old→new id mapping and the wiring actually applied."
+        description = "Duplicate a whole ensemble unit (members + quorum + shared prompt) — CONFIG only, never runtime state — in one call. Optional overrides: name, prompt_template (e.g. swap a proposer prompt for a review prompt), members (2-8 replacement), min_pass, timeout_minutes, straggler_timeout_minutes, and wiring (from_node/condition entry, on_pass_to/on_fail_to exit). Wiring defaults to the source's; for a cross-loop copy pass wiring that exists in the target graph. Every id is new; the response returns the full old→new id mapping and the wiring actually applied."
     )]
     async fn loop_copy_ensemble(
         &self,
@@ -4112,7 +4112,7 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "loop_update_ensemble",
-        description = "Update an ensemble's shared prompt (propagated to every member), member list (platform/model — added/removed/replaced by position), join config (min_pass, straggler_timeout_minutes, timeout_minutes), and/or exit wiring (on_pass_to/on_fail_to) — all in one call, without touching individual member nodes directly."
+        description = "Update an ensemble's shared prompt (propagated to every member), member list (platform/model — added/removed/replaced by position), quorum config (min_pass, straggler_timeout_minutes, timeout_minutes), and/or exit wiring (on_pass_to/on_fail_to) — all in one call, without touching individual member nodes directly."
     )]
     async fn loop_update_ensemble(
         &self,
@@ -4355,7 +4355,7 @@ impl TaskTriggerHandler {
                 }
                 if let Err(e) = validate_node_not_ensemble_owned(&self.db, on_pass_to) {
                     return Ok(error_result(&format!(
-                        "Cannot wire an ensemble's exit into another ensemble's members/join: {e}"
+                        "Cannot wire an ensemble's exit into another ensemble's members/quorum: {e}"
                     )));
                 }
                 self.db
@@ -4395,7 +4395,7 @@ impl TaskTriggerHandler {
                     }
                     if let Err(e) = validate_node_not_ensemble_owned(&self.db, target) {
                         return Ok(error_result(&format!(
-                            "Cannot wire an ensemble's exit into another ensemble's members/join: {e}"
+                            "Cannot wire an ensemble's exit into another ensemble's members/quorum: {e}"
                         )));
                     }
                     self.db
@@ -5553,7 +5553,7 @@ fn loop_node_json(node: &LoopNode) -> serde_json::Value {
         "spec_id": node.spec_id,
         "loop_id": node.loop_id,
         "name": node.name,
-        "kind": node.kind.as_str(),
+        "kind": node.kind.display_str(),
         "config": node.config,
         "position": node.position,
         "created_at": node.created_at.to_rfc3339(),
@@ -5868,7 +5868,7 @@ mod tests {
             id: "join1".to_string(),
             spec_id: Some("spec-1".to_string()),
             loop_id: None,
-            name: "join".to_string(),
+            name: "quorum".to_string(),
             kind: LoopNodeKind::Join,
             config: serde_json::json!({"ensemble_id": "ens1"}),
             position: 4,

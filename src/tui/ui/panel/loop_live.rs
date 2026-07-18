@@ -227,7 +227,7 @@ fn node_box_lines(
     inner: usize,
 ) -> Vec<Line<'static>> {
     let (border_style, text_style, marker) = node_style(is_highlighted, follow);
-    let kind_tag = format!("[{}]", node.kind.as_str());
+    let kind_tag = format!("[{}]", node.kind.display_str());
     let max_name = inner.saturating_sub(2 + kind_tag.len());
     let name_display = truncate_str(&node.name, max_name);
     let spaces = inner.saturating_sub(2 + name_display.len() + kind_tag.len());
@@ -496,7 +496,7 @@ fn footer_lines(
         ),
         Span::raw("  "),
         Span::styled(
-            format!("[{}]", node.kind.as_str()),
+            format!("[{}]", node.kind.display_str()),
             Style::default().fg(DIM),
         ),
         Span::raw("  "),
@@ -895,7 +895,7 @@ mod tests {
                 id: "join1".to_string(),
                 spec_id: Some("spec-1".to_string()),
                 loop_id: None,
-                name: "Proposers (join)".to_string(),
+                name: "Proposers (quorum)".to_string(),
                 kind: LoopNodeKind::Join,
                 config: json!({}),
                 position: 4,
@@ -956,7 +956,7 @@ mod tests {
         assert!(text.contains("Proposers [3 models]"), "{text}");
         assert!(!text.contains("Proposers [1]"), "{text}");
         assert!(!text.contains("Proposers [2]"), "{text}");
-        assert!(!text.contains("Proposers (join)"), "{text}");
+        assert!(!text.contains("Proposers (quorum)"), "{text}");
         // Per-member live status inside the collapsed box.
         assert!(text.contains("[pass]"), "{text}");
         assert!(text.contains("[running]"), "{text}");

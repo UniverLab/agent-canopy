@@ -206,7 +206,7 @@ pub enum LoopNodeKind {
     Agent,
     Check,
     Gate,
-    /// Engine-executed join gate for an ensemble (F1) — never created via
+    /// Engine-managed quorum node for an ensemble (F1) — never created via
     /// `loop_add_node` directly, only as part of `loop_add_ensemble`'s
     /// one-call expansion. Waits for every member branch to terminate,
     /// consolidates their outputs, and routes onward. See
@@ -215,12 +215,24 @@ pub enum LoopNodeKind {
 }
 
 impl LoopNodeKind {
+    /// Serde/DB-safe kind string. Unchanged for all variants (keeps
+    /// existing DB rows and `from_str` parsing intact).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Agent => "agent",
             Self::Check => "check",
             Self::Gate => "gate",
             Self::Join => "join",
+        }
+    }
+
+    /// User-facing label for the node kind. Returns `"quorum"` for
+    /// `Join` so user-facing surfaces (TUI, CLI, MCP descriptions)
+    /// display the intent rather than the internal enum name.
+    pub fn display_str(self) -> &'static str {
+        match self {
+            Self::Join => "quorum",
+            other => other.as_str(),
         }
     }
 
@@ -770,6 +782,14 @@ Task:
         assert_eq!(LoopNodeKind::from_str("gate"), Some(LoopNodeKind::Gate));
         assert_eq!(LoopNodeKind::from_str("join"), Some(LoopNodeKind::Join));
         assert!(LoopNodeKind::from_str("invalid").is_none());
+    }
+
+    #[test]
+    fn loop_node_kind_display_str() {
+        assert_eq!(LoopNodeKind::Agent.display_str(), "agent");
+        assert_eq!(LoopNodeKind::Check.display_str(), "check");
+        assert_eq!(LoopNodeKind::Gate.display_str(), "gate");
+        assert_eq!(LoopNodeKind::Join.display_str(), "quorum");
     }
 
     #[test]

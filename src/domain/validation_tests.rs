@@ -205,7 +205,7 @@ mod ensemble_graph {
         let (details, nodes, mut edges) = valid_fixture();
         edges.retain(|e| !(e.from_node == "m2" && e.to_node == "join1"));
         let err = validate_ensembles_in_graph(&details, &nodes, &edges).unwrap_err();
-        assert!(err.contains("not wired to the join"));
+        assert!(err.contains("not wired to the quorum"));
     }
 
     #[test]

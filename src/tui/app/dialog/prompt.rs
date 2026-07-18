@@ -2413,7 +2413,7 @@ mod tests {
         assert_eq!(rect.x, 6); // inner.x + 1
         assert_eq!(rect.y, 6); // inner.y + 3
         assert_eq!(rect.width, 58); // inner.width - 2
-        // height = inner.height - 2 (send+gap) - 3 (top) = 30 - 5 = 25
+                                    // height = inner.height - 2 (send+gap) - 3 (top) = 30 - 5 = 25
         assert_eq!(rect.height, 25);
     }
 

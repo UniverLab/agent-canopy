@@ -1,5 +1,5 @@
 //! F1: DB layer for ensembles — a group of homogeneous agent-node members
-//! plus their join gate, persisted as one [`Ensemble`] row on top of ordinary
+//! plus their quorum gate, persisted as one [`Ensemble`] row on top of ordinary
 //! `loop_nodes`/`loop_edges` rows (see `src/domain/loops.rs` for why).
 
 use anyhow::{anyhow, Result};
@@ -657,7 +657,7 @@ mod tests {
             id: "join1".to_string(),
             spec_id: Some("spec-1".to_string()),
             loop_id: None,
-            name: "join".to_string(),
+            name: "quorum".to_string(),
             kind: LoopNodeKind::Join,
             config: serde_json::json!({"ensemble_id": "ens1"}),
             position: 5,
@@ -806,7 +806,7 @@ mod tests {
             id: "join1".to_string(),
             spec_id: Some("spec-1".to_string()),
             loop_id: None,
-            name: "join".to_string(),
+            name: "quorum".to_string(),
             kind: LoopNodeKind::Join,
             config: serde_json::json!({"ensemble_id": "ens1"}),
             position: 4,
@@ -963,7 +963,7 @@ mod tests {
             id: "join1".to_string(),
             spec_id: Some("spec-1".to_string()),
             loop_id: None,
-            name: "join".to_string(),
+            name: "quorum".to_string(),
             kind: LoopNodeKind::Join,
             config: serde_json::json!({"ensemble_id": "ens1"}),
             position: 3,
@@ -1089,7 +1089,7 @@ mod tests {
             id: "join1".to_string(),
             spec_id: Some("spec-1".to_string()),
             loop_id: None,
-            name: "join".to_string(),
+            name: "quorum".to_string(),
             kind: LoopNodeKind::Join,
             config: serde_json::json!({"ensemble_id": "ens1"}),
             position: 4,

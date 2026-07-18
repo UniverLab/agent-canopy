@@ -545,19 +545,19 @@ pub struct LoopAddEnsembleParams {
     pub from_node: String,
     /// Entry routing condition from `from_node`: pass, fail, or always.
     pub condition: String,
-    /// Members required to pass for the join to report `pass`. Defaults to
+    /// Members required to pass for the quorum to report `pass`. Defaults to
     /// every member.
     pub min_pass: Option<i64>,
-    /// Minutes a member may run before the join kills it and counts it as
+    /// Minutes a member may run before the quorum kills it and counts it as
     /// failed. Defaults to `timeout_minutes` (the members' own agent
     /// timeout).
     pub straggler_timeout_minutes: Option<i64>,
     /// Shared agent timeout (minutes) applied to every member. Defaults to
     /// 30, matching an ordinary agent node.
     pub timeout_minutes: Option<i64>,
-    /// Existing node ID the join routes to on `pass` (e.g. an arbiter node).
+    /// Existing node ID the quorum routes to on `pass` (e.g. an arbiter node).
     pub on_pass_to: String,
-    /// Existing node ID the join routes to on `fail`. Omit for a dead end on
+    /// Existing node ID the quorum routes to on `fail`. Omit for a dead end on
     /// fail, same as any other node with no matching outgoing edge.
     pub on_fail_to: Option<String>,
 }
@@ -589,7 +589,7 @@ pub struct LoopUpdateEnsembleParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LoopCopyNodeParams {
     /// Node to copy. Only its config is copied — never any runtime state
-    /// (runs, iterations, statuses). Cannot be an ensemble member/join node
+    /// (runs, iterations, statuses). Cannot be an ensemble member/quorum node
     /// (copy those with loop_copy_ensemble).
     pub source_node_id: String,
     /// Target spec ID for the copy. Provide at most one of spec_id/loop_id;

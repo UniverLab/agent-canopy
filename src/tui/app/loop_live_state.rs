@@ -924,7 +924,7 @@ mod tests {
             id: "join1".to_string(),
             spec_id: Some(spec_id.to_string()),
             loop_id: None,
-            name: "Proposers (join)".to_string(),
+            name: "Proposers (quorum)".to_string(),
             kind: LoopNodeKind::Join,
             config: json!({}),
             position: 4,
