@@ -1670,10 +1670,11 @@ fn merge_attempt_marker(output: &Value, attempt: u32, is_crash: bool) -> Value {
     obj
 }
 
-/// B19 infra-crash decision for one agent attempt: a non-self-reported,
+/// B19/B39 infra-crash decision for one agent attempt: a non-self-reported,
 /// quick (within `crash_max_secs`) nonzero-exit failure of an AGENT node with
 /// retry budget still left. A self-reported result, a Check/Gate node, a
-/// semantic pass, or a failure past the crash window is never an infra crash.
+/// semantic pass, a failure past the crash window, or a permanent spawn
+/// failure (binary not found, permission denied) is never an infra crash.
 ///
 /// Shared by the sequential node path ([`LoopEngine::run_spec`]) and, since
 /// B26, by ensemble members ([`LoopEngine::execute_ensemble`]) — both use the
@@ -1688,7 +1689,13 @@ fn is_infra_crash(
     crash_max_secs: u64,
 ) -> bool {
     let self_reported = run.status != LoopRunStatus::Running;
+    let permanent = execution
+        .output
+        .get("spawn_permanent")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     !self_reported
+        && !permanent
         && node.kind == LoopNodeKind::Agent
         && execution.status == LoopRunStatus::Fail
         && (chrono::Utc::now() - run.started_at).num_seconds() < crash_max_secs as i64
@@ -2029,6 +2036,58 @@ async fn execute_agent_node(
     Ok(execution)
 }
 
+/// A failure to build or spawn the child process, classified by whether it
+/// can plausibly resolve itself between attempts (B39).
+///
+/// Permanent failures — an unresolvable binary, a non-executable file — are
+/// deterministic: retrying spends the infra-retry budget and its doubling
+/// backoff on a state that cannot change. `permanent_reason` carries the
+/// operator-facing "why we did not retry", set from the *kind* of the
+/// underlying error (typed [`BinaryResolutionError`][ce], `io::ErrorKind`) and
+/// never from matching the rendered message per CLI.
+///
+/// [ce]: crate::domain::cli_strategy::BinaryResolutionError
+struct SpawnError {
+    message: String,
+    permanent_reason: Option<&'static str>,
+}
+
+impl SpawnError {
+    /// A failure while building the command — chiefly resolving the CLI's
+    /// configured binary, which is where a missing CLI surfaces.
+    fn from_build(error: &anyhow::Error) -> Self {
+        let permanent_reason = error
+            .downcast_ref::<crate::domain::cli_strategy::BinaryResolutionError>()
+            .map(|_| "cli binary could not be resolved");
+        Self {
+            message: error.to_string(),
+            permanent_reason,
+        }
+    }
+
+    /// A failure from the spawn/wait syscalls themselves.
+    fn from_io(error: &std::io::Error) -> Self {
+        let permanent_reason = match error.kind() {
+            std::io::ErrorKind::NotFound => Some("cli binary not found at its resolved path"),
+            std::io::ErrorKind::PermissionDenied => Some("cli binary is not executable"),
+            _ => None,
+        };
+        Self {
+            message: error.to_string(),
+            permanent_reason,
+        }
+    }
+
+    /// A failure with no reason to believe a retry would land differently is
+    /// transient by default, so the B19/B26 retry path is unchanged.
+    fn transient(message: String) -> Self {
+        Self {
+            message,
+            permanent_reason: None,
+        }
+    }
+}
+
 /// Outcome of actually running the child process to completion, as opposed
 /// to failing to build/spawn it (see [`spawn_and_wait_cli_process`]'s `Err`).
 enum CliProcessOutcome {
@@ -2073,22 +2132,24 @@ async fn spawn_and_wait_cli_process(
     session_id: Option<&str>,
     resume_session_id: Option<&str>,
     on_pid: impl FnOnce(u32),
-) -> Result<CliProcessOutcome, String> {
+) -> Result<CliProcessOutcome, SpawnError> {
     // A resume (RS2) uses the by-id resume flag and continues an existing
     // session; a cold start uses the set-at-spawn flag (if any). The two are
     // mutually exclusive — the caller passes at most one.
     let mut command = match resume_session_id {
         Some(sid) => strategy
             .build_resume_command(sid, prompt, model, Some(workdir))
-            .map_err(|error| error.to_string())?,
+            .map_err(|error| SpawnError::from_build(&error))?,
         None => strategy
             .build_command_with_session(prompt, model, Some(workdir), session_id)
-            .map_err(|error| error.to_string())?,
+            .map_err(|error| SpawnError::from_build(&error))?,
     };
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
 
-    let child = command.spawn().map_err(|error| error.to_string())?;
+    let child = command
+        .spawn()
+        .map_err(|error| SpawnError::from_io(&error))?;
     // Captured before `wait_with_output` below takes ownership of `child`.
     let pid = child.id();
     if let Some(pid) = pid {
@@ -2112,7 +2173,7 @@ async fn spawn_and_wait_cli_process(
                 stderr,
             })
         }
-        Ok(Err(error)) => Err(error.to_string()),
+        Ok(Err(error)) => Err(SpawnError::transient(error.to_string())),
         Err(_elapsed) => {
             if let Some(pid) = pid {
                 crate::daemon::process::terminate_process_group_async(pid as i64, KILL_GRACE);
@@ -2211,7 +2272,7 @@ async fn run_agent_process(
     }
 
     match outcome {
-        Err(error) => Ok(agent_spawn_failure(node, cli, model, error)),
+        Err(error) => Ok(agent_spawn_failure(node, cli, model, &error)),
         Ok(CliProcessOutcome::TimedOut) => {
             let output = serde_json::json!({
                 "kind": "agent",
@@ -2264,19 +2325,32 @@ fn agent_spawn_failure(
     node: &LoopNode,
     cli: &Cli,
     model: Option<&str>,
-    error: impl std::fmt::Display,
+    error: &SpawnError,
 ) -> NodeExecution {
-    let message = error.to_string();
+    let mut output = serde_json::json!({
+        "kind": "agent",
+        "node_id": node.id,
+        "cli": cli.as_str(),
+        "model": model,
+        "error": error.message,
+    });
+    // A permanent failure is recorded with its reason so the run reads as
+    // "failed fast on purpose" rather than "retried and gave up" — the two
+    // are otherwise indistinguishable in a persisted run row.
+    if let (Some(reason), serde_json::Value::Object(map)) = (error.permanent_reason, &mut output) {
+        map.insert("spawn_permanent".to_string(), Value::Bool(true));
+        map.insert(
+            "infra_retry_skipped".to_string(),
+            Value::String(reason.to_string()),
+        );
+    }
     NodeExecution {
         status: LoopRunStatus::Fail,
-        output: serde_json::json!({
-            "kind": "agent",
-            "node_id": node.id,
-            "cli": cli.as_str(),
-            "model": model,
-            "error": message,
-        }),
-        summary: format!("Agent node '{}' failed to spawn: {}", node.name, message),
+        output,
+        summary: format!(
+            "Agent node '{}' failed to spawn: {}",
+            node.name, error.message
+        ),
     }
 }
 
@@ -2431,9 +2505,9 @@ async fn run_completion_hook_process(
             output: serde_json::json!({
                 "cli": cli.as_str(),
                 "model": model,
-                "error": error,
+                "error": error.message,
             }),
-            summary: format!("on_completed hook failed to spawn: {error}"),
+            summary: format!("on_completed hook failed to spawn: {}", error.message),
         },
         Ok(CliProcessOutcome::TimedOut) => HookExecution {
             status: LoopRunStatus::Fail,
@@ -5128,6 +5202,192 @@ echo done
         assert_eq!(execution.status, LoopRunStatus::Fail);
         assert!(execution.summary.contains("failed to spawn"));
         assert!(execution.output.get("error").is_some());
+    }
+
+    /// B39: a permanent spawn failure (missing binary) must produce a
+    /// `spawn_permanent` flag in the output and must NOT be classified as an
+    /// infra crash — exactly one run row, no `infra_attempt` marker.
+    #[tokio::test]
+    async fn b39_permanent_spawn_failure_skips_infra_retry() {
+        let (_dir, db) = test_db();
+        let cli = Cli::new("test-cli");
+        let strategy = sample_strategy("/nonexistent/somewhere/definitely-not-a-binary");
+        let node = sample_agent_node();
+
+        let execution = run_agent_process(
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+        )
+        .await
+        .expect("spawn failure must not propagate as a hard error");
+
+        assert_eq!(execution.status, LoopRunStatus::Fail);
+        assert!(
+            execution
+                .output
+                .get("spawn_permanent")
+                .and_then(Value::as_bool)
+                == Some(true),
+            "missing binary must set spawn_permanent flag"
+        );
+        assert!(
+            execution.output.get("infra_attempt").is_none(),
+            "permanent failure must not carry infra_attempt marker"
+        );
+        assert!(
+            execution.output.get("infra_retry_skipped").is_some(),
+            "the run row must record why the retry was skipped"
+        );
+
+        let run = LoopNodeRun {
+            id: "run-test".to_string(),
+            loop_id: "loop1".to_string(),
+            spec_id: "spec1".to_string(),
+            node_id: node.id.clone(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        };
+        assert!(
+            !is_infra_crash(&node, &execution, &run, 0, 3, 60),
+            "permanent spawn failure must not be classified as infra crash"
+        );
+    }
+
+    /// B39, the case actually observed in loop f9d070bc: the CLI's configured
+    /// binary resolves to nothing, so the failure happens while *building* the
+    /// command rather than at spawn. It is just as permanent, and must be
+    /// classified as such without matching on the rendered message.
+    #[tokio::test]
+    async fn b39_unresolvable_binary_is_permanent_at_build_time() {
+        let (_dir, db) = test_db();
+        let cli = Cli::new("test-cli");
+        // Bare name (not an absolute path) that is in neither PATH nor
+        // `~/.<binary>/bin/<binary>` — the mimo failure mode.
+        let strategy = sample_strategy("canopy-b39-definitely-not-installed");
+        let node = sample_agent_node();
+
+        let execution = run_agent_process(
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+        )
+        .await
+        .expect("spawn failure must not propagate as a hard error");
+
+        assert_eq!(execution.status, LoopRunStatus::Fail);
+        assert_eq!(
+            execution
+                .output
+                .get("spawn_permanent")
+                .and_then(Value::as_bool),
+            Some(true),
+            "an unresolvable binary must be classified permanent at build time"
+        );
+        assert!(
+            execution.output.get("infra_retry_skipped").is_some(),
+            "the run row must record why the retry was skipped"
+        );
+    }
+
+    /// B39: a transient spawn failure (command-build error, not NotFound)
+    /// still qualifies for infra-crash retry.
+    #[tokio::test]
+    async fn b39_transient_spawn_failure_still_retried() {
+        let output = serde_json::json!({
+            "kind": "agent",
+            "node_id": "node-agent",
+            "cli": "test-cli",
+            "error": "some transient build error",
+        });
+        let execution = NodeExecution {
+            status: LoopRunStatus::Fail,
+            output,
+            summary: "failed to spawn".to_string(),
+        };
+        let node = sample_agent_node();
+        let run = LoopNodeRun {
+            id: "run1".to_string(),
+            loop_id: "loop1".to_string(),
+            spec_id: "spec1".to_string(),
+            node_id: node.id.clone(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        };
+        assert!(
+            is_infra_crash(&node, &execution, &run, 0, 3, 60),
+            "transient spawn failure without spawn_permanent must still be retried"
+        );
+    }
+
+    /// SpawnError::from_build treats a typed binary-resolution failure as
+    /// permanent and every other command-build error as transient.
+    #[test]
+    fn spawn_error_from_build_classification() {
+        let unresolvable = SpawnError::from_build(
+            &crate::domain::cli_strategy::BinaryResolutionError::NotFound {
+                binary: "mimo".to_string(),
+                fallback: std::path::PathBuf::from("/home/u/.mimo/bin/mimo"),
+            }
+            .into(),
+        );
+        assert_eq!(
+            unresolvable.permanent_reason,
+            Some("cli binary could not be resolved")
+        );
+
+        let other = SpawnError::from_build(&anyhow::anyhow!(
+            "CLI 'x' has no session_resume_cmd; cannot resume by id"
+        ));
+        assert!(
+            other.permanent_reason.is_none(),
+            "an untyped build error must stay transient"
+        );
+    }
+
+    /// SpawnError::from_io correctly classifies NotFound and PermissionDenied
+    /// as permanent (with a reason), and other kinds as transient.
+    #[test]
+    fn spawn_error_from_io_classification() {
+        let not_found = SpawnError::from_io(&std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "binary not found",
+        ));
+        assert!(
+            not_found.permanent_reason.is_some(),
+            "NotFound must be permanent"
+        );
+
+        let perm_denied = SpawnError::from_io(&std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        ));
+        assert!(
+            perm_denied.permanent_reason.is_some(),
+            "PermissionDenied must be permanent"
+        );
+
+        let broken_pipe = SpawnError::from_io(&std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "broken pipe",
+        ));
+        assert!(
+            broken_pipe.permanent_reason.is_none(),
+            "BrokenPipe must be transient"
+        );
+
+        let other = SpawnError::from_io(&std::io::Error::other("something else"));
+        assert!(other.permanent_reason.is_none(), "Other must be transient");
     }
 
     #[tokio::test]

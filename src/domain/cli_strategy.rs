@@ -56,6 +56,23 @@ pub struct CliStrategy {
     pub session_resume_cmd: Option<String>,
 }
 
+/// A CLI's configured `binary` could not be resolved to an executable.
+///
+/// Typed (rather than a bare `anyhow!` string) so callers can tell this
+/// apart from every other command-build failure without matching on the
+/// rendered message: a missing binary is *permanent*, so the loop engine's
+/// infra-crash retry must not spend attempts and backoff waiting for it to
+/// appear (B39).
+#[derive(Debug, thiserror::Error)]
+pub enum BinaryResolutionError {
+    /// No home directory to fall back into, so PATH was the only place looked.
+    #[error("CLI binary '{binary}' not found in PATH.")]
+    NotInPath { binary: String },
+    /// Neither PATH nor the `~/.<binary>/bin/<binary>` install fallback had it.
+    #[error("CLI binary '{binary}' not found. Looked in PATH and in {}", fallback.display())]
+    NotFound { binary: String, fallback: PathBuf },
+}
+
 /// Resolve the executable path for a CLI's configured `binary`.
 ///
 /// - Absolute paths are used as-is, with no PATH lookup at all (this is how
@@ -79,7 +96,10 @@ fn resolve_binary_with_home(binary: &str, home: Option<&Path>) -> Result<PathBuf
     }
 
     let Some(home) = home else {
-        anyhow::bail!("CLI binary '{binary}' not found in PATH.");
+        return Err(BinaryResolutionError::NotInPath {
+            binary: binary.to_string(),
+        }
+        .into());
     };
 
     let fallback = home.join(format!(".{binary}")).join("bin").join(binary);
@@ -87,10 +107,11 @@ fn resolve_binary_with_home(binary: &str, home: Option<&Path>) -> Result<PathBuf
         return Ok(fallback);
     }
 
-    anyhow::bail!(
-        "CLI binary '{binary}' not found. Looked in PATH and in {}",
-        fallback.display()
-    );
+    Err(BinaryResolutionError::NotFound {
+        binary: binary.to_string(),
+        fallback,
+    }
+    .into())
 }
 
 impl CliStrategy {
