@@ -156,7 +156,8 @@ needed. Iteration limits prevent infinite retry loops. `loop_reset`
 returns a completed/failed loop to pending so `loop_run` can restart
 it, and `loop_schedule_autorun` sets a future time at which the loop
 auto-resumes (useful for quota-limited loops that fail and need to
-wait before retrying).
+wait before retrying). Call it again with `at` omitted to cancel a
+pending schedule.
 
 ## `on_completed` hook
 

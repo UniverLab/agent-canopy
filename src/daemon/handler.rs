@@ -4859,7 +4859,7 @@ impl TaskTriggerHandler {
     /// a human decision, made via `loop_reset` + `loop_run`.
     #[tool(
         name = "loop_schedule_autorun",
-        description = "Schedule a one-shot resume for a loop at a future ISO 8601 time. When the scheduler reaches that time: a `failed` loop is auto-reset (same transition as loop_reset) and resumed — useful for a loop that failed on a quota to reschedule its own resumption at the exact reset time; a `completed` loop is left alone (the schedule is cleared but the loop is not re-run — use loop_reset + loop_run to re-run a finished loop); any other fireable status launches normally. If the loop's last run was against a pool, the resume targets that same pool (its pending members, in queue order) instead of the loop's own bound specs. The schedule always clears after firing (one-shot)."
+        description = "Schedule a one-shot resume for a loop at a future ISO 8601 time, or cancel a pending one. When the scheduler reaches that time: a `failed` loop is auto-reset (same transition as loop_reset) and resumed — useful for a loop that failed on a quota to reschedule its own resumption at the exact reset time; a `completed` loop is left alone (the schedule is cleared but the loop is not re-run — use loop_reset + loop_run to re-run a finished loop); any other fireable status launches normally. If the loop's last run was against a pool, the resume targets that same pool (its pending members, in queue order) instead of the loop's own bound specs. The schedule always clears after firing (one-shot). Omit `at` (or pass null) to cancel any pending autorun instead of scheduling one — valid regardless of the loop's current status, and a no-op (not an error) if nothing was scheduled."
     )]
     async fn loop_schedule_autorun(
         &self,
@@ -4867,7 +4867,7 @@ impl TaskTriggerHandler {
             LoopScheduleAutorunParams,
         >,
     ) -> Result<CallToolResult, McpError> {
-        let Some(_existing) = self
+        let Some(existing) = self
             .db
             .get_loop(&loop_id)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?
@@ -4876,6 +4876,21 @@ impl TaskTriggerHandler {
                 "No loop found with ID '{}'",
                 loop_id
             )));
+        };
+
+        let Some(at) = at else {
+            let previously_scheduled = existing.autorun_at;
+            self.db
+                .clear_loop_autorun(&loop_id)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            return Ok(success_result(&match previously_scheduled {
+                Some(previous_at) => format!(
+                    "Loop '{}' autorun scheduled for {} was cancelled.",
+                    loop_id,
+                    previous_at.to_rfc3339()
+                ),
+                None => format!("Loop '{}' had no pending autorun to cancel.", loop_id),
+            }));
         };
 
         let at = match chrono::DateTime::parse_from_rfc3339(&at) {
@@ -5839,8 +5854,9 @@ mod tests {
         TaskTriggerHandler, MISSING_SYNC_IDENTITY_MESSAGE,
     };
     use crate::daemon::params::{
-        LoopCopyEnsembleParams, LoopCopyNodeParams, LoopRunParams, PoolAddSpecParams,
-        PoolCreateParams, PoolListParams, QueueAddSpecParams, QueueCreateParams, QueueListParams,
+        LoopCopyEnsembleParams, LoopCopyNodeParams, LoopRunParams, LoopScheduleAutorunParams,
+        PoolAddSpecParams, PoolCreateParams, PoolListParams, QueueAddSpecParams, QueueCreateParams,
+        QueueListParams,
     };
     use crate::db::Database;
     use crate::domain::blueprints::Blueprint;
@@ -7413,6 +7429,121 @@ mod tests {
         let details = db.get_loop_details(&loop_id).unwrap().unwrap();
         let json = loop_details_json(&db, &details).unwrap();
         assert_eq!(json["autorun_at"].as_str().unwrap(), at.to_rfc3339());
+    }
+
+    // ── B41: cancel a scheduled autorun via loop_schedule_autorun(at=None) ──
+
+    fn autorun_test_loop(loop_id: &str, workdir: &str, status: LoopStatus) -> Loop {
+        Loop {
+            id: loop_id.to_string(),
+            name: loop_id.to_string(),
+            description: None,
+            workdir: workdir.to_string(),
+            status,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            active_run_pool_id: None,
+            on_completed: None,
+        }
+    }
+
+    /// B41: a `failed` loop with a pending autorun is exactly the state a
+    /// scheduled wake-up needs to be cancellable from — cancelling must
+    /// succeed and report the time that was cleared.
+    #[tokio::test]
+    async fn loop_schedule_autorun_cancels_pending_schedule_on_failed_loop() {
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let (dir, db, handler) = queue_test_handler();
+        let loop_id = "loop-failed-autorun";
+        db.insert_loop(&autorun_test_loop(
+            loop_id,
+            &dir.path().to_string_lossy(),
+            LoopStatus::Failed,
+        ))
+        .unwrap();
+        let scheduled_at = chrono::Utc::now() + chrono::Duration::hours(1);
+        db.schedule_loop_autorun(loop_id, scheduled_at).unwrap();
+
+        let result = handler
+            .loop_schedule_autorun(Parameters(LoopScheduleAutorunParams {
+                loop_id: loop_id.to_string(),
+                at: None,
+            }))
+            .await
+            .unwrap();
+
+        let text = result_text(&result);
+        assert!(text.contains("cancelled"), "{text}");
+        let lp = db.get_loop(loop_id).unwrap().unwrap();
+        assert!(lp.autorun_at.is_none(), "cancel must clear autorun_at");
+        assert_eq!(
+            lp.status,
+            LoopStatus::Failed,
+            "cancelling must not touch loop status"
+        );
+    }
+
+    /// B41: cancelling must also work on a `completed` loop — the other
+    /// status a loop with a pending autorun can hold.
+    #[tokio::test]
+    async fn loop_schedule_autorun_cancels_pending_schedule_on_completed_loop() {
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let (dir, db, handler) = queue_test_handler();
+        let loop_id = "loop-completed-autorun";
+        db.insert_loop(&autorun_test_loop(
+            loop_id,
+            &dir.path().to_string_lossy(),
+            LoopStatus::Completed,
+        ))
+        .unwrap();
+        let scheduled_at = chrono::Utc::now() + chrono::Duration::hours(1);
+        db.schedule_loop_autorun(loop_id, scheduled_at).unwrap();
+
+        let result = handler
+            .loop_schedule_autorun(Parameters(LoopScheduleAutorunParams {
+                loop_id: loop_id.to_string(),
+                at: None,
+            }))
+            .await
+            .unwrap();
+
+        assert!(result_text(&result).contains("cancelled"));
+        let lp = db.get_loop(loop_id).unwrap().unwrap();
+        assert!(lp.autorun_at.is_none());
+    }
+
+    /// B41: cancelling when nothing is scheduled must succeed and say so —
+    /// it is not an error, since the caller's intent (no pending autorun) is
+    /// already satisfied.
+    #[tokio::test]
+    async fn loop_schedule_autorun_cancel_with_nothing_scheduled_is_not_an_error() {
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let (dir, db, handler) = queue_test_handler();
+        let loop_id = "loop-no-autorun";
+        db.insert_loop(&autorun_test_loop(
+            loop_id,
+            &dir.path().to_string_lossy(),
+            LoopStatus::Failed,
+        ))
+        .unwrap();
+
+        let result = handler
+            .loop_schedule_autorun(Parameters(LoopScheduleAutorunParams {
+                loop_id: loop_id.to_string(),
+                at: None,
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        let text = result_text(&result);
+        assert!(text.contains("no pending autorun"), "{text}");
     }
 
     // ── U10: copy nodes and ensembles ────────────────────────────────

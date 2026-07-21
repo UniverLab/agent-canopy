@@ -890,6 +890,35 @@ mod tests {
         );
     }
 
+    /// B41: a schedule cancelled via `clear_loop_autorun` (the path
+    /// `loop_schedule_autorun` with `at` omitted takes) must not fire later,
+    /// even past its original due time — cancelling must actually prevent
+    /// the wake-up, not just delay it.
+    #[tokio::test]
+    async fn fire_due_autorun_loops_never_fires_a_cancelled_schedule() {
+        use crate::domain::loops::LoopStatus;
+
+        let (db, scheduler) = test_scheduler_with_loops();
+        db.insert_loop(&sample_loop("cancelled-autorun", LoopStatus::Failed))
+            .unwrap();
+        db.schedule_loop_autorun(
+            "cancelled-autorun",
+            Utc::now() - chrono::Duration::minutes(1),
+        )
+        .unwrap();
+        db.clear_loop_autorun("cancelled-autorun").unwrap();
+
+        scheduler.fire_due_autorun_loops(Utc::now()).unwrap();
+
+        let lp = db.get_loop("cancelled-autorun").unwrap().unwrap();
+        assert_eq!(
+            lp.status,
+            LoopStatus::Failed,
+            "a cancelled schedule must not auto-reset/resume the loop"
+        );
+        assert!(lp.autorun_at.is_none());
+    }
+
     /// A `Running`/`Paused` loop must not be relaunched by its own
     /// `autorun_at`, even if it's past due — that would spawn a duplicate
     /// execution over the same graph.

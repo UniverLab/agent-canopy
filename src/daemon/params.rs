@@ -806,7 +806,9 @@ pub struct LoopScheduleAutorunParams {
     pub loop_id: String,
     /// ISO 8601 timestamp at which the loop should resume, e.g.
     /// "2026-07-10T09:00:00Z". Fires once, then the schedule is cleared.
-    pub at: String,
+    /// Omit (or pass null) to cancel any pending autorun schedule instead of
+    /// setting a new one.
+    pub at: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
