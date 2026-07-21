@@ -211,14 +211,20 @@ fn handle_loop_info(db: &Database, id_or_name: &str) -> Result<()> {
         // by the engine, not by its own verdict — say so, otherwise the run
         // reads as an ordinary fail and the operator hunts the wrong cause.
         let commit_note = commit_rights_note(run.output.as_ref());
+        // B36: a run the daemon marked `fail` only because it was cut short
+        // by a restart/kill must never read as "the node failed" — flag it
+        // with its own icon and note, including how to recover any
+        // quarantined worktree changes.
+        let interrupted_note = interrupted_note(run.output.as_ref());
         println!(
-            " {} {}  {}{}{}{}",
-            run_status_icon(run.status),
+            " {} {}  {}{}{}{}{}",
+            run_status_icon(run.status, run.output.as_ref()),
             node_name,
             format_dt(run.started_at),
             sid,
             group_note,
-            commit_note
+            commit_note,
+            interrupted_note
         );
     }
 
@@ -227,7 +233,7 @@ fn handle_loop_info(db: &Database, id_or_name: &str) -> Result<()> {
         for run in hook_runs.iter().rev().take(5) {
             println!(
                 " {} {}",
-                run_status_icon(run.status),
+                run_status_icon(run.status, run.output.as_ref()),
                 format_dt(run.started_at)
             );
         }
@@ -252,6 +258,23 @@ fn commit_rights_note(output: Option<&serde_json::Value>) -> String {
         "  \x1b[31m(no commit rights — committed {})\x1b[0m",
         head_after.chars().take(8).collect::<String>()
     )
+}
+
+/// The `loop info` annotation for a run cut short by a daemon restart/kill
+/// (B36), or an empty string for every other run — pairs with the distinct
+/// icon `run_status_icon` already gives it. Also surfaces the recovery hint
+/// when uncommitted changes were quarantined via `git stash`, so a `fail`
+/// here never reads as the node's own doing.
+fn interrupted_note(output: Option<&serde_json::Value>) -> String {
+    if !is_interrupted(output) {
+        return String::new();
+    }
+    match output.and_then(|o| o.get("quarantine")) {
+        Some(q) if q.get("stashed").and_then(|v| v.as_bool()) == Some(true) => {
+            "  \x1b[33m(interrupted — worktree changes quarantined, recover with `git stash pop`)\x1b[0m".to_string()
+        }
+        _ => "  \x1b[33m(interrupted — not a node failure)\x1b[0m".to_string(),
+    }
 }
 
 /// Count of specs that have reached a final `completed` state, alongside the
@@ -412,12 +435,26 @@ fn spec_status_icon(status: LoopSpecStatus) -> &'static str {
     }
 }
 
-fn run_status_icon(status: LoopRunStatus) -> &'static str {
+/// B36: a run cut short by a daemon restart/kill is recorded as `fail` (see
+/// `reconcile_orphaned_loops` / `reconcile_stranded_pool_specs`), but it must
+/// never render like an ordinary node failure — its own icon, distinct from
+/// both a genuine fail and a healthy pass.
+fn run_status_icon(status: LoopRunStatus, output: Option<&serde_json::Value>) -> &'static str {
+    if is_interrupted(output) {
+        return "\x1b[33m⚑\x1b[0m";
+    }
     match status {
         LoopRunStatus::Running => "\x1b[36m▶\x1b[0m",
         LoopRunStatus::Pass => "\x1b[32m✓\x1b[0m",
         LoopRunStatus::Fail => "\x1b[31m✗\x1b[0m",
     }
+}
+
+fn is_interrupted(output: Option<&serde_json::Value>) -> bool {
+    output
+        .and_then(|o| o.get("interrupted"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 fn format_dt(dt: DateTime<Utc>) -> String {
