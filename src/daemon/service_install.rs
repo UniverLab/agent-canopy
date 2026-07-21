@@ -51,6 +51,13 @@ fn install_systemd_service(exe: &std::path::Path, port: u16) -> Result<()> {
     let unit_path = unit_dir.join(SYSTEMD_SERVICE_NAME);
     let exe_str = exe.display().to_string();
 
+    // Capture PATH from the process environment rather than shelling out to a
+    // login shell. This is the correct choice because `canopy daemon install` is
+    // run by the same user who installed their CLIs, and the process already
+    // inherits that user's PATH. Shelling out to `bash -lc 'echo $PATH'` would
+    // risk picking up a different shell profile (or failing in headless/SSH
+    // environments). The daemon's PATH is written once at install time and
+    // kept up to date by re-running `canopy daemon install`.
     let current_path = std::env::var("PATH").unwrap_or_default();
     let path_value = reconcile_path(unit_path.as_path(), &current_path);
 

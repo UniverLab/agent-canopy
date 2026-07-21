@@ -64,52 +64,44 @@ pub struct CliStrategy {
 /// infra-crash retry must not spend attempts and backoff waiting for it to
 /// appear (B39).
 #[derive(Debug, thiserror::Error)]
-pub enum BinaryResolutionError {
-    /// No home directory to fall back into, so PATH was the only place looked.
-    #[error("CLI binary '{binary}' not found in PATH.")]
-    NotInPath { binary: String },
-    /// Neither PATH nor the `~/.<binary>/bin/<binary>` install fallback had it.
-    #[error("CLI binary '{binary}' not found. Looked in PATH and in {}", fallback.display())]
-    NotFound { binary: String, fallback: PathBuf },
+#[error("CLI binary '{binary}' not found on PATH (searched: {path})")]
+pub struct BinaryResolutionError {
+    pub binary: String,
+    pub path: String,
 }
 
 /// Resolve the executable path for a CLI's configured `binary`.
 ///
-/// - Absolute paths are used as-is, with no PATH lookup at all (this is how
-///   CLIs like mimo are configured in `~/.canopy/config.toml` today).
-/// - Bare names are resolved against PATH first.
-/// - If PATH resolution fails, falls back to `~/.<binary>/bin/<binary>`,
-///   since many CLI installers drop their binary there without ever
-///   touching the (often PATH-minimal) systemd user environment.
+/// - Absolute paths are returned as-is (the `binary` override in
+///   `~/.canopy/config.toml` escape-hatch).
+/// - Bare names are resolved against PATH via `which::which`.
+///
+/// Resolution is PATH-only: no install-directory guesses, no
+/// `~/.<binary>/bin/<binary>` fallback. If the daemon's PATH matches the
+/// user's PATH (set at `canopy daemon install` time), this is all that is
+/// needed.
 pub fn resolve_binary(binary: &str) -> Result<PathBuf> {
-    resolve_binary_with_home(binary, dirs::home_dir().as_deref())
+    let path_value = std::env::var("PATH").unwrap_or_default();
+    resolve_binary_with_path(binary, &path_value)
 }
 
-fn resolve_binary_with_home(binary: &str, home: Option<&Path>) -> Result<PathBuf> {
-    let path = Path::new(binary);
-    if path.is_absolute() {
-        return Ok(path.to_path_buf());
+/// Resolve a binary against an explicit PATH string (colon-separated).
+///
+/// Tests inject a controlled PATH so they never depend on the developer's
+/// real environment.
+fn resolve_binary_with_path(binary: &str, path: &str) -> Result<PathBuf> {
+    let b = Path::new(binary);
+    if b.is_absolute() {
+        return Ok(b.to_path_buf());
     }
 
     if let Ok(resolved) = which::which(binary) {
         return Ok(resolved);
     }
 
-    let Some(home) = home else {
-        return Err(BinaryResolutionError::NotInPath {
-            binary: binary.to_string(),
-        }
-        .into());
-    };
-
-    let fallback = home.join(format!(".{binary}")).join("bin").join(binary);
-    if fallback.is_file() {
-        return Ok(fallback);
-    }
-
-    Err(BinaryResolutionError::NotFound {
+    Err(BinaryResolutionError {
         binary: binary.to_string(),
-        fallback,
+        path: path.to_string(),
     }
     .into())
 }
@@ -667,40 +659,17 @@ mod tests {
     fn resolve_binary_absolute_path_used_as_is_without_touching_path() {
         // Deliberately a path that does not exist: absolute paths must be
         // returned verbatim, with no PATH lookup and no existence check.
-        let resolved = resolve_binary_with_home("/nonexistent/somewhere/mimo", None).unwrap();
+        let resolved = resolve_binary_with_path("/nonexistent/somewhere/mimo", "").unwrap();
         assert_eq!(resolved, PathBuf::from("/nonexistent/somewhere/mimo"));
     }
 
     #[test]
-    fn resolve_binary_bare_name_falls_back_to_dot_dir_bin() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-        let bin_dir = home.join(".canopy-test-fixture-cli").join("bin");
-        std::fs::create_dir_all(&bin_dir).unwrap();
-        let fake_binary = bin_dir.join("canopy-test-fixture-cli");
-        std::fs::write(&fake_binary, "#!/bin/sh\n").unwrap();
-
-        let resolved = resolve_binary_with_home("canopy-test-fixture-cli", Some(home)).unwrap();
-        assert_eq!(resolved, fake_binary);
-    }
-
-    #[test]
-    fn resolve_binary_not_found_anywhere_names_binary_and_searched_paths() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-
-        let err =
-            resolve_binary_with_home("canopy-test-fixture-cli-missing", Some(home)).unwrap_err();
+    fn resolve_binary_not_found_names_binary_and_searched_path() {
+        let err = resolve_binary_with_path("canopy-test-fixture-cli-missing", "/usr/bin:/bin")
+            .unwrap_err();
         let message = err.to_string();
 
         assert!(message.contains("canopy-test-fixture-cli-missing"));
-        assert!(message.contains("PATH"));
-        assert!(message.contains(
-            home.join(".canopy-test-fixture-cli-missing")
-                .join("bin")
-                .join("canopy-test-fixture-cli-missing")
-                .to_str()
-                .unwrap()
-        ));
+        assert!(message.contains("/usr/bin:/bin"));
     }
 }

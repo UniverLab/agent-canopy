@@ -414,9 +414,8 @@ impl Executor {
 
 /// Resolve the full path to a CLI binary.
 ///
-/// Delegates to `cli_strategy::resolve_binary`, which handles absolute
-/// paths, PATH lookup, and the `~/.<binary>/bin/<binary>` fallback for
-/// CLIs installed outside a PATH-minimal systemd user environment.
+/// Delegates to `cli_strategy::resolve_binary`, which resolves absolute
+/// paths as-is and bare names via PATH lookup.
 fn resolve_cli_binary(cli: &Cli) -> Result<PathBuf> {
     let cmd_name = cli.command_name();
     crate::domain::cli_strategy::resolve_binary(&cmd_name)

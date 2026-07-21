@@ -5510,9 +5510,9 @@ echo done
     #[test]
     fn spawn_error_from_build_classification() {
         let unresolvable = SpawnError::from_build(
-            &crate::domain::cli_strategy::BinaryResolutionError::NotFound {
+            &crate::domain::cli_strategy::BinaryResolutionError {
                 binary: "mimo".to_string(),
-                fallback: std::path::PathBuf::from("/home/u/.mimo/bin/mimo"),
+                path: "/usr/bin:/bin".to_string(),
             }
             .into(),
         );
