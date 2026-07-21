@@ -249,6 +249,37 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Atomically claim `loop_id` for a run by flipping it to `Running`, but
+    /// only if it is not *already* `Running` (B42). Returns `true` when this
+    /// call won the claim (the loop was fireable and is now `Running`), `false`
+    /// when the loop was already `Running` — i.e. another dispatch is live and
+    /// this launch must be treated as a no-op rather than starting a duplicate,
+    /// superseding run.
+    ///
+    /// This is a single-statement compare-and-set, so two dispatches racing to
+    /// launch the same loop (the classic autorun-vs-resume check-then-act race:
+    /// one reads the loop as `failed`, the other hasn't written `running` yet)
+    /// serialize on the connection lock and exactly one wins — the guard is on
+    /// the status *transition* itself, not on a separate earlier read.
+    pub fn claim_loop_for_run(&self, loop_id: &str, started_at: DateTime<Utc>) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE loops
+             SET status = ?1,
+                 started_at = COALESCE(?2, started_at)
+             WHERE id = ?3 AND status != ?1",
+            params![
+                LoopStatus::Running.as_str(),
+                started_at.timestamp(),
+                loop_id,
+            ],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// Persist (or, with `None`, clear) the pool a run against `loop_id` is
     /// currently drawing from. Called once when a run starts — including a
     /// resumed run, so a failed pool run that gets auto-reset-and-relaunched

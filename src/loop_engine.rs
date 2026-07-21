@@ -64,6 +64,13 @@ enum SpecExecutionOutcome {
     },
     Paused,
     Failed(String),
+    /// This spec's in-flight node run was terminated because a newer attempt at
+    /// the same node superseded it (B42). Pure engine bookkeeping, not a node
+    /// failure: the dispatch that owned the superseded run stops silently —
+    /// it routes down no edge, fails nothing, and completes nothing. The newer
+    /// attempt (or, for a duplicate resume, the dispatch that won the loop
+    /// claim) is what now drives the loop.
+    Superseded,
 }
 
 struct NodeExecution {
@@ -251,12 +258,26 @@ impl LoopEngine {
             return Err(EmptySpecSetError(message).into());
         }
 
-        self.db.update_loop_status(
-            &loop_id,
-            LoopStatus::Running,
-            Some(chrono::Utc::now()),
-            None,
-        )?;
+        // (B42) Claim the loop for this dispatch by flipping it to `Running`,
+        // but ONLY if it isn't already `Running`. This is the single guarded
+        // entry point every launch path — fresh `loop_run`, cron/watch
+        // triggers, scheduled autorun, and `loop_continue`'s resume — funnels
+        // through, so two dispatches racing to launch the same loop (the
+        // autorun-vs-resume check-then-act race: one read the loop as `failed`,
+        // the other hadn't written `running` yet) can't both proceed. The loser
+        // of the atomic claim finds the loop already `Running` and returns a
+        // silent no-op rather than starting a duplicate run that would
+        // supersede the winner's in-flight node the moment it reached the same
+        // node. It touches nothing (no status flip, no pool context, no
+        // notification), leaving the loop exactly as the winning dispatch left it.
+        if !self.db.claim_loop_for_run(&loop_id, chrono::Utc::now())? {
+            tracing::info!(
+                "Loop '{}' is already running; this launch is a duplicate and was refused \
+                 (another dispatch owns the run).",
+                loop_id
+            );
+            return Ok(());
+        }
         // Persist which pool (if any) this run is drawing from *before* the
         // first spec executes, so an interruption (quota failure, daemon
         // crash) leaves behind the context every resume path needs — a
@@ -343,7 +364,12 @@ impl LoopEngine {
                                 SpecExecutionOutcome::Completed { summary } => {
                                     completed_specs.push((spec.name.clone(), summary));
                                 }
-                                SpecExecutionOutcome::Paused => return Ok(()),
+                                // B42: a superseded run is silent — a newer
+                                // dispatch now owns this loop, so stop without
+                                // failing or completing anything.
+                                SpecExecutionOutcome::Paused | SpecExecutionOutcome::Superseded => {
+                                    return Ok(())
+                                }
                                 SpecExecutionOutcome::Failed(summary) => {
                                     self.fail_loop(&loop_id, Some(&spec.name), &summary)?;
                                     return Ok(());
@@ -376,7 +402,9 @@ impl LoopEngine {
                             completed_specs.push((spec.name.clone(), summary));
                             continue;
                         }
-                        SpecExecutionOutcome::Paused => return Ok(()),
+                        SpecExecutionOutcome::Paused | SpecExecutionOutcome::Superseded => {
+                            return Ok(())
+                        }
                         SpecExecutionOutcome::Failed(summary) => {
                             self.fail_loop(&loop_id, Some(&spec.name), &summary)?;
                             return Ok(());
@@ -401,7 +429,9 @@ impl LoopEngine {
                             completed_specs.push((spec.name.clone(), summary));
                             continue;
                         }
-                        SpecExecutionOutcome::Paused => return Ok(()),
+                        SpecExecutionOutcome::Paused | SpecExecutionOutcome::Superseded => {
+                            return Ok(())
+                        }
                         SpecExecutionOutcome::Failed(summary) => {
                             self.fail_loop(&loop_id, Some(&spec.name), &summary)?;
                             return Ok(());
@@ -864,7 +894,7 @@ impl LoopEngine {
             // own rows don't exist yet.
             for node_id in cursor_node_ids(&cursor, &ensembles) {
                 if let Some(stale) = self.db.get_active_loop_run_for_node(&node_id)? {
-                    self.terminate_run(&stale, "superseded by a new attempt at this node");
+                    self.terminate_run(&stale, SUPERSEDE_REASON);
                 }
             }
 
@@ -1007,6 +1037,19 @@ impl LoopEngine {
 
                         break (execution, run);
                     };
+
+                    // B42: a newer attempt at this node terminated this run out
+                    // from under us (see `terminate_run`/`SUPERSEDE_REASON`).
+                    // That is engine bookkeeping — the run's `Fail` row is a
+                    // reclaim, not a node failure — so this dispatch stops here:
+                    // it evaluates NO edge (never the fail edge to a resilience
+                    // node), fails nothing, and leaves the loop to whichever
+                    // dispatch now owns it. Checked before any routing so the
+                    // supersede can never be routed as a fail (the runaway that
+                    // manufactured a resilience run per killed implementer).
+                    if run_was_superseded(&run) {
+                        return Ok(SpecExecutionOutcome::Superseded);
+                    }
 
                     // RS2: remember this node's captured session so a later
                     // fail-edge bounce back to it resumes instead of cold
@@ -2709,6 +2752,27 @@ fn cursor_label(cursor: &SpecCursor, ensembles: &[EnsembleDetails]) -> String {
             .map(|details| format!("ensemble '{}'", details.ensemble.name))
             .unwrap_or_else(|| format!("ensemble '{ensemble_id}'")),
     }
+}
+
+/// Reason recorded on a node run terminated because a newer attempt at the
+/// same node superseded it (B42). Unlike every other termination reason, a
+/// superseded run is pure engine bookkeeping rather than a node failure: the
+/// dispatch that owned it must recognise the marker and stop silently, routing
+/// it down no edge (see [`run_was_superseded`] and its use in
+/// [`LoopEngine::run_spec`]).
+const SUPERSEDE_REASON: &str = "superseded by a new attempt at this node";
+
+/// Whether `run` was terminated by the supersede path ([`SUPERSEDE_REASON`]) —
+/// i.e. its `Fail` row is a newer attempt reclaiming the node, not a real node
+/// failure. Recognised by the exact `{ "terminated": true, "reason": … }`
+/// marker [`terminate_run_row`] writes, so a genuine agent output that merely
+/// mentions the phrase can never be mistaken for one.
+fn run_was_superseded(run: &LoopNodeRun) -> bool {
+    let Some(output) = run.output.as_ref() else {
+        return false;
+    };
+    output.get("terminated").and_then(Value::as_bool) == Some(true)
+        && output.get("reason").and_then(Value::as_str) == Some(SUPERSEDE_REASON)
 }
 
 /// Best-effort termination (B12) of `run`'s OS process, if it still has one
@@ -6108,9 +6172,9 @@ echo done
         );
 
         // `loop_continue { retry_current_node }`: resume with the loop's
-        // persisted pool context, same as `resume_background`.
-        db.update_loop_status(&loop_id, LoopStatus::Running, None, None)
-            .unwrap();
+        // persisted pool context, same as `resume_background`. The loop is left
+        // `Paused` (as reconcile set it) — the dispatch's own atomic claim (B42)
+        // owns the flip to `Running`, so no caller pre-flips it anymore.
         engine
             .run_loop_dispatch(loop_id.clone(), Some("pool-1".to_string()), None, true)
             .await
@@ -6815,6 +6879,175 @@ echo done
 
         let review_run = runs.iter().find(|r| r.node_id == "node-review").unwrap();
         assert_eq!(review_run.status, LoopRunStatus::Pass);
+    }
+
+    // ── B42: a superseded run is terminal and silent ─────────────────────
+
+    /// The core of the runaway: an in-flight node run superseded by a newer
+    /// attempt at the same node must traverse NO edge. Its graph has a fail
+    /// edge to a "resilience" node — exactly the shape that manufactured a
+    /// fresh Resilience run per killed implementer — and that node must never
+    /// run, because a supersede is engine bookkeeping, not a node failure.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn superseded_run_traverses_no_edge_and_creates_no_resilience_run() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        // "implement": a long-running node we can supersede mid-flight. A
+        // killed process exits nonzero, so absent the fix its `Fail` would
+        // route straight down the fail edge below.
+        db.insert_loop_node(&LoopNode {
+            id: "implement".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "implement".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "sleep 30",
+                "success_condition": "exit_code_0",
+                "timeout_seconds": 60,
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        // "resilience": the fail-edge target that must NEVER run for a supersede.
+        db.insert_loop_node(&LoopNode {
+            id: "resilience".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "resilience".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf DIAGNOSED",
+                "success_condition": "exit_code_0",
+            }),
+            position: 2,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "edge-fail".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "implement".to_string(),
+            to_node: "resilience".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Fail,
+        })
+        .unwrap();
+
+        let engine = Arc::new(engine);
+        let dispatch = {
+            let engine = Arc::clone(&engine);
+            let loop_id = loop_id.clone();
+            tokio::spawn(async move { engine.run_loop(loop_id, None, None).await })
+        };
+
+        // Once the implement run is live (has a pid), supersede it exactly as a
+        // newer attempt at the same node does — the same
+        // `terminate_run(&stale, SUPERSEDE_REASON)` the reap loop runs. Polling
+        // to the pid makes the ordering deterministic: the row is finalized
+        // superseded before the killed process's `wait` ever returns.
+        let superseded_run_id = loop {
+            if let Some(run) = db.get_active_loop_run_for_node("implement").unwrap() {
+                if run.pid.is_some() {
+                    terminate_run_row(&db, &run, SUPERSEDE_REASON);
+                    break run.id;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+
+        dispatch.await.unwrap().unwrap();
+
+        // The superseded run is recorded terminated/superseded...
+        let superseded = db.get_loop_run(&superseded_run_id).unwrap().unwrap();
+        assert_eq!(superseded.status, LoopRunStatus::Fail);
+        assert!(
+            run_was_superseded(&superseded),
+            "the run must carry the supersede marker"
+        );
+
+        // ...and it traversed no edge: NO resilience run was ever created, and
+        // the only run for the spec is the one superseded implement run.
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        assert!(
+            runs.iter().all(|r| r.node_id != "resilience"),
+            "a superseded run must not route down the fail edge to the resilience node"
+        );
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].node_id, "implement");
+
+        // The dispatch stopped silently — it failed nothing and completed
+        // nothing; the loop and spec are left for whoever now owns them.
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Running);
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(spec.status, LoopSpecStatus::Running);
+    }
+
+    /// A second launch against a loop that already has an in-flight run must be
+    /// a silent no-op — the atomic loop claim refuses it, so it can't start a
+    /// duplicate dispatch that would supersede the live run at the next node.
+    #[tokio::test]
+    async fn duplicate_launch_of_running_loop_is_a_noop() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "implement".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "implement".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf OK",
+                "success_condition": "exit_code_0",
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        // Simulate a live dispatch: the loop is already `Running` with an
+        // in-flight node run behind it.
+        db.update_loop_status(
+            &loop_id,
+            LoopStatus::Running,
+            Some(chrono::Utc::now()),
+            None,
+        )
+        .unwrap();
+        db.insert_loop_run(&LoopNodeRun {
+            id: "inflight".to_string(),
+            loop_id: loop_id.clone(),
+            spec_id: spec_id.clone(),
+            node_id: "implement".to_string(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        })
+        .unwrap();
+
+        // A second dispatch (autorun/resume racing the live one) must no-op.
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+
+        // The loop is untouched and the in-flight run was neither superseded
+        // nor duplicated.
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Running);
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        assert_eq!(
+            runs.len(),
+            1,
+            "the duplicate launch must not create a second run"
+        );
+        assert_eq!(runs[0].status, LoopRunStatus::Running);
     }
 
     // ── N1: loop lifecycle notifications ──────────────────────────────────

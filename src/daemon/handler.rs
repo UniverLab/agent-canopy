@@ -4962,11 +4962,12 @@ impl TaskTriggerHandler {
             }
         }
 
-        self.db
-            .update_loop_status(&params.loop_id, LoopStatus::Running, None, None)
-            .map_err(internal_error)?;
         // Resume with the loop's persisted run context — a paused pool run
         // must pick the same pool back up, not the loop's own bound specs.
+        // The flip to `Running` is NOT done here: the dispatch's own atomic
+        // loop claim (B42) owns that transition, so this resume and any other
+        // launch racing it converge on one guarded entry point instead of each
+        // pre-flipping the status and then both dispatching.
         Arc::clone(&self.loop_engine).resume_background(params.loop_id.clone());
 
         Ok(success_result(&format!(
