@@ -986,10 +986,7 @@ impl LoopEngine {
                             .and_then(Value::as_str)
                             .map(str::trim)
                             .filter(|v| !v.is_empty());
-                        let node_model = node
-                            .config
-                            .get("model")
-                            .and_then(Value::as_str);
+                        let node_model = node.config.get("model").and_then(Value::as_str);
                         tracing::info!(
                             loop_id = %lp.id,
                             spec_id = %spec.id,
@@ -1186,29 +1183,33 @@ impl LoopEngine {
                 }
             };
 
-            let next_step =
+            let step_selection =
                 select_next_step(edges, &ensembles, &from_node_id, final_execution.status)?;
 
             let run_id_field = run_id.as_deref().unwrap_or("");
-            match &next_step {
-                Some(SpecCursor::Node(target)) => {
-                    tracing::info!(
-                        run_id = run_id_field,
-                        from_node = %from_node_id,
-                        to_node = %target,
-                        status = ?final_execution.status,
-                        "edge traversed"
-                    );
-                }
-                Some(SpecCursor::Ensemble(eid)) => {
-                    tracing::info!(
-                        run_id = run_id_field,
-                        from_node = %from_node_id,
-                        to_ensemble = %eid,
-                        status = ?final_execution.status,
-                        "edge traversed to ensemble"
-                    );
-                }
+            match &step_selection {
+                Some(sel) => match &sel.cursor {
+                    SpecCursor::Node(target) => {
+                        tracing::info!(
+                            run_id = run_id_field,
+                            from_node = %from_node_id,
+                            to_node = %target,
+                            status = ?final_execution.status,
+                            edge_condition = sel.edge_condition.as_str(),
+                            "edge traversed"
+                        );
+                    }
+                    SpecCursor::Ensemble(eid) => {
+                        tracing::info!(
+                            run_id = run_id_field,
+                            from_node = %from_node_id,
+                            to_ensemble = %eid,
+                            status = ?final_execution.status,
+                            edge_condition = sel.edge_condition.as_str(),
+                            "edge traversed to ensemble"
+                        );
+                    }
+                },
                 None => {
                     tracing::info!(
                         run_id = run_id_field,
@@ -1218,6 +1219,8 @@ impl LoopEngine {
                     );
                 }
             }
+
+            let next_step = step_selection.map(|sel| sel.cursor);
 
             match next_step {
                 Some(step) => {
@@ -2750,6 +2753,14 @@ fn find_entry_node(nodes: &[LoopNode], edges: &[LoopEdge], spec_name: &str) -> R
     }
 }
 
+/// Result of [`select_next_step`]: the next cursor plus the edge condition
+/// that matched (needed for B43 lifecycle logging).
+#[derive(Debug)]
+struct StepSelection {
+    cursor: SpecCursor,
+    edge_condition: LoopEdgeCondition,
+}
+
 /// Resolve the next graph step from `from_node`'s outgoing edges matching
 /// `status`. Ordinarily a single matching edge (or several identical-target
 /// edges) resolves to [`SpecCursor::Node`]. Multiple *distinct* targets are
@@ -2761,7 +2772,7 @@ fn select_next_step(
     ensembles: &[EnsembleDetails],
     from_node: &str,
     status: LoopRunStatus,
-) -> Result<Option<SpecCursor>> {
+) -> Result<Option<StepSelection>> {
     let matching = edges
         .iter()
         .filter(|edge| edge.from_node == from_node)
@@ -2780,7 +2791,10 @@ fn select_next_step(
 
     match matching.as_slice() {
         [] => Ok(None),
-        [edge] => Ok(Some(SpecCursor::Node(edge.to_node.clone()))),
+        [edge] => Ok(Some(StepSelection {
+            cursor: SpecCursor::Node(edge.to_node.clone()),
+            edge_condition: edge.condition,
+        })),
         _ => {
             let distinct_targets = matching
                 .iter()
@@ -2788,7 +2802,10 @@ fn select_next_step(
                 .collect::<HashSet<_>>();
             if distinct_targets.len() == 1 {
                 let to_node = *distinct_targets.iter().next().expect("len == 1");
-                return Ok(Some(SpecCursor::Node(to_node.to_string())));
+                return Ok(Some(StepSelection {
+                    cursor: SpecCursor::Node(to_node.to_string()),
+                    edge_condition: matching[0].condition,
+                }));
             }
             for details in ensembles {
                 let member_ids: HashSet<&str> = details
@@ -2797,7 +2814,10 @@ fn select_next_step(
                     .map(|member| member.node_id.as_str())
                     .collect();
                 if member_ids == distinct_targets {
-                    return Ok(Some(SpecCursor::Ensemble(details.ensemble.id.clone())));
+                    return Ok(Some(StepSelection {
+                        cursor: SpecCursor::Ensemble(details.ensemble.id.clone()),
+                        edge_condition: matching[0].condition,
+                    }));
                 }
             }
             bail!("Node '{}' has ambiguous outgoing edges.", from_node)
@@ -5665,7 +5685,12 @@ echo done
 
         let next = select_next_step(&edges, &[], "implement", LoopRunStatus::Pass).unwrap();
 
-        assert_eq!(next, Some(SpecCursor::Node("review".to_string())));
+        let sel = next.unwrap();
+        assert_eq!(sel.cursor, SpecCursor::Node("review".to_string()));
+        assert_eq!(
+            sel.edge_condition,
+            crate::domain::loops::LoopEdgeCondition::Always
+        );
     }
 
     #[test]
@@ -5719,7 +5744,12 @@ echo done
 
         let next = select_next_step(&edges, &ensembles, "kickoff", LoopRunStatus::Pass).unwrap();
 
-        assert_eq!(next, Some(SpecCursor::Ensemble("ens1".to_string())));
+        let sel = next.unwrap();
+        assert_eq!(sel.cursor, SpecCursor::Ensemble("ens1".to_string()));
+        assert_eq!(
+            sel.edge_condition,
+            crate::domain::loops::LoopEdgeCondition::Always
+        );
     }
 
     fn ensemble_details_fixture(
