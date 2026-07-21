@@ -927,7 +927,7 @@ impl LoopEngine {
             }
             let iteration_value = *iteration;
 
-            let (final_execution, from_node_id) = match &cursor {
+            let (final_execution, from_node_id, run_id) = match &cursor {
                 SpecCursor::Node(node_id) => {
                     let node = nodes_by_id
                         .get(node_id.as_str())
@@ -977,6 +977,30 @@ impl LoopEngine {
                         boot_id: crate::system::boot_id(),
                         session_id: None,
                     })?;
+
+                    {
+                        let node_platform = node
+                            .config
+                            .get("platform")
+                            .or_else(|| node.config.get("cli"))
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|v| !v.is_empty());
+                        let node_model = node
+                            .config
+                            .get("model")
+                            .and_then(Value::as_str);
+                        tracing::info!(
+                            loop_id = %lp.id,
+                            spec_id = %spec.id,
+                            node_id = %node.id,
+                            node = %node.name,
+                            run_id = %run_id,
+                            platform = node_platform.unwrap_or(""),
+                            model = node_model.unwrap_or(""),
+                            "node run launched"
+                        );
+                    }
 
                     // B37: baseline HEAD for this node's whole visit, infra
                     // retries included — a retry that commits is as much a
@@ -1037,6 +1061,13 @@ impl LoopEngine {
 
                         break (execution, run);
                     };
+
+                    tracing::info!(
+                        run_id = %run_id,
+                        status = ?run.status,
+                        node = %node.name,
+                        "node run completed"
+                    );
 
                     // B42: a newer attempt at this node terminated this run out
                     // from under us (see `terminate_run`/`SUPERSEDE_REASON`).
@@ -1127,7 +1158,7 @@ impl LoopEngine {
                         });
                     }
 
-                    (final_execution, node.id.clone())
+                    (final_execution, node.id.clone(), Some(run_id))
                 }
                 SpecCursor::Ensemble(ensemble_id) => {
                     let details = ensembles
@@ -1151,12 +1182,42 @@ impl LoopEngine {
                         return Ok(SpecExecutionOutcome::Paused);
                     }
 
-                    (final_execution, details.ensemble.join_node_id.clone())
+                    (final_execution, details.ensemble.join_node_id.clone(), None)
                 }
             };
 
             let next_step =
                 select_next_step(edges, &ensembles, &from_node_id, final_execution.status)?;
+
+            let run_id_field = run_id.as_deref().unwrap_or("");
+            match &next_step {
+                Some(SpecCursor::Node(target)) => {
+                    tracing::info!(
+                        run_id = run_id_field,
+                        from_node = %from_node_id,
+                        to_node = %target,
+                        status = ?final_execution.status,
+                        "edge traversed"
+                    );
+                }
+                Some(SpecCursor::Ensemble(eid)) => {
+                    tracing::info!(
+                        run_id = run_id_field,
+                        from_node = %from_node_id,
+                        to_ensemble = %eid,
+                        status = ?final_execution.status,
+                        "edge traversed to ensemble"
+                    );
+                }
+                None => {
+                    tracing::info!(
+                        run_id = run_id_field,
+                        from_node = %from_node_id,
+                        status = ?final_execution.status,
+                        "no outgoing edge matched; spec terminating"
+                    );
+                }
+            }
 
             match next_step {
                 Some(step) => {
@@ -1250,6 +1311,22 @@ impl LoopEngine {
                 session_id: None,
             })?;
 
+            {
+                let member_platform = member.platform.as_str();
+                let member_model = member.model.as_deref().unwrap_or("");
+                tracing::info!(
+                    loop_id = %lp.id,
+                    spec_id = %spec.id,
+                    node_id = %node.id,
+                    node = %node.name,
+                    run_id = %run_id,
+                    platform = %member_platform,
+                    model = %member_model,
+                    ensemble_id = %ensemble.id,
+                    "ensemble member run launched"
+                );
+            }
+
             let db = Arc::clone(&self.db);
             let lp = lp.clone();
             let spec = spec.clone();
@@ -1257,6 +1334,7 @@ impl LoopEngine {
             let workdir = workdir.to_string();
             let semaphore = Arc::clone(&self.ensemble_concurrency);
             let label = member_label(member);
+            let ensemble_id = ensemble.id.clone();
 
             set.spawn(async move {
                 let _permit = semaphore
@@ -1330,6 +1408,13 @@ impl LoopEngine {
 
                 let execution = match outcome {
                     Ok(Ok((execution, run, final_run_id))) => {
+                        tracing::info!(
+                            run_id = %final_run_id,
+                            status = ?execution.status,
+                            node = %node.name,
+                            ensemble_id = %ensemble_id,
+                            "ensemble member run completed"
+                        );
                         if run.status == LoopRunStatus::Running {
                             let _ = db.update_loop_run_result(
                                 &final_run_id,
@@ -2780,6 +2865,12 @@ fn run_was_superseded(run: &LoopNodeRun) -> bool {
 /// [`LoopEngine::terminate_run`] — also used by ensemble member tasks, which
 /// don't have a `&LoopEngine` to call the method on.
 fn terminate_run_row(db: &Database, run: &LoopNodeRun, reason: &str) {
+    tracing::info!(
+        run_id = %run.id,
+        node_id = %run.node_id,
+        reason,
+        "node run terminated"
+    );
     if let Some(pid) = run.pid {
         crate::daemon::process::terminate_process_group_async(pid, KILL_GRACE);
     }
