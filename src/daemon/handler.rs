@@ -35,9 +35,9 @@ where
 use crate::application::notification_service::NotificationService;
 use crate::application::ports::{AgentRepository, RunRepository, StateRepository};
 use crate::daemon::handler_formatting::{
-    format_agent_info, format_catalog_models, format_log_output, format_platform_models,
-    format_temporal_agents, format_uptime, internal_error, make_log_path, recent_runs_output,
-    resolve_log_path,
+    format_agent_info, format_catalog_models, format_log_output, format_native_models,
+    format_platform_models, format_temporal_agents, format_uptime, internal_error, make_log_path,
+    recent_runs_output, resolve_log_path,
 };
 use crate::daemon::handler_helpers::{
     apply_scalar_updates, apply_trigger_updates, handle_timed_out_run, load_bound_seed_identity,
@@ -2172,15 +2172,39 @@ impl TaskTriggerHandler {
     /// List available AI models.
     #[tool(
         name = "agent_models",
-        description = "List AI models available for use with agents. Pass an optional `platform` (e.g. \"opencode\") to filter to the models that platform can reach; pass `refresh: true` to force a fresh models.dev fetch. Returns model ids that can be passed to the model field of agent_add or agent_watch, plus cache provenance (source: cache|live|stale, fetched_at)."
+        description = "List AI models available for use with agents. Pass an optional `platform` (e.g. \"opencode\") to filter to the models that platform can reach; pass `refresh: true` to force a fresh fetch. Every returned model id is the literal string that platform's CLI accepts for its model field — for a universal gateway that is the provider-prefixed form (opencode/big-pickle), for claude the bare form (claude-opus-4-8) — so an id can be copied verbatim into the model field of agent_add or agent_watch. Includes cache provenance (source: cache|live|stale, fetched_at)."
     )]
     async fn task_models(
         &self,
         Parameters(params): Parameters<TaskModelsParams>,
     ) -> Result<CallToolResult, McpError> {
         let force_refresh = params.refresh.unwrap_or(false);
-        // The catalog load touches disk and possibly the network; keep it off
-        // the async executor.
+
+        // Optional platform filter, validated against the platforms actually
+        // configured in canopy (registry-driven) when that config is present.
+        let platform = params
+            .platform
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty());
+
+        if let Some(platform) = platform {
+            if let Some(err) = validate_platform_configured(platform) {
+                return Ok(error_result(&err));
+            }
+            // Registry-driven: a platform that can enumerate its own models is
+            // the authoritative source of passable ids (each line is the literal
+            // string its model flag accepts, prefix and all). models.dev cannot
+            // know a gateway's provider-prefixed form or its private catalog, so
+            // when the registry gives us an enumeration command we use it and
+            // skip models.dev entirely — never requiring it to be reachable.
+            if let Some((binary, args)) = platform_enumeration_cmd(platform) {
+                return Ok(native_models_result(platform, binary, args, force_refresh).await);
+            }
+        }
+
+        // models.dev-derived path: the all-providers listing, or a platform
+        // without native enumeration (e.g. claude, whose bare ids are correct).
         let load = tokio::task::spawn_blocking(move || {
             crate::domain::models_db::load_catalog_with_source(force_refresh)
         })
@@ -2197,19 +2221,8 @@ impl TaskTriggerHandler {
         };
         let crate::domain::models_db::CatalogLoad { catalog, source } = load;
 
-        // Optional platform filter, validated against the platforms actually
-        // configured in canopy (registry-driven) when that config is present.
-        let platform = params
-            .platform
-            .as_deref()
-            .map(str::trim)
-            .filter(|p| !p.is_empty());
-
         let listing = match platform {
             Some(platform) => {
-                if let Some(err) = validate_platform_configured(platform) {
-                    return Ok(error_result(&err));
-                }
                 let providers = crate::domain::models_db::providers_for_cli(platform);
                 if providers.is_empty() {
                     return Ok(error_result(&format!(
@@ -2229,21 +2242,9 @@ impl TaskTriggerHandler {
             ),
         };
 
-        let stale_hint = if source == crate::domain::models_db::CatalogSource::Stale {
-            " (models.dev was unreachable — this cache may be out of date; retry with refresh: true)"
-        } else {
-            ""
-        };
-        let result = format!(
-            "{listing}\n\n\
-             Source: {}{stale_hint} · fetched_at: {}\n\
-             Note: model availability also depends on the CLI's configured API keys. \
-             If model is omitted, the CLI uses its own default.",
-            source.as_str(),
-            format_system_time(catalog.fetched_at),
-        );
-
-        Ok(CallToolResult::success(vec![Content::text(result)]))
+        Ok(CallToolResult::success(vec![Content::text(
+            model_result_footer(&listing, source, catalog.fetched_at),
+        )]))
     }
 
     /// Get log output for an agent.
@@ -5257,6 +5258,86 @@ fn validate_platform_configured(platform: &str) -> Option<String> {
          Omit `platform` to list all providers.",
         configured.join(", ")
     ))
+}
+
+/// The `(binary, enumeration args)` for a platform that can list its own
+/// models, read straight from its registry-driven `CliConfig` — `None` when the
+/// platform has no such command configured (so nothing is inferred from the CLI
+/// name). This is the seam that decides opencode enumerates via `opencode
+/// models` while claude does not.
+fn platform_enumeration_cmd(platform: &str) -> Option<(String, String)> {
+    let home = dirs::home_dir()?;
+    let config = crate::domain::canopy_config::CanopyConfig::load(&home.join(".canopy"));
+    let cli = config.get_cli(platform)?;
+    let args = cli.models_list_cmd.as_deref()?.trim();
+    if args.is_empty() || cli.binary.is_empty() {
+        return None;
+    }
+    Some((cli.binary.clone(), args.to_string()))
+}
+
+/// Build the `agent_models` result from a platform's native enumeration. The
+/// CLI run happens off the async executor (it may spawn a process); a fresh
+/// cache returns with no CLI call at all.
+async fn native_models_result(
+    platform: &str,
+    binary: String,
+    args: String,
+    force_refresh: bool,
+) -> CallToolResult {
+    let platform_owned = platform.to_string();
+    let load = tokio::task::spawn_blocking(move || {
+        crate::domain::models_db::load_native_models(
+            &platform_owned,
+            &binary,
+            &args,
+            force_refresh,
+        )
+    })
+    .await
+    .ok()
+    .flatten();
+
+    let Some(load) = load else {
+        return error_result(&format!(
+            "Could not enumerate '{platform}' models: running its model-list command \
+             failed and no cached enumeration exists. Retry once the CLI is reachable."
+        ));
+    };
+    let crate::domain::models_db::NativeLoad { catalog, source } = load;
+
+    let listing = format!(
+        "Models available to platform '{platform}' (enumerated from the CLI — ids are \
+         passable verbatim):\n{}",
+        format_native_models(&catalog.ids)
+    );
+    CallToolResult::success(vec![Content::text(model_result_footer(
+        &listing,
+        source,
+        catalog.fetched_at,
+    ))])
+}
+
+/// The shared provenance/footer block for `agent_models`, used by both the
+/// models.dev and native-enumeration paths.
+fn model_result_footer(
+    listing: &str,
+    source: crate::domain::models_db::CatalogSource,
+    fetched_at: std::time::SystemTime,
+) -> String {
+    let stale_hint = if source == crate::domain::models_db::CatalogSource::Stale {
+        " (the source was unreachable — this cache may be out of date; retry with refresh: true)"
+    } else {
+        ""
+    };
+    format!(
+        "{listing}\n\n\
+         Source: {}{stale_hint} · fetched_at: {}\n\
+         Note: model availability also depends on the CLI's configured API keys. \
+         If model is omitted, the CLI uses its own default.",
+        source.as_str(),
+        format_system_time(fetched_at),
+    )
 }
 
 /// Format a `SystemTime` as an RFC 3339 / ISO 8601 UTC timestamp for the

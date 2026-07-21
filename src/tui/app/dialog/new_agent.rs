@@ -930,6 +930,7 @@ mod tests {
             session_id_set_flag: None,
             session_list_format_args: None,
             session_id_pattern: None,
+            models_list_cmd: None,
             accent_color: None,
             yolo_flag: None,
             instruction_file: None,

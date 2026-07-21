@@ -74,6 +74,18 @@ pub struct CliConfig {
     /// [`session_list_format_args`]: Self::session_list_format_args
     #[serde(default)]
     pub session_id_pattern: Option<String>,
+    /// Subcommand/args that make this CLI print its own available model ids,
+    /// one passable id per line (e.g. opencode's `models` → `opencode/big-pickle`,
+    /// `opencode-go/glm-5.2`). When set, `agent_models` uses this enumeration as
+    /// the authoritative, guaranteed-passable catalog for the platform: each
+    /// line is the literal string the model flag accepts, prefix and all —
+    /// which models.dev cannot know for a universal gateway (it carries neither
+    /// the `provider/model` form the CLI requires nor the gateway's private zen
+    /// catalog). Registry-driven so nothing is inferred from the CLI name; the
+    /// enumeration is cached like the models.dev catalog and never runs on the
+    /// hot path.
+    #[serde(default)]
+    pub models_list_cmd: Option<String>,
     /// RGB accent color for this CLI's agents in the TUI.
     #[serde(default)]
     pub accent_color: Option<[u8; 3]>,
@@ -265,6 +277,7 @@ mod tests {
             session_id_set_flag: None,
             session_list_format_args: None,
             session_id_pattern: None,
+            models_list_cmd: None,
             accent_color: None,
             yolo_flag: None,
             instruction_file: None,

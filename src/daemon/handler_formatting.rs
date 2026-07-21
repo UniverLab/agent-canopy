@@ -256,6 +256,44 @@ pub(crate) fn format_platform_models(
     format_models_for_providers(catalog, &providers)
 }
 
+/// Format a platform's native enumeration (e.g. `opencode models`): the ids are
+/// already the literal, passable strings the CLI accepts (`opencode/big-pickle`),
+/// so they are rendered verbatim — never re-derived — grouped by their provider
+/// prefix (the segment before the first `/`) for readability and bounded by the
+/// same [`MAX_PROVIDERS`] x [`MODELS_PER_PROVIDER`] caps as the models.dev path.
+/// The id is always the first token on the line; the parenthetical is only a
+/// human label, so a caller copying the id verbatim always succeeds.
+pub(crate) fn format_native_models(ids: &[String]) -> String {
+    // Group by provider prefix, preserving first-seen order.
+    let mut groups: Vec<(String, Vec<&String>)> = Vec::new();
+    for id in ids {
+        let provider = id.split_once('/').map(|(p, _)| p).unwrap_or("");
+        match groups.iter_mut().find(|(p, _)| p == provider) {
+            Some((_, models)) => models.push(id),
+            None => groups.push((provider.to_string(), vec![id])),
+        }
+    }
+
+    groups
+        .iter()
+        .take(MAX_PROVIDERS)
+        .map(|(provider, models)| {
+            let display = if provider.is_empty() {
+                "native".to_string()
+            } else {
+                provider_display(provider)
+            };
+            models
+                .iter()
+                .take(MODELS_PER_PROVIDER)
+                .map(|id| format!("  {id}  ({display})"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Shared renderer: newest [`MODELS_PER_PROVIDER`] models for each listed
 /// provider that has any, skipping empty providers, capped at [`MAX_PROVIDERS`]
 /// non-empty providers.
@@ -290,4 +328,74 @@ fn format_models_for_providers(
     }
 
     sections.join("\n")
+}
+
+#[cfg(test)]
+mod model_listing_tests {
+    use super::*;
+    use crate::domain::models_db::{ModelCatalog, ModelEntry};
+    use std::time::SystemTime;
+
+    fn entry(provider: &str, id: &str) -> ModelEntry {
+        ModelEntry {
+            id: id.to_string(),
+            name: id.to_string(),
+            provider: provider.to_string(),
+            release_date: None,
+            size_hint: None,
+        }
+    }
+
+    /// opencode enumerates its own models: the ids are already the passable
+    /// `provider/model` form and must be rendered verbatim (this is the bug the
+    /// spec exists for — bare ids fail at runtime with a generic server error).
+    #[test]
+    fn native_listing_emits_provider_prefixed_ids_verbatim() {
+        let ids = vec![
+            "opencode/big-pickle".to_string(),
+            "opencode/mimo-v2.5-free".to_string(),
+            "opencode-go/glm-5.2".to_string(),
+        ];
+        let out = format_native_models(&ids);
+        // The passable id is the first token on each line, prefix intact.
+        for want in &ids {
+            assert!(
+                out.lines().any(|l| l.trim_start().starts_with(want)),
+                "missing passable id {want} in:\n{out}"
+            );
+        }
+        // Grouped by provider prefix, with the prefix as a human label only.
+        assert!(out.contains("(Opencode)"));
+        assert!(out.contains("(Opencode Go)"));
+        // Exactly the zen models that models.dev does not carry are present.
+        assert!(out.contains("opencode/mimo-v2.5-free"));
+        assert!(out.contains("opencode/big-pickle"));
+    }
+
+    /// claude has no native enumeration, so its listing derives bare ids from
+    /// models.dev — `claude-opus-4-8`, not `anthropic/claude-opus-4-8`.
+    #[test]
+    fn models_dev_listing_emits_bare_ids_for_claude() {
+        let catalog = ModelCatalog {
+            models: vec![entry("anthropic", "claude-opus-4-8")],
+            fetched_at: SystemTime::now(),
+        };
+        let out = format_platform_models(&catalog, &["anthropic"]);
+        assert!(out.contains("claude-opus-4-8"));
+        assert!(
+            !out.contains("anthropic/claude-opus-4-8"),
+            "claude ids must stay bare (no provider prefix): {out}"
+        );
+    }
+
+    #[test]
+    fn native_listing_is_bounded() {
+        // Far more than the caps allow; output must stay bounded.
+        let ids: Vec<String> = (0..50)
+            .map(|i| format!("nvidia/model-{i}"))
+            .chain((0..50).map(|i| format!("opencode/zen-{i}")))
+            .collect();
+        let out = format_native_models(&ids);
+        assert!(out.lines().count() <= MAX_PROVIDERS * MODELS_PER_PROVIDER);
+    }
 }

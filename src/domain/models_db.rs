@@ -173,7 +173,13 @@ fn resolve_catalog(
 /// (clock skew) makes `elapsed()` error; treat that as stale so a bad clock
 /// forces a refresh rather than pinning a possibly-wrong cache forever.
 fn is_fresh(catalog: &ModelCatalog) -> bool {
-    catalog.fetched_at.elapsed().unwrap_or(CACHE_TTL) < CACHE_TTL
+    fetched_within_ttl(catalog.fetched_at)
+}
+
+/// Shared TTL check used by both the models.dev catalog and the per-platform
+/// native enumeration. A future timestamp (clock skew) counts as stale.
+fn fetched_within_ttl(fetched_at: SystemTime) -> bool {
+    fetched_at.elapsed().unwrap_or(CACHE_TTL) < CACHE_TTL
 }
 
 /// Load the catalog without ever blocking on the network.
@@ -211,6 +217,151 @@ pub fn suggestions_for(catalog: &ModelCatalog, cli_name: &str, query: &str) -> V
         })
         .cloned()
         .collect()
+}
+
+// ── Platform-native model enumeration ───────────────────────────────
+
+/// A platform's own passable model ids, captured from a CLI enumeration
+/// (e.g. `opencode models`), plus when they were captured. Each id is the
+/// literal string that platform's model flag accepts — for a universal gateway
+/// that is the `provider/model` form (`opencode/big-pickle`), which models.dev
+/// does not carry. Cached like [`ModelCatalog`] so the CLI is only run when the
+/// cache is stale, missing, or force-refreshed — never on the hot path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeCatalog {
+    /// Passable model ids, in the order the CLI emitted them.
+    pub ids: Vec<String>,
+    #[serde(with = "timestamp_serde")]
+    pub fetched_at: SystemTime,
+}
+
+/// A loaded native enumeration together with its provenance.
+#[derive(Debug, Clone)]
+pub struct NativeLoad {
+    pub catalog: NativeCatalog,
+    pub source: CatalogSource,
+}
+
+/// Load a platform's native model enumeration and report where it came from.
+///
+/// Mirrors [`load_catalog_with_source`]'s staleness policy: a fresh cache is
+/// served with no CLI call ([`CatalogSource::Cache`]); a stale/missing cache
+/// (or `force_refresh`) runs `<binary> <args>` ([`CatalogSource::Live`]); a
+/// failed run falls back to any existing cache as [`CatalogSource::Stale`]
+/// rather than failing hard. Returns `None` only when there is neither a usable
+/// cache nor a successful enumeration.
+pub fn load_native_models(
+    cli: &str,
+    binary: &str,
+    args: &str,
+    force_refresh: bool,
+) -> Option<NativeLoad> {
+    let cli = cli.to_string();
+    let cache_key = cli.clone();
+    resolve_native(
+        force_refresh,
+        || load_native_from_cache(&cache_key),
+        || {
+            let ids = run_model_enumeration(binary, args)?;
+            let catalog = NativeCatalog {
+                ids,
+                fetched_at: SystemTime::now(),
+            };
+            save_native_to_cache(&cli, &catalog);
+            Some(catalog)
+        },
+    )
+}
+
+/// TTL-and-provenance core of [`load_native_models`], with the cache read and
+/// the enumeration injected so the policy — and the emitted id form — is
+/// testable without touching disk or spawning a process.
+fn resolve_native(
+    force_refresh: bool,
+    load_cache: impl FnOnce() -> Option<NativeCatalog>,
+    enumerate: impl FnOnce() -> Option<NativeCatalog>,
+) -> Option<NativeLoad> {
+    let cached = load_cache();
+
+    if !force_refresh {
+        if let Some(catalog) = cached
+            .as_ref()
+            .filter(|c| fetched_within_ttl(c.fetched_at))
+            .cloned()
+        {
+            return Some(NativeLoad {
+                catalog,
+                source: CatalogSource::Cache,
+            });
+        }
+    }
+
+    match enumerate() {
+        Some(catalog) => Some(NativeLoad {
+            catalog,
+            source: CatalogSource::Live,
+        }),
+        None => cached.map(|catalog| NativeLoad {
+            catalog,
+            source: CatalogSource::Stale,
+        }),
+    }
+}
+
+/// Run `<binary> <args>` and parse its stdout into passable model ids. Returns
+/// `None` if the process cannot be spawned or exits non-zero, so a failed
+/// enumeration falls back to the cache rather than caching an empty list.
+fn run_model_enumeration(binary: &str, args: &str) -> Option<Vec<String>> {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    let output = std::process::Command::new(binary).args(&parts).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let ids = parse_native_ids(&String::from_utf8_lossy(&output.stdout));
+    if ids.is_empty() {
+        return None;
+    }
+    Some(ids)
+}
+
+/// Each non-empty, trimmed stdout line is one passable model id. Kept pure so
+/// the enumeration output shape (verified against real `opencode models`) is
+/// unit-testable.
+fn parse_native_ids(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn native_cache_path(cli: &str) -> Option<PathBuf> {
+    // Keep the file name to the platform name so a bogus `cli` can't escape the
+    // cache directory; platform names are registry-controlled slugs.
+    let safe: String = cli
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    dirs::home_dir().map(|h| h.join(format!(".canopy/models_native_{safe}.json")))
+}
+
+fn load_native_from_cache(cli: &str) -> Option<NativeCatalog> {
+    let path = native_cache_path(cli)?;
+    let data = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+fn save_native_to_cache(cli: &str, catalog: &NativeCatalog) {
+    let Some(path) = native_cache_path(cli) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string(catalog) {
+        let _ = std::fs::write(path, json);
+    }
 }
 
 // ── Internal: fetch ─────────────────────────────────────────────────
@@ -542,5 +693,103 @@ mod tests {
     #[test]
     fn unknown_cli_has_no_providers() {
         assert!(providers_for_cli("no-such-cli").is_empty());
+    }
+
+    // ── Platform-native enumeration ─────────────────────────────────
+
+    fn native(ids: &[&str], age: Duration) -> NativeCatalog {
+        NativeCatalog {
+            ids: ids.iter().map(|s| (*s).to_string()).collect(),
+            fetched_at: SystemTime::now() - age,
+        }
+    }
+
+    #[test]
+    fn parse_native_ids_keeps_one_prefixed_id_per_line() {
+        // Shape verified against real `opencode models` output: one passable
+        // `provider/model` id per line, blank lines ignored, whitespace trimmed.
+        let out = "opencode/big-pickle\nopencode-go/glm-5.2\n\n  nvidia/meta/llama-3.3-70b-instruct  \n";
+        assert_eq!(
+            parse_native_ids(out),
+            vec![
+                "opencode/big-pickle".to_string(),
+                "opencode-go/glm-5.2".to_string(),
+                "nvidia/meta/llama-3.3-70b-instruct".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn fresh_native_cache_is_served_without_enumerating() {
+        let enumerated = Cell::new(false);
+        let load = resolve_native(
+            false,
+            || Some(native(&["opencode/big-pickle"], Duration::from_secs(60))),
+            || {
+                enumerated.set(true);
+                None
+            },
+        )
+        .unwrap();
+        assert_eq!(load.source, CatalogSource::Cache);
+        assert!(
+            !enumerated.get(),
+            "a fresh native cache must not spawn the CLI"
+        );
+        // opencode's form is the provider-prefixed id, verbatim from the CLI.
+        assert_eq!(load.catalog.ids, vec!["opencode/big-pickle".to_string()]);
+    }
+
+    #[test]
+    fn stale_native_cache_reenumerates_and_reports_live() {
+        let load = resolve_native(
+            false,
+            || Some(native(&["opencode/old"], CACHE_TTL + Duration::from_secs(1))),
+            || Some(native(&["opencode/mimo-v2.5-free", "opencode/big-pickle"], Duration::ZERO)),
+        )
+        .unwrap();
+        assert_eq!(load.source, CatalogSource::Live);
+        // The zen models models.dev can't see now surface, in prefixed form.
+        assert_eq!(
+            load.catalog.ids,
+            vec![
+                "opencode/mimo-v2.5-free".to_string(),
+                "opencode/big-pickle".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_native_enumeration_falls_back_to_stale_cache() {
+        let load = resolve_native(
+            false,
+            || Some(native(&["opencode/big-pickle"], CACHE_TTL + Duration::from_secs(1))),
+            || None,
+        )
+        .unwrap();
+        assert_eq!(load.source, CatalogSource::Stale);
+        assert_eq!(load.catalog.ids, vec!["opencode/big-pickle".to_string()]);
+    }
+
+    #[test]
+    fn no_native_cache_and_failed_enumeration_returns_none() {
+        assert!(resolve_native(false, || None, || None).is_none());
+    }
+
+    #[test]
+    fn force_refresh_reenumerates_even_when_native_cache_is_fresh() {
+        let enumerated = Cell::new(false);
+        let load = resolve_native(
+            true,
+            || Some(native(&["opencode/cached"], Duration::from_secs(1))),
+            || {
+                enumerated.set(true);
+                Some(native(&["opencode/fresh"], Duration::ZERO))
+            },
+        )
+        .unwrap();
+        assert!(enumerated.get(), "force_refresh must always re-enumerate");
+        assert_eq!(load.source, CatalogSource::Live);
+        assert_eq!(load.catalog.ids, vec!["opencode/fresh".to_string()]);
     }
 }
