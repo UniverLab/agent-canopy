@@ -93,12 +93,17 @@ impl Platform {
     }
 }
 
-/// Check if a platform is available by detecting its CLI binary in PATH.
+/// Check if a platform is available by detecting its CLI binary using the
+/// shared resolver (B40). Uses the same resolution path as the spawner so
+/// detection can never disagree with runtime spawning.
 pub fn is_platform_available(p: &Platform) -> bool {
     p.cli
         .as_ref()
         .and_then(|v| v.get("binary").and_then(|b| b.as_str()))
-        .map(|binary| which::which(binary).is_ok())
+        .map(|binary| {
+            let path_value = std::env::var("PATH").unwrap_or_default();
+            crate::domain::cli_strategy::resolve_binary_in(binary, &path_value).is_ok()
+        })
         .unwrap_or(false)
 }
 
@@ -143,7 +148,8 @@ pub(crate) fn save_mcp_fs_root(home: &Path, root: &str) {
     let _ = config.save(&canopy_dir);
 }
 pub(crate) fn is_binary_available(binary: &str) -> bool {
-    which::which(binary).is_ok()
+    let path_value = std::env::var("PATH").unwrap_or_default();
+    crate::domain::cli_strategy::resolve_binary_in(binary, &path_value).is_ok()
 }
 
 #[allow(dead_code)]

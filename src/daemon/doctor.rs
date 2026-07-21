@@ -14,7 +14,7 @@ pub(crate) async fn run_doctor() -> Result<()> {
     let canopy_dir = home.join(".canopy");
     let db_path = canopy_dir.join("background_agents.db");
 
-    let mut issues = Vec::new();
+    let mut issues: Vec<String> = Vec::new();
 
     if canopy_dir.exists() {
         println!(" \x1b[32m✓\x1b[0m Data directory: {}", canopy_dir.display());
@@ -23,7 +23,7 @@ pub(crate) async fn run_doctor() -> Result<()> {
             " \x1b[31m✗\x1b[0m Data directory not found: {}",
             canopy_dir.display()
         );
-        issues.push("Run 'canopy setup' to initialize");
+        issues.push("Run 'canopy setup' to initialize".to_string());
     }
 
     if db_path.exists() {
@@ -71,7 +71,7 @@ pub(crate) async fn run_doctor() -> Result<()> {
                 println!(" \x1b[32m✓\x1b[0m Daemon running (PID: {})", pid);
             } else {
                 println!(" \x1b[31m✗\x1b[0m Daemon not running (stale PID: {})", pid);
-                issues.push("Stale PID file — run 'canopy daemon start'");
+                issues.push("Stale PID file — run 'canopy daemon start'".to_string());
             }
         }
     } else {
@@ -82,22 +82,60 @@ pub(crate) async fn run_doctor() -> Result<()> {
         println!(" \x1b[32m✓\x1b[0m Setup completed");
     } else {
         println!(" \x1b[33m⚠\x1b[0m Setup not completed");
-        issues.push("Run 'canopy setup'");
+        issues.push("Run 'canopy setup'".to_string());
     }
 
-    let available_clis = crate::domain::models::Cli::detect_available();
-    if !available_clis.is_empty() {
-        println!(
-            " \x1b[32m✓\x1b[0m Harnesses in PATH: {}",
-            available_clis
-                .iter()
-                .map(|c| c.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+    // ── CLI Resolution (B40) ──────────────────────────────────
+    // Per-CLI report: resolved or not, by which step, absolute path.
+    // Also warns when a CLI is reachable from the current process's PATH
+    // but not from the daemon's captured PATH (different environments).
+    let daemon_path = crate::domain::cli_strategy::daemon_path();
+
+    if config.clis.is_empty() {
+        println!(" \x1b[33m⚠\x1b[0m No harnesses configured (run 'canopy setup')");
+        issues.push("Run 'canopy setup' to detect and configure harnesses".to_string());
     } else {
-        println!(" \x1b[31m✗\x1b[0m No supported harnesses found in PATH");
-        issues.push("Install at least one: opencode, kiro-cli, copilot, or qwen");
+        for cli_config in &config.clis {
+            match cli_config.resolve() {
+                Ok((resolved, step)) => {
+                    // Check daemon reachability: does the binary also
+                    // resolve under the daemon's captured PATH?
+                    let daemon_reachable = match &daemon_path {
+                        Some(dp) => cli_config.resolve_against(dp).is_ok(),
+                        // No daemon PATH (macOS/launchd) → no mismatch possible
+                        None => true,
+                    };
+                    if daemon_reachable {
+                        println!(
+                            " \x1b[32m✓\x1b[0m {} → {} (via {})",
+                            cli_config.name,
+                            resolved.display(),
+                            step.label()
+                        );
+                    } else {
+                        println!(
+                            " \x1b[33m⚠\x1b[0m {} → {} (via {} — reachable now but NOT from the daemon)",
+                            cli_config.name,
+                            resolved.display(),
+                            step.label()
+                        );
+                        issues.push(format!(
+                            "'{}' is on your interactive PATH but not the daemon's. \
+                             Re-run `canopy daemon install` to update the daemon's PATH, \
+                             or add the directory to the systemd unit's Environment=PATH=.",
+                            cli_config.name
+                        ));
+                    }
+                }
+                Err(e) => {
+                    println!(" \x1b[31m✗\x1b[0m {} — not found ({})", cli_config.name, e);
+                    issues.push(format!(
+                        "'{}' binary '{}' not found. {}",
+                        cli_config.name, e.binary, e.path
+                    ));
+                }
+            }
+        }
     }
 
     // ── RAG Health ──────────────────────────────────────────────
@@ -105,7 +143,7 @@ pub(crate) async fn run_doctor() -> Result<()> {
 
     if config.embeddings_model.is_empty() {
         println!(" \x1b[31m✗\x1b[0m Embeddings model not configured (run 'canopy setup')");
-        issues.push("Configure embeddings model via 'canopy setup'");
+        issues.push("Configure embeddings model via 'canopy setup'".to_string());
     } else {
         println!(
             " \x1b[32m✓\x1b[0m Embeddings model: {}",
@@ -131,7 +169,8 @@ pub(crate) async fn run_doctor() -> Result<()> {
                     " \x1b[31m✗\x1b[0m Model '{}' is not supported. Run 'canopy setup' to pick a compatible model.",
                     config.embeddings_model
                 );
-                issues.push("Run 'canopy setup' and select a supported embedding model");
+                issues
+                    .push("Run 'canopy setup' and select a supported embedding model".to_string());
                 None
             }
         };
@@ -141,14 +180,14 @@ pub(crate) async fn run_doctor() -> Result<()> {
                 println!(" \x1b[32m✓\x1b[0m API key {key_var} is set");
             } else {
                 println!(" \x1b[31m✗\x1b[0m {key_var} is NOT set — indexing will fail silently");
-                issues.push("Export the required API key before starting the daemon");
+                issues.push("Export the required API key before starting the daemon".to_string());
             }
         }
     }
 
     if config.rag_personal_dirs.is_empty() {
         println!(" \x1b[33m⚠\x1b[0m No personal RAG directories configured");
-        issues.push("Add personal RAG directories via 'canopy setup'");
+        issues.push("Add personal RAG directories via 'canopy setup'".to_string());
     } else {
         let mut total_files: usize = 0;
         let mut oversize_files: usize = 0;
@@ -178,7 +217,7 @@ pub(crate) async fn run_doctor() -> Result<()> {
                 oversize_files += dir_oversize;
             } else {
                 println!(" \x1b[31m✗\x1b[0m RAG dir missing: {dir}");
-                issues.push("Personal RAG directory not found on disk");
+                issues.push("Personal RAG directory not found on disk".to_string());
             }
         }
         if total_files == 0 && !config.rag_personal_dirs.is_empty() {
@@ -193,7 +232,8 @@ pub(crate) async fn run_doctor() -> Result<()> {
                  indexing limit (FILE_MAX_BYTES) and are skipped"
             );
             issues.push(
-                "Some configured files exceed FILE_MAX_BYTES and are skipped — see 'canopy rag report'",
+                "Some configured files exceed FILE_MAX_BYTES and are skipped — see 'canopy rag report'"
+                    .to_string(),
             );
         }
     }
@@ -210,7 +250,7 @@ pub(crate) async fn run_doctor() -> Result<()> {
         Ok(p) => p,
         Err(_) => {
             println!(" \x1b[33m⚠\x1b[0m Could not determine LanceDB path");
-            issues.push("Home directory not found");
+            issues.push("Home directory not found".to_string());
             dirs::home_dir()
                 .unwrap_or_default()
                 .join(".canopy/rag/vectors.lancedb")
@@ -265,7 +305,8 @@ pub(crate) async fn run_doctor() -> Result<()> {
                                          check daemon logs for embedding errors"
                                     );
                                     issues.push(
-                                        "Some files may not be indexed — verify API key and daemon logs",
+                                        "Some files may not be indexed — verify API key and daemon logs"
+                                            .to_string(),
                                     );
                                 }
                             }
@@ -278,13 +319,16 @@ pub(crate) async fn run_doctor() -> Result<()> {
                                     ),
                                     Some(crate::rag::embedding_client::EmbeddingProvider::Local)
                                 );
-                                issues.push(if is_local {
-                                    "RAG directories are configured but nothing is indexed — \
-                                     ensure the daemon is running"
-                                } else {
-                                    "RAG directories are configured but nothing is indexed — \
-                                     ensure the daemon is running and the API key env var is set"
-                                });
+                                issues.push(
+                                    if is_local {
+                                        "RAG directories are configured but nothing is indexed — \
+                                         ensure the daemon is running"
+                                    } else {
+                                        "RAG directories are configured but nothing is indexed — \
+                                         ensure the daemon is running and the API key env var is set"
+                                    }
+                                    .to_string(),
+                                );
                             }
                         }
                     }
@@ -294,7 +338,10 @@ pub(crate) async fn run_doctor() -> Result<()> {
                 },
                 Err(e) => {
                     println!(" \x1b[31m✗\x1b[0m Could not open LanceDB: {e}");
-                    issues.push("LanceDB open error — check if the embeddings model is supported");
+                    issues.push(
+                        "LanceDB open error — check if the embeddings model is supported"
+                            .to_string(),
+                    );
                 }
             }
         }

@@ -70,6 +70,27 @@ pub struct BinaryResolutionError {
     pub path: String,
 }
 
+/// Which step of the resolution order produced a match. Setup/doctor
+/// detection (B40) reports this alongside the resolved path so it can never
+/// disagree with the spawner about *how* a CLI was found, not just whether
+/// it was found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolutionStep {
+    /// `binary` was already an absolute path; used as-is, no PATH search.
+    AbsolutePath,
+    /// Found by searching PATH.
+    Path,
+}
+
+impl ResolutionStep {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ResolutionStep::AbsolutePath => "absolute path",
+            ResolutionStep::Path => "PATH",
+        }
+    }
+}
+
 /// Resolve the executable path for a CLI's configured `binary`.
 ///
 /// - Absolute paths are returned as-is (the `binary` override in
@@ -85,25 +106,64 @@ pub fn resolve_binary(binary: &str) -> Result<PathBuf> {
     resolve_binary_with_path(binary, &path_value)
 }
 
-/// Resolve a binary against an explicit PATH string (colon-separated).
+/// Read the `Environment=PATH=` value from the systemd user unit file.
 ///
-/// Tests inject a controlled PATH so they never depend on the developer's
-/// real environment.
-fn resolve_binary_with_path(binary: &str, path: &str) -> Result<PathBuf> {
+/// Returns `None` when the unit file doesn't exist or doesn't declare a PATH
+/// (e.g. macOS launchd, or a manual install). The returned string is the
+/// raw value — callers split on `:` themselves.
+pub fn daemon_path() -> Option<String> {
+    daemon_path_at(&dirs::home_dir()?)
+}
+
+/// [`daemon_path`], reading the unit file from under an explicit home
+/// directory instead of `dirs::home_dir()`. Tests inject a temp dir so they
+/// never depend on the developer's real `~/.config/systemd/user`.
+fn daemon_path_at(home: &Path) -> Option<String> {
+    let unit_path = home.join(".config/systemd/user").join("canopy.service");
+    let content = std::fs::read_to_string(unit_path).ok()?;
+    content
+        .lines()
+        .find_map(|line| line.strip_prefix("Environment=PATH="))
+        .map(|v| v.to_string())
+}
+
+/// [`resolve_binary`], reporting which step of the resolution order matched.
+///
+/// This is the single resolution primitive shared by the spawner
+/// (`resolve_binary`, via [`resolve_binary_with_path`]) and setup/doctor
+/// detection, so the two can never disagree about whether a CLI is usable —
+/// there is one resolution path in the codebase, not two. `path` is an
+/// explicit, injectable PATH string (colon-separated) rather than always
+/// reading the current process's environment, so callers can ask "would
+/// this resolve under *this* PATH" — e.g. doctor comparing the interactive
+/// shell's PATH against the daemon's captured PATH (B40).
+pub fn resolve_binary_in(
+    binary: &str,
+    path: &str,
+) -> std::result::Result<(PathBuf, ResolutionStep), BinaryResolutionError> {
     let b = Path::new(binary);
     if b.is_absolute() {
-        return Ok(b.to_path_buf());
+        return Ok((b.to_path_buf(), ResolutionStep::AbsolutePath));
     }
 
-    if let Ok(resolved) = which::which(binary) {
-        return Ok(resolved);
+    if let Ok(resolved) = which::which_in(binary, Some(path), ".") {
+        return Ok((resolved, ResolutionStep::Path));
     }
 
     Err(BinaryResolutionError {
         binary: binary.to_string(),
         path: path.to_string(),
-    }
-    .into())
+    })
+}
+
+/// Resolve a binary against an explicit PATH string (colon-separated).
+///
+/// Tests inject a controlled PATH so they never depend on the developer's
+/// real environment.
+fn resolve_binary_with_path(binary: &str, path: &str) -> Result<PathBuf> {
+    resolve_binary_in(binary, path)
+        .map(|(resolved, _step)| resolved)
+        .map_err(Into::into)
 }
 
 impl CliStrategy {
@@ -661,6 +721,41 @@ mod tests {
         // returned verbatim, with no PATH lookup and no existence check.
         let resolved = resolve_binary_with_path("/nonexistent/somewhere/mimo", "").unwrap();
         assert_eq!(resolved, PathBuf::from("/nonexistent/somewhere/mimo"));
+    }
+
+    #[test]
+    fn daemon_path_at_none_when_unit_file_missing() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(daemon_path_at(home.path()).is_none());
+    }
+
+    #[test]
+    fn daemon_path_at_none_when_unit_has_no_path_line() {
+        let home = tempfile::tempdir().unwrap();
+        let unit_dir = home.path().join(".config/systemd/user");
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        std::fs::write(
+            unit_dir.join("canopy.service"),
+            "[Service]\nExecStart=/usr/local/bin/canopy daemon run\n",
+        )
+        .unwrap();
+        assert!(daemon_path_at(home.path()).is_none());
+    }
+
+    #[test]
+    fn daemon_path_at_reads_environment_path_line() {
+        let home = tempfile::tempdir().unwrap();
+        let unit_dir = home.path().join(".config/systemd/user");
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        std::fs::write(
+            unit_dir.join("canopy.service"),
+            "[Service]\nEnvironment=PATH=/usr/bin:/bin:/home/user/.opencode/bin\nExecStart=/usr/local/bin/canopy daemon run\n",
+        )
+        .unwrap();
+        assert_eq!(
+            daemon_path_at(home.path()),
+            Some("/usr/bin:/bin:/home/user/.opencode/bin".to_string())
+        );
     }
 
     #[test]

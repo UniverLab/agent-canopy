@@ -187,9 +187,44 @@ pub struct CliRegistry {
 }
 
 impl CliConfig {
-    /// Check if this CLI is available in PATH.
+    /// Check if this CLI is available in the given PATH.
+    ///
+    /// Uses the shared resolver (`resolve_binary_in`) so detection can never
+    /// disagree with the spawner — there is one resolution path in the
+    /// codebase, not two. When `path` is `None`, the current process's PATH
+    /// is used.
     pub fn is_available(&self) -> bool {
-        which::which(&self.binary).is_ok()
+        self.resolve().is_ok()
+    }
+
+    /// Resolve this CLI's binary using the shared resolver, returning the
+    /// absolute path and which step of the resolution order matched.
+    ///
+    /// This is the single resolution primitive for detection; it delegates
+    /// to [`super::cli_strategy::resolve_binary_in`] so setup/doctor and the
+    /// spawner can never disagree (B40).
+    pub fn resolve(
+        &self,
+    ) -> std::result::Result<
+        (std::path::PathBuf, super::cli_strategy::ResolutionStep),
+        super::cli_strategy::BinaryResolutionError,
+    > {
+        let path_value = std::env::var("PATH").unwrap_or_default();
+        super::cli_strategy::resolve_binary_in(&self.binary, &path_value)
+    }
+
+    /// Resolve this CLI's binary against an explicit PATH string.
+    ///
+    /// Use this to test resolution under a different PATH (e.g. the
+    /// daemon's captured PATH) without mutating the process environment.
+    pub fn resolve_against(
+        &self,
+        path: &str,
+    ) -> std::result::Result<
+        (std::path::PathBuf, super::cli_strategy::ResolutionStep),
+        super::cli_strategy::BinaryResolutionError,
+    > {
+        super::cli_strategy::resolve_binary_in(&self.binary, path)
     }
 }
 
@@ -316,6 +351,53 @@ mod tests {
         let registry = CliRegistry::new();
         let config = registry.get("nonexistent");
         assert!(config.is_none());
+    }
+
+    #[test]
+    fn resolve_against_finds_binary_on_injected_path() {
+        // B40: setup/doctor detection must use the same resolver the
+        // spawner uses. Point PATH at a temp dir containing a fake
+        // executable and confirm resolve_against finds it there, with no
+        // dependency on the developer's real PATH.
+        let dir = TempDir::new().unwrap();
+        let bin_path = dir.path().join("opencode");
+        std::fs::write(&bin_path, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let config = sample_cli_config();
+        let (resolved, step) = config
+            .resolve_against(dir.path().to_str().unwrap())
+            .unwrap();
+        assert_eq!(resolved, bin_path);
+        assert_eq!(step, super::super::cli_strategy::ResolutionStep::Path);
+    }
+
+    #[test]
+    fn resolve_against_reports_every_location_searched_on_failure() {
+        let mut config = sample_cli_config();
+        config.binary = "canopy-test-fixture-cli-missing".to_string();
+        let err = config.resolve_against("/usr/bin:/bin").unwrap_err();
+        assert!(err.to_string().contains("canopy-test-fixture-cli-missing"));
+        assert!(err.to_string().contains("/usr/bin:/bin"));
+    }
+
+    #[test]
+    fn resolve_against_absolute_binary_skips_path_search() {
+        let mut config = sample_cli_config();
+        config.binary = "/nonexistent/somewhere/opencode".to_string();
+        let (resolved, step) = config.resolve_against("").unwrap();
+        assert_eq!(
+            resolved,
+            std::path::PathBuf::from("/nonexistent/somewhere/opencode")
+        );
+        assert_eq!(
+            step,
+            super::super::cli_strategy::ResolutionStep::AbsolutePath
+        );
     }
 
     #[test]

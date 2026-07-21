@@ -88,7 +88,10 @@ struct SkillsRegistry {
 impl SkillsRegistry {
     fn should_install(&self, skill_name: &str) -> bool {
         match self.requires.get(skill_name) {
-            Some(binary) => which::which(binary).is_ok(),
+            Some(binary) => {
+                let path_value = std::env::var("PATH").unwrap_or_default();
+                crate::domain::cli_strategy::resolve_binary_in(binary, &path_value).is_ok()
+            }
             None => true,
         }
     }
