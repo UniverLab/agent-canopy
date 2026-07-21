@@ -5287,12 +5287,7 @@ async fn native_models_result(
 ) -> CallToolResult {
     let platform_owned = platform.to_string();
     let load = tokio::task::spawn_blocking(move || {
-        crate::domain::models_db::load_native_models(
-            &platform_owned,
-            &binary,
-            &args,
-            force_refresh,
-        )
+        crate::domain::models_db::load_native_models(&platform_owned, &binary, &args, force_refresh)
     })
     .await
     .ok()

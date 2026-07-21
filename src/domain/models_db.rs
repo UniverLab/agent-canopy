@@ -313,7 +313,10 @@ fn resolve_native(
 /// enumeration falls back to the cache rather than caching an empty list.
 fn run_model_enumeration(binary: &str, args: &str) -> Option<Vec<String>> {
     let parts: Vec<&str> = args.split_whitespace().collect();
-    let output = std::process::Command::new(binary).args(&parts).output().ok()?;
+    let output = std::process::Command::new(binary)
+        .args(&parts)
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -341,7 +344,13 @@ fn native_cache_path(cli: &str) -> Option<PathBuf> {
     // cache directory; platform names are registry-controlled slugs.
     let safe: String = cli
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     dirs::home_dir().map(|h| h.join(format!(".canopy/models_native_{safe}.json")))
 }
@@ -708,7 +717,8 @@ mod tests {
     fn parse_native_ids_keeps_one_prefixed_id_per_line() {
         // Shape verified against real `opencode models` output: one passable
         // `provider/model` id per line, blank lines ignored, whitespace trimmed.
-        let out = "opencode/big-pickle\nopencode-go/glm-5.2\n\n  nvidia/meta/llama-3.3-70b-instruct  \n";
+        let out =
+            "opencode/big-pickle\nopencode-go/glm-5.2\n\n  nvidia/meta/llama-3.3-70b-instruct  \n";
         assert_eq!(
             parse_native_ids(out),
             vec![
@@ -744,8 +754,18 @@ mod tests {
     fn stale_native_cache_reenumerates_and_reports_live() {
         let load = resolve_native(
             false,
-            || Some(native(&["opencode/old"], CACHE_TTL + Duration::from_secs(1))),
-            || Some(native(&["opencode/mimo-v2.5-free", "opencode/big-pickle"], Duration::ZERO)),
+            || {
+                Some(native(
+                    &["opencode/old"],
+                    CACHE_TTL + Duration::from_secs(1),
+                ))
+            },
+            || {
+                Some(native(
+                    &["opencode/mimo-v2.5-free", "opencode/big-pickle"],
+                    Duration::ZERO,
+                ))
+            },
         )
         .unwrap();
         assert_eq!(load.source, CatalogSource::Live);
@@ -763,7 +783,12 @@ mod tests {
     fn failed_native_enumeration_falls_back_to_stale_cache() {
         let load = resolve_native(
             false,
-            || Some(native(&["opencode/big-pickle"], CACHE_TTL + Duration::from_secs(1))),
+            || {
+                Some(native(
+                    &["opencode/big-pickle"],
+                    CACHE_TTL + Duration::from_secs(1),
+                ))
+            },
             || None,
         )
         .unwrap();
