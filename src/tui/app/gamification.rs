@@ -180,8 +180,15 @@ impl App {
         ];
         for (key, event) in daemon_flags {
             if self.db.get_state(key)?.as_deref() == Some("1") {
-                self.queue_mission_event(event);
-                let _ = self.db.set_state(key, "done");
+                // Commit the "done" write before queueing the event: if it
+                // fails (e.g. DB contention), leave the flag at "1" and
+                // retry the capture next tick instead of double-firing.
+                match self.db.set_state(key, "done") {
+                    Ok(()) => self.queue_mission_event(event),
+                    Err(e) => tracing::warn!(
+                        "Failed to consume daemon flag '{key}', will retry next tick: {e}"
+                    ),
+                }
             }
         }
 
@@ -194,7 +201,9 @@ impl App {
                 .unwrap_or(0);
             let max = stored.max(f);
             if max > stored {
-                let _ = self.db.set_state(MAX_CPU_FREQ_KEY, &max.to_string());
+                if let Err(e) = self.db.set_state(MAX_CPU_FREQ_KEY, &max.to_string()) {
+                    tracing::warn!("Failed to persist max CPU frequency: {e}");
+                }
             }
             self.max_cpu_frequency_seen = Some(max);
         } else {
