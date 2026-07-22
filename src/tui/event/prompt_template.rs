@@ -237,6 +237,10 @@ fn handle_section_picker_key(
             handle_project_picker_key(dialog, *selected, entries.len(), code);
             Ok(true)
         }
+        SectionPickerMode::PresetPicker { .. } => {
+            handle_preset_picker_key(dialog, code);
+            Ok(true)
+        }
     }
 }
 
@@ -292,6 +296,7 @@ fn select_addable_section(
     match name {
         "tools" => open_skills_picker(dialog, workdir),
         "project_context" => open_project_picker(dialog, db)?,
+        "preset" => open_preset_picker(dialog),
         _ => {
             dialog.add_section(name);
             dialog.picker_mode = SectionPickerMode::None;
@@ -299,6 +304,20 @@ fn select_addable_section(
     }
 
     Ok(())
+}
+
+/// Open the Preset picker (P2): lists `~/.canopy/prompts/*.md`, read fresh
+/// so an external edit shows up immediately. An empty/missing directory
+/// still opens the picker — it just shows the "no presets" hint (rendered
+/// in `ui::dialogs::section_picker`) instead of erroring.
+fn open_preset_picker(dialog: &mut SimplePromptDialog) {
+    let dir = crate::domain::prompts::prompts_dir(&crate::domain::prompts::canopy_dir());
+    let entries = SimplePromptDialog::collect_presets_for_picker(&dir);
+    dialog.picker_mode = SectionPickerMode::PresetPicker {
+        selected: 0,
+        entries,
+        filter: String::new(),
+    };
 }
 
 fn open_skills_picker(dialog: &mut SimplePromptDialog, workdir: &Path) {
@@ -428,6 +447,88 @@ fn confirm_skills_picker_selection(dialog: &mut SimplePromptDialog) {
         None => {
             dialog.add_section_with_content("tools", label.clone());
         }
+    }
+}
+
+/// Indices into the Preset picker's `entries` that currently pass its typed
+/// filter, or `Vec::new()` if `dialog.picker_mode` isn't `PresetPicker`.
+fn preset_filtered_indices(dialog: &SimplePromptDialog) -> Vec<usize> {
+    let SectionPickerMode::PresetPicker {
+        entries, filter, ..
+    } = &dialog.picker_mode
+    else {
+        return Vec::new();
+    };
+    SimplePromptDialog::filtered_preset_indices(entries, filter)
+}
+
+fn handle_preset_picker_key(dialog: &mut SimplePromptDialog, code: KeyCode) {
+    match code {
+        KeyCode::Esc => dialog.picker_mode = SectionPickerMode::None,
+        KeyCode::Up => move_preset_picker(dialog, false),
+        KeyCode::Down => move_preset_picker(dialog, true),
+        KeyCode::Enter | KeyCode::Tab => confirm_preset_picker_selection(dialog),
+        KeyCode::Backspace => pop_preset_picker_filter(dialog),
+        KeyCode::Char(c) => push_preset_picker_filter(dialog, c),
+        _ => {}
+    }
+}
+
+fn move_preset_picker(dialog: &mut SimplePromptDialog, forward: bool) {
+    let filtered_len = preset_filtered_indices(dialog).len();
+    if filtered_len == 0 {
+        return;
+    }
+    let SectionPickerMode::PresetPicker { selected, .. } = &mut dialog.picker_mode else {
+        return;
+    };
+    *selected = if forward {
+        (*selected + 1) % filtered_len
+    } else {
+        selected.checked_sub(1).unwrap_or(filtered_len - 1)
+    };
+}
+
+fn push_preset_picker_filter(dialog: &mut SimplePromptDialog, c: char) {
+    if let SectionPickerMode::PresetPicker {
+        filter, selected, ..
+    } = &mut dialog.picker_mode
+    {
+        filter.push(c);
+        *selected = 0;
+    }
+}
+
+fn pop_preset_picker_filter(dialog: &mut SimplePromptDialog) {
+    if let SectionPickerMode::PresetPicker {
+        filter, selected, ..
+    } = &mut dialog.picker_mode
+    {
+        filter.pop();
+        *selected = 0;
+    }
+}
+
+/// Insert the selected preset's full content as a new instruction section
+/// (mirrors the Skills picker's un-replace_id path: `add_section_with_content`)
+/// so the preset becomes a normal, freely-editable field — never a locked
+/// reference — and closes the picker either way.
+fn confirm_preset_picker_selection(dialog: &mut SimplePromptDialog) {
+    let filtered = preset_filtered_indices(dialog);
+    let SectionPickerMode::PresetPicker {
+        selected, entries, ..
+    } = &dialog.picker_mode
+    else {
+        return;
+    };
+    let content = filtered
+        .get(*selected)
+        .and_then(|&idx| entries.get(idx))
+        .map(|(_, _, content)| content.clone());
+
+    dialog.picker_mode = SectionPickerMode::None;
+    if let Some(content) = content {
+        dialog.add_section_with_content("instruction", content);
     }
 }
 
@@ -1442,6 +1543,116 @@ mod tests {
             normalize_prompt_char_input('a', KeyModifiers::CONTROL),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod preset_picker_tests {
+    use super::{handle_preset_picker_key, preset_filtered_indices};
+    use crate::tui::app::dialog::{SectionPickerMode, SimplePromptDialog};
+    use ratatui::crossterm::event::KeyCode;
+
+    fn dialog_with_presets(entries: Vec<(&str, &str, &str)>) -> SimplePromptDialog {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.picker_mode = SectionPickerMode::PresetPicker {
+            selected: 0,
+            entries: entries
+                .into_iter()
+                .map(|(n, p, c)| (n.to_string(), p.to_string(), c.to_string()))
+                .collect(),
+            filter: String::new(),
+        };
+        dialog
+    }
+
+    #[test]
+    fn typing_filters_the_list_and_resets_selection_to_the_top() {
+        let mut dialog = dialog_with_presets(vec![
+            ("implementer", "role a", "implementer content"),
+            ("reviewer", "role b", "reviewer content"),
+            ("resilience", "role c", "resilience content"),
+        ]);
+
+        // Move off the top so the filter's reset-to-0 is actually exercised.
+        handle_preset_picker_key(&mut dialog, KeyCode::Down);
+        handle_preset_picker_key(&mut dialog, KeyCode::Down);
+
+        handle_preset_picker_key(&mut dialog, KeyCode::Char('r'));
+        handle_preset_picker_key(&mut dialog, KeyCode::Char('e'));
+
+        let filtered = preset_filtered_indices(&dialog);
+        let SectionPickerMode::PresetPicker {
+            entries, selected, ..
+        } = &dialog.picker_mode
+        else {
+            panic!("expected PresetPicker");
+        };
+        let names: Vec<&str> = filtered.iter().map(|&i| entries[i].0.as_str()).collect();
+        assert_eq!(names, vec!["reviewer", "resilience"]);
+        assert_eq!(*selected, 0);
+    }
+
+    #[test]
+    fn backspace_removes_a_filter_char_and_widens_the_match() {
+        let mut dialog = dialog_with_presets(vec![
+            ("implementer", "role a", "implementer content"),
+            ("reviewer", "role b", "reviewer content"),
+        ]);
+
+        handle_preset_picker_key(&mut dialog, KeyCode::Char('x'));
+        assert!(preset_filtered_indices(&dialog).is_empty());
+
+        handle_preset_picker_key(&mut dialog, KeyCode::Backspace);
+        assert_eq!(preset_filtered_indices(&dialog).len(), 2);
+    }
+
+    #[test]
+    fn enter_inserts_the_selected_preset_as_a_new_instruction_section_and_closes() {
+        let mut dialog = dialog_with_presets(vec![
+            ("implementer", "role a", "implementer content"),
+            ("reviewer", "role b", "reviewer content"),
+        ]);
+        dialog.set_section_content("instruction_1", "existing task".to_string());
+
+        handle_preset_picker_key(&mut dialog, KeyCode::Down); // select "reviewer"
+        handle_preset_picker_key(&mut dialog, KeyCode::Enter);
+
+        assert_eq!(dialog.picker_mode, SectionPickerMode::None);
+        // The existing instruction is left alone — the preset lands in a
+        // fresh, freely-editable section rather than clobbering it.
+        assert_eq!(dialog.get_section_content("instruction_1"), "existing task");
+        assert_eq!(
+            dialog.get_section_content("instruction_2"),
+            "reviewer content"
+        );
+        assert!(dialog
+            .enabled_sections
+            .contains(&"instruction_2".to_string()));
+    }
+
+    #[test]
+    fn esc_closes_the_picker_without_inserting_anything() {
+        let mut dialog =
+            dialog_with_presets(vec![("implementer", "role a", "implementer content")]);
+        let original_sections = dialog.enabled_sections.clone();
+
+        handle_preset_picker_key(&mut dialog, KeyCode::Esc);
+
+        assert_eq!(dialog.picker_mode, SectionPickerMode::None);
+        assert_eq!(dialog.enabled_sections, original_sections);
+    }
+
+    #[test]
+    fn enter_on_an_empty_directory_closes_without_inserting_anything() {
+        // Mirrors the "no presets in ~/.canopy/prompts" hint state: the
+        // picker opened successfully but found nothing to list.
+        let mut dialog = dialog_with_presets(vec![]);
+        let original_sections = dialog.enabled_sections.clone();
+
+        handle_preset_picker_key(&mut dialog, KeyCode::Enter);
+
+        assert_eq!(dialog.picker_mode, SectionPickerMode::None);
+        assert_eq!(dialog.enabled_sections, original_sections);
     }
 }
 

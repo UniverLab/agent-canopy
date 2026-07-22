@@ -36,6 +36,16 @@ pub enum SectionPickerMode {
         selected: usize,
         entries: Vec<ProjectPickerEntry>,
     },
+    /// Prompt-preset picker (P2): entries are read fresh from
+    /// `~/.canopy/prompts/*.md` (P1) each time the picker opens — `(name,
+    /// preview, full content)`. `filter` is the user's typed substring
+    /// filter; `selected` indexes into the FILTERED list, mirroring
+    /// `NewAgentDialog`'s CLI picker (`cli_picker_idx`).
+    PresetPicker {
+        selected: usize,
+        entries: Vec<(String, String, String)>,
+        filter: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -441,6 +451,7 @@ impl SimplePromptDialog {
             sections.push(("rag_search", "RAG Search"));
         }
         sections.extend([("constraints", "Constraints"), ("tools", "Tools")]);
+        sections.push(("preset", "Preset"));
         sections
     }
 
@@ -461,6 +472,54 @@ impl SimplePromptDialog {
             }
         }
         entries
+    }
+
+    /// Collect prompt presets for the Preset picker (P2): every `*.md` file
+    /// under `dir` (typically `~/.canopy/prompts/`, see
+    /// `domain::prompts::prompts_dir`), sorted by name. Returns `(name,
+    /// preview, full content)` where `preview` is the file's first
+    /// non-empty line. Read fresh at picker-open time — no caching — so an
+    /// external edit shows up immediately (spec P2). A missing directory
+    /// yields an empty list rather than an error; an unreadable file is
+    /// skipped rather than aborting the whole listing.
+    pub fn collect_presets_for_picker(dir: &std::path::Path) -> Vec<(String, String, String)> {
+        let Ok(read_dir) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut entries: Vec<(String, String, String)> = read_dir
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("md"))
+            .filter_map(|entry| {
+                let path = entry.path();
+                let name = path.file_stem()?.to_str()?.to_string();
+                let content = std::fs::read_to_string(&path).ok()?;
+                let preview = content
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .unwrap_or("")
+                    .to_string();
+                Some((name, preview, content))
+            })
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
+    }
+
+    /// Indices into `entries` whose name matches `filter` as a
+    /// case-insensitive substring — the same "fuzzy" filter convention
+    /// `NewAgentDialog::filtered_cli_indices` uses for the CLI picker.
+    pub fn filtered_preset_indices(
+        entries: &[(String, String, String)],
+        filter: &str,
+    ) -> Vec<usize> {
+        let query = filter.trim().to_lowercase();
+        entries
+            .iter()
+            .enumerate()
+            .filter(|(_, (name, _, _))| query.is_empty() || name.to_lowercase().contains(&query))
+            .map(|(idx, _)| idx)
+            .collect()
     }
 
     pub fn collect_projects_for_picker(db: &Database) -> Result<Vec<ProjectPickerEntry>> {
@@ -1816,6 +1875,82 @@ fn strip_resources_section(prompt: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn preset_is_discoverable_via_the_add_section_list_like_tools() {
+        let dialog = SimplePromptDialog::new();
+        let names: Vec<&str> = dialog
+            .get_addable_sections()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert!(names.contains(&"preset"));
+        assert!(names.contains(&"tools"));
+    }
+
+    #[test]
+    fn collect_presets_for_picker_lists_md_files_sorted_with_preview() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("reviewer.md"),
+            "You are the reviewer.\n\nMore text.",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("implementer.md"),
+            "You are the implementer.",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "ignored, not .md").unwrap();
+
+        let entries = SimplePromptDialog::collect_presets_for_picker(dir.path());
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, "implementer");
+        assert_eq!(entries[0].1, "You are the implementer.");
+        assert_eq!(entries[0].2, "You are the implementer.");
+        assert_eq!(entries[1].0, "reviewer");
+        assert_eq!(entries[1].1, "You are the reviewer.");
+    }
+
+    #[test]
+    fn collect_presets_for_picker_returns_empty_for_missing_directory() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+
+        assert!(SimplePromptDialog::collect_presets_for_picker(&missing).is_empty());
+    }
+
+    #[test]
+    fn filtered_preset_indices_matches_case_insensitive_substring() {
+        let entries = vec![
+            (
+                "implementer".to_string(),
+                "preview".to_string(),
+                "content".to_string(),
+            ),
+            (
+                "reviewer".to_string(),
+                "preview".to_string(),
+                "content".to_string(),
+            ),
+            (
+                "resilience".to_string(),
+                "preview".to_string(),
+                "content".to_string(),
+            ),
+        ];
+
+        let filtered = SimplePromptDialog::filtered_preset_indices(&entries, "RE");
+        let names: Vec<&str> = filtered.iter().map(|&i| entries[i].0.as_str()).collect();
+        assert_eq!(names, vec!["reviewer", "resilience"]);
+
+        assert_eq!(
+            SimplePromptDialog::filtered_preset_indices(&entries, "").len(),
+            3
+        );
+        assert!(SimplePromptDialog::filtered_preset_indices(&entries, "zzz").is_empty());
+    }
 
     #[test]
     fn build_prompt_resolves_project_context_and_file_resources() {

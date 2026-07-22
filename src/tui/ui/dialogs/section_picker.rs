@@ -334,6 +334,124 @@ pub(crate) fn draw_section_picker_modal(
                 },
             );
         }
+        SectionPickerMode::PresetPicker {
+            selected,
+            entries,
+            filter,
+        } => {
+            let filtered = crate::tui::app::dialog::SimplePromptDialog::filtered_preset_indices(
+                entries, filter,
+            );
+            let height = (filtered.len() as u16 + 6).min(17);
+            let area = centered_rect(60, height.max(7), frame.area());
+            frame.render_widget(Clear, area);
+
+            let block = Block::default()
+                .title(" Preset ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(accent))
+                .style(Style::default().bg(Color::Rgb(10, 20, 30)));
+
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+
+            let mut filter_display = filter.clone();
+            filter_display.push('│');
+            let filter_line = Line::from(vec![
+                Span::styled("  🔍 ", Style::default().fg(DIM)),
+                Span::styled(filter_display, Style::default().fg(ACCENT)),
+            ]);
+            frame.render_widget(
+                Paragraph::new(filter_line),
+                ratatui::layout::Rect {
+                    x: inner.x,
+                    y: inner.y,
+                    width: inner.width,
+                    height: 1,
+                },
+            );
+
+            let list_y = inner.y + 1;
+            if entries.is_empty() {
+                let msg = Line::from(vec![Span::styled(
+                    "  no presets in ~/.canopy/prompts",
+                    Style::default().fg(Color::DarkGray),
+                )]);
+                frame.render_widget(
+                    Paragraph::new(msg),
+                    ratatui::layout::Rect {
+                        x: inner.x,
+                        y: list_y,
+                        width: inner.width,
+                        height: 1,
+                    },
+                );
+            } else if filtered.is_empty() {
+                let msg = Line::from(vec![Span::styled(
+                    "  no presets match",
+                    Style::default().fg(Color::DarkGray),
+                )]);
+                frame.render_widget(
+                    Paragraph::new(msg),
+                    ratatui::layout::Rect {
+                        x: inner.x,
+                        y: list_y,
+                        width: inner.width,
+                        height: 1,
+                    },
+                );
+            } else {
+                for (y_pos, (i, &idx)) in (list_y..).zip(filtered.iter().enumerate()) {
+                    if y_pos >= inner.y + inner.height.saturating_sub(1) {
+                        break;
+                    }
+                    let (name, preview, _) = &entries[idx];
+                    let is_selected = i == *selected;
+                    let style = if is_selected {
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(accent)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    let display = if preview.is_empty() {
+                        format!("  {name} ")
+                    } else {
+                        format!("  {name} — {preview} ")
+                    };
+                    frame.render_widget(
+                        Paragraph::new(Line::from(vec![Span::styled(display, style)])),
+                        ratatui::layout::Rect {
+                            x: inner.x,
+                            y: y_pos,
+                            width: inner.width,
+                            height: 1,
+                        },
+                    );
+                }
+            }
+
+            let hint = Line::from(vec![
+                Span::styled("↑↓ ", Style::default().fg(DIM)),
+                Span::styled("select  ", Style::default().fg(Color::White)),
+                Span::styled("type ", Style::default().fg(DIM)),
+                Span::styled("filter  ", Style::default().fg(Color::White)),
+                Span::styled("Enter ", Style::default().fg(DIM)),
+                Span::styled("insert  ", Style::default().fg(Color::White)),
+                Span::styled("Esc ", Style::default().fg(DIM)),
+                Span::styled("cancel", Style::default().fg(Color::White)),
+            ]);
+            frame.render_widget(
+                Paragraph::new(hint),
+                ratatui::layout::Rect {
+                    x: inner.x,
+                    y: inner.y + inner.height.saturating_sub(1),
+                    width: inner.width,
+                    height: 1,
+                },
+            );
+        }
         SectionPickerMode::None => {}
     }
 }
