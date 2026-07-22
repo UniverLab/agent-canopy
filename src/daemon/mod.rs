@@ -4,6 +4,7 @@
 //! with `Parameters<T>` for proper MCP protocol compliance.
 
 pub(crate) mod bridge;
+pub(crate) mod clean_cli;
 pub(crate) mod cli;
 pub(crate) mod doctor;
 pub(crate) mod handler_formatting;

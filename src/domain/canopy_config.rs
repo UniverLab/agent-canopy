@@ -61,6 +61,34 @@ pub struct CanopyConfig {
     /// fork-bombing the host.
     #[serde(default = "default_ensemble_concurrency_cap")]
     pub ensemble_concurrency_cap: usize,
+
+    /// `[clean]` settings for the `canopy clean` CLI command.
+    #[serde(default)]
+    pub clean: CleanConfig,
+}
+
+/// Settings for `canopy clean` (soft cleanup). Read from the `[clean]` table
+/// in `config.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CleanConfig {
+    /// Days of retention before orphaned/error/completed
+    /// `interactive_sessions` rows and orphaned log/terminal/RAG-residue
+    /// artifacts become eligible for removal. Overridable per-run with
+    /// `canopy clean --older-than <days>`.
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u64,
+}
+
+impl Default for CleanConfig {
+    fn default() -> Self {
+        Self {
+            retention_days: default_retention_days(),
+        }
+    }
+}
+
+fn default_retention_days() -> u64 {
+    7
 }
 
 /// Preferred unit for temperature display.
@@ -160,6 +188,7 @@ impl Default for CanopyConfig {
             projects_root: default_projects_root(),
             embeddings_idle_unload_secs: default_embeddings_idle_unload_secs(),
             ensemble_concurrency_cap: default_ensemble_concurrency_cap(),
+            clean: CleanConfig::default(),
         }
     }
 }
@@ -241,6 +270,31 @@ mod tests {
 
         let loaded = CanopyConfig::load(&canopy_dir);
         assert_eq!(loaded.ensemble_concurrency_cap, 4);
+    }
+
+    #[test]
+    fn test_config_without_clean_section_uses_default_retention_of_seven_days() {
+        let dir = TempDir::new().unwrap();
+        let canopy_dir = dir.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        // Simulates a config written before the `[clean]` table existed.
+        let toml = r#"embeddings_model = "intfloat/multilingual-e5-base""#;
+        std::fs::write(canopy_dir.join("config.toml"), toml).unwrap();
+
+        let loaded = CanopyConfig::load(&canopy_dir);
+        assert_eq!(loaded.clean.retention_days, 7);
+    }
+
+    #[test]
+    fn test_clean_retention_days_round_trips_via_config_toml() {
+        let dir = TempDir::new().unwrap();
+        let canopy_dir = dir.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        let toml = "[clean]\nretention_days = 3\n";
+        std::fs::write(canopy_dir.join("config.toml"), toml).unwrap();
+
+        let loaded = CanopyConfig::load(&canopy_dir);
+        assert_eq!(loaded.clean.retention_days, 3);
     }
 
     #[test]

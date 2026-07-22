@@ -874,6 +874,7 @@ impl Database {
 pub mod achievements;
 pub mod agent;
 pub mod blueprints;
+pub mod clean;
 pub mod ensembles;
 pub mod gamification;
 pub mod group;

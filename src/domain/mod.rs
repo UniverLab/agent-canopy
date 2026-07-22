@@ -5,6 +5,7 @@
 
 pub mod blueprints;
 pub mod canopy_config;
+pub mod clean;
 pub mod cli_config;
 pub mod cli_strategy;
 pub mod gamification;

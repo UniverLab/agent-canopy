@@ -30,6 +30,7 @@ mod watchers;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use daemon::bridge::run_bridge;
+use daemon::clean_cli::handle_clean_action;
 use daemon::cli::{handle_daemon_action, DaemonAction};
 use daemon::doctor::run_doctor;
 use daemon::loop_cli::{handle_loop_action, LoopAction};
@@ -89,6 +90,15 @@ enum Commands {
         #[command(subcommand)]
         action: SpecAction,
     },
+    /// Remove safely-removable stale data (soft cleanup, default mode).
+    Clean {
+        /// Preview what would be removed without deleting or modifying anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Override the configured retention window, in days.
+        #[arg(long = "older-than", value_name = "DAYS")]
+        older_than: Option<u64>,
+    },
     /// Discover file-backed prompt presets (~/.canopy/prompts/).
     Prompts {
         #[command(subcommand)]
@@ -140,6 +150,10 @@ async fn main() -> Result<()> {
         Some(Commands::Rag { action }) => handle_rag_action(action).await,
         Some(Commands::Loop { action }) => handle_loop_action(action).await,
         Some(Commands::Spec { action }) => handle_spec_action(action).await,
+        Some(Commands::Clean {
+            dry_run,
+            older_than,
+        }) => handle_clean_action(dry_run, older_than).await,
         Some(Commands::Prompts { action }) => handle_prompts_action(action).await,
         Some(Commands::Bridge {
             agent_id,
