@@ -1,6 +1,6 @@
 use crate::domain::sync::summarize_sync_context;
 
-use super::types::{AgentEntry, App, SidebarMode, SyncPanelState};
+use super::types::{AgentEntry, App, SidebarLayer, SyncPanelState};
 
 pub(crate) const ACTIVITY_PANEL_WIDTH: u16 = 34;
 const ACTIVITY_PANEL_MIN_WIDTH: u16 = 24;
@@ -58,7 +58,7 @@ impl App {
 
     pub(crate) fn activity_panel_state(&self) -> Option<SyncPanelState> {
         let state = self.selected_activity_state()?;
-        if self.sidebar_mode == SidebarMode::Projects {
+        if self.sidebar_layer == SidebarLayer::Knowledge {
             return Some(state);
         }
         // Terminal sessions hide the sync panel by default; an explicit toggle
@@ -95,7 +95,7 @@ impl App {
     }
 
     pub(crate) fn selected_activity_workdir(&self) -> Option<&str> {
-        if self.sidebar_mode == SidebarMode::Projects {
+        if self.sidebar_layer == SidebarLayer::Knowledge {
             return self.selected_project().map(|project| project.path.as_str());
         }
         match self.selected_agent()? {
@@ -136,7 +136,7 @@ impl App {
             .into_iter()
             .collect::<std::collections::HashSet<_>>();
         if recent_messages.is_empty() {
-            if self.sidebar_mode != SidebarMode::Projects {
+            if self.sidebar_layer != SidebarLayer::Knowledge {
                 return None;
             }
             return Some(SyncPanelState {
@@ -312,7 +312,7 @@ mod tests {
         let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
         let project = sample_project("/tmp/project");
         app.projects = vec![project];
-        app.sidebar_mode = SidebarMode::Projects;
+        app.sidebar_layer = SidebarLayer::Knowledge;
 
         assert_eq!(app.selected_activity_workdir(), Some("/tmp/project"));
     }
@@ -324,7 +324,7 @@ mod tests {
         let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
         let project = sample_project("/tmp/project");
         app.projects = vec![project];
-        app.sidebar_mode = SidebarMode::Projects;
+        app.sidebar_layer = SidebarLayer::Knowledge;
 
         let state = app
             .activity_panel_state()
@@ -342,7 +342,7 @@ mod tests {
         let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
         let project = sample_project("/tmp/project");
         app.projects = vec![project];
-        app.sidebar_mode = SidebarMode::Projects;
+        app.sidebar_layer = SidebarLayer::Knowledge;
 
         assert!(app.activity_panel_state().is_some());
         app.toggle_activity_panel();

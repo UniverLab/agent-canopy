@@ -1,4 +1,5 @@
-//! Sidebar rendering — agent cards split into Background and Interactive groups.
+//! Sidebar rendering — layered: RAG (pinned top) → Live → Automation →
+//! Knowledge (projects) → sysinfo (pinned bottom).
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -14,149 +15,47 @@ use super::{STATUS_DISABLED, STATUS_FAIL, STATUS_OK, STATUS_RUNNING};
 use crate::domain::loops::{Loop, LoopStatus};
 use crate::tui::agent::AgentStatus;
 use crate::tui::app::types::{
-    AgentEntry, AgentSectionFocus, App, Focus, LoopSidebarMeta, ProjectsPanelFocus, SidebarMode,
+    AgentEntry, AgentSectionFocus, App, AutomationKind, Focus, LoopSidebarMeta, SidebarLayer,
 };
 use ratatui::style::Color;
 
-/// Minimum rows reserved for the `loops`/`backlog`/`history`/`knowledge`
-/// sections when the projects sidebar overflows and sections must be shrunk
-/// to fit — each is "always present" (shown with a placeholder when empty,
-/// see `projects_layout_requirements`), so none of them may silently claim
-/// to exist while being allocated zero rows (bug T41).
-// Loop/history cards are 3 content rows tall (name, progress/status,
-// workdir); one full card plus its 2-row border is the minimum that can
-// show a single entry, not just a placeholder line.
-const MIN_LOOPS_HEIGHT: u16 = 5;
-const MIN_BACKLOG_HEIGHT: u16 = 3;
-const MIN_HISTORY_HEIGHT: u16 = 5;
-const MIN_KNOWLEDGE_HEIGHT: u16 = 4;
-/// Floor used for `projects`/`rag` under overflow — unlike the other four,
-/// they don't have their own placeholder-driven minimum, but still shouldn't
-/// be crushed to an unusable sliver by `fair_section_heights`' proportional
-/// split (see `section_floor`).
-const MIN_SECTION_HEIGHT: u16 = 3;
-
 pub(super) fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App) {
     app.sidebar_click_map.clear();
+    app.automation_loop_click_map.clear();
+    app.project_click_map.clear();
+    app.layer_header_click_map.clear();
     app.sidebar_visible_capacity = 0;
 
-    let (background_indices, interactive_indices, terminal_indices) = agent_indices_by_kind(app);
     let areas = split_sidebar_content(area, app);
 
-    if app.sidebar_mode == SidebarMode::Projects {
-        draw_projects_sidebar(frame, areas, app);
-        return;
+    let show_rag = app.rag_info.has_rag_activity() && areas.content.height >= 6;
+    let (rag_area, content_below) = split_top_panel(areas.content, show_rag, 6);
+
+    if let Some(rag_area) = rag_area.filter(|area| area.height >= 3) {
+        render_titled_panel(
+            frame,
+            rag_area,
+            rag_info_title(app),
+            Style::default().fg(if is_rag_focused(app) { ACCENT } else { DIM }),
+            rag_border_style(app),
+            |frame, inner| draw_rag_info(frame, inner, app),
+        );
     }
 
-    let has_agents = !background_indices.is_empty()
-        || !interactive_indices.is_empty()
-        || !terminal_indices.is_empty()
-        || !app.split_groups.is_empty();
-    if !has_agents {
-        draw_empty_agents_sidebar(frame, areas, app);
-        return;
-    }
+    let brain_area = draw_sidebar_layers(frame, content_below, app);
+    render_brain_or_graph(frame, brain_area, app);
 
-    draw_agents_sidebar(
-        frame,
-        areas,
-        &background_indices,
-        &interactive_indices,
-        &terminal_indices,
-        app,
-    );
+    render_dashboard_if_present(frame, areas.dashboard, app);
+
+    if let Some(dialog) = app.project_relation_dialog.as_ref() {
+        draw_project_relation_dialog(frame, areas.content, app, dialog);
+    }
 }
 
 #[derive(Clone, Copy)]
 struct SidebarContentAreas {
     content: Rect,
     dashboard: Option<Rect>,
-}
-
-#[derive(Default)]
-struct ProjectsLayout {
-    projects: Option<Rect>,
-    loops: Option<Rect>,
-    backlog: Option<Rect>,
-    history: Option<Rect>,
-    knowledge: Option<Rect>,
-    rag_queue: Option<Rect>,
-    brain: Option<Rect>,
-}
-
-#[derive(Default)]
-struct AgentLayout {
-    background: Option<Rect>,
-    interactive: Option<Rect>,
-    terminal: Option<Rect>,
-    groups: Option<Rect>,
-    brain: Option<Rect>,
-    rag_info: Option<Rect>,
-}
-
-#[derive(Clone, Copy, Default)]
-struct AgentSectionHeights {
-    background: Option<u16>,
-    interactive: Option<u16>,
-    terminal: Option<u16>,
-    groups: Option<u16>,
-}
-
-impl AgentSectionHeights {
-    fn total(self) -> u16 {
-        self.background.unwrap_or(0)
-            + self.interactive.unwrap_or(0)
-            + self.terminal.unwrap_or(0)
-            + self.groups.unwrap_or(0)
-    }
-
-    fn count(self) -> u16 {
-        self.background.is_some() as u16
-            + self.interactive.is_some() as u16
-            + self.terminal.is_some() as u16
-            + self.groups.is_some() as u16
-    }
-}
-
-#[derive(Clone, Copy)]
-struct ScrollState {
-    start: usize,
-    max_visible: usize,
-    has_up: bool,
-    has_down: bool,
-}
-
-#[derive(Clone, Copy)]
-struct AgentCardMeta<'a> {
-    accent: Color,
-    status_color: Color,
-    agent_type: &'static str,
-    type_detail: &'a str,
-    work_dir: Option<&'a str>,
-}
-
-#[derive(Clone, Copy)]
-struct GroupRowStyle {
-    bg: Color,
-    fg: Color,
-    modifier: Modifier,
-    prefix_color: Color,
-    active_tag: &'static str,
-}
-
-fn agent_indices_by_kind(app: &App) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
-    app.agents.iter().enumerate().fold(
-        (Vec::new(), Vec::new(), Vec::new()),
-        |mut indices, (index, agent)| {
-            match agent {
-                AgentEntry::Interactive(_) | AgentEntry::Orphaned(_) => indices.1.push(index),
-                AgentEntry::Terminal(_) => indices.2.push(index),
-                AgentEntry::Group(_) => {}
-                _ => indices.0.push(index),
-            }
-            indices
-        },
-    )
 }
 
 fn dashboard_height(app: &App) -> u16 {
@@ -188,6 +87,16 @@ fn split_sidebar_content(area: Rect, app: &App) -> SidebarContentAreas {
         )
     });
     SidebarContentAreas { content, dashboard }
+}
+
+fn split_top_panel(content: Rect, enabled: bool, top_height: u16) -> (Option<Rect>, Rect) {
+    if !enabled {
+        return (None, content);
+    }
+
+    let [top, bottom] =
+        Layout::vertical([Constraint::Length(top_height), Constraint::Min(0)]).areas(content);
+    (Some(top), bottom)
 }
 
 fn section_block<'a>(title: &'a str, title_style: Style, border_style: Style) -> Block<'a> {
@@ -228,6 +137,14 @@ fn take_top(area: &mut Rect, height: u16) -> Option<Rect> {
     Some(top)
 }
 
+#[derive(Clone, Copy)]
+struct ScrollState {
+    start: usize,
+    max_visible: usize,
+    has_up: bool,
+    has_down: bool,
+}
+
 fn scroll_state(total_items: usize, selected: Option<usize>, max_visible: usize) -> ScrollState {
     scroll_state_with_offset(total_items, selected, max_visible, 0)
 }
@@ -259,10 +176,10 @@ fn scroll_state_with_offset(
     }
 }
 
-fn render_brain_if_visible(frame: &mut Frame, area: Option<Rect>, app: &App) {
-    let Some(area) = area.filter(|area| area.height >= 3 && area.width >= 6) else {
+fn render_brain_if_visible(frame: &mut Frame, area: Rect, app: &App) {
+    if area.height < 3 || area.width < 6 {
         return;
-    };
+    }
     let Some(brain) = app.sidebar_brain.as_ref() else {
         return;
     };
@@ -281,490 +198,107 @@ fn render_dashboard_if_present(frame: &mut Frame, area: Option<Rect>, app: &App)
     );
 }
 
-fn draw_projects_sidebar(frame: &mut Frame, areas: SidebarContentAreas, app: &App) {
-    let rag_items = &app.global_rag_queue;
-    let active_loop_count = app.active_loops().len();
-    let finished_loop_count = app.finished_loops().len();
-    let show_rag_info = app.rag_info.has_rag_activity() && areas.content.height >= 6;
-    // ragInfo sits at the TOP of the projects sidebar so it's always visible.
-    let (rag_info_area, content_below) = split_top_panel(areas.content, show_rag_info, 6);
-    let needs = projects_layout_requirements(
-        app,
-        active_loop_count,
-        finished_loop_count,
-        rag_items,
-        content_below.height,
+/// Leftover space below the three layers: the project relation graph when
+/// there's something to show, else Brian's Brain.
+fn render_brain_or_graph(frame: &mut Frame, area: Rect, app: &App) {
+    if area.height == 0 {
+        return;
+    }
+    if !app.project_graph_trees.is_empty() && area.height >= 4 {
+        render_titled_panel(
+            frame,
+            area,
+            " project graph ",
+            Style::default().fg(DIM),
+            Style::default().fg(DIM),
+            |frame, inner| draw_project_graph(frame, inner, app),
+        );
+        return;
+    }
+    render_brain_if_visible(frame, area, app);
+}
+
+// ── Layer headers ─────────────────────────────────────────────────
+
+fn layer_label(layer: SidebarLayer) -> &'static str {
+    match layer {
+        SidebarLayer::Live => "Live",
+        SidebarLayer::Automation => "Automation",
+        SidebarLayer::Knowledge => "Knowledge",
+    }
+}
+
+fn layer_collapsed(app: &App, layer: SidebarLayer) -> bool {
+    match layer {
+        SidebarLayer::Live => app.live_collapsed,
+        SidebarLayer::Automation => app.automation_collapsed,
+        SidebarLayer::Knowledge => app.knowledge_collapsed,
+    }
+}
+
+fn layer_count(app: &App, layer: SidebarLayer) -> usize {
+    match layer {
+        SidebarLayer::Live => {
+            let (_, interactive, terminal) = agent_indices_by_kind(app);
+            interactive.len() + terminal.len() + app.split_groups.len()
+        }
+        SidebarLayer::Automation => {
+            let (background, _, _) = agent_indices_by_kind(app);
+            background.len() + app.active_loops().len()
+        }
+        SidebarLayer::Knowledge => app.projects.len(),
+    }
+}
+
+fn layer_focused(app: &App, layer: SidebarLayer) -> bool {
+    matches!(app.focus, Focus::Home | Focus::Preview)
+        && !app.playground_active
+        && !app.agents_rag_focused
+        && app.sidebar_layer == layer
+}
+
+/// Draws a layer's 1-row collapsible header (`▾ Live (3)`), registers it in
+/// `layer_header_click_map`, and returns the row it occupies.
+fn draw_layer_header(frame: &mut Frame, area: Rect, app: &mut App, layer: SidebarLayer) {
+    if area.height == 0 {
+        return;
+    }
+    let collapsed = layer_collapsed(app, layer);
+    let arrow = if collapsed { "▸" } else { "▾" };
+    let focused = layer_focused(app, layer);
+    let fg = if focused { ACCENT } else { Color::White };
+    let text = format!(
+        " {arrow} {} ({}) ",
+        layer_label(layer),
+        layer_count(app, layer)
     );
-    let layout = layout_projects_sections(content_below, &needs);
-
-    if let Some(rag_info_area) = rag_info_area.filter(|area| area.height >= 3) {
-        render_titled_panel(
-            frame,
-            rag_info_area,
-            " ragInfo ",
-            Style::default().fg(DIM),
-            projects_panel_border_style(app, ProjectsPanelFocus::RagInfo),
-            |frame, inner| draw_rag_info(frame, inner, app),
-        );
-    }
-
-    if let Some(projects_area) = layout.projects {
-        render_titled_panel(
-            frame,
-            projects_area,
-            " projects ",
-            Style::default().fg(DIM),
-            projects_panel_border_style(app, ProjectsPanelFocus::Projects),
-            |frame, inner| draw_projects_list(frame, inner, app),
-        );
-    }
-
-    if let Some(loops_area) = layout.loops {
-        render_titled_panel(
-            frame,
-            loops_area,
-            " loops ",
-            Style::default().fg(DIM),
-            projects_panel_border_style(app, ProjectsPanelFocus::Loops),
-            |frame, inner| draw_loops_list(frame, inner, app),
-        );
-    }
-
-    if let Some(backlog_area) = layout.backlog {
-        render_titled_panel(
-            frame,
-            backlog_area,
-            &format!(" backlog ({}) ", app.backlog_specs.len()),
-            Style::default().fg(DIM),
-            projects_panel_border_style(app, ProjectsPanelFocus::Backlog),
-            |frame, inner| draw_backlog_list(frame, inner, app),
-        );
-    }
-
-    if let Some(history_area) = layout.history {
-        render_titled_panel(
-            frame,
-            history_area,
-            &format!(" history ({}) ", finished_loop_count),
-            Style::default().fg(DIM),
-            projects_panel_border_style(app, ProjectsPanelFocus::History),
-            |frame, inner| draw_history_list(frame, inner, app),
-        );
-    }
-
-    if let Some(knowledge_area) = layout.knowledge {
-        render_titled_panel(
-            frame,
-            knowledge_area,
-            " knowledge ",
-            Style::default().fg(DIM),
-            projects_panel_border_style(app, ProjectsPanelFocus::Knowledge),
-            |frame, inner| draw_knowledge_list(frame, inner, app),
-        );
-    }
-
-    if let Some(rag_area) = layout.rag_queue.filter(|area| area.height >= 3) {
-        render_titled_panel(
-            frame,
-            rag_area,
-            rag_queue_title(app.rag_paused),
-            Style::default().fg(DIM),
-            Style::default().fg(DIM),
-            |frame, inner| draw_rag_queue(frame, inner, rag_items, app.selected_rag_queue),
-        );
-    }
-
-    render_brain_if_visible(frame, layout.brain, app);
-
-    // Project graph — show in brain area if we have graph trees
-    if !app.project_graph_trees.is_empty() {
-        if let Some(graph_area) = layout.brain.filter(|area| area.height >= 4) {
-            render_titled_panel(
-                frame,
-                graph_area,
-                " project graph ",
-                Style::default().fg(DIM),
-                Style::default().fg(DIM),
-                |frame, inner| draw_project_graph(frame, inner, app),
-            );
-        }
-    }
-
-    render_dashboard_if_present(frame, areas.dashboard, app);
-
-    // Project relation dialog overlay
-    if let Some(dialog) = app.project_relation_dialog.as_ref() {
-        draw_project_relation_dialog(frame, areas.content, app, dialog);
-    }
-}
-
-fn split_top_panel(content: Rect, enabled: bool, top_height: u16) -> (Option<Rect>, Rect) {
-    if !enabled {
-        return (None, content);
-    }
-
-    let [top, bottom] =
-        Layout::vertical([Constraint::Length(top_height), Constraint::Min(0)]).areas(content);
-    (Some(top), bottom)
-}
-
-/// Height each section of the projects sidebar would like, computed once per
-/// frame from the current data. `loops`, `backlog`, `history`, and
-/// `knowledge` are "always present" sections — they fall back to a small
-/// placeholder height when empty rather than disappearing (see
-/// `layout_projects_sections`), matching the pre-existing `loops`/`knowledge`
-/// convention. `projects` and `rag` are the only sections omitted outright
-/// when they have nothing to show.
-struct ProjectsSectionNeeds {
-    has_projects: bool,
-    projects: u16,
-    loops: u16,
-    backlog: u16,
-    history: u16,
-    knowledge: u16,
-    rag: u16,
-}
-
-/// Total box height (border + content) needed to show `count` stacked
-/// 3-content-row cards with a 1-row gap between them — used by `projects`,
-/// `loops`, and expanded `history`, whose entries all render via
-/// `draw_project_loop_card`/`draw_active_loop_card` (`row_h = 4`, but only
-/// the *last* visible card skips its trailing gap row). Plain `count*3+2`
-/// undercounts by one row per item beyond the first.
-fn card_section_height(count: u16) -> u16 {
-    if count == 0 {
-        0
-    } else {
-        count * 4 + 1
-    }
-}
-
-fn projects_layout_requirements(
-    app: &App,
-    active_loop_count: usize,
-    finished_loop_count: usize,
-    rag_items: &[crate::db::project::RagQueueItem],
-    content_height: u16,
-) -> ProjectsSectionNeeds {
-    let has_projects = !app.projects.is_empty();
-    let projects = if has_projects {
-        card_section_height(app.projects.len() as u16).min(content_height)
-    } else {
-        0
-    };
-    let loops = if active_loop_count > 0 {
-        card_section_height(active_loop_count as u16).min(content_height)
-    } else {
-        MIN_LOOPS_HEIGHT.min(content_height)
-    };
-    let backlog = if !app.backlog_specs.is_empty() {
-        (app.backlog_specs.len() as u16 + 2).min(content_height)
-    } else {
-        MIN_BACKLOG_HEIGHT.min(content_height)
-    };
-    let history = if !app.history_collapsed && finished_loop_count > 0 {
-        card_section_height(finished_loop_count as u16).min(content_height)
-    } else {
-        MIN_HISTORY_HEIGHT.min(content_height)
-    };
-    let knowledge = if !app.project_knowledge.is_empty() {
-        (app.project_knowledge.len() as u16 * 3 + 2).min(12)
-    } else {
-        MIN_KNOWLEDGE_HEIGHT.min(content_height)
-    };
-    let rag = if app.playground_active && !rag_items.is_empty() {
-        (rag_items.len() as u16 * 2 + 3).min(14)
-    } else {
-        0
-    };
-
-    ProjectsSectionNeeds {
-        has_projects,
-        projects,
-        loops,
-        backlog,
-        history,
-        knowledge,
-        rag,
-    }
-}
-
-fn rag_queue_title(rag_paused: bool) -> &'static str {
-    if rag_paused {
-        " ragQueue ⏸ "
-    } else {
-        " ragQueue "
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ProjectsSectionKind {
-    Projects,
-    Loops,
-    Backlog,
-    History,
-    Knowledge,
-    Rag,
-}
-
-fn assign_projects_rect(
-    layout: &mut ProjectsLayout,
-    kind: ProjectsSectionKind,
-    rect: Option<Rect>,
-) {
-    match kind {
-        ProjectsSectionKind::Projects => layout.projects = rect,
-        ProjectsSectionKind::Loops => layout.loops = rect,
-        ProjectsSectionKind::Backlog => layout.backlog = rect,
-        ProjectsSectionKind::History => layout.history = rect,
-        ProjectsSectionKind::Knowledge => layout.knowledge = rect,
-        ProjectsSectionKind::Rag => layout.rag_queue = rect,
-    }
-}
-
-/// Guaranteed minimum height for a section, capped at its own demand — one
-/// full entry (or the empty-state placeholder) plus its 2-row border, so a
-/// section is never reserved more than it could ever use.
-fn section_floor(kind: ProjectsSectionKind, demand: u16) -> u16 {
-    let floor = match kind {
-        ProjectsSectionKind::Loops => MIN_LOOPS_HEIGHT,
-        ProjectsSectionKind::Backlog => MIN_BACKLOG_HEIGHT,
-        ProjectsSectionKind::History => MIN_HISTORY_HEIGHT,
-        ProjectsSectionKind::Knowledge => MIN_KNOWLEDGE_HEIGHT,
-        ProjectsSectionKind::Projects | ProjectsSectionKind::Rag => MIN_SECTION_HEIGHT,
-    };
-    floor.min(demand)
-}
-
-/// Priority order for reserving each section's floor when the budget can't
-/// cover every floor at once (see `layout_projects_sections`). `Loops` goes
-/// first — "what's running right now" is the sidebar's headline concern —
-/// then `Backlog`/`History` (this change's other two sections), then the
-/// pre-existing `Knowledge`, then `Projects` (which, being a per-project
-/// list, degrades the most gracefully by just showing fewer projects) and
-/// finally `Rag` (already omitted outright unless the playground is open).
-const PROJECTS_SECTION_FLOOR_PRIORITY: [ProjectsSectionKind; 6] = [
-    ProjectsSectionKind::Loops,
-    ProjectsSectionKind::Backlog,
-    ProjectsSectionKind::History,
-    ProjectsSectionKind::Knowledge,
-    ProjectsSectionKind::Projects,
-    ProjectsSectionKind::Rag,
-];
-
-/// Lays out every projects-sidebar section top-to-bottom. `loops`, `backlog`,
-/// `history`, and `knowledge` are always included (with their placeholder
-/// height when empty); `projects`/`rag` are included only when they have
-/// something to show.
-///
-/// Every included section is first reserved its `section_floor`, taken in
-/// `PROJECTS_SECTION_FLOOR_PRIORITY` order so higher-priority sections keep
-/// their floor even if the budget runs out before reaching the rest (bug
-/// T41: a demanding section like `projects` with many entries must not
-/// out-vote a small one like `loops` down to 0). Whatever budget remains
-/// after every floor is then handed out by `fair_section_heights` — the same
-/// max-min-fair allocator the agents sidebar uses — proportional to each
-/// section's remaining (above-floor) demand, and any leftover becomes
-/// `brain`.
-fn layout_projects_sections(content_top: Rect, needs: &ProjectsSectionNeeds) -> ProjectsLayout {
-    let mut kinds: Vec<ProjectsSectionKind> = Vec::new();
-    let mut demands: Vec<u16> = Vec::new();
-
-    if needs.has_projects {
-        kinds.push(ProjectsSectionKind::Projects);
-        demands.push(needs.projects);
-    }
-    kinds.push(ProjectsSectionKind::Loops);
-    demands.push(needs.loops);
-    kinds.push(ProjectsSectionKind::Backlog);
-    demands.push(needs.backlog);
-    kinds.push(ProjectsSectionKind::History);
-    demands.push(needs.history);
-    kinds.push(ProjectsSectionKind::Knowledge);
-    demands.push(needs.knowledge);
-    if needs.rag > 0 {
-        kinds.push(ProjectsSectionKind::Rag);
-        demands.push(needs.rag);
-    }
-
-    let mut floors = vec![0u16; kinds.len()];
-    let mut budget_left = content_top.height;
-    for &want_kind in &PROJECTS_SECTION_FLOOR_PRIORITY {
-        if let Some(i) = kinds.iter().position(|&kind| kind == want_kind) {
-            let floor = section_floor(want_kind, demands[i]).min(budget_left);
-            floors[i] = floor;
-            budget_left -= floor;
-        }
-    }
-
-    let extra_demands: Vec<u16> = demands
-        .iter()
-        .zip(floors.iter())
-        .map(|(&demand, &floor)| demand - floor)
-        .collect();
-    let extra_alloc = fair_section_heights(&extra_demands, budget_left);
-    let allocation: Vec<u16> = floors
-        .iter()
-        .zip(extra_alloc.iter())
-        .map(|(&floor, &extra)| floor + extra)
-        .collect();
-
-    let mut layout = ProjectsLayout::default();
-    let mut remaining = content_top;
-    for (&kind, &height) in kinds.iter().zip(allocation.iter()) {
-        let rect = take_top(&mut remaining, height);
-        assign_projects_rect(&mut layout, kind, rect);
-    }
-    if remaining.height > 0 {
-        layout.brain = Some(remaining);
-    }
-    layout
-}
-
-fn draw_empty_agents_sidebar(frame: &mut Frame, areas: SidebarContentAreas, app: &App) {
-    let show_rag_info = app.rag_info.has_rag_activity() && areas.content.height >= 9;
-    let (brain_area, rag_info_area) = if show_rag_info {
-        let [top, bottom] =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(6)]).areas(areas.content);
-        (Some(top), Some(bottom))
-    } else {
-        (Some(areas.content), None)
-    };
-
-    render_brain_if_visible(frame, brain_area, app);
-    if let Some(rag_info_area) = rag_info_area {
-        draw_agents_rag_info_panel(frame, rag_info_area, app);
-    }
-    render_dashboard_if_present(frame, areas.dashboard, app);
-}
-
-fn draw_agents_sidebar(
-    frame: &mut Frame,
-    areas: SidebarContentAreas,
-    background_indices: &[usize],
-    interactive_indices: &[usize],
-    terminal_indices: &[usize],
-    app: &mut App,
-) {
-    let show_rag_info = app.rag_info.has_rag_activity() && areas.content.height >= 10;
-    // ragInfo sits at the TOP so it's always visible, same as the projects sidebar.
-    let (rag_info_area, content_area) = if show_rag_info {
-        let [top, bottom] =
-            Layout::vertical([Constraint::Length(6), Constraint::Min(0)]).areas(areas.content);
-        (Some(top), bottom)
-    } else {
-        (None, areas.content)
-    };
-
-    let heights = AgentSectionHeights {
-        background: (!background_indices.is_empty())
-            .then_some(background_indices.len() as u16 * 4 + 2),
-        interactive: (!interactive_indices.is_empty())
-            .then_some(interactive_indices.len() as u16 * 4 + 2),
-        terminal: (!terminal_indices.is_empty()).then_some(terminal_indices.len() as u16 * 4 + 2),
-        groups: (!app.split_groups.is_empty()).then_some(app.split_groups.len() as u16 * 2 + 2),
-    };
-    let mut layout = layout_agent_sections(content_area, heights);
-    layout.rag_info = rag_info_area;
-
-    render_agent_list_panel(
-        frame,
-        layout.background,
-        " background ",
-        background_indices,
-        app,
-        ACCENT,
-        AgentSectionFocus::Background,
+    let bg = if focused { BG_SELECTED } else { Color::Reset };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            text,
+            Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
+        )))
+        .style(Style::default().bg(bg)),
+        Rect::new(area.x, area.y, area.width, 1),
     );
-    render_agent_list_panel(
-        frame,
-        layout.interactive,
-        " interactive ",
-        interactive_indices,
-        app,
-        INTERACTIVE_COLOR,
-        AgentSectionFocus::Interactive,
-    );
-    render_agent_list_panel(
-        frame,
-        layout.terminal,
-        " terminal ",
-        terminal_indices,
-        app,
-        Color::Green,
-        AgentSectionFocus::Terminal,
-    );
-    render_groups_panel(frame, layout.groups, app, AgentSectionFocus::Groups);
-    render_brain_if_visible(frame, layout.brain, app);
-    if let Some(rag_info_area) = layout.rag_info {
-        draw_agents_rag_info_panel(frame, rag_info_area, app);
-    }
-    render_dashboard_if_present(frame, areas.dashboard, app);
+    app.layer_header_click_map.push((layer, area.y, area.y + 1));
 }
 
-fn layout_agent_sections(content_area: Rect, heights: AgentSectionHeights) -> AgentLayout {
-    let total_needed = heights.total();
-    let section_count = heights.count();
-    let mut layout = AgentLayout::default();
-    let mut remaining = content_area;
+// ── Layer bodies ─────────────────────────────────────────────────
 
-    if total_needed <= content_area.height || section_count == 1 {
-        if let Some(height) = heights.background {
-            layout.background = take_top(&mut remaining, height);
-        }
-        if let Some(height) = heights.interactive {
-            layout.interactive = take_top(&mut remaining, height);
-        }
-        if let Some(height) = heights.terminal {
-            layout.terminal = take_top(&mut remaining, height);
-        }
-        if let Some(height) = heights.groups.filter(|_| remaining.height > 0) {
-            layout.groups = take_top(&mut remaining, height);
-        }
-        if remaining.height > 0 {
-            layout.brain = Some(remaining);
-        }
-        return layout;
-    }
-
-    // Overflow: the sections don't all fit. Instead of an equal `height /
-    // section_count` slice for everyone — which hands small sections
-    // (background/terminal/groups) a fat slice they can't fill, leaving empty
-    // gaps while `interactive` scrolls — allocate with max-min fairness so no
-    // section ends up taller than its content.
-    let mut kinds: Vec<AgentSectionKind> = Vec::new();
-    let mut demands: Vec<u16> = Vec::new();
-    for (kind, height) in [
-        (AgentSectionKind::Background, heights.background),
-        (AgentSectionKind::Interactive, heights.interactive),
-        (AgentSectionKind::Terminal, heights.terminal),
-        (AgentSectionKind::Groups, heights.groups),
-    ] {
-        if let Some(height) = height {
-            kinds.push(kind);
-            demands.push(height);
-        }
-    }
-
-    let allocation = fair_section_heights(&demands, content_area.height);
-    for (kind, &height) in kinds.iter().zip(allocation.iter()) {
-        let rect = take_top(&mut remaining, height);
-        match kind {
-            AgentSectionKind::Background => layout.background = rect,
-            AgentSectionKind::Interactive => layout.interactive = rect,
-            AgentSectionKind::Terminal => layout.terminal = rect,
-            AgentSectionKind::Groups => layout.groups = rect,
-        }
-    }
-    layout
-}
-
-#[derive(Clone, Copy)]
-enum AgentSectionKind {
-    Background,
-    Interactive,
-    Terminal,
-    Groups,
+fn agent_indices_by_kind(app: &App) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+    app.agents.iter().enumerate().fold(
+        (Vec::new(), Vec::new(), Vec::new()),
+        |mut indices, (index, agent)| {
+            match agent {
+                AgentEntry::Interactive(_) | AgentEntry::Orphaned(_) => indices.1.push(index),
+                AgentEntry::Terminal(_) => indices.2.push(index),
+                AgentEntry::Group(_) => {}
+                _ => indices.0.push(index),
+            }
+            indices
+        },
+    )
 }
 
 /// Split `budget` rows across sections with the given `demands` using max-min
@@ -836,6 +370,249 @@ fn fair_section_heights(demands: &[u16], budget: u16) -> Vec<u16> {
     alloc
 }
 
+/// Rows needed for a card-style sub-list (agent cards, loop cards): 0 when
+/// empty, else `count*4+2` (3-row cards + 1-row gap + 2-row border).
+fn card_list_demand(count: usize) -> u16 {
+    if count == 0 {
+        0
+    } else {
+        count as u16 * 4 + 2
+    }
+}
+
+/// Rows needed for the compact groups list: 0 when empty, else
+/// `count*2+2` (1-row entries + 1-row gap + 2-row border, see `draw_groups_list`).
+fn groups_list_demand(count: usize) -> u16 {
+    if count == 0 {
+        0
+    } else {
+        count as u16 * 2 + 2
+    }
+}
+
+fn live_body_demand(app: &App, interactive: &[usize], terminal: &[usize]) -> u16 {
+    card_list_demand(interactive.len())
+        + card_list_demand(terminal.len())
+        + groups_list_demand(app.split_groups.len())
+}
+
+fn automation_body_demand(app: &App, background: &[usize]) -> u16 {
+    card_list_demand(background.len()) + card_list_demand(app.active_loops().len())
+}
+
+fn knowledge_body_demand(app: &App) -> u16 {
+    if app.projects.is_empty() {
+        2
+    } else {
+        card_list_demand(app.projects.len())
+    }
+}
+
+/// Lays out and draws the three sidebar layers top-to-bottom, returning the
+/// leftover area (for the project graph / Brian's Brain).
+fn draw_sidebar_layers(frame: &mut Frame, area: Rect, app: &mut App) -> Rect {
+    let (background_indices, interactive_indices, terminal_indices) = agent_indices_by_kind(app);
+
+    let header_budget = 3.min(area.height);
+    let body_budget = area.height.saturating_sub(header_budget);
+    let demands = [
+        if app.live_collapsed {
+            0
+        } else {
+            live_body_demand(app, &interactive_indices, &terminal_indices)
+        },
+        if app.automation_collapsed {
+            0
+        } else {
+            automation_body_demand(app, &background_indices)
+        },
+        if app.knowledge_collapsed {
+            0
+        } else {
+            knowledge_body_demand(app)
+        },
+    ];
+    let alloc = fair_section_heights(&demands, body_budget);
+
+    let mut remaining = area;
+
+    if let Some(header) = take_top(&mut remaining, 1) {
+        draw_layer_header(frame, header, app, SidebarLayer::Live);
+    }
+    if let Some(body) = take_top(&mut remaining, alloc[0]) {
+        draw_live_body(frame, body, app, &interactive_indices, &terminal_indices);
+    }
+
+    if let Some(header) = take_top(&mut remaining, 1) {
+        draw_layer_header(frame, header, app, SidebarLayer::Automation);
+    }
+    if let Some(body) = take_top(&mut remaining, alloc[1]) {
+        draw_automation_body(frame, body, app, &background_indices);
+    }
+
+    if let Some(header) = take_top(&mut remaining, 1) {
+        draw_layer_header(frame, header, app, SidebarLayer::Knowledge);
+    }
+    if let Some(body) = take_top(&mut remaining, alloc[2]) {
+        draw_knowledge_body(frame, body, app);
+    }
+
+    remaining
+}
+
+fn draw_live_body(
+    frame: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    interactive_indices: &[usize],
+    terminal_indices: &[usize],
+) {
+    let demands = [
+        card_list_demand(interactive_indices.len()),
+        card_list_demand(terminal_indices.len()),
+        groups_list_demand(app.split_groups.len()),
+    ];
+    let alloc = fair_section_heights(&demands, area.height);
+    let mut remaining = area;
+
+    if let Some(sub) = take_top(&mut remaining, alloc[0]) {
+        let border_style = agent_section_border_style(app, AgentSectionFocus::Interactive);
+        render_agent_list_panel(
+            frame,
+            Some(sub),
+            " interactive ",
+            interactive_indices,
+            app,
+            INTERACTIVE_COLOR,
+            border_style,
+        );
+    }
+    if let Some(sub) = take_top(&mut remaining, alloc[1]) {
+        let border_style = agent_section_border_style(app, AgentSectionFocus::Terminal);
+        render_agent_list_panel(
+            frame,
+            Some(sub),
+            " terminal ",
+            terminal_indices,
+            app,
+            Color::Green,
+            border_style,
+        );
+    }
+    if let Some(sub) = take_top(&mut remaining, alloc[2]) {
+        render_groups_panel(frame, Some(sub), app, AgentSectionFocus::Groups);
+    }
+}
+
+fn draw_automation_body(
+    frame: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    background_indices: &[usize],
+) {
+    let loop_count = app.active_loops().len();
+    let demands = [
+        card_list_demand(background_indices.len()),
+        card_list_demand(loop_count),
+    ];
+    let alloc = fair_section_heights(&demands, area.height);
+    let mut remaining = area;
+
+    if let Some(sub) = take_top(&mut remaining, alloc[0]) {
+        let border_style = automation_agents_border_style(app);
+        render_agent_list_panel(
+            frame,
+            Some(sub),
+            " agents ",
+            background_indices,
+            app,
+            ACCENT,
+            border_style,
+        );
+    }
+    if let Some(sub) = take_top(&mut remaining, alloc[1]) {
+        render_titled_panel(
+            frame,
+            sub,
+            " loops ",
+            Style::default().fg(DIM),
+            automation_border_style(app, AutomationKind::Loop),
+            |frame, inner| draw_automation_loops_list(frame, inner, app),
+        );
+    }
+}
+
+fn draw_knowledge_body(frame: &mut Frame, area: Rect, app: &mut App) {
+    render_titled_panel(
+        frame,
+        area,
+        " projects ",
+        Style::default().fg(DIM),
+        knowledge_border_style(app),
+        |frame, inner| draw_projects_list(frame, inner, app),
+    );
+}
+
+// ── Focus/border styling ────────────────────────────────────────────
+
+fn is_rag_focused(app: &App) -> bool {
+    matches!(app.focus, Focus::Home | Focus::Preview)
+        && app.agents_rag_focused
+        && !app.playground_active
+}
+
+fn rag_info_title(app: &App) -> &'static str {
+    if app.rag_paused {
+        " ragInfo ⏸ "
+    } else {
+        " ragInfo "
+    }
+}
+
+fn rag_border_style(app: &App) -> Style {
+    Style::default().fg(if is_rag_focused(app) {
+        ACCENT
+    } else {
+        BORDER_COLOR
+    })
+}
+
+fn knowledge_border_style(app: &App) -> Style {
+    let focused = layer_focused(app, SidebarLayer::Knowledge);
+    Style::default().fg(if focused { ACCENT } else { BORDER_COLOR })
+}
+
+fn automation_border_style(app: &App, kind: AutomationKind) -> Style {
+    let focused = layer_focused(app, SidebarLayer::Automation) && app.automation_kind == kind;
+    Style::default().fg(if focused { ACCENT } else { BORDER_COLOR })
+}
+
+fn agent_section_border_style(app: &App, section: AgentSectionFocus) -> Style {
+    let focused = if matches!(app.focus, Focus::Home | Focus::Preview) {
+        layer_focused(app, SidebarLayer::Live) && app.agent_section_focus == section
+    } else if app.focus == Focus::Agent {
+        match app.agents.get(app.selected) {
+            Some(AgentEntry::Interactive(_) | AgentEntry::Orphaned(_)) => {
+                section == AgentSectionFocus::Interactive
+            }
+            Some(AgentEntry::Terminal(_)) => section == AgentSectionFocus::Terminal,
+            Some(AgentEntry::Group(_)) => section == AgentSectionFocus::Groups,
+            _ => false,
+        }
+    } else {
+        false
+    };
+
+    Style::default().fg(if focused { ACCENT } else { BORDER_COLOR })
+}
+
+/// Border style for the Automation layer's `agents` sub-panel — distinct
+/// from `agent_section_border_style` (Live's Interactive/Terminal/Groups)
+/// since Automation tracks its active sub-list via `automation_kind`.
+fn automation_agents_border_style(app: &App) -> Style {
+    automation_border_style(app, AutomationKind::Agent)
+}
+
 fn render_agent_list_panel(
     frame: &mut Frame,
     area: Option<Rect>,
@@ -843,7 +620,7 @@ fn render_agent_list_panel(
     indices: &[usize],
     app: &mut App,
     accent: Color,
-    section: AgentSectionFocus,
+    border_style: Style,
 ) {
     let Some(area) = area else {
         return;
@@ -853,7 +630,7 @@ fn render_agent_list_panel(
         area,
         title,
         Style::default().fg(DIM),
-        agent_section_border_style(app, section),
+        border_style,
         |frame, inner| draw_agent_list(frame, inner, indices, app, accent),
     );
 }
@@ -877,7 +654,9 @@ fn render_groups_panel(
     );
 }
 
-fn draw_projects_list(frame: &mut Frame, area: Rect, app: &App) {
+// ── Knowledge layer: projects list ──────────────────────────────────
+
+fn draw_projects_list(frame: &mut Frame, area: Rect, app: &mut App) {
     if app.projects.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -892,35 +671,54 @@ fn draw_projects_list(frame: &mut Frame, area: Rect, app: &App) {
     let scroll = scroll_state(
         app.projects.len(),
         Some(app.selected_project),
-        (area.height / 4).max(1) as usize, // Ajustado para cards de 3 + separación
+        (area.height / 4).max(1) as usize,
     );
-    let panel_focused = app.projects_panel_focus == ProjectsPanelFocus::Projects;
+    let panel_focused = knowledge_border_style_is_focused(app);
     let mut y = area.y;
     let row_h = 4u16;
 
-    for (idx, project) in app
+    // Collected up front (rather than iterating `app.projects` directly) so
+    // the loop body can also push into `app.project_click_map` — mirrors
+    // `draw_automation_loops_list`'s `loop_ids_and_meta` pattern, since both
+    // borrow `app` mutably for the click map alongside the data being drawn.
+    let visible: Vec<(usize, String, String, String)> = app
         .projects
         .iter()
         .enumerate()
         .skip(scroll.start)
         .take(scroll.max_visible)
-    {
+        .map(|(idx, project)| {
+            (
+                idx,
+                project.name.clone(),
+                project.hash.clone(),
+                last_two_segments(&project.path),
+            )
+        })
+        .collect();
+
+    for (idx, name, hash, path) in &visible {
         if y + 3 > area.y + area.height {
             break;
         }
         draw_project_loop_card(
             frame,
             Rect::new(area.x, y, area.width, 3),
-            idx == app.selected_project,
-            &project.name,
-            &project.hash,
-            &last_two_segments(&project.path),
+            *idx == app.selected_project,
+            name,
+            hash,
+            path,
             panel_focused,
         );
-        y += row_h; // card + gap visual
+        app.project_click_map.push((*idx, y, y + 3));
+        y += row_h;
     }
 
     draw_scroll_indicators(frame, area, scroll.has_up, scroll.has_down);
+}
+
+fn knowledge_border_style_is_focused(app: &App) -> bool {
+    layer_focused(app, SidebarLayer::Knowledge)
 }
 
 fn draw_project_loop_card(
@@ -961,118 +759,7 @@ fn draw_project_loop_card(
     );
 }
 
-fn draw_knowledge_list(frame: &mut Frame, area: Rect, app: &App) {
-    let filtered = app.filtered_knowledge_indices();
-    let filter_active = app.knowledge_filter_mode || !app.knowledge_filter.trim().is_empty();
-    let list_area = if filter_active && area.height > 1 {
-        let filter_text = if app.knowledge_filter_mode {
-            format!("Filter: {}_", app.knowledge_filter)
-        } else {
-            format!("Filter: {}", app.knowledge_filter)
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                truncate_str(&filter_text, area.width as usize),
-                Style::default().fg(Color::Yellow),
-            ))),
-            Rect::new(area.x, area.y, area.width, 1),
-        );
-        Rect::new(
-            area.x,
-            area.y + 1,
-            area.width,
-            area.height.saturating_sub(1),
-        )
-    } else {
-        area
-    };
-
-    if filtered.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                if app.project_knowledge.is_empty() {
-                    "No knowledge yet. Agents can add facts/patterns."
-                } else {
-                    "No knowledge matches the current filter."
-                },
-                Style::default().fg(Color::DarkGray),
-            ))),
-            list_area,
-        );
-        return;
-    }
-
-    let scroll = scroll_state(
-        filtered.len(),
-        app.selected_filtered_knowledge_index(),
-        (list_area.height / 3).max(1) as usize,
-    );
-    let panel_focused = app.projects_panel_focus == ProjectsPanelFocus::Knowledge;
-    let mut y = list_area.y;
-    let row_h = 3u16;
-
-    for (display_idx, node_idx) in filtered
-        .iter()
-        .skip(scroll.start)
-        .take(scroll.max_visible)
-        .enumerate()
-    {
-        if y + 2 > list_area.y + list_area.height {
-            break;
-        }
-        let node = &app.project_knowledge[*node_idx];
-        let selected = Some(display_idx + scroll.start) == app.selected_filtered_knowledge_index();
-        draw_knowledge_card(
-            frame,
-            Rect::new(list_area.x, y, list_area.width, 2),
-            selected,
-            &node.title,
-            &node.kind,
-            panel_focused,
-        );
-        y += row_h;
-    }
-
-    draw_scroll_indicators(frame, list_area, scroll.has_up, scroll.has_down);
-}
-
-fn draw_knowledge_card(
-    frame: &mut Frame,
-    area: Rect,
-    selected: bool,
-    title: &str,
-    kind: &str,
-    panel_focused: bool,
-) {
-    let bg = if selected { BG_SELECTED } else { Color::Reset };
-    let kind_color = if kind == "fact" {
-        Color::Cyan
-    } else {
-        Color::Magenta
-    };
-    let title_style = if selected && panel_focused {
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::White)
-    };
-
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            truncate_str(title, area.width as usize),
-            title_style,
-        )))
-        .style(Style::default().bg(bg)),
-        Rect::new(area.x, area.y, area.width, 1),
-    );
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!("[{}]", kind),
-            Style::default().fg(kind_color),
-        )))
-        .style(Style::default().bg(bg)),
-        Rect::new(area.x, area.y + 1, area.width, 1),
-    );
-}
+// ── Automation layer: loops sub-list ────────────────────────────────
 
 /// Status icon shown on an active loop's card: running takes priority, then
 /// blocked (a paused loop whose latest run recorded a `loop_report_blocker`
@@ -1131,7 +818,7 @@ fn draw_active_loop_card(
     );
 }
 
-fn draw_loops_list(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_automation_loops_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let loops = app.active_loops();
     if loops.is_empty() {
         frame.render_widget(
@@ -1151,158 +838,36 @@ fn draw_loops_list(frame: &mut Frame, area: Rect, app: &App) {
     let scroll = scroll_state(
         loops.len(),
         selected_index,
-        // Only the *last* visible card skips its trailing gap row, so a
-        // plain `height / row_h` undercounts by one card whenever `height`
-        // is an exact fit (e.g. 7 rows is enough for 2 cards, not 1).
         ((area.height + 1) / 4).max(1) as usize,
     );
-    let panel_focused = app.projects_panel_focus == ProjectsPanelFocus::Loops;
+    let panel_focused =
+        layer_focused(app, SidebarLayer::Automation) && app.automation_kind == AutomationKind::Loop;
     let mut y = area.y;
     let row_h = 4u16;
 
-    for lp in loops
+    let loop_ids_and_meta: Vec<(String, Loop, LoopSidebarMeta)> = loops
         .iter()
         .copied()
         .skip(scroll.start)
         .take(scroll.max_visible)
-    {
+        .map(|lp| {
+            let meta = app
+                .loop_sidebar_meta
+                .get(&lp.id)
+                .copied()
+                .unwrap_or_default();
+            (lp.id.clone(), lp.clone(), meta)
+        })
+        .collect();
+
+    for (id, lp, meta) in &loop_ids_and_meta {
         if y + 3 > area.y + area.height {
             break;
         }
-        let meta = app
-            .loop_sidebar_meta
-            .get(&lp.id)
-            .copied()
-            .unwrap_or_default();
-        draw_active_loop_card(
-            frame,
-            Rect::new(area.x, y, area.width, 3),
-            app.selected_loop_id.as_deref() == Some(lp.id.as_str()),
-            lp,
-            meta,
-            panel_focused,
-        );
-        y += row_h;
-    }
-
-    draw_scroll_indicators(frame, area, scroll.has_up, scroll.has_down);
-}
-
-fn draw_backlog_list(frame: &mut Frame, area: Rect, app: &App) {
-    if app.backlog_specs.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "No backlog specs",
-                Style::default().fg(Color::DarkGray),
-            ))),
-            area,
-        );
-        return;
-    }
-
-    let panel_focused = app.projects_panel_focus == ProjectsPanelFocus::Backlog;
-    let scroll = scroll_state(
-        app.backlog_specs.len(),
-        Some(app.selected_backlog),
-        area.height.max(1) as usize,
-    );
-    let mut y = area.y;
-
-    for (display_idx, spec) in app
-        .backlog_specs
-        .iter()
-        .skip(scroll.start)
-        .take(scroll.max_visible)
-        .enumerate()
-    {
-        if y >= area.y + area.height {
-            break;
-        }
-        let selected = display_idx + scroll.start == app.selected_backlog;
-        let bg = if selected { BG_SELECTED } else { Color::Reset };
-        let title_style = if selected && panel_focused {
-            Style::default()
-                .fg(Color::Black)
-                .bg(ACCENT)
-                .add_modifier(Modifier::BOLD)
-        } else if selected {
-            Style::default()
-                .fg(Color::White)
-                .bg(BG_SELECTED)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                truncate_str(&spec.name, area.width as usize),
-                title_style,
-            )))
-            .style(Style::default().bg(bg)),
-            Rect::new(area.x, y, area.width, 1),
-        );
-        y += 1;
-    }
-
-    draw_scroll_indicators(frame, area, scroll.has_up, scroll.has_down);
-}
-
-fn draw_history_list(frame: &mut Frame, area: Rect, app: &App) {
-    let finished = app.finished_loops();
-    if finished.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "No finished loops yet",
-                Style::default().fg(Color::DarkGray),
-            ))),
-            area,
-        );
-        return;
-    }
-
-    if app.history_collapsed {
-        let summary = format!("{} completed/failed — Enter to expand", finished.len());
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                truncate_str(&summary, area.width as usize),
-                Style::default().fg(DIM),
-            ))),
-            area,
-        );
-        return;
-    }
-
-    let selected_index = app
-        .selected_loop_id
-        .as_deref()
-        .and_then(|id| finished.iter().position(|lp| lp.id == id));
-    let scroll = scroll_state(
-        finished.len(),
-        selected_index,
-        ((area.height + 1) / 4).max(1) as usize,
-    );
-    let panel_focused = app.projects_panel_focus == ProjectsPanelFocus::History;
-    let mut y = area.y;
-    let row_h = 4u16;
-
-    for lp in finished
-        .iter()
-        .copied()
-        .skip(scroll.start)
-        .take(scroll.max_visible)
-    {
-        if y + 3 > area.y + area.height {
-            break;
-        }
-        draw_project_loop_card(
-            frame,
-            Rect::new(area.x, y, area.width, 3),
-            app.selected_loop_id.as_deref() == Some(lp.id.as_str()),
-            &lp.name,
-            &lp.status.as_str().to_uppercase(),
-            &last_two_segments(&lp.workdir),
-            panel_focused,
-        );
+        let card_area = Rect::new(area.x, y, area.width, 3);
+        let selected = app.selected_loop_id.as_deref() == Some(id.as_str());
+        draw_active_loop_card(frame, card_area, selected, lp, *meta, panel_focused);
+        app.automation_loop_click_map.push((id.clone(), y, y + 3));
         y += row_h;
     }
 
@@ -1332,6 +897,8 @@ fn project_meta_style(selected: bool) -> Style {
         Style::default().fg(DIM)
     }
 }
+
+// ── RAG (pinned top) ─────────────────────────────────────────────────
 
 fn draw_rag_queue(
     frame: &mut Frame,
@@ -1400,6 +967,21 @@ fn draw_rag_info(frame: &mut Frame, area: Rect, app: &App) {
     )));
 
     frame.render_widget(Paragraph::new(lines), area);
+
+    if app.rag_info.total_chunks == 0 && !app.global_rag_queue.is_empty() && area.height > 5 {
+        let queue_area = Rect::new(
+            area.x,
+            area.y + 5,
+            area.width,
+            area.height.saturating_sub(5),
+        );
+        draw_rag_queue(
+            frame,
+            queue_area,
+            &app.global_rag_queue,
+            app.selected_rag_queue,
+        );
+    }
 }
 
 fn labeled_kv_line(label: &'static str, value: &str) -> Line<'static> {
@@ -1445,82 +1027,7 @@ fn rag_queue_text(app: &App) -> String {
     }
 }
 
-fn is_agents_rag_info_focused(app: &App) -> bool {
-    app.sidebar_mode == SidebarMode::Agents
-        && matches!(app.focus, Focus::Home | Focus::Preview)
-        && app.agents_rag_focused
-        && !app.playground_active
-}
-
-fn agents_rag_info_title(app: &App) -> &'static str {
-    if app.rag_paused {
-        " ragInfo ⏸ "
-    } else {
-        " ragInfo "
-    }
-}
-
-fn agents_rag_info_border_style(app: &App) -> Style {
-    Style::default().fg(if is_agents_rag_info_focused(app) {
-        ACCENT
-    } else {
-        BORDER_COLOR
-    })
-}
-
-fn draw_agents_rag_info_panel(frame: &mut Frame, area: Rect, app: &App) {
-    let title_style = Style::default().fg(if is_agents_rag_info_focused(app) {
-        ACCENT
-    } else {
-        DIM
-    });
-    render_titled_panel(
-        frame,
-        area,
-        agents_rag_info_title(app),
-        title_style,
-        agents_rag_info_border_style(app),
-        |frame, inner| {
-            if inner.height >= 1 {
-                draw_rag_info(frame, inner, app);
-            }
-        },
-    );
-}
-
-fn projects_panel_border_style(app: &App, panel: ProjectsPanelFocus) -> Style {
-    let focused = app.sidebar_mode == SidebarMode::Projects
-        && matches!(app.focus, Focus::Home | Focus::Preview)
-        && app.projects_panel_focus == panel
-        && !app.playground_active;
-    Style::default().fg(if focused { ACCENT } else { BORDER_COLOR })
-}
-
-fn agent_section_border_style(app: &App, section: AgentSectionFocus) -> Style {
-    let in_agents_mode = app.sidebar_mode == SidebarMode::Agents;
-    let not_playground = !app.playground_active;
-
-    let focused = if matches!(app.focus, Focus::Home | Focus::Preview) {
-        in_agents_mode && not_playground && app.agent_section_focus == section
-    } else if app.focus == Focus::Agent {
-        in_agents_mode && not_playground && {
-            match app.agents.get(app.selected) {
-                Some(AgentEntry::Agent(_) | AgentEntry::Corrupt(_) | AgentEntry::Group(_)) => {
-                    section == AgentSectionFocus::Background
-                }
-                Some(AgentEntry::Interactive(_) | AgentEntry::Orphaned(_)) => {
-                    section == AgentSectionFocus::Interactive
-                }
-                Some(AgentEntry::Terminal(_)) => section == AgentSectionFocus::Terminal,
-                None => false,
-            }
-        }
-    } else {
-        false
-    };
-
-    Style::default().fg(if focused { ACCENT } else { BORDER_COLOR })
-}
+// ── Live/Automation agent cards (shared card renderer) ──────────────
 
 fn draw_agent_list(frame: &mut Frame, area: Rect, indices: &[usize], app: &mut App, accent: Color) {
     let card_h = 3u16;
@@ -1586,6 +1093,15 @@ fn draw_scroll_indicators(frame: &mut Frame, area: Rect, has_up: bool, has_down:
             ),
         );
     }
+}
+
+#[derive(Clone, Copy)]
+struct AgentCardMeta<'a> {
+    accent: Color,
+    status_color: Color,
+    agent_type: &'static str,
+    type_detail: &'a str,
+    work_dir: Option<&'a str>,
 }
 
 fn draw_sidebar_card(
@@ -1853,6 +1369,15 @@ fn group_agent_indices(app: &App) -> Vec<usize> {
         .collect()
 }
 
+#[derive(Clone, Copy)]
+struct GroupRowStyle {
+    bg: Color,
+    fg: Color,
+    modifier: Modifier,
+    prefix_color: Color,
+    active_tag: &'static str,
+}
+
 fn group_row_style(is_selected: bool, is_active: bool) -> GroupRowStyle {
     GroupRowStyle {
         bg: if is_selected {
@@ -2100,10 +1625,10 @@ mod tests {
     }
 
     /// Builds an App backed by a fresh temp DB with `project_count` registered
-    /// projects and one loop named "Probe Loop", then renders the sidebar in
-    /// Projects mode into a `width`x`height` TestBackend and returns the
-    /// screen contents as a flat string for substring assertions.
-    fn render_projects_sidebar_text(project_count: usize, width: u16, height: u16) -> String {
+    /// projects and one loop named "Probe Loop", then renders the sidebar into
+    /// a `width`x`height` TestBackend and returns the screen contents as a
+    /// flat string for substring assertions.
+    fn render_sidebar_text(project_count: usize, width: u16, height: u16) -> String {
         use crate::db::Database;
         use crate::domain::loops::{Loop, LoopStatus};
         use crate::domain::project::Project;
@@ -2133,7 +1658,7 @@ mod tests {
             name: "Probe Loop".to_string(),
             description: None,
             workdir: "/tmp/probe".to_string(),
-            status: LoopStatus::Draft,
+            status: LoopStatus::Running,
             trigger: None,
             created_at: chrono::Utc::now(),
             started_at: None,
@@ -2146,10 +1671,8 @@ mod tests {
 
         let data_dir = tempfile::tempdir().unwrap();
         let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
-        app.toggle_sidebar_mode();
-        assert!(matches!(app.sidebar_mode, SidebarMode::Projects));
         assert!(
-            !app.visible_loops().is_empty(),
+            !app.active_loops().is_empty(),
             "loop should be loaded from db"
         );
 
@@ -2174,37 +1697,43 @@ mod tests {
     }
 
     #[test]
-    fn loops_section_renders_in_projects_mode_with_ample_room() {
-        let text = render_projects_sidebar_text(2, 34, 34);
-        assert!(text.contains("loops"), "expected loops section title");
+    fn layer_headers_render_with_counts() {
+        let text = render_sidebar_text(2, 34, 40);
+        assert!(text.contains("Live"), "expected Live layer header");
+        assert!(
+            text.contains("Automation"),
+            "expected Automation layer header"
+        );
+        assert!(
+            text.contains("Knowledge (2)"),
+            "expected Knowledge layer header with count"
+        );
+    }
+
+    #[test]
+    fn automation_layer_shows_running_loop() {
+        let text = render_sidebar_text(1, 34, 40);
         assert!(text.contains("Probe Loop"), "expected loop name visible");
     }
 
     #[test]
-    fn loops_section_still_renders_when_projects_overflow_the_sidebar() {
-        // Regression test: many projects in a short sidebar used to let the
-        // `projects` section swallow the entire content area, leaving 0 rows
-        // for `loops` — the loop existed in the DB but was never drawn.
-        let text = render_projects_sidebar_text(20, 34, 20);
-        assert!(text.contains("loops"), "expected loops section title");
-        assert!(text.contains("Probe Loop"), "expected loop name visible");
+    fn old_top_level_backlog_knowledge_history_sections_are_gone() {
+        // T-regression: these used to be top-level sidebar sections; they now
+        // only exist inside a project's Focus tab bar.
+        let text = render_sidebar_text(1, 34, 40);
+        assert!(
+            !text.contains(" backlog "),
+            "backlog must not be a top-level section"
+        );
+        assert!(
+            !text.contains(" history "),
+            "history must not be a top-level section"
+        );
     }
 
-    /// Like `render_projects_sidebar_text`, but also seeds `spec_count`
-    /// standalone backlog specs (tagged to `/tmp/project0`, the first
-    /// project) and `finished_count` completed loops, and lets the caller
-    /// control the `History` section's collapsed state before rendering.
-    fn render_projects_sidebar_text_with_backlog_and_history(
-        project_count: usize,
-        width: u16,
-        height: u16,
-        spec_count: usize,
-        finished_count: usize,
-        history_collapsed: bool,
-    ) -> String {
+    #[test]
+    fn collapsed_layer_hides_its_body() {
         use crate::db::Database;
-        use crate::domain::loops::{Loop, LoopSpec, LoopSpecStatus, LoopStatus};
-        use crate::domain::project::Project;
         use crate::tui::app::App;
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -2214,61 +1743,22 @@ mod tests {
         let path = tmp.path().to_path_buf();
         std::mem::forget(tmp);
         let db = Arc::new(Database::new(&path).unwrap());
-        for i in 0..project_count {
-            db.upsert_project(&Project {
-                hash: format!("hash{i}"),
-                path: format!("/tmp/project{i}"),
-                name: format!("project{i}"),
-                description: None,
-                tags: None,
-                indexed_at: None,
-                created_at: 0,
-            })
-            .unwrap();
-        }
-        for i in 0..spec_count {
-            db.insert_loop_spec(&LoopSpec {
-                id: format!("spec-{i}"),
-                loop_id: None,
-                name: format!("Spec {i}"),
-                description: None,
-                position: 0,
-                parallelizable: false,
-                status: LoopSpecStatus::Pending,
-                started_at: None,
-                completed_at: None,
-                spec_start_head: None,
-                workdir: (project_count > 0).then(|| "/tmp/project0".to_string()),
-                completed_via: None,
-                completed_via_reason: None,
-                completed_via_at: None,
-            })
-            .unwrap();
-        }
-        for i in 0..finished_count {
-            db.insert_loop(&Loop {
-                id: format!("loop-done-{i}"),
-                name: format!("Finished Loop {i}"),
-                description: None,
-                workdir: "/tmp/probe".to_string(),
-                status: LoopStatus::Completed,
-                trigger: None,
-                created_at: chrono::Utc::now(),
-                started_at: None,
-                completed_at: None,
-                autorun_at: None,
-                active_run_pool_id: None,
-                on_completed: None,
-            })
-            .unwrap();
-        }
+        db.upsert_project(&crate::domain::project::Project {
+            hash: "hash0".to_string(),
+            path: "/tmp/project0".to_string(),
+            name: "project0".to_string(),
+            description: None,
+            tags: None,
+            indexed_at: None,
+            created_at: 0,
+        })
+        .unwrap();
 
         let data_dir = tempfile::tempdir().unwrap();
         let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
-        app.toggle_sidebar_mode();
-        app.history_collapsed = history_collapsed;
+        app.knowledge_collapsed = true;
 
-        let backend = TestBackend::new(width, height);
+        let backend = TestBackend::new(34, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
@@ -2285,111 +1775,66 @@ mod tests {
             }
             text.push('\n');
         }
-        text
+
+        assert!(text.contains("Knowledge (1)"), "header still shows count");
+        assert!(!text.contains("project0"), "collapsed layer hides its body");
     }
 
     #[test]
-    fn backlog_section_shows_count_and_spec_names_with_ample_room() {
-        let text = render_projects_sidebar_text_with_backlog_and_history(1, 34, 40, 2, 0, true);
-        assert!(
-            text.contains("backlog (2)"),
-            "expected backlog title with count, got:\n{text}"
-        );
-        assert!(text.contains("Spec 0"));
-        assert!(text.contains("Spec 1"));
-    }
+    fn drawing_the_knowledge_layer_populates_project_click_map() {
+        // T-regression: `draw_projects_list`/`draw_knowledge_body` used to
+        // take `&App`, so nothing ever pushed into `project_click_map` and a
+        // mouse click on a sidebar project row silently did nothing —
+        // functional requirement 4 requires project rows to be clickable.
+        use crate::db::Database;
+        use crate::tui::app::App;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::sync::Arc;
 
-    #[test]
-    fn history_section_collapsed_by_default_hides_finished_loop_names() {
-        let text = render_projects_sidebar_text_with_backlog_and_history(1, 34, 40, 0, 2, true);
-        assert!(
-            text.contains("history (2)"),
-            "expected history title with count, got:\n{text}"
-        );
-        assert!(
-            !text.contains("Finished Loop 0"),
-            "collapsed history should not list finished loop names"
-        );
-    }
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        for i in 0..2 {
+            db.upsert_project(&crate::domain::project::Project {
+                hash: format!("hash{i}"),
+                path: format!("/tmp/project{i}"),
+                name: format!("project{i}"),
+                description: None,
+                tags: None,
+                indexed_at: None,
+                created_at: 0,
+            })
+            .unwrap();
+        }
 
-    #[test]
-    fn history_section_expanded_shows_finished_loop_names() {
-        let text = render_projects_sidebar_text_with_backlog_and_history(1, 34, 40, 0, 2, false);
-        assert!(text.contains("history (2)"));
-        assert!(text.contains("Finished Loop 0"));
-        assert!(text.contains("Finished Loop 1"));
-    }
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
+        assert_eq!(app.projects.len(), 2, "projects should be loaded from db");
 
-    #[test]
-    fn backlog_and_history_sections_still_render_when_projects_overflow_the_sidebar() {
-        // Same T41 regression as `loops_section_still_renders_when_projects_
-        // overflow_the_sidebar`, extended to the two new sections: a lone
-        // backlog spec and a lone finished loop must stay visible even when
-        // 20 projects are competing for the same short sidebar.
-        let text = render_projects_sidebar_text_with_backlog_and_history(20, 34, 20, 1, 1, false);
-        assert!(text.contains("backlog"), "expected backlog section title");
-        assert!(text.contains("Spec 0"), "expected backlog spec visible");
-        assert!(text.contains("history"), "expected history section title");
-        assert!(
-            text.contains("Finished Loop 0"),
-            "expected finished loop visible, got:\n{text}"
+        let backend = TestBackend::new(34, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_sidebar(frame, area, &mut app);
+            })
+            .unwrap();
+
+        assert_eq!(
+            app.project_click_map.len(),
+            2,
+            "each rendered project row must register a click region: {:?}",
+            app.project_click_map
         );
-    }
-
-    #[test]
-    fn layout_projects_sections_gives_each_section_its_full_demand_when_room_is_ample() {
-        let needs = ProjectsSectionNeeds {
-            has_projects: true,
-            projects: 8,
-            loops: 5,
-            backlog: 4,
-            history: 5,
-            knowledge: 4,
-            rag: 0,
-        };
-        let content = Rect::new(0, 0, 34, 40);
-        let layout = layout_projects_sections(content, &needs);
-
-        assert_eq!(layout.projects.unwrap().height, 8);
-        assert_eq!(layout.loops.unwrap().height, 5);
-        assert_eq!(layout.backlog.unwrap().height, 4);
-        assert_eq!(layout.history.unwrap().height, 5);
-        assert_eq!(layout.knowledge.unwrap().height, 4);
-        assert!(layout.brain.is_some(), "leftover room should go to brain");
-    }
-
-    #[test]
-    fn layout_projects_sections_prioritizes_loops_backlog_history_floors_over_projects() {
-        // 20 projects' worth of demand competing with one active loop, one
-        // backlog spec, and one finished (expanded) loop in a short sidebar.
-        // `loops`/`backlog`/`history` must keep at least their floor even
-        // though `projects` alone would happily consume the entire budget.
-        let needs = ProjectsSectionNeeds {
-            has_projects: true,
-            projects: 62,
-            loops: 5,
-            backlog: 3,
-            history: 5,
-            knowledge: 4,
-            rag: 0,
-        };
-        let content = Rect::new(0, 0, 34, 15);
-        let layout = layout_projects_sections(content, &needs);
-
-        assert!(
-            layout.loops.unwrap().height >= MIN_LOOPS_HEIGHT,
-            "loops must keep its floor"
-        );
-        assert!(
-            layout.backlog.unwrap().height >= MIN_BACKLOG_HEIGHT,
-            "backlog must keep its floor"
-        );
-        assert!(
-            layout.history.unwrap().height >= MIN_HISTORY_HEIGHT,
-            "history must keep its floor"
-        );
-        // `projects` is the one allowed to give the most ground.
-        assert!(layout.projects.map(|r| r.height).unwrap_or(0) <= needs.projects);
+        let indices: Vec<usize> = app
+            .project_click_map
+            .iter()
+            .map(|&(idx, _, _)| idx)
+            .collect();
+        assert!(indices.contains(&0));
+        assert!(indices.contains(&1));
     }
 
     #[test]
@@ -2434,62 +1879,6 @@ mod tests {
         let alloc = fair_section_heights(&demands, 100);
         assert_eq!(alloc[0], demands[0]);
         assert_eq!(alloc[1], demands[1]);
-    }
-
-    #[test]
-    fn layout_agent_sections_overflow_keeps_small_sections_within_needed() {
-        let content = Rect::new(0, 0, 33, 30);
-        let heights = AgentSectionHeights {
-            background: Some(needed_agents(1)),
-            interactive: Some(needed_agents(6)),
-            terminal: Some(needed_agents(1)),
-            groups: None,
-        };
-        assert!(
-            heights.total() > content.height,
-            "test must exercise overflow"
-        );
-
-        let layout = layout_agent_sections(content, heights);
-
-        let background = layout.background.expect("background rect");
-        let interactive = layout.interactive.expect("interactive rect");
-        let terminal = layout.terminal.expect("terminal rect");
-
-        // Small sections never get a slice taller than their content.
-        assert!(background.height <= needed_agents(1));
-        assert!(terminal.height <= needed_agents(1));
-        // Interactive takes the bulk of the space and scrolls.
-        assert!(interactive.height > background.height);
-        assert!(interactive.height > terminal.height);
-        // Sections tile the content area top-to-bottom with no gaps.
-        assert_eq!(background.y, content.y);
-        assert_eq!(interactive.y, background.y + background.height);
-        assert_eq!(terminal.y, interactive.y + interactive.height);
-        assert_eq!(
-            background.height + interactive.height + terminal.height,
-            content.height
-        );
-    }
-
-    #[test]
-    fn layout_agent_sections_fits_all_when_room_available() {
-        let content = Rect::new(0, 0, 33, 60);
-        let heights = AgentSectionHeights {
-            background: Some(needed_agents(1)),
-            interactive: Some(needed_agents(2)),
-            terminal: Some(needed_agents(1)),
-            groups: None,
-        };
-        assert!(heights.total() <= content.height);
-
-        let layout = layout_agent_sections(content, heights);
-
-        assert_eq!(layout.background.unwrap().height, needed_agents(1));
-        assert_eq!(layout.interactive.unwrap().height, needed_agents(2));
-        assert_eq!(layout.terminal.unwrap().height, needed_agents(1));
-        // Leftover space becomes the brain panel.
-        assert!(layout.brain.is_some());
     }
 
     #[test]

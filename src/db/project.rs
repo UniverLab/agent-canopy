@@ -17,6 +17,27 @@ pub struct RagQueueItem {
     pub queued_at: i64,
 }
 
+/// One row in a project's persisted History tab: a finished loop or a past
+/// (no longer live) interactive/terminal session, scoped to the project's
+/// workdir and ordered newest-first. Unlike the live agent/loop providers
+/// (which only know about what's running in *this* TUI process), this reads
+/// straight from SQLite so history survives a restart.
+#[derive(Debug, Clone)]
+pub struct ProjectHistoryEntry {
+    pub kind: ProjectHistoryKind,
+    pub name: String,
+    pub status: String,
+    /// Unix timestamp used for sorting and relative-time display.
+    pub at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectHistoryKind {
+    Loop,
+    InteractiveSession,
+    TerminalSession,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RagInfoSummary {
     pub total_chunks: i64,
@@ -579,5 +600,104 @@ impl Database {
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+}
+
+fn parse_rfc3339_timestamp(value: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|dt| dt.timestamp())
+        .unwrap_or(0)
+}
+
+impl Database {
+    /// Persisted history for a project's `Focus → History` tab: finished
+    /// loops plus past (exited/finished) interactive and terminal sessions,
+    /// all scoped to `workdir` and merged newest-first. Reads straight from
+    /// SQLite (via the `idx_loops_workdir_created`,
+    /// `idx_interactive_sessions_workdir`, and `idx_terminal_sessions_workdir`
+    /// indices) rather than the live agent/loop providers, which only know
+    /// about state observed since this TUI process started.
+    pub fn list_project_history(
+        &self,
+        workdir: &str,
+        limit: usize,
+    ) -> Result<Vec<ProjectHistoryEntry>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
+        let mut entries = Vec::new();
+
+        let mut loop_stmt = conn.prepare(
+            "SELECT name, status, COALESCE(completed_at, created_at)
+             FROM loops
+             WHERE workdir = ?1 AND status IN ('completed', 'failed')
+             ORDER BY COALESCE(completed_at, created_at) DESC
+             LIMIT ?2",
+        )?;
+        let loop_rows = loop_stmt.query_map(rusqlite::params![workdir, limit as i64], |row| {
+            Ok(ProjectHistoryEntry {
+                kind: ProjectHistoryKind::Loop,
+                name: row.get(0)?,
+                status: row.get(1)?,
+                at: row.get(2)?,
+            })
+        })?;
+        for row in loop_rows {
+            entries.push(row?);
+        }
+
+        let mut interactive_stmt = conn.prepare(
+            "SELECT name, status, COALESCE(exited_at, started_at)
+             FROM interactive_sessions
+             WHERE working_dir = ?1 AND status != 'active'
+             ORDER BY COALESCE(exited_at, started_at) DESC
+             LIMIT ?2",
+        )?;
+        let interactive_rows =
+            interactive_stmt.query_map(rusqlite::params![workdir, limit as i64], |row| {
+                let name: String = row.get(0)?;
+                let status: String = row.get(1)?;
+                let at: String = row.get(2)?;
+                Ok((name, status, at))
+            })?;
+        for row in interactive_rows {
+            let (name, status, at) = row?;
+            entries.push(ProjectHistoryEntry {
+                kind: ProjectHistoryKind::InteractiveSession,
+                name,
+                status,
+                at: parse_rfc3339_timestamp(&at),
+            });
+        }
+
+        let mut terminal_stmt = conn.prepare(
+            "SELECT name, status, COALESCE(last_active, created_at)
+             FROM terminal_sessions
+             WHERE working_dir = ?1 AND status != 'idle'
+             ORDER BY COALESCE(last_active, created_at) DESC
+             LIMIT ?2",
+        )?;
+        let terminal_rows =
+            terminal_stmt.query_map(rusqlite::params![workdir, limit as i64], |row| {
+                let name: String = row.get(0)?;
+                let status: String = row.get(1)?;
+                let at: String = row.get(2)?;
+                Ok((name, status, at))
+            })?;
+        for row in terminal_rows {
+            let (name, status, at) = row?;
+            entries.push(ProjectHistoryEntry {
+                kind: ProjectHistoryKind::TerminalSession,
+                name,
+                status,
+                at: parse_rfc3339_timestamp(&at),
+            });
+        }
+
+        entries.sort_by(|a, b| b.at.cmp(&a.at));
+        entries.truncate(limit);
+        Ok(entries)
     }
 }

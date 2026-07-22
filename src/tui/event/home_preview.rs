@@ -1,8 +1,7 @@
 use anyhow::Result;
 use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
-use crate::tui::app::types::{AgentEntry, App, Focus, ProjectsPanelFocus, SidebarMode};
-use crate::tui::event::knowledge_dialog::{edit_knowledge_dialog, open_knowledge_dialog};
+use crate::tui::app::types::{AgentEntry, App, Focus, ProjectTab, SidebarLayer};
 
 // ── Home: screensaver — arrows enter Preview ────────────────────────
 
@@ -16,11 +15,10 @@ pub fn handle_home_key(app: &mut App, code: KeyCode, _modifiers: KeyModifiers) -
         return Ok(());
     }
 
-    let has_project_preview = app.sidebar_mode == SidebarMode::Projects
-        && (!app.projects.is_empty()
-            || !app.visible_loops().is_empty()
-            || !app.global_rag_queue.is_empty()
-            || app.rag_info.total_chunks > 0);
+    let has_sidebar_preview = !app.agents.is_empty()
+        || !app.projects.is_empty()
+        || !app.visible_loops().is_empty()
+        || app.rag_info.has_rag_activity();
 
     match code {
         KeyCode::F(10) => {
@@ -44,30 +42,19 @@ pub fn handle_home_key(app: &mut App, code: KeyCode, _modifiers: KeyModifiers) -
         KeyCode::F(1) => {
             app.show_legend = true;
         }
-        KeyCode::Down | KeyCode::Char('j') if !app.agents.is_empty() || has_project_preview => {
+        KeyCode::Down | KeyCode::Char('j') if has_sidebar_preview => {
             app.dismiss_brain();
-            if app.sidebar_mode == SidebarMode::Agents {
-                // Arrow-down from Home: go to the first agent (background, at top of sidebar).
-                app.selected = 0;
-                app.agents_rag_focused = false;
-            } else {
-                app.focus_projects_panel_from_edge(true);
-            }
+            app.focus_sidebar_from_edge(true);
             app.log_scroll = 0;
             app.focus = Focus::Preview;
         }
-        KeyCode::Up | KeyCode::Char('k') if !app.agents.is_empty() || has_project_preview => {
+        KeyCode::Up | KeyCode::Char('k') if has_sidebar_preview => {
             app.dismiss_brain();
-            if app.sidebar_mode == SidebarMode::Agents {
-                app.selected = app.agents.len().saturating_sub(1);
-                app.agents_rag_focused = false;
-            } else {
-                app.focus_projects_panel_from_edge(false);
-            }
+            app.focus_sidebar_from_edge(false);
             app.log_scroll = 0;
             app.focus = Focus::Preview;
         }
-        KeyCode::Enter if !app.agents.is_empty() || has_project_preview => {
+        KeyCode::Enter if has_sidebar_preview => {
             app.dismiss_brain();
             app.log_scroll = 0;
             app.focus = Focus::Preview;
@@ -116,74 +103,31 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
         return Ok(());
     }
 
-    if app.sidebar_mode == SidebarMode::Projects
-        && app.projects_panel_focus == ProjectsPanelFocus::Knowledge
-        && app.knowledge_filter_mode
-    {
-        match code {
-            KeyCode::Esc => {
-                app.clear_knowledge_filter();
-                app.exit_knowledge_filter_mode();
-                return Ok(());
-            }
-            KeyCode::Enter => {
-                app.exit_knowledge_filter_mode();
-                return Ok(());
-            }
-            KeyCode::Backspace => {
-                app.pop_knowledge_filter();
-                return Ok(());
-            }
-            KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
-                app.append_knowledge_filter(c);
-                return Ok(());
-            }
-            _ => {
-                return Ok(());
-            }
-        }
-    }
+    let on_loop = app.sidebar_layer == SidebarLayer::Automation
+        && app.automation_kind == crate::tui::app::AutomationKind::Loop;
 
     match code {
         // Manual node inspection in the live loop view intercepts Esc to
         // return to auto-follow first; a second Esc falls through to the
         // general "back to Home" behavior below.
-        KeyCode::Esc
-            if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::Loops
-                && !app.loop_graph_follow =>
-        {
+        KeyCode::Esc if on_loop && !app.loop_graph_follow => {
             app.loop_graph_reset_follow();
         }
         KeyCode::Esc | KeyCode::Char('h') => {
             app.focus = Focus::Home;
         }
         KeyCode::Enter | KeyCode::Char('l') => {
-            if app.sidebar_mode == SidebarMode::Projects {
-                match app.projects_panel_focus {
-                    ProjectsPanelFocus::RagInfo => app.activate_playground(),
-                    ProjectsPanelFocus::Projects => {
-                        let _ = app.open_project_relation_dialog();
-                    }
-                    ProjectsPanelFocus::Loops => {
-                        let _ = app.open_loop_editor_dialog();
-                    }
-                    // Backlog is read-only: the selected spec's name and
-                    // description are already shown in the main panel via
-                    // panel focus, so Enter has nothing further to do.
-                    ProjectsPanelFocus::Backlog => {}
-                    ProjectsPanelFocus::History => {
-                        app.toggle_history_collapsed();
-                    }
-                    ProjectsPanelFocus::Knowledge => {
-                        edit_knowledge_dialog(app);
-                    }
-                }
-                return Ok(());
-            }
-            // Agents mode: Enter on focused RagInfo → open playground.
             if app.agents_rag_focused {
                 app.activate_playground();
+                return Ok(());
+            }
+            if app.sidebar_layer == SidebarLayer::Knowledge {
+                app.enter_project_focus(ProjectTab::Overview);
+                app.focus = Focus::Agent;
+                return Ok(());
+            }
+            if on_loop {
+                let _ = app.open_loop_editor_dialog();
                 return Ok(());
             }
             // For Group entries: Enter activates the split and enters focus
@@ -200,131 +144,67 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
             app.log_scroll = 0;
             app.focus = Focus::Agent;
         }
-        KeyCode::Tab if app.sidebar_mode == SidebarMode::Projects => {
-            app.cycle_projects_panel_focus(true);
-        }
-        KeyCode::BackTab if app.sidebar_mode == SidebarMode::Projects => {
-            app.cycle_projects_panel_focus(false);
-        }
         KeyCode::Down | KeyCode::Char('j') => {
             app.select_next();
         }
         KeyCode::Up | KeyCode::Char('k') => {
             app.select_prev();
         }
-        KeyCode::Left
-            if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::Loops =>
-        {
+        KeyCode::Left if on_loop => {
             app.loop_graph_move_highlight(false);
         }
-        KeyCode::Right
-            if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::Loops =>
-        {
+        KeyCode::Right if on_loop => {
             app.loop_graph_move_highlight(true);
         }
-        KeyCode::Left
-            if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::History
-                && !app.history_collapsed =>
-        {
-            app.toggle_history_collapsed();
-        }
-        KeyCode::Right
-            if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::History
-                && app.history_collapsed =>
-        {
-            app.toggle_history_collapsed();
-        }
-        KeyCode::Char('[')
-            if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::Loops =>
-        {
+        KeyCode::Char('[') if on_loop => {
             app.cycle_loop_spec(false);
         }
-        KeyCode::Char(']')
-            if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::Loops =>
-        {
+        KeyCode::Char(']') if on_loop => {
             app.cycle_loop_spec(true);
         }
         KeyCode::Char('e') if !app.agents_rag_focused => {
-            if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::Loops
-            {
+            if on_loop {
                 let _ = app.open_loop_editor_dialog();
-            } else if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::Knowledge
-            {
-                edit_knowledge_dialog(app);
-            } else {
+            } else if app.sidebar_layer != SidebarLayer::Knowledge {
                 app.open_edit_dialog();
             }
         }
-        KeyCode::Char('d')
-            if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::Loops =>
-        {
+        KeyCode::Char('d') if on_loop => {
             // U10: duplicate the highlighted loop node in place.
             let _ = app.duplicate_selected_loop_node();
         }
-        KeyCode::Char('d') if !app.agents_rag_focused => {
+        KeyCode::Char('d')
+            if !app.agents_rag_focused && app.sidebar_layer != SidebarLayer::Knowledge =>
+        {
             let _ = app.toggle_enable();
         }
-        KeyCode::Char('r') if !app.agents_rag_focused => {
+        KeyCode::Char('r')
+            if !app.agents_rag_focused && app.sidebar_layer != SidebarLayer::Knowledge =>
+        {
             let _ = app.rerun_selected();
         }
-        KeyCode::Char('R') if app.sidebar_mode == SidebarMode::Projects => {
+        KeyCode::Char('R') if app.sidebar_layer == SidebarLayer::Knowledge => {
             let _ = app.open_project_relation_dialog();
         }
-        KeyCode::Char('p')
-            if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::RagInfo =>
-        {
+        KeyCode::Char('p') if app.agents_rag_focused => {
             app.toggle_rag_pause();
         }
         KeyCode::Char('n') => {
-            if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::Knowledge
-            {
-                open_knowledge_dialog(app);
-            } else if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::Loops
-            {
+            if on_loop {
                 app.open_new_loop_dialog();
-            } else {
+            } else if app.sidebar_layer != SidebarLayer::Knowledge {
                 app.open_new_agent_dialog();
             }
         }
-        KeyCode::Char('E')
-            if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::Loops =>
-        {
+        KeyCode::Char('E') if on_loop => {
             app.open_edit_loop_dialog();
         }
-        KeyCode::Char('/')
-            if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::Knowledge =>
-        {
-            app.enter_knowledge_filter_mode();
-        }
         KeyCode::F(4) => {
-            if app.sidebar_mode == SidebarMode::Projects {
-                match app.projects_panel_focus {
-                    ProjectsPanelFocus::Projects => {
-                        app.delete_project_confirm = true;
-                    }
-                    ProjectsPanelFocus::Loops => {
-                        app.delete_loop_confirm = true;
-                    }
-                    ProjectsPanelFocus::Knowledge => {
-                        let _ = app.delete_selected_knowledge();
-                    }
-                    _ => {}
-                }
-            } else if app.sidebar_mode != SidebarMode::Projects && !app.agents_rag_focused {
+            if app.sidebar_layer == SidebarLayer::Knowledge {
+                app.delete_project_confirm = true;
+            } else if on_loop {
+                app.delete_loop_confirm = true;
+            } else if !app.agents_rag_focused {
                 let _ = app.delete_selected();
             }
         }

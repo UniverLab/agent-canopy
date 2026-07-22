@@ -7,13 +7,13 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use super::DIM;
-use crate::tui::app::types::{AgentEntry, App, Focus};
+use crate::tui::app::types::{AgentEntry, App, Focus, ProjectTab, SidebarLayer};
 
 pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     let activity_available = app.activity_panel_available();
     let hints = match app.focus {
         Focus::Home => {
-            let mut h = vec![("↑↓", "select"), ("n", "new"), ("F2", "projects")];
+            let mut h = vec![("↑↓", "select"), ("n", "new")];
             if activity_available {
                 h.push(("F3", "activity"));
             }
@@ -23,49 +23,26 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             h
         }
         Focus::Preview => {
-            if app.sidebar_mode == crate::tui::app::SidebarMode::Projects {
-                if app.playground_active {
-                    vec![
-                        ("type", "search"),
-                        ("↑↓", "results"),
-                        ("Enter", "search/open"),
-                        ("Shift+↑↓", "agents"),
-                        ("Ctrl+T", "transfer"),
-                        ("Esc", "close"),
-                        ("F2", "agents"),
-                    ]
-                } else {
-                    let mut h = vec![
-                        ("Tab", "section"),
-                        ("↑↓", "nav"),
-                        ("←→", "highlight"),
-                        ("[ ]", "spec"),
-                        ("Enter/e", "edit"),
-                        ("F2", "agents"),
-                    ];
-                    if app.projects_panel_focus == crate::tui::app::ProjectsPanelFocus::RagInfo {
-                        h.push(("p", "pause rag"));
-                    }
-                    if app.projects_panel_focus == crate::tui::app::ProjectsPanelFocus::Loops {
-                        h.push(("n", "new loop"));
-                        h.push(("E", "loop settings"));
-                    }
-                    if app.projects_panel_focus == crate::tui::app::ProjectsPanelFocus::History {
-                        h.push((
-                            "Enter/→",
-                            if app.history_collapsed {
-                                "expand"
-                            } else {
-                                "collapse"
-                            },
-                        ));
-                    }
-                    h.push(("Esc", "home"));
-                    h
-                }
+            if app.playground_active {
+                vec![
+                    ("type", "search"),
+                    ("↑↓", "results"),
+                    ("Enter", "search/open"),
+                    ("Shift+↑↓", "agents"),
+                    ("Ctrl+T", "transfer"),
+                    ("Esc", "close"),
+                ]
+            } else if app.sidebar_layer == SidebarLayer::Knowledge {
+                let mut h = vec![
+                    ("↑↓", "highlight"),
+                    ("Enter", "open project"),
+                    ("F2", "layer"),
+                ];
+                h.push(("Esc", "home"));
+                h
             } else {
                 let is_bg = matches!(app.selected_agent(), Some(AgentEntry::Agent(_)));
-                let mut h = vec![("↑↓", "nav"), ("Enter", "focus")];
+                let mut h = vec![("↑↓", "nav"), ("Enter", "focus"), ("F2", "layer")];
                 if is_bg {
                     h.push(("e", "edit"));
                     h.push(("d", "toggle"));
@@ -73,7 +50,6 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                     h.push(("r", "rerun"));
                 }
                 h.push(("n", "new"));
-                h.push(("F2", "projects"));
                 if activity_available {
                     h.push(("F3", "activity"));
                 }
@@ -94,6 +70,18 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("Enter", "confirm"),
             ("Esc", "cancel"),
         ],
+        Focus::Agent if app.sidebar_layer == SidebarLayer::Knowledge => {
+            let mut h = vec![
+                ("Tab/]/[", "tab"),
+                ("o/b/k/h", "jump tab"),
+                ("↑↓", "nav list"),
+            ];
+            if app.project_focus == Some(ProjectTab::Knowledge) {
+                h.push(("/", "filter"));
+            }
+            h.push(("Esc", "back"));
+            h
+        }
         Focus::Agent => {
             if app.playground_active {
                 return draw_footer_playground(frame, area, app, activity_available);
@@ -127,7 +115,6 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                 if matches!(app.selected_agent(), Some(AgentEntry::Interactive(_))) {
                     h.push(("Ctrl+B", "prompt"));
                 }
-                h.push(("F2", "projects"));
                 if activity_available {
                     h.push(("F3", "activity"));
                 }
@@ -139,7 +126,6 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                 if !app.agents_rag_focused {
                     h.push(("e", "edit"));
                 }
-                h.push(("F2", "projects"));
                 if activity_available {
                     h.push(("F3", "activity"));
                 }
@@ -273,7 +259,6 @@ fn draw_footer_playground(frame: &mut Frame, area: Rect, app: &App, activity_ava
         ("Ctrl+T", "transfer"),
         ("F10", "preview"),
         ("Esc", "close"),
-        ("F2", "projects"),
     ];
     if activity_available {
         hints.push(("F3", "activity"));

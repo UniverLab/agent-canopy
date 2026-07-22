@@ -3,12 +3,13 @@ use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
 use super::context_transfer::{active_split_session_name, resolve_session};
 use super::home_preview::handle_playground_key;
+use super::knowledge_dialog::{edit_knowledge_dialog, open_knowledge_dialog};
 use super::search_picker::handle_suggestion_picker_key;
 use super::terminal_warp::{
     handle_terminal_direct_pty_key, handle_terminal_warp_key, record_terminal_command,
 };
 use crate::tui::agent::{key_to_bytes, InteractiveAgent};
-use crate::tui::app::types::{AgentEntry, App, Focus};
+use crate::tui::app::types::{AgentEntry, App, Focus, ProjectTab, SidebarLayer};
 
 #[derive(Clone, Copy)]
 enum FocusedAgent {
@@ -17,6 +18,11 @@ enum FocusedAgent {
 }
 
 pub fn handle_agent_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
+    if app.sidebar_layer == SidebarLayer::Knowledge && app.project_focus.is_some() {
+        handle_project_focus_key(app, code, modifiers);
+        return Ok(());
+    }
+
     if app.suggestion_picker.is_some() {
         return handle_suggestion_picker_key(app, code);
     }
@@ -46,6 +52,60 @@ pub fn handle_agent_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -
 
     forward_key_to_focused_agent(app, target, code, modifiers);
     Ok(())
+}
+
+/// Keys while a project's Focus tab bar is open (`sidebar_layer ==
+/// Knowledge`, `project_focus.is_some()`): arrows navigate the active tab's
+/// list only — they never change tabs; Tab/Shift+Tab or `]`/`[` cycle tabs;
+/// o/b/k/h jump directly; Esc returns to the sidebar (functional
+/// requirement 4).
+fn handle_project_focus_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+    if app.knowledge_filter_mode {
+        match code {
+            KeyCode::Esc => {
+                app.clear_knowledge_filter();
+                app.exit_knowledge_filter_mode();
+            }
+            KeyCode::Enter => app.exit_knowledge_filter_mode(),
+            KeyCode::Backspace => app.pop_knowledge_filter(),
+            KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                app.append_knowledge_filter(c);
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    match code {
+        KeyCode::Esc | KeyCode::F(10) => {
+            app.exit_project_focus();
+            app.focus = Focus::Preview;
+        }
+        KeyCode::Tab | KeyCode::Char(']') => app.cycle_project_tab(true),
+        KeyCode::BackTab | KeyCode::Char('[') => app.cycle_project_tab(false),
+        KeyCode::Char(c) if ProjectTab::ALL.iter().any(|tab| tab.hotkey() == c) => {
+            let tab = ProjectTab::ALL
+                .into_iter()
+                .find(|tab| tab.hotkey() == c)
+                .unwrap();
+            app.open_project_tab(tab);
+        }
+        KeyCode::Down => app.select_next(),
+        KeyCode::Up => app.select_prev(),
+        KeyCode::Char('/') if app.project_focus == Some(ProjectTab::Knowledge) => {
+            app.enter_knowledge_filter_mode();
+        }
+        KeyCode::Char('e') if app.project_focus == Some(ProjectTab::Knowledge) => {
+            edit_knowledge_dialog(app);
+        }
+        KeyCode::Char('n') if app.project_focus == Some(ProjectTab::Knowledge) => {
+            open_knowledge_dialog(app);
+        }
+        KeyCode::F(4) if app.project_focus == Some(ProjectTab::Knowledge) => {
+            let _ = app.delete_selected_knowledge();
+        }
+        _ => {}
+    }
 }
 
 fn handle_split_picker_key(app: &mut App, code: KeyCode) -> bool {
@@ -299,7 +359,7 @@ fn handle_agent_cycle_shortcut(app: &mut App, code: KeyCode, modifiers: KeyModif
         app.prev_interactive();
     }
 
-    app.sidebar_mode = crate::tui::app::SidebarMode::Agents;
+    app.update_agent_section_focus_on_change(0);
     true
 }
 
@@ -314,7 +374,7 @@ fn try_cycle_from_playground(app: &mut App, forward: bool) -> bool {
     } else {
         app.prev_interactive();
     }
-    app.sidebar_mode = crate::tui::app::SidebarMode::Agents;
+    app.update_agent_section_focus_on_change(0);
     true
 }
 
@@ -339,7 +399,7 @@ fn try_cycle_through_focusable(app: &mut App, forward: bool) -> bool {
     if focusable.is_empty() {
         app.activate_playground();
         app.focus = Focus::Agent;
-        app.sidebar_mode = crate::tui::app::SidebarMode::Agents;
+        app.update_agent_section_focus_on_change(0);
         return true;
     }
 
@@ -373,14 +433,14 @@ fn try_cycle_to_rag_info(app: &mut App, forward: bool, focusable: &[usize]) -> b
     if !app.agents_rag_focused {
         app.agents_rag_focused = true;
         app.focus = Focus::Agent;
-        app.sidebar_mode = crate::tui::app::SidebarMode::Agents;
+        app.update_agent_section_focus_on_change(0);
         return true;
     }
 
     app.agents_rag_focused = false;
     app.selected = if forward { 0 } else { focusable.len() - 1 };
     app.focus = Focus::Agent;
-    app.sidebar_mode = crate::tui::app::SidebarMode::Agents;
+    app.update_agent_section_focus_on_change(0);
     true
 }
 
@@ -392,7 +452,7 @@ fn try_cycle_from_rag_info(app: &mut App, forward: bool, focusable: &[usize]) ->
     app.agents_rag_focused = false;
     app.selected = if forward { 0 } else { focusable.len() - 1 };
     app.focus = Focus::Agent;
-    app.sidebar_mode = crate::tui::app::SidebarMode::Agents;
+    app.update_agent_section_focus_on_change(0);
     true
 }
 
@@ -408,7 +468,7 @@ fn advance_focusable_selection(app: &mut App, forward: bool, focusable: &[usize]
     };
     app.selected = focusable[next_pos];
     app.focus = Focus::Agent;
-    app.sidebar_mode = crate::tui::app::SidebarMode::Agents;
+    app.update_agent_section_focus_on_change(0);
 }
 
 fn resolve_focused_agent(app: &mut App) -> Option<FocusedAgent> {

@@ -15,7 +15,7 @@ use ratatui::crossterm::event::{
 use std::time::Duration;
 
 use crate::tui::agent::InteractiveAgent;
-use crate::tui::app::types::{AgentEntry, App, Focus, SidebarMode, TerminalSelection};
+use crate::tui::app::types::{AgentEntry, App, Focus, ProjectTab, SidebarLayer, TerminalSelection};
 use crate::tui::app::TerminalSearch;
 use crate::tui::ui;
 
@@ -178,7 +178,7 @@ fn handle_global_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> b
     }
 
     if code == KeyCode::F(2) {
-        toggle_sidebar_and_normalize_focus(app);
+        cycle_sidebar_layer_and_normalize_focus(app);
         return true;
     }
 
@@ -199,8 +199,8 @@ fn handle_global_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> b
 }
 
 /// Shared by the F2 key and a sidebar right-click.
-fn toggle_sidebar_and_normalize_focus(app: &mut App) {
-    app.toggle_sidebar_mode();
+fn cycle_sidebar_layer_and_normalize_focus(app: &mut App) {
+    app.cycle_sidebar_layer();
     if matches!(app.focus, Focus::Agent) {
         app.focus = Focus::Preview;
     }
@@ -235,6 +235,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
     }
 
     if handle_sidebar_mouse(app, &mouse) {
+        return Ok(());
+    }
+
+    if handle_project_panel_mouse(app, &mouse) {
         return Ok(());
     }
 
@@ -327,16 +331,16 @@ fn handle_prompt_dialog_mouse(app: &mut App, mouse: &MouseEvent) {
     }
 }
 
-// ── Mouse: agent sidebar (hover, click, scroll, right-click) ────────
+// ── Mouse: layered sidebar (hover, click, scroll, right-click) ──────
 
-/// Handle a mouse event landing on the agent sidebar: hover highlight,
-/// left-click to select/enter an agent, scroll to page the list, and
-/// right-click as a shortcut for F2. Returns `true` if the event was
-/// consumed and no further mouse handling should run.
+/// Handle a mouse event landing on the sidebar: layer-header clicks
+/// (collapse toggle), left-click to select/enter a row in whichever layer
+/// it belongs to (Live/Automation agent card, Automation loop card,
+/// Knowledge project row), scroll to page the hovered layer's list, and
+/// right-click as a shortcut for F2 (cycle layer). Returns `true` if the
+/// event was consumed and no further mouse handling should run.
 fn handle_sidebar_mouse(app: &mut App, mouse: &MouseEvent) -> bool {
-    let in_sidebar = app.sidebar_visible
-        && app.sidebar_mode == SidebarMode::Agents
-        && mouse.column < sidebar_width(app);
+    let in_sidebar = app.sidebar_visible && mouse.column < sidebar_width(app);
 
     if !in_sidebar {
         if app.hovered_row.is_some() {
@@ -351,19 +355,11 @@ fn handle_sidebar_mouse(app: &mut App, mouse: &MouseEvent) -> bool {
             true
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            if let Some(idx) = sidebar_agent_at(app, mouse.row) {
-                let reenter = app.selected == idx && !app.agents_rag_focused;
-                app.select_agent_at(idx);
-                app.focus = if reenter {
-                    Focus::Agent
-                } else {
-                    Focus::Preview
-                };
-            }
+            handle_sidebar_left_click(app, mouse.row);
             true
         }
         MouseEventKind::Down(MouseButton::Right) => {
-            toggle_sidebar_and_normalize_focus(app);
+            cycle_sidebar_layer_and_normalize_focus(app);
             true
         }
         MouseEventKind::ScrollUp => {
@@ -378,10 +374,135 @@ fn handle_sidebar_mouse(app: &mut App, mouse: &MouseEvent) -> bool {
     }
 }
 
+fn handle_sidebar_left_click(app: &mut App, row: u16) {
+    if let Some(layer) = layer_header_at(app, row) {
+        app.toggle_layer_collapsed(layer);
+        return;
+    }
+    if let Some(idx) = sidebar_agent_at(app, row) {
+        let reenter = app.selected == idx && !app.agents_rag_focused;
+        app.select_agent_at(idx);
+        app.focus = if reenter {
+            Focus::Agent
+        } else {
+            Focus::Preview
+        };
+        return;
+    }
+    if let Some(loop_id) = automation_loop_at(app, row) {
+        let reselect = app.sidebar_layer == SidebarLayer::Automation
+            && app.selected_loop_id.as_deref() == Some(loop_id.as_str());
+        app.sidebar_layer = SidebarLayer::Automation;
+        app.automation_kind = crate::tui::app::AutomationKind::Loop;
+        app.selected_loop_id = Some(loop_id);
+        app.refresh_loops_selection();
+        app.focus = Focus::Preview;
+        let _ = reselect;
+        return;
+    }
+    if let Some(idx) = project_row_at(app, row) {
+        let reenter = app.sidebar_layer == SidebarLayer::Knowledge && app.selected_project == idx;
+        app.sidebar_layer = SidebarLayer::Knowledge;
+        app.selected_project = idx;
+        app.refresh_loops_selection();
+        if reenter {
+            app.enter_project_focus(ProjectTab::Overview);
+            app.focus = Focus::Agent;
+        } else {
+            app.exit_project_focus();
+            app.focus = Focus::Preview;
+        }
+    }
+}
+
+/// Map a sidebar row to the layer whose header was clicked, via the click
+/// map populated during draw.
+fn layer_header_at(app: &App, row: u16) -> Option<SidebarLayer> {
+    app.layer_header_click_map
+        .iter()
+        .find(|&&(_, start, end)| row >= start && row < end)
+        .map(|&(layer, _, _)| layer)
+}
+
 /// Map a sidebar row (terminal row coordinate) to the agent index rendered
 /// there on the last frame, via the click map populated during draw.
 fn sidebar_agent_at(app: &App, row: u16) -> Option<usize> {
     app.sidebar_click_map
+        .iter()
+        .find(|&&(_, start, end)| row >= start && row < end)
+        .map(|&(idx, _, _)| idx)
+}
+
+/// Map a sidebar row to the Automation-layer loop id rendered there.
+fn automation_loop_at(app: &App, row: u16) -> Option<String> {
+    app.automation_loop_click_map
+        .iter()
+        .find(|&&(_, start, end)| row >= start && row < end)
+        .map(|(id, _, _)| id.clone())
+}
+
+/// Map a sidebar row to the Knowledge-layer project index rendered there.
+fn project_row_at(app: &App, row: u16) -> Option<usize> {
+    app.project_click_map
+        .iter()
+        .find(|&&(_, start, end)| row >= start && row < end)
+        .map(|&(idx, _, _)| idx)
+}
+
+// ── Mouse: project Focus tab bar + tab content (main panel) ─────────
+
+/// Handle a mouse event landing on a project's Focus tab bar/content in the
+/// main panel — reuses the same click-map-populated-during-draw pattern as
+/// the sidebar (functional requirement 4: no second mouse path). Returns
+/// `true` if consumed.
+fn handle_project_panel_mouse(app: &mut App, mouse: &MouseEvent) -> bool {
+    if app.sidebar_layer != SidebarLayer::Knowledge || app.project_focus.is_none() {
+        return false;
+    }
+    let (panel_w, panel_h) = app.last_panel_inner;
+    let panel_rect =
+        ratatui::layout::Rect::new(app.last_panel_x, app.last_panel_y, panel_w, panel_h);
+    if !rect_contains_point(panel_rect, mouse.column, mouse.row) {
+        return false;
+    }
+
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if mouse.row == app.last_panel_y {
+                if let Some(tab) = project_tab_at(app, mouse.column) {
+                    app.enter_project_focus(tab);
+                    return true;
+                }
+            }
+            if let Some(idx) = project_tab_row_at(app, mouse.row) {
+                app.set_project_tab_row(idx);
+            }
+            true
+        }
+        MouseEventKind::ScrollUp => {
+            app.select_prev();
+            true
+        }
+        MouseEventKind::ScrollDown => {
+            app.select_next();
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Map a main-panel column (on the tab-bar row) to the `ProjectTab` rendered
+/// there on the last frame.
+fn project_tab_at(app: &App, col: u16) -> Option<ProjectTab> {
+    app.project_tab_click_map
+        .iter()
+        .find(|&&(_, start, end)| col >= start && col < end)
+        .map(|&(tab, _, _)| tab)
+}
+
+/// Map a main-panel row to the active tab's list row index rendered there.
+fn project_tab_row_at(app: &App, row: u16) -> Option<usize> {
+    app.project_tab_row_click_map
         .iter()
         .find(|&&(_, start, end)| row >= start && row < end)
         .map(|&(idx, _, _)| idx)
@@ -937,7 +1058,6 @@ mod sidebar_mouse_tests {
             .map(|i| AgentEntry::Agent(cron_agent(&format!("agent-{i}"))))
             .collect();
         app.sidebar_visible = true;
-        app.sidebar_mode = SidebarMode::Agents;
         app.sidebar_click_map = (0..count)
             .map(|i| (i, (i * 4) as u16, (i * 4 + 3) as u16))
             .collect();
@@ -1043,29 +1163,234 @@ mod sidebar_mouse_tests {
 
         assert!(key_handled);
         assert!(click_handled);
-        assert!(via_key.sidebar_mode == via_click.sidebar_mode);
+        assert!(via_key.sidebar_layer == via_click.sidebar_layer);
         assert!(matches!(via_key.focus, Focus::Preview));
         assert!(matches!(via_click.focus, Focus::Preview));
     }
 
     #[test]
-    fn f2_toggles_sidebar_mode_between_agents_and_projects() {
+    fn f2_cycles_sidebar_layer_skipping_empty_layers() {
         let mut app = app_with_agents(3);
-        assert!(matches!(app.sidebar_mode, SidebarMode::Agents));
+        assert_eq!(app.sidebar_layer, crate::tui::app::SidebarLayer::Live);
 
         assert!(handle_global_key(
             &mut app,
             KeyCode::F(2),
             KeyModifiers::NONE
         ));
-        assert!(matches!(app.sidebar_mode, SidebarMode::Projects));
+        assert_eq!(app.sidebar_layer, crate::tui::app::SidebarLayer::Automation);
 
+        // Live and Knowledge are both empty, so a second press has nowhere
+        // else to land and stays on Automation.
         assert!(handle_global_key(
             &mut app,
             KeyCode::F(2),
             KeyModifiers::NONE
         ));
-        assert!(matches!(app.sidebar_mode, SidebarMode::Agents));
+        assert_eq!(app.sidebar_layer, crate::tui::app::SidebarLayer::Automation);
+    }
+}
+
+/// Functional requirement 4's mouse surface: the project Focus tab bar and
+/// per-tab list rows in the main panel, reusing the same
+/// click-map-populated-during-draw pattern as the sidebar.
+#[cfg(test)]
+mod project_panel_mouse_tests {
+    use super::*;
+    use crate::db::Database;
+    use crate::domain::loops::{LoopSpec, LoopSpecStatus};
+    use crate::domain::project::Project;
+    use crate::tui::app::types::ProjectTab;
+    use std::sync::Arc;
+    use tempfile::{tempdir, NamedTempFile};
+
+    fn test_db() -> Arc<Database> {
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        Arc::new(Database::new(&path).expect("create test db"))
+    }
+
+    fn backlog_spec(id: &str, name: &str) -> LoopSpec {
+        LoopSpec {
+            id: id.to_string(),
+            loop_id: None,
+            name: name.to_string(),
+            description: None,
+            position: 0,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        }
+    }
+
+    /// Builds an App focused on a single project's Backlog tab, with the
+    /// main panel occupying rows `[2, 22)` / columns `[0, 40)` — matching
+    /// what `draw_project_tabs_panel` would have set on the last frame —
+    /// and a tab bar + row click map for 3 backlog specs at rows `[3, 6)`.
+    fn app_with_project_backlog(count: usize) -> App {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.projects = vec![Project::new("/tmp/project")];
+        app.sidebar_layer = crate::tui::app::SidebarLayer::Knowledge;
+        app.selected_project = 0;
+        app.project_focus = Some(ProjectTab::Backlog);
+        app.backlog_specs = (0..count)
+            .map(|i| backlog_spec(&format!("spec-{i}"), &format!("Spec {i}")))
+            .collect();
+        app.selected_backlog = 0;
+        app.focus = Focus::Agent;
+
+        app.last_panel_x = 0;
+        app.last_panel_y = 2;
+        app.last_panel_inner = (40, 20);
+        app.project_tab_click_map = vec![
+            (ProjectTab::Overview, 0, 9),
+            (ProjectTab::Backlog, 9, 17),
+            (ProjectTab::Knowledge, 17, 27),
+            (ProjectTab::History, 27, 35),
+        ];
+        app.project_tab_row_click_map = (0..count)
+            .map(|i| (i, (3 + i) as u16, (4 + i) as u16))
+            .collect();
+        app
+    }
+
+    #[test]
+    fn clicking_tab_bar_switches_active_tab() {
+        let mut app = app_with_project_backlog(3);
+        assert_eq!(app.project_focus, Some(ProjectTab::Backlog));
+
+        // Row == last_panel_y is the tab-bar row; column 20 falls inside the
+        // Knowledge tab's span [17, 27).
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 20,
+            row: app.last_panel_y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let consumed = handle_project_panel_mouse(&mut app, &mouse);
+
+        assert!(consumed);
+        assert_eq!(app.project_focus, Some(ProjectTab::Knowledge));
+    }
+
+    #[test]
+    fn clicking_a_list_row_selects_it_without_changing_tab() {
+        let mut app = app_with_project_backlog(3);
+
+        // Row 5 falls in spec #2's span [5, 6) from `project_tab_row_click_map`.
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        let consumed = handle_project_panel_mouse(&mut app, &mouse);
+
+        assert!(consumed);
+        assert_eq!(app.selected_backlog, 2);
+        assert_eq!(
+            app.project_focus,
+            Some(ProjectTab::Backlog),
+            "clicking a row must not cycle the tab"
+        );
+    }
+
+    #[test]
+    fn scroll_down_in_panel_advances_the_active_tabs_list() {
+        let mut app = app_with_project_backlog(3);
+        assert_eq!(app.selected_backlog, 0);
+
+        let mouse = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        let consumed = handle_project_panel_mouse(&mut app, &mouse);
+
+        assert!(consumed);
+        assert_eq!(app.selected_backlog, 1);
+    }
+
+    #[test]
+    fn scroll_up_in_panel_retreats_the_active_tabs_list() {
+        let mut app = app_with_project_backlog(3);
+        app.selected_backlog = 1;
+
+        let mouse = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 5,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        let consumed = handle_project_panel_mouse(&mut app, &mouse);
+
+        assert!(consumed);
+        assert_eq!(app.selected_backlog, 0);
+    }
+
+    #[test]
+    fn click_outside_the_panel_rect_is_not_consumed() {
+        let mut app = app_with_project_backlog(3);
+
+        // Row 30 is past last_panel_y (2) + last_panel_inner.1 (20) = 22.
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 30,
+            modifiers: KeyModifiers::NONE,
+        };
+        let consumed = handle_project_panel_mouse(&mut app, &mouse);
+
+        assert!(!consumed);
+        assert_eq!(app.selected_backlog, 0);
+        assert_eq!(app.project_focus, Some(ProjectTab::Backlog));
+    }
+
+    #[test]
+    fn click_is_not_consumed_when_no_project_is_focused() {
+        let mut app = app_with_project_backlog(3);
+        app.project_focus = None;
+
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 20,
+            row: app.last_panel_y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let consumed = handle_project_panel_mouse(&mut app, &mouse);
+
+        assert!(!consumed);
+    }
+
+    #[test]
+    fn click_is_not_consumed_outside_the_knowledge_sidebar_layer() {
+        let mut app = app_with_project_backlog(3);
+        app.sidebar_layer = crate::tui::app::SidebarLayer::Live;
+
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 20,
+            row: app.last_panel_y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let consumed = handle_project_panel_mouse(&mut app, &mouse);
+
+        assert!(!consumed);
+        assert_eq!(
+            app.project_focus,
+            Some(ProjectTab::Backlog),
+            "leaving Knowledge must not itself change the remembered tab"
+        );
     }
 }
 

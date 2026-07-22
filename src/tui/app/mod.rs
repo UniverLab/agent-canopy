@@ -38,7 +38,9 @@ pub mod utils;
 pub(crate) use session_resume::build_resumed_session_args;
 pub use terminal_search::TerminalSearch;
 pub(crate) use types::ContextTransferSource;
-pub use types::{AgentEntry, AgentSectionFocus, App, Focus, ProjectsPanelFocus, SidebarMode};
+pub use types::{
+    AgentEntry, AgentSectionFocus, App, AutomationKind, Focus, ProjectTab, SidebarLayer,
+};
 use types::{LoopSidebarMeta, RagTransferModal};
 
 impl App {
@@ -50,6 +52,15 @@ impl App {
         let system_monitor_active = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let system_info_rx = spawn_system_monitor(&system_monitor_active);
         let mission_manager = Self::init_mission_manager(Arc::clone(&db))?;
+        let is_collapsed = |layer| {
+            db.get_state(layer_collapsed_state_key(layer))
+                .ok()
+                .flatten()
+                .is_some_and(|v| v == "1")
+        };
+        let live_collapsed = is_collapsed(SidebarLayer::Live);
+        let automation_collapsed = is_collapsed(SidebarLayer::Automation);
+        let knowledge_collapsed = is_collapsed(SidebarLayer::Knowledge);
 
         let mut app = Self {
             db,
@@ -73,7 +84,15 @@ impl App {
             daemon_version: String::new(),
             selected: 0,
             focus: Focus::Home,
-            sidebar_mode: SidebarMode::Agents,
+            sidebar_layer: SidebarLayer::Live,
+            live_collapsed,
+            automation_collapsed,
+            knowledge_collapsed,
+            automation_kind: AutomationKind::Agent,
+            project_focus: None,
+            selected_project_history: 0,
+            project_history_cache: HashMap::new(),
+            project_preview_cache: HashMap::new(),
             log_content: String::new(),
             log_scroll: 0,
             running: true,
@@ -92,8 +111,12 @@ impl App {
             sidebar_visible_capacity: 0,
             projects: Vec::new(),
             selected_project: 0,
-            projects_panel_focus: ProjectsPanelFocus::Projects,
-            agent_section_focus: AgentSectionFocus::Background,
+            agent_section_focus: AgentSectionFocus::Interactive,
+            automation_loop_click_map: Vec::new(),
+            project_click_map: Vec::new(),
+            project_tab_click_map: Vec::new(),
+            project_tab_row_click_map: Vec::new(),
+            layer_header_click_map: Vec::new(),
             loops: Vec::new(),
             selected_loop_id: None,
             loop_details: None,
@@ -108,8 +131,6 @@ impl App {
             loop_graph_selected_node: None,
             backlog_specs: Vec::new(),
             selected_backlog: 0,
-            history_collapsed: true,
-            selected_history: 0,
             global_rag_queue: Vec::new(),
             selected_rag_queue: 0,
             rag_info: crate::db::project::RagInfoSummary::default(),
@@ -342,27 +363,394 @@ impl App {
     }
 
     // ── Navigation ──────────────────────────────────────────────
+    //
+    // The sidebar is one flat vertical ring for arrow-key purposes: pinned
+    // RAG (top) → Live → Automation → Knowledge (bottom), wrapping around.
+    // Inside Knowledge, once a project is entered (`project_focus.is_some()`)
+    // arrows instead navigate the active tab's list exclusively — they never
+    // change tabs (functional requirement 4).
 
     pub fn select_next(&mut self) {
-        if self.sidebar_mode == SidebarMode::Projects {
-            self.select_next_project_panel();
+        if self.agents_rag_focused {
+            self.leave_rag_focus(true);
+            self.reset_log_scroll();
+            return;
+        }
+        if self.project_focus.is_some() {
+            self.navigate_project_tab_list(true);
+            self.reset_log_scroll();
+            return;
+        }
+        match self.sidebar_layer {
+            SidebarLayer::Live => self.navigate_live(true),
+            SidebarLayer::Automation => self.navigate_automation(true),
+            SidebarLayer::Knowledge => self.navigate_projects_next(),
+        }
+        self.reset_log_scroll();
+    }
+
+    pub fn select_prev(&mut self) {
+        if self.agents_rag_focused {
+            self.leave_rag_focus(false);
+            self.reset_log_scroll();
+            return;
+        }
+        if self.project_focus.is_some() {
+            self.navigate_project_tab_list(false);
+            self.reset_log_scroll();
+            return;
+        }
+        match self.sidebar_layer {
+            SidebarLayer::Live => self.navigate_live(false),
+            SidebarLayer::Automation => self.navigate_automation(false),
+            SidebarLayer::Knowledge => self.navigate_projects_prev(),
+        }
+        self.reset_log_scroll();
+    }
+
+    /// Indices into `app.agents` that render inside the `Live` layer
+    /// (interactive sessions, terminals, orphaned sessions, split groups —
+    /// everything with a PTY right now), in rendering order.
+    fn live_indices(&self) -> Vec<usize> {
+        self.agents
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| {
+                matches!(
+                    a,
+                    AgentEntry::Interactive(_)
+                        | AgentEntry::Terminal(_)
+                        | AgentEntry::Orphaned(_)
+                        | AgentEntry::Group(_)
+                )
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Indices into `app.agents` that render inside the `Automation` layer's
+    /// agent sub-list (background agents, including corrupt rows).
+    fn automation_agent_indices(&self) -> Vec<usize> {
+        self.agents
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| matches!(a, AgentEntry::Agent(_) | AgentEntry::Corrupt(_)))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn navigate_live(&mut self, forward: bool) {
+        // The layer may have been collapsed (e.g. a header click) while it
+        // was the active layer with a row selected; treat that exactly like
+        // an empty layer rather than moving the cursor further into a list
+        // that no longer renders.
+        if self.live_collapsed {
+            self.cross_layer(SidebarLayer::Live, forward);
+            return;
+        }
+        let indices = self.live_indices();
+        if indices.is_empty() {
+            self.cross_layer(SidebarLayer::Live, forward);
+            return;
+        }
+        let current = indices.iter().position(|&i| i == self.selected);
+        let next_pos = match current {
+            Some(pos) if forward && pos + 1 < indices.len() => Some(pos + 1),
+            Some(pos) if !forward && pos > 0 => Some(pos - 1),
+            Some(_) => None,
+            None => Some(0),
+        };
+        match next_pos {
+            Some(pos) => {
+                let prev = self.selected;
+                self.selected = indices[pos];
+                self.update_agent_section_focus_on_change(prev);
+            }
+            None => self.cross_layer(SidebarLayer::Live, forward),
+        }
+    }
+
+    /// Automation is one flat ring for arrow-key purposes, agents rendered
+    /// above loops: `[agent, agent, …, loop, loop, …]`. Running off either
+    /// true end crosses to the next/previous layer (`cross_layer`) instead
+    /// of bouncing between the two sub-lists.
+    fn navigate_automation(&mut self, forward: bool) {
+        // See the equivalent guard in `navigate_live`: a header click can
+        // collapse the layer we're currently navigating.
+        if self.automation_collapsed {
+            self.cross_layer(SidebarLayer::Automation, forward);
+            return;
+        }
+        let agent_indices = self.automation_agent_indices();
+        let loop_ids: Vec<String> = self
+            .active_loops()
+            .into_iter()
+            .map(|lp| lp.id.clone())
+            .collect();
+        let total = agent_indices.len() + loop_ids.len();
+        if total == 0 {
+            self.cross_layer(SidebarLayer::Automation, forward);
             return;
         }
 
-        self.select_next_agent_panel();
+        let current = match self.automation_kind {
+            AutomationKind::Agent => agent_indices.iter().position(|&i| i == self.selected),
+            AutomationKind::Loop => self
+                .selected_loop_id
+                .as_ref()
+                .and_then(|id| loop_ids.iter().position(|v| v == id))
+                .map(|pos| agent_indices.len() + pos),
+        };
+        let next_pos = match current {
+            Some(pos) if forward && pos + 1 < total => Some(pos + 1),
+            Some(pos) if !forward && pos > 0 => Some(pos - 1),
+            Some(_) => None,
+            None => Some(if forward { 0 } else { total - 1 }),
+        };
+        let Some(pos) = next_pos else {
+            self.cross_layer(SidebarLayer::Automation, forward);
+            return;
+        };
+
+        if pos < agent_indices.len() {
+            self.automation_kind = AutomationKind::Agent;
+            let prev = self.selected;
+            self.selected = agent_indices[pos];
+            self.update_agent_section_focus_on_change(prev);
+        } else {
+            self.automation_kind = AutomationKind::Loop;
+            self.selected_loop_id = Some(loop_ids[pos - agent_indices.len()].clone());
+            self.refresh_loops_selection();
+        }
     }
 
-    fn select_next_project_panel(&mut self) {
-        self.normalize_projects_panel_focus();
-        match self.projects_panel_focus {
-            ProjectsPanelFocus::Projects => self.navigate_projects_next(),
-            ProjectsPanelFocus::Loops => self.navigate_active_loops_next(),
-            ProjectsPanelFocus::Backlog => self.navigate_backlog_next(),
-            ProjectsPanelFocus::History => self.navigate_history_next(),
-            ProjectsPanelFocus::Knowledge => self.navigate_knowledge_next(),
-            ProjectsPanelFocus::RagInfo => self.navigate_from_rag_info_next(),
+    fn navigate_projects_next(&mut self) {
+        // See the equivalent guard in `navigate_live`: a header click can
+        // collapse the layer we're currently navigating.
+        if self.knowledge_collapsed || self.projects.is_empty() {
+            self.cross_layer(SidebarLayer::Knowledge, true);
+            return;
         }
-        self.reset_log_scroll();
+        let next = self.selected_project + 1;
+        if next < self.projects.len() {
+            self.selected_project = next;
+            self.refresh_loops_selection();
+            return;
+        }
+        self.cross_layer(SidebarLayer::Knowledge, true);
+    }
+
+    fn navigate_projects_prev(&mut self) {
+        if self.knowledge_collapsed || self.projects.is_empty() {
+            self.cross_layer(SidebarLayer::Knowledge, false);
+            return;
+        }
+        if self.selected_project > 0 {
+            self.selected_project -= 1;
+            self.refresh_loops_selection();
+            return;
+        }
+        self.cross_layer(SidebarLayer::Knowledge, false);
+    }
+
+    /// Ran off the end of `from`'s list: move to the next/previous layer in
+    /// ring order (RAG → Live → Automation → Knowledge → RAG…), skipping a
+    /// layer if it has nothing to select, and landing on the RAG pinned
+    /// summary when it has activity.
+    fn cross_layer(&mut self, from: SidebarLayer, forward: bool) {
+        let ring = [
+            SidebarLayer::Live,
+            SidebarLayer::Automation,
+            SidebarLayer::Knowledge,
+        ];
+        let start = ring.iter().position(|&l| l == from).unwrap_or(0);
+        let len = ring.len();
+        for step in 1..=len {
+            let idx = if forward {
+                (start + step) % len
+            } else {
+                (start + len - step) % len
+            };
+            if self.enter_layer(ring[idx], forward) {
+                return;
+            }
+        }
+        // Nothing navigable anywhere else — try RAG, else stay put.
+        if self.rag_info.has_rag_activity() {
+            self.enter_rag_focus();
+        }
+    }
+
+    /// Whether `layer`'s body is currently collapsed (nothing rendered below
+    /// its header), mirroring `sidebar::layer_collapsed`.
+    fn layer_is_collapsed(&self, layer: SidebarLayer) -> bool {
+        match layer {
+            SidebarLayer::Live => self.live_collapsed,
+            SidebarLayer::Automation => self.automation_collapsed,
+            SidebarLayer::Knowledge => self.knowledge_collapsed,
+        }
+    }
+
+    /// Whether `layer` has anything to select, ignoring its collapsed state
+    /// — used to tell "collapsed but has rows underneath" (focus the header)
+    /// apart from "collapsed and genuinely empty" (skip it like before).
+    fn layer_has_any_items(&self, layer: SidebarLayer) -> bool {
+        match layer {
+            SidebarLayer::Live => !self.live_indices().is_empty(),
+            SidebarLayer::Automation => {
+                !self.automation_agent_indices().is_empty() || !self.active_loops().is_empty()
+            }
+            SidebarLayer::Knowledge => !self.projects.is_empty(),
+        }
+    }
+
+    /// Try focusing the first/last navigable item of `layer`. Returns
+    /// `false` (and touches nothing) if `layer` has nothing to select, so
+    /// `cross_layer` can keep looking.
+    ///
+    /// A collapsed layer renders no rows below its header, so there is
+    /// nothing to select yet: focus lands on the header (`sidebar_layer`
+    /// switches to it, highlighting it) without disturbing `selected` /
+    /// `selected_loop_id` / `selected_project`, so no cursor is left on an
+    /// invisible row.
+    fn enter_layer(&mut self, layer: SidebarLayer, forward: bool) -> bool {
+        if self.layer_is_collapsed(layer) {
+            if self.layer_has_any_items(layer) {
+                self.sidebar_layer = layer;
+                return true;
+            }
+            return false;
+        }
+        match layer {
+            SidebarLayer::Live => {
+                let indices = self.live_indices();
+                if indices.is_empty() {
+                    return false;
+                }
+                self.sidebar_layer = SidebarLayer::Live;
+                let prev = self.selected;
+                self.selected = if forward {
+                    indices[0]
+                } else {
+                    *indices.last().unwrap()
+                };
+                self.update_agent_section_focus_on_change(prev);
+                true
+            }
+            SidebarLayer::Automation => {
+                let agent_indices = self.automation_agent_indices();
+                let loop_ids: Vec<String> = self
+                    .active_loops()
+                    .into_iter()
+                    .map(|lp| lp.id.clone())
+                    .collect();
+                if agent_indices.is_empty() && loop_ids.is_empty() {
+                    return false;
+                }
+                self.sidebar_layer = SidebarLayer::Automation;
+                // Agents render above loops, so entering forward (from
+                // above) lands on agents first; entering backward (from
+                // below) lands on loops first — whichever list is empty is
+                // skipped.
+                if forward {
+                    if !agent_indices.is_empty() {
+                        self.automation_kind = AutomationKind::Agent;
+                        let prev = self.selected;
+                        self.selected = agent_indices[0];
+                        self.update_agent_section_focus_on_change(prev);
+                    } else {
+                        self.automation_kind = AutomationKind::Loop;
+                        self.selected_loop_id = Some(loop_ids[0].clone());
+                        self.refresh_loops_selection();
+                    }
+                } else if !loop_ids.is_empty() {
+                    self.automation_kind = AutomationKind::Loop;
+                    self.selected_loop_id = Some(loop_ids.last().unwrap().clone());
+                    self.refresh_loops_selection();
+                } else {
+                    self.automation_kind = AutomationKind::Agent;
+                    let prev = self.selected;
+                    self.selected = *agent_indices.last().unwrap();
+                    self.update_agent_section_focus_on_change(prev);
+                }
+                true
+            }
+            SidebarLayer::Knowledge => {
+                if self.projects.is_empty() {
+                    return false;
+                }
+                self.sidebar_layer = SidebarLayer::Knowledge;
+                self.selected_project = if forward { 0 } else { self.projects.len() - 1 };
+                self.refresh_loops_selection();
+                true
+            }
+        }
+    }
+
+    fn enter_rag_focus(&mut self) {
+        self.agents_rag_focused = true;
+    }
+
+    /// Leaving the pinned RAG summary: land on the layer nearest it (`Live`
+    /// going forward, `Knowledge` wrapping around going backward), else stay
+    /// on RAG if nothing else is navigable.
+    fn leave_rag_focus(&mut self, forward: bool) {
+        self.agents_rag_focused = false;
+        let start = if forward {
+            SidebarLayer::Automation
+        } else {
+            SidebarLayer::Knowledge
+        };
+        // Try the immediate neighbor first (Live going forward, Knowledge
+        // going backward), then fall back through the ring.
+        if forward && self.enter_layer(SidebarLayer::Live, true) {
+            return;
+        }
+        if !forward && self.enter_layer(SidebarLayer::Knowledge, false) {
+            return;
+        }
+        self.cross_layer(start, forward);
+    }
+
+    /// Move a project's active `ProjectTab` list selection. Arrows never
+    /// change tabs (functional requirement 4) — only the list inside the
+    /// current tab moves, or wraps within it.
+    fn navigate_project_tab_list(&mut self, forward: bool) {
+        match self.project_focus {
+            Some(ProjectTab::Overview) | None => {}
+            Some(ProjectTab::Backlog) => {
+                if self.backlog_specs.is_empty() {
+                    return;
+                }
+                self.selected_backlog = if forward {
+                    (self.selected_backlog + 1) % self.backlog_specs.len()
+                } else {
+                    self.selected_backlog
+                        .checked_sub(1)
+                        .unwrap_or(self.backlog_specs.len() - 1)
+                };
+            }
+            Some(ProjectTab::Knowledge) => {
+                if forward {
+                    self.navigate_knowledge_next();
+                } else {
+                    self.navigate_knowledge_prev();
+                }
+            }
+            Some(ProjectTab::History) => {
+                let len = self.selected_project_history_entries().len();
+                if len == 0 {
+                    return;
+                }
+                self.selected_project_history = if forward {
+                    (self.selected_project_history + 1) % len
+                } else {
+                    self.selected_project_history
+                        .checked_sub(1)
+                        .unwrap_or(len - 1)
+                };
+            }
+        }
     }
 
     fn navigate_knowledge_next(&mut self) {
@@ -375,242 +763,6 @@ impl App {
             .position(|&idx| idx == self.selected_knowledge)
             .unwrap_or(0);
         self.selected_knowledge = filtered[(current + 1) % filtered.len()];
-    }
-
-    fn navigate_projects_next(&mut self) {
-        if self.projects.is_empty() {
-            return;
-        }
-        let next = self.selected_project + 1;
-        if next < self.projects.len() {
-            self.selected_project = next;
-            self.refresh_loops_selection();
-            return;
-        }
-        self.cross_forward_from_projects();
-    }
-
-    /// Shared "ran off the end" fallback for Projects/Loops/Backlog: try
-    /// entering the next non-empty section in sidebar order (Loops →
-    /// Backlog → History → RagInfo), else wrap to the first project.
-    fn cross_forward_from_projects(&mut self) {
-        if self.try_cross_to_loops_first() {
-            return;
-        }
-        self.cross_forward_from_loops();
-    }
-
-    fn cross_forward_from_loops(&mut self) {
-        if self.try_cross_to_backlog_first() {
-            return;
-        }
-        self.cross_forward_from_backlog();
-    }
-
-    fn cross_forward_from_backlog(&mut self) {
-        if self.try_cross_to_history_first() {
-            return;
-        }
-        if self.rag_info.has_rag_activity() {
-            self.projects_panel_focus = ProjectsPanelFocus::RagInfo;
-            return;
-        }
-        self.projects_panel_focus = ProjectsPanelFocus::Projects;
-        self.selected_project = 0;
-    }
-
-    fn try_cross_to_loops_first(&mut self) -> bool {
-        let Some(id) = self.active_loops().first().map(|lp| lp.id.clone()) else {
-            return false;
-        };
-        self.projects_panel_focus = ProjectsPanelFocus::Loops;
-        self.selected_loop_id = Some(id);
-        self.refresh_loops_selection();
-        true
-    }
-
-    fn try_cross_to_backlog_first(&mut self) -> bool {
-        if self.backlog_specs.is_empty() {
-            return false;
-        }
-        self.projects_panel_focus = ProjectsPanelFocus::Backlog;
-        self.selected_backlog = 0;
-        true
-    }
-
-    /// Focuses `History` on its first finished loop. When the section is
-    /// collapsed there is nothing to select yet — focus lands on the header
-    /// (Enter/→ expands it) without disturbing `selected_loop_id`.
-    fn try_cross_to_history_first(&mut self) -> bool {
-        let finished_ids: Vec<String> = self
-            .finished_loops()
-            .iter()
-            .map(|lp| lp.id.clone())
-            .collect();
-        if finished_ids.is_empty() {
-            return false;
-        }
-        self.projects_panel_focus = ProjectsPanelFocus::History;
-        if !self.history_collapsed {
-            self.selected_history = 0;
-            self.selected_loop_id = Some(finished_ids[0].clone());
-            self.refresh_loops_selection();
-        }
-        true
-    }
-
-    fn navigate_active_loops_next(&mut self) {
-        let visible_ids: Vec<String> = self
-            .active_loops()
-            .into_iter()
-            .map(|lp| lp.id.clone())
-            .collect();
-        if visible_ids.is_empty() {
-            self.cross_forward_from_loops();
-            return;
-        }
-        let current = self
-            .selected_loop_id
-            .as_ref()
-            .and_then(|id| visible_ids.iter().position(|vid| vid == id))
-            .unwrap_or(0);
-        let next = current + 1;
-        if next < visible_ids.len() {
-            self.selected_loop_id = Some(visible_ids[next].clone());
-            self.refresh_loops_selection();
-            return;
-        }
-        self.cross_forward_from_loops();
-    }
-
-    fn navigate_backlog_next(&mut self) {
-        if self.backlog_specs.is_empty() {
-            self.cross_forward_from_backlog();
-            return;
-        }
-        let next = self.selected_backlog + 1;
-        if next < self.backlog_specs.len() {
-            self.selected_backlog = next;
-            return;
-        }
-        self.cross_forward_from_backlog();
-    }
-
-    fn navigate_history_next(&mut self) {
-        let finished_ids: Vec<String> = self
-            .finished_loops()
-            .iter()
-            .map(|lp| lp.id.clone())
-            .collect();
-        if finished_ids.is_empty() || self.history_collapsed {
-            if self.rag_info.has_rag_activity() {
-                self.projects_panel_focus = ProjectsPanelFocus::RagInfo;
-                return;
-            }
-            self.projects_panel_focus = ProjectsPanelFocus::Projects;
-            self.selected_project = 0;
-            return;
-        }
-        let current = self
-            .selected_loop_id
-            .as_ref()
-            .and_then(|id| finished_ids.iter().position(|vid| vid == id))
-            .unwrap_or(0);
-        let next = current + 1;
-        if next < finished_ids.len() {
-            self.selected_history = next;
-            self.selected_loop_id = Some(finished_ids[next].clone());
-            self.refresh_loops_selection();
-            return;
-        }
-        if self.rag_info.has_rag_activity() {
-            self.projects_panel_focus = ProjectsPanelFocus::RagInfo;
-            return;
-        }
-        self.projects_panel_focus = ProjectsPanelFocus::Projects;
-        self.selected_project = 0;
-    }
-
-    fn navigate_from_rag_info_next(&mut self) {
-        if self.projects.is_empty() {
-            return;
-        }
-        self.projects_panel_focus = ProjectsPanelFocus::Projects;
-        self.selected_project = 0;
-        self.refresh_loops_selection();
-    }
-
-    fn select_next_agent_panel(&mut self) {
-        if !self.rag_info.has_rag_activity() {
-            self.advance_agent_selection();
-            return;
-        }
-
-        if self.agents_rag_focused {
-            self.agents_rag_focused = false;
-            if !self.agents.is_empty() {
-                let prev = self.selected;
-                self.selected = 0;
-                self.update_agent_section_focus_on_change(prev);
-            }
-            self.reset_log_scroll();
-            return;
-        }
-
-        if self.agents.is_empty() || self.selected + 1 >= self.agents.len() {
-            self.agents_rag_focused = true;
-            self.reset_log_scroll();
-            return;
-        }
-
-        self.advance_agent_selection();
-    }
-
-    fn advance_agent_selection(&mut self) {
-        if self.agents.is_empty() {
-            return;
-        }
-
-        let prev = self.selected;
-        self.selected = (self.selected + 1) % self.agents.len();
-        self.update_agent_section_focus_on_change(prev);
-        self.reset_log_scroll();
-    }
-
-    fn update_agent_section_focus_on_change(&mut self, _prev_selected: usize) {
-        if let Some(agent) = self.agents.get(self.selected) {
-            self.agent_section_focus = match agent {
-                AgentEntry::Agent(_) | AgentEntry::Corrupt(_) | AgentEntry::Group(_) => {
-                    AgentSectionFocus::Background
-                }
-                AgentEntry::Interactive(_) | AgentEntry::Orphaned(_) => {
-                    AgentSectionFocus::Interactive
-                }
-                AgentEntry::Terminal(_) => AgentSectionFocus::Terminal,
-            };
-        }
-    }
-
-    pub fn select_prev(&mut self) {
-        if self.sidebar_mode == SidebarMode::Projects {
-            self.select_prev_project_panel();
-            return;
-        }
-
-        self.select_prev_agent_panel();
-    }
-
-    fn select_prev_project_panel(&mut self) {
-        self.normalize_projects_panel_focus();
-        match self.projects_panel_focus {
-            ProjectsPanelFocus::Projects => self.navigate_projects_prev(),
-            ProjectsPanelFocus::Loops => self.navigate_active_loops_prev(),
-            ProjectsPanelFocus::Backlog => self.navigate_backlog_prev(),
-            ProjectsPanelFocus::History => self.navigate_history_prev(),
-            ProjectsPanelFocus::Knowledge => self.navigate_knowledge_prev(),
-            ProjectsPanelFocus::RagInfo => self.navigate_from_rag_info_prev(),
-        }
-        self.reset_log_scroll();
     }
 
     fn navigate_knowledge_prev(&mut self) {
@@ -626,219 +778,27 @@ impl App {
         self.selected_knowledge = filtered[next];
     }
 
-    fn navigate_projects_prev(&mut self) {
-        if self.projects.is_empty() {
-            return;
+    pub(crate) fn update_agent_section_focus_on_change(&mut self, _prev_selected: usize) {
+        if let Some(agent) = self.agents.get(self.selected) {
+            match agent {
+                AgentEntry::Agent(_) | AgentEntry::Corrupt(_) => {
+                    self.sidebar_layer = SidebarLayer::Automation;
+                    self.automation_kind = AutomationKind::Agent;
+                }
+                AgentEntry::Interactive(_) | AgentEntry::Orphaned(_) => {
+                    self.sidebar_layer = SidebarLayer::Live;
+                    self.agent_section_focus = AgentSectionFocus::Interactive;
+                }
+                AgentEntry::Terminal(_) => {
+                    self.sidebar_layer = SidebarLayer::Live;
+                    self.agent_section_focus = AgentSectionFocus::Terminal;
+                }
+                AgentEntry::Group(_) => {
+                    self.sidebar_layer = SidebarLayer::Live;
+                    self.agent_section_focus = AgentSectionFocus::Groups;
+                }
+            };
         }
-        if self.selected_project > 0 {
-            self.selected_project -= 1;
-            self.refresh_loops_selection();
-            return;
-        }
-        self.cross_backward_from_projects();
-    }
-
-    /// Shared "ran off the start" fallback for Projects: try entering the
-    /// previous non-empty section in reverse sidebar order (RagInfo →
-    /// History → Backlog → Loops), else wrap to the last project.
-    fn cross_backward_from_projects(&mut self) {
-        if self.rag_info.has_rag_activity() {
-            self.projects_panel_focus = ProjectsPanelFocus::RagInfo;
-            return;
-        }
-        if self.try_cross_to_history_last() {
-            return;
-        }
-        if self.try_cross_to_backlog_last() {
-            return;
-        }
-        if self.try_cross_to_loops_last() {
-            return;
-        }
-        self.selected_project = self.projects.len() - 1;
-    }
-
-    fn cross_backward_from_loops(&mut self) {
-        if !self.projects.is_empty() {
-            self.projects_panel_focus = ProjectsPanelFocus::Projects;
-            self.selected_project = self.projects.len() - 1;
-            return;
-        }
-        // No projects to land on either — stay put on the last active loop
-        // if one exists, otherwise there's nothing navigable at all.
-        if let Some(last) = self.active_loops().last() {
-            self.selected_loop_id = Some(last.id.clone());
-            self.refresh_loops_selection();
-        }
-    }
-
-    fn cross_backward_from_backlog(&mut self) {
-        if self.try_cross_to_loops_last() {
-            return;
-        }
-        self.cross_backward_from_loops();
-    }
-
-    fn try_cross_to_loops_last(&mut self) -> bool {
-        let Some(id) = self.active_loops().last().map(|lp| lp.id.clone()) else {
-            return false;
-        };
-        self.projects_panel_focus = ProjectsPanelFocus::Loops;
-        self.selected_loop_id = Some(id);
-        self.refresh_loops_selection();
-        true
-    }
-
-    fn try_cross_to_backlog_last(&mut self) -> bool {
-        if self.backlog_specs.is_empty() {
-            return false;
-        }
-        self.projects_panel_focus = ProjectsPanelFocus::Backlog;
-        self.selected_backlog = self.backlog_specs.len() - 1;
-        true
-    }
-
-    /// Focuses `History` on its last finished loop. When collapsed there is
-    /// nothing to select — focus lands on the header without disturbing
-    /// `selected_loop_id`, matching `try_cross_to_history_first`.
-    fn try_cross_to_history_last(&mut self) -> bool {
-        let finished_ids: Vec<String> = self
-            .finished_loops()
-            .iter()
-            .map(|lp| lp.id.clone())
-            .collect();
-        if finished_ids.is_empty() {
-            return false;
-        }
-        self.projects_panel_focus = ProjectsPanelFocus::History;
-        if !self.history_collapsed {
-            self.selected_history = finished_ids.len() - 1;
-            self.selected_loop_id = Some(finished_ids[finished_ids.len() - 1].clone());
-            self.refresh_loops_selection();
-        }
-        true
-    }
-
-    fn navigate_active_loops_prev(&mut self) {
-        let visible_ids: Vec<String> = self
-            .active_loops()
-            .into_iter()
-            .map(|lp| lp.id.clone())
-            .collect();
-        if visible_ids.is_empty() {
-            self.cross_backward_from_loops();
-            return;
-        }
-        let current = self
-            .selected_loop_id
-            .as_ref()
-            .and_then(|id| visible_ids.iter().position(|vid| vid == id))
-            .unwrap_or(0);
-        if current > 0 {
-            self.selected_loop_id = Some(visible_ids[current - 1].clone());
-            self.refresh_loops_selection();
-            return;
-        }
-        self.cross_backward_from_loops();
-    }
-
-    fn navigate_backlog_prev(&mut self) {
-        if self.backlog_specs.is_empty() {
-            self.cross_backward_from_backlog();
-            return;
-        }
-        if self.selected_backlog > 0 {
-            self.selected_backlog -= 1;
-            return;
-        }
-        self.cross_backward_from_backlog();
-    }
-
-    fn navigate_history_prev(&mut self) {
-        let finished_ids: Vec<String> = self
-            .finished_loops()
-            .iter()
-            .map(|lp| lp.id.clone())
-            .collect();
-        if finished_ids.is_empty() || self.history_collapsed {
-            if self.try_cross_to_backlog_last() {
-                return;
-            }
-            self.cross_backward_from_loops();
-            return;
-        }
-        let current = self
-            .selected_loop_id
-            .as_ref()
-            .and_then(|id| finished_ids.iter().position(|vid| vid == id))
-            .unwrap_or(0);
-        if current > 0 {
-            self.selected_history = current - 1;
-            self.selected_loop_id = Some(finished_ids[current - 1].clone());
-            self.refresh_loops_selection();
-            return;
-        }
-        if self.try_cross_to_backlog_last() {
-            return;
-        }
-        self.cross_backward_from_loops();
-    }
-
-    fn navigate_from_rag_info_prev(&mut self) {
-        if self.try_cross_to_history_last() {
-            return;
-        }
-        if self.try_cross_to_backlog_last() {
-            return;
-        }
-        if self.try_cross_to_loops_last() {
-            return;
-        }
-        if self.projects.is_empty() {
-            return;
-        }
-        self.projects_panel_focus = ProjectsPanelFocus::Projects;
-        self.selected_project = self.projects.len() - 1;
-    }
-
-    fn select_prev_agent_panel(&mut self) {
-        if !self.rag_info.has_rag_activity() {
-            self.retreat_agent_selection();
-            return;
-        }
-
-        if self.agents_rag_focused {
-            self.agents_rag_focused = false;
-            if !self.agents.is_empty() {
-                let prev = self.selected;
-                self.selected = self.agents.len() - 1;
-                self.update_agent_section_focus_on_change(prev);
-            }
-            self.reset_log_scroll();
-            return;
-        }
-
-        if self.agents.is_empty() || self.selected == 0 {
-            self.agents_rag_focused = true;
-            self.reset_log_scroll();
-            return;
-        }
-
-        self.retreat_agent_selection();
-    }
-
-    fn retreat_agent_selection(&mut self) {
-        if self.agents.is_empty() {
-            return;
-        }
-
-        let prev = self.selected;
-        self.selected = self
-            .selected
-            .checked_sub(1)
-            .unwrap_or(self.agents.len() - 1);
-        self.update_agent_section_focus_on_change(prev);
-        self.reset_log_scroll();
     }
 
     fn reset_log_scroll(&mut self) {
@@ -877,7 +837,98 @@ impl App {
         }
         self.refresh_project_knowledge()?;
         self.refresh_backlog_specs()?;
+        self.refresh_project_preview_cache();
+        // Keep an already-open History tab live instead of only loading it
+        // once on first show — cheap (one indexed query) and scoped to just
+        // the project currently being looked at.
+        if self.project_focus == Some(ProjectTab::History) {
+            if let Some(hash) = self.selected_project().map(|p| p.hash.clone()) {
+                self.load_project_history(&hash);
+            }
+        }
         Ok(())
+    }
+
+    /// Recompute the Knowledge layer's per-project Preview summary cache
+    /// (pending backlog count, knowledge entry count, last activity, loop
+    /// badge). Cheap aggregate queries over the small `projects` list, run
+    /// once per refresh tick — never per keystroke/highlight move
+    /// (functional requirement 3).
+    fn refresh_project_preview_cache(&mut self) {
+        let running_workdirs: HashSet<String> = self
+            .active_loops()
+            .iter()
+            .filter(|lp| lp.status == LoopStatus::Running)
+            .map(|lp| lp.workdir.clone())
+            .collect();
+
+        let mut cache = HashMap::new();
+        for project in &self.projects {
+            let pending_backlog = self
+                .db
+                .list_specs(Some(project.path.as_str()), None, true)
+                .map(|specs| specs.len())
+                .unwrap_or(0);
+            let knowledge_entries = self
+                .db
+                .list_project_knowledge(&project.hash, None, 200)
+                .map(|nodes| nodes.len())
+                .unwrap_or(0);
+            let last_activity = self
+                .db
+                .list_loops(Some(project.path.as_str()))
+                .ok()
+                .and_then(|loops| loops.iter().map(|lp| lp.created_at.timestamp()).max());
+            cache.insert(
+                project.hash.clone(),
+                types::ProjectPreviewSummary {
+                    pending_backlog,
+                    knowledge_entries,
+                    last_activity,
+                    loop_running: running_workdirs.contains(&project.path),
+                },
+            );
+        }
+        self.project_preview_cache = cache;
+    }
+
+    pub(crate) fn selected_project_preview(&self) -> Option<&types::ProjectPreviewSummary> {
+        let project = self.selected_project()?;
+        self.project_preview_cache.get(&project.hash)
+    }
+
+    /// Load (or reload) the persisted History tab entries for the project
+    /// with `hash` into the cache.
+    fn load_project_history(&mut self, hash: &str) {
+        let Some(workdir) = self
+            .projects
+            .iter()
+            .find(|p| p.hash == hash)
+            .map(|p| p.path.clone())
+        else {
+            return;
+        };
+        let entries = self
+            .db
+            .list_project_history(&workdir, 100)
+            .unwrap_or_default();
+        self.project_history_cache.insert(hash.to_string(), entries);
+    }
+
+    /// Persisted History entries for the currently selected project, lazily
+    /// loading them into the cache on first access.
+    pub(crate) fn selected_project_history_entries(
+        &mut self,
+    ) -> &[crate::db::project::ProjectHistoryEntry] {
+        let Some(hash) = self.selected_project().map(|p| p.hash.clone()) else {
+            return &[];
+        };
+        if !self.project_history_cache.contains_key(&hash) {
+            self.load_project_history(&hash);
+        }
+        self.project_history_cache
+            .get(&hash)
+            .map_or(&[], |v| v.as_slice())
     }
 
     /// Reload the standalone/backlog specs shown in the sidebar's `Backlog`
@@ -966,15 +1017,7 @@ impl App {
         loops
     }
 
-    /// Completed/failed loops for the sidebar's `History` section.
-    pub fn finished_loops(&self) -> Vec<&crate::domain::loops::Loop> {
-        self.loops
-            .iter()
-            .filter(|lp| matches!(lp.status, LoopStatus::Completed | LoopStatus::Failed))
-            .collect()
-    }
-
-    fn refresh_loops_selection(&mut self) {
+    pub(crate) fn refresh_loops_selection(&mut self) {
         let visible = self.visible_loops();
         if visible.is_empty() {
             self.selected_loop_id = None;
@@ -1144,9 +1187,6 @@ impl App {
         }
 
         if !self.rag_info.has_rag_activity() {
-            if self.projects_panel_focus == ProjectsPanelFocus::RagInfo {
-                self.projects_panel_focus = ProjectsPanelFocus::Projects;
-            }
             self.agents_rag_focused = false;
         }
 
@@ -1246,12 +1286,6 @@ impl App {
             .collect()
     }
 
-    pub fn selected_filtered_knowledge_index(&self) -> Option<usize> {
-        self.filtered_knowledge_indices()
-            .iter()
-            .position(|&idx| idx == self.selected_knowledge)
-    }
-
     pub fn append_knowledge_filter(&mut self, value: char) {
         self.knowledge_filter.push(value);
         self.normalize_selected_knowledge();
@@ -1289,77 +1323,139 @@ impl App {
         self.selected_knowledge = filtered[0];
     }
 
-    #[allow(dead_code)]
-    pub fn visible_projects_panels(&self) -> Vec<ProjectsPanelFocus> {
-        let mut panels = vec![
-            ProjectsPanelFocus::Projects,
-            ProjectsPanelFocus::Loops,
-            ProjectsPanelFocus::Backlog,
-            ProjectsPanelFocus::History,
-            ProjectsPanelFocus::Knowledge,
+    /// Entry point for arrow-down/up from the `Home` screen: focus the
+    /// nearest navigable edge of the sidebar ring (RAG → Live → Automation →
+    /// Knowledge), mirroring `cross_layer`'s ring order.
+    pub(crate) fn focus_sidebar_from_edge(&mut self, from_top: bool) {
+        if from_top {
+            if self.rag_info.has_rag_activity() {
+                self.enter_rag_focus();
+                return;
+            }
+            for layer in [
+                SidebarLayer::Live,
+                SidebarLayer::Automation,
+                SidebarLayer::Knowledge,
+            ] {
+                if self.enter_layer(layer, true) {
+                    return;
+                }
+            }
+        } else {
+            for layer in [
+                SidebarLayer::Knowledge,
+                SidebarLayer::Automation,
+                SidebarLayer::Live,
+            ] {
+                if self.enter_layer(layer, false) {
+                    return;
+                }
+            }
+            if self.rag_info.has_rag_activity() {
+                self.enter_rag_focus();
+            }
+        }
+    }
+
+    /// Jump directly to the next sidebar layer (F2 / right-click), skipping
+    /// layers with nothing to select — a keyboard-only shortcut alongside
+    /// arrow-key ring navigation.
+    pub(crate) fn cycle_sidebar_layer(&mut self) {
+        self.agents_rag_focused = false;
+        let start = self.sidebar_layer;
+        let ring = [
+            SidebarLayer::Live,
+            SidebarLayer::Automation,
+            SidebarLayer::Knowledge,
         ];
-        if self.rag_info.has_rag_activity() {
-            panels.push(ProjectsPanelFocus::RagInfo);
-        }
-        panels
-    }
-
-    fn project_panel_has_navigable_items(&self, panel: ProjectsPanelFocus) -> bool {
-        match panel {
-            ProjectsPanelFocus::Projects => !self.projects.is_empty(),
-            ProjectsPanelFocus::Loops => !self.active_loops().is_empty(),
-            ProjectsPanelFocus::Backlog => !self.backlog_specs.is_empty(),
-            ProjectsPanelFocus::History => !self.finished_loops().is_empty(),
-            ProjectsPanelFocus::Knowledge => true,
-            ProjectsPanelFocus::RagInfo => self.rag_info.has_rag_activity(),
+        let start_idx = ring.iter().position(|&l| l == start).unwrap_or(0);
+        for step in 1..=ring.len() {
+            let layer = ring[(start_idx + step) % ring.len()];
+            if self.enter_layer(layer, true) {
+                return;
+            }
         }
     }
 
-    fn normalize_projects_panel_focus(&mut self) {
-        if self.project_panel_has_navigable_items(self.projects_panel_focus) {
+    /// Enter a highlighted project's Focus tab bar (functional requirement
+    /// 4). `tab` defaults to `Overview`; History lazily loads on first show.
+    pub(crate) fn enter_project_focus(&mut self, tab: ProjectTab) {
+        self.project_focus = Some(tab);
+        if tab == ProjectTab::History {
+            let _ = self.selected_project_history_entries();
+        }
+    }
+
+    /// Leave a project's Focus tab bar back to the sidebar (Esc).
+    pub(crate) fn exit_project_focus(&mut self) {
+        self.project_focus = None;
+    }
+
+    /// Tab/Shift+Tab or `]`/`[` inside a project's Focus tab bar.
+    pub(crate) fn cycle_project_tab(&mut self, forward: bool) {
+        let Some(current) = self.project_focus else {
             return;
-        }
-
-        let fallback = self
-            .visible_projects_panels()
-            .into_iter()
-            .find(|panel| self.project_panel_has_navigable_items(*panel));
-        if let Some(panel) = fallback {
-            self.projects_panel_focus = panel;
-        }
-    }
-
-    pub(crate) fn focus_projects_panel_from_edge(&mut self, from_top: bool) {
-        let panels = self.visible_projects_panels();
-        let ordered = if from_top {
-            panels
-        } else {
-            panels.into_iter().rev().collect::<Vec<_>>()
         };
-
-        let selected = ordered
+        let idx = ProjectTab::ALL
             .iter()
-            .copied()
-            .find(|panel| self.project_panel_has_navigable_items(*panel))
-            .or_else(|| ordered.first().copied())
-            .unwrap_or(ProjectsPanelFocus::Projects);
-        self.projects_panel_focus = selected;
-    }
-
-    #[allow(dead_code)]
-    pub fn cycle_projects_panel_focus(&mut self, forward: bool) {
-        let panels = self.visible_projects_panels();
-        let current = panels
-            .iter()
-            .position(|panel| *panel == self.projects_panel_focus)
+            .position(|&t| t == current)
             .unwrap_or(0);
+        let len = ProjectTab::ALL.len();
         let next = if forward {
-            (current + 1) % panels.len()
+            (idx + 1) % len
         } else {
-            current.checked_sub(1).unwrap_or(panels.len() - 1)
+            idx.checked_sub(1).unwrap_or(len - 1)
         };
-        self.projects_panel_focus = panels[next];
-        self.log_scroll = 0;
+        self.enter_project_focus(ProjectTab::ALL[next]);
+    }
+
+    /// Direct hotkey (o/b/k/h) to jump straight to a tab.
+    pub(crate) fn open_project_tab(&mut self, tab: ProjectTab) {
+        self.enter_project_focus(tab);
+    }
+
+    /// Mouse click on the active tab's list at display row `idx` — sets the
+    /// tab's selection directly (unlike arrow keys, which move by one).
+    pub(crate) fn set_project_tab_row(&mut self, idx: usize) {
+        match self.project_focus {
+            Some(ProjectTab::Backlog) => {
+                if idx < self.backlog_specs.len() {
+                    self.selected_backlog = idx;
+                }
+            }
+            Some(ProjectTab::Knowledge) => {
+                if let Some(&node_idx) = self.filtered_knowledge_indices().get(idx) {
+                    self.selected_knowledge = node_idx;
+                }
+            }
+            Some(ProjectTab::History) => {
+                if idx < self.selected_project_history_entries().len() {
+                    self.selected_project_history = idx;
+                }
+            }
+            Some(ProjectTab::Overview) | None => {}
+        }
+    }
+
+    /// Toggle a sidebar layer's collapsed state and persist it (see
+    /// `App::new`, which restores it) — functional requirement 1.
+    pub(crate) fn toggle_layer_collapsed(&mut self, layer: SidebarLayer) {
+        let collapsed = match layer {
+            SidebarLayer::Live => {
+                self.live_collapsed = !self.live_collapsed;
+                self.live_collapsed
+            }
+            SidebarLayer::Automation => {
+                self.automation_collapsed = !self.automation_collapsed;
+                self.automation_collapsed
+            }
+            SidebarLayer::Knowledge => {
+                self.knowledge_collapsed = !self.knowledge_collapsed;
+                self.knowledge_collapsed
+            }
+        };
+        let key = layer_collapsed_state_key(layer);
+        let _ = self.db.set_state(key, if collapsed { "1" } else { "0" });
     }
 
     pub fn activate_playground(&mut self) {
@@ -1390,35 +1486,6 @@ impl App {
             .db
             .set_state("rag_paused", if new_val { "1" } else { "0" });
         self.rag_paused = new_val;
-    }
-
-    pub fn toggle_sidebar_mode(&mut self) {
-        self.sidebar_mode = match self.sidebar_mode {
-            SidebarMode::Agents => SidebarMode::Projects,
-            SidebarMode::Projects => SidebarMode::Agents,
-        };
-        if self.sidebar_mode == SidebarMode::Projects {
-            self.normalize_projects_panel_focus();
-        }
-        self.agents_rag_focused = false;
-        self.reset_log_scroll();
-    }
-
-    /// Toggles the sidebar's `History` section between its collapsed header
-    /// (just the count) and the expanded finished-loop list. On expand,
-    /// selects the first finished loop so the main panel previews it — same
-    /// as entering the section from an edge.
-    pub fn toggle_history_collapsed(&mut self) {
-        self.history_collapsed = !self.history_collapsed;
-        if self.history_collapsed {
-            return;
-        }
-        let Some(first) = self.finished_loops().first().map(|lp| lp.id.clone()) else {
-            return;
-        };
-        self.selected_history = 0;
-        self.selected_loop_id = Some(first);
-        self.refresh_loops_selection();
     }
 
     pub fn cycle_loop_spec(&mut self, forward: bool) {
@@ -1641,7 +1708,7 @@ impl App {
     }
 
     pub fn toggle_activity_panel(&mut self) {
-        if self.sidebar_mode == SidebarMode::Projects {
+        if self.sidebar_layer == SidebarLayer::Knowledge {
             return;
         }
 
@@ -1701,7 +1768,7 @@ impl App {
     }
 
     fn workdir_for_projects_mode(&self) -> Option<PathBuf> {
-        if self.sidebar_mode != SidebarMode::Projects {
+        if self.sidebar_layer != SidebarLayer::Knowledge {
             return None;
         }
         self.selected_project().map(|p| PathBuf::from(&p.path))
@@ -1743,7 +1810,7 @@ impl App {
     }
 
     fn prompt_session_key_for_selected_project(&self) -> Option<String> {
-        if self.sidebar_mode != SidebarMode::Projects {
+        if self.sidebar_layer != SidebarLayer::Knowledge {
             return None;
         }
         let project = self.selected_project()?;
@@ -2991,6 +3058,16 @@ fn spawn_system_monitor(
     system_info_rx
 }
 
+/// `daemon_state` key under which a sidebar layer's collapsed state
+/// persists across sessions (functional requirement 1).
+fn layer_collapsed_state_key(layer: SidebarLayer) -> &'static str {
+    match layer {
+        SidebarLayer::Live => "sidebar_layer_live_collapsed",
+        SidebarLayer::Automation => "sidebar_layer_automation_collapsed",
+        SidebarLayer::Knowledge => "sidebar_layer_knowledge_collapsed",
+    }
+}
+
 fn load_cli_usage() -> crate::domain::usage_stats::CliUsage {
     let mut usage = dirs::home_dir()
         .map(|h| crate::domain::usage_stats::CliUsage::load(&h.join(".canopy")))
@@ -3063,7 +3140,7 @@ mod tests {
     };
     use crate::db::session::InteractiveSession;
     use crate::db::Database;
-    use crate::tui::app::types::App;
+    use crate::tui::app::types::{AgentEntry, App, AutomationKind, ProjectTab, SidebarLayer};
     use std::sync::Arc;
     use tempfile::{tempdir, NamedTempFile};
 
@@ -3427,30 +3504,6 @@ mod tests {
     }
 
     #[test]
-    fn finished_loops_only_includes_completed_and_failed() {
-        use crate::domain::loops::LoopStatus;
-
-        let db = test_db();
-        db.insert_loop(&make_loop("l-running", "Running Loop", LoopStatus::Running))
-            .unwrap();
-        db.insert_loop(&make_loop("l-done", "Done Loop", LoopStatus::Completed))
-            .unwrap();
-        db.insert_loop(&make_loop("l-failed", "Failed Loop", LoopStatus::Failed))
-            .unwrap();
-
-        let data_dir = tempdir().expect("create data dir");
-        let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
-
-        let mut ids: Vec<&str> = app
-            .finished_loops()
-            .iter()
-            .map(|lp| lp.id.as_str())
-            .collect();
-        ids.sort_unstable();
-        assert_eq!(ids, vec!["l-done", "l-failed"]);
-    }
-
-    #[test]
     fn refresh_backlog_specs_filters_by_selected_project_workdir() {
         let db = test_db();
         db.upsert_project(&make_project("hash0", "/tmp/proj0"))
@@ -3488,87 +3541,170 @@ mod tests {
     }
 
     #[test]
-    fn toggle_history_collapsed_selects_first_finished_loop() {
-        use crate::domain::loops::LoopStatus;
-
+    fn entering_a_project_defaults_to_overview_and_history_lazily_loads() {
         let db = test_db();
-        // A second, active loop so the initially-selected loop (whichever
-        // `refresh_loops_selection` defaults to) isn't already "l-done" —
-        // otherwise the assertion below can't tell a real selection change
-        // from a coincidence.
-        db.insert_loop(&make_loop("l-active", "Active Loop", LoopStatus::Running))
-            .unwrap();
-        db.insert_loop(&make_loop("l-done", "Done Loop", LoopStatus::Completed))
+        db.upsert_project(&make_project("hash0", "/tmp/proj0"))
             .unwrap();
 
         let data_dir = tempdir().expect("create data dir");
         let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
-        app.selected_loop_id = Some("l-active".to_string());
-        assert!(app.history_collapsed, "history starts collapsed");
+        assert!(app.project_focus.is_none(), "starts on Preview, not Focus");
 
-        app.toggle_history_collapsed();
-        assert!(!app.history_collapsed);
-        assert_eq!(app.selected_loop_id.as_deref(), Some("l-done"));
-        assert_eq!(app.selected_history, 0);
+        app.enter_project_focus(ProjectTab::Overview);
+        assert_eq!(app.project_focus, Some(ProjectTab::Overview));
 
-        app.toggle_history_collapsed();
-        assert!(app.history_collapsed);
+        app.open_project_tab(ProjectTab::History);
+        assert_eq!(app.project_focus, Some(ProjectTab::History));
+        assert!(
+            app.project_history_cache.contains_key("hash0"),
+            "History tab lazily loads persisted data on first show"
+        );
+
+        app.exit_project_focus();
+        assert!(app.project_focus.is_none());
     }
 
     #[test]
-    fn select_next_cycles_projects_loops_backlog_history_then_wraps() {
+    fn cycle_project_tab_wraps_through_all_four_tabs() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.enter_project_focus(ProjectTab::Overview);
+
+        app.cycle_project_tab(true);
+        assert_eq!(app.project_focus, Some(ProjectTab::Backlog));
+        app.cycle_project_tab(true);
+        assert_eq!(app.project_focus, Some(ProjectTab::Knowledge));
+        app.cycle_project_tab(true);
+        assert_eq!(app.project_focus, Some(ProjectTab::History));
+        app.cycle_project_tab(true);
+        assert_eq!(app.project_focus, Some(ProjectTab::Overview));
+
+        app.cycle_project_tab(false);
+        assert_eq!(app.project_focus, Some(ProjectTab::History));
+    }
+
+    #[test]
+    fn select_next_crosses_live_automation_knowledge_then_wraps() {
         use crate::domain::loops::LoopStatus;
-        use crate::tui::app::types::{ProjectsPanelFocus, SidebarMode};
 
         let db = test_db();
         db.upsert_project(&make_project("hash0", "/tmp/proj0"))
             .unwrap();
         db.insert_loop(&make_loop("l-active", "Active Loop", LoopStatus::Running))
             .unwrap();
-        db.insert_loop(&make_loop("l-done", "Done Loop", LoopStatus::Completed))
-            .unwrap();
-        db.insert_loop_spec(&make_backlog_spec("spec-a", "Spec A", Some("/tmp/proj0")))
+
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.agents = vec![AgentEntry::Agent(crate::domain::models::Agent {
+            id: "bg-1".to_string(),
+            prompt: String::new(),
+            trigger: None,
+            cli: crate::domain::models::Cli::new("claude"),
+            model: None,
+            working_dir: None,
+            enabled: true,
+            enable_at: None,
+            created_at: chrono::Utc::now(),
+            log_path: "/tmp/bg-1.log".to_string(),
+            timeout_minutes: 15,
+            expires_at: None,
+            last_run_at: None,
+            last_run_ok: None,
+            last_triggered_at: None,
+            trigger_count: 0,
+        })];
+        app.sidebar_layer = SidebarLayer::Automation;
+        app.automation_kind = AutomationKind::Agent;
+        app.selected = 0;
+
+        // Automation's agent sub-list has one entry, so the next press
+        // crosses into the loop sub-list before leaving the layer.
+        app.select_next();
+        assert_eq!(app.automation_kind, AutomationKind::Loop);
+        assert_eq!(app.selected_loop_id.as_deref(), Some("l-active"));
+
+        // Automation is exhausted — cross into Knowledge (the only project).
+        app.select_next();
+        assert_eq!(app.sidebar_layer, SidebarLayer::Knowledge);
+        assert_eq!(app.selected_project, 0);
+
+        // Knowledge is exhausted too — wrap back to the top of the ring.
+        app.select_next();
+        assert_eq!(app.sidebar_layer, SidebarLayer::Automation);
+        assert_eq!(app.automation_kind, AutomationKind::Agent);
+    }
+
+    #[test]
+    fn entering_a_collapsed_but_nonempty_layer_focuses_its_header_without_selecting_a_row() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+
+        // One background agent — Automation has something to select, but
+        // it's collapsed, so nothing under its header is rendered.
+        app.agents = vec![AgentEntry::Agent(crate::domain::models::Agent {
+            id: "bg-1".to_string(),
+            prompt: String::new(),
+            trigger: None,
+            cli: crate::domain::models::Cli::new("claude"),
+            model: None,
+            working_dir: None,
+            enabled: true,
+            enable_at: None,
+            created_at: chrono::Utc::now(),
+            log_path: "/tmp/bg-collapsed.log".to_string(),
+            timeout_minutes: 15,
+            expires_at: None,
+            last_run_at: None,
+            last_run_ok: None,
+            last_triggered_at: None,
+            trigger_count: 0,
+        })];
+        app.automation_collapsed = true;
+        // A sentinel far outside Automation's single valid index (0): if
+        // `enter_layer` incorrectly selected into the collapsed list, this
+        // would change to 0 instead of staying untouched.
+        app.selected = 999;
+
+        // Arrow-down from Home: Live is empty so it's skipped, landing on
+        // Automation, which is collapsed but not empty.
+        app.focus_sidebar_from_edge(true);
+
+        assert_eq!(
+            app.sidebar_layer,
+            SidebarLayer::Automation,
+            "focus should land on the collapsed layer's header"
+        );
+        assert_eq!(
+            app.selected, 999,
+            "a collapsed layer must not have a row selected into its invisible list"
+        );
+    }
+
+    #[test]
+    fn entering_a_collapsed_and_genuinely_empty_layer_is_skipped_like_before() {
+        let db = test_db();
+        db.upsert_project(&make_project("hash0", "/tmp/proj0"))
             .unwrap();
 
         let data_dir = tempdir().expect("create data dir");
         let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
-        app.toggle_sidebar_mode();
-        assert!(matches!(app.sidebar_mode, SidebarMode::Projects));
-        app.projects_panel_focus = ProjectsPanelFocus::Projects;
-        app.selected_project = 0;
+        // No agents and no loops: Automation has nothing to select at all,
+        // collapsed or not, so it must still be skipped in favor of the
+        // next navigable layer (Knowledge, which has our one project) —
+        // exactly like the pre-existing empty-layer behavior.
+        app.automation_collapsed = true;
+        app.selected = 999;
 
-        app.select_next();
-        assert_eq!(app.projects_panel_focus, ProjectsPanelFocus::Loops);
-        assert_eq!(app.selected_loop_id.as_deref(), Some("l-active"));
+        app.focus_sidebar_from_edge(true);
 
-        app.select_next();
-        assert_eq!(app.projects_panel_focus, ProjectsPanelFocus::Backlog);
-        assert_eq!(app.selected_backlog, 0);
-
-        app.select_next();
-        assert_eq!(app.projects_panel_focus, ProjectsPanelFocus::History);
-        assert!(
-            app.history_collapsed,
-            "crossing into History shouldn't auto-expand it"
+        assert_eq!(
+            app.sidebar_layer,
+            SidebarLayer::Knowledge,
+            "a collapsed AND empty layer must still be skipped, not focused"
         );
-
-        // Collapsed History has nothing to cycle through, so the next arrow
-        // press falls through to the end of the chain and wraps back to
-        // Projects (there's no RAG activity in this test).
-        app.select_next();
-        assert_eq!(app.projects_panel_focus, ProjectsPanelFocus::Projects);
         assert_eq!(app.selected_project, 0);
-
-        // And the reverse chain mirrors it exactly.
-        app.select_prev();
-        assert_eq!(app.projects_panel_focus, ProjectsPanelFocus::History);
-
-        app.select_prev();
-        assert_eq!(app.projects_panel_focus, ProjectsPanelFocus::Backlog);
-
-        app.select_prev();
-        assert_eq!(app.projects_panel_focus, ProjectsPanelFocus::Loops);
-        assert_eq!(app.selected_loop_id.as_deref(), Some("l-active"));
     }
 
     #[test]

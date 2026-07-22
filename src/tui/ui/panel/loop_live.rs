@@ -540,7 +540,7 @@ mod tests {
     use crate::domain::loops::{
         LoopEdge, LoopNode, LoopNodeKind, LoopSpecStatus, LoopStatus as DomainLoopStatus,
     };
-    use crate::tui::app::types::{App, ProjectsPanelFocus};
+    use crate::tui::app::types::App;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use serde_json::json;
@@ -749,7 +749,6 @@ mod tests {
         seed_running_loop(&db);
 
         let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
-        app.projects_panel_focus = ProjectsPanelFocus::Loops;
         let auto_node = app.loop_graph_highlighted_node_id().map(str::to_string);
         assert!(app.loop_graph_follow);
 

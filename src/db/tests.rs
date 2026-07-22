@@ -9,7 +9,7 @@ use crate::domain::pools::Pool;
 use crate::domain::sync::{
     IntentPayload, MessageKind, MissionImpact, StatusPayload, WorkspaceStatus,
 };
-use chrono::{Duration, Utc};
+use chrono::{Duration, TimeZone, Utc};
 use tempfile::{tempdir, NamedTempFile};
 
 /// Create an in-memory-like DB backed by a temp file (`SQLite` needs a real file for WAL).
@@ -4393,4 +4393,122 @@ fn reconcile_stranded_pool_specs_leaves_worktree_untouched_for_healthy_run() {
 
     let run_after = db.get_loop_run("run-stranded-healthy").unwrap().unwrap();
     assert_eq!(run_after.status, LoopRunStatus::Running);
+}
+
+#[test]
+fn list_project_history_merges_finished_loops_and_past_sessions_newest_first() {
+    use crate::db::project::ProjectHistoryKind;
+
+    let tmp = NamedTempFile::new().expect("create temp file");
+    let path = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+    let db = Database::new(&path).expect("create test db");
+    let workdir = "/tmp/history-project";
+    let other_workdir = "/tmp/other-project";
+
+    // A finished loop, scoped to our workdir — the oldest event.
+    let mut finished_loop = sample_loop("loop-finished");
+    finished_loop.workdir = workdir.to_string();
+    finished_loop.name = "Finished loop".to_string();
+    finished_loop.status = LoopStatus::Completed;
+    finished_loop.completed_at = Some(Utc.with_ymd_and_hms(2024, 1, 1, 0, 1, 0).unwrap());
+    db.insert_loop(&finished_loop).unwrap();
+
+    // A still-running loop in the same workdir must NOT show up in history —
+    // only completed/failed loops are "finished".
+    let mut running_loop = sample_loop("loop-running");
+    running_loop.workdir = workdir.to_string();
+    running_loop.status = LoopStatus::Running;
+    db.insert_loop(&running_loop).unwrap();
+
+    // A finished loop in a *different* workdir must not leak into our results.
+    let mut other_loop = sample_loop("loop-other-project");
+    other_loop.workdir = other_workdir.to_string();
+    other_loop.status = LoopStatus::Completed;
+    other_loop.completed_at = Some(Utc.with_ymd_and_hms(2024, 1, 1, 0, 1, 30).unwrap());
+    db.insert_loop(&other_loop).unwrap();
+
+    // A past (closed) interactive session in our workdir — the middle event.
+    db.insert_interactive_session(
+        "session-past",
+        "Past session",
+        "opencode",
+        workdir,
+        None,
+        None,
+        "interactive",
+        None,
+    )
+    .unwrap();
+    db.mark_session_closed("session-past").unwrap();
+
+    // A still-active interactive session must NOT show up in history.
+    db.insert_interactive_session(
+        "session-active",
+        "Active session",
+        "opencode",
+        workdir,
+        None,
+        None,
+        "interactive",
+        None,
+    )
+    .unwrap();
+
+    // A finished terminal session in our workdir, the most recent event.
+    db.insert_terminal_session("term-finished", "Finished terminal", "bash", workdir)
+        .unwrap();
+    db.finish_terminal_session("term-finished").unwrap();
+
+    // A still-idle terminal session must NOT show up in history.
+    db.insert_terminal_session("term-idle", "Idle terminal", "bash", workdir)
+        .unwrap();
+
+    // Pin down exact timestamps for the two session rows via a short-lived raw
+    // connection: `list_project_history` truncates rfc3339 timestamps to whole
+    // seconds (`DateTime::timestamp()`), so two `Utc::now()` calls made back to
+    // back in this test could otherwise tie and make the ordering assertions
+    // flaky. Deterministic timestamps make the newest-first order exact.
+    {
+        let conn = rusqlite::Connection::open(&path).expect("open raw conn for timestamp fixup");
+        conn.execute(
+            "UPDATE interactive_sessions SET started_at = ?1 WHERE id = 'session-past'",
+            rusqlite::params!["2024-01-01T00:02:00Z"],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE terminal_sessions SET last_active = ?1 WHERE id = 'term-finished'",
+            rusqlite::params!["2024-01-01T00:03:00Z"],
+        )
+        .unwrap();
+    }
+
+    let history = db.list_project_history(workdir, 100).unwrap();
+
+    assert_eq!(
+        history.len(),
+        3,
+        "only the finished loop and the two closed/finished sessions for this workdir should appear: {:?}",
+        history.iter().map(|e| &e.name).collect::<Vec<_>>()
+    );
+    assert!(history.iter().any(|e| e.name == "Finished loop"
+        && e.kind == ProjectHistoryKind::Loop
+        && e.status == "completed"));
+    assert!(history
+        .iter()
+        .any(|e| e.name == "Past session" && e.kind == ProjectHistoryKind::InteractiveSession));
+    assert!(history
+        .iter()
+        .any(|e| e.name == "Finished terminal" && e.kind == ProjectHistoryKind::TerminalSession));
+
+    // Newest-first ordering: the terminal session finished most recently,
+    // then the interactive session was closed, then the loop completed.
+    assert_eq!(history[0].name, "Finished terminal");
+    assert_eq!(history[1].name, "Past session");
+    assert_eq!(history[2].name, "Finished loop");
+
+    // Sessions/loops for other workdirs or still-active never leak in.
+    assert!(!history.iter().any(|e| e.name.contains("other-project")));
+    assert!(!history.iter().any(|e| e.name == "Active session"));
+    assert!(!history.iter().any(|e| e.name == "Idle terminal"));
 }

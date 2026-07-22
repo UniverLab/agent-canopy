@@ -103,6 +103,12 @@ impl Database {
                 status TEXT NOT NULL DEFAULT 'idle'
             );
 
+            CREATE INDEX IF NOT EXISTS idx_interactive_sessions_workdir
+                ON interactive_sessions(working_dir, started_at DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_terminal_sessions_workdir
+                ON terminal_sessions(working_dir, created_at DESC);
+
             CREATE TABLE IF NOT EXISTS groups (
                 id TEXT PRIMARY KEY,
                 orientation TEXT NOT NULL DEFAULT 'horizontal',

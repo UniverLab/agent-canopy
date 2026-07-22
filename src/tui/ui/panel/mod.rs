@@ -13,8 +13,7 @@ use super::{
     STATUS_DISABLED, STATUS_FAIL, STATUS_OK, STATUS_RUNNING,
 };
 use crate::tui::agent::ScreenSnapshot;
-use crate::tui::app::types::{AgentEntry, App, Focus, ProjectsPanelFocus};
-use crate::tui::app::SidebarMode;
+use crate::tui::app::types::{AgentEntry, App, Focus, ProjectTab, SidebarLayer};
 
 pub mod background_agent;
 pub mod details;
@@ -238,7 +237,7 @@ fn panel_mode_label(app: &App) -> Option<&'static str> {
 
 fn show_home_fallback(app: &App) -> bool {
     app.agents.is_empty()
-        && app.sidebar_mode != SidebarMode::Projects
+        && app.projects.is_empty()
         && !matches!(
             app.focus,
             Focus::NewAgentDialog
@@ -262,14 +261,14 @@ fn draw_home_panel(frame: &mut Frame, area: Rect, app: &App) {
 fn draw_log_panel_focus(frame: &mut Frame, area: Rect, app: &mut App) -> bool {
     match app.focus {
         Focus::Home => {
-            if app.sidebar_mode == SidebarMode::Projects {
-                draw_projects_mode_panel(frame, area, app);
-            } else {
-                draw_home_panel(frame, area, app);
-            }
+            draw_home_panel(frame, area, app);
             true
         }
         Focus::Preview => draw_preview_panel(frame, area, app),
+        Focus::Agent if app.sidebar_layer == SidebarLayer::Knowledge => {
+            draw_project_tabs_panel(frame, area, app);
+            true
+        }
         Focus::Agent => draw_agent_panel(frame, area, app),
         Focus::NewAgentDialog => draw_new_agent_dialog_background(frame, area, app),
         Focus::LaunchpadDialog
@@ -280,7 +279,7 @@ fn draw_log_panel_focus(frame: &mut Frame, area: Rect, app: &mut App) -> bool {
         | Focus::LoopEditorDialog
         | Focus::LoopFormDialog => false,
         Focus::ProjectRelationDialog => {
-            draw_projects_mode_panel(frame, area, app);
+            draw_project_preview_card(frame, area, app);
             true
         }
     }
@@ -292,8 +291,15 @@ fn draw_preview_panel(frame: &mut Frame, area: Rect, app: &App) -> bool {
         return true;
     }
 
-    if app.sidebar_mode == SidebarMode::Projects {
-        draw_projects_mode_panel(frame, area, app);
+    if app.sidebar_layer == SidebarLayer::Knowledge {
+        draw_project_preview_card(frame, area, app);
+        return true;
+    }
+
+    if app.sidebar_layer == SidebarLayer::Automation
+        && app.automation_kind == crate::tui::app::AutomationKind::Loop
+    {
+        draw_loop_live_view(frame, area, app);
         return true;
     }
 
@@ -739,19 +745,212 @@ fn draw_project_overview(frame: &mut Frame, area: Rect, app: &App) {
     render_wrapped_paragraph(frame, area, lines);
 }
 
-fn draw_projects_mode_panel(frame: &mut Frame, area: Rect, app: &App) {
+/// Knowledge layer's Preview (project highlighted, not entered): a cheap
+/// summary card — pending backlog count, knowledge entry count, last
+/// activity, and a badge if a loop is running against this project's
+/// workdir (functional requirement 3). Reads `App::selected_project_preview`,
+/// a cache refreshed on the normal tick cadence — never recomputed here.
+fn draw_project_preview_card(frame: &mut Frame, area: Rect, app: &App) {
     if app.playground_active {
         draw_playground_panel(frame, area, app);
         return;
     }
 
-    match app.projects_panel_focus {
-        ProjectsPanelFocus::Projects => draw_project_overview(frame, area, app),
-        ProjectsPanelFocus::Loops => draw_loop_live_view(frame, area, app),
-        ProjectsPanelFocus::Backlog => draw_backlog_overview(frame, area, app),
-        ProjectsPanelFocus::History => draw_history_overview(frame, area, app),
-        ProjectsPanelFocus::Knowledge => draw_knowledge_overview(frame, area, app),
-        ProjectsPanelFocus::RagInfo => draw_rag_queue_overview(frame, area, app),
+    let Some(project) = app.selected_project() else {
+        frame.render_widget(
+            Paragraph::new("No registered projects").style(Style::default().fg(DIM)),
+            area,
+        );
+        return;
+    };
+
+    let summary = app.selected_project_preview();
+    let running_badge = if summary.is_some_and(|s| s.loop_running) {
+        Span::styled("  ● loop running", Style::default().fg(STATUS_RUNNING))
+    } else {
+        Span::raw("")
+    };
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Project ", Style::default().fg(DIM)),
+            Span::styled(
+                &project.name,
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            running_badge,
+        ]),
+        Line::from(format!("path: {}", project.path)),
+        Line::from(""),
+    ];
+
+    match summary {
+        Some(summary) => {
+            lines.push(Line::from(vec![
+                Span::styled("Backlog: ", Style::default().fg(DIM)),
+                Span::styled(
+                    summary.pending_backlog.to_string(),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("   Knowledge: ", Style::default().fg(DIM)),
+                Span::styled(
+                    summary.knowledge_entries.to_string(),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            let last_activity = summary
+                .last_activity
+                .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+                .map(|dt| crate::tui::app::utils::relative_time(&dt))
+                .unwrap_or_else(|| "no activity yet".to_string());
+            lines.push(Line::from(vec![
+                Span::styled("Last activity: ", Style::default().fg(DIM)),
+                Span::styled(last_activity, Style::default().fg(Color::White)),
+            ]));
+        }
+        None => lines.push(Line::from(Span::styled(
+            "Summary loading…",
+            Style::default().fg(DIM),
+        ))),
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Enter → Overview | Backlog | Knowledge | History",
+        Style::default().fg(ACCENT),
+    )));
+
+    render_wrapped_paragraph(frame, area, lines);
+}
+
+/// Knowledge layer's Focus (project entered, `Enter`): the tab bar —
+/// Overview | Backlog | Knowledge | History — plus the active tab's lazily
+/// loaded content (functional requirement 4). Populates
+/// `project_tab_click_map`/`project_tab_row_click_map` for mouse
+/// hit-testing, reusing the same click-map pattern as the sidebar.
+fn draw_project_tabs_panel(frame: &mut Frame, area: Rect, app: &mut App) {
+    app.project_tab_click_map.clear();
+    app.project_tab_row_click_map.clear();
+
+    if area.height == 0 {
+        return;
+    }
+    let Some(project) = app.selected_project().cloned() else {
+        frame.render_widget(
+            Paragraph::new("No registered projects").style(Style::default().fg(DIM)),
+            area,
+        );
+        return;
+    };
+    let Some(active_tab) = app.project_focus else {
+        return;
+    };
+
+    let [tab_bar_area, content_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+
+    draw_project_tab_bar(frame, tab_bar_area, app, &project.name, active_tab);
+
+    match active_tab {
+        ProjectTab::Overview => draw_project_overview(frame, content_area, app),
+        ProjectTab::Backlog => draw_backlog_overview(frame, content_area, app),
+        ProjectTab::Knowledge => draw_knowledge_overview(frame, content_area, app),
+        ProjectTab::History => draw_project_history_tab(frame, content_area, app),
+    }
+}
+
+fn draw_project_tab_bar(
+    frame: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    project_name: &str,
+    active_tab: ProjectTab,
+) {
+    let mut spans = vec![
+        Span::styled(" ", Style::default()),
+        Span::styled(
+            project_name,
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+    ];
+    let mut x = area.x
+        + spans
+            .iter()
+            .map(|s| s.content.chars().count() as u16)
+            .sum::<u16>();
+
+    for tab in ProjectTab::ALL {
+        let label = format!(" {} ", tab.label());
+        let start = x;
+        let selected = tab == active_tab;
+        spans.push(Span::styled(
+            label.clone(),
+            if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(DIM)
+            },
+        ));
+        let width = label.chars().count() as u16;
+        app.project_tab_click_map.push((tab, start, start + width));
+        x += width;
+        spans.push(Span::raw(" "));
+        x += 1;
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Persisted per-project History tab: finished loops + past sessions for
+/// this project's workdir, read straight from the DB (functional
+/// requirement 5) — see `App::selected_project_history_entries`.
+fn draw_project_history_tab(frame: &mut Frame, area: Rect, app: &mut App) {
+    let selected = app.selected_project_history;
+    let entries = app.selected_project_history_entries().to_vec();
+    if entries.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No history yet for this project.").style(Style::default().fg(DIM)),
+            area,
+        );
+        return;
+    }
+
+    let mut y = area.y;
+    for (idx, entry) in entries.iter().enumerate() {
+        if y >= area.y + area.height {
+            break;
+        }
+        let is_selected = idx == selected;
+        let (style, marker) = selected_row_style(is_selected);
+        let kind_label = match entry.kind {
+            crate::db::project::ProjectHistoryKind::Loop => "loop",
+            crate::db::project::ProjectHistoryKind::InteractiveSession => "session",
+            crate::db::project::ProjectHistoryKind::TerminalSession => "terminal",
+        };
+        let when = chrono::DateTime::from_timestamp(entry.at, 0)
+            .map(|dt| crate::tui::app::utils::relative_time(&dt))
+            .unwrap_or_default();
+        let line = Line::from(vec![
+            Span::styled(marker, style.fg(ACCENT)),
+            Span::raw(" "),
+            Span::styled(format!("[{kind_label}] "), style.fg(DIM)),
+            Span::styled(
+                truncate_str(&entry.name, area.width.saturating_sub(20) as usize),
+                style.fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  {} · {}", entry.status, when), style.fg(DIM)),
+        ]);
+        frame.render_widget(Paragraph::new(line), Rect::new(area.x, y, area.width, 1));
+        app.project_tab_row_click_map.push((idx, y, y + 1));
+        y += 1;
     }
 }
 
@@ -804,40 +1003,6 @@ fn draw_backlog_overview(frame: &mut Frame, area: Rect, app: &App) {
     render_wrapped_paragraph(frame, area, lines);
 }
 
-/// `History`'s main-panel preview: while collapsed, just the summary the
-/// header already advertises; once expanded, the selected finished loop's
-/// details — reusing `draw_loop_live_view` rather than duplicating it, since
-/// selecting a history loop keeps today's loop-view behavior (rendered
-/// statically: no engine to auto-follow, see `LoopLiveState`).
-fn draw_history_overview(frame: &mut Frame, area: Rect, app: &App) {
-    let finished = app.finished_loops();
-    if finished.is_empty() {
-        frame.render_widget(
-            Paragraph::new("No finished loops yet").style(Style::default().fg(DIM)),
-            area,
-        );
-        return;
-    }
-
-    if app.history_collapsed {
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(format!(
-                    "{} completed/failed loop{}",
-                    finished.len(),
-                    if finished.len() == 1 { "" } else { "s" }
-                )),
-                Line::from(Span::styled("Enter/→ to expand", Style::default().fg(DIM))),
-            ])
-            .style(Style::default().fg(Color::White)),
-            area,
-        );
-        return;
-    }
-
-    draw_loop_live_view(frame, area, app);
-}
-
 fn draw_knowledge_overview(frame: &mut Frame, area: Rect, app: &App) {
     if app.project_knowledge.is_empty() {
         frame.render_widget(
@@ -882,10 +1047,6 @@ fn draw_knowledge_overview(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
-}
-
-fn draw_rag_queue_overview(frame: &mut Frame, area: Rect, app: &App) {
-    draw_rag_info_overview(frame, area, app);
 }
 
 fn rag_status(app: &App) -> (&'static str, Color) {
@@ -1481,7 +1642,7 @@ mod tests {
     use super::BORDER_COLOR;
     use crate::tui::agent::screen::VtCell;
     use crate::tui::agent::ScreenSnapshot;
-    use crate::tui::app::types::{App, Focus, ProjectsPanelFocus};
+    use crate::tui::app::types::{App, Focus};
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
     use ratatui::style::Color;
@@ -1541,8 +1702,7 @@ mod tests {
         .unwrap();
 
         let data_dir = tempfile::tempdir().unwrap();
-        let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
-        app.projects_panel_focus = ProjectsPanelFocus::Backlog;
+        let app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
         assert_eq!(app.backlog_specs.len(), 1, "backlog spec should be loaded");
 
         let text = render_to_text(50, 10, |frame, area| {

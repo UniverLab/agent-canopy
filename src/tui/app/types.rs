@@ -86,14 +86,75 @@ impl TerminalSelection {
     }
 }
 
+/// The sidebar's three thematic layers, stacked between the pinned RAG
+/// summary (top) and sysinfo dashboard (bottom). Each is independently
+/// collapsible; `App::sidebar_layer` tracks which one currently has
+/// keyboard/mouse focus.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ProjectsPanelFocus {
-    Projects,
-    Loops,
-    Backlog,
-    History,
+pub enum SidebarLayer {
+    /// Interactive agents + terminals — the things with a PTY right now.
+    Live,
+    /// Background agents + loops — live/recent runs, global across projects.
+    Automation,
+    /// The projects list.
     Knowledge,
-    RagInfo,
+}
+
+/// Which of Automation's two sub-lists (background agents, loops) arrow-key
+/// navigation is currently cycling through.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AutomationKind {
+    Agent,
+    Loop,
+}
+
+/// Tabs shown inside a project once it's entered (`Focus::Agent` while
+/// `SidebarLayer::Knowledge` is active) — everything project-scoped lives
+/// here instead of as top-level sidebar siblings.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProjectTab {
+    Overview,
+    Backlog,
+    Knowledge,
+    History,
+}
+
+impl ProjectTab {
+    pub const ALL: [ProjectTab; 4] = [
+        ProjectTab::Overview,
+        ProjectTab::Backlog,
+        ProjectTab::Knowledge,
+        ProjectTab::History,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ProjectTab::Overview => "Overview",
+            ProjectTab::Backlog => "Backlog",
+            ProjectTab::Knowledge => "Knowledge",
+            ProjectTab::History => "History",
+        }
+    }
+
+    pub fn hotkey(self) -> char {
+        match self {
+            ProjectTab::Overview => 'o',
+            ProjectTab::Backlog => 'b',
+            ProjectTab::Knowledge => 'k',
+            ProjectTab::History => 'h',
+        }
+    }
+}
+
+/// Cheap, cached summary shown on a project's Preview card (highlighted, not
+/// entered) — recomputed on the normal `App::refresh` cadence, never on a
+/// per-keystroke highlight move (functional requirement 3).
+#[derive(Clone, Default)]
+pub(crate) struct ProjectPreviewSummary {
+    pub pending_backlog: usize,
+    pub knowledge_entries: usize,
+    pub last_activity: Option<i64>,
+    pub loop_running: bool,
 }
 
 /// Per-loop rendering data for the sidebar's `Loops` section — spec progress
@@ -107,10 +168,11 @@ pub(crate) struct LoopSidebarMeta {
     pub blocked: bool,
 }
 
+/// Border-focus sub-section within the `Live` layer (interactive/terminal
+/// agents render as three stacked sub-panels sharing one collapsible layer).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[expect(dead_code)]
 pub enum AgentSectionFocus {
-    Background,
     Interactive,
     Terminal,
     Groups,
@@ -227,12 +289,6 @@ pub(crate) struct RagTransferModal {
     pub context_payload: String,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum SidebarMode {
-    Agents,
-    Projects,
-}
-
 // ── App struct ──────────────────────────────────────────────────
 
 /// Main application state.
@@ -277,7 +333,24 @@ pub struct App {
     // UI state
     pub(crate) selected: usize,
     pub(crate) focus: Focus,
-    pub(crate) sidebar_mode: SidebarMode,
+    /// Which sidebar layer currently has keyboard/mouse focus.
+    pub(crate) sidebar_layer: SidebarLayer,
+    /// Persisted (see `db::state`) collapsed state for each layer.
+    pub(crate) live_collapsed: bool,
+    pub(crate) automation_collapsed: bool,
+    pub(crate) knowledge_collapsed: bool,
+    /// Which of Automation's two sub-lists is active for navigation.
+    pub(crate) automation_kind: AutomationKind,
+    /// `Some(tab)` while a project is entered (Focus tab bar showing);
+    /// `None` while only highlighted (Preview summary card showing).
+    pub(crate) project_focus: Option<ProjectTab>,
+    pub(crate) selected_project_history: usize,
+    /// Persisted per-project History tab data, keyed by project hash and
+    /// refreshed lazily on first show of the tab (functional requirement 4).
+    pub(crate) project_history_cache: HashMap<String, Vec<crate::db::project::ProjectHistoryEntry>>,
+    /// Cheap per-project Preview summary, keyed by project hash and
+    /// recomputed on the normal refresh cadence — never per keystroke.
+    pub(crate) project_preview_cache: HashMap<String, ProjectPreviewSummary>,
     pub(crate) log_content: String,
     pub(crate) log_scroll: u16,
     pub(crate) running: bool,
@@ -316,8 +389,21 @@ pub struct App {
     pub(crate) sidebar_visible_capacity: usize,
     pub(crate) projects: Vec<Project>,
     pub(crate) selected_project: usize,
-    pub(crate) projects_panel_focus: ProjectsPanelFocus,
     pub(crate) agent_section_focus: AgentSectionFocus,
+    /// Mouse hit-test rows for the Automation layer's loop cards, populated
+    /// during draw: `(loop id, row_start, row_end)`.
+    pub(crate) automation_loop_click_map: Vec<(String, u16, u16)>,
+    /// Mouse hit-test rows for the Knowledge layer's project list,
+    /// populated during draw: `(project index, row_start, row_end)`.
+    pub(crate) project_click_map: Vec<(usize, u16, u16)>,
+    /// Mouse hit-test columns for a Focus tab bar, populated during draw:
+    /// `(tab, col_start, col_end)`.
+    pub(crate) project_tab_click_map: Vec<(ProjectTab, u16, u16)>,
+    /// Mouse hit-test rows for the active tab's list, populated during draw.
+    pub(crate) project_tab_row_click_map: Vec<(usize, u16, u16)>,
+    /// Mouse hit-test rows for the three layer headers, populated during
+    /// draw: clicking toggles that layer's collapsed state.
+    pub(crate) layer_header_click_map: Vec<(SidebarLayer, u16, u16)>,
     pub(crate) loops: Vec<Loop>,
     pub(crate) selected_loop_id: Option<String>,
     pub(crate) loop_details: Option<LoopDetails>,
@@ -346,10 +432,6 @@ pub struct App {
     /// `projects` in `App::refresh_projects`.
     pub(crate) backlog_specs: Vec<LoopSpec>,
     pub(crate) selected_backlog: usize,
-    /// Whether the sidebar's `History` section (completed/failed loops) is
-    /// collapsed to just its header. Collapsed by default.
-    pub(crate) history_collapsed: bool,
-    pub(crate) selected_history: usize,
     pub(crate) global_rag_queue: Vec<RagQueueItem>,
     pub(crate) selected_rag_queue: usize,
     pub(crate) rag_info: RagInfoSummary,
