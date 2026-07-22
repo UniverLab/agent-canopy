@@ -15,6 +15,7 @@ pub mod notification;
 pub mod nursery;
 pub mod pools;
 pub mod project;
+pub mod prompts;
 pub mod seeds;
 pub mod sync;
 pub mod usage_stats;

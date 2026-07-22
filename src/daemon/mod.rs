@@ -12,6 +12,7 @@ pub(crate) mod helpers;
 pub(crate) mod loop_cli;
 pub(crate) mod params;
 pub(crate) mod process;
+pub(crate) mod prompts_cli;
 pub(crate) mod rag_cli;
 pub(crate) mod server;
 pub(crate) mod service_install;

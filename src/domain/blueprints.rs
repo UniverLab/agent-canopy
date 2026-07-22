@@ -36,7 +36,7 @@ pub fn builtin_blueprint_specs() -> Vec<(&'static str, LoopNodeKind, Value)> {
             LoopNodeKind::Agent,
             serde_json::json!({
                 "platform": "claude",
-                "prompt": "Implement this spec:\n\n{{spec_content}}\n\nPrevious feedback (if any): {{previous_feedback}}"
+                "prompt_preset": "implementer"
             }),
         ),
         (
@@ -51,7 +51,7 @@ pub fn builtin_blueprint_specs() -> Vec<(&'static str, LoopNodeKind, Value)> {
             LoopNodeKind::Agent,
             serde_json::json!({
                 "platform": "mimo",
-                "prompt": "Review the changes made for this spec:\n\n{{spec_content}}\n\nIf they look correct, commit them. Otherwise, describe what's wrong so the implementer can address it."
+                "prompt_preset": "reviewer"
             }),
         ),
         (
@@ -66,7 +66,7 @@ pub fn builtin_blueprint_specs() -> Vec<(&'static str, LoopNodeKind, Value)> {
             LoopNodeKind::Agent,
             serde_json::json!({
                 "platform": "mimo",
-                "prompt": "A node in this loop failed or reported a blocker: {{previous_feedback}}\n\nDiagnose the root cause and resolve it, or escalate with a clear explanation if it needs a human."
+                "prompt_preset": "resilience"
             }),
         ),
     ]
@@ -190,6 +190,27 @@ mod tests {
                 "resilience-mimo",
             ]
         );
+    }
+
+    #[test]
+    fn builtin_agent_blueprints_carry_prompt_preset_not_inline_prompt() {
+        let agent_specs: Vec<(&str, Value)> = builtin_blueprint_specs()
+            .into_iter()
+            .filter(|(_, kind, _)| *kind == LoopNodeKind::Agent)
+            .map(|(name, _, config)| (name, config))
+            .collect();
+
+        assert_eq!(agent_specs.len(), 3);
+        for (name, config) in &agent_specs {
+            let preset = config["prompt_preset"]
+                .as_str()
+                .unwrap_or_else(|| panic!("blueprint '{name}' must carry a prompt_preset"));
+            assert!(!preset.is_empty());
+            assert!(
+                config.get("prompt").is_none(),
+                "blueprint '{name}' must not carry an inline 'prompt' key"
+            );
+        }
     }
 
     #[test]

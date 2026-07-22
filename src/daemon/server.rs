@@ -26,6 +26,9 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
     let data_dir = crate::ensure_data_dir()?;
     let _daemon_lock = acquire_daemon_lock(&data_dir)?;
     let db = Arc::new(Database::new(&data_dir.join("background_agents.db"))?);
+    if let Err(e) = crate::domain::prompts::seed_builtin_prompt_presets(&data_dir) {
+        tracing::warn!("Could not seed builtin prompt presets: {e}");
+    }
     let notification_service: Arc<dyn NotificationService> = Arc::new(DefaultNotificationService);
     let executor = Arc::new(Executor::new(
         Arc::clone(&db),
@@ -214,6 +217,9 @@ pub(crate) async fn run_stdio_server() -> Result<()> {
 
     let data_dir = crate::ensure_data_dir()?;
     let db = Arc::new(Database::new(&data_dir.join("background_agents.db"))?);
+    if let Err(e) = crate::domain::prompts::seed_builtin_prompt_presets(&data_dir) {
+        tracing::warn!("Could not seed builtin prompt presets: {e}");
+    }
     let notification_service: Arc<dyn NotificationService> = Arc::new(DefaultNotificationService);
     let executor = Arc::new(Executor::new(
         Arc::clone(&db),

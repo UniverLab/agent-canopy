@@ -2132,16 +2132,15 @@ async fn execute_agent_node(
     }
 
     // ── Cold start (byte-identical to the pre-RS2 path) ─────────────────
-    let prompt_template = node
-        .config
-        .get("prompt_template")
-        .and_then(Value::as_str)
-        .unwrap_or("{{spec_content}}\n\n{{previous_feedback}}");
+    let prompt_template = resolve_node_prompt_template(
+        node,
+        &crate::domain::prompts::prompts_dir(&crate::domain::prompts::canopy_dir()),
+    );
     let prompt = render_agent_prompt(
         lp,
         spec,
         node,
-        prompt_template,
+        &prompt_template,
         previous_output,
         workdir,
         run_id,
@@ -2994,6 +2993,35 @@ fn ceil_char_boundary(s: &str, index: usize) -> usize {
         i += 1;
     }
     i
+}
+
+/// Resolve an agent node's prompt template at SPAWN time (P1), not at node
+/// creation. Precedence: an explicit `prompt_template` in the node config
+/// always wins; otherwise a `prompt_preset` name is resolved against
+/// `<prompts_dir>/<name>.md` (falling back to the hardcoded seed constant,
+/// with a WARN, when the file is missing or unreadable — see
+/// `domain::prompts::resolve_prompt_preset`); otherwise the engine's own
+/// default template. Resolving at spawn time (rather than baking the prompt
+/// into the node's config once) is what lets a user's edit to a preset file
+/// take effect on the very next run without touching the node itself.
+fn resolve_node_prompt_template(node: &LoopNode, prompts_dir: &std::path::Path) -> String {
+    if let Some(template) = node
+        .config
+        .get("prompt_template")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+    {
+        return template.to_string();
+    }
+    if let Some(preset_name) = node
+        .config
+        .get("prompt_preset")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+    {
+        return crate::domain::prompts::resolve_prompt_preset(prompts_dir, preset_name);
+    }
+    "{{spec_content}}\n\n{{previous_feedback}}".to_string()
 }
 
 fn render_agent_prompt(
@@ -4494,6 +4522,92 @@ mod tests {
         assert!(prompt.contains("run_id=\"run-1\""));
         assert!(prompt.contains("Do the thing"));
         assert!(prompt.contains("\"feedback\": \"ok\""));
+    }
+
+    fn agent_node_with_config(config: Value) -> LoopNode {
+        LoopNode {
+            id: "node-1".to_string(),
+            spec_id: Some("spec".to_string()),
+            loop_id: None,
+            name: "Agent".to_string(),
+            kind: LoopNodeKind::Agent,
+            config,
+            position: 1,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn resolve_node_prompt_template_prefers_explicit_prompt_template_over_preset() {
+        let dir = tempfile::tempdir().unwrap();
+        // The prompts dir doesn't even exist — an explicit prompt_template
+        // must win without ever touching disk.
+        let prompts_dir = dir.path().join("prompts");
+
+        let node = agent_node_with_config(serde_json::json!({
+            "platform": "claude",
+            "prompt_template": "explicit template",
+            "prompt_preset": "implementer"
+        }));
+
+        assert_eq!(
+            resolve_node_prompt_template(&node, &prompts_dir),
+            "explicit template"
+        );
+    }
+
+    #[test]
+    fn resolve_node_prompt_template_reads_preset_file_over_hardcoded_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompts_dir = dir.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+        std::fs::write(
+            prompts_dir.join("implementer.md"),
+            "edited implementer preset",
+        )
+        .unwrap();
+
+        let node = agent_node_with_config(serde_json::json!({
+            "platform": "claude",
+            "prompt_preset": "implementer"
+        }));
+
+        assert_eq!(
+            resolve_node_prompt_template(&node, &prompts_dir),
+            "edited implementer preset"
+        );
+    }
+
+    #[test]
+    fn resolve_node_prompt_template_falls_back_to_hardcoded_constant_when_preset_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompts_dir = dir.path().join("prompts"); // never created
+
+        let node = agent_node_with_config(serde_json::json!({
+            "platform": "claude",
+            "prompt_preset": "reviewer"
+        }));
+
+        let expected = crate::domain::prompts::builtin_prompt_preset_specs()
+            .into_iter()
+            .find(|(name, _)| *name == "reviewer")
+            .map(|(_, content)| content.to_string())
+            .unwrap();
+
+        assert_eq!(resolve_node_prompt_template(&node, &prompts_dir), expected);
+    }
+
+    #[test]
+    fn resolve_node_prompt_template_defaults_when_neither_prompt_nor_preset_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompts_dir = dir.path().join("prompts");
+
+        let node = agent_node_with_config(serde_json::json!({ "platform": "claude" }));
+
+        assert_eq!(
+            resolve_node_prompt_template(&node, &prompts_dir),
+            "{{spec_content}}\n\n{{previous_feedback}}"
+        );
     }
 
     #[test]

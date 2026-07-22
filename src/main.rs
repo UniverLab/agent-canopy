@@ -33,6 +33,7 @@ use daemon::bridge::run_bridge;
 use daemon::cli::{handle_daemon_action, DaemonAction};
 use daemon::doctor::run_doctor;
 use daemon::loop_cli::{handle_loop_action, LoopAction};
+use daemon::prompts_cli::{handle_prompts_action, PromptsAction};
 use daemon::rag_cli::{handle_rag_action, RagAction};
 use daemon::server::{run_http_server, run_stdio_server};
 use daemon::spec_cli::{handle_spec_action, SpecAction};
@@ -88,6 +89,11 @@ enum Commands {
         #[command(subcommand)]
         action: SpecAction,
     },
+    /// Discover file-backed prompt presets (~/.canopy/prompts/).
+    Prompts {
+        #[command(subcommand)]
+        action: PromptsAction,
+    },
     /// Run a stdio sidecar proxy that injects canopy identity headers.
     Bridge {
         /// Agent session ID to bind this bridge process.
@@ -134,6 +140,7 @@ async fn main() -> Result<()> {
         Some(Commands::Rag { action }) => handle_rag_action(action).await,
         Some(Commands::Loop { action }) => handle_loop_action(action).await,
         Some(Commands::Spec { action }) => handle_spec_action(action).await,
+        Some(Commands::Prompts { action }) => handle_prompts_action(action).await,
         Some(Commands::Bridge {
             agent_id,
             port,
