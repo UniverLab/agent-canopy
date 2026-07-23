@@ -39,6 +39,12 @@ pub struct LoopEngine {
     /// loop's ensemble running at the same time — they queue for the same
     /// pool of permits.
     ensemble_concurrency: Arc<Semaphore>,
+    /// Backing store (S1) for resolving skills pinned on agent nodes (S2)
+    /// at spawn time. `None` in engines built without one (most tests) —
+    /// a node's `skills` config is then treated as unresolvable and
+    /// degrades to a WARN + note per skill, exactly like a store that's
+    /// there but can't reach its sources.
+    dynamic_skills: Option<Arc<crate::dynamic_skills::SkillStore>>,
 }
 
 /// Where a spec's sequential graph cursor currently is: at a single ordinary
@@ -103,6 +109,7 @@ impl LoopEngine {
             db,
             notification_service,
             ensemble_concurrency: Arc::new(Semaphore::new(DEFAULT_ENSEMBLE_CONCURRENCY_CAP)),
+            dynamic_skills: None,
         }
     }
 
@@ -112,6 +119,15 @@ impl LoopEngine {
     /// forever.
     pub fn with_ensemble_concurrency_cap(mut self, cap: usize) -> Self {
         self.ensemble_concurrency = Arc::new(Semaphore::new(cap.max(1)));
+        self
+    }
+
+    /// Give this engine the dynamic skill store (S1) it resolves pinned
+    /// `skills` (S2) through at spawn time — e.g. the same store instance
+    /// the daemon's `skill_list`/`skill_get` MCP tools use, so there is only
+    /// ever one fetch/TTL-cache path for a given skill.
+    pub fn with_dynamic_skills(mut self, store: Arc<crate::dynamic_skills::SkillStore>) -> Self {
+        self.dynamic_skills = Some(store);
         self
     }
 
@@ -1338,6 +1354,7 @@ impl LoopEngine {
             let semaphore = Arc::clone(&self.ensemble_concurrency);
             let label = member_label(member);
             let ensemble_id = ensemble.id.clone();
+            let dynamic_skills = self.dynamic_skills.clone();
 
             set.spawn(async move {
                 let _permit = semaphore
@@ -1373,6 +1390,7 @@ impl LoopEngine {
                                 &member_run_id,
                                 &workdir,
                                 resume_candidate.as_deref(),
+                                dynamic_skills.as_ref(),
                             )
                             .await?;
                             let run = db.get_loop_run(&member_run_id)?.ok_or_else(|| {
@@ -1616,6 +1634,7 @@ impl LoopEngine {
                     run_id,
                     workdir,
                     resume_session_id,
+                    self.dynamic_skills.as_ref(),
                 )
                 .await
             }
@@ -2014,6 +2033,109 @@ fn sized_strategy(
     }
 }
 
+/// A node's pinned `skills` (S2): an optional array of skill names in
+/// `node.config["skills"]`, resolved through the dynamic skill store (S1) at
+/// spawn time and appended to the composed prompt in listed order. Anything
+/// other than an array of strings (key absent, wrong type, non-string
+/// element) is treated as "no pins" — malformed config must never fail a
+/// spawn, exactly like every other loosely-typed node config key.
+fn node_pinned_skills(node: &LoopNode) -> Vec<String> {
+    node.config
+        .get("skills")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Stable delimiter a pinned skill's instructions are appended under (S2).
+/// Keep this format stable — downstream prompts may reference it.
+fn render_pinned_skill_section(name: &str, instructions: &str) -> String {
+    format!("\n\n## Skill: {name}\n{instructions}")
+}
+
+/// One-line stand-in for a pinned skill that couldn't be resolved, under the
+/// same `## Skill: <name>` delimiter so the section is still easy to spot.
+fn render_unresolved_skill_note(name: &str) -> String {
+    format!(
+        "\n\n## Skill: {name}\n_Could not resolve pinned skill '{name}' — continuing without it._"
+    )
+}
+
+/// Resolve every skill pinned on `node` (S2) through the dynamic skill store
+/// and append each one's instructions to `prompt`, in listed order, under a
+/// `## Skill: <name>` section (see [`render_pinned_skill_section`]). Applied
+/// identically to cold-start and resumed prompts so every agent-spawn
+/// flavor carries the same pins.
+///
+/// A skill that can't be resolved — unknown name, no store configured, the
+/// store's blocking fetch task panicking, or (via [`crate::dynamic_skills`]'s
+/// own TTL/network handling) a source that's unreachable — degrades to
+/// [`render_unresolved_skill_note`] plus a WARN naming the node and skill.
+/// Pinned skills are a convenience the agent gets automatically, never a
+/// hard dependency for the spawn to proceed at all.
+async fn append_pinned_skills(
+    mut prompt: String,
+    node: &LoopNode,
+    dynamic_skills: Option<&Arc<crate::dynamic_skills::SkillStore>>,
+) -> String {
+    let names = node_pinned_skills(node);
+    if names.is_empty() {
+        return prompt;
+    }
+
+    for name in names {
+        let resolved = match dynamic_skills {
+            Some(store) => {
+                let store = Arc::clone(store);
+                let fetch_name = name.clone();
+                match tokio::task::spawn_blocking(move || store.get(&fetch_name)).await {
+                    Ok(Ok(content)) => Some(content.instructions),
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            node = %node.name,
+                            skill = %name,
+                            error = %e,
+                            "could not resolve pinned skill; continuing without it"
+                        );
+                        None
+                    }
+                    Err(join_err) => {
+                        tracing::warn!(
+                            node = %node.name,
+                            skill = %name,
+                            error = %join_err,
+                            "pinned skill resolution task failed; continuing without it"
+                        );
+                        None
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(
+                    node = %node.name,
+                    skill = %name,
+                    "no dynamic skill store configured; pinned skill not injected"
+                );
+                None
+            }
+        };
+
+        match resolved {
+            Some(instructions) => {
+                prompt.push_str(&render_pinned_skill_section(&name, &instructions));
+            }
+            None => prompt.push_str(&render_unresolved_skill_note(&name)),
+        }
+    }
+
+    prompt
+}
+
 /// If the agent finalized its own run row (called `loop_complete_node` /
 /// `loop_report_blocker`), turn that self-reported status into the node's
 /// result; otherwise `None` so the caller uses the process-derived execution.
@@ -2049,6 +2171,7 @@ async fn execute_agent_node(
     run_id: &str,
     workdir: &str,
     resume_session_id: Option<&str>,
+    dynamic_skills: Option<&Arc<crate::dynamic_skills::SkillStore>>,
 ) -> Result<NodeExecution> {
     let cli_name = node
         .config
@@ -2088,6 +2211,7 @@ async fn execute_agent_node(
                 workdir,
                 run_id,
             );
+            let resume_prompt = append_pinned_skills(resume_prompt, node, dynamic_skills).await;
             let strategy = sized_strategy(&base_strategy, &resume_prompt);
             let execution = run_agent_process(
                 db,
@@ -2145,6 +2269,7 @@ async fn execute_agent_node(
         workdir,
         run_id,
     );
+    let prompt = append_pinned_skills(prompt, node, dynamic_skills).await;
     let strategy = sized_strategy(&base_strategy, &prompt);
     let execution = run_agent_process(
         db,
@@ -4689,6 +4814,276 @@ mod tests {
         assert!(prompt.len() < 600 * 1024);
     }
 
+    // ── S2: pinned skills (node.config["skills"]) ───────────────────────
+
+    #[test]
+    fn node_pinned_skills_parses_array_of_strings() {
+        let node = agent_node_with_config(serde_json::json!({
+            "platform": "claude",
+            "skills": ["coder", "reviewer"]
+        }));
+        assert_eq!(
+            node_pinned_skills(&node),
+            vec!["coder".to_string(), "reviewer".to_string()]
+        );
+    }
+
+    #[test]
+    fn node_pinned_skills_defaults_to_empty_when_absent() {
+        let node = agent_node_with_config(serde_json::json!({ "platform": "claude" }));
+        assert!(node_pinned_skills(&node).is_empty());
+    }
+
+    #[test]
+    fn node_pinned_skills_ignores_malformed_values_instead_of_failing() {
+        // Not an array at all: no pins, not an error.
+        let not_an_array = agent_node_with_config(serde_json::json!({ "skills": "coder" }));
+        assert!(node_pinned_skills(&not_an_array).is_empty());
+
+        // An array with a non-string element mixed in with valid names:
+        // keep the valid entries, drop the malformed one.
+        let mixed =
+            agent_node_with_config(serde_json::json!({ "skills": ["coder", 42, "reviewer"] }));
+        assert_eq!(
+            node_pinned_skills(&mixed),
+            vec!["coder".to_string(), "reviewer".to_string()]
+        );
+    }
+
+    /// Build a local git repo (no real network — a local path is a valid git
+    /// remote) with one directory per `(name, body)` skill, each holding a
+    /// minimal `SKILL.md`. Mirrors `dynamic_skills`'s own test fixtures.
+    fn make_skill_registry(dir: &std::path::Path, skills: &[(&str, &str)]) {
+        use std::process::Command;
+        Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "test"])
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        for (name, body) in skills {
+            let skill_dir = dir.join(name);
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                format!(
+                    "---\nname: {name}\ndescription: \"{name} skill\"\n---\n# {name}\n{body}\n"
+                ),
+            )
+            .unwrap();
+        }
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-q", "-m", "init"])
+            .current_dir(dir)
+            .status()
+            .unwrap();
+    }
+
+    fn skill_store_for(
+        registry: &std::path::Path,
+        store_dir: &std::path::Path,
+    ) -> crate::dynamic_skills::SkillStore {
+        crate::dynamic_skills::SkillStore::new(
+            store_dir.to_path_buf(),
+            vec![crate::dynamic_skills::GitSource::new(
+                registry.to_string_lossy().to_string(),
+                None,
+            )],
+            15,
+        )
+    }
+
+    #[tokio::test]
+    async fn append_pinned_skills_is_noop_when_absent_or_empty() {
+        // Absent/empty `skills` must behave exactly as today: byte-identical
+        // prompt, no dynamic-skill-store call at all (passing `None` here
+        // would panic if the empty-check didn't short-circuit first).
+        let node_absent = agent_node_with_config(serde_json::json!({ "platform": "claude" }));
+        let prompt = append_pinned_skills("base prompt".to_string(), &node_absent, None).await;
+        assert_eq!(prompt, "base prompt");
+
+        let node_empty = agent_node_with_config(serde_json::json!({
+            "platform": "claude",
+            "skills": []
+        }));
+        let prompt = append_pinned_skills("base prompt".to_string(), &node_empty, None).await;
+        assert_eq!(prompt, "base prompt");
+    }
+
+    #[tokio::test]
+    async fn append_pinned_skills_appends_resolved_content_in_listed_order() {
+        let registry = tempdir().unwrap();
+        make_skill_registry(
+            registry.path(),
+            &[("alpha", "Alpha body."), ("beta", "Beta body.")],
+        );
+        let store_dir = tempdir().unwrap();
+        let store = Arc::new(skill_store_for(registry.path(), store_dir.path()));
+
+        let node = agent_node_with_config(serde_json::json!({
+            "platform": "claude",
+            "skills": ["beta", "alpha"]
+        }));
+
+        let prompt = append_pinned_skills("base prompt".to_string(), &node, Some(&store)).await;
+
+        assert!(prompt.starts_with("base prompt"));
+        let beta_pos = prompt.find("## Skill: beta").expect("beta section present");
+        let alpha_pos = prompt
+            .find("## Skill: alpha")
+            .expect("alpha section present");
+        assert!(
+            beta_pos < alpha_pos,
+            "skills must be appended in the order listed on the node, not alphabetically"
+        );
+        assert!(prompt.contains("Beta body."));
+        assert!(prompt.contains("Alpha body."));
+    }
+
+    #[tokio::test]
+    async fn append_pinned_skills_degrades_to_note_for_unknown_skill_name() {
+        let registry = tempdir().unwrap();
+        make_skill_registry(registry.path(), &[("alpha", "Alpha body.")]);
+        let store_dir = tempdir().unwrap();
+        let store = Arc::new(skill_store_for(registry.path(), store_dir.path()));
+
+        let node = agent_node_with_config(serde_json::json!({
+            "platform": "claude",
+            "skills": ["does-not-exist"]
+        }));
+
+        let prompt = append_pinned_skills("base prompt".to_string(), &node, Some(&store)).await;
+
+        assert!(prompt.contains("## Skill: does-not-exist"));
+        assert!(prompt.contains("Could not resolve"));
+    }
+
+    #[tokio::test]
+    async fn append_pinned_skills_degrades_gracefully_without_a_configured_store() {
+        // No dynamic skill store at all (e.g. a LoopEngine built without
+        // `with_dynamic_skills`) must not fail the spawn either — every pin
+        // just becomes a note.
+        let node = agent_node_with_config(serde_json::json!({
+            "platform": "claude",
+            "skills": ["coder", "reviewer"]
+        }));
+
+        let prompt = append_pinned_skills("base prompt".to_string(), &node, None).await;
+
+        assert!(prompt.contains("## Skill: coder"));
+        assert!(prompt.contains("## Skill: reviewer"));
+        assert!(prompt.contains("Could not resolve"));
+    }
+
+    /// B9: a large pinned skill's content, once appended, must be carried by
+    /// the same oversized-prompt mechanism as everything else in the
+    /// composed prompt — the injected content is not a special case.
+    #[tokio::test]
+    async fn large_pinned_skill_pushes_prompt_past_argv_threshold_forcing_stdin() {
+        let registry = tempdir().unwrap();
+        let huge_body = "z".repeat(ARGV_SAFETY_THRESHOLD + 1);
+        make_skill_registry(registry.path(), &[("huge", &huge_body)]);
+        let store_dir = tempdir().unwrap();
+        let store = Arc::new(skill_store_for(registry.path(), store_dir.path()));
+
+        let node = agent_node_with_config(serde_json::json!({
+            "platform": "claude",
+            "skills": ["huge"]
+        }));
+
+        let prompt =
+            append_pinned_skills("small base prompt".to_string(), &node, Some(&store)).await;
+        assert!(prompt.len() > ARGV_SAFETY_THRESHOLD);
+
+        let base_strategy = sample_strategy("/bin/cat");
+        assert!(!base_strategy.prompt_via_stdin);
+        let sized = sized_strategy(&base_strategy, &prompt);
+        assert!(
+            sized.prompt_via_stdin,
+            "an oversized pinned skill must force stdin transport, same as any other cause"
+        );
+    }
+
+    /// Full pipeline, not just the helper: `LoopEngine::with_dynamic_skills`
+    /// through `execute_node` → `execute_agent_node` → `append_pinned_skills`
+    /// → the actual spawned process, proving the plumbing between the engine
+    /// and the S1 store is wired correctly end to end.
+    #[tokio::test]
+    async fn execute_node_injects_pinned_skill_into_composed_prompt_end_to_end() {
+        let registry = tempdir().unwrap();
+        make_skill_registry(registry.path(), &[("coder", "Write clean code.")]);
+        let store_dir = tempdir().unwrap();
+        let store = Arc::new(skill_store_for(registry.path(), store_dir.path()));
+
+        let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+        let engine = engine.with_dynamic_skills(Arc::clone(&store));
+
+        let spec = standalone_spec("sid-pin", 1);
+        db.insert_loop_spec(&spec).unwrap();
+        let node = LoopNode {
+            id: "node-pin".to_string(),
+            spec_id: Some(spec.id.clone()),
+            loop_id: None,
+            name: "impl".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({
+                "platform": "skills-test-cli",
+                "prompt_template": "{{spec_content}}",
+                "skills": ["coder"]
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+        db.insert_loop_node(&node).unwrap();
+
+        let cli = crate::domain::cli_config::CliConfig {
+            name: "skills-test-cli".to_string(),
+            binary: "/bin/cat".to_string(),
+            prompt_via_stdin: true,
+            ..Default::default()
+        };
+        let home = write_resume_cli_home(cli);
+        let _guard = HomeGuard::set(home.path());
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+
+        let execution = engine
+            .execute_node(
+                &lp,
+                &spec,
+                &node,
+                None,
+                None,
+                "run-pin",
+                dir.path().to_str().unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let stdout = execution
+            .output
+            .get("stdout")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(stdout.contains("## Skill: coder"));
+        assert!(stdout.contains("Write clean code."));
+    }
+
     fn sample_agent_node() -> LoopNode {
         LoopNode {
             id: "node-agent".to_string(),
@@ -5153,6 +5548,7 @@ echo done
             "run-r",
             dir.path().to_str().unwrap(),
             resume_session_id,
+            None,
         )
         .await
         .unwrap();

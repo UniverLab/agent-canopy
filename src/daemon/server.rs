@@ -36,9 +36,14 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
     ));
     let sync_manager = Arc::new(SyncManager::new(Arc::clone(&db)));
     let canopy_config = crate::domain::canopy_config::CanopyConfig::load(&data_dir);
+    let dynamic_skills = Arc::new(crate::dynamic_skills::SkillStore::from_config(
+        &data_dir,
+        &canopy_config.skills,
+    ));
     let loop_engine = Arc::new(
         LoopEngine::new(Arc::clone(&db), Arc::clone(&notification_service))
-            .with_ensemble_concurrency_cap(canopy_config.ensemble_concurrency_cap),
+            .with_ensemble_concurrency_cap(canopy_config.ensemble_concurrency_cap)
+            .with_dynamic_skills(Arc::clone(&dynamic_skills)),
     );
     let watcher_engine = Arc::new(WatcherEngine::new(
         Arc::clone(&db),
@@ -48,11 +53,6 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
 
     let ingestion = Arc::new(IngestionManager::new(Arc::clone(&db), data_dir.clone()));
     let _ingestion_cancel = Arc::clone(&ingestion).start();
-
-    let dynamic_skills = Arc::new(crate::dynamic_skills::SkillStore::from_config(
-        &data_dir,
-        &canopy_config.skills,
-    ));
 
     tracing::info!(
         "canopy v{} starting on port {}",
@@ -234,9 +234,14 @@ pub(crate) async fn run_stdio_server() -> Result<()> {
     ));
     let sync_manager = Arc::new(SyncManager::new(Arc::clone(&db)));
     let canopy_config = crate::domain::canopy_config::CanopyConfig::load(&data_dir);
+    let dynamic_skills = Arc::new(crate::dynamic_skills::SkillStore::from_config(
+        &data_dir,
+        &canopy_config.skills,
+    ));
     let loop_engine = Arc::new(
         LoopEngine::new(Arc::clone(&db), Arc::clone(&notification_service))
-            .with_ensemble_concurrency_cap(canopy_config.ensemble_concurrency_cap),
+            .with_ensemble_concurrency_cap(canopy_config.ensemble_concurrency_cap)
+            .with_dynamic_skills(Arc::clone(&dynamic_skills)),
     );
     let watcher_engine = Arc::new(WatcherEngine::new(
         Arc::clone(&db),
@@ -246,11 +251,6 @@ pub(crate) async fn run_stdio_server() -> Result<()> {
 
     let ingestion = Arc::new(IngestionManager::new(Arc::clone(&db), data_dir.clone()));
     let _ingestion_cancel = Arc::clone(&ingestion).start();
-
-    let dynamic_skills = Arc::new(crate::dynamic_skills::SkillStore::from_config(
-        &data_dir,
-        &canopy_config.skills,
-    ));
 
     match db.reconcile_orphaned_loops() {
         Ok(count) if count > 0 => {

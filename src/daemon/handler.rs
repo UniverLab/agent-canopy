@@ -7444,6 +7444,53 @@ mod tests {
     }
 
     #[test]
+    fn loop_get_response_surfaces_pinned_skills_on_a_node() {
+        // S2: an agent node's pinned `skills` array must be visible to
+        // agents inspecting/building loops via loop_get, not just used
+        // internally at spawn time.
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let loop_id = "loop-with-pinned-skills".to_string();
+        db.insert_loop(&Loop {
+            id: loop_id.clone(),
+            name: "Loop".to_string(),
+            description: None,
+            workdir: dir.path().to_string_lossy().to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            active_run_pool_id: None,
+            on_completed: None,
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "pinned-node".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "implement".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({
+                "platform": "claude",
+                "skills": ["coder", "rust-idiomatic-patterns"]
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let details = db.get_loop_details(&loop_id).unwrap().unwrap();
+        let json = loop_details_json(&db, &details).unwrap();
+
+        assert_eq!(
+            json["graph"]["nodes"][0]["config"]["skills"],
+            serde_json::json!(["coder", "rust-idiomatic-patterns"])
+        );
+    }
+
+    #[test]
     fn loop_get_response_exposes_autorun_at_so_agents_never_need_sql() {
         // B14: a failed loop's pending autorun schedule must be visible via
         // `loop_get` — before this, an agent had to query

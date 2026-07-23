@@ -174,6 +174,39 @@ mod tests {
         assert_eq!(merged, template);
     }
 
+    /// S2: a blueprint may carry pinned `skills` in its config template like
+    /// any other key. With no override, the template's array passes through
+    /// untouched.
+    #[test]
+    fn merge_blueprint_config_preserves_skills_array_from_template() {
+        let template = serde_json::json!({
+            "platform": "claude",
+            "skills": ["coder", "rust-idiomatic-patterns"]
+        });
+        let merged = merge_blueprint_config(&template, None);
+        assert_eq!(
+            merged["skills"],
+            serde_json::json!(["coder", "rust-idiomatic-patterns"])
+        );
+    }
+
+    /// S2: an override's `skills` key replaces the template's wholesale —
+    /// shallow merge, not an elementwise union — exactly like every other
+    /// overridden key.
+    #[test]
+    fn merge_blueprint_config_override_replaces_template_skills_array() {
+        let template = serde_json::json!({
+            "platform": "claude",
+            "skills": ["coder"]
+        });
+        let overrides = serde_json::json!({ "skills": ["reviewer", "coder"] });
+
+        let merged = merge_blueprint_config(&template, Some(&overrides));
+
+        assert_eq!(merged["skills"], serde_json::json!(["reviewer", "coder"]));
+        assert_eq!(merged["platform"], "claude");
+    }
+
     #[test]
     fn builtin_blueprint_specs_has_the_five_proven_nodes() {
         let names: Vec<&str> = builtin_blueprint_specs()
