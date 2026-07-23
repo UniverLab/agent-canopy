@@ -14,9 +14,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::{
-    compact_cwd, truncate_str, ACCENT, BORDER_COLOR, DIM, STATUS_FAIL, STATUS_OK, STATUS_RUNNING,
-};
+use super::super::theme::Theme;
+use super::{compact_cwd, truncate_str, STATUS_FAIL, STATUS_OK, STATUS_RUNNING};
 use crate::domain::loops::{
     LoopEdgeCondition, LoopNode, LoopRunStatus, LoopSpecStatus, LoopStatus,
 };
@@ -25,13 +24,13 @@ use crate::tui::app::loop_live_state::{
 };
 use crate::tui::app::types::App;
 
-pub(crate) fn draw_loop_live_view(frame: &mut Frame, area: Rect, app: &App) {
+pub(crate) fn draw_loop_live_view(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let Some(state) = app.loop_live_state.as_ref() else {
         frame.render_widget(
-            Paragraph::new("No loop selected").style(Style::default().fg(DIM)),
+            Paragraph::new("No loop selected").style(Style::default().fg(theme.dim_text)),
             area,
         );
         return;
@@ -54,6 +53,7 @@ pub(crate) fn draw_loop_live_view(frame: &mut Frame, area: Rect, app: &App) {
             node_info: &node_info,
             blocked,
             now: Utc::now(),
+            theme,
         },
     );
 }
@@ -69,19 +69,23 @@ struct LiveViewContext<'a> {
     node_info: &'a NodeRunInfo,
     blocked: bool,
     now: DateTime<Utc>,
+    theme: &'a Theme,
 }
 
 fn render_loop_live_view(frame: &mut Frame, area: Rect, ctx: &LiveViewContext) {
     let state = ctx.state;
-    let mut lines = header_lines(state, ctx.blocked);
+    let mut lines = header_lines(state, ctx.blocked, ctx.theme);
     lines.push(Line::from(""));
-    lines.extend(queue_lines(state));
+    lines.extend(queue_lines(state, ctx.theme));
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("Graph", Style::default().fg(DIM))));
+    lines.push(Line::from(Span::styled(
+        "Graph",
+        Style::default().fg(ctx.theme.dim_text),
+    )));
     if state.effective_nodes.is_empty() {
         lines.push(Line::from(Span::styled(
             "  (no nodes yet)",
-            Style::default().fg(DIM),
+            Style::default().fg(ctx.theme.dim_text),
         )));
     } else {
         lines.extend(graph_lines(
@@ -89,6 +93,7 @@ fn render_loop_live_view(frame: &mut Frame, area: Rect, ctx: &LiveViewContext) {
             ctx.highlighted_node_id,
             ctx.follow,
             area.width,
+            ctx.theme,
         ));
     }
     lines.push(Line::from(""));
@@ -98,12 +103,17 @@ fn render_loop_live_view(frame: &mut Frame, area: Rect, ctx: &LiveViewContext) {
         ctx.node_info,
         ctx.follow,
         ctx.now,
+        ctx.theme,
     ));
 
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
-fn status_icon_and_label(state: &LoopLiveState, blocked: bool) -> (&'static str, String, Color) {
+fn status_icon_and_label(
+    state: &LoopLiveState,
+    blocked: bool,
+    theme: &Theme,
+) -> (&'static str, String, Color) {
     if let Some(at) = state.autorun_at {
         let local = at.with_timezone(&Local);
         return (
@@ -120,31 +130,33 @@ fn status_icon_and_label(state: &LoopLiveState, blocked: bool) -> (&'static str,
         LoopStatus::Paused => ("⏸", "paused".to_string(), Color::Yellow),
         LoopStatus::Completed => ("✓", "completed".to_string(), STATUS_OK),
         LoopStatus::Failed => ("✗", "failed".to_string(), STATUS_FAIL),
-        LoopStatus::Draft => ("·", "draft".to_string(), DIM),
+        LoopStatus::Draft => ("·", "draft".to_string(), theme.dim_text),
     }
 }
 
-fn header_lines(state: &LoopLiveState, blocked: bool) -> Vec<Line<'static>> {
-    let (icon, label, color) = status_icon_and_label(state, blocked);
+fn header_lines(state: &LoopLiveState, blocked: bool, theme: &Theme) -> Vec<Line<'static>> {
+    let (icon, label, color) = status_icon_and_label(state, blocked, theme);
     vec![
         Line::from(vec![
             Span::styled(icon, Style::default().fg(color)),
             Span::raw(" "),
             Span::styled(
                 state.loop_name.clone(),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.header_color)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
             Span::styled(label, Style::default().fg(color)),
             Span::raw("   "),
             Span::styled(
                 format!("{}/{} specs", state.done_count, state.total_count),
-                Style::default().fg(DIM),
+                Style::default().fg(theme.dim_text),
             ),
         ]),
         Line::from(Span::styled(
             format!("Workdir: {}", compact_cwd(&state.workdir)),
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         )),
     ]
 }
@@ -153,27 +165,31 @@ fn header_lines(state: &LoopLiveState, blocked: bool) -> Vec<Line<'static>> {
 /// regardless of its underlying status (running or the next pending one —
 /// see `assemble_loop_live_state`'s `current_spec_id` rule), executed specs
 /// (completed/failed/skipped) show `✓`, everything else is still `○`.
-fn spec_chip(entry: &SpecQueueEntry, current_spec_id: Option<&str>) -> (&'static str, Color) {
+fn spec_chip(
+    entry: &SpecQueueEntry,
+    current_spec_id: Option<&str>,
+    theme: &Theme,
+) -> (&'static str, Color) {
     if Some(entry.spec_id.as_str()) == current_spec_id {
         ("▶", STATUS_RUNNING)
     } else if entry.status == LoopSpecStatus::Pending {
-        ("○", DIM)
+        ("○", theme.dim_text)
     } else {
         ("✓", STATUS_OK)
     }
 }
 
-fn queue_lines(state: &LoopLiveState) -> Vec<Line<'static>> {
+fn queue_lines(state: &LoopLiveState, theme: &Theme) -> Vec<Line<'static>> {
     if state.spec_queue.is_empty() {
         return vec![Line::from(Span::styled(
             "Queue: (empty)",
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         ))];
     }
 
     let mut chips: Vec<Span<'static>> = Vec::new();
     for entry in &state.spec_queue {
-        let (icon, color) = spec_chip(entry, state.current_spec_id.as_deref());
+        let (icon, color) = spec_chip(entry, state.current_spec_id.as_deref(), theme);
         chips.push(Span::styled(icon, Style::default().fg(color)));
         chips.push(Span::raw(" "));
     }
@@ -198,22 +214,28 @@ fn queue_lines(state: &LoopLiveState) -> Vec<Line<'static>> {
 /// solid marker while auto-following (the "pulsing current node" cue),
 /// plain accent with a `›` marker for a manually-picked node, dim/plain
 /// otherwise.
-fn node_style(is_highlighted: bool, follow: bool) -> (Style, Style, &'static str) {
+fn node_style(is_highlighted: bool, follow: bool, theme: &Theme) -> (Style, Style, &'static str) {
     if is_highlighted && follow {
         (
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.header_color)
+                .add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.header_color)
+                .add_modifier(Modifier::BOLD),
             "●",
         )
     } else if is_highlighted {
         (
-            Style::default().fg(ACCENT),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.header_color),
+            Style::default()
+                .fg(theme.header_color)
+                .add_modifier(Modifier::BOLD),
             "›",
         )
     } else {
         (
-            Style::default().fg(BORDER_COLOR),
+            Style::default().fg(theme.border_color),
             Style::default().fg(Color::White),
             " ",
         )
@@ -225,8 +247,9 @@ fn node_box_lines(
     is_highlighted: bool,
     follow: bool,
     inner: usize,
+    theme: &Theme,
 ) -> Vec<Line<'static>> {
-    let (border_style, text_style, marker) = node_style(is_highlighted, follow);
+    let (border_style, text_style, marker) = node_style(is_highlighted, follow, theme);
     let kind_tag = format!("[{}]", node.kind.display_str());
     let max_name = inner.saturating_sub(2 + kind_tag.len());
     let name_display = truncate_str(&node.name, max_name);
@@ -266,8 +289,9 @@ fn ensemble_box_lines(
     is_highlighted: bool,
     follow: bool,
     inner: usize,
+    theme: &Theme,
 ) -> Vec<Line<'static>> {
-    let (border_style, text_style, marker) = node_style(is_highlighted, follow);
+    let (border_style, text_style, marker) = node_style(is_highlighted, follow, theme);
     let title = format!("{} [{} models]", ensemble.name, ensemble.members.len());
     let max_title = inner.saturating_sub(2);
     let title_display = truncate_str(&title, max_title);
@@ -289,7 +313,7 @@ fn ensemble_box_lines(
         )),
     ];
     for member in &ensemble.members {
-        let (tag, color) = ensemble_member_status_tag(member.status);
+        let (tag, color) = ensemble_member_status_tag(member.status, theme);
         let label = format!("{} {tag}", member.label);
         let max_label = inner.saturating_sub(4);
         let label_display = truncate_str(&label, max_label);
@@ -306,22 +330,25 @@ fn ensemble_box_lines(
     lines
 }
 
-fn ensemble_member_status_tag(status: Option<LoopRunStatus>) -> (&'static str, Color) {
+fn ensemble_member_status_tag(
+    status: Option<LoopRunStatus>,
+    theme: &Theme,
+) -> (&'static str, Color) {
     match status {
         Some(LoopRunStatus::Pass) => ("[pass]", STATUS_OK),
         Some(LoopRunStatus::Fail) => ("[fail]", STATUS_FAIL),
         Some(LoopRunStatus::Running) => ("[running]", STATUS_RUNNING),
-        None => ("[pending]", DIM),
+        None => ("[pending]", theme.dim_text),
     }
 }
 
-fn edge_lines(edges: &[(String, LoopEdgeCondition)]) -> Vec<Line<'static>> {
+fn edge_lines(edges: &[(String, LoopEdgeCondition)], theme: &Theme) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for (i, (label, condition)) in edges.iter().enumerate() {
         let branch = if i == edges.len() - 1 { "└" } else { "├" };
         lines.push(Line::from(Span::styled(
             format!("   {}─ {} → {}", branch, condition.as_str(), label),
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         )));
     }
     lines
@@ -370,6 +397,7 @@ fn graph_lines(
     highlighted_node_id: Option<&str>,
     follow: bool,
     area_width: u16,
+    theme: &Theme,
 ) -> Vec<Line<'static>> {
     let mut outgoing: HashMap<&str, Vec<(&LoopNode, LoopEdgeCondition)>> = HashMap::new();
     for edge in &state.effective_edges {
@@ -418,13 +446,19 @@ fn graph_lines(
                 .iter()
                 .any(|m| Some(m.node_id.as_str()) == highlighted_node_id)
                 || highlighted_node_id == Some(ensemble.join_node_id.as_str());
-            lines.extend(ensemble_box_lines(ensemble, is_highlighted, follow, inner));
+            lines.extend(ensemble_box_lines(
+                ensemble,
+                is_highlighted,
+                follow,
+                inner,
+                theme,
+            ));
 
             // The collapsed box's own outgoing routing is the join's real
             // outgoing edges (on_pass_to/on_fail_to).
             if let Some(edges) = outgoing.get(ensemble.join_node_id.as_str()) {
                 let labeled = collapse_ensemble_targets(edges, &ensemble_by_member);
-                lines.extend(edge_lines(&labeled));
+                lines.extend(edge_lines(&labeled, theme));
                 lines.push(Line::from(""));
             } else if idx + 1 < nodes.len() {
                 lines.push(Line::from(""));
@@ -433,11 +467,11 @@ fn graph_lines(
         }
 
         let is_highlighted = highlighted_node_id == Some(node.id.as_str());
-        lines.extend(node_box_lines(node, is_highlighted, follow, inner));
+        lines.extend(node_box_lines(node, is_highlighted, follow, inner, theme));
 
         if let Some(edges) = outgoing.get(node.id.as_str()) {
             let labeled = collapse_ensemble_targets(edges, &ensemble_by_member);
-            lines.extend(edge_lines(&labeled));
+            lines.extend(edge_lines(&labeled, theme));
             lines.push(Line::from(""));
         } else if idx + 1 < nodes.len() {
             lines.push(Line::from(""));
@@ -457,14 +491,14 @@ fn format_elapsed(started_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
     }
 }
 
-fn run_status_span(status: Option<LoopRunStatus>) -> Span<'static> {
+fn run_status_span(status: Option<LoopRunStatus>, theme: &Theme) -> Span<'static> {
     match status {
         Some(LoopRunStatus::Running) => {
             Span::styled("running", Style::default().fg(STATUS_RUNNING))
         }
         Some(LoopRunStatus::Pass) => Span::styled("pass", Style::default().fg(STATUS_OK)),
         Some(LoopRunStatus::Fail) => Span::styled("fail", Style::default().fg(STATUS_FAIL)),
-        None => Span::styled("(no runs yet)", Style::default().fg(DIM)),
+        None => Span::styled("(no runs yet)", Style::default().fg(theme.dim_text)),
     }
 }
 
@@ -474,17 +508,18 @@ fn footer_lines(
     node_info: &NodeRunInfo,
     follow: bool,
     now: DateTime<Utc>,
+    theme: &Theme,
 ) -> Vec<Line<'static>> {
     let Some(node_id) = highlighted_node_id else {
         return vec![Line::from(Span::styled(
             "(no node selected)",
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         ))];
     };
     let Some(node) = state.effective_nodes.iter().find(|n| n.id == node_id) else {
         return vec![Line::from(Span::styled(
             "(node not found)",
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         ))];
     };
 
@@ -492,30 +527,35 @@ fn footer_lines(
     let mut lines = vec![Line::from(vec![
         Span::styled(
             node.name.clone(),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.header_color)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
         Span::styled(
             format!("[{}]", node.kind.display_str()),
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         ),
         Span::raw("  "),
-        Span::styled(format!("({mode_label})"), Style::default().fg(DIM)),
+        Span::styled(
+            format!("({mode_label})"),
+            Style::default().fg(theme.dim_text),
+        ),
     ])];
 
-    let mut meta = vec![run_status_span(node_info.status)];
+    let mut meta = vec![run_status_span(node_info.status, theme)];
     if let Some(started_at) = node_info.started_at {
         meta.push(Span::raw("  "));
         meta.push(Span::styled(
             format!("elapsed {}", format_elapsed(started_at, now)),
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         ));
     }
     if let Some(iteration) = node_info.iteration {
         meta.push(Span::raw("  "));
         meta.push(Span::styled(
             format!("iter {iteration}"),
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         ));
     }
     lines.push(Line::from(meta));
@@ -680,6 +720,7 @@ mod tests {
                     node_info: &node_info,
                     blocked: false,
                     now: Utc::now(),
+                    theme: &Theme::classic(),
                 },
             );
         });
@@ -733,6 +774,7 @@ mod tests {
                     node_info: &node_info,
                     blocked: false,
                     now: Utc::now(),
+                    theme: &Theme::classic(),
                 },
             );
         });
@@ -776,6 +818,7 @@ mod tests {
             node_info: &node_info,
             blocked: false,
             now: Utc::now(),
+            theme: &Theme::classic(),
         };
         render_to_text(1, 5, |frame, area| {
             render_loop_live_view(frame, area, &ctx);
@@ -811,6 +854,7 @@ mod tests {
                     node_info: &node_info,
                     blocked: false,
                     now: Utc::now(),
+                    theme: &Theme::classic(),
                 },
             );
         });
@@ -946,6 +990,7 @@ mod tests {
                     node_info: &node_info,
                     blocked: false,
                     now: Utc::now(),
+                    theme: &Theme::classic(),
                 },
             );
         });

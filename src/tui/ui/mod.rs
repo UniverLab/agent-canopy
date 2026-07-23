@@ -82,7 +82,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 Constraint::Length(activity_width),
             ])
             .areas(body_area);
-            panel::draw_activity_panel(frame, sync, activity_state, app.sync_scroll_offset);
+            panel::draw_activity_panel(frame, sync, activity_state, app.sync_scroll_offset, &theme);
             app.last_sync_area = Some(sync);
             (panel, Some(sync))
         } else {
@@ -111,15 +111,29 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 }
             };
             let [area_a, area_b]: [Rect; 2] = areas;
-            panel::draw_split_panel(frame, area_a, app, &session_a, !app.split_right_focused);
-            panel::draw_split_panel(frame, area_b, app, &session_b, app.split_right_focused);
+            panel::draw_split_panel(
+                frame,
+                area_a,
+                app,
+                &session_a,
+                !app.split_right_focused,
+                &theme,
+            );
+            panel::draw_split_panel(
+                frame,
+                area_b,
+                app,
+                &session_b,
+                app.split_right_focused,
+                &theme,
+            );
         } else {
             // Group no longer exists — clear stale reference
             app.active_split_id = None;
-            panel::draw_log_panel(frame, panel_area, app);
+            panel::draw_log_panel(frame, panel_area, app, &theme);
         }
     } else {
-        panel::draw_log_panel(frame, panel_area, app);
+        panel::draw_log_panel(frame, panel_area, app, &theme);
     }
 
     footer::draw_footer(frame, footer_area, app, &theme);
