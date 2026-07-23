@@ -154,7 +154,7 @@ mod tests {
 
         let wrote = sync_write(
             &dest,
-            "essential-pack:loop-design/SKILL.md",
+            "essential-pack:canopy-loop-design/SKILL.md",
             b"stale v1.2 content",
             false,
         )
@@ -174,7 +174,7 @@ mod tests {
 
         let wrote = sync_write(
             &dest,
-            "essential-pack:loop-design/SKILL.md",
+            "essential-pack:canopy-loop-design/SKILL.md",
             b"same content",
             false,
         )
@@ -193,7 +193,7 @@ mod tests {
 
         let wrote = sync_write(
             &dest,
-            "essential-pack:loop-design/SKILL.md",
+            "essential-pack:canopy-loop-design/SKILL.md",
             b"forced content",
             true,
         )
@@ -210,7 +210,7 @@ mod tests {
 
         let wrote = sync_write(
             &dest,
-            "essential-pack:loop-design/SKILL.md",
+            "essential-pack:canopy-loop-design/SKILL.md",
             b"brand new",
             false,
         )
@@ -231,7 +231,7 @@ mod tests {
 
         let wrote = sync_write(
             &dest,
-            "essential-pack:loop-design/SKILL.md",
+            "essential-pack:canopy-loop-design/SKILL.md",
             b"forced content",
             true,
         )
@@ -248,7 +248,7 @@ mod tests {
 
         assert!(sync_write(
             &dest,
-            "essential-pack:loop-design/SKILL.md",
+            "essential-pack:canopy-loop-design/SKILL.md",
             b"content",
             false
         )
@@ -256,7 +256,7 @@ mod tests {
         // Second run: destination now matches incoming, so nothing changes.
         assert!(!sync_write(
             &dest,
-            "essential-pack:loop-design/SKILL.md",
+            "essential-pack:canopy-loop-design/SKILL.md",
             b"content",
             false
         )

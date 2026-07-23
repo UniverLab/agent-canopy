@@ -199,8 +199,11 @@ impl App {
         lines.push(
             "The `execution-mindset` skill governs how you operate (judgment, \
             verify-before-reporting, security, resourcefulness, token efficiency) and applies to \
-            every task. Use `code-engineering` for code work. Apply the skills directly — they \
-            are the source of truth, not this summary."
+            every task. Reach for `architect-mindset` when designing or writing specs, \
+            `code-engineering` for code work, and Canopy's own tooling skills \
+            (`canopy-intelligence`, `canopy-sync`, `canopy-loop-design`, `canopy-capabilities`) \
+            when working this MCP surface. Apply the skills directly — they are the source of \
+            truth, not this summary."
                 .to_string(),
         );
 
