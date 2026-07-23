@@ -7,9 +7,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use super::{BORDER_COLOR, DIM};
 use crate::domain::canopy_config::TemperatureUnit;
 use crate::system::{PowerSource, SystemInfo};
+use crate::tui::ui::theme::Theme;
 
 // ── Alert colors ────────────────────────────────────────────────
 
@@ -17,24 +17,24 @@ const WARN: Color = Color::Rgb(255, 193, 7); // amber
 const DANGER: Color = Color::Rgb(229, 57, 53); // red
 
 /// Pick an alert color based on value thresholds.
-fn alert_color(value: f32, yellow: f32, red: f32) -> Color {
+fn alert_color(value: f32, yellow: f32, red: f32, theme: &Theme) -> Color {
     if value >= red {
         DANGER
     } else if value >= yellow {
         WARN
     } else {
-        DIM
+        theme.dim_text
     }
 }
 
 /// Pick an alert color for temperatures (Celsius).
-fn temp_alert_color(temp_c: f32) -> Color {
-    alert_color(temp_c, 70.0, 85.0)
+fn temp_alert_color(temp_c: f32, theme: &Theme) -> Color {
+    alert_color(temp_c, 70.0, 85.0, theme)
 }
 
 /// Pick an alert color for GPU temperatures (Celsius).
-fn gpu_temp_alert_color(temp_c: f32) -> Color {
-    alert_color(temp_c, 75.0, 90.0)
+fn gpu_temp_alert_color(temp_c: f32, theme: &Theme) -> Color {
+    alert_color(temp_c, 75.0, 90.0, theme)
 }
 
 /// Format bytes smartly: show in MB if < 1 GB, otherwise in GB, with 2 decimals
@@ -75,6 +75,7 @@ pub fn render_system_dashboard(
     area: Rect,
     system_info: &SystemInfo,
     temperature_unit: TemperatureUnit,
+    theme: &Theme,
 ) {
     // Only render if we have enough space (3 content lines + 2 borders)
     if area.height < 5 {
@@ -82,20 +83,23 @@ pub fn render_system_dashboard(
     }
 
     let max_lines = area.height.saturating_sub(2) as usize;
-    let dashboard = create_system_dashboard_lines(system_info, temperature_unit, max_lines);
+    let dashboard = create_system_dashboard_lines(system_info, temperature_unit, max_lines, theme);
 
     frame.render_widget(
         Paragraph::new(dashboard)
             .block(
                 Block::default()
                     .title(
-                        Line::from(Span::styled(" sysInfo ", Style::default().fg(DIM)))
-                            .alignment(ratatui::layout::Alignment::Right),
+                        Line::from(Span::styled(
+                            " sysInfo ",
+                            Style::default().fg(theme.dim_text),
+                        ))
+                        .alignment(ratatui::layout::Alignment::Right),
                     )
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(BORDER_COLOR)),
+                    .border_style(Style::default().fg(theme.border_color)),
             )
-            .style(Style::default().fg(DIM)),
+            .style(Style::default().fg(theme.dim_text)),
         area,
     );
 }
@@ -105,9 +109,10 @@ fn create_system_dashboard_lines(
     system_info: &SystemInfo,
     temperature_unit: TemperatureUnit,
     max_lines: usize,
+    theme: &Theme,
 ) -> Vec<Line<'static>> {
     let cpu_usage = system_info.cpu_usage_percent();
-    let cpu_color = alert_color(cpu_usage, 70.0, 90.0);
+    let cpu_color = alert_color(cpu_usage, 70.0, 90.0, theme);
 
     // Build CPU line: usage (alert) + temp (alert) + freq (dim) + cores (dim)
     let mut cpu_spans = vec![
@@ -118,16 +123,19 @@ fn create_system_dashboard_lines(
         let temp_str = format_temperature(temp_c, temperature_unit);
         cpu_spans.push(Span::styled(
             format!(" {temp_str}"),
-            Style::default().fg(temp_alert_color(temp_c)),
+            Style::default().fg(temp_alert_color(temp_c, theme)),
         ));
     }
     if let Some(freq) = format_cpu_frequency(system_info.cpu_frequency_mhz) {
-        cpu_spans.push(Span::styled(format!(" {freq}"), Style::default().fg(DIM)));
+        cpu_spans.push(Span::styled(
+            format!(" {freq}"),
+            Style::default().fg(theme.dim_text),
+        ));
     }
     if system_info.cpu_cores > 0 {
         cpu_spans.push(Span::styled(
             format!(" {}core", system_info.cpu_cores),
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         ));
     }
     let mut lines = vec![Line::from(cpu_spans)];
@@ -139,7 +147,7 @@ fn create_system_dashboard_lines(
     // drawing right now).
     if let Some(gpu) = &system_info.gpu_info {
         let usage_pct = gpu.usage.unwrap_or(0.0);
-        let gpu_usage_color = alert_color(usage_pct, 70.0, 90.0);
+        let gpu_usage_color = alert_color(usage_pct, 70.0, 90.0, theme);
 
         // Show VRAM as a single size figure ("1.25GB"). The percentage
         // version (`16% 1.25GB`) is dropped because the same info is
@@ -176,7 +184,7 @@ fn create_system_dashboard_lines(
                 let sep = if gpu.usage.is_some() { " " } else { "" };
                 spans.push(Span::styled(
                     format!("{sep}{}", format_temperature(temp, temperature_unit)),
-                    Style::default().fg(gpu_temp_alert_color(temp)),
+                    Style::default().fg(gpu_temp_alert_color(temp, theme)),
                 ));
             }
             // Layout: <usage>% <temp> · <vram> · <watts>W
@@ -188,7 +196,10 @@ fn create_system_dashboard_lines(
                 if has_left {
                     spans.push(Span::styled(" · ", Style::default().fg(Color::White)));
                 }
-                spans.push(Span::styled(vram.clone(), Style::default().fg(DIM)));
+                spans.push(Span::styled(
+                    vram.clone(),
+                    Style::default().fg(theme.dim_text),
+                ));
             }
             if let Some(watts) = power_watts {
                 let any_left = has_left || vram_size_text.is_some();
@@ -197,7 +208,7 @@ fn create_system_dashboard_lines(
                 }
                 spans.push(Span::styled(
                     format!("{watts:.0}W"),
-                    Style::default().fg(DIM),
+                    Style::default().fg(theme.dim_text),
                 ));
             }
 
@@ -215,11 +226,11 @@ fn create_system_dashboard_lines(
         Span::styled("mem: ", Style::default().fg(Color::White)),
         Span::styled(
             format!("{mem_pct:.0}%"),
-            Style::default().fg(alert_color(mem_pct, 70.0, 90.0)),
+            Style::default().fg(alert_color(mem_pct, 70.0, 90.0, theme)),
         ),
         Span::styled(
             format!(" {}", format_bytes_smart(system_info.memory_used)),
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         ),
     ]));
 
@@ -236,16 +247,16 @@ fn create_system_dashboard_lines(
             if let Some(p) = pct {
                 spans.push(Span::styled(
                     format!("{p:.0}%"),
-                    Style::default().fg(alert_color(p, 70.0, 90.0)),
+                    Style::default().fg(alert_color(p, 70.0, 90.0, theme)),
                 ));
                 spans.push(Span::styled(
                     format!(" {watts:.0}W"),
-                    Style::default().fg(DIM),
+                    Style::default().fg(theme.dim_text),
                 ));
             } else {
                 spans.push(Span::styled(
                     format!("{watts:.0}W"),
-                    Style::default().fg(DIM),
+                    Style::default().fg(theme.dim_text),
                 ));
             }
             lines.push(Line::from(spans));
@@ -273,17 +284,17 @@ fn create_system_dashboard_lines(
         } else if load_per_core >= 0.7 {
             WARN
         } else {
-            DIM
+            theme.dim_text
         };
         let load_pct = (load_per_core * 100.0) as u32;
         lines.push(Line::from(vec![
             Span::styled("load: ", Style::default().fg(Color::White)),
             Span::styled(format!("{load_pct}%"), Style::default().fg(load_color)),
-            Span::styled(format!(" {load:.2}"), Style::default().fg(DIM)),
+            Span::styled(format!(" {load:.2}"), Style::default().fg(theme.dim_text)),
             Span::styled(" · ", Style::default().fg(Color::White)),
             Span::styled(
                 format!("{} procs", system_info.process_count),
-                Style::default().fg(DIM),
+                Style::default().fg(theme.dim_text),
             ),
         ]));
     } else {
@@ -291,7 +302,7 @@ fn create_system_dashboard_lines(
             Span::styled("procs: ", Style::default().fg(Color::White)),
             Span::styled(
                 format!("{}", system_info.process_count),
-                Style::default().fg(DIM),
+                Style::default().fg(theme.dim_text),
             ),
         ]));
     }
@@ -309,8 +320,9 @@ fn create_system_dashboard_lines(
 pub(super) fn dashboard_content_line_count(
     system_info: &SystemInfo,
     temperature_unit: TemperatureUnit,
+    theme: &Theme,
 ) -> usize {
-    create_system_dashboard_lines(system_info, temperature_unit, usize::MAX).len()
+    create_system_dashboard_lines(system_info, temperature_unit, usize::MAX, theme).len()
 }
 
 fn format_temperature(temp_celsius: f32, unit: TemperatureUnit) -> String {
@@ -331,7 +343,8 @@ mod tests {
     #[test]
     fn test_dashboard_creation() {
         let info = SystemInfo::new();
-        let lines = create_system_dashboard_lines(&info, TemperatureUnit::Celsius, 10);
+        let lines =
+            create_system_dashboard_lines(&info, TemperatureUnit::Celsius, 10, &Theme::classic());
 
         // Should have at least the 2 base lines (cpu, mem)
         assert!(
@@ -372,7 +385,8 @@ mod tests {
         info.power_watts = Some(12.0);
         info.power_source = Some(crate::system::PowerSource::Gpu);
 
-        let lines = create_system_dashboard_lines(&info, TemperatureUnit::Celsius, 10);
+        let lines =
+            create_system_dashboard_lines(&info, TemperatureUnit::Celsius, 10, &Theme::classic());
         let gpu_line = lines
             .iter()
             .map(|l| l.to_string())
@@ -418,7 +432,8 @@ mod tests {
         info.power_limit_watts = None;
         info.power_source = Some(crate::system::PowerSource::Battery);
 
-        let lines = create_system_dashboard_lines(&info, TemperatureUnit::Celsius, 10);
+        let lines =
+            create_system_dashboard_lines(&info, TemperatureUnit::Celsius, 10, &Theme::classic());
         let gpu_line = lines
             .iter()
             .map(|l| l.to_string())
@@ -445,8 +460,14 @@ mod tests {
         // `default()` (not `new()`) keeps the count deterministic: `new()`
         // probes real hardware, which varies per machine.
         let info = SystemInfo::default();
-        let count = dashboard_content_line_count(&info, TemperatureUnit::Celsius);
-        let rendered = create_system_dashboard_lines(&info, TemperatureUnit::Celsius, usize::MAX);
+        let count =
+            dashboard_content_line_count(&info, TemperatureUnit::Celsius, &Theme::classic());
+        let rendered = create_system_dashboard_lines(
+            &info,
+            TemperatureUnit::Celsius,
+            usize::MAX,
+            &Theme::classic(),
+        );
 
         assert_eq!(
             count,
@@ -466,11 +487,13 @@ mod tests {
     #[test]
     fn battery_pwr_row_adds_exactly_one_line_of_height() {
         let mut info = SystemInfo::default();
-        let base_count = dashboard_content_line_count(&info, TemperatureUnit::Celsius);
+        let base_count =
+            dashboard_content_line_count(&info, TemperatureUnit::Celsius, &Theme::classic());
 
         info.power_source = Some(PowerSource::Battery);
         info.power_watts = Some(18.0);
-        let pwr_count = dashboard_content_line_count(&info, TemperatureUnit::Celsius);
+        let pwr_count =
+            dashboard_content_line_count(&info, TemperatureUnit::Celsius, &Theme::classic());
 
         assert_eq!(
             pwr_count,
@@ -482,7 +505,8 @@ mod tests {
     #[test]
     fn gpu_row_adds_exactly_one_line_of_height() {
         let mut info = SystemInfo::default();
-        let base_count = dashboard_content_line_count(&info, TemperatureUnit::Celsius);
+        let base_count =
+            dashboard_content_line_count(&info, TemperatureUnit::Celsius, &Theme::classic());
 
         info.gpu_info = Some(crate::system::GpuInfo {
             name: "Test GPU".to_string(),
@@ -494,7 +518,8 @@ mod tests {
             power_watts: None,
             power_limit_watts: None,
         });
-        let gpu_count = dashboard_content_line_count(&info, TemperatureUnit::Celsius);
+        let gpu_count =
+            dashboard_content_line_count(&info, TemperatureUnit::Celsius, &Theme::classic());
 
         assert_eq!(
             gpu_count,
@@ -519,7 +544,8 @@ mod tests {
         // System-level power also missing.
         info.power_watts = None;
 
-        let lines = create_system_dashboard_lines(&info, TemperatureUnit::Celsius, 10);
+        let lines =
+            create_system_dashboard_lines(&info, TemperatureUnit::Celsius, 10, &Theme::classic());
         let gpu_line = lines
             .iter()
             .map(|l| l.to_string())

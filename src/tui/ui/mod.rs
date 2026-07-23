@@ -6,7 +6,7 @@ mod header;
 mod panel;
 mod sidebar;
 mod system_dashboard;
-mod theme;
+pub(crate) mod theme;
 
 use theme::Theme;
 
@@ -18,13 +18,7 @@ use super::app::types::App;
 
 // ── Shared palette ──────────────────────────────────────────────
 
-pub(crate) const ACCENT: Color = Color::Rgb(76, 175, 80);
-pub(crate) const DIM: Color = Color::Rgb(150, 150, 170);
-/// Unfocused box-drawing borders. Darker than [`DIM`] so borders recede
-/// instead of competing with panel content.
-pub(crate) const BORDER_COLOR: Color = Color::Rgb(50, 50, 50);
 pub(crate) const ERROR_COLOR: Color = Color::Rgb(229, 57, 53);
-pub(crate) const BG_SELECTED: Color = Color::Rgb(45, 45, 45);
 pub(crate) const BG_HOVER: Color = Color::Rgb(30, 30, 30);
 pub(crate) const INTERACTIVE_COLOR: Color = Color::Rgb(102, 187, 106);
 pub(crate) const STATUS_DISABLED: Color = Color::Rgb(120, 120, 120);
@@ -139,35 +133,35 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     footer::draw_footer(frame, footer_area, app, &theme);
 
     if app.new_agent_dialog.is_some() {
-        dialogs::draw_new_agent_dialog(frame, app);
+        dialogs::draw_new_agent_dialog(frame, app, &theme);
     }
 
     if app.launchpad_dialog.is_some() {
-        dialogs::draw_launchpad_dialog(frame, app);
+        dialogs::draw_launchpad_dialog(frame, app, &theme);
     }
 
     if app.quit_confirm {
-        dialogs::draw_quit_confirm(frame);
+        dialogs::draw_quit_confirm(frame, &theme);
     } else if app.delete_project_confirm {
-        dialogs::draw_delete_project_confirm(frame);
+        dialogs::draw_delete_project_confirm(frame, &theme);
     } else if app.delete_loop_confirm {
-        dialogs::draw_delete_loop_confirm(frame);
+        dialogs::draw_delete_loop_confirm(frame, &theme);
     }
 
     if app.show_legend {
-        dialogs::draw_legend(frame, app);
+        dialogs::draw_legend(frame, app, &theme);
     }
 
     if app.context_transfer_modal.is_some() {
-        dialogs::draw_context_transfer_modal(frame, app);
+        dialogs::draw_context_transfer_modal(frame, app, &theme);
     }
 
     if app.rag_transfer_modal.is_some() {
-        dialogs::draw_rag_transfer_modal(frame, app);
+        dialogs::draw_rag_transfer_modal(frame, app, &theme);
     }
 
     if app.simple_prompt_dialog.is_some() {
-        let result = dialogs::draw_simple_prompt_dialog(frame, app);
+        let result = dialogs::draw_simple_prompt_dialog(frame, app, &theme);
         if let Some((tab_origin, content_rect)) = result {
             app.prompt_tab_origin = Some(tab_origin);
             app.prompt_raw_content_rect = content_rect;
@@ -175,23 +169,23 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     if app.loop_editor_dialog.is_some() {
-        dialogs::draw_loop_editor_dialog(frame, app);
+        dialogs::draw_loop_editor_dialog(frame, app, &theme);
     }
 
     if app.loop_form_dialog.is_some() {
-        dialogs::draw_loop_form_dialog(frame, app);
+        dialogs::draw_loop_form_dialog(frame, app, &theme);
     }
 
     if app.knowledge_dialog.is_some() {
-        dialogs::draw_knowledge_dialog(frame, app);
+        dialogs::draw_knowledge_dialog(frame, app, &theme);
     }
 
     if app.split_picker_open {
-        dialogs::draw_split_picker(frame, app);
+        dialogs::draw_split_picker(frame, app, &theme);
     }
 
     if app.suggestion_picker.is_some() {
-        dialogs::draw_suggestion_picker(frame, app, panel_area);
+        dialogs::draw_suggestion_picker(frame, app, panel_area, &theme);
     }
 
     // Terminal search bar overlay (Ctrl+F)
@@ -225,8 +219,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             let x = full.x + full.width - w - 1;
             let y = full.y + 1; // just below header
             let area = ratatui::layout::Rect::new(x, y, w, 1);
-            let widget = ratatui::widgets::Paragraph::new(msg)
-                .style(ratatui::style::Style::default().fg(ACCENT).bg(Color::Black));
+            let widget = ratatui::widgets::Paragraph::new(msg).style(
+                ratatui::style::Style::default()
+                    .fg(theme.header_color)
+                    .bg(Color::Black),
+            );
             frame.render_widget(widget, area);
         }
     }

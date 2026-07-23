@@ -10,7 +10,7 @@ use ratatui::Frame;
 
 use super::theme::Theme;
 use super::{
-    truncate_str, truncate_str_keep_tail, DIM, INTERACTIVE_COLOR, STATUS_DISABLED, STATUS_FAIL,
+    truncate_str, truncate_str_keep_tail, INTERACTIVE_COLOR, STATUS_DISABLED, STATUS_FAIL,
     STATUS_OK, STATUS_RUNNING,
 };
 use crate::tui::agent::ScreenSnapshot;
@@ -316,7 +316,7 @@ fn draw_preview_panel(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) -
         return false;
     };
 
-    draw_selected_preview(frame, area, app, selected)
+    draw_selected_preview(frame, area, app, selected, theme)
 }
 
 fn draw_agent_panel(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) -> bool {
@@ -333,11 +333,11 @@ fn draw_agent_panel(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme)
         AgentEntry::Interactive(idx) => draw_focused_interactive_panel(frame, area, app, *idx),
         AgentEntry::Terminal(idx) => draw_focused_terminal_panel(frame, area, app, *idx),
         AgentEntry::Group(idx) => {
-            draw_group_details(frame, area, app, *idx);
+            draw_group_details(frame, area, app, *idx, theme);
             true
         }
         AgentEntry::Agent(agent) => {
-            draw_background_agent_panel(frame, area, agent, app);
+            draw_background_agent_panel(frame, area, agent, app, theme);
             true
         }
         AgentEntry::Corrupt(corrupt) => {
@@ -455,10 +455,16 @@ fn draw_focused_terminal_panel(frame: &mut Frame, area: Rect, app: &mut App, idx
     true
 }
 
-fn draw_selected_preview(frame: &mut Frame, area: Rect, app: &App, selected: &AgentEntry) -> bool {
+fn draw_selected_preview(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    selected: &AgentEntry,
+    theme: &Theme,
+) -> bool {
     match selected {
         AgentEntry::Agent(agent) => {
-            draw_agent_details(frame, area, agent, app);
+            draw_agent_details(frame, area, agent, app, theme);
             true
         }
         AgentEntry::Corrupt(corrupt) => {
@@ -468,7 +474,7 @@ fn draw_selected_preview(frame: &mut Frame, area: Rect, app: &App, selected: &Ag
         AgentEntry::Interactive(idx) => draw_interactive_preview(frame, area, app, *idx),
         AgentEntry::Terminal(idx) => draw_terminal_preview(frame, area, app, *idx),
         AgentEntry::Group(idx) => {
-            draw_group_details(frame, area, app, *idx);
+            draw_group_details(frame, area, app, *idx, theme);
             true
         }
         AgentEntry::Orphaned(idx) => {

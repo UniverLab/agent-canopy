@@ -3,11 +3,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use super::{centered_rect, ACCENT, DIM};
+use super::centered_rect;
+use super::ERROR_COLOR;
 use crate::tui::app::types::App;
-
-#[allow(unused_imports)]
-use super::{BG_SELECTED, ERROR_COLOR, INTERACTIVE_COLOR};
+use crate::tui::ui::theme::Theme;
 
 // Old function removed - using simple prompt dialog instead
 pub(crate) fn draw_section_picker_modal(
@@ -15,6 +14,7 @@ pub(crate) fn draw_section_picker_modal(
     app: &App,
     accent: Color,
     mode: &crate::tui::app::dialog::SectionPickerMode,
+    theme: &Theme,
 ) {
     use crate::tui::app::dialog::SectionPickerMode;
 
@@ -60,13 +60,13 @@ pub(crate) fn draw_section_picker_modal(
             }
 
             let hint = Line::from(vec![
-                Span::styled("↑↓ ", Style::default().fg(DIM)),
+                Span::styled("↑↓ ", Style::default().fg(theme.dim_text)),
                 Span::styled("select  ", Style::default().fg(Color::White)),
-                Span::styled("c ", Style::default().fg(DIM)),
+                Span::styled("c ", Style::default().fg(theme.dim_text)),
                 Span::styled("custom  ", Style::default().fg(Color::White)),
-                Span::styled("Enter ", Style::default().fg(DIM)),
+                Span::styled("Enter ", Style::default().fg(theme.dim_text)),
                 Span::styled("add  ", Style::default().fg(Color::White)),
-                Span::styled("Esc ", Style::default().fg(DIM)),
+                Span::styled("Esc ", Style::default().fg(theme.dim_text)),
                 Span::styled("cancel", Style::default().fg(Color::White)),
             ]);
             let hint_area = ratatui::layout::Rect {
@@ -104,7 +104,9 @@ pub(crate) fn draw_section_picker_modal(
             display.push('│');
             let input_line = Line::from(vec![Span::styled(
                 display,
-                Style::default().fg(ACCENT).bg(Color::Rgb(20, 35, 20)),
+                Style::default()
+                    .fg(theme.header_color)
+                    .bg(Color::Rgb(20, 35, 20)),
             )]);
             let input_area = ratatui::layout::Rect {
                 x: inner.x + 1,
@@ -115,9 +117,9 @@ pub(crate) fn draw_section_picker_modal(
             frame.render_widget(Paragraph::new(input_line), input_area);
 
             let hint = Line::from(vec![
-                Span::styled("Enter ", Style::default().fg(DIM)),
+                Span::styled("Enter ", Style::default().fg(theme.dim_text)),
                 Span::styled("add  ", Style::default().fg(Color::White)),
-                Span::styled("Esc ", Style::default().fg(DIM)),
+                Span::styled("Esc ", Style::default().fg(theme.dim_text)),
                 Span::styled("cancel", Style::default().fg(Color::White)),
             ]);
             let hint_area = ratatui::layout::Rect {
@@ -166,11 +168,11 @@ pub(crate) fn draw_section_picker_modal(
             }
 
             let hint = Line::from(vec![
-                Span::styled("↑↓ ", Style::default().fg(DIM)),
+                Span::styled("↑↓ ", Style::default().fg(theme.dim_text)),
                 Span::styled("select  ", Style::default().fg(Color::White)),
-                Span::styled("Enter ", Style::default().fg(DIM)),
+                Span::styled("Enter ", Style::default().fg(theme.dim_text)),
                 Span::styled("remove  ", Style::default().fg(Color::White)),
-                Span::styled("Esc ", Style::default().fg(DIM)),
+                Span::styled("Esc ", Style::default().fg(theme.dim_text)),
                 Span::styled("cancel", Style::default().fg(Color::White)),
             ]);
             let hint_area = ratatui::layout::Rect {
@@ -243,11 +245,11 @@ pub(crate) fn draw_section_picker_modal(
             }
 
             let hint = Line::from(vec![
-                Span::styled("↑↓ ", Style::default().fg(DIM)),
+                Span::styled("↑↓ ", Style::default().fg(theme.dim_text)),
                 Span::styled("select  ", Style::default().fg(Color::White)),
-                Span::styled("Enter ", Style::default().fg(DIM)),
+                Span::styled("Enter ", Style::default().fg(theme.dim_text)),
                 Span::styled("add  ", Style::default().fg(Color::White)),
-                Span::styled("Esc ", Style::default().fg(DIM)),
+                Span::styled("Esc ", Style::default().fg(theme.dim_text)),
                 Span::styled("cancel", Style::default().fg(Color::White)),
             ]);
             frame.render_widget(
@@ -317,11 +319,11 @@ pub(crate) fn draw_section_picker_modal(
             }
 
             let hint = Line::from(vec![
-                Span::styled("↑↓ ", Style::default().fg(DIM)),
+                Span::styled("↑↓ ", Style::default().fg(theme.dim_text)),
                 Span::styled("select  ", Style::default().fg(Color::White)),
-                Span::styled("Enter ", Style::default().fg(DIM)),
+                Span::styled("Enter ", Style::default().fg(theme.dim_text)),
                 Span::styled("add  ", Style::default().fg(Color::White)),
-                Span::styled("Esc ", Style::default().fg(DIM)),
+                Span::styled("Esc ", Style::default().fg(theme.dim_text)),
                 Span::styled("cancel", Style::default().fg(Color::White)),
             ]);
             frame.render_widget(
@@ -358,8 +360,8 @@ pub(crate) fn draw_section_picker_modal(
             let mut filter_display = filter.clone();
             filter_display.push('│');
             let filter_line = Line::from(vec![
-                Span::styled("  🔍 ", Style::default().fg(DIM)),
-                Span::styled(filter_display, Style::default().fg(ACCENT)),
+                Span::styled("  🔍 ", Style::default().fg(theme.dim_text)),
+                Span::styled(filter_display, Style::default().fg(theme.header_color)),
             ]);
             frame.render_widget(
                 Paragraph::new(filter_line),
@@ -433,13 +435,13 @@ pub(crate) fn draw_section_picker_modal(
             }
 
             let hint = Line::from(vec![
-                Span::styled("↑↓ ", Style::default().fg(DIM)),
+                Span::styled("↑↓ ", Style::default().fg(theme.dim_text)),
                 Span::styled("select  ", Style::default().fg(Color::White)),
-                Span::styled("type ", Style::default().fg(DIM)),
+                Span::styled("type ", Style::default().fg(theme.dim_text)),
                 Span::styled("filter  ", Style::default().fg(Color::White)),
-                Span::styled("Enter ", Style::default().fg(DIM)),
+                Span::styled("Enter ", Style::default().fg(theme.dim_text)),
                 Span::styled("insert  ", Style::default().fg(Color::White)),
-                Span::styled("Esc ", Style::default().fg(DIM)),
+                Span::styled("Esc ", Style::default().fg(theme.dim_text)),
                 Span::styled("cancel", Style::default().fg(Color::White)),
             ]);
             frame.render_widget(

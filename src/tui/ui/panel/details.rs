@@ -1,14 +1,21 @@
-use super::{DIM, INTERACTIVE_COLOR, STATUS_DISABLED, STATUS_FAIL, STATUS_OK, STATUS_RUNNING};
+use super::{INTERACTIVE_COLOR, STATUS_DISABLED, STATUS_FAIL, STATUS_OK, STATUS_RUNNING};
 use crate::domain::models::{Agent, Trigger};
 use crate::tui::app::types::App;
 use crate::tui::app::utils::relative_time;
+use crate::tui::ui::theme::Theme;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
-pub fn draw_group_details(frame: &mut Frame, area: Rect, app: &App, group_idx: usize) {
+pub fn draw_group_details(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    group_idx: usize,
+    theme: &Theme,
+) {
     let Some(group) = app.split_groups.get(group_idx) else {
         return;
     };
@@ -36,12 +43,12 @@ pub fn draw_group_details(frame: &mut Frame, area: Rect, app: &App, group_idx: u
             if is_active {
                 Span::styled("● active", Style::default().fg(Color::Green))
             } else {
-                Span::styled("○ inactive", Style::default().fg(DIM))
+                Span::styled("○ inactive", Style::default().fg(theme.dim_text))
             },
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Session A:  ", Style::default().fg(DIM)),
+            Span::styled("  Session A:  ", Style::default().fg(theme.dim_text)),
             Span::styled(
                 &group.session_a,
                 Style::default()
@@ -50,7 +57,7 @@ pub fn draw_group_details(frame: &mut Frame, area: Rect, app: &App, group_idx: u
             ),
         ]),
         Line::from(vec![
-            Span::styled("  Session B:  ", Style::default().fg(DIM)),
+            Span::styled("  Session B:  ", Style::default().fg(theme.dim_text)),
             Span::styled(
                 &group.session_b,
                 Style::default()
@@ -60,7 +67,7 @@ pub fn draw_group_details(frame: &mut Frame, area: Rect, app: &App, group_idx: u
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Orientation: ", Style::default().fg(DIM)),
+            Span::styled("  Orientation: ", Style::default().fg(theme.dim_text)),
             Span::styled(
                 group.orientation.as_str(),
                 Style::default().fg(Color::White),
@@ -73,7 +80,7 @@ pub fn draw_group_details(frame: &mut Frame, area: Rect, app: &App, group_idx: u
             } else {
                 "  Enter to activate split  ·  D to dissolve"
             },
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         )),
     ];
 
@@ -123,25 +130,25 @@ pub(crate) fn agent_status(agent: &Agent, has_active_run: bool) -> (&'static str
     }
 }
 
-pub fn draw_agent_details(frame: &mut Frame, area: Rect, agent: &Agent, app: &App) {
+pub fn draw_agent_details(frame: &mut Frame, area: Rect, agent: &Agent, app: &App, theme: &Theme) {
     let has_active = app.active_runs.contains_key(&agent.id);
     let (status_text, status_color) = agent_status(agent, has_active);
 
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("Status:  ", Style::default().fg(DIM)),
+            Span::styled("Status:  ", Style::default().fg(theme.dim_text)),
             Span::styled(status_text, Style::default().fg(status_color)),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("Type:    ", Style::default().fg(DIM)),
+            Span::styled("Type:    ", Style::default().fg(theme.dim_text)),
             Span::styled(
                 agent.trigger_type_label(),
                 Style::default().fg(INTERACTIVE_COLOR),
             ),
         ]),
         Line::from(vec![
-            Span::styled("Prompt:  ", Style::default().fg(DIM)),
+            Span::styled("Prompt:  ", Style::default().fg(theme.dim_text)),
             Span::raw(&agent.prompt),
         ]),
     ];
@@ -149,7 +156,7 @@ pub fn draw_agent_details(frame: &mut Frame, area: Rect, agent: &Agent, app: &Ap
     match &agent.trigger {
         Some(Trigger::Cron { schedule_expr }) => {
             lines.push(Line::from(vec![
-                Span::styled("Cron:    ", Style::default().fg(DIM)),
+                Span::styled("Cron:    ", Style::default().fg(theme.dim_text)),
                 Span::styled(schedule_expr, Style::default().fg(INTERACTIVE_COLOR)),
             ]));
         }
@@ -162,11 +169,11 @@ pub fn draw_agent_details(frame: &mut Frame, area: Rect, agent: &Agent, app: &Ap
         }) => {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
-                Span::styled("Path:    ", Style::default().fg(DIM)),
+                Span::styled("Path:    ", Style::default().fg(theme.dim_text)),
                 Span::raw(path),
             ]));
             lines.push(Line::from(vec![
-                Span::styled("Events:  ", Style::default().fg(DIM)),
+                Span::styled("Events:  ", Style::default().fg(theme.dim_text)),
                 Span::raw(
                     events
                         .iter()
@@ -176,11 +183,11 @@ pub fn draw_agent_details(frame: &mut Frame, area: Rect, agent: &Agent, app: &Ap
                 ),
             ]));
             lines.push(Line::from(vec![
-                Span::styled("Debounce:", Style::default().fg(DIM)),
+                Span::styled("Debounce:", Style::default().fg(theme.dim_text)),
                 Span::raw(format!(" {}s", debounce_seconds)),
             ]));
             lines.push(Line::from(vec![
-                Span::styled("Recursive:", Style::default().fg(DIM)),
+                Span::styled("Recursive:", Style::default().fg(theme.dim_text)),
                 Span::raw(if *recursive { " yes" } else { " no" }),
             ]));
         }
@@ -188,46 +195,46 @@ pub fn draw_agent_details(frame: &mut Frame, area: Rect, agent: &Agent, app: &Ap
     }
 
     lines.push(Line::from(vec![
-        Span::styled("CLI:     ", Style::default().fg(DIM)),
+        Span::styled("CLI:     ", Style::default().fg(theme.dim_text)),
         Span::raw(agent.cli.as_str()),
     ]));
 
     if let Some(ref model) = agent.model {
         lines.push(Line::from(vec![
-            Span::styled("Model:   ", Style::default().fg(DIM)),
+            Span::styled("Model:   ", Style::default().fg(theme.dim_text)),
             Span::raw(model),
         ]));
     }
 
     if let Some(ref dir) = agent.working_dir {
         lines.push(Line::from(vec![
-            Span::styled("Dir:     ", Style::default().fg(DIM)),
+            Span::styled("Dir:     ", Style::default().fg(theme.dim_text)),
             Span::raw(dir),
         ]));
     }
 
     lines.push(Line::from(vec![
-        Span::styled("Timeout: ", Style::default().fg(DIM)),
+        Span::styled("Timeout: ", Style::default().fg(theme.dim_text)),
         Span::raw(format!("{} min", agent.timeout_minutes)),
     ]));
 
     if let Some(ref exp) = agent.expires_at {
         lines.push(Line::from(vec![
-            Span::styled("Expires: ", Style::default().fg(DIM)),
+            Span::styled("Expires: ", Style::default().fg(theme.dim_text)),
             Span::raw(relative_time(exp)),
         ]));
     }
 
     if let Some(ref lr) = agent.last_run_at {
         lines.push(Line::from(vec![
-            Span::styled("Last run:", Style::default().fg(DIM)),
+            Span::styled("Last run:", Style::default().fg(theme.dim_text)),
             Span::raw(relative_time(lr)),
         ]));
     }
 
     if agent.trigger_count > 0 {
         lines.push(Line::from(vec![
-            Span::styled("Triggers:", Style::default().fg(DIM)),
+            Span::styled("Triggers:", Style::default().fg(theme.dim_text)),
             Span::raw(agent.trigger_count.to_string()),
         ]));
     }

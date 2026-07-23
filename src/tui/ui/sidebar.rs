@@ -24,7 +24,7 @@ pub(super) fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App, theme: 
     app.layer_header_click_map.clear();
     app.sidebar_visible_capacity = 0;
 
-    let areas = split_sidebar_content(area, app);
+    let areas = split_sidebar_content(area, app, theme);
 
     let show_rag = app.rag_info.has_rag_activity() && areas.content.height >= 6;
     let (rag_area, content_below) = split_top_panel(areas.content, show_rag, 6);
@@ -47,7 +47,7 @@ pub(super) fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App, theme: 
     let brain_area = draw_sidebar_layers(frame, content_below, app, theme);
     render_brain_or_graph(frame, brain_area, app, theme);
 
-    render_dashboard_if_present(frame, areas.dashboard, app);
+    render_dashboard_if_present(frame, areas.dashboard, app, theme);
 
     if let Some(dialog) = app.project_relation_dialog.as_ref() {
         draw_project_relation_dialog(frame, areas.content, app, dialog, theme);
@@ -60,7 +60,7 @@ struct SidebarContentAreas {
     dashboard: Option<Rect>,
 }
 
-fn dashboard_height(app: &App) -> u16 {
+fn dashboard_height(app: &App, theme: &Theme) -> u16 {
     // Ask the dashboard how many rows it will actually draw (cpu/mem/load are
     // always present; gpu/pwr/swap only when their data is). Reserving a fixed
     // slot for optional rows — as an earlier version did for the now
@@ -68,12 +68,13 @@ fn dashboard_height(app: &App) -> u16 {
     let content_lines = crate::tui::ui::system_dashboard::dashboard_content_line_count(
         &app.system_info,
         app.temperature_unit,
+        theme,
     ) as u16;
     content_lines + 2
 }
 
-fn split_sidebar_content(area: Rect, app: &App) -> SidebarContentAreas {
-    let height = dashboard_height(app);
+fn split_sidebar_content(area: Rect, app: &App, theme: &Theme) -> SidebarContentAreas {
+    let height = dashboard_height(app, theme);
     let dashboard = (area.height >= height).then_some(Rect::new(
         area.x,
         area.y + area.height - height,
@@ -188,7 +189,7 @@ fn render_brain_if_visible(frame: &mut Frame, area: Rect, app: &App) {
     crate::tui::ui::panel::draw_brians_brain(frame, area, brain);
 }
 
-fn render_dashboard_if_present(frame: &mut Frame, area: Option<Rect>, app: &App) {
+fn render_dashboard_if_present(frame: &mut Frame, area: Option<Rect>, app: &App, theme: &Theme) {
     let Some(area) = area else {
         return;
     };
@@ -197,6 +198,7 @@ fn render_dashboard_if_present(frame: &mut Frame, area: Option<Rect>, app: &App)
         area,
         &app.system_info,
         app.temperature_unit,
+        theme,
     );
 }
 

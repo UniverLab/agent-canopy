@@ -7,7 +7,8 @@ use ratatui::Frame;
 
 use crate::tui::app::types::App;
 
-use super::{centered_rect, truncate_str, ACCENT, BG_SELECTED, DIM, ERROR_COLOR};
+use super::{centered_rect, truncate_str, ERROR_COLOR};
+use crate::tui::ui::theme::Theme;
 
 fn mission_view_window(text: &str, cursor_byte: usize, max_cols: usize) -> (String, usize) {
     let max_cols = max_cols.max(1);
@@ -31,7 +32,7 @@ fn mission_view_window(text: &str, cursor_byte: usize, max_cols: usize) -> (Stri
     (display, cursor_col)
 }
 
-pub fn draw_launchpad_dialog(frame: &mut Frame, app: &App) {
+pub fn draw_launchpad_dialog(frame: &mut Frame, app: &App, theme: &Theme) {
     let Some(dialog) = &app.launchpad_dialog else {
         return;
     };
@@ -53,7 +54,7 @@ pub fn draw_launchpad_dialog(frame: &mut Frame, app: &App) {
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(Style::default().fg(theme.header_color))
         .style(Style::default().bg(Color::Rgb(15, 25, 15)));
     frame.render_widget(block, area);
 
@@ -69,9 +70,11 @@ pub fn draw_launchpad_dialog(frame: &mut Frame, app: &App) {
 
     let is_new_selected = dialog.is_new_mission_selected();
     let new_style = if is_new_selected {
-        Style::default().bg(BG_SELECTED).fg(ACCENT)
+        Style::default()
+            .bg(theme.selected_bg)
+            .fg(theme.header_color)
     } else {
-        Style::default().fg(DIM)
+        Style::default().fg(theme.dim_text)
     };
     let marker = if is_new_selected { ">" } else { " " };
     lines.push(Line::from(Span::styled(
@@ -94,7 +97,7 @@ pub fn draw_launchpad_dialog(frame: &mut Frame, app: &App) {
             let style = if dialog.submit_blocked {
                 Style::default().fg(ERROR_COLOR)
             } else {
-                Style::default().fg(DIM)
+                Style::default().fg(theme.dim_text)
             };
             lines.push(Line::from(Span::styled(format!("  {message}"), style)));
         }
@@ -103,20 +106,22 @@ pub fn draw_launchpad_dialog(frame: &mut Frame, app: &App) {
     if dialog.recent_missions.is_empty() {
         lines.push(Line::from(Span::styled(
             "No previous missions found for this workspace.",
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         )));
     } else {
         lines.push(Line::from(Span::styled(
             "Recent missions:",
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         )));
         for (i, mission) in dialog.recent_missions.iter().enumerate() {
             let item_index = i + 1; // 0 is "New mission"
             let is_selected = dialog.selected_index == item_index;
             let style = if is_selected {
-                Style::default().bg(BG_SELECTED).fg(ACCENT)
+                Style::default()
+                    .bg(theme.selected_bg)
+                    .fg(theme.header_color)
             } else {
-                Style::default().fg(DIM)
+                Style::default().fg(theme.dim_text)
             };
             let marker = if is_selected { ">" } else { " " };
             lines.push(Line::from(Span::styled(
@@ -147,7 +152,7 @@ pub fn draw_launchpad_dialog(frame: &mut Frame, app: &App) {
             } else {
                 " confirm (disabled)  "
             },
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         ),
         Span::styled(
             "Up/Down",
@@ -155,14 +160,14 @@ pub fn draw_launchpad_dialog(frame: &mut Frame, app: &App) {
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" navigate  ", Style::default().fg(DIM)),
+        Span::styled(" navigate  ", Style::default().fg(theme.dim_text)),
         Span::styled(
             "Esc",
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" cancel", Style::default().fg(DIM)),
+        Span::styled(" cancel", Style::default().fg(theme.dim_text)),
     ]));
 
     frame.render_widget(Paragraph::new(lines).block(Block::default()), inner);

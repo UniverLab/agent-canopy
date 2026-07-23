@@ -5,12 +5,12 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::tui::app::types::App;
-use crate::tui::ui::BORDER_COLOR;
+use crate::tui::ui::theme::Theme;
 
 const ACCENT: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
 
-pub fn draw_knowledge_dialog(frame: &mut Frame, app: &App) {
+pub fn draw_knowledge_dialog(frame: &mut Frame, app: &App, theme: &Theme) {
     let Some(dialog) = app.knowledge_dialog.as_ref() else {
         return;
     };
@@ -38,7 +38,14 @@ pub fn draw_knowledge_dialog(frame: &mut Frame, app: &App) {
     ])
     .split(inner);
 
-    draw_field(frame, chunks[0], "Title", &dialog.title, dialog.field == 0);
+    draw_field(
+        frame,
+        chunks[0],
+        "Title",
+        &dialog.title,
+        dialog.field == 0,
+        theme,
+    );
 
     draw_field(
         frame,
@@ -46,9 +53,17 @@ pub fn draw_knowledge_dialog(frame: &mut Frame, app: &App) {
         "Kind",
         dialog.kind_str(),
         dialog.field == 2,
+        theme,
     );
 
-    draw_multiline_field(frame, chunks[2], "Body", &dialog.body, dialog.field == 1);
+    draw_multiline_field(
+        frame,
+        chunks[2],
+        "Body",
+        &dialog.body,
+        dialog.field == 1,
+        theme,
+    );
 
     let help = Line::from(vec![
         Span::styled(
@@ -83,8 +98,15 @@ pub fn draw_knowledge_dialog(frame: &mut Frame, app: &App) {
     frame.render_widget(Paragraph::new(help), chunks[4]);
 }
 
-fn draw_field(frame: &mut Frame, area: Rect, label: &str, value: &str, focused: bool) {
-    let border_color = if focused { ACCENT } else { BORDER_COLOR };
+fn draw_field(
+    frame: &mut Frame,
+    area: Rect,
+    label: &str,
+    value: &str,
+    focused: bool,
+    theme: &Theme,
+) {
+    let border_color = if focused { ACCENT } else { theme.border_color };
     let block = Block::default()
         .title(format!(" {} ", label))
         .borders(Borders::ALL)
@@ -102,8 +124,15 @@ fn draw_field(frame: &mut Frame, area: Rect, label: &str, value: &str, focused: 
     frame.render_widget(text, inner);
 }
 
-fn draw_multiline_field(frame: &mut Frame, area: Rect, label: &str, value: &str, focused: bool) {
-    let border_color = if focused { ACCENT } else { BORDER_COLOR };
+fn draw_multiline_field(
+    frame: &mut Frame,
+    area: Rect,
+    label: &str,
+    value: &str,
+    focused: bool,
+    theme: &Theme,
+) {
+    let border_color = if focused { ACCENT } else { theme.border_color };
     let block = Block::default()
         .title(format!(" {} ", label))
         .borders(Borders::ALL)

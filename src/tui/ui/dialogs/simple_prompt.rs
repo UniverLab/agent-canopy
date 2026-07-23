@@ -3,14 +3,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use super::{draw_dialog_left_wave, truncate_str, ACCENT, DIM};
+use super::{draw_dialog_left_wave, truncate_str};
 use crate::tui::app::dialog::PromptTab;
 use crate::tui::app::types::{AgentEntry, App};
 use crate::tui::ui::dialogs::at_picker::draw_at_picker_dropdown;
 use crate::tui::ui::dialogs::section_picker::draw_section_picker_modal;
-
-#[allow(unused_imports)]
-use super::{BG_SELECTED, ERROR_COLOR, INTERACTIVE_COLOR};
+use crate::tui::ui::theme::Theme;
 
 /// Max rows the scheduled-sends list panel shows at once before it scrolls (B33).
 const SCHEDULED_LIST_MAX_ROWS: usize = 4;
@@ -326,6 +324,7 @@ fn select_shortcut_hints(
 pub fn draw_simple_prompt_dialog(
     frame: &mut Frame,
     app: &App,
+    theme: &Theme,
 ) -> Option<((u16, u16), Option<ratatui::layout::Rect>)> {
     let dialog = app.simple_prompt_dialog.as_ref()?;
 
@@ -338,7 +337,7 @@ pub fn draw_simple_prompt_dialog(
             }
             _ => None,
         })
-        .unwrap_or(ACCENT);
+        .unwrap_or(theme.header_color);
 
     // Pending scheduled sends targeting the currently selected session —
     // shown next to the Schedule field and cancelable with Ctrl+K there.
@@ -470,7 +469,7 @@ pub fn draw_simple_prompt_dialog(
                         .add_modifier(Modifier::BOLD | Modifier::REVERSED),
                 )
             } else {
-                Span::styled(label, Style::default().fg(DIM))
+                Span::styled(label, Style::default().fg(theme.dim_text))
             }
         })
         .collect();
@@ -495,7 +494,7 @@ pub fn draw_simple_prompt_dialog(
     .into_iter()
     .flat_map(|hint| {
         [
-            Span::styled(hint.key, Style::default().fg(DIM)),
+            Span::styled(hint.key, Style::default().fg(theme.dim_text)),
             Span::styled(hint.desc, Style::default().fg(Color::White)),
         ]
     })
@@ -518,7 +517,7 @@ pub fn draw_simple_prompt_dialog(
     let send_y = inner.y + inner.height.saturating_sub(1);
 
     let mut send_spans: Vec<Span> = Vec::new();
-    let ghost = Style::default().fg(DIM);
+    let ghost = Style::default().fg(theme.dim_text);
     let lit = Style::default().fg(accent).add_modifier(Modifier::BOLD);
     let label_style = if send_is_focused { lit } else { ghost };
 
@@ -599,7 +598,15 @@ pub fn draw_simple_prompt_dialog(
     // preview when empty); the Normal tab draws its scrolling section stack.
     let mut picker_anchor_area: Option<ratatui::layout::Rect> = None;
     if dialog.active_tab == PromptTab::Raw {
-        draw_raw_tab_content(frame, dialog, accent, inner, field_width, list_panel_height);
+        draw_raw_tab_content(
+            frame,
+            dialog,
+            accent,
+            inner,
+            field_width,
+            list_panel_height,
+            theme,
+        );
     } else {
         // sections_available_h = inner height minus tab(1) + hint(1) + gap(1) at the
         // top and gap(1) + send line(1) at the bottom, and the scheduled-list
@@ -869,7 +876,7 @@ pub fn draw_simple_prompt_dialog(
     }
 
     // Draw picker modal if open
-    draw_section_picker_modal(frame, app, accent, &dialog.picker_mode);
+    draw_section_picker_modal(frame, app, accent, &dialog.picker_mode, theme);
 
     let content_rect = if dialog.active_tab == PromptTab::Raw {
         Some(
@@ -885,6 +892,7 @@ pub fn draw_simple_prompt_dialog(
 /// content area, or — when the buffer is empty — a dimmed, read-only preview
 /// of the composed Normal-form prompt (the exact string a send would produce),
 /// clamped with a "… (+N lines)" tail when it overflows.
+#[allow(clippy::too_many_arguments)]
 fn draw_raw_tab_content(
     frame: &mut Frame,
     dialog: &crate::tui::app::dialog::SimplePromptDialog,
@@ -892,6 +900,7 @@ fn draw_raw_tab_content(
     inner: ratatui::layout::Rect,
     field_width: usize,
     list_panel_height: u16,
+    theme: &Theme,
 ) {
     let content_top = inner.y + 3;
     // Leave the send line plus the scheduled-list panel (B33) at the bottom.
@@ -944,13 +953,12 @@ fn draw_raw_tab_content(
         }
         let body_h = avail_h.saturating_sub(lines.len()).saturating_sub(1).max(1);
         let shown = all_lines.len().min(scroll + body_h) - scroll;
-        lines.extend(
-            all_lines
-                .iter()
-                .skip(scroll)
-                .take(body_h)
-                .map(|l| Line::from(Span::styled((*l).to_string(), Style::default().fg(DIM)))),
-        );
+        lines.extend(all_lines.iter().skip(scroll).take(body_h).map(|l| {
+            Line::from(Span::styled(
+                (*l).to_string(),
+                Style::default().fg(theme.dim_text),
+            ))
+        }));
         let below = all_lines.len().saturating_sub(scroll + shown);
         if below > 0 {
             lines.push(Line::from(Span::styled(

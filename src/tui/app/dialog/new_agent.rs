@@ -6,6 +6,7 @@ use crate::domain::models::Cli;
 use crate::domain::models_db::{self, ModelCatalog, ModelEntry};
 
 use crate::tui::app::types::Focus;
+use crate::tui::ui::theme::Theme;
 
 /// Seed identity option for the agent creation dialog.
 #[derive(Clone, Debug)]
@@ -381,9 +382,9 @@ impl NewAgentDialog {
             .and_then(|c| c.yolo_flag.clone())
     }
 
-    pub fn selected_accent_color(&self) -> Color {
+    pub fn selected_accent_color(&self, theme: &Theme) -> Color {
         if self.task_type == NewTaskType::Terminal {
-            return crate::tui::ui::ACCENT;
+            return theme.header_color;
         }
 
         self.cli_configs
@@ -801,7 +802,10 @@ mod tests {
         let mut dialog = NewAgentDialog::new(None);
         dialog.task_type = NewTaskType::Terminal;
 
-        assert_eq!(dialog.selected_accent_color(), crate::tui::ui::ACCENT);
+        assert_eq!(
+            dialog.selected_accent_color(&Theme::classic()),
+            Theme::classic().header_color
+        );
     }
 
     #[test]

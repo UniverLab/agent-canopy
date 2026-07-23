@@ -4,30 +4,38 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use super::{centered_rect, draw_dialog_left_wave, ACCENT, DIM};
+use super::{centered_rect, draw_dialog_left_wave};
 use crate::tui::app::types::App;
+use crate::tui::ui::theme::Theme;
 
-pub fn draw_quit_confirm(frame: &mut Frame) {
-    draw_modal_confirm(frame, " Quit? ", "Press y/Enter to quit, any key to cancel");
+pub fn draw_quit_confirm(frame: &mut Frame, theme: &Theme) {
+    draw_modal_confirm(
+        frame,
+        " Quit? ",
+        "Press y/Enter to quit, any key to cancel",
+        theme,
+    );
 }
 
-pub fn draw_delete_project_confirm(frame: &mut Frame) {
+pub fn draw_delete_project_confirm(frame: &mut Frame, theme: &Theme) {
     draw_modal_confirm(
         frame,
         " Delete Project? ",
         "Are you sure you want to delete this project?\nY/Enter = Confirm  N/Esc = Cancel",
+        theme,
     );
 }
 
-pub fn draw_delete_loop_confirm(frame: &mut Frame) {
+pub fn draw_delete_loop_confirm(frame: &mut Frame, theme: &Theme) {
     draw_modal_confirm(
         frame,
         " Delete Loop? ",
         "Are you sure you want to delete this loop?\nY/Enter = Confirm  N/Esc = Cancel",
+        theme,
     );
 }
 
-fn draw_modal_confirm(frame: &mut Frame, title: &str, text: &str) {
+fn draw_modal_confirm(frame: &mut Frame, title: &str, text: &str, theme: &Theme) {
     let dialog_width = frame.area().width * 40 / 100;
     let inner_width = dialog_width.saturating_sub(2).max(1);
     let chars_per_line = inner_width as usize;
@@ -43,13 +51,13 @@ fn draw_modal_confirm(frame: &mut Frame, title: &str, text: &str) {
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(Style::default().fg(theme.header_color))
         .style(Style::default().bg(Color::Rgb(15, 25, 15)));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let msg = Paragraph::new(text)
-        .style(Style::default().fg(ACCENT))
+        .style(Style::default().fg(theme.header_color))
         .alignment(ratatui::layout::Alignment::Center)
         .wrap(ratatui::widgets::Wrap { trim: true });
     frame.render_widget(msg, inner);
@@ -91,14 +99,14 @@ fn mission_unlock_text(
     )
 }
 
-pub fn draw_legend(frame: &mut Frame, app: &mut App) {
+pub fn draw_legend(frame: &mut Frame, app: &mut App, theme: &Theme) {
     use crate::domain::gamification::{MissionCategory, MISSIONS};
 
-    let label_style = Style::default().fg(DIM);
+    let label_style = Style::default().fg(theme.dim_text);
     let value_style = Style::default()
         .fg(Color::White)
         .add_modifier(Modifier::BOLD);
-    let accent_style = Style::default().fg(ACCENT);
+    let accent_style = Style::default().fg(theme.header_color);
 
     let session_uptime = format_uptime_precise(app.process_start_time.elapsed().as_secs());
     let canopy_uptime = format_uptime_precise(app.accumulated_uptime_secs());
@@ -138,7 +146,7 @@ pub fn draw_legend(frame: &mut Frame, app: &mut App) {
     let block = Block::default()
         .title(" Canopy Missions ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(Style::default().fg(theme.header_color))
         .style(Style::default().bg(Color::Rgb(12, 20, 12)));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -240,7 +248,7 @@ pub fn draw_legend(frame: &mut Frame, app: &mut App) {
                 Style::default().fg(Color::Rgb(200, 200, 200))
             };
             mission_lines.push(Line::from(vec![
-                Span::styled(marker, Style::default().fg(ACCENT)),
+                Span::styled(marker, Style::default().fg(theme.header_color)),
                 Span::raw(" "),
                 Span::styled(
                     def.icon,

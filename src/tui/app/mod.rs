@@ -2610,7 +2610,7 @@ impl App {
             rows,
             Some(&session.name),
             &existing_refs,
-            crate::tui::ui::ACCENT,
+            crate::tui::ui::theme::Theme::classic().header_color,
         ) {
             Ok(agent) => agent,
             Err(e) => {

@@ -34,9 +34,8 @@ pub use simple_modals::{
 pub use simple_prompt::draw_simple_prompt_dialog;
 
 // Common imports shared with submodules
+pub(crate) use super::ERROR_COLOR;
 pub(crate) use super::{centered_rect, truncate_str};
-pub(crate) use super::{ACCENT, BORDER_COLOR, DIM};
-pub(crate) use super::{BG_SELECTED, ERROR_COLOR, INTERACTIVE_COLOR};
 
 fn gradient_wave_color(index: usize, shift: usize) -> Color {
     let gradient = crate::shared::banner::BANNER_GRADIENT;

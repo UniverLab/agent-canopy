@@ -3,21 +3,22 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use super::{centered_rect, draw_dialog_left_wave, truncate_str, ACCENT, BG_SELECTED, DIM};
+use super::{centered_rect, draw_dialog_left_wave, truncate_str};
 use crate::tui::app::types::App;
 use crate::tui::context_transfer::ContextTransferStep;
+use crate::tui::ui::theme::Theme;
 
-pub fn draw_context_transfer_modal(frame: &mut Frame, app: &App) {
+pub fn draw_context_transfer_modal(frame: &mut Frame, app: &App, theme: &Theme) {
     let Some(modal) = &app.context_transfer_modal else {
         return;
     };
 
     match modal.step {
-        ContextTransferStep::Preview => draw_ctx_preview(frame, app),
-        ContextTransferStep::AgentPicker => draw_ctx_picker(frame, app),
+        ContextTransferStep::Preview => draw_ctx_preview(frame, app, theme),
+        ContextTransferStep::AgentPicker => draw_ctx_picker(frame, app, theme),
     }
 }
-fn draw_ctx_preview(frame: &mut Frame, app: &App) {
+fn draw_ctx_preview(frame: &mut Frame, app: &App, theme: &Theme) {
     let Some(modal) = &app.context_transfer_modal else {
         return;
     };
@@ -32,12 +33,12 @@ fn draw_ctx_preview(frame: &mut Frame, app: &App) {
         app.terminal_agents
             .get(modal.source_agent_idx)
             .map(|a| (a.name.as_str(), a.accent_color))
-            .unwrap_or(("?", ACCENT))
+            .unwrap_or(("?", theme.header_color))
     } else {
         app.interactive_agents
             .get(modal.source_agent_idx)
             .map(|a| (a.name.as_str(), a.accent_color))
-            .unwrap_or(("?", ACCENT))
+            .unwrap_or(("?", theme.header_color))
     };
 
     let src_type = if modal.source_is_terminal {
@@ -63,20 +64,26 @@ fn draw_ctx_preview(frame: &mut Frame, app: &App) {
     let mut lines = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled(format!("  From {src_type}: "), Style::default().fg(DIM)),
+            Span::styled(
+                format!("  From {src_type}: "),
+                Style::default().fg(theme.dim_text),
+            ),
             Span::styled(format!(" ◀ {} ▶ ", modal.n_units), active_style),
             Span::styled(
                 format!("  ({})", modal.unit_label()),
-                Style::default().fg(DIM),
+                Style::default().fg(theme.dim_text),
             ),
         ]),
         Line::from(""),
         Line::from(Span::styled(
             format!("  Capture: {}", modal.unit_help()),
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         )),
         Line::from(""),
-        Line::from(Span::styled("  Preview:", Style::default().fg(DIM))),
+        Line::from(Span::styled(
+            "  Preview:",
+            Style::default().fg(theme.dim_text),
+        )),
     ];
 
     for line in preview_lines.iter().take(8) {
@@ -88,19 +95,19 @@ fn draw_ctx_preview(frame: &mut Frame, app: &App) {
     if preview_lines.len() > 8 {
         lines.push(Line::from(Span::styled(
             format!("  … {} more lines", preview_lines.len() - 8),
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         )));
     }
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  ←→: adjust range · Enter: pick destination · Esc: cancel",
-        Style::default().fg(DIM),
+        Style::default().fg(theme.dim_text),
     )));
 
     frame.render_widget(Paragraph::new(lines), inner);
 }
-fn draw_ctx_picker(frame: &mut Frame, app: &App) {
+fn draw_ctx_picker(frame: &mut Frame, app: &App, theme: &Theme) {
     let Some(modal) = &app.context_transfer_modal else {
         return;
     };
@@ -121,7 +128,7 @@ fn draw_ctx_picker(frame: &mut Frame, app: &App) {
         .interactive_agents
         .get(modal.source_agent_idx)
         .map(|a| a.accent_color)
-        .unwrap_or(ACCENT);
+        .unwrap_or(theme.header_color);
 
     let block = Block::default()
         .title(" Select Destination Agent ")
@@ -143,7 +150,7 @@ fn draw_ctx_picker(frame: &mut Frame, app: &App) {
     if agents.is_empty() {
         lines.push(Line::from(Span::styled(
             "  No interactive agents running.",
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         )));
     } else {
         for (i, agent) in agents.iter().enumerate() {
@@ -153,19 +160,23 @@ fn draw_ctx_picker(frame: &mut Frame, app: &App) {
             let is_sel = i == modal.picker_selected;
             let is_src = i == modal.source_agent_idx;
 
-            let bar_color = if is_src { DIM } else { agent.accent_color };
+            let bar_color = if is_src {
+                theme.dim_text
+            } else {
+                agent.accent_color
+            };
             let accent = agent.accent_color;
             // Subtle selection (matches the sidebar): dark-gray background with
             // the agent name in its accent color, instead of a full accent fill.
             let id_color = if is_sel {
                 accent
             } else if is_src {
-                DIM
+                theme.dim_text
             } else {
                 Color::White
             };
             let bg = if is_sel {
-                BG_SELECTED
+                theme.selected_bg
             } else {
                 Color::Rgb(15, 25, 15)
             };
@@ -192,7 +203,7 @@ fn draw_ctx_picker(frame: &mut Frame, app: &App) {
                 Span::styled("    ", Style::default().bg(bg)),
                 Span::styled(
                     format!("pty · {}", agent.cli.as_str()),
-                    Style::default().fg(DIM).bg(bg),
+                    Style::default().fg(theme.dim_text).bg(bg),
                 ),
                 row_fill(bg),
             ]));
@@ -209,7 +220,7 @@ fn draw_ctx_picker(frame: &mut Frame, app: &App) {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  ↑↓ navigate · Enter transfer · Esc back",
-        Style::default().fg(DIM),
+        Style::default().fg(theme.dim_text),
     )));
 
     frame.render_widget(Paragraph::new(lines), inner);

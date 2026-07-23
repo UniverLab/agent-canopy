@@ -5,9 +5,6 @@ use ratatui::Frame;
 
 use crate::tui::app::dialog::SimplePromptDialog;
 
-#[allow(unused_imports)]
-use super::{BG_SELECTED, ERROR_COLOR, INTERACTIVE_COLOR};
-
 // Old function removed - using simple prompt dialog instead
 pub(crate) fn draw_at_picker_dropdown(
     frame: &mut Frame,

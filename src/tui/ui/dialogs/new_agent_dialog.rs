@@ -4,11 +4,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use super::{centered_rect, draw_dialog_left_wave, truncate_str, DIM};
+use super::{centered_rect, draw_dialog_left_wave, truncate_str};
 use crate::tui::app::{
     dialog::new_agent::{BackgroundTrigger, NewAgentDialog, NewTaskMode, NewTaskType, SeedOption},
     types::App,
 };
+use crate::tui::ui::theme::Theme;
 
 const TYPE_FIELD: usize = 0;
 const INTERACTIVE_MODE_FIELD: usize = 1;
@@ -84,12 +85,12 @@ impl PickerWindow {
     }
 }
 
-pub fn draw_new_agent_dialog(frame: &mut Frame, app: &App) {
+pub fn draw_new_agent_dialog(frame: &mut Frame, app: &App, theme: &Theme) {
     let Some(dialog) = &app.new_agent_dialog else {
         return;
     };
 
-    let accent = dialog.selected_accent_color();
+    let accent = dialog.selected_accent_color(theme);
     let filtered_clis = dialog.filtered_cli_indices();
     let area = centered_rect(65, dialog_height(dialog, &filtered_clis), frame.area());
     frame.render_widget(Clear, area);
@@ -106,7 +107,7 @@ pub fn draw_new_agent_dialog(frame: &mut Frame, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let lines = build_dialog_lines(dialog, accent, &filtered_clis, field_width);
+    let lines = build_dialog_lines(dialog, accent, &filtered_clis, field_width, theme);
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -229,9 +230,10 @@ fn build_dialog_lines(
     accent: Color,
     filtered_clis: &[usize],
     field_width: usize,
+    theme: &Theme,
 ) -> Vec<Line<'static>> {
     let layout = FieldLayout::for_task(dialog.task_type);
-    let mut lines = dialog_header_lines(dialog, accent);
+    let mut lines = dialog_header_lines(dialog, accent, theme);
 
     match dialog.task_type {
         NewTaskType::Interactive => {
@@ -242,10 +244,11 @@ fn build_dialog_lines(
                 filtered_clis,
                 layout,
                 field_width,
+                theme,
             );
         }
         NewTaskType::Terminal => {
-            append_terminal_sections(&mut lines, dialog, accent, field_width);
+            append_terminal_sections(&mut lines, dialog, accent, field_width, theme);
         }
         NewTaskType::Background => {
             append_background_sections(
@@ -255,25 +258,34 @@ fn build_dialog_lines(
                 filtered_clis,
                 layout,
                 field_width,
+                theme,
             );
         }
     }
 
     lines.push(Line::from(Span::styled(
         help_text(dialog),
-        Style::default().fg(DIM),
+        Style::default().fg(theme.dim_text),
     )));
     lines
 }
 
-fn dialog_header_lines(dialog: &NewAgentDialog, accent: Color) -> Vec<Line<'static>> {
-    let mut type_row = vec![Span::styled("  Type:  ", Style::default().fg(DIM))];
+fn dialog_header_lines(
+    dialog: &NewAgentDialog,
+    accent: Color,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let mut type_row = vec![Span::styled(
+        "  Type:  ",
+        Style::default().fg(theme.dim_text),
+    )];
     type_row.extend(selector_spans(
         task_type_label(dialog.task_type),
         TYPE_FIELD,
         dialog.is_edit_mode(),
         accent,
         dialog.field,
+        theme,
     ));
     vec![Line::from(""), Line::from(type_row), Line::from("")]
 }
@@ -284,6 +296,7 @@ fn selector_spans(
     locked: bool,
     accent: Color,
     current_field: usize,
+    theme: &Theme,
 ) -> Vec<Span<'static>> {
     if locked {
         return vec![Span::styled(
@@ -298,7 +311,7 @@ fn selector_spans(
     let arrow_style = if current_field == field {
         Style::default().fg(accent)
     } else {
-        Style::default().fg(DIM)
+        Style::default().fg(theme.dim_text)
     };
     vec![
         Span::styled(" ‹ ", arrow_style),
@@ -329,28 +342,34 @@ fn picker_item_style(accent: Color, selected: bool) -> Style {
     Style::default().fg(Color::White)
 }
 
-fn picker_detail_style(selected: bool, selected_style: Style) -> Style {
+fn picker_detail_style(selected: bool, selected_style: Style, theme: &Theme) -> Style {
     if selected {
         selected_style
     } else {
-        Style::default().fg(DIM)
+        Style::default().fg(theme.dim_text)
     }
 }
 
-fn filter_row(prefix: &str, filter: &str, focused: bool, accent: Color) -> Line<'static> {
+fn filter_row(
+    prefix: &str,
+    filter: &str,
+    focused: bool,
+    accent: Color,
+    theme: &Theme,
+) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             prefix.to_string(),
             if focused {
                 Style::default().fg(accent)
             } else {
-                Style::default().fg(DIM)
+                Style::default().fg(theme.dim_text)
             },
         ),
         Span::styled(
             filter_display(filter),
             if filter.is_empty() {
-                Style::default().fg(DIM)
+                Style::default().fg(theme.dim_text)
             } else {
                 Style::default().fg(Color::White)
             },
@@ -373,6 +392,7 @@ fn push_spaced_row(lines: &mut Vec<Line<'static>>, row: Line<'static>) {
 
 // ── Section builders ─────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn append_interactive_sections(
     lines: &mut Vec<Line<'static>>,
     dialog: &NewAgentDialog,
@@ -380,16 +400,17 @@ fn append_interactive_sections(
     filtered_clis: &[usize],
     layout: FieldLayout,
     _field_width: usize,
+    theme: &Theme,
 ) {
     if !dialog.is_edit_mode() {
-        push_spaced_row(lines, interactive_mode_row(dialog, accent));
+        push_spaced_row(lines, interactive_mode_row(dialog, accent, theme));
     }
 
-    append_cli_section(lines, dialog, accent, filtered_clis, layout.cli);
-    append_session_picker_rows(lines, dialog);
-    append_identity_section(lines, dialog, accent, layout.identity);
-    append_yolo_section(lines, dialog, accent, layout.yolo);
-    append_directory_section(lines, dialog, accent, layout.dir, false, layout.dir);
+    append_cli_section(lines, dialog, accent, filtered_clis, layout.cli, theme);
+    append_session_picker_rows(lines, dialog, theme);
+    append_identity_section(lines, dialog, accent, layout.identity, theme);
+    append_yolo_section(lines, dialog, accent, layout.yolo, theme);
+    append_directory_section(lines, dialog, accent, layout.dir, false, layout.dir, theme);
 }
 
 fn append_terminal_sections(
@@ -397,6 +418,7 @@ fn append_terminal_sections(
     dialog: &NewAgentDialog,
     accent: Color,
     _field_width: usize,
+    theme: &Theme,
 ) {
     append_directory_section(
         lines,
@@ -405,10 +427,12 @@ fn append_terminal_sections(
         TERMINAL_DIR_FIELD,
         false,
         TERMINAL_DIR_FIELD,
+        theme,
     );
-    push_spaced_row(lines, terminal_shell_row(dialog, accent));
+    push_spaced_row(lines, terminal_shell_row(dialog, accent, theme));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_background_sections(
     lines: &mut Vec<Line<'static>>,
     dialog: &NewAgentDialog,
@@ -416,25 +440,38 @@ fn append_background_sections(
     filtered_clis: &[usize],
     layout: FieldLayout,
     field_width: usize,
+    theme: &Theme,
 ) {
-    append_trigger_section(lines, dialog, accent);
-    append_cli_section(lines, dialog, accent, filtered_clis, layout.cli);
-    append_model_section(lines, dialog, accent, layout.model);
-    append_prompt_section(lines, dialog, accent, layout, field_width);
+    append_trigger_section(lines, dialog, accent, theme);
+    append_cli_section(lines, dialog, accent, filtered_clis, layout.cli, theme);
+    append_model_section(lines, dialog, accent, layout.model, theme);
+    append_prompt_section(lines, dialog, accent, layout, field_width, theme);
 
     let hide_dir = dialog.background_trigger == BackgroundTrigger::Watch;
     let browser_field = if hide_dir { layout.extra } else { layout.dir };
-    append_directory_section(lines, dialog, accent, layout.dir, hide_dir, browser_field);
+    append_directory_section(
+        lines,
+        dialog,
+        accent,
+        layout.dir,
+        hide_dir,
+        browser_field,
+        theme,
+    );
 }
 
-fn interactive_mode_row(dialog: &NewAgentDialog, accent: Color) -> Line<'static> {
-    let mut spans = vec![Span::styled("  Session:  ", Style::default().fg(DIM))];
+fn interactive_mode_row(dialog: &NewAgentDialog, accent: Color, theme: &Theme) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        "  Session:  ",
+        Style::default().fg(theme.dim_text),
+    )];
     spans.extend(selector_spans(
         interactive_mode_label(dialog.task_mode),
         INTERACTIVE_MODE_FIELD,
         false,
         accent,
         dialog.field,
+        theme,
     ));
 
     if dialog.resume_unconfigured() && !dialog.has_session_picker() {
@@ -454,14 +491,23 @@ fn interactive_mode_row(dialog: &NewAgentDialog, accent: Color) -> Line<'static>
     Line::from(spans)
 }
 
-fn append_trigger_section(lines: &mut Vec<Line<'static>>, dialog: &NewAgentDialog, accent: Color) {
-    let mut trigger_row = vec![Span::styled("  Trigger:", Style::default().fg(DIM))];
+fn append_trigger_section(
+    lines: &mut Vec<Line<'static>>,
+    dialog: &NewAgentDialog,
+    accent: Color,
+    theme: &Theme,
+) {
+    let mut trigger_row = vec![Span::styled(
+        "  Trigger:",
+        Style::default().fg(theme.dim_text),
+    )];
     trigger_row.extend(selector_spans(
         background_trigger_label(dialog.background_trigger),
         BACKGROUND_TRIGGER_FIELD,
         dialog.is_edit_mode(),
         accent,
         dialog.field,
+        theme,
     ));
     push_spaced_row(lines, Line::from(trigger_row));
 }
@@ -472,26 +518,32 @@ fn append_cli_section(
     accent: Color,
     filtered_clis: &[usize],
     cli_field: usize,
+    theme: &Theme,
 ) {
     lines.push(Line::from(vec![
-        Span::styled("  Harness: ", Style::default().fg(DIM)),
+        Span::styled("  Harness: ", Style::default().fg(theme.dim_text)),
         Span::styled(
             format!(" {} ", dialog.selected_cli()),
             focus_style(dialog.field, cli_field, accent),
         ),
-        Span::styled("  (◂▸ cycle · type/Space pick)", Style::default().fg(DIM)),
+        Span::styled(
+            "  (◂▸ cycle · type/Space pick)",
+            Style::default().fg(theme.dim_text),
+        ),
     ]));
 
-    append_cli_picker_rows(lines, dialog, accent, filtered_clis, cli_field);
+    append_cli_picker_rows(lines, dialog, accent, filtered_clis, cli_field, theme);
     lines.push(Line::from(""));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_cli_picker_rows(
     lines: &mut Vec<Line<'static>>,
     dialog: &NewAgentDialog,
     accent: Color,
     filtered_clis: &[usize],
     cli_field: usize,
+    theme: &Theme,
 ) {
     if !dialog.cli_picker_open {
         return;
@@ -506,12 +558,13 @@ fn append_cli_picker_rows(
         &dialog.cli_picker_filter,
         dialog.field == cli_field,
         accent,
+        theme,
     ));
 
     if filtered_clis.is_empty() {
         lines.push(Line::from(Span::styled(
             "    (no matches)",
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         )));
     } else {
         for (i, cli_idx) in filtered_clis
@@ -539,7 +592,10 @@ fn append_cli_picker_rows(
     } else {
         format!("    {total_matches}/{total} harnesses  type to filter  Enter/Esc close")
     };
-    lines.push(Line::from(Span::styled(footer, Style::default().fg(DIM))));
+    lines.push(Line::from(Span::styled(
+        footer,
+        Style::default().fg(theme.dim_text),
+    )));
 }
 
 fn append_model_section(
@@ -547,16 +603,17 @@ fn append_model_section(
     dialog: &NewAgentDialog,
     accent: Color,
     model_field: usize,
+    theme: &Theme,
 ) {
     lines.push(Line::from(vec![
-        Span::styled("  Model: ", Style::default().fg(DIM)),
+        Span::styled("  Model: ", Style::default().fg(theme.dim_text)),
         Span::styled(
             model_value(dialog),
             focus_style(dialog.field, model_field, accent),
         ),
     ]));
 
-    append_model_picker_rows(lines, dialog, accent, model_field);
+    append_model_picker_rows(lines, dialog, accent, model_field, theme);
     lines.push(Line::from(""));
 }
 
@@ -573,6 +630,7 @@ fn append_model_picker_rows(
     dialog: &NewAgentDialog,
     accent: Color,
     model_field: usize,
+    theme: &Theme,
 ) {
     if dialog.field != model_field || !dialog.model_picker_open {
         return;
@@ -601,7 +659,7 @@ fn append_model_picker_rows(
             Span::styled(truncate_str(&entry.id, 38), style),
             Span::styled(
                 format!(" [{}]", entry.provider),
-                picker_detail_style(is_selected, style),
+                picker_detail_style(is_selected, style, theme),
             ),
         ]));
     }
@@ -609,12 +667,16 @@ fn append_model_picker_rows(
     if total > MODEL_PICKER_VISIBLE {
         lines.push(Line::from(Span::styled(
             format!("    … {total} models  ↑↓ scroll  Enter accept  Esc close"),
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         )));
     }
 }
 
-fn append_session_picker_rows(lines: &mut Vec<Line<'static>>, dialog: &NewAgentDialog) {
+fn append_session_picker_rows(
+    lines: &mut Vec<Line<'static>>,
+    dialog: &NewAgentDialog,
+    theme: &Theme,
+) {
     if !dialog.session_picker_open {
         return;
     }
@@ -625,7 +687,7 @@ fn append_session_picker_rows(lines: &mut Vec<Line<'static>>, dialog: &NewAgentD
     if total == 0 {
         lines.push(Line::from(Span::styled(
             "    (no sessions found)",
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         )));
         return;
     }
@@ -647,7 +709,7 @@ fn append_session_picker_rows(lines: &mut Vec<Line<'static>>, dialog: &NewAgentD
             Span::styled(truncate_str(id, 18), style),
             Span::styled(
                 format!("  {}", truncate_str(label, 36)),
-                picker_detail_style(is_selected, style),
+                picker_detail_style(is_selected, style, theme),
             ),
         ]));
     }
@@ -655,7 +717,7 @@ fn append_session_picker_rows(lines: &mut Vec<Line<'static>>, dialog: &NewAgentD
     if total > SESSION_PICKER_VISIBLE {
         lines.push(Line::from(Span::styled(
             format!("    … {total} sessions  ↑↓ scroll  Enter accept  Esc close"),
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         )));
     }
 }
@@ -666,23 +728,28 @@ fn append_prompt_section(
     accent: Color,
     layout: FieldLayout,
     field_width: usize,
+    theme: &Theme,
 ) {
     push_spaced_row(
         lines,
-        background_prompt_label(dialog, accent, layout.prompt),
+        background_prompt_label(dialog, accent, layout.prompt, theme),
     );
-    append_prompt_input_block(lines, dialog, accent, layout.prompt, field_width);
-    push_spaced_row(lines, background_target_row(dialog, accent, layout.extra));
+    append_prompt_input_block(lines, dialog, accent, layout.prompt, field_width, theme);
+    push_spaced_row(
+        lines,
+        background_target_row(dialog, accent, layout.extra, theme),
+    );
 }
 
 fn background_prompt_label(
     dialog: &NewAgentDialog,
     accent: Color,
     prompt_field: usize,
+    theme: &Theme,
 ) -> Line<'static> {
     let focus = focus_style(dialog.field, prompt_field, accent);
     Line::from(vec![
-        Span::styled("  Prompt: ", Style::default().fg(DIM)),
+        Span::styled("  Prompt: ", Style::default().fg(theme.dim_text)),
         Span::styled(
             format!(" {} rows ", PROMPT_VISIBLE_ROWS),
             focus.add_modifier(Modifier::DIM),
@@ -694,12 +761,14 @@ fn background_prompt_label(
 /// lines starting from `dialog.prompt_scroll`, drawing a block cursor at
 /// `dialog.prompt_cursor`. Mirrors the math in `prompt_visual_line_count` so
 /// scrolling, the input handler, and the render stay in lockstep.
+#[allow(clippy::too_many_arguments)]
 fn append_prompt_input_block(
     lines: &mut Vec<Line<'static>>,
     dialog: &NewAgentDialog,
     accent: Color,
     prompt_field: usize,
     field_width: usize,
+    theme: &Theme,
 ) {
     let field_width = field_width.max(1);
     let indent = "  ";
@@ -711,17 +780,18 @@ fn append_prompt_input_block(
             .bg(accent)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(DIM)
+        Style::default().fg(theme.dim_text)
     };
     let base_style = if is_focused {
         Style::default().fg(Color::White)
     } else {
-        Style::default().fg(DIM)
+        Style::default().fg(theme.dim_text)
     };
 
     for row in 0..PROMPT_VISIBLE_ROWS {
         let line_index = dialog.prompt_scroll + row;
-        let mut spans: Vec<Span<'static>> = vec![Span::styled(indent, Style::default().fg(DIM))];
+        let mut spans: Vec<Span<'static>> =
+            vec![Span::styled(indent, Style::default().fg(theme.dim_text))];
         if dialog.prompt.is_empty() {
             // Empty prompt: show placeholder only on the first row, otherwise
             // leave a blank cell so the cursor still has a visible home.
@@ -731,7 +801,9 @@ fn append_prompt_input_block(
                 } else {
                     spans.push(Span::styled(
                         placeholder.chars().take(field_width).collect::<String>(),
-                        Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
+                        Style::default()
+                            .fg(theme.dim_text)
+                            .add_modifier(Modifier::ITALIC),
                     ));
                 }
             } else if is_focused {
@@ -862,17 +934,18 @@ fn background_target_row(
     dialog: &NewAgentDialog,
     accent: Color,
     extra_field: usize,
+    theme: &Theme,
 ) -> Line<'static> {
     match dialog.background_trigger {
         BackgroundTrigger::Cron => Line::from(vec![
-            Span::styled("  Cron:  ", Style::default().fg(DIM)),
+            Span::styled("  Cron:  ", Style::default().fg(theme.dim_text)),
             Span::styled(
                 cron_value(dialog),
                 focus_style(dialog.field, extra_field, accent),
             ),
         ]),
         BackgroundTrigger::Watch => Line::from(vec![
-            Span::styled("  Path:  ", Style::default().fg(DIM)),
+            Span::styled("  Path:  ", Style::default().fg(theme.dim_text)),
             Span::styled(
                 truncate_str(&dialog.watch_path, 50),
                 focus_style(dialog.field, extra_field, accent),
@@ -894,16 +967,21 @@ fn append_identity_section(
     dialog: &NewAgentDialog,
     accent: Color,
     identity_field: usize,
+    theme: &Theme,
 ) {
     let label = identity_label(dialog);
     let locked = dialog.seed_options.len() <= 1;
-    let mut identity_row = vec![Span::styled("  Identity: ", Style::default().fg(DIM))];
+    let mut identity_row = vec![Span::styled(
+        "  Identity: ",
+        Style::default().fg(theme.dim_text),
+    )];
     identity_row.extend(selector_spans(
         &label,
         identity_field,
         locked,
         accent,
         dialog.field,
+        theme,
     ));
     push_spaced_row(lines, Line::from(identity_row));
 }
@@ -921,6 +999,7 @@ fn append_yolo_section(
     dialog: &NewAgentDialog,
     accent: Color,
     yolo_field: usize,
+    theme: &Theme,
 ) {
     let has_yolo = dialog.selected_yolo_flag().is_some();
     let checkbox = if dialog.yolo_mode { "◉" } else { "○" };
@@ -935,13 +1014,13 @@ fn append_yolo_section(
     };
 
     let mut spans = vec![
-        Span::styled("  Yolo:  ", Style::default().fg(DIM)),
+        Span::styled("  Yolo:  ", Style::default().fg(theme.dim_text)),
         Span::styled(format!("{checkbox} Autonomous mode"), checkbox_style),
     ];
     if !has_yolo {
         spans.push(Span::styled(
             "  (not supported by this harness)",
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         ));
     } else if dialog.yolo_mode {
         spans.push(Span::styled(
@@ -953,6 +1032,7 @@ fn append_yolo_section(
     push_spaced_row(lines, Line::from(spans));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_directory_section(
     lines: &mut Vec<Line<'static>>,
     dialog: &NewAgentDialog,
@@ -960,9 +1040,10 @@ fn append_directory_section(
     dir_field: usize,
     hide_dir: bool,
     browser_field: usize,
+    theme: &Theme,
 ) {
     if !hide_dir {
-        push_spaced_row(lines, working_dir_row(dialog, accent, dir_field));
+        push_spaced_row(lines, working_dir_row(dialog, accent, dir_field, theme));
     }
     if dialog.dir_entries.is_empty() {
         return;
@@ -972,12 +1053,18 @@ fn append_directory_section(
         dialog,
         accent,
         dialog.field == browser_field,
+        theme,
     ));
 }
 
-fn working_dir_row(dialog: &NewAgentDialog, accent: Color, dir_field: usize) -> Line<'static> {
+fn working_dir_row(
+    dialog: &NewAgentDialog,
+    accent: Color,
+    dir_field: usize,
+    theme: &Theme,
+) -> Line<'static> {
     Line::from(vec![
-        Span::styled("  Dir:   ", Style::default().fg(DIM)),
+        Span::styled("  Dir:   ", Style::default().fg(theme.dim_text)),
         Span::styled(
             truncate_str(&dialog.working_dir, 50),
             focus_style(dialog.field, dir_field, accent),
@@ -985,7 +1072,7 @@ fn working_dir_row(dialog: &NewAgentDialog, accent: Color, dir_field: usize) -> 
     ])
 }
 
-fn terminal_shell_row(dialog: &NewAgentDialog, accent: Color) -> Line<'static> {
+fn terminal_shell_row(dialog: &NewAgentDialog, accent: Color, theme: &Theme) -> Line<'static> {
     let shell_display = if dialog.available_shells.len() > 1 {
         format!("◂ {} ▸", dialog.selected_shell())
     } else {
@@ -993,7 +1080,7 @@ fn terminal_shell_row(dialog: &NewAgentDialog, accent: Color) -> Line<'static> {
     };
 
     Line::from(vec![
-        Span::styled("  Shell: ", Style::default().fg(DIM)),
+        Span::styled("  Shell: ", Style::default().fg(theme.dim_text)),
         Span::styled(
             format!(" {} ", shell_display),
             focus_style(dialog.field, TERMINAL_SHELL_FIELD, accent),
@@ -1003,15 +1090,26 @@ fn terminal_shell_row(dialog: &NewAgentDialog, accent: Color) -> Line<'static> {
 
 // ── Navigation / picker rendering ────────────────────────────────────────────
 
-fn dir_browser_lines(dialog: &NewAgentDialog, accent: Color, focused: bool) -> Vec<Line<'static>> {
+fn dir_browser_lines(
+    dialog: &NewAgentDialog,
+    accent: Color,
+    focused: bool,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     let filtered = dialog.filtered_dir_entries();
     let window = PickerWindow::new(dialog.dir_selected, filtered.len(), DIR_BROWSER_VISIBLE);
-    let mut lines = vec![filter_row("  🔍 ", &dialog.dir_filter, focused, accent)];
+    let mut lines = vec![filter_row(
+        "  🔍 ",
+        &dialog.dir_filter,
+        focused,
+        accent,
+        theme,
+    )];
 
     if filtered.is_empty() {
         lines.push(Line::from(Span::styled(
             "    (no matches)",
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         )));
     } else {
         for (i, entry) in filtered
@@ -1036,7 +1134,10 @@ fn dir_browser_lines(dialog: &NewAgentDialog, accent: Color, focused: bool) -> V
             filtered.len()
         )
     };
-    lines.push(Line::from(Span::styled(footer, Style::default().fg(DIM))));
+    lines.push(Line::from(Span::styled(
+        footer,
+        Style::default().fg(theme.dim_text),
+    )));
     lines.push(Line::from(""));
     lines
 }
@@ -1138,6 +1239,7 @@ mod tests {
                 false,
                 Color::Cyan,
                 current,
+                &Theme::classic(),
             ));
             assert!(text.contains('‹') && text.contains('›'), "got {text:?}");
             assert!(!text.contains('◀') && !text.contains('▶'), "got {text:?}");
@@ -1153,6 +1255,7 @@ mod tests {
             true,
             Color::Cyan,
             TYPE_FIELD,
+            &Theme::classic(),
         ));
         assert!(!text.contains('‹') && !text.contains('›'));
         assert!(!text.contains('◀') && !text.contains('▶'));

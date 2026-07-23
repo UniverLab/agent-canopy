@@ -4,10 +4,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use super::{centered_rect, ACCENT, DIM};
+use super::centered_rect;
 use crate::tui::app::types::App;
+use crate::tui::ui::theme::Theme;
 
-pub fn draw_loop_editor_dialog(frame: &mut Frame, app: &App) {
+pub fn draw_loop_editor_dialog(frame: &mut Frame, app: &App, theme: &Theme) {
     let Some(dialog) = &app.loop_editor_dialog else {
         return;
     };
@@ -17,7 +18,11 @@ pub fn draw_loop_editor_dialog(frame: &mut Frame, app: &App) {
     let area = centered_rect(70, height, frame.area());
     frame.render_widget(Clear, area);
 
-    let border_color = if has_error { Color::Red } else { ACCENT };
+    let border_color = if has_error {
+        Color::Red
+    } else {
+        theme.header_color
+    };
 
     let block = Block::default()
         .title(dialog.title.as_str())
@@ -29,10 +34,13 @@ pub fn draw_loop_editor_dialog(frame: &mut Frame, app: &App) {
 
     let header = vec![
         Line::from(vec![
-            Span::styled("Node: ", Style::default().fg(DIM)),
+            Span::styled("Node: ", Style::default().fg(theme.dim_text)),
             Span::styled(dialog.node_name.as_str(), Style::default().fg(Color::White)),
         ]),
-        Line::from(Span::styled(dialog.help.as_str(), Style::default().fg(DIM))),
+        Line::from(Span::styled(
+            dialog.help.as_str(),
+            Style::default().fg(theme.dim_text),
+        )),
     ];
     frame.render_widget(
         Paragraph::new(header),
