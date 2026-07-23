@@ -6,7 +6,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use super::{ACCENT, ERROR_COLOR};
+use super::theme::Theme;
+use super::ERROR_COLOR;
 use crate::shared::banner::BANNER_GRADIENT;
 use crate::tui::app::types::App;
 use crate::tui::whimsg::TITLE;
@@ -50,7 +51,7 @@ fn push_animated_gradient_text(spans: &mut Vec<Span>, visible: &str, millis: u12
     }
 }
 
-pub(super) fn draw_header(frame: &mut Frame, area: Rect, app: &mut App) {
+pub(super) fn draw_header(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -59,7 +60,7 @@ pub(super) fn draw_header(frame: &mut Frame, area: Rect, app: &mut App) {
     let (status_char, status_color) = if app.daemon_running {
         // Smooth spinner in green, no blink
         let frame_idx = ((millis / 125) % 8) as usize;
-        (SPINNER[frame_idx], ACCENT)
+        (SPINNER[frame_idx], theme.header_color)
     } else {
         // Blinking █ in red when stopped
         let blink_on = (millis / 500).is_multiple_of(2);

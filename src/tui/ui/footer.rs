@@ -6,10 +6,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use super::DIM;
+use super::theme::Theme;
 use crate::tui::app::types::{AgentEntry, App, Focus, ProjectTab, SidebarLayer};
 
-pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
+pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let activity_available = app.activity_panel_available();
     let hints = match app.focus {
         Focus::Home => {
@@ -84,7 +84,7 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         }
         Focus::Agent => {
             if app.playground_active {
-                return draw_footer_playground(frame, area, app, activity_available);
+                return draw_footer_playground(frame, area, app, activity_available, theme);
             }
 
             let is_pty = matches!(
@@ -188,7 +188,7 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(*desc, Style::default().fg(DIM)));
+        spans.push(Span::styled(*desc, Style::default().fg(theme.dim_text)));
     }
 
     // Show split session names when in split view
@@ -235,14 +235,16 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             right_spans.push(Span::styled(
                 sl.as_str(),
                 Style::default()
-                    .fg(super::ACCENT)
+                    .fg(theme.header_color)
                     .add_modifier(Modifier::BOLD),
             ));
         }
         if !version.is_empty() {
             right_spans.push(Span::styled(
                 &version,
-                Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.dim_text)
+                    .add_modifier(Modifier::BOLD),
             ));
         }
         let right_p = Paragraph::new(Line::from(right_spans));
@@ -250,7 +252,13 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn draw_footer_playground(frame: &mut Frame, area: Rect, app: &App, activity_available: bool) {
+fn draw_footer_playground(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    activity_available: bool,
+    theme: &Theme,
+) {
     let mut hints = vec![
         ("type", "search"),
         ("↑↓", "results"),
@@ -277,7 +285,7 @@ fn draw_footer_playground(frame: &mut Frame, area: Rect, app: &App, activity_ava
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(*desc, Style::default().fg(DIM)));
+        spans.push(Span::styled(*desc, Style::default().fg(theme.dim_text)));
     }
 
     let version = if app.daemon_version.is_empty() {
@@ -295,7 +303,9 @@ fn draw_footer_playground(frame: &mut Frame, area: Rect, app: &App, activity_ava
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 version,
-                Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.dim_text)
+                    .add_modifier(Modifier::BOLD),
             ))),
             right_area,
         );

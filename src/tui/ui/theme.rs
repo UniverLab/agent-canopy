@@ -1,12 +1,11 @@
-//! Centralized color palette for the TUI. Not yet consumed by renderers
-//! (see T2-T4) — this is the first step of the theme system, moving the
-//! hardcoded constants from `ui/mod.rs` into a single struct so later
-//! steps can swap palettes without touching every call site.
+//! Centralized color palette for the TUI. header.rs, footer.rs, and
+//! sidebar.rs consume it as of T2; panel/dashboard/dialog surfaces (T3-T4)
+//! still read the free-standing constants in `ui/mod.rs` directly.
 
 use ratatui::style::Color;
 
-/// Kept until T2-T4 wire the renderers to read from a `Theme` instead of
-/// the free-standing color constants in `ui/mod.rs`.
+/// `panel_bg`, `sidebar_bg`, and `show_borders` stay unread until T3-T5 wire
+/// the remaining renderers and the borderless modern theme.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {

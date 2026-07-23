@@ -8,6 +8,8 @@ mod sidebar;
 mod system_dashboard;
 mod theme;
 
+use theme::Theme;
+
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::Frame;
@@ -46,6 +48,7 @@ pub(crate) const SIDEBAR_WIDTH: u16 = 33;
 // ── Main draw entry point ───────────────────────────────────────
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    let theme = Theme::classic();
     let full = frame.area();
     frame.render_widget(
         ratatui::widgets::Paragraph::new("").style(Style::default().bg(Color::Rgb(18, 18, 18))),
@@ -62,11 +65,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let body_area = if app.sidebar_visible {
         let [sidebar, content] =
             Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)]).areas(body);
-        header::draw_header(frame, header_area, app);
-        sidebar::draw_sidebar(frame, sidebar, app);
+        header::draw_header(frame, header_area, app, &theme);
+        sidebar::draw_sidebar(frame, sidebar, app, &theme);
         content
     } else {
-        header::draw_header(frame, header_area, app);
+        header::draw_header(frame, header_area, app, &theme);
         body
     };
 
@@ -119,7 +122,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         panel::draw_log_panel(frame, panel_area, app);
     }
 
-    footer::draw_footer(frame, footer_area, app);
+    footer::draw_footer(frame, footer_area, app, &theme);
 
     if app.new_agent_dialog.is_some() {
         dialogs::draw_new_agent_dialog(frame, app);

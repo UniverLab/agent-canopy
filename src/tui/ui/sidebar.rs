@@ -7,10 +7,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use super::{
-    last_two_segments, truncate_str, ACCENT, BG_HOVER, BG_SELECTED, BORDER_COLOR, DIM,
-    INTERACTIVE_COLOR,
-};
+use super::theme::Theme;
+use super::{last_two_segments, truncate_str, BG_HOVER, INTERACTIVE_COLOR};
 use super::{STATUS_DISABLED, STATUS_FAIL, STATUS_OK, STATUS_RUNNING};
 use crate::domain::loops::{Loop, LoopStatus};
 use crate::tui::agent::AgentStatus;
@@ -19,7 +17,7 @@ use crate::tui::app::types::{
 };
 use ratatui::style::Color;
 
-pub(super) fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App) {
+pub(super) fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     app.sidebar_click_map.clear();
     app.automation_loop_click_map.clear();
     app.project_click_map.clear();
@@ -36,19 +34,23 @@ pub(super) fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App) {
             frame,
             rag_area,
             rag_info_title(app),
-            Style::default().fg(if is_rag_focused(app) { ACCENT } else { DIM }),
-            rag_border_style(app),
-            |frame, inner| draw_rag_info(frame, inner, app),
+            Style::default().fg(if is_rag_focused(app) {
+                theme.header_color
+            } else {
+                theme.dim_text
+            }),
+            rag_border_style(app, theme),
+            |frame, inner| draw_rag_info(frame, inner, app, theme),
         );
     }
 
-    let brain_area = draw_sidebar_layers(frame, content_below, app);
-    render_brain_or_graph(frame, brain_area, app);
+    let brain_area = draw_sidebar_layers(frame, content_below, app, theme);
+    render_brain_or_graph(frame, brain_area, app, theme);
 
     render_dashboard_if_present(frame, areas.dashboard, app);
 
     if let Some(dialog) = app.project_relation_dialog.as_ref() {
-        draw_project_relation_dialog(frame, areas.content, app, dialog);
+        draw_project_relation_dialog(frame, areas.content, app, dialog, theme);
     }
 }
 
@@ -200,7 +202,7 @@ fn render_dashboard_if_present(frame: &mut Frame, area: Option<Rect>, app: &App)
 
 /// Leftover space below the three layers: the project relation graph when
 /// there's something to show, else Brian's Brain.
-fn render_brain_or_graph(frame: &mut Frame, area: Rect, app: &App) {
+fn render_brain_or_graph(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     if area.height == 0 {
         return;
     }
@@ -209,8 +211,8 @@ fn render_brain_or_graph(frame: &mut Frame, area: Rect, app: &App) {
             frame,
             area,
             " project graph ",
-            Style::default().fg(DIM),
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
+            Style::default().fg(theme.dim_text),
             |frame, inner| draw_project_graph(frame, inner, app),
         );
         return;
@@ -259,20 +261,34 @@ fn layer_focused(app: &App, layer: SidebarLayer) -> bool {
 
 /// Draws a layer's 1-row collapsible header (`▾ Live (3)`), registers it in
 /// `layer_header_click_map`, and returns the row it occupies.
-fn draw_layer_header(frame: &mut Frame, area: Rect, app: &mut App, layer: SidebarLayer) {
+fn draw_layer_header(
+    frame: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    layer: SidebarLayer,
+    theme: &Theme,
+) {
     if area.height == 0 {
         return;
     }
     let collapsed = layer_collapsed(app, layer);
     let arrow = if collapsed { "▸" } else { "▾" };
     let focused = layer_focused(app, layer);
-    let fg = if focused { ACCENT } else { Color::White };
+    let fg = if focused {
+        theme.header_color
+    } else {
+        Color::White
+    };
     let text = format!(
         " {arrow} {} ({}) ",
         layer_label(layer),
         layer_count(app, layer)
     );
-    let bg = if focused { BG_SELECTED } else { Color::Reset };
+    let bg = if focused {
+        theme.selected_bg
+    } else {
+        Color::Reset
+    };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             text,
@@ -410,7 +426,7 @@ fn knowledge_body_demand(app: &App) -> u16 {
 
 /// Lays out and draws the three sidebar layers top-to-bottom, returning the
 /// leftover area (for the project graph / Brian's Brain).
-fn draw_sidebar_layers(frame: &mut Frame, area: Rect, app: &mut App) -> Rect {
+fn draw_sidebar_layers(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) -> Rect {
     let (background_indices, interactive_indices, terminal_indices) = agent_indices_by_kind(app);
 
     let header_budget = 3.min(area.height);
@@ -437,24 +453,31 @@ fn draw_sidebar_layers(frame: &mut Frame, area: Rect, app: &mut App) -> Rect {
     let mut remaining = area;
 
     if let Some(header) = take_top(&mut remaining, 1) {
-        draw_layer_header(frame, header, app, SidebarLayer::Live);
+        draw_layer_header(frame, header, app, SidebarLayer::Live, theme);
     }
     if let Some(body) = take_top(&mut remaining, alloc[0]) {
-        draw_live_body(frame, body, app, &interactive_indices, &terminal_indices);
+        draw_live_body(
+            frame,
+            body,
+            app,
+            &interactive_indices,
+            &terminal_indices,
+            theme,
+        );
     }
 
     if let Some(header) = take_top(&mut remaining, 1) {
-        draw_layer_header(frame, header, app, SidebarLayer::Automation);
+        draw_layer_header(frame, header, app, SidebarLayer::Automation, theme);
     }
     if let Some(body) = take_top(&mut remaining, alloc[1]) {
-        draw_automation_body(frame, body, app, &background_indices);
+        draw_automation_body(frame, body, app, &background_indices, theme);
     }
 
     if let Some(header) = take_top(&mut remaining, 1) {
-        draw_layer_header(frame, header, app, SidebarLayer::Knowledge);
+        draw_layer_header(frame, header, app, SidebarLayer::Knowledge, theme);
     }
     if let Some(body) = take_top(&mut remaining, alloc[2]) {
-        draw_knowledge_body(frame, body, app);
+        draw_knowledge_body(frame, body, app, theme);
     }
 
     remaining
@@ -466,6 +489,7 @@ fn draw_live_body(
     app: &mut App,
     interactive_indices: &[usize],
     terminal_indices: &[usize],
+    theme: &Theme,
 ) {
     let demands = [
         card_list_demand(interactive_indices.len()),
@@ -476,7 +500,7 @@ fn draw_live_body(
     let mut remaining = area;
 
     if let Some(sub) = take_top(&mut remaining, alloc[0]) {
-        let border_style = agent_section_border_style(app, AgentSectionFocus::Interactive);
+        let border_style = agent_section_border_style(app, AgentSectionFocus::Interactive, theme);
         render_agent_list_panel(
             frame,
             Some(sub),
@@ -485,10 +509,11 @@ fn draw_live_body(
             app,
             INTERACTIVE_COLOR,
             border_style,
+            theme,
         );
     }
     if let Some(sub) = take_top(&mut remaining, alloc[1]) {
-        let border_style = agent_section_border_style(app, AgentSectionFocus::Terminal);
+        let border_style = agent_section_border_style(app, AgentSectionFocus::Terminal, theme);
         render_agent_list_panel(
             frame,
             Some(sub),
@@ -497,10 +522,11 @@ fn draw_live_body(
             app,
             Color::Green,
             border_style,
+            theme,
         );
     }
     if let Some(sub) = take_top(&mut remaining, alloc[2]) {
-        render_groups_panel(frame, Some(sub), app, AgentSectionFocus::Groups);
+        render_groups_panel(frame, Some(sub), app, AgentSectionFocus::Groups, theme);
     }
 }
 
@@ -509,6 +535,7 @@ fn draw_automation_body(
     area: Rect,
     app: &mut App,
     background_indices: &[usize],
+    theme: &Theme,
 ) {
     let loop_count = app.active_loops().len();
     let demands = [
@@ -519,15 +546,16 @@ fn draw_automation_body(
     let mut remaining = area;
 
     if let Some(sub) = take_top(&mut remaining, alloc[0]) {
-        let border_style = automation_agents_border_style(app);
+        let border_style = automation_agents_border_style(app, theme);
         render_agent_list_panel(
             frame,
             Some(sub),
             " agents ",
             background_indices,
             app,
-            ACCENT,
+            theme.header_color,
             border_style,
+            theme,
         );
     }
     if let Some(sub) = take_top(&mut remaining, alloc[1]) {
@@ -535,21 +563,21 @@ fn draw_automation_body(
             frame,
             sub,
             " loops ",
-            Style::default().fg(DIM),
-            automation_border_style(app, AutomationKind::Loop),
-            |frame, inner| draw_automation_loops_list(frame, inner, app),
+            Style::default().fg(theme.dim_text),
+            automation_border_style(app, AutomationKind::Loop, theme),
+            |frame, inner| draw_automation_loops_list(frame, inner, app, theme),
         );
     }
 }
 
-fn draw_knowledge_body(frame: &mut Frame, area: Rect, app: &mut App) {
+fn draw_knowledge_body(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     render_titled_panel(
         frame,
         area,
         " projects ",
-        Style::default().fg(DIM),
-        knowledge_border_style(app),
-        |frame, inner| draw_projects_list(frame, inner, app),
+        Style::default().fg(theme.dim_text),
+        knowledge_border_style(app, theme),
+        |frame, inner| draw_projects_list(frame, inner, app, theme),
     );
 }
 
@@ -569,25 +597,33 @@ fn rag_info_title(app: &App) -> &'static str {
     }
 }
 
-fn rag_border_style(app: &App) -> Style {
+fn rag_border_style(app: &App, theme: &Theme) -> Style {
     Style::default().fg(if is_rag_focused(app) {
-        ACCENT
+        theme.header_color
     } else {
-        BORDER_COLOR
+        theme.border_color
     })
 }
 
-fn knowledge_border_style(app: &App) -> Style {
+fn knowledge_border_style(app: &App, theme: &Theme) -> Style {
     let focused = layer_focused(app, SidebarLayer::Knowledge);
-    Style::default().fg(if focused { ACCENT } else { BORDER_COLOR })
+    Style::default().fg(if focused {
+        theme.header_color
+    } else {
+        theme.border_color
+    })
 }
 
-fn automation_border_style(app: &App, kind: AutomationKind) -> Style {
+fn automation_border_style(app: &App, kind: AutomationKind, theme: &Theme) -> Style {
     let focused = layer_focused(app, SidebarLayer::Automation) && app.automation_kind == kind;
-    Style::default().fg(if focused { ACCENT } else { BORDER_COLOR })
+    Style::default().fg(if focused {
+        theme.header_color
+    } else {
+        theme.border_color
+    })
 }
 
-fn agent_section_border_style(app: &App, section: AgentSectionFocus) -> Style {
+fn agent_section_border_style(app: &App, section: AgentSectionFocus, theme: &Theme) -> Style {
     let focused = if matches!(app.focus, Focus::Home | Focus::Preview) {
         layer_focused(app, SidebarLayer::Live) && app.agent_section_focus == section
     } else if app.focus == Focus::Agent {
@@ -603,16 +639,21 @@ fn agent_section_border_style(app: &App, section: AgentSectionFocus) -> Style {
         false
     };
 
-    Style::default().fg(if focused { ACCENT } else { BORDER_COLOR })
+    Style::default().fg(if focused {
+        theme.header_color
+    } else {
+        theme.border_color
+    })
 }
 
 /// Border style for the Automation layer's `agents` sub-panel — distinct
 /// from `agent_section_border_style` (Live's Interactive/Terminal/Groups)
 /// since Automation tracks its active sub-list via `automation_kind`.
-fn automation_agents_border_style(app: &App) -> Style {
-    automation_border_style(app, AutomationKind::Agent)
+fn automation_agents_border_style(app: &App, theme: &Theme) -> Style {
+    automation_border_style(app, AutomationKind::Agent, theme)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_agent_list_panel(
     frame: &mut Frame,
     area: Option<Rect>,
@@ -621,6 +662,7 @@ fn render_agent_list_panel(
     app: &mut App,
     accent: Color,
     border_style: Style,
+    theme: &Theme,
 ) {
     let Some(area) = area else {
         return;
@@ -629,9 +671,9 @@ fn render_agent_list_panel(
         frame,
         area,
         title,
-        Style::default().fg(DIM),
+        Style::default().fg(theme.dim_text),
         border_style,
-        |frame, inner| draw_agent_list(frame, inner, indices, app, accent),
+        |frame, inner| draw_agent_list(frame, inner, indices, app, accent, theme),
     );
 }
 
@@ -640,6 +682,7 @@ fn render_groups_panel(
     area: Option<Rect>,
     app: &mut App,
     section: AgentSectionFocus,
+    theme: &Theme,
 ) {
     let Some(area) = area else {
         return;
@@ -648,15 +691,15 @@ fn render_groups_panel(
         frame,
         area,
         " groups ",
-        Style::default().fg(DIM),
-        agent_section_border_style(app, section),
-        |frame, inner| draw_groups_list(frame, inner, app),
+        Style::default().fg(theme.dim_text),
+        agent_section_border_style(app, section, theme),
+        |frame, inner| draw_groups_list(frame, inner, app, theme),
     );
 }
 
 // ── Knowledge layer: projects list ──────────────────────────────────
 
-fn draw_projects_list(frame: &mut Frame, area: Rect, app: &mut App) {
+fn draw_projects_list(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     if app.projects.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -709,18 +752,20 @@ fn draw_projects_list(frame: &mut Frame, area: Rect, app: &mut App) {
             hash,
             path,
             panel_focused,
+            theme,
         );
         app.project_click_map.push((*idx, y, y + 3));
         y += row_h;
     }
 
-    draw_scroll_indicators(frame, area, scroll.has_up, scroll.has_down);
+    draw_scroll_indicators(frame, area, scroll.has_up, scroll.has_down, theme);
 }
 
 fn knowledge_border_style_is_focused(app: &App) -> bool {
     layer_focused(app, SidebarLayer::Knowledge)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_project_loop_card(
     frame: &mut Frame,
     area: Rect,
@@ -729,10 +774,15 @@ fn draw_project_loop_card(
     meta1: &str,
     meta2: &str,
     panel_focused: bool,
+    theme: &Theme,
 ) {
-    let bg = if selected { BG_SELECTED } else { Color::Reset };
-    let title_style = project_title_style(selected, panel_focused);
-    let meta_style = project_meta_style(selected);
+    let bg = if selected {
+        theme.selected_bg
+    } else {
+        Color::Reset
+    };
+    let title_style = project_title_style(selected, panel_focused, theme);
+    let meta_style = project_meta_style(selected, theme);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             truncate_str(title, area.width as usize),
@@ -764,12 +814,12 @@ fn draw_project_loop_card(
 /// Status icon shown on an active loop's card: running takes priority, then
 /// blocked (a paused loop whose latest run recorded a `loop_report_blocker`
 /// description), then plain paused, then draft.
-fn loop_status_icon(lp: &Loop, meta: LoopSidebarMeta) -> (&'static str, Color) {
+fn loop_status_icon(lp: &Loop, meta: LoopSidebarMeta, theme: &Theme) -> (&'static str, Color) {
     match lp.status {
         LoopStatus::Running => ("▶", STATUS_RUNNING),
         LoopStatus::Paused if meta.blocked => ("⛔", STATUS_FAIL),
         LoopStatus::Paused => ("⏸", Color::Yellow),
-        LoopStatus::Draft | LoopStatus::Completed | LoopStatus::Failed => ("·", DIM),
+        LoopStatus::Draft | LoopStatus::Completed | LoopStatus::Failed => ("·", theme.dim_text),
     }
 }
 
@@ -780,11 +830,16 @@ fn draw_active_loop_card(
     lp: &Loop,
     meta: LoopSidebarMeta,
     panel_focused: bool,
+    theme: &Theme,
 ) {
-    let bg = if selected { BG_SELECTED } else { Color::Reset };
-    let title_style = project_title_style(selected, panel_focused);
-    let meta_style = project_meta_style(selected);
-    let (icon, icon_color) = loop_status_icon(lp, meta);
+    let bg = if selected {
+        theme.selected_bg
+    } else {
+        Color::Reset
+    };
+    let title_style = project_title_style(selected, panel_focused, theme);
+    let meta_style = project_meta_style(selected, theme);
+    let (icon, icon_color) = loop_status_icon(lp, meta, theme);
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -818,7 +873,7 @@ fn draw_active_loop_card(
     );
 }
 
-fn draw_automation_loops_list(frame: &mut Frame, area: Rect, app: &mut App) {
+fn draw_automation_loops_list(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     let loops = app.active_loops();
     if loops.is_empty() {
         frame.render_widget(
@@ -866,35 +921,37 @@ fn draw_automation_loops_list(frame: &mut Frame, area: Rect, app: &mut App) {
         }
         let card_area = Rect::new(area.x, y, area.width, 3);
         let selected = app.selected_loop_id.as_deref() == Some(id.as_str());
-        draw_active_loop_card(frame, card_area, selected, lp, *meta, panel_focused);
+        draw_active_loop_card(frame, card_area, selected, lp, *meta, panel_focused, theme);
         app.automation_loop_click_map.push((id.clone(), y, y + 3));
         y += row_h;
     }
 
-    draw_scroll_indicators(frame, area, scroll.has_up, scroll.has_down);
+    draw_scroll_indicators(frame, area, scroll.has_up, scroll.has_down, theme);
 }
 
-fn project_title_style(selected: bool, panel_focused: bool) -> Style {
+fn project_title_style(selected: bool, panel_focused: bool, theme: &Theme) -> Style {
     if selected && panel_focused {
         return Style::default()
             .fg(Color::Black)
-            .bg(ACCENT)
+            .bg(theme.header_color)
             .add_modifier(Modifier::BOLD);
     }
     if selected {
         return Style::default()
             .fg(Color::White)
-            .bg(BG_SELECTED)
+            .bg(theme.selected_bg)
             .add_modifier(Modifier::BOLD);
     }
-    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    Style::default()
+        .fg(theme.header_color)
+        .add_modifier(Modifier::BOLD)
 }
 
-fn project_meta_style(selected: bool) -> Style {
+fn project_meta_style(selected: bool, theme: &Theme) -> Style {
     if selected {
-        Style::default().fg(Color::White).bg(BG_SELECTED)
+        Style::default().fg(Color::White).bg(theme.selected_bg)
     } else {
-        Style::default().fg(DIM)
+        Style::default().fg(theme.dim_text)
     }
 }
 
@@ -905,9 +962,8 @@ fn draw_rag_queue(
     area: Rect,
     items: &[crate::db::project::RagQueueItem],
     scroll_pos: usize,
+    theme: &Theme,
 ) {
-    use crate::tui::ui::ACCENT;
-
     let mut y = area.y;
     for (idx, item) in items.iter().enumerate() {
         if y >= area.y + area.height {
@@ -916,13 +972,13 @@ fn draw_rag_queue(
         let (icon, icon_color) = if item.status == "processing" {
             ("◉", Color::Yellow)
         } else {
-            ("·", ACCENT)
+            ("·", theme.header_color)
         };
         let is_cursor = idx == scroll_pos;
         let prefix = if is_cursor { "›" } else { " " };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(prefix, Style::default().fg(ACCENT)),
+                Span::styled(prefix, Style::default().fg(theme.header_color)),
                 Span::styled(icon, Style::default().fg(icon_color)),
                 Span::raw(" "),
                 Span::styled(
@@ -940,7 +996,7 @@ fn draw_rag_queue(
                         &last_two_segments(&item.source_path),
                         area.width.saturating_sub(3) as usize,
                     ),
-                    Style::default().fg(DIM),
+                    Style::default().fg(theme.dim_text),
                 ))),
                 Rect::new(area.x + 2, y, area.width.saturating_sub(2), 1),
             );
@@ -949,21 +1005,21 @@ fn draw_rag_queue(
     }
 }
 
-fn draw_rag_info(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_rag_info(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let mut lines = vec![
-        labeled_kv_line(" chunks: ", &app.rag_info.total_chunks.to_string()),
-        labeled_kv_line(" files:  ", &app.rag_info.indexed_files.to_string()),
+        labeled_kv_line(" chunks: ", &app.rag_info.total_chunks.to_string(), theme),
+        labeled_kv_line(" files:  ", &app.rag_info.indexed_files.to_string(), theme),
     ];
 
     let queue_text = rag_queue_text(app);
     if !queue_text.is_empty() {
-        lines.push(labeled_kv_line(" queue:  ", &queue_text));
+        lines.push(labeled_kv_line(" queue:  ", &queue_text, theme));
     }
 
-    lines.push(rag_status_line(app));
+    lines.push(rag_status_line(app, theme));
     lines.push(Line::from(Span::styled(
         " Enter → playground ",
-        Style::default().fg(ACCENT),
+        Style::default().fg(theme.header_color),
     )));
 
     frame.render_widget(Paragraph::new(lines), area);
@@ -980,13 +1036,14 @@ fn draw_rag_info(frame: &mut Frame, area: Rect, app: &App) {
             queue_area,
             &app.global_rag_queue,
             app.selected_rag_queue,
+            theme,
         );
     }
 }
 
-fn labeled_kv_line(label: &'static str, value: &str) -> Line<'static> {
+fn labeled_kv_line(label: &'static str, value: &str, theme: &Theme) -> Line<'static> {
     Line::from(vec![
-        Span::styled(label, Style::default().fg(DIM)),
+        Span::styled(label, Style::default().fg(theme.dim_text)),
         Span::styled(
             value.to_string(),
             Style::default()
@@ -996,7 +1053,7 @@ fn labeled_kv_line(label: &'static str, value: &str) -> Line<'static> {
     ])
 }
 
-fn rag_status_line(app: &App) -> Line<'static> {
+fn rag_status_line(app: &App, theme: &Theme) -> Line<'static> {
     use crate::rag::status::{compute_rag_model_status, RagModelStatus};
 
     match compute_rag_model_status(
@@ -1012,10 +1069,14 @@ fn rag_status_line(app: &App) -> Line<'static> {
             " ◉ indexing ",
             Style::default().fg(Color::Yellow),
         )),
-        RagModelStatus::Ready => Line::from(Span::styled(" ● ready ", Style::default().fg(ACCENT))),
-        RagModelStatus::Sleeping => {
-            Line::from(Span::styled(" ○ sleeping ", Style::default().fg(DIM)))
-        }
+        RagModelStatus::Ready => Line::from(Span::styled(
+            " ● ready ",
+            Style::default().fg(theme.header_color),
+        )),
+        RagModelStatus::Sleeping => Line::from(Span::styled(
+            " ○ sleeping ",
+            Style::default().fg(theme.dim_text),
+        )),
     }
 }
 
@@ -1029,7 +1090,14 @@ fn rag_queue_text(app: &App) -> String {
 
 // ── Live/Automation agent cards (shared card renderer) ──────────────
 
-fn draw_agent_list(frame: &mut Frame, area: Rect, indices: &[usize], app: &mut App, accent: Color) {
+fn draw_agent_list(
+    frame: &mut Frame,
+    area: Rect,
+    indices: &[usize],
+    app: &mut App,
+    accent: Color,
+    theme: &Theme,
+) {
     let card_h = 3u16;
     let row_h = 4u16;
 
@@ -1065,6 +1133,7 @@ fn draw_agent_list(frame: &mut Frame, area: Rect, indices: &[usize], app: &mut A
             selected,
             hovered,
             accent,
+            theme,
         );
         app.sidebar_click_map.push((idx, y, y + card_h));
 
@@ -1072,19 +1141,25 @@ fn draw_agent_list(frame: &mut Frame, area: Rect, indices: &[usize], app: &mut A
         y += if is_last_visible { card_h } else { row_h };
     }
 
-    draw_scroll_indicators(frame, area, scroll.has_up, scroll.has_down);
+    draw_scroll_indicators(frame, area, scroll.has_up, scroll.has_down, theme);
 }
 
-fn draw_scroll_indicators(frame: &mut Frame, area: Rect, has_up: bool, has_down: bool) {
+fn draw_scroll_indicators(
+    frame: &mut Frame,
+    area: Rect,
+    has_up: bool,
+    has_down: bool,
+    theme: &Theme,
+) {
     if has_up {
         frame.render_widget(
-            Paragraph::new("▲").style(Style::default().fg(DIM)),
+            Paragraph::new("▲").style(Style::default().fg(theme.dim_text)),
             Rect::new(area.x + area.width.saturating_sub(2), area.y, 1, 1),
         );
     }
     if has_down {
         frame.render_widget(
-            Paragraph::new("▼").style(Style::default().fg(DIM)),
+            Paragraph::new("▼").style(Style::default().fg(theme.dim_text)),
             Rect::new(
                 area.x + area.width.saturating_sub(2),
                 (area.y + area.height).saturating_sub(1),
@@ -1104,6 +1179,7 @@ struct AgentCardMeta<'a> {
     work_dir: Option<&'a str>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_sidebar_card(
     frame: &mut Frame,
     area: Rect,
@@ -1112,11 +1188,12 @@ fn draw_sidebar_card(
     selected: bool,
     hovered: bool,
     _accent: Color,
+    theme: &Theme,
 ) {
-    let meta = agent_card_meta(agent, app);
+    let meta = agent_card_meta(agent, app, theme);
     let status_color = effective_status_color(meta.status_color, agent, app, selected);
     let bg = if selected {
-        BG_SELECTED
+        theme.selected_bg
     } else if hovered {
         BG_HOVER
     } else {
@@ -1131,7 +1208,7 @@ fn draw_sidebar_card(
             .fg(if selected { meta.accent } else { Color::White }),
     )];
     if is_agent_in_group(name, app) {
-        name_spans.push(Span::styled(" [▣]", Style::default().fg(DIM)));
+        name_spans.push(Span::styled(" [▣]", Style::default().fg(theme.dim_text)));
     }
     render_sidebar_card_line(frame, area, 0, bg, status_color, name_spans);
 
@@ -1146,7 +1223,10 @@ fn draw_sidebar_card(
         1,
         bg,
         status_color,
-        vec![Span::styled(type_detail, Style::default().fg(DIM))],
+        vec![Span::styled(
+            type_detail,
+            Style::default().fg(theme.dim_text),
+        )],
     );
 
     let dir_text = meta
@@ -1160,14 +1240,14 @@ fn draw_sidebar_card(
         2,
         bg,
         status_color,
-        vec![Span::styled(dir_text, Style::default().fg(DIM))],
+        vec![Span::styled(dir_text, Style::default().fg(theme.dim_text))],
     );
 }
 
-fn agent_card_meta<'a>(agent: &'a AgentEntry, app: &'a App) -> AgentCardMeta<'a> {
+fn agent_card_meta<'a>(agent: &'a AgentEntry, app: &'a App, theme: &Theme) -> AgentCardMeta<'a> {
     match agent {
         AgentEntry::Agent(agent) => AgentCardMeta {
-            accent: ACCENT,
+            accent: theme.header_color,
             status_color: if !agent.enabled {
                 STATUS_DISABLED
             } else if app.active_runs.contains_key(&agent.id) {
@@ -1230,7 +1310,7 @@ fn agent_card_meta<'a>(agent: &'a AgentEntry, app: &'a App) -> AgentCardMeta<'a>
             }
         }
         AgentEntry::Group(_) => AgentCardMeta {
-            accent: ACCENT,
+            accent: theme.header_color,
             status_color: STATUS_OK,
             agent_type: "group",
             type_detail: "",
@@ -1378,15 +1458,15 @@ struct GroupRowStyle {
     active_tag: &'static str,
 }
 
-fn group_row_style(is_selected: bool, is_active: bool) -> GroupRowStyle {
+fn group_row_style(is_selected: bool, is_active: bool, theme: &Theme) -> GroupRowStyle {
     GroupRowStyle {
         bg: if is_selected {
-            BG_SELECTED
+            theme.selected_bg
         } else {
             Color::Reset
         },
         fg: if is_selected {
-            ACCENT
+            theme.header_color
         } else if is_active {
             Color::Green
         } else {
@@ -1397,12 +1477,16 @@ fn group_row_style(is_selected: bool, is_active: bool) -> GroupRowStyle {
         } else {
             Modifier::empty()
         },
-        prefix_color: if is_active { Color::Green } else { DIM },
+        prefix_color: if is_active {
+            Color::Green
+        } else {
+            theme.dim_text
+        },
         active_tag: if is_active { " ●" } else { "" },
     }
 }
 
-fn draw_groups_list(frame: &mut Frame, area: Rect, app: &mut App) {
+fn draw_groups_list(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     let group_agent_indices = group_agent_indices(app);
     let mut y = area.y;
 
@@ -1420,7 +1504,7 @@ fn draw_groups_list(frame: &mut Frame, area: Rect, app: &mut App) {
             .active_split_id
             .as_deref()
             .is_some_and(|id| id == group.id);
-        let style = group_row_style(is_selected, is_active);
+        let style = group_row_style(is_selected, is_active, theme);
         let label = format!("{} · {}", group.session_a, group.session_b);
         let text = format!(
             "{}{}",
@@ -1505,6 +1589,7 @@ fn draw_project_relation_dialog(
     _area: Rect,
     _app: &App,
     dialog: &crate::tui::app::types::ProjectRelationDialog,
+    theme: &Theme,
 ) {
     // Center the dialog in the screen area
     let dialog_w = 50u16.min(frame.area().width.saturating_sub(4));
@@ -1516,7 +1601,7 @@ fn draw_project_relation_dialog(
     let block = Block::default()
         .title(format!(" Link: {} ", dialog.from_name))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT));
+        .border_style(Style::default().fg(theme.header_color));
     frame.render_widget(block, area);
 
     let inner = Rect::new(
@@ -1534,7 +1619,9 @@ fn draw_project_relation_dialog(
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             rel_line,
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.header_color)
+                .add_modifier(Modifier::BOLD),
         ))),
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
@@ -1610,7 +1697,7 @@ fn draw_project_relation_dialog(
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             " Enter confirm  ·  ←→ relation  ·  Esc cancel  ·  type filter ",
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         ))),
         Rect::new(inner.x, footer_y, inner.width, 1),
     );
@@ -1681,7 +1768,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_sidebar(frame, area, &mut app);
+                draw_sidebar(frame, area, &mut app, &Theme::classic());
             })
             .unwrap();
 
@@ -1763,7 +1850,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_sidebar(frame, area, &mut app);
+                draw_sidebar(frame, area, &mut app, &Theme::classic());
             })
             .unwrap();
 
@@ -1818,7 +1905,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_sidebar(frame, area, &mut app);
+                draw_sidebar(frame, area, &mut app, &Theme::classic());
             })
             .unwrap();
 
