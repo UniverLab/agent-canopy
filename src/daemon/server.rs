@@ -49,6 +49,11 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
     let ingestion = Arc::new(IngestionManager::new(Arc::clone(&db), data_dir.clone()));
     let _ingestion_cancel = Arc::clone(&ingestion).start();
 
+    let dynamic_skills = Arc::new(crate::dynamic_skills::SkillStore::from_config(
+        &data_dir,
+        &canopy_config.skills,
+    ));
+
     tracing::info!(
         "canopy v{} starting on port {}",
         env!("CARGO_PKG_VERSION"),
@@ -104,6 +109,7 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
     let handler_sync_manager = Arc::clone(&sync_manager);
     let handler_loop_engine = Arc::clone(&loop_engine);
     let handler_ingestion = Arc::clone(&ingestion);
+    let handler_dynamic_skills = Arc::clone(&dynamic_skills);
 
     let ct = tokio_util::sync::CancellationToken::new();
 
@@ -118,6 +124,7 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
                 Arc::clone(&notification_service),
                 Arc::clone(&handler_sync_manager),
                 Arc::clone(&handler_ingestion),
+                Arc::clone(&handler_dynamic_skills),
                 port,
             ))
         },
@@ -240,6 +247,11 @@ pub(crate) async fn run_stdio_server() -> Result<()> {
     let ingestion = Arc::new(IngestionManager::new(Arc::clone(&db), data_dir.clone()));
     let _ingestion_cancel = Arc::clone(&ingestion).start();
 
+    let dynamic_skills = Arc::new(crate::dynamic_skills::SkillStore::from_config(
+        &data_dir,
+        &canopy_config.skills,
+    ));
+
     match db.reconcile_orphaned_loops() {
         Ok(count) if count > 0 => {
             tracing::warn!(
@@ -285,6 +297,7 @@ pub(crate) async fn run_stdio_server() -> Result<()> {
         Arc::clone(&notification_service),
         sync_manager,
         Arc::clone(&ingestion),
+        dynamic_skills,
         0,
     );
 

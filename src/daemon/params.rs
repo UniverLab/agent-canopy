@@ -887,6 +887,14 @@ pub struct IntelligenceLinkProjectsParams {
     pub weight: Option<f64>,
 }
 
+// ── Dynamic skill store tool parameter types ──────────────────────────
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SkillGetParams {
+    /// Skill directory name, as reported by `skill_list` (e.g. "code-review").
+    pub name: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

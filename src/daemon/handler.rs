@@ -1667,6 +1667,9 @@ pub struct TaskTriggerHandler {
     pub ingestion: Arc<crate::rag::ingestion::IngestionManager>,
     /// Rate limiters for rag_search (10 calls/min). Keyed by agent_id.
     pub rag_limiters: Arc<tokio::sync::Mutex<std::collections::HashMap<String, RateLimiter>>>,
+    /// Backing store for `skill_list`/`skill_get` (`~/.canopy/skills/`).
+    /// Git operations block, so callers run it via `spawn_blocking`.
+    pub dynamic_skills: Arc<crate::dynamic_skills::SkillStore>,
     pub start_time: std::time::Instant,
     pub port: u16,
     #[allow(dead_code)]
@@ -1761,6 +1764,7 @@ impl TaskTriggerHandler {
         notification_service: Arc<dyn NotificationService>,
         sync_manager: Arc<SyncManager>,
         ingestion: Arc<crate::rag::ingestion::IngestionManager>,
+        dynamic_skills: Arc<crate::dynamic_skills::SkillStore>,
         port: u16,
     ) -> Self {
         Self {
@@ -1773,6 +1777,7 @@ impl TaskTriggerHandler {
             sync_manager,
             ingestion,
             rag_limiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            dynamic_skills,
             start_time: std::time::Instant::now(),
             port,
             tool_router: Self::tool_router(),
@@ -2892,6 +2897,51 @@ impl TaskTriggerHandler {
             "Seed '{}' removed successfully.",
             params.seed_id
         ))]))
+    }
+
+    #[tool(
+        name = "skill_list",
+        description = "List skills available to this agent from the dynamic skill store — the \
+         union of skills already fetched into ~/.canopy/skills/ and the catalogs of every \
+         git source configured under [skills] in ~/.canopy/config.toml. Each entry reports \
+         name, one-line description, source URL, and whether it is already installed \
+         (fetched locally, served instantly) or merely available (fetch it on demand with \
+         skill_get, which clones it into the store transparently). Call this first to \
+         discover what's available before deciding which skill_get to call — this system \
+         works across every harness, not just one platform's local skills folder."
+    )]
+    async fn skill_list(&self) -> Result<CallToolResult, McpError> {
+        let store = Arc::clone(&self.dynamic_skills);
+        let entries = tokio::task::spawn_blocking(move || store.list())
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&entries).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        name = "skill_get",
+        description = "Fetch a skill's full instructions by name from the dynamic skill \
+         store. If the skill isn't in the local store yet, clones it on demand from its \
+         configured git source; if it is present but its TTL has expired, transparently \
+         checks the source for updates and refreshes the local copy first (network failures \
+         during that check are non-fatal — the last-known-good copy is served). Returns the \
+         SKILL.md/INSTRUCTIONS.md instructions plus any reference files (inlined when small, \
+         otherwise listed by store path). Call skill_list first to find valid skill names."
+    )]
+    async fn skill_get(
+        &self,
+        Parameters(params): Parameters<SkillGetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let store = Arc::clone(&self.dynamic_skills);
+        let content = tokio::task::spawn_blocking(move || store.get(&params.name))
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&content).unwrap_or_default(),
+        )]))
     }
 
     #[tool(
@@ -6606,6 +6656,11 @@ mod tests {
             Arc::clone(&db),
             dir.path().to_path_buf(),
         ));
+        let dynamic_skills = Arc::new(crate::dynamic_skills::SkillStore::new(
+            dir.path().join("skills"),
+            Vec::new(),
+            15,
+        ));
         let handler = TaskTriggerHandler::new(
             Arc::clone(&db),
             executor,
@@ -6615,6 +6670,7 @@ mod tests {
             notif,
             sync_manager,
             ingestion,
+            dynamic_skills,
             0,
         );
         (dir, db, handler)

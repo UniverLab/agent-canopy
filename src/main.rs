@@ -14,6 +14,7 @@ mod config;
 mod daemon;
 mod db;
 mod domain;
+mod dynamic_skills;
 mod executor;
 mod loop_engine;
 mod mcp_wizard_module;
