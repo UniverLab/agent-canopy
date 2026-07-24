@@ -539,3 +539,518 @@ fn init_tracing() {
         .with_writer(std::io::stderr)
         .init();
 }
+
+/// DIAGNOSTIC (temporary): reproduces the reported hang over the *real*
+/// transport a node actually uses — a Streamable HTTP POST that goes through
+/// `rmcp`'s `LocalSessionManager`/SSE machinery, not a direct in-process call
+/// into `TaskTriggerHandler` (which the `diag_concurrent_db_write_during_dispatch`
+/// test in `loop_engine.rs` already proved returns in milliseconds even mid-
+/// dispatch). Isolates whether the hang lives in the HTTP/session layer.
+#[cfg(test)]
+mod hang_repro {
+    use super::*;
+    use crate::application::notification_service::{
+        DefaultNotificationService, NotificationService,
+    };
+    use crate::daemon::TaskTriggerHandler;
+    use crate::domain::loops::{
+        Loop, LoopNode, LoopNodeKind, LoopSpec, LoopSpecStatus, LoopStatus,
+    };
+    use crate::executor::Executor;
+    use crate::loop_engine::LoopEngine;
+    use crate::rag::ingestion::IngestionManager;
+    use crate::sync_manager::SyncManager;
+    use crate::watchers::WatcherEngine;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Serializes tests in this module that touch `CANOPY_HOME_OVERRIDE`
+    /// (process-wide env var) against each other. Mirrors the `HomeGuard`
+    /// pattern in `loop_engine.rs`'s test module (a distinct static — this is
+    /// a diagnostic test run in isolation, not meant to coexist with the
+    /// wider suite's parallelism).
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn setup_sleeping_cli_home() -> tempfile::TempDir {
+        let fake_home = tempfile::tempdir().unwrap();
+        let canopy_dir = fake_home.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        let script = fake_home.path().join("sleep-cli.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nsleep \"${SLEEP_SECONDS:-4}\"\necho done\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config = crate::domain::canopy_config::CanopyConfig {
+            configured_at: Some(chrono::Utc::now().to_rfc3339()),
+            clis: vec![crate::domain::cli_config::CliConfig {
+                name: "sleep-cli".to_string(),
+                binary: script.to_string_lossy().to_string(),
+                headless_mode: "-c".to_string(),
+                model_flag: None,
+                supports_working_dir: false,
+                working_dir_flag: None,
+                env_vars: std::collections::HashMap::new(),
+                interactive_args: None,
+                fallback_interactive_args: None,
+                resume_args: None,
+                session_list_cmd: None,
+                session_resume_cmd: None,
+                accent_color: None,
+                yolo_flag: None,
+                prompt_via_stdin: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        config.save(&canopy_dir).unwrap();
+        fake_home
+    }
+
+    /// Spawn a bare-bones Streamable HTTP MCP server (same construction as
+    /// `run_http_server`, minus pid-file/daemon-lock/graceful-shutdown
+    /// machinery) bound to an OS-chosen port. Returns the bound port and the
+    /// pieces the test needs to drive a concurrent dispatch directly.
+    async fn spawn_test_server(db: Arc<Database>) -> (u16, Arc<LoopEngine>) {
+        let notif: Arc<dyn NotificationService> = Arc::new(DefaultNotificationService);
+        let executor = Arc::new(Executor::new(Arc::clone(&db), Arc::clone(&notif)));
+        let sync_manager = Arc::new(SyncManager::new(Arc::clone(&db)));
+        let loop_engine = Arc::new(LoopEngine::new(Arc::clone(&db), Arc::clone(&notif)));
+        let watcher_engine = Arc::new(WatcherEngine::new(
+            Arc::clone(&db),
+            Arc::clone(&executor),
+            Arc::clone(&loop_engine),
+        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let ingestion = Arc::new(IngestionManager::new(
+            Arc::clone(&db),
+            tmp.path().to_path_buf(),
+        ));
+        let dynamic_skills = Arc::new(crate::dynamic_skills::SkillStore::new(
+            tmp.path().join("skills"),
+            Vec::new(),
+            15,
+        ));
+        let cron_scheduler = Arc::new(crate::scheduler::cron_scheduler::CronScheduler::with_loops(
+            Arc::clone(&db),
+            Arc::clone(&executor),
+            Arc::clone(&loop_engine),
+        ));
+        let scheduler_notify = cron_scheduler.notifier();
+        let _scheduler_cancel = Arc::clone(&cron_scheduler).start();
+
+        let handler_db = Arc::clone(&db);
+        let handler_executor = Arc::clone(&executor);
+        let handler_watcher_engine = Arc::clone(&watcher_engine);
+        let handler_scheduler_notify = Arc::clone(&scheduler_notify);
+        let handler_sync_manager = Arc::clone(&sync_manager);
+        let handler_loop_engine = Arc::clone(&loop_engine);
+        let handler_notif = Arc::clone(&notif);
+        let handler_ingestion = Arc::clone(&ingestion);
+        let handler_dynamic_skills = Arc::clone(&dynamic_skills);
+
+        let service = rmcp::transport::streamable_http_server::StreamableHttpService::new(
+            move || {
+                Ok(TaskTriggerHandler::new(
+                    Arc::clone(&handler_db),
+                    Arc::clone(&handler_executor),
+                    Arc::clone(&handler_watcher_engine),
+                    Arc::clone(&handler_scheduler_notify),
+                    Arc::clone(&handler_loop_engine),
+                    Arc::clone(&handler_notif),
+                    Arc::clone(&handler_sync_manager),
+                    Arc::clone(&handler_ingestion),
+                    Arc::clone(&handler_dynamic_skills),
+                    0,
+                ))
+            },
+            rmcp::transport::streamable_http_server::session::local::LocalSessionManager::default()
+                .into(),
+            Default::default(),
+        );
+        let router = axum::Router::new().nest_service("/mcp", service);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        // give the listener a beat to start accepting
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (port, loop_engine)
+    }
+
+    struct McpClient {
+        client: reqwest::Client,
+        endpoint: String,
+        session_id: Option<String>,
+    }
+
+    impl McpClient {
+        fn new(port: u16) -> Self {
+            Self {
+                client: reqwest::Client::new(),
+                endpoint: format!("http://127.0.0.1:{port}/mcp"),
+                session_id: None,
+            }
+        }
+
+        /// POST one JSON-RPC message, return the concatenated `data:` payload(s)
+        /// of the SSE response body (mirrors `bridge.rs`'s `forward_request`).
+        async fn post(&mut self, body: serde_json::Value) -> anyhow::Result<String> {
+            let mut req = self
+                .client
+                .post(&self.endpoint)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(
+                    reqwest::header::ACCEPT,
+                    "application/json, text/event-stream",
+                )
+                .body(body.to_string());
+            if let Some(sid) = &self.session_id {
+                req = req.header("mcp-session-id", sid);
+            }
+            let resp = req.send().await?;
+            if let Some(sid) = resp.headers().get("mcp-session-id") {
+                self.session_id = Some(sid.to_str()?.to_string());
+            }
+            let text = resp.text().await?;
+            let mut out = String::new();
+            for line in text.lines() {
+                if let Some(data) = line.strip_prefix("data:") {
+                    out.push_str(data.trim());
+                }
+            }
+            Ok(out)
+        }
+
+        async fn initialize(&mut self) -> anyhow::Result<()> {
+            self.post(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "repro", "version": "0.1"}
+                }
+            }))
+            .await?;
+            // notifications/initialized — no id, server responds 202 Accepted.
+            self.post(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            }))
+            .await?;
+            Ok(())
+        }
+
+        async fn call_tool(
+            &mut self,
+            name: &str,
+            args: serde_json::Value,
+        ) -> anyhow::Result<String> {
+            self.post(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": args}
+            }))
+            .await
+        }
+    }
+
+    fn insert_loop_and_sleeping_node(db: &Database, workdir: &str) -> (String, String) {
+        let loop_id = "wf-hang-repro".to_string();
+        let spec_id = "spec-hang-repro".to_string();
+        db.insert_loop(&Loop {
+            id: loop_id.clone(),
+            name: "Repro Loop".to_string(),
+            description: None,
+            workdir: workdir.to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_pool_id: None,
+            on_completed: None,
+        })
+        .unwrap();
+        db.insert_loop_spec(&LoopSpec {
+            id: spec_id.clone(),
+            loop_id: Some(loop_id.clone()),
+            name: "Spec".to_string(),
+            description: Some("desc".to_string()),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-sleep".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "sleep".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({
+                "platform": "sleep-cli",
+                "timeout_minutes": 1,
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        (loop_id, spec_id)
+    }
+
+    /// Regression (a): while a node is mid-dispatch on loop L (agent process
+    /// running, loop status == `Running`), a *second*, independent MCP
+    /// session — standing in for that node's own bridge connection calling
+    /// back into the daemon — calls `loop_schedule_autorun` for the SAME
+    /// loop L over real Streamable HTTP, exactly as a resilience node
+    /// scheduling its own loop's resume does in production. The response
+    /// must arrive promptly (well under any node timeout) and the schedule
+    /// must be durably persisted.
+    ///
+    /// Also covers requirement 3 (fast-fail): `loop_run` and `loop_reset`
+    /// against the SAME loop, mid-dispatch, must reject immediately with an
+    /// explanatory error rather than blocking — proven here under a real
+    /// concurrent dispatch, not just against a synthetic `LoopStatus::Running`
+    /// value.
+    #[tokio::test]
+    // The HOME_LOCK guard is held for the entire test lifetime so concurrent
+    // runs of CANOPY_HOME_OVERRIDE-touching tests can't race on the env var.
+    // Holding a `std::sync::MutexGuard` across `.await` points is intentional
+    // here (the lock is process-wide and is *meant* to be serializing) — and
+    // clippy's await-holding-lock lint can't tell the difference between
+    // "unintentional deadlock risk" and "deliberate cross-async test
+    // serialization", so opt out at the test level.
+    #[allow(clippy::await_holding_lock)]
+    async fn node_initiated_autorun_call_during_own_dispatch_over_http() {
+        let _home_lock = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let fake_home = setup_sleeping_cli_home();
+        let prev_home = std::env::var("CANOPY_HOME_OVERRIDE").ok();
+        unsafe {
+            std::env::set_var("CANOPY_HOME_OVERRIDE", fake_home.path());
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
+        let (loop_id, _spec_id) = insert_loop_and_sleeping_node(&db, &dir.path().to_string_lossy());
+
+        let (port, loop_engine) = spawn_test_server(Arc::clone(&db)).await;
+
+        let dispatch_loop_id = loop_id.clone();
+        let dispatch =
+            tokio::spawn(async move { loop_engine.run_loop(dispatch_loop_id, None, None).await });
+
+        // Wait until the loop is actually Running (node process spawned).
+        for _ in 0..50 {
+            if db.get_loop(&loop_id).unwrap().unwrap().status == LoopStatus::Running {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            db.get_loop(&loop_id).unwrap().unwrap().status,
+            LoopStatus::Running,
+            "dispatch never reached Running before the repro call"
+        );
+
+        let mut client = McpClient::new(port);
+        client.initialize().await.unwrap();
+
+        let at_dt = chrono::Utc::now() + chrono::Duration::hours(1);
+        let at = at_dt.to_rfc3339();
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.call_tool(
+                "loop_schedule_autorun",
+                serde_json::json!({"loop_id": loop_id, "at": at}),
+            ),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        let schedule_response = result
+            .expect("node-initiated loop_schedule_autorun must respond promptly mid-dispatch")
+            .expect("loop_schedule_autorun call must succeed");
+        assert!(
+            schedule_response.contains("scheduled to autorun"),
+            "{schedule_response}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "response took {elapsed:?}, expected well under the node timeout"
+        );
+
+        let persisted = db.get_loop(&loop_id).unwrap().unwrap().autorun_at;
+        assert_eq!(
+            persisted.map(|v| v.timestamp()),
+            Some(at_dt.timestamp()),
+            "schedule must be durably persisted at the requested instant"
+        );
+
+        // Requirement 3: loop_run / loop_reset against the SAME loop, still
+        // mid-dispatch, must fail fast (not hang, not queue).
+        let run_result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.call_tool("loop_run", serde_json::json!({"loop_id": loop_id})),
+        )
+        .await
+        .expect("loop_run must respond promptly against a running loop")
+        .unwrap();
+        assert!(
+            run_result.contains("already running"),
+            "expected fast-fail error, got: {run_result}"
+        );
+
+        let reset_result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.call_tool("loop_reset", serde_json::json!({"loop_id": loop_id})),
+        )
+        .await
+        .expect("loop_reset must respond promptly against a running loop")
+        .unwrap();
+        assert!(
+            reset_result.contains("running") && reset_result.contains("loop_pause"),
+            "expected fast-fail error, got: {reset_result}"
+        );
+
+        dispatch.abort();
+        match prev_home {
+            Some(v) => unsafe { std::env::set_var("CANOPY_HOME_OVERRIDE", v) },
+            None => unsafe { std::env::remove_var("CANOPY_HOME_OVERRIDE") },
+        }
+        drop(fake_home);
+    }
+
+    /// Regression (b): a quota-shaped implementer failure — modeled here as
+    /// the raw CLI message the resilience node would observe — ends with
+    /// `autorun_at` set to the *correct* instant, computed deterministically
+    /// by the engine rather than by model arithmetic. Exercises the full
+    /// `quota_reset_message` path through the real `#[tool]` handler, over
+    /// the real HTTP transport.
+    #[tokio::test]
+    async fn quota_shaped_failure_schedules_correct_autorun_instant() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
+        let (loop_id, _spec_id) = insert_loop_and_sleeping_node(&db, &dir.path().to_string_lossy());
+        db.update_loop_status(&loop_id, LoopStatus::Failed, None, Some(chrono::Utc::now()))
+            .unwrap();
+
+        let (port, _loop_engine) = spawn_test_server(Arc::clone(&db)).await;
+        let mut client = McpClient::new(port);
+        client.initialize().await.unwrap();
+
+        let before = chrono::Utc::now();
+        let result = client
+            .call_tool(
+                "loop_schedule_autorun",
+                serde_json::json!({
+                    "loop_id": loop_id,
+                    "quota_reset_message":
+                        "You've hit your session limit · resets 1pm (America/Bogota)"
+                }),
+            )
+            .await
+            .unwrap();
+        let after = chrono::Utc::now();
+        assert!(result.contains("scheduled to autorun"), "{result}");
+
+        let persisted = db
+            .get_loop(&loop_id)
+            .unwrap()
+            .unwrap()
+            .autorun_at
+            .expect("autorun_at must be set");
+        // The handler computed `at` from its own `Utc::now()` sometime
+        // between `before` and `after`; recomputing against either bound
+        // must agree with what got persisted, proving it's the deterministic
+        // parser's output (not a model-guessed value).
+        let expected_lo = crate::domain::quota_reset::parse_quota_reset_instant(
+            "resets 1pm (America/Bogota)",
+            before,
+        )
+        .unwrap();
+        let expected_hi = crate::domain::quota_reset::parse_quota_reset_instant(
+            "resets 1pm (America/Bogota)",
+            after,
+        )
+        .unwrap();
+        assert_eq!(expected_lo.timestamp(), expected_hi.timestamp());
+        assert_eq!(persisted.timestamp(), expected_lo.timestamp());
+    }
+
+    /// Mutually exclusive params: passing both `at` and `quota_reset_message`
+    /// must be rejected up front, not silently prefer one.
+    #[tokio::test]
+    async fn at_and_quota_reset_message_are_mutually_exclusive() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
+        let (loop_id, _spec_id) = insert_loop_and_sleeping_node(&db, &dir.path().to_string_lossy());
+
+        let (port, _loop_engine) = spawn_test_server(Arc::clone(&db)).await;
+        let mut client = McpClient::new(port);
+        client.initialize().await.unwrap();
+
+        let result = client
+            .call_tool(
+                "loop_schedule_autorun",
+                serde_json::json!({
+                    "loop_id": loop_id,
+                    "at": chrono::Utc::now().to_rfc3339(),
+                    "quota_reset_message": "resets 1pm (America/Bogota)",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("not both"), "{result}");
+        assert!(
+            db.get_loop(&loop_id).unwrap().unwrap().autorun_at.is_none(),
+            "rejected call must not have scheduled anything"
+        );
+    }
+
+    /// Requirement 4: a retried `loop_schedule_autorun` (simulating a lost
+    /// ack whose write already committed) must not double-schedule — the
+    /// second call with the same loop id + target instant leaves exactly one
+    /// pending schedule, at that instant, not a queued second one.
+    #[tokio::test]
+    async fn retried_schedule_call_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
+        let (loop_id, _spec_id) = insert_loop_and_sleeping_node(&db, &dir.path().to_string_lossy());
+
+        let (port, _loop_engine) = spawn_test_server(Arc::clone(&db)).await;
+        let mut client = McpClient::new(port);
+        client.initialize().await.unwrap();
+
+        let at = chrono::Utc::now() + chrono::Duration::hours(1);
+        for _ in 0..2 {
+            let result = client
+                .call_tool(
+                    "loop_schedule_autorun",
+                    serde_json::json!({"loop_id": loop_id, "at": at.to_rfc3339()}),
+                )
+                .await
+                .unwrap();
+            assert!(result.contains("scheduled to autorun"), "{result}");
+        }
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.autorun_at.map(|v| v.timestamp()), Some(at.timestamp()));
+    }
+}

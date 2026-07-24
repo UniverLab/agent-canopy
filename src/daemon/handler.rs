@@ -4911,13 +4911,15 @@ impl TaskTriggerHandler {
     /// a human decision, made via `loop_reset` + `loop_run`.
     #[tool(
         name = "loop_schedule_autorun",
-        description = "Schedule a one-shot resume for a loop at a future ISO 8601 time, or cancel a pending one. When the scheduler reaches that time: a `failed` loop is auto-reset (same transition as loop_reset) and resumed — useful for a loop that failed on a quota to reschedule its own resumption at the exact reset time; a `completed` loop is left alone (the schedule is cleared but the loop is not re-run — use loop_reset + loop_run to re-run a finished loop); any other fireable status launches normally. If the loop's last run was against a pool, the resume targets that same pool (its pending members, in queue order) instead of the loop's own bound specs. The schedule always clears after firing (one-shot). Omit `at` (or pass null) to cancel any pending autorun instead of scheduling one — valid regardless of the loop's current status, and a no-op (not an error) if nothing was scheduled."
+        description = "Schedule a one-shot resume for a loop at a future ISO 8601 time, or cancel a pending one. When the scheduler reaches that time: a `failed` loop is auto-reset (same transition as loop_reset) and resumed — useful for a loop that failed on a quota to reschedule its own resumption at the exact reset time; a `completed` loop is left alone (the schedule is cleared but the loop is not re-run — use loop_reset + loop_run to re-run a finished loop); any other fireable status launches normally. If the loop's last run was against a pool, the resume targets that same pool (its pending members, in queue order) instead of the loop's own bound specs. The schedule always clears after firing (one-shot). Omit both `at` and `quota_reset_message` to cancel any pending autorun instead of scheduling one — valid regardless of the loop's current status, and a no-op (not an error) if nothing was scheduled. After a quota failure, prefer `quota_reset_message` (the raw CLI text, e.g. \"resets 1pm (America/Bogota)\") over computing `at` yourself — the engine parses the stated local time/timezone and converts it deterministically, avoiding scheduling errors from doing that arithmetic by hand."
     )]
     async fn loop_schedule_autorun(
         &self,
-        Parameters(LoopScheduleAutorunParams { loop_id, at }): Parameters<
-            LoopScheduleAutorunParams,
-        >,
+        Parameters(LoopScheduleAutorunParams {
+            loop_id,
+            at,
+            quota_reset_message,
+        }): Parameters<LoopScheduleAutorunParams>,
     ) -> Result<CallToolResult, McpError> {
         let Some(existing) = self
             .db
@@ -4929,6 +4931,33 @@ impl TaskTriggerHandler {
                 loop_id
             )));
         };
+
+        if at.is_some() && quota_reset_message.is_some() {
+            return Ok(error_result(
+                "Pass either `at` or `quota_reset_message`, not both.",
+            ));
+        }
+
+        // B — deterministic, engine-side conversion: a raw CLI quota message
+        // ("resets 1pm (America/Bogota)") is parsed and converted to UTC
+        // here, in code, rather than trusting the calling model's own
+        // local-time arithmetic (the source of a +2h scheduling error on
+        // 2026-07-24 — see `domain::quota_reset`).
+        if let Some(message) = quota_reset_message {
+            let at = match crate::domain::quota_reset::parse_quota_reset_instant(
+                &message,
+                chrono::Utc::now(),
+            ) {
+                Ok(at) => at,
+                Err(e) => {
+                    return Ok(error_result(&format!(
+                        "Could not compute a reset instant from '{}': {}",
+                        message, e
+                    )));
+                }
+            };
+            return self.commit_loop_autorun(&loop_id, at);
+        }
 
         let Some(at) = at else {
             let previously_scheduled = existing.autorun_at;
@@ -4955,8 +4984,21 @@ impl TaskTriggerHandler {
             }
         };
 
+        self.commit_loop_autorun(&loop_id, at)
+    }
+
+    /// Shared tail of `loop_schedule_autorun`'s two entry points (`at` and
+    /// `quota_reset_message`): persist the schedule (idempotent — a retry
+    /// with the same `loop_id`/`at` after a lost ack just re-overwrites the
+    /// same single-column schedule, never creating a second pending
+    /// schedule) and wake the scheduler.
+    fn commit_loop_autorun(
+        &self,
+        loop_id: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<CallToolResult, McpError> {
         self.db
-            .schedule_loop_autorun(&loop_id, at)
+            .schedule_loop_autorun(loop_id, at)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         self.scheduler_notify.notify_one();
@@ -7673,6 +7715,7 @@ mod tests {
             .loop_schedule_autorun(Parameters(LoopScheduleAutorunParams {
                 loop_id: loop_id.to_string(),
                 at: None,
+                quota_reset_message: None,
             }))
             .await
             .unwrap();
@@ -7709,6 +7752,7 @@ mod tests {
             .loop_schedule_autorun(Parameters(LoopScheduleAutorunParams {
                 loop_id: loop_id.to_string(),
                 at: None,
+                quota_reset_message: None,
             }))
             .await
             .unwrap();
@@ -7738,6 +7782,7 @@ mod tests {
             .loop_schedule_autorun(Parameters(LoopScheduleAutorunParams {
                 loop_id: loop_id.to_string(),
                 at: None,
+                quota_reset_message: None,
             }))
             .await
             .unwrap();

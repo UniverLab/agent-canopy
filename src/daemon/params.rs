@@ -807,8 +807,17 @@ pub struct LoopScheduleAutorunParams {
     /// ISO 8601 timestamp at which the loop should resume, e.g.
     /// "2026-07-10T09:00:00Z". Fires once, then the schedule is cleared.
     /// Omit (or pass null) to cancel any pending autorun schedule instead of
-    /// setting a new one.
+    /// setting a new one. Mutually exclusive with `quota_reset_message` —
+    /// prefer that field for a quota-limit CLI message instead of computing
+    /// the timestamp yourself.
     pub at: Option<String>,
+    /// Raw CLI quota-limit message, e.g. "You've hit your session limit ·
+    /// resets 1pm (America/Bogota)". When set, the engine parses the stated
+    /// local reset time and timezone itself and computes the UTC resume
+    /// instant deterministically (plus a small safety margin) instead of
+    /// requiring you to do that arithmetic — this is the preferred way to
+    /// reschedule after a quota failure. Mutually exclusive with `at`.
+    pub quota_reset_message: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

@@ -8289,6 +8289,152 @@ echo done
         fake_home
     }
 
+    /// Set up a temporary HOME with a canopy config containing a `sleep-cli`
+    /// entry that points at a fixed-behavior script (ignores its prompt
+    /// argument entirely — a real composed node prompt is multi-line prose,
+    /// not valid shell, so unlike `test-cli` (`/bin/sh -c "<prompt>"`) this
+    /// fixture can't just execute the prompt as a command). The script
+    /// sleeps `$SLEEP_SECONDS` (default 4) then exits 0.
+    fn setup_sleeping_cli_home() -> tempfile::TempDir {
+        let fake_home = tempfile::tempdir().unwrap();
+        let canopy_dir = fake_home.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        let script = fake_home.path().join("sleep-cli.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nsleep \"${SLEEP_SECONDS:-4}\"\necho done\nexit 0\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config = crate::domain::canopy_config::CanopyConfig {
+            configured_at: Some(chrono::Utc::now().to_rfc3339()),
+            clis: vec![crate::domain::cli_config::CliConfig {
+                name: "sleep-cli".to_string(),
+                binary: script.to_string_lossy().to_string(),
+                headless_mode: "-c".to_string(),
+                model_flag: None,
+                supports_working_dir: false,
+                working_dir_flag: None,
+                env_vars: std::collections::HashMap::new(),
+                interactive_args: None,
+                fallback_interactive_args: None,
+                resume_args: None,
+                session_list_cmd: None,
+                session_resume_cmd: None,
+                accent_color: None,
+                yolo_flag: None,
+                prompt_via_stdin: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        config.save(&canopy_dir).unwrap();
+        fake_home
+    }
+
+    /// DIAGNOSTIC (temporary): while a spec's agent node is actually
+    /// in-flight (mid `run_loop_dispatch`), does a concurrent DB write
+    /// targeting the SAME loop id block until the dispatch finishes?
+    #[tokio::test]
+    async fn diag_concurrent_db_write_during_dispatch() {
+        let fake_home = setup_sleeping_cli_home();
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        let engine = Arc::new(engine);
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-sleep".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "sleep".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({
+                "platform": "sleep-cli",
+                "timeout_minutes": 1,
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let _home = HomeGuard::set(fake_home.path());
+        let engine2 = Arc::clone(&engine);
+        let loop_id2 = loop_id.clone();
+        let dispatch = tokio::spawn(async move { engine2.run_loop(loop_id2, None, None).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        let lp_mid = db.get_loop(&loop_id).unwrap().unwrap();
+        eprintln!("DIAG: mid-dispatch loop status = {:?}", lp_mid.status);
+
+        let db2 = Arc::clone(&db);
+        let loop_id3 = loop_id.clone();
+        let start = std::time::Instant::now();
+        let write = tokio::time::timeout(std::time::Duration::from_secs(3), async move {
+            db2.get_loop(&loop_id3).unwrap();
+            db2.schedule_loop_autorun(&loop_id3, chrono::Utc::now() + chrono::Duration::hours(1))
+                .unwrap();
+        })
+        .await;
+        eprintln!(
+            "DIAG: write result = {:?}, elapsed = {:?}",
+            write,
+            start.elapsed()
+        );
+
+        let dispatch_start = std::time::Instant::now();
+        dispatch.await.unwrap().unwrap();
+        eprintln!(
+            "DIAG: dispatch total elapsed = {:?}",
+            dispatch_start.elapsed()
+        );
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        eprintln!("DIAG: final loop status = {:?}", lp.status);
+        drop(_home);
+
+        assert!(
+            write.is_ok(),
+            "node-initiated DB write blocked during dispatch"
+        );
+    }
+
+    /// DIAGNOSTIC (temporary) control: same as above, minus the concurrent
+    /// write — isolates whether the slow dispatch is caused by the write or
+    /// is inherent to dispatching a plain sleeping node.
+    #[tokio::test]
+    async fn diag_dispatch_alone_no_concurrent_write() {
+        let fake_home = setup_sleeping_cli_home();
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        let engine = Arc::new(engine);
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-sleep".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "sleep".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({
+                "platform": "sleep-cli",
+                "timeout_minutes": 1,
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let _home = HomeGuard::set(fake_home.path());
+        let start = std::time::Instant::now();
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        eprintln!("DIAG: dispatch-alone total elapsed = {:?}", start.elapsed());
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        eprintln!("DIAG: final loop status = {:?}", lp.status);
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        for r in &runs {
+            eprintln!("DIAG: run status={:?} output={:?}", r.status, r.output);
+        }
+        drop(_home);
+    }
+
     /// Serializes [`HomeGuard`] users against each other. `HomeGuard` sets
     /// `CANOPY_HOME_OVERRIDE` rather than the real `HOME` specifically so
     /// unrelated tests (which never read that var) are unaffected — but the

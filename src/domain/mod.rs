@@ -17,6 +17,7 @@ pub mod nursery;
 pub mod pools;
 pub mod project;
 pub mod prompts;
+pub mod quota_reset;
 pub mod seeds;
 pub mod sync;
 pub mod usage_stats;

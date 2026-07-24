@@ -51,6 +51,7 @@ cron = "0.16"
 
 # Date/time
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 
 # CLI binary discovery
 which = "8.0"
