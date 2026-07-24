@@ -33,10 +33,6 @@ impl Theme {
 
     /// Borderless, background-contrast look (T5): panels are separated by
     /// differing background colors instead of box-drawing borders.
-    ///
-    /// Nothing constructs this outside tests yet — theme selection/persistence
-    /// is T6's job — so the compiler can't see a production caller.
-    #[allow(dead_code)]
     pub fn modern() -> Self {
         let panel_bg = Color::Rgb(25, 25, 35);
         Self {
@@ -47,6 +43,21 @@ impl Theme {
             header_color: Color::Rgb(160, 160, 170),
             dim_text: Color::Rgb(90, 90, 100),
             show_borders: false,
+        }
+    }
+
+    /// Resolve a `Theme` from the persisted `CanopyConfig::theme` string
+    /// (T6): `"modern"` -> [`Theme::modern`], anything else -> classic.
+    /// An unrecognized value (a config from a newer binary, a typo, etc.)
+    /// falls back to classic with a warning instead of failing to start.
+    pub fn resolve(config_value: &str) -> Self {
+        match config_value {
+            "classic" => Self::classic(),
+            "modern" => Self::modern(),
+            other => {
+                tracing::warn!(theme = other, "unknown theme in config, using classic");
+                Self::classic()
+            }
         }
     }
 }
@@ -92,6 +103,22 @@ mod tests {
         assert_eq!(theme.selected_bg, Color::Rgb(40, 40, 55));
         assert_eq!(theme.header_color, Color::Rgb(160, 160, 170));
         assert_eq!(theme.dim_text, Color::Rgb(90, 90, 100));
+    }
+
+    #[test]
+    fn resolve_classic_returns_classic() {
+        assert_eq!(Theme::resolve("classic"), Theme::classic());
+    }
+
+    #[test]
+    fn resolve_modern_returns_modern() {
+        assert_eq!(Theme::resolve("modern"), Theme::modern());
+    }
+
+    #[test]
+    fn resolve_unknown_value_falls_back_to_classic_without_panicking() {
+        assert_eq!(Theme::resolve("bogus"), Theme::classic());
+        assert_eq!(Theme::resolve(""), Theme::classic());
     }
 
     #[test]

@@ -487,6 +487,9 @@ pub struct App {
     pub(crate) animation_tick: u32,
     /// Preferred unit for sysinfo temperature labels.
     pub(crate) temperature_unit: crate::domain::canopy_config::TemperatureUnit,
+    /// Resolved TUI color theme (T6), read from config once at startup.
+    /// No live switching yet — changing it requires a restart.
+    pub(crate) theme: crate::tui::ui::theme::Theme,
     /// Terminal autocomplete suggestion picker (shown on Tab).
     pub(crate) suggestion_picker: Option<crate::tui::terminal_history::SuggestionPicker>,
     /// Per-session terminal histories (loaded on demand, cached in memory).

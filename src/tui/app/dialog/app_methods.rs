@@ -634,7 +634,7 @@ impl App {
             base_args
         };
         let fallback = dialog.selected_fallback_args();
-        let accent = dialog.selected_accent_color(&crate::tui::ui::theme::Theme::classic());
+        let accent = dialog.selected_accent_color(&self.theme);
         let model = if dialog.model.is_empty() {
             None
         } else {
@@ -797,7 +797,7 @@ impl App {
             rows,
             None,
             &existing_refs,
-            crate::tui::ui::theme::Theme::classic().header_color,
+            self.theme.header_color,
         )?;
         let _ = self
             .db

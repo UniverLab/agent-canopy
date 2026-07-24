@@ -52,7 +52,7 @@ pub(crate) const SIDEBAR_WIDTH: u16 = 33;
 // ── Main draw entry point ───────────────────────────────────────
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let theme = Theme::classic();
+    let theme = app.theme;
     let full = frame.area();
     frame.render_widget(
         ratatui::widgets::Paragraph::new("").style(Style::default().bg(theme.panel_bg)),

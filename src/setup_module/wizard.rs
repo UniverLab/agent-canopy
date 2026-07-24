@@ -82,6 +82,17 @@ pub fn run_setup(force_skills: bool) -> Result<()> {
         }
     ));
 
+    // ── Step 2.25: TUI theme preference ──────────────────────────
+    wiz.render()?;
+    let theme = select_theme(&existing_config.theme)?;
+    wiz.add(format!(
+        "\x1b[32m✓\x1b[0m Theme: {}",
+        match theme.as_str() {
+            "modern" => THEME_OPTION_MODERN,
+            _ => THEME_OPTION_CLASSIC,
+        }
+    ));
+
     // ── Step 2.3: RAG opt-in ─────────────────────────────────────
     wiz.render()?;
     let rag_previously_configured = !existing_config.embeddings_model.is_empty()
@@ -234,6 +245,7 @@ pub fn run_setup(force_skills: bool) -> Result<()> {
     config.mark_configured();
     config.clis = cli_registry.available_clis;
     config.temperature_unit = temperature_unit;
+    config.theme = theme;
     config.embeddings_model = embeddings_model;
     config.similarity_threshold = similarity_threshold;
     config.rag_personal_dirs = rag_personal_dirs;
@@ -318,6 +330,31 @@ fn select_temperature_unit() -> Result<crate::domain::canopy_config::Temperature
         "Fahrenheit (°F)" => crate::domain::canopy_config::TemperatureUnit::Fahrenheit,
         _ => crate::domain::canopy_config::TemperatureUnit::Celsius,
     })
+}
+
+const THEME_OPTION_CLASSIC: &str = "Classic (bordered)";
+const THEME_OPTION_MODERN: &str = "Modern (borderless)";
+
+fn select_theme(current: &str) -> Result<String> {
+    let options = [THEME_OPTION_CLASSIC, THEME_OPTION_MODERN];
+    let start = if current == "modern" { 1 } else { 0 };
+    let selected = Select::new("TUI theme:", options.to_vec())
+        .with_starting_cursor(start)
+        .with_help_message("enter: confirm | ↑↓: navigate | restart the TUI to apply")
+        .prompt()
+        .map_err(|e| anyhow::anyhow!("Theme selection cancelled: {}", e))?;
+
+    Ok(theme_choice_to_config_value(selected))
+}
+
+/// Map a `select_theme` menu label to the `CanopyConfig::theme` value.
+/// Pure so it's testable without an interactive prompt.
+fn theme_choice_to_config_value(selected: &str) -> String {
+    if selected == THEME_OPTION_MODERN {
+        "modern".to_string()
+    } else {
+        "classic".to_string()
+    }
 }
 
 fn select_local_embeddings_model(current: &str) -> Result<String> {
@@ -411,4 +448,29 @@ fn pick_multiple_directories(
     println!();
 
     Ok(dirs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn theme_choice_writes_modern_for_the_modern_menu_label() {
+        assert_eq!(theme_choice_to_config_value(THEME_OPTION_MODERN), "modern");
+    }
+
+    #[test]
+    fn theme_choice_writes_classic_for_the_classic_menu_label() {
+        assert_eq!(
+            theme_choice_to_config_value(THEME_OPTION_CLASSIC),
+            "classic"
+        );
+    }
+
+    #[test]
+    fn theme_choice_defaults_unrecognized_input_to_classic() {
+        // Defensive: any label that isn't the modern one falls back to classic
+        // rather than writing an unexpected value to config.
+        assert_eq!(theme_choice_to_config_value("not a real option"), "classic");
+    }
 }

@@ -164,6 +164,7 @@ impl App {
             prev_active_run_ids: std::collections::HashSet::new(),
             animation_tick: 0,
             temperature_unit: canopy_config.temperature_unit,
+            theme: crate::tui::ui::theme::Theme::resolve(&canopy_config.theme),
             suggestion_picker: None,
             terminal_histories: HashMap::new(),
             terminal_search: None,
@@ -2610,7 +2611,7 @@ impl App {
             rows,
             Some(&session.name),
             &existing_refs,
-            crate::tui::ui::theme::Theme::classic().header_color,
+            self.theme.header_color,
         ) {
             Ok(agent) => agent,
             Err(e) => {

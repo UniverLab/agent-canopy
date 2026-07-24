@@ -69,6 +69,13 @@ pub struct CanopyConfig {
     /// `[skills]` settings for the dynamic skill store (`~/.canopy/skills/`).
     #[serde(default)]
     pub skills: SkillsConfig,
+
+    /// TUI color theme: `"classic"` (bordered) or `"modern"` (borderless).
+    /// A plain `String` (not an enum) so a config written by a newer binary
+    /// with a theme this binary doesn't know about still deserializes fine —
+    /// unknown values are resolved to classic at startup, not rejected here.
+    #[serde(default = "default_theme")]
+    pub theme: String,
 }
 
 /// One configured git source for the dynamic skill store. A skill is a
@@ -170,6 +177,10 @@ fn default_ensemble_concurrency_cap() -> usize {
     4
 }
 
+fn default_theme() -> String {
+    "classic".to_string()
+}
+
 fn default_projects_root() -> String {
     if let Some(home) = dirs::home_dir() {
         let preferred = home.join("Documents").join("Projects");
@@ -242,6 +253,7 @@ impl Default for CanopyConfig {
             ensemble_concurrency_cap: default_ensemble_concurrency_cap(),
             clean: CleanConfig::default(),
             skills: SkillsConfig::default(),
+            theme: default_theme(),
         }
     }
 }
@@ -259,6 +271,35 @@ mod tests {
         assert_eq!(config.temperature_unit, TemperatureUnit::Celsius);
         assert_eq!(config.embeddings_model, "");
         assert_eq!(config.similarity_threshold, 0.25);
+        assert_eq!(config.theme, "classic");
+    }
+
+    #[test]
+    fn test_config_without_theme_field_uses_classic_default() {
+        let dir = TempDir::new().unwrap();
+        let canopy_dir = dir.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        // Simulates a config written before the `theme` field existed.
+        let toml = r#"embeddings_model = "intfloat/multilingual-e5-base""#;
+        std::fs::write(canopy_dir.join("config.toml"), toml).unwrap();
+
+        let loaded = CanopyConfig::load(&canopy_dir);
+        assert_eq!(loaded.theme, "classic");
+    }
+
+    #[test]
+    fn test_theme_round_trips_via_config_toml() {
+        let dir = TempDir::new().unwrap();
+        let canopy_dir = dir.path().join(".canopy");
+
+        let config = CanopyConfig {
+            theme: "modern".to_string(),
+            ..CanopyConfig::default()
+        };
+        config.save(&canopy_dir).unwrap();
+
+        let loaded = CanopyConfig::load(&canopy_dir);
+        assert_eq!(loaded.theme, "modern");
     }
 
     #[test]
