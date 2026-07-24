@@ -1,12 +1,14 @@
-//! CLI handler for `canopy clean` (soft cleanup, C1).
+//! CLI handler for `canopy clean` (soft cleanup, C1) and
+//! `canopy clean --hard` (orphan-project cascade, C2).
 //!
 //! Gathers facts from the DB and filesystem, hands them to the pure
 //! `domain::clean` decision functions to build a [`CleanPlan`], then either
 //! prints it (`--dry-run`) or executes it and prints what happened. Soft
 //! mode never touches `active`/`resumed` sessions, never deletes projects,
-//! and only reports orphaned projects (missing workdir) with a hint that
-//! `canopy clean --hard` — a separate, not-yet-implemented spec — removes
-//! them.
+//! and only reports orphaned projects (missing workdir). `--hard` runs the
+//! full soft cleanup first, then prints the orphan-project cascade plan
+//! and prompts before deleting each orphan (and every row that references
+//! it) unless `--yes` or `--dry-run` is set.
 
 use std::path::Path;
 
@@ -14,9 +16,16 @@ use anyhow::Result;
 
 use crate::db::Database;
 use crate::domain::canopy_config::CanopyConfig;
-use crate::domain::clean::{self, CleanPlan, FileCandidate, ProjectCandidate};
+use crate::domain::clean::{
+    self, CleanPlan, FileCandidate, HardCascadeCandidate, HardCascadePlan, ProjectCandidate,
+};
 
-pub async fn handle_clean_action(dry_run: bool, older_than: Option<u64>) -> Result<()> {
+pub async fn handle_clean_action(
+    dry_run: bool,
+    older_than: Option<u64>,
+    hard: bool,
+    yes: bool,
+) -> Result<()> {
     let data_dir = crate::ensure_data_dir()?;
     let db = Database::new(&data_dir.join("background_agents.db"))?;
     let config = CanopyConfig::load(&data_dir);
@@ -25,6 +34,11 @@ pub async fn handle_clean_action(dry_run: bool, older_than: Option<u64>) -> Resu
 
     let plan = run_clean(&data_dir, &db, dry_run, retention_days, now_ts)?;
     print_summary(&plan, retention_days, dry_run);
+
+    if hard {
+        run_hard_cascade(&db, dry_run, yes)?;
+    }
+
     Ok(())
 }
 
@@ -83,6 +97,179 @@ fn run_clean(
     }
 
     Ok(plan)
+}
+
+/// `--hard` mode: gather the per-project cascade facts, build the
+/// [`HardCascadePlan`], print it, and (unless `dry_run`) prompt and
+/// execute. Splits the orphan work from `run_clean` so the soft-mode
+/// tests don't pay for the extra DB roundtrips when `--hard` isn't set.
+fn run_hard_cascade(db: &Database, dry_run: bool, yes: bool) -> Result<()> {
+    let candidates: Vec<HardCascadeCandidate> = db
+        .list_projects()?
+        .into_iter()
+        .map(|p| {
+            let workdir_exists = Path::new(&p.path).exists();
+            let counts = db.project_hard_cascade_counts(&p.hash, &p.path)?;
+            let skip_reason = db.project_hard_cascade_skip_reason(&p.path)?;
+            Ok::<_, anyhow::Error>(HardCascadeCandidate {
+                hash: p.hash,
+                name: p.name,
+                path: p.path,
+                workdir_exists,
+                counts,
+                skip_reason,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let plan = clean::plan_hard_cascade(&candidates);
+    print_hard_cascade_plan(&plan, dry_run);
+
+    if plan.targets.is_empty() {
+        return Ok(());
+    }
+
+    if dry_run {
+        // Plan-only: no prompt, no deletes (spec: "deletes nothing, no
+        // confirmation needed").
+        return Ok(());
+    }
+
+    if !yes {
+        // Interactive confirmation; refuse on no/eof/non-tty.
+        let proceed = match prompt_hard_cascade_confirmation(&plan) {
+            Ok(value) => value,
+            Err(err) => {
+                eprintln!("  {err}\n  Aborting --hard: refusing to run without an explicit yes.");
+                return Ok(());
+            }
+        };
+        if !proceed {
+            println!("  Aborted by user — nothing deleted.");
+            return Ok(());
+        }
+    }
+
+    for target in &plan.targets {
+        match db.cascade_delete_orphan_project(&target.hash, &target.missing_path) {
+            Ok(actual) => {
+                println!(
+                    " \x1b[32m✓\x1b[0m  Removed {} ({}): {} direct + {} cascade rows across the project.",
+                    target.name,
+                    target.hash,
+                    direct_count(&actual),
+                    cascade_count(&actual),
+                );
+            }
+            Err(err) => {
+                eprintln!(
+                    " \x1b[31m✗\x1b[0m  Failed to remove {} ({}): {err}",
+                    target.name, target.hash
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn direct_count(c: &clean::HardCascadeCounts) -> i64 {
+    c.loops
+        + c.interactive_sessions
+        + c.terminal_sessions
+        + c.last_prompts
+        + c.scheduled_sends
+        + c.failed_scheduled_sends
+        + c.sync_messages
+        + c.sync_locks
+        + c.intelligence_nodes
+}
+
+fn cascade_count(c: &clean::HardCascadeCounts) -> i64 {
+    c.loop_specs
+        + c.loop_nodes
+        + c.loop_edges
+        + c.loop_runs
+        + c.loop_completion_hook_runs
+        + c.ensembles
+        + c.ensemble_members
+        + c.pool_members
+        + c.seed_sessions
+        + c.intelligence_edges
+}
+
+fn prompt_hard_cascade_confirmation(plan: &HardCascadePlan) -> Result<bool> {
+    use inquire::Confirm;
+    // Default to no so a stray Enter (or a non-tty env) can't accidentally
+    // confirm a destructive cascade. Scripts that want unattended deletes
+    // must pass `--yes`.
+    let prompt = format!(
+        "Delete these {} orphaned project(s) and every row that references them?",
+        plan.targets.len()
+    );
+    Confirm::new(&prompt)
+        .with_default(false)
+        .with_help_message("y: delete, n/Esc: abort")
+        .prompt()
+        .map_err(|err| anyhow::anyhow!("{err}"))
+}
+
+fn print_hard_cascade_plan(plan: &HardCascadePlan, dry_run: bool) {
+    if plan.is_empty() && plan.skips.is_empty() {
+        println!("\nNo orphaned projects to clean.");
+        return;
+    }
+    let verb = if dry_run {
+        "Would remove"
+    } else {
+        "Will remove"
+    };
+    if !plan.targets.is_empty() {
+        println!("\n\x1b[1m── canopy clean --hard (orphan-project cascade) ──\x1b[0m");
+        println!(" {verb} {} orphaned project(s):", plan.targets.len());
+        for t in &plan.targets {
+            let c = &t.counts;
+            println!(
+                "   {} ({})  missing: {}\n     [{} loop(s), {} interactive session(s), {} terminal session(s),\n      {} last prompt(s), {} scheduled send(s), {} failed send(s),\n      {} sync message(s), {} sync lock(s), {} intelligence node(s)]\n     + cascade: [{} loop_spec(s), {} loop_node(s), {} loop_edge(s),\n                 {} loop_run(s), {} completion_hook_run(s),\n                 {} ensemble(s), {} ensemble_member(s), {} pool_member(s),\n                 {} seed_session(s), {} intelligence_edge(s)]",
+                t.name,
+                t.hash,
+                t.missing_path,
+                c.loops,
+                c.interactive_sessions,
+                c.terminal_sessions,
+                c.last_prompts,
+                c.scheduled_sends,
+                c.failed_scheduled_sends,
+                c.sync_messages,
+                c.sync_locks,
+                c.intelligence_nodes,
+                c.loop_specs,
+                c.loop_nodes,
+                c.loop_edges,
+                c.loop_runs,
+                c.loop_completion_hook_runs,
+                c.ensembles,
+                c.ensemble_members,
+                c.pool_members,
+                c.seed_sessions,
+                c.intelligence_edges,
+            );
+        }
+    }
+    if !plan.skips.is_empty() {
+        println!(
+            "\n\x1b[33m⚠\x1b[0m  Skipped {} project(s) with in-flight state:",
+            plan.skips.len()
+        );
+        for s in &plan.skips {
+            println!(
+                "   {} ({})  missing: {}  — {}",
+                s.name,
+                s.hash,
+                s.missing_path,
+                s.reason.describe()
+            );
+        }
+    }
 }
 
 fn execute_plan(db: &Database, plan: &CleanPlan) -> Result<()> {
@@ -251,7 +438,7 @@ fn print_summary(plan: &CleanPlan, retention_days: u64, dry_run: bool) {
             );
         }
         println!(
-            "   Hint: `canopy clean --hard` removes orphaned projects (separate spec, not yet available)."
+            "   Hint: `canopy clean --hard` removes orphaned projects (and their dependents) with confirmation."
         );
     }
 
@@ -264,6 +451,7 @@ fn print_summary(plan: &CleanPlan, retention_days: u64, dry_run: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::loops::LoopStatus;
     use tempfile::tempdir;
 
     fn test_db(dir: &Path) -> Database {
@@ -505,5 +693,243 @@ mod tests {
         assert_eq!(format_bytes(0), "0 B");
         assert_eq!(format_bytes(512), "512 B");
         assert_eq!(format_bytes(2048), "2.0 KB");
+    }
+
+    fn make_project(hash: &str, path: &str) -> crate::domain::project::Project {
+        crate::domain::project::Project {
+            hash: hash.to_string(),
+            path: path.to_string(),
+            name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            description: None,
+            tags: None,
+            indexed_at: None,
+            created_at: 1_700_000_000,
+        }
+    }
+
+    fn make_loop(
+        id: &str,
+        workdir: &str,
+        status: crate::domain::loops::LoopStatus,
+    ) -> crate::domain::loops::Loop {
+        crate::domain::loops::Loop {
+            id: id.to_string(),
+            name: format!("loop-{id}"),
+            description: None,
+            workdir: workdir.to_string(),
+            status,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_pool_id: None,
+            on_completed: None,
+        }
+    }
+
+    #[test]
+    fn hard_cascade_with_yes_deletes_orphan_and_its_dependents() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path();
+        let db = test_db(data_dir);
+        let workdir = "/definitely/does/not/exist";
+        let hash = "hash-orphan";
+        db.upsert_project(&make_project(hash, workdir)).unwrap();
+        db.insert_loop(&make_loop("loop-1", workdir, LoopStatus::Completed))
+            .unwrap();
+        db.insert_interactive_session(
+            "s-old",
+            "s-old",
+            "opencode",
+            workdir,
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+        db.finish_interactive_session("s-old", 0).unwrap();
+        db.insert_terminal_session("t-1", "t-1", "bash", workdir)
+            .unwrap();
+
+        // --hard --yes: confirm the cascade executes without prompting.
+        run_hard_cascade(&db, false, true).unwrap();
+
+        assert!(db.get_project(hash).unwrap().is_none());
+        assert_eq!(db.project_dependent_counts(workdir).unwrap().loops, 0);
+        assert_eq!(
+            db.project_dependent_counts(workdir)
+                .unwrap()
+                .interactive_sessions,
+            0
+        );
+        assert_eq!(
+            db.project_dependent_counts(workdir)
+                .unwrap()
+                .terminal_sessions,
+            0
+        );
+    }
+
+    #[test]
+    fn hard_cascade_dry_run_deletes_nothing() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path();
+        let db = test_db(data_dir);
+        let workdir = "/definitely/does/not/exist";
+        let hash = "hash-orphan-dry";
+        db.upsert_project(&make_project(hash, workdir)).unwrap();
+        db.insert_loop(&make_loop("loop-1", workdir, LoopStatus::Completed))
+            .unwrap();
+        db.insert_interactive_session(
+            "s-old",
+            "s-old",
+            "opencode",
+            workdir,
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+        db.finish_interactive_session("s-old", 0).unwrap();
+
+        // --hard --dry-run: no prompt, no deletes, plan still printed.
+        run_hard_cascade(&db, true, false).unwrap();
+
+        assert!(db.get_project(hash).unwrap().is_some());
+        assert_eq!(db.project_dependent_counts(workdir).unwrap().loops, 1);
+        assert_eq!(
+            db.project_dependent_counts(workdir)
+                .unwrap()
+                .interactive_sessions,
+            1
+        );
+    }
+
+    #[test]
+    fn hard_cascade_keeps_project_with_existing_workdir_intact() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path();
+        let db = test_db(data_dir);
+        let workdir = dir.path().join("real-workdir");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let workdir_str = workdir.to_string_lossy().to_string();
+        let hash = "hash-keep";
+        db.upsert_project(&make_project(hash, &workdir_str))
+            .unwrap();
+        db.insert_loop(&make_loop("loop-1", &workdir_str, LoopStatus::Completed))
+            .unwrap();
+        db.insert_interactive_session(
+            "s-1",
+            "s-1",
+            "opencode",
+            &workdir_str,
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+        db.finish_interactive_session("s-1", 0).unwrap();
+
+        run_hard_cascade(&db, false, true).unwrap();
+
+        // Project with an existing workdir is NEVER a target of --hard.
+        assert!(db.get_project(hash).unwrap().is_some());
+        assert_eq!(db.project_dependent_counts(&workdir_str).unwrap().loops, 1);
+    }
+
+    #[test]
+    fn hard_cascade_skips_orphan_with_running_loop() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path();
+        let db = test_db(data_dir);
+        let workdir = "/orphan/with/running/loop";
+        let hash = "hash-running";
+        db.upsert_project(&make_project(hash, workdir)).unwrap();
+        db.insert_loop(&make_loop("loop-r", workdir, LoopStatus::Running))
+            .unwrap();
+
+        run_hard_cascade(&db, false, true).unwrap();
+
+        // Project survives because its loop is still running.
+        assert!(db.get_project(hash).unwrap().is_some());
+        assert!(db.get_loop("loop-r").unwrap().is_some());
+    }
+
+    #[test]
+    fn hard_cascade_skips_orphan_with_active_session() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path();
+        let db = test_db(data_dir);
+        let workdir = "/orphan/with/active/session";
+        let hash = "hash-active";
+        db.upsert_project(&make_project(hash, workdir)).unwrap();
+        db.insert_interactive_session(
+            "s-live",
+            "s-live",
+            "opencode",
+            workdir,
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+
+        run_hard_cascade(&db, false, true).unwrap();
+
+        assert!(db.get_project(hash).unwrap().is_some());
+        assert_eq!(
+            db.project_dependent_counts(workdir)
+                .unwrap()
+                .interactive_sessions,
+            1
+        );
+    }
+
+    #[test]
+    fn hard_cascade_processes_targets_and_skips_in_one_call() {
+        // Mixed: one deletable orphan, one skipped (running loop), one with
+        // a real workdir. --hard should delete only the first.
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path();
+        let db = test_db(data_dir);
+
+        let real_workdir = dir.path().join("real");
+        std::fs::create_dir_all(&real_workdir).unwrap();
+        let real_str = real_workdir.to_string_lossy().to_string();
+
+        db.upsert_project(&make_project("hash-real", &real_str))
+            .unwrap();
+        db.upsert_project(&make_project("hash-doomed", "/orphan/doomed"))
+            .unwrap();
+        db.upsert_project(&make_project("hash-skipped", "/orphan/skipped"))
+            .unwrap();
+
+        db.insert_loop(&make_loop("loop-real", &real_str, LoopStatus::Completed))
+            .unwrap();
+        db.insert_loop(&make_loop(
+            "loop-doomed",
+            "/orphan/doomed",
+            LoopStatus::Completed,
+        ))
+        .unwrap();
+        db.insert_loop(&make_loop(
+            "loop-skipped",
+            "/orphan/skipped",
+            LoopStatus::Running,
+        ))
+        .unwrap();
+
+        run_hard_cascade(&db, false, true).unwrap();
+
+        assert!(db.get_project("hash-real").unwrap().is_some());
+        assert!(db.get_project("hash-doomed").unwrap().is_none());
+        assert!(db.get_project("hash-skipped").unwrap().is_some());
     }
 }

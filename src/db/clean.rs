@@ -1,4 +1,5 @@
-//! Repository functions backing `canopy clean` (soft cleanup, C1).
+//! Repository functions backing `canopy clean` (soft cleanup, C1) and
+//! `canopy clean --hard` (orphan-project cascade, C2).
 //!
 //! Query/mutate helpers only — the decision of *what* is safe to remove
 //! lives in `domain::clean` as pure functions over the facts these return.
@@ -8,7 +9,9 @@ use rusqlite::params;
 use std::collections::HashSet;
 
 use crate::db::Database;
-use crate::domain::clean::{ProjectDependentCounts, SessionCandidate};
+use crate::domain::clean::{
+    HardCascadeCounts, HardCascadeSkipReason, ProjectDependentCounts, SessionCandidate,
+};
 
 fn parse_rfc3339_ts(value: &str) -> i64 {
     chrono::DateTime::parse_from_rfc3339(value)
@@ -116,11 +119,332 @@ impl Database {
             terminal_sessions,
         })
     }
+
+    /// Full per-table row counts for the `--hard` cascade plan. Counts both
+    /// the direct targets (rows whose own `workdir`/`working_dir`/
+    /// `project_hash` column points at this project) and the FK-CASCADE
+    /// follow-on rows that the database will auto-remove once the direct
+    /// target is deleted. The follow-on counts are needed so the printed
+    /// plan can show the real blast radius (a loop with a 200-node graph
+    /// deletes 200 more rows than just the loop row itself).
+    ///
+    /// Single transaction at READ COMMITTED (no writes) so the counts are
+    /// internally consistent: a row counted in `loop_specs` here cannot
+    /// have disappeared from `loops` between the two queries.
+    ///
+    /// `hash` is the project's `projects.hash` (what `intelligence_nodes.
+    /// project_hash` stores) — distinct from `workdir`, which every other
+    /// project-scoped table keys on. Passing `workdir` for both would
+    /// silently under-count intelligence rows for every real project.
+    pub fn project_hard_cascade_counts(
+        &self,
+        hash: &str,
+        workdir: &str,
+    ) -> Result<HardCascadeCounts> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let tx = conn.unchecked_transaction()?;
+        let counts = count_hard_cascade(&tx, hash, workdir)?;
+        tx.commit()?;
+        Ok(counts)
+    }
+
+    /// Transactional cascade delete of one orphaned project. Returns the
+    /// `HardCascadeCounts` of rows actually deleted, so the caller can
+    /// print "removed N rows" after the prompt-and-confirm. The cascade is
+    /// expressed entirely in this function (not in the CLI layer): the
+    /// counts are gathered first, then every direct-target `DELETE` is
+    /// issued inside the *same* SQLite transaction, so an interrupted
+    /// `--hard` can never leave the project half-deleted (C2 spec:
+    /// "transactional per project: either the whole cascade for a project
+    /// applies or none of it").
+    ///
+    /// `pragma foreign_keys=ON` is in effect (see `Database::new`), so
+    /// deleting `loops` cascades through `loop_specs` (loop-bound only) /
+    /// `loop_nodes` / `loop_edges` / `loop_runs` /
+    /// `loop_completion_hook_runs` / `ensembles` / `ensemble_members` /
+    /// `pool_members`; deleting `interactive_sessions` cascades through
+    /// `seed_sessions`; deleting `intelligence_nodes` cascades through
+    /// `intelligence_edges`. Those follow-on rows are therefore never
+    /// deleted by an explicit statement here — issuing one *after* the
+    /// cascade already ran would always affect zero rows, silently
+    /// under-reporting the count. The pre-computed counts from
+    /// `count_hard_cascade` are what's returned instead, since by
+    /// construction every one of those rows will have been removed by the
+    /// time this transaction commits.
+    pub fn cascade_delete_orphan_project(
+        &self,
+        hash: &str,
+        workdir: &str,
+    ) -> Result<HardCascadeCounts> {
+        let mut conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let tx = conn.transaction()?;
+        let counts = count_hard_cascade(&tx, hash, workdir)?;
+
+        tx.execute(
+            "DELETE FROM sync_messages WHERE workdir = ?1",
+            params![workdir],
+        )?;
+        tx.execute(
+            "DELETE FROM sync_locks WHERE workdir = ?1",
+            params![workdir],
+        )?;
+        tx.execute(
+            "DELETE FROM last_prompts WHERE workdir = ?1",
+            params![workdir],
+        )?;
+        tx.execute(
+            "DELETE FROM scheduled_sends WHERE workdir = ?1",
+            params![workdir],
+        )?;
+        tx.execute(
+            "DELETE FROM failed_scheduled_sends WHERE workdir = ?1",
+            params![workdir],
+        )?;
+        tx.execute(
+            "DELETE FROM terminal_sessions WHERE working_dir = ?1",
+            params![workdir],
+        )?;
+        // CASCADEs to seed_sessions.
+        tx.execute(
+            "DELETE FROM interactive_sessions WHERE working_dir = ?1",
+            params![workdir],
+        )?;
+        // CASCADEs to loop-bound loop_specs, which CASCADEs further to
+        // loop_nodes / loop_edges / ensembles / ensemble_members /
+        // pool_members / loop_runs; loop_completion_hook_runs CASCADEs
+        // directly off loop_id. Standalone specs (loop_id IS NULL) are
+        // untouched, matching count_hard_cascade.
+        tx.execute("DELETE FROM loops WHERE workdir = ?1", params![workdir])?;
+        // CASCADEs to intelligence_edges.
+        tx.execute(
+            "DELETE FROM intelligence_nodes WHERE project_hash = ?1",
+            params![hash],
+        )?;
+        tx.execute("DELETE FROM projects WHERE hash = ?1", params![hash])?;
+
+        tx.commit()?;
+        Ok(counts)
+    }
+
+    /// Why a project must be skipped by `--hard`, if any. Returns `Some` only
+    /// when the project has either a `Running` loop or an `active`/`resumed`
+    /// interactive session, both of which are in-flight state the cascade
+    /// MUST NOT touch.
+    ///
+    /// Active/resumed sessions are checked first: those are the most direct
+    /// "a human or TUI is looking at this right now" signal (a running loop
+    /// may also be reported separately as part of the project's history).
+    pub fn project_hard_cascade_skip_reason(
+        &self,
+        workdir: &str,
+    ) -> Result<Option<HardCascadeSkipReason>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let active_session: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM interactive_sessions
+                 WHERE working_dir = ?1 AND status IN ('active', 'resumed')
+             )",
+            params![workdir],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if active_session {
+            return Ok(Some(HardCascadeSkipReason::ActiveSession));
+        }
+        let running_loop: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM loops
+                 WHERE workdir = ?1 AND status = 'running'
+             )",
+            params![workdir],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if running_loop {
+            return Ok(Some(HardCascadeSkipReason::RunningLoop));
+        }
+        Ok(None)
+    }
+}
+
+/// Shared counting logic for [`Database::project_hard_cascade_counts`] (the
+/// pre-delete plan) and [`Database::cascade_delete_orphan_project`] (which
+/// counts before deleting, since rows removed by FK CASCADE can't be
+/// counted by their own `DELETE` statement's affected-row count — the
+/// parent's `DELETE` is what removes them). Both call sites must see
+/// identical numbers, so this is the only place the counting SQL lives.
+fn count_hard_cascade(
+    tx: &rusqlite::Transaction,
+    hash: &str,
+    workdir: &str,
+) -> Result<HardCascadeCounts> {
+    // Direct targets — rows whose own column references the project.
+    let loops: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM loops WHERE workdir = ?1",
+        params![workdir],
+        |row| row.get(0),
+    )?;
+    let interactive_sessions: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM interactive_sessions WHERE working_dir = ?1",
+        params![workdir],
+        |row| row.get(0),
+    )?;
+    let terminal_sessions: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM terminal_sessions WHERE working_dir = ?1",
+        params![workdir],
+        |row| row.get(0),
+    )?;
+    let last_prompts: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM last_prompts WHERE workdir = ?1",
+        params![workdir],
+        |row| row.get(0),
+    )?;
+    let scheduled_sends: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM scheduled_sends WHERE workdir = ?1",
+        params![workdir],
+        |row| row.get(0),
+    )?;
+    let failed_scheduled_sends: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM failed_scheduled_sends WHERE workdir = ?1",
+        params![workdir],
+        |row| row.get(0),
+    )?;
+    let sync_messages: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM sync_messages WHERE workdir = ?1",
+        params![workdir],
+        |row| row.get(0),
+    )?;
+    let sync_locks: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM sync_locks WHERE workdir = ?1",
+        params![workdir],
+        |row| row.get(0),
+    )?;
+    let intelligence_nodes: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM intelligence_nodes WHERE project_hash = ?1",
+        params![hash],
+        |row| row.get(0),
+    )?;
+
+    // Follow-on (FK CASCADE) targets: only count rows attached to *this*
+    // project's loops / interactive_sessions / intelligence_nodes.
+    // Counting everything in the table would over-report by
+    // attributing other projects' rows to this one.
+    //
+    // `loop_specs` (and everything keyed off it below) counts only
+    // *loop-bound* specs (`loop_id` set, pointing at one of this
+    // project's loops) — a standalone spec (`loop_id IS NULL`) is a
+    // shared/backlog entity the cascade never deletes, even when its
+    // own `workdir` column happens to match this project, so it must
+    // never be counted here either (this count has to match exactly
+    // what `cascade_delete_orphan_project` removes).
+    //
+    // Every placeholder below is `?1` reused, never `?2`/`?3` — passing
+    // more than one bound value per query is a rusqlite parameter-count
+    // mismatch, not "extra safety".
+    let loop_specs: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM loop_specs
+              WHERE loop_id IN (SELECT id FROM loops WHERE workdir = ?1)",
+        params![workdir],
+        |row| row.get(0),
+    )?;
+    let loop_nodes: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM loop_nodes ln
+              WHERE (ln.loop_id IS NOT NULL AND ln.loop_id IN (SELECT id FROM loops WHERE workdir = ?1))
+                 OR (ln.spec_id IS NOT NULL AND ln.spec_id IN (
+                      SELECT id FROM loop_specs WHERE loop_id IN (SELECT id FROM loops WHERE workdir = ?1)
+                 ))",
+            params![workdir],
+            |row| row.get(0),
+        )?;
+    let loop_edges: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM loop_edges le
+              WHERE (le.loop_id IS NOT NULL AND le.loop_id IN (SELECT id FROM loops WHERE workdir = ?1))
+                 OR (le.spec_id IS NOT NULL AND le.spec_id IN (
+                      SELECT id FROM loop_specs WHERE loop_id IN (SELECT id FROM loops WHERE workdir = ?1)
+                 ))",
+            params![workdir],
+            |row| row.get(0),
+        )?;
+    let loop_runs: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM loop_runs
+              WHERE loop_id IN (SELECT id FROM loops WHERE workdir = ?1)",
+        params![workdir],
+        |row| row.get(0),
+    )?;
+    let loop_completion_hook_runs: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM loop_completion_hook_runs
+              WHERE loop_id IN (SELECT id FROM loops WHERE workdir = ?1)",
+        params![workdir],
+        |row| row.get(0),
+    )?;
+    let ensembles: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM ensembles
+              WHERE (loop_id IS NOT NULL AND loop_id IN (SELECT id FROM loops WHERE workdir = ?1))
+                 OR (spec_id IS NOT NULL AND spec_id IN (
+                      SELECT id FROM loop_specs WHERE loop_id IN (SELECT id FROM loops WHERE workdir = ?1)
+                 ))",
+            params![workdir],
+            |row| row.get(0),
+        )?;
+    let ensemble_members: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM ensemble_members
+              WHERE node_id IN (
+                  SELECT id FROM loop_nodes ln
+                   WHERE (ln.loop_id IS NOT NULL AND ln.loop_id IN (SELECT id FROM loops WHERE workdir = ?1))
+                      OR (ln.spec_id IS NOT NULL AND ln.spec_id IN (
+                           SELECT id FROM loop_specs WHERE loop_id IN (SELECT id FROM loops WHERE workdir = ?1)
+                      ))
+              )",
+            params![workdir],
+            |row| row.get(0),
+        )?;
+    let pool_members: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM pool_members
+              WHERE spec_id IN (
+                  SELECT id FROM loop_specs WHERE loop_id IN (SELECT id FROM loops WHERE workdir = ?1)
+              )",
+            params![workdir],
+            |row| row.get(0),
+        )?;
+    let seed_sessions: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM seed_sessions
+              WHERE session_id IN (SELECT id FROM interactive_sessions WHERE working_dir = ?1)",
+        params![workdir],
+        |row| row.get(0),
+    )?;
+    let intelligence_edges: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM intelligence_edges
+              WHERE from_node_id IN (SELECT id FROM intelligence_nodes WHERE project_hash = ?1)
+                 OR to_node_id   IN (SELECT id FROM intelligence_nodes WHERE project_hash = ?1)",
+        params![hash],
+        |row| row.get(0),
+    )?;
+
+    Ok(HardCascadeCounts {
+        loops,
+        interactive_sessions,
+        terminal_sessions,
+        last_prompts,
+        scheduled_sends,
+        failed_scheduled_sends,
+        sync_messages,
+        sync_locks,
+        intelligence_nodes,
+        loop_specs,
+        loop_nodes,
+        loop_edges,
+        loop_runs,
+        loop_completion_hook_runs,
+        ensembles,
+        ensemble_members,
+        pool_members,
+        seed_sessions,
+        intelligence_edges,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::loops::{LoopSpecStatus, LoopStatus};
     use tempfile::tempdir;
 
     fn test_db() -> Database {
@@ -248,5 +572,416 @@ mod tests {
             .unwrap();
         let names = db.list_terminal_session_names().unwrap();
         assert!(names.contains("my-term"));
+    }
+
+    fn make_project(hash: &str, path: &str) -> crate::domain::project::Project {
+        crate::domain::project::Project {
+            hash: hash.to_string(),
+            path: path.to_string(),
+            name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            description: None,
+            tags: None,
+            indexed_at: None,
+            created_at: 1_700_000_000,
+        }
+    }
+
+    fn make_loop(
+        id: &str,
+        workdir: &str,
+        status: crate::domain::loops::LoopStatus,
+    ) -> crate::domain::loops::Loop {
+        crate::domain::loops::Loop {
+            id: id.to_string(),
+            name: format!("loop-{id}"),
+            description: None,
+            workdir: workdir.to_string(),
+            status,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_pool_id: None,
+            on_completed: None,
+        }
+    }
+
+    #[test]
+    fn hard_cascade_counts_sums_direct_and_follow_on_rows() {
+        let db = test_db();
+        let workdir = "/proj-x";
+        db.upsert_project(&make_project("hash-x", workdir)).unwrap();
+
+        // Direct targets.
+        db.insert_loop(&make_loop("loop-1", workdir, LoopStatus::Completed))
+            .unwrap();
+        db.insert_interactive_session(
+            "s-old",
+            "s-old",
+            "opencode",
+            workdir,
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+        db.finish_interactive_session("s-old", 0).unwrap();
+        db.insert_terminal_session("t1", "t1", "bash", workdir)
+            .unwrap();
+        db.upsert_intelligence_node(crate::db::intelligence::IntelligenceNodeInput {
+            id: None,
+            kind: "fact".to_string(),
+            title: "x".to_string(),
+            body: "y".to_string(),
+            metadata: None,
+            project_hash: Some("hash-x".to_string()),
+            session_id: None,
+            relations: None,
+        })
+        .unwrap();
+
+        // Cascade children attached to the loop.
+        let spec = crate::domain::loops::LoopSpec {
+            id: "spec-1".to_string(),
+            loop_id: Some("loop-1".to_string()),
+            name: "spec".to_string(),
+            description: None,
+            position: 0,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: Some(workdir.to_string()),
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        db.insert_loop_spec(&spec).unwrap();
+        let node = crate::domain::loops::LoopNode {
+            id: "node-1".to_string(),
+            spec_id: Some("spec-1".to_string()),
+            loop_id: None,
+            name: "n1".to_string(),
+            kind: crate::domain::loops::LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 0,
+            created_at: chrono::Utc::now(),
+        };
+        db.insert_loop_node(&node).unwrap();
+
+        // A standalone spec (no owning loop) whose own `workdir` happens to
+        // match this project. It's a shared/backlog entity the cascade
+        // never deletes (spec C2: "standalone specs ... are NOT deleted"),
+        // so it must not inflate the printed plan either.
+        db.insert_loop_spec(&crate::domain::loops::LoopSpec {
+            id: "spec-standalone".to_string(),
+            loop_id: None,
+            name: "standalone".to_string(),
+            description: None,
+            position: 0,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: Some(workdir.to_string()),
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+
+        let counts = db.project_hard_cascade_counts("hash-x", workdir).unwrap();
+        assert_eq!(counts.loops, 1);
+        assert_eq!(counts.interactive_sessions, 1);
+        assert_eq!(counts.terminal_sessions, 1);
+        // `upsert_project` auto-creates a kind='project' intelligence root
+        // node, so this is that root plus the fact node inserted above.
+        assert_eq!(counts.intelligence_nodes, 2);
+        // Only the loop-bound spec is counted; the standalone spec is not.
+        assert_eq!(counts.loop_specs, 1);
+        assert_eq!(counts.loop_nodes, 1);
+    }
+
+    #[test]
+    fn hard_cascade_counts_zero_for_unknown_workdir() {
+        let db = test_db();
+        let counts = db
+            .project_hard_cascade_counts("hash-never", "/never")
+            .unwrap();
+        assert!(counts.is_empty());
+    }
+
+    #[test]
+    fn hard_cascade_skip_reason_detects_running_loop() {
+        let db = test_db();
+        let workdir = "/proj-running";
+        db.upsert_project(&make_project("hash-run", workdir))
+            .unwrap();
+        db.insert_loop(&make_loop("loop-r", workdir, LoopStatus::Running))
+            .unwrap();
+        let reason = db.project_hard_cascade_skip_reason(workdir).unwrap();
+        assert_eq!(reason, Some(HardCascadeSkipReason::RunningLoop));
+    }
+
+    #[test]
+    fn hard_cascade_skip_reason_detects_active_session() {
+        let db = test_db();
+        let workdir = "/proj-active";
+        db.upsert_project(&make_project("hash-act", workdir))
+            .unwrap();
+        db.insert_interactive_session(
+            "s-live",
+            "s-live",
+            "opencode",
+            workdir,
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+        let reason = db.project_hard_cascade_skip_reason(workdir).unwrap();
+        assert_eq!(reason, Some(HardCascadeSkipReason::ActiveSession));
+    }
+
+    #[test]
+    fn hard_cascade_skip_reason_prefers_active_session_over_running_loop() {
+        let db = test_db();
+        let workdir = "/proj-both";
+        db.upsert_project(&make_project("hash-both", workdir))
+            .unwrap();
+        db.insert_loop(&make_loop("loop-b", workdir, LoopStatus::Running))
+            .unwrap();
+        db.insert_interactive_session(
+            "s-both",
+            "s-both",
+            "opencode",
+            workdir,
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+        let reason = db.project_hard_cascade_skip_reason(workdir).unwrap();
+        assert_eq!(reason, Some(HardCascadeSkipReason::ActiveSession));
+    }
+
+    #[test]
+    fn hard_cascade_skip_reason_none_for_completed_state() {
+        let db = test_db();
+        let workdir = "/proj-clean";
+        db.upsert_project(&make_project("hash-clean", workdir))
+            .unwrap();
+        db.insert_loop(&make_loop("loop-c", workdir, LoopStatus::Completed))
+            .unwrap();
+        db.insert_interactive_session(
+            "s-finished",
+            "s-finished",
+            "opencode",
+            workdir,
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+        db.finish_interactive_session("s-finished", 0).unwrap();
+        let reason = db.project_hard_cascade_skip_reason(workdir).unwrap();
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn cascade_delete_orphan_project_removes_all_dependents() {
+        let db = test_db();
+        let workdir = "/proj-cascade";
+        let hash = "hash-cascade";
+        db.upsert_project(&make_project(hash, workdir)).unwrap();
+        db.insert_loop(&make_loop("loop-c", workdir, LoopStatus::Completed))
+            .unwrap();
+        let spec = crate::domain::loops::LoopSpec {
+            id: "spec-c".to_string(),
+            loop_id: Some("loop-c".to_string()),
+            name: "spec".to_string(),
+            description: None,
+            position: 0,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: Some(workdir.to_string()),
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        db.insert_loop_spec(&spec).unwrap();
+        let node = crate::domain::loops::LoopNode {
+            id: "node-c".to_string(),
+            spec_id: Some("spec-c".to_string()),
+            loop_id: None,
+            name: "n1".to_string(),
+            kind: crate::domain::loops::LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 0,
+            created_at: chrono::Utc::now(),
+        };
+        db.insert_loop_node(&node).unwrap();
+        db.insert_interactive_session(
+            "s-c",
+            "s-c",
+            "opencode",
+            workdir,
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+        db.finish_interactive_session("s-c", 0).unwrap();
+        db.insert_terminal_session("t-c", "t-c", "bash", workdir)
+            .unwrap();
+        db.upsert_intelligence_node(crate::db::intelligence::IntelligenceNodeInput {
+            id: None,
+            kind: "fact".to_string(),
+            title: "c".to_string(),
+            body: "d".to_string(),
+            metadata: None,
+            project_hash: Some(hash.to_string()),
+            session_id: None,
+            relations: None,
+        })
+        .unwrap();
+
+        let counts = db.cascade_delete_orphan_project(hash, workdir).unwrap();
+        assert_eq!(counts.loops, 1);
+        assert_eq!(counts.interactive_sessions, 1);
+        assert_eq!(counts.terminal_sessions, 1);
+        // The project-root node `upsert_project` auto-creates, plus the
+        // fact node inserted above.
+        assert_eq!(counts.intelligence_nodes, 2);
+        // Removed only via the loop's FK CASCADE (no explicit DELETE
+        // touches loop_specs/loop_nodes) — asserting the exact count here
+        // is what catches a returned-count regression: an explicit
+        // post-cascade "sweep" DELETE always affects zero rows once the
+        // parent DELETE already cascaded the row away, which would
+        // silently report 0 instead of 1.
+        assert_eq!(counts.loop_specs, 1);
+        assert_eq!(counts.loop_nodes, 1);
+
+        // The project row and every dependent must be gone.
+        assert!(db.get_project(hash).unwrap().is_none());
+        assert_eq!(db.project_dependent_counts(workdir).unwrap().loops, 0);
+        assert_eq!(
+            db.project_dependent_counts(workdir)
+                .unwrap()
+                .interactive_sessions,
+            0
+        );
+        assert_eq!(
+            db.project_dependent_counts(workdir)
+                .unwrap()
+                .terminal_sessions,
+            0
+        );
+        // Spec was loop-bound, so it should be CASCADE-deleted with the loop.
+        assert!(db.get_loop_spec("spec-c").unwrap().is_none());
+        assert!(db.get_loop_node("node-c").unwrap().is_none());
+    }
+
+    #[test]
+    fn cascade_delete_orphan_project_leaves_unrelated_projects_intact() {
+        let db = test_db();
+        db.upsert_project(&make_project("hash-a", "/proj-a"))
+            .unwrap();
+        db.upsert_project(&make_project("hash-b", "/proj-b"))
+            .unwrap();
+        db.insert_loop(&make_loop("loop-a", "/proj-a", LoopStatus::Completed))
+            .unwrap();
+        db.insert_loop(&make_loop("loop-b", "/proj-b", LoopStatus::Completed))
+            .unwrap();
+
+        db.cascade_delete_orphan_project("hash-a", "/proj-a")
+            .unwrap();
+
+        assert!(db.get_project("hash-a").unwrap().is_none());
+        assert!(db.get_project("hash-b").unwrap().is_some());
+        assert!(db.get_loop("loop-b").unwrap().is_some());
+    }
+
+    #[test]
+    fn cascade_delete_orphan_project_preserves_other_projects_pool_members() {
+        // A pool membership belongs to a *pool*, not a project; only the
+        // pool membership's spec (which is loop-bound to the deleted
+        // project) should be removed. The pool itself, and any membership
+        // attached to a different (unrelated) spec, must remain.
+        let db = test_db();
+        let workdir = "/proj-pool";
+        db.upsert_project(&make_project("hash-p", workdir)).unwrap();
+        db.insert_loop(&make_loop("loop-p", workdir, LoopStatus::Completed))
+            .unwrap();
+        let doomed_spec_id = "spec-p-1";
+        let safe_spec_id = "spec-p-2";
+        db.insert_loop_spec(&crate::domain::loops::LoopSpec {
+            id: doomed_spec_id.to_string(),
+            loop_id: Some("loop-p".to_string()),
+            name: "d".to_string(),
+            description: None,
+            position: 0,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: Some(workdir.to_string()),
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+        db.insert_loop_spec(&crate::domain::loops::LoopSpec {
+            id: safe_spec_id.to_string(),
+            loop_id: None,
+            name: "s".to_string(),
+            description: None,
+            position: 0,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: Some("/elsewhere".to_string()),
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+        let pool = crate::domain::pools::Pool {
+            id: "pool-1".to_string(),
+            name: "p1".to_string(),
+            created_at: chrono::Utc::now(),
+        };
+        db.insert_pool(&pool).unwrap();
+        db.append_pool_member(&pool.id, doomed_spec_id, None)
+            .unwrap();
+        db.append_pool_member(&pool.id, safe_spec_id, None).unwrap();
+
+        db.cascade_delete_orphan_project("hash-p", workdir).unwrap();
+
+        // Pool itself remains (shared, not project-owned).
+        assert!(db.get_pool(&pool.id).unwrap().is_some());
+        // The doomed spec is gone (loop-bound → CASCADE).
+        assert!(db.get_loop_spec(doomed_spec_id).unwrap().is_none());
+        // The standalone spec survives, and so does its pool membership.
+        assert!(db.get_loop_spec(safe_spec_id).unwrap().is_some());
+        assert!(db.pool_has_member(&pool.id, safe_spec_id).unwrap());
+        // The pool membership that pointed at the doomed spec is gone.
+        assert!(!db.pool_has_member(&pool.id, doomed_spec_id).unwrap());
     }
 }

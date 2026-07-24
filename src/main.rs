@@ -99,6 +99,17 @@ enum Commands {
         /// Override the configured retention window, in days.
         #[arg(long = "older-than", value_name = "DAYS")]
         older_than: Option<u64>,
+        /// Also delete orphaned projects (workdir missing) and their
+        /// dependent rows. Requires interactive confirmation, unless
+        /// `--yes` is set; `--dry-run` skips the prompt and deletes
+        /// nothing. Soft cleanup runs first either way.
+        #[arg(long)]
+        hard: bool,
+        /// Skip the interactive yes/no prompt that `--hard` would
+        /// otherwise require. Intended for scripting; a typo here can
+        /// delete a real cascade.
+        #[arg(long)]
+        yes: bool,
     },
     /// Discover file-backed prompt presets (~/.canopy/prompts/).
     Prompts {
@@ -154,7 +165,9 @@ async fn main() -> Result<()> {
         Some(Commands::Clean {
             dry_run,
             older_than,
-        }) => handle_clean_action(dry_run, older_than).await,
+            hard,
+            yes,
+        }) => handle_clean_action(dry_run, older_than, hard, yes).await,
         Some(Commands::Prompts { action }) => handle_prompts_action(action).await,
         Some(Commands::Bridge {
             agent_id,

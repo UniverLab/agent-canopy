@@ -44,12 +44,97 @@ pub struct FileCandidate {
 
 /// Row counts that depend on a project's workdir, surfaced in the
 /// orphaned-project report so a reader can judge blast radius before ever
-/// running the (separate, C2) `--hard` cascade.
+/// running `--hard`. Soft mode only needs the user-visible top-three (the
+/// rows a human would scan when judging whether to nuke a project).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProjectDependentCounts {
     pub loops: i64,
     pub interactive_sessions: i64,
     pub terminal_sessions: i64,
+}
+
+/// Full row-count breakdown for a project targeted by `--hard`. Beyond the
+/// soft-mode trio, this includes every project-scoped table the cascade
+/// actually deletes (sessions, prompts, scheduled sends, sync state) plus
+/// every row that is auto-cascade-deleted by SQLite's FK rules when the
+/// owning loop / interactive_session / intelligence_node is removed (the
+/// `loop_*` / `ensemble_*` / `pool_members` / `seed_sessions` /
+/// `intelligence_edges` rows). Surfaced in the pre-delete prompt so the
+/// reader sees the entire blast radius, not just the rows the cascade
+/// driver issues a `DELETE` for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HardCascadeCounts {
+    // Direct targets (rows whose own `workdir`/`working_dir`/`project_hash`
+    // column points at this project).
+    pub loops: i64,
+    pub interactive_sessions: i64,
+    pub terminal_sessions: i64,
+    pub last_prompts: i64,
+    pub scheduled_sends: i64,
+    pub failed_scheduled_sends: i64,
+    pub sync_messages: i64,
+    pub sync_locks: i64,
+    pub intelligence_nodes: i64,
+    // Auto-cascade targets (rows removed by FK ON DELETE CASCADE once the
+    // direct target above is deleted; counted up front for the prompt).
+    pub loop_specs: i64,
+    pub loop_nodes: i64,
+    pub loop_edges: i64,
+    pub loop_runs: i64,
+    pub loop_completion_hook_runs: i64,
+    pub ensembles: i64,
+    pub ensemble_members: i64,
+    pub pool_members: i64,
+    pub seed_sessions: i64,
+    pub intelligence_edges: i64,
+}
+
+impl HardCascadeCounts {
+    pub fn is_empty(&self) -> bool {
+        self.loops == 0
+            && self.interactive_sessions == 0
+            && self.terminal_sessions == 0
+            && self.last_prompts == 0
+            && self.scheduled_sends == 0
+            && self.failed_scheduled_sends == 0
+            && self.sync_messages == 0
+            && self.sync_locks == 0
+            && self.intelligence_nodes == 0
+            && self.loop_specs == 0
+            && self.loop_nodes == 0
+            && self.loop_edges == 0
+            && self.loop_runs == 0
+            && self.loop_completion_hook_runs == 0
+            && self.ensembles == 0
+            && self.ensemble_members == 0
+            && self.pool_members == 0
+            && self.seed_sessions == 0
+            && self.intelligence_edges == 0
+    }
+}
+
+/// Why a project that *would* have been cascaded was instead skipped.
+///
+/// Spec C2: a project is never deleted by `--hard` if it has a currently
+/// running loop, or an `active`/`resumed` interactive session, even when
+/// the workdir is missing. The skip reason is what the prompt reports back
+/// (so the user can decide whether to retry after the loop ends).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HardCascadeSkipReason {
+    /// At least one loop for this project has `status = 'running'`.
+    RunningLoop,
+    /// At least one interactive session for this project is `active` or
+    /// `resumed`.
+    ActiveSession,
+}
+
+impl HardCascadeSkipReason {
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::RunningLoop => "has a running loop",
+            Self::ActiveSession => "has an active/resumed interactive session",
+        }
+    }
 }
 
 /// A registered project as input to [`plan_orphaned_projects`]. `workdir_exists`
@@ -72,6 +157,60 @@ pub struct OrphanProjectReport {
     pub name: String,
     pub missing_path: String,
     pub dependents: ProjectDependentCounts,
+}
+
+/// Input for [`plan_hard_cascade`]: a registered project together with the
+/// facts (filesystem-existence, dependent-row counts, running/active guard)
+/// the caller has already gathered. Same shape as [`ProjectCandidate`]
+/// extended with the extra facts `--hard` needs.
+#[derive(Debug, Clone)]
+pub struct HardCascadeCandidate {
+    pub hash: String,
+    pub name: String,
+    pub path: String,
+    pub workdir_exists: bool,
+    pub counts: HardCascadeCounts,
+    /// `Some(reason)` if this project has a running loop or an
+    /// `active`/`resumed` interactive session, in which case the cascade
+    /// MUST skip it. The reason is reported in the printed plan so the
+    /// user can see why their orphan wasn't eligible.
+    pub skip_reason: Option<HardCascadeSkipReason>,
+}
+
+/// A project that `--hard` will actually delete (passes every guard and
+/// has at least one dependent row to clean — the spec allows deleting a
+/// project with zero dependents, since the user asked, but reporting it
+/// as a target only when something is going away is more useful).
+#[derive(Debug, Clone)]
+pub struct HardCascadeTarget {
+    pub hash: String,
+    pub name: String,
+    pub missing_path: String,
+    pub counts: HardCascadeCounts,
+}
+
+/// A project that `--hard` would have deleted but skipped because of an
+/// in-flight guard (running loop / active session).
+#[derive(Debug, Clone)]
+pub struct HardCascadeSkip {
+    pub hash: String,
+    pub name: String,
+    pub missing_path: String,
+    pub reason: HardCascadeSkipReason,
+}
+
+/// The full `--hard` plan: a list of projects to delete (with their
+/// dependent-row counts) and a list of projects to skip (with reasons).
+#[derive(Debug, Clone, Default)]
+pub struct HardCascadePlan {
+    pub targets: Vec<HardCascadeTarget>,
+    pub skips: Vec<HardCascadeSkip>,
+}
+
+impl HardCascadePlan {
+    pub fn is_empty(&self) -> bool {
+        self.targets.is_empty()
+    }
 }
 
 /// Everything a `canopy clean` run decided to do (or, under `--dry-run`,
@@ -176,6 +315,54 @@ pub fn plan_orphaned_projects(candidates: &[ProjectCandidate]) -> Vec<OrphanProj
             dependents: c.dependents,
         })
         .collect()
+}
+
+/// Decide which orphaned projects `--hard` will actually delete and which
+/// it must skip. A project is included in `targets` iff:
+///
+/// - its workdir is missing (the only thing `--hard` cleans up), AND
+/// - it has no running loop and no `active`/`resumed` session (the
+///   in-flight guard: deleting state out from under a live agent would
+///   corrupt the run), AND
+/// - the caller has at least one row to clean (an orphan with zero
+///   dependents is still deletable, but reporting it as a target only
+///   when there's something to remove keeps the printed plan honest about
+///   blast radius).
+///
+/// Pure function over the facts in `candidates` — no I/O.
+pub fn plan_hard_cascade(candidates: &[HardCascadeCandidate]) -> HardCascadePlan {
+    let mut plan = HardCascadePlan::default();
+    for c in candidates {
+        if c.workdir_exists {
+            // Hard mode is orphan-only by design: a project whose workdir
+            // still exists is NEVER a target, regardless of what its
+            // dependents look like.
+            continue;
+        }
+        if let Some(reason) = c.skip_reason {
+            plan.skips.push(HardCascadeSkip {
+                hash: c.hash.clone(),
+                name: c.name.clone(),
+                missing_path: c.path.clone(),
+                reason,
+            });
+            continue;
+        }
+        if c.counts.is_empty() {
+            // Nothing to cascade: don't pretend we will. The project row
+            // itself can still be removed by the caller if it wants, but
+            // the spec's prompt-and-confirm model is about showing the
+            // blast radius, and an empty blast radius is a no-op.
+            continue;
+        }
+        plan.targets.push(HardCascadeTarget {
+            hash: c.hash.clone(),
+            name: c.name.clone(),
+            missing_path: c.path.clone(),
+            counts: c.counts,
+        });
+    }
+    plan
 }
 
 #[cfg(test)]
@@ -310,5 +497,152 @@ mod tests {
         let plan = CleanPlan::default();
         assert_eq!(plan.reclaimed_bytes(), 0);
         assert!(plan.is_empty());
+    }
+
+    fn hard_candidate(
+        hash: &str,
+        name: &str,
+        path: &str,
+        workdir_exists: bool,
+        counts: HardCascadeCounts,
+        skip_reason: Option<HardCascadeSkipReason>,
+    ) -> HardCascadeCandidate {
+        HardCascadeCandidate {
+            hash: hash.to_string(),
+            name: name.to_string(),
+            path: path.to_string(),
+            workdir_exists,
+            counts,
+            skip_reason,
+        }
+    }
+
+    #[test]
+    fn hard_plan_only_targets_missing_workdirs() {
+        let counts = HardCascadeCounts {
+            loops: 1,
+            ..Default::default()
+        };
+        let candidates = vec![
+            hard_candidate("aaa", "exists", "/exists", true, counts, None),
+            hard_candidate("bbb", "missing", "/missing", false, counts, None),
+        ];
+        let plan = plan_hard_cascade(&candidates);
+        assert_eq!(plan.targets.len(), 1);
+        assert_eq!(plan.targets[0].hash, "bbb");
+        assert!(plan.skips.is_empty());
+    }
+
+    #[test]
+    fn hard_plan_skips_projects_with_running_loops() {
+        let counts = HardCascadeCounts {
+            loops: 1,
+            ..Default::default()
+        };
+        let candidates = vec![hard_candidate(
+            "running",
+            "r",
+            "/r",
+            false,
+            counts,
+            Some(HardCascadeSkipReason::RunningLoop),
+        )];
+        let plan = plan_hard_cascade(&candidates);
+        assert!(plan.targets.is_empty());
+        assert_eq!(plan.skips.len(), 1);
+        assert_eq!(plan.skips[0].reason, HardCascadeSkipReason::RunningLoop);
+        assert_eq!(plan.skips[0].hash, "running");
+    }
+
+    #[test]
+    fn hard_plan_skips_projects_with_active_sessions() {
+        let counts = HardCascadeCounts {
+            interactive_sessions: 1,
+            ..Default::default()
+        };
+        let candidates = vec![hard_candidate(
+            "live",
+            "l",
+            "/l",
+            false,
+            counts,
+            Some(HardCascadeSkipReason::ActiveSession),
+        )];
+        let plan = plan_hard_cascade(&candidates);
+        assert!(plan.targets.is_empty());
+        assert_eq!(plan.skips[0].reason, HardCascadeSkipReason::ActiveSession);
+    }
+
+    #[test]
+    fn hard_plan_omits_orphans_with_zero_dependents() {
+        // An orphan with no dependents and no in-flight guard is not
+        // strictly a target (nothing to cascade), so the plan reports
+        // nothing for it — the project row itself is still removed by the
+        // executor if the caller chose to invoke the cascade unconditionally.
+        let candidates = vec![hard_candidate(
+            "empty",
+            "e",
+            "/e",
+            false,
+            HardCascadeCounts::default(),
+            None,
+        )];
+        let plan = plan_hard_cascade(&candidates);
+        assert!(plan.is_empty());
+        assert!(plan.skips.is_empty());
+    }
+
+    #[test]
+    fn hard_plan_reports_all_targets_and_skips_independently() {
+        let counts_with_loops = HardCascadeCounts {
+            loops: 2,
+            interactive_sessions: 1,
+            ..Default::default()
+        };
+        let counts_with_sessions = HardCascadeCounts {
+            interactive_sessions: 3,
+            ..Default::default()
+        };
+        let candidates = vec![
+            hard_candidate("ok", "ok", "/ok", false, counts_with_loops, None),
+            hard_candidate(
+                "live",
+                "live",
+                "/live",
+                false,
+                counts_with_sessions,
+                Some(HardCascadeSkipReason::ActiveSession),
+            ),
+            hard_candidate("kept", "kept", "/kept", true, counts_with_loops, None),
+        ];
+        let plan = plan_hard_cascade(&candidates);
+        assert_eq!(plan.targets.len(), 1);
+        assert_eq!(plan.targets[0].hash, "ok");
+        assert_eq!(plan.targets[0].counts.loops, 2);
+        assert_eq!(plan.targets[0].counts.interactive_sessions, 1);
+        assert_eq!(plan.skips.len(), 1);
+        assert_eq!(plan.skips[0].hash, "live");
+    }
+
+    #[test]
+    fn skip_reason_describe_is_human_readable() {
+        assert_eq!(
+            HardCascadeSkipReason::RunningLoop.describe(),
+            "has a running loop"
+        );
+        assert_eq!(
+            HardCascadeSkipReason::ActiveSession.describe(),
+            "has an active/resumed interactive session"
+        );
+    }
+
+    #[test]
+    fn hard_cascade_counts_is_empty_when_all_zero() {
+        assert!(HardCascadeCounts::default().is_empty());
+        assert!(!HardCascadeCounts {
+            loop_edges: 1,
+            ..Default::default()
+        }
+        .is_empty());
     }
 }
