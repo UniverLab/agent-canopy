@@ -3485,6 +3485,8 @@ mod tests {
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
             active_run_pool_id: None,
             on_completed: None,
         };
@@ -3673,6 +3675,8 @@ mod tests {
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
             active_run_pool_id: None,
             on_completed: None,
         };
@@ -4602,6 +4606,8 @@ mod tests {
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
             active_run_pool_id: None,
             on_completed: None,
         };
@@ -4769,6 +4775,8 @@ mod tests {
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
             active_run_pool_id: None,
             on_completed: None,
         };
@@ -6596,6 +6604,8 @@ echo done
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
             active_run_pool_id: None,
             on_completed: None,
         };
@@ -6853,6 +6863,8 @@ echo done
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
             active_run_pool_id: None,
             on_completed: None,
         };
@@ -7340,6 +7352,8 @@ echo done
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
             active_run_pool_id: None,
             on_completed: None,
         };
@@ -8695,6 +8709,8 @@ echo done
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
             active_run_pool_id: None,
             on_completed: None,
         };
@@ -8730,6 +8746,8 @@ echo done
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
             active_run_pool_id: None,
             on_completed: None,
         };
@@ -9813,6 +9831,8 @@ echo done
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
             active_run_pool_id: None,
             on_completed: None,
         };

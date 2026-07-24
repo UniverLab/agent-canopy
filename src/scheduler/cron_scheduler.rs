@@ -278,6 +278,24 @@ impl CronScheduler {
             }
         }
 
+        // One-shot `auto_continue_at` loop schedules (deferred resume of a
+        // paused loop) need a wakeup too, same as `autorun_at` above.
+        if self.loop_engine.is_some() {
+            if let Ok(pending) = self.db.list_pending_auto_continue_loops() {
+                for lp in &pending {
+                    if let Some(auto_continue_at) = lp.auto_continue_at {
+                        let nearer = match earliest {
+                            Some(e) => auto_continue_at < e,
+                            None => true,
+                        };
+                        if nearer {
+                            earliest = Some(auto_continue_at);
+                        }
+                    }
+                }
+            }
+        }
+
         match earliest {
             Some(t) => {
                 let delta = t.signed_duration_since(now_utc);
@@ -340,6 +358,7 @@ impl CronScheduler {
 
         self.fire_due_enable_at(now_utc)?;
         self.fire_due_autorun_loops(now_utc)?;
+        self.fire_due_auto_continue_loops(now_utc)?;
 
         Ok(())
     }
@@ -422,6 +441,74 @@ impl CronScheduler {
             // exactly how a resumed pool run used to be mistaken for
             // "nothing to do" and marked completed with members still
             // pending.
+            Arc::clone(loop_engine).resume_background(lp.id.clone());
+        }
+        Ok(())
+    }
+
+    /// One-shot `auto_continue_at`: for each loop with a pending
+    /// auto-continue schedule whose time has been reached, clear the
+    /// schedule and — only if the loop is still `Paused` — fire the
+    /// requested `loop_continue` action (`retry_current_node` by default) and
+    /// resume it in place.
+    ///
+    /// Unlike [`Self::fire_due_autorun_loops`], a loop that is no longer
+    /// `Paused` by the scheduled time (already continued manually, failed,
+    /// completed, or running) is *not* waited on further — the schedule is
+    /// cleared right away without firing, so a stale deferred-resume can
+    /// never double-run a loop that moved on some other way. This never
+    /// resets or relaunches the loop (that's `autorun_at`'s job): it goes
+    /// straight through the same action-then-resume path the `loop_continue`
+    /// MCP tool uses, preserving the paused cursor/context.
+    fn fire_due_auto_continue_loops(&self, now_utc: chrono::DateTime<Utc>) -> anyhow::Result<()> {
+        let Some(loop_engine) = self.loop_engine.as_ref() else {
+            return Ok(());
+        };
+        let pending = self.db.list_pending_auto_continue_loops()?;
+        for lp in &pending {
+            if !lp.is_auto_continue_due(now_utc) {
+                // Not firing this tick. If the time has passed but the loop
+                // left `Paused` some other way (manual `loop_continue`,
+                // failure) before the schedule fired, it's stale — clear it
+                // now rather than leaving it to linger forever waiting for
+                // `Paused` to recur (unlike `autorun_at`, which does wait,
+                // since its target statuses don't otherwise repeat).
+                if lp.is_auto_continue_time_reached(now_utc) {
+                    self.db.clear_loop_auto_continue(&lp.id)?;
+                    tracing::warn!(
+                        "Loop '{}' auto-continue fired but the loop is no longer paused ({}); \
+                         clearing the schedule without resuming it",
+                        lp.id,
+                        lp.status.as_str()
+                    );
+                }
+                continue;
+            }
+            self.db.clear_loop_auto_continue(&lp.id)?;
+
+            let action = lp
+                .auto_continue_action
+                .as_deref()
+                .unwrap_or("retry_current_node");
+            let applied = match action {
+                "skip_next_spec" => crate::daemon::handler::handle_skip_next_spec(&self.db, &lp.id),
+                _ => crate::daemon::handler::handle_retry_current_node(&self.db, &lp.id),
+            };
+            if let Err(error) = applied {
+                tracing::warn!(
+                    "Loop '{}' auto-continue could not apply action '{}' ({}); skipping resume",
+                    lp.id,
+                    action,
+                    error.message
+                );
+                continue;
+            }
+
+            tracing::info!(
+                "Loop '{}' reached its auto_continue_at time; resuming with action '{}'",
+                lp.id,
+                action
+            );
             Arc::clone(loop_engine).resume_background(lp.id.clone());
         }
         Ok(())
@@ -834,6 +921,8 @@ mod tests {
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
             active_run_pool_id: None,
             on_completed: None,
         }
@@ -972,6 +1061,8 @@ mod tests {
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
             active_run_pool_id: None,
             on_completed: None,
         })
@@ -1074,6 +1165,8 @@ mod tests {
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
             active_run_pool_id: Some("pool-1".to_string()),
             on_completed: None,
         })
@@ -1214,6 +1307,273 @@ mod tests {
         );
     }
 
+    /// A future `auto_continue_at` must not resume the loop — it's a
+    /// schedule, not an immediate action.
+    #[tokio::test]
+    async fn fire_due_auto_continue_loops_ignores_future_schedule() {
+        use crate::domain::loops::LoopStatus;
+
+        let (db, scheduler) = test_scheduler_with_loops();
+        db.insert_loop(&sample_loop("future-auto-continue", LoopStatus::Paused))
+            .unwrap();
+        db.schedule_loop_auto_continue(
+            "future-auto-continue",
+            Utc::now() + chrono::Duration::hours(1),
+            None,
+        )
+        .unwrap();
+
+        scheduler.fire_due_auto_continue_loops(Utc::now()).unwrap();
+
+        let lp = db.get_loop("future-auto-continue").unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Paused, "must not resume yet");
+        assert!(
+            lp.auto_continue_at.is_some(),
+            "future auto_continue_at must remain pending"
+        );
+    }
+
+    /// A schedule cancelled via `clear_loop_auto_continue` must not fire
+    /// later, even past its original due time.
+    #[tokio::test]
+    async fn fire_due_auto_continue_loops_never_fires_a_cancelled_schedule() {
+        use crate::domain::loops::LoopStatus;
+
+        let (db, scheduler) = test_scheduler_with_loops();
+        db.insert_loop(&sample_loop("cancelled-auto-continue", LoopStatus::Paused))
+            .unwrap();
+        db.schedule_loop_auto_continue(
+            "cancelled-auto-continue",
+            Utc::now() - chrono::Duration::minutes(1),
+            None,
+        )
+        .unwrap();
+        db.clear_loop_auto_continue("cancelled-auto-continue")
+            .unwrap();
+
+        scheduler.fire_due_auto_continue_loops(Utc::now()).unwrap();
+
+        let lp = db.get_loop("cancelled-auto-continue").unwrap().unwrap();
+        assert_eq!(
+            lp.status,
+            LoopStatus::Paused,
+            "a cancelled schedule must not resume the loop"
+        );
+        assert!(lp.auto_continue_at.is_none());
+    }
+
+    /// If the loop is no longer `Paused` by the scheduled time (already
+    /// continued manually, failed, completed, or running), the schedule must
+    /// be cleared without resuming it — never double-run.
+    #[tokio::test]
+    async fn fire_due_auto_continue_loops_clears_without_firing_when_not_paused() {
+        use crate::domain::loops::LoopStatus;
+
+        for status in [
+            LoopStatus::Draft,
+            LoopStatus::Running,
+            LoopStatus::Completed,
+            LoopStatus::Failed,
+        ] {
+            let (db, scheduler) = test_scheduler_with_loops();
+            let id = format!("not-paused-auto-continue-{}", status.as_str());
+            db.insert_loop(&sample_loop(&id, status)).unwrap();
+            db.schedule_loop_auto_continue(&id, Utc::now() - chrono::Duration::minutes(1), None)
+                .unwrap();
+
+            scheduler.fire_due_auto_continue_loops(Utc::now()).unwrap();
+
+            let lp = db.get_loop(&id).unwrap().unwrap();
+            assert_eq!(
+                lp.status, status,
+                "{status:?} loop's status must be untouched"
+            );
+            assert!(
+                lp.auto_continue_at.is_none(),
+                "{status:?} loop's stale schedule must still be cleared, not left pending forever"
+            );
+        }
+    }
+
+    /// The functional core of this feature: a `Paused` loop's
+    /// `auto_continue_at` firing must go straight through the
+    /// `loop_continue`/`resume_background` path — never `loop_reset` and
+    /// never a fresh dispatch — preserving the paused cursor. Verified by
+    /// checking the in-flight spec's status is untouched *synchronously*,
+    /// right after firing (a reset would flip it to `Pending` immediately,
+    /// before any background dispatch runs), then letting the real resumed
+    /// dispatch run to completion.
+    #[tokio::test]
+    async fn fire_due_auto_continue_loops_resumes_paused_loop_without_reset_or_relaunch() {
+        use crate::domain::loops::{
+            Loop, LoopNode, LoopNodeKind, LoopSpec, LoopSpecStatus, LoopStatus,
+        };
+
+        let (db, scheduler) = test_scheduler_with_loops();
+        let workdir = tempfile::tempdir().unwrap();
+        let loop_id = "paused-auto-continue".to_string();
+        db.insert_loop(&Loop {
+            id: loop_id.clone(),
+            name: "Auto-continue test loop".to_string(),
+            description: None,
+            workdir: workdir.path().to_string_lossy().to_string(),
+            status: LoopStatus::Paused,
+            trigger: None,
+            created_at: Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_pool_id: None,
+            on_completed: None,
+        })
+        .unwrap();
+        db.insert_loop_spec(&LoopSpec {
+            id: "spec-1".to_string(),
+            loop_id: Some(loop_id.clone()),
+            name: "Spec 1".to_string(),
+            description: Some(
+                "Functional Requirements:\n- A\n\nNon-Functional Requirements:\n- B\n\nObjective:\n- C\n\nConstraints:\n- D\n\nGuidelines:\n- E\n\nIn Scope:\n- F\n\nOut of Scope:\n- G".to_string(),
+            ),
+            position: 1,
+            parallelizable: false,
+            // A loop paused mid-spec leaves that spec `running` — `loop_pause`
+            // never touches spec status, only the loop's own.
+            status: LoopSpecStatus::Running,
+            started_at: Some(Utc::now()),
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: Utc::now(),
+        })
+        .unwrap();
+        db.schedule_loop_auto_continue(
+            &loop_id,
+            Utc::now() - chrono::Duration::minutes(1),
+            Some("retry_current_node"),
+        )
+        .unwrap();
+
+        scheduler.fire_due_auto_continue_loops(Utc::now()).unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert!(
+            lp.auto_continue_at.is_none(),
+            "firing must clear auto_continue_at"
+        );
+
+        // `retry_current_node` never mutates the spec, and a reset would have
+        // flipped it to `Pending` synchronously, before the background
+        // dispatch even starts — so `Running` here proves no reset happened.
+        let spec = db.get_loop_spec("spec-1").unwrap().unwrap();
+        assert_eq!(
+            spec.status,
+            LoopSpecStatus::Running,
+            "auto-continue must not reset the in-flight spec"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let lp = db.get_loop(&loop_id).unwrap().unwrap();
+            if lp.status == LoopStatus::Completed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "resumed run did not complete in time; loop status is {:?}",
+                lp.status
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let spec = db.get_loop_spec("spec-1").unwrap().unwrap();
+        assert_eq!(
+            spec.status,
+            LoopSpecStatus::Completed,
+            "the auto-continued run must have actually executed the spec's graph"
+        );
+    }
+
+    /// `skip_next_spec` must be honored too, not just the default
+    /// `retry_current_node` — the scheduler must pass the configured action
+    /// through exactly like the `loop_continue` MCP tool would.
+    #[tokio::test]
+    async fn fire_due_auto_continue_loops_applies_skip_next_spec_action() {
+        use crate::domain::loops::{Loop, LoopSpec, LoopSpecStatus, LoopStatus};
+
+        let (db, scheduler) = test_scheduler_with_loops();
+        let workdir = tempfile::tempdir().unwrap();
+        let loop_id = "paused-auto-continue-skip".to_string();
+        db.insert_loop(&Loop {
+            id: loop_id.clone(),
+            name: "Auto-continue skip test loop".to_string(),
+            description: None,
+            workdir: workdir.path().to_string_lossy().to_string(),
+            status: LoopStatus::Paused,
+            trigger: None,
+            created_at: Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_pool_id: None,
+            on_completed: None,
+        })
+        .unwrap();
+        db.insert_loop_spec(&LoopSpec {
+            id: "spec-skip".to_string(),
+            loop_id: Some(loop_id.clone()),
+            name: "Spec skip".to_string(),
+            description: Some("desc".to_string()),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Running,
+            started_at: Some(Utc::now()),
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+        db.schedule_loop_auto_continue(
+            &loop_id,
+            Utc::now() - chrono::Duration::minutes(1),
+            Some("skip_next_spec"),
+        )
+        .unwrap();
+
+        scheduler.fire_due_auto_continue_loops(Utc::now()).unwrap();
+
+        let spec = db.get_loop_spec("spec-skip").unwrap().unwrap();
+        assert_eq!(
+            spec.status,
+            LoopSpecStatus::Skipped,
+            "skip_next_spec must mark the in-flight spec skipped, synchronously"
+        );
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert!(lp.auto_continue_at.is_none(), "firing must be one-shot");
+    }
+
     /// A future `enable_at` must not flip the agent to enabled — it's a
     /// schedule, not an immediate action.
     #[test]
@@ -1268,6 +1628,31 @@ mod tests {
         assert!(
             dur <= std::time::Duration::from_secs(6),
             "expected to wake in ~5s for the pending enable_at, got {:?}",
+            dur
+        );
+    }
+
+    /// `next_sleep_duration` must also wake for a pending `auto_continue_at`,
+    /// same as `autorun_at` — otherwise a deferred paused-loop resume would
+    /// rely on the reconcile fallback instead of firing on time.
+    #[test]
+    fn next_sleep_duration_wakes_for_pending_auto_continue_at() {
+        use crate::domain::loops::LoopStatus;
+
+        let (db, scheduler) = test_scheduler_with_loops();
+        db.insert_loop(&sample_loop("soon-auto-continue", LoopStatus::Paused))
+            .unwrap();
+        db.schedule_loop_auto_continue(
+            "soon-auto-continue",
+            Utc::now() + chrono::Duration::seconds(5),
+            None,
+        )
+        .unwrap();
+
+        let dur = scheduler.next_sleep_duration();
+        assert!(
+            dur <= std::time::Duration::from_secs(6),
+            "expected to wake in ~5s for the pending auto_continue_at, got {:?}",
             dur
         );
     }

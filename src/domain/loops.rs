@@ -322,6 +322,25 @@ pub struct Loop {
     /// instead of relying on a blindly polling cron.
     #[serde(default)]
     pub autorun_at: Option<DateTime<Utc>>,
+    /// One-shot deferred resume for a *paused* loop: when set and reached
+    /// while the loop is still `Paused`, the scheduler fires the equivalent
+    /// of `loop_continue` (see `auto_continue_action`) — preserving the
+    /// paused cursor/context — rather than `autorun_at`'s reset-and-relaunch.
+    /// Lets a user pause a loop to stop burning quota now and have it pick
+    /// back up automatically at a later time, without a human calling
+    /// `loop_continue`. Deliberately a separate field from `autorun_at`
+    /// rather than a shared one: the two fire through entirely different
+    /// paths (`resume_background` alone vs. auto-reset-then-`resume_background`)
+    /// and must never be conflated. See `is_auto_continue_due`.
+    #[serde(default)]
+    pub auto_continue_at: Option<DateTime<Utc>>,
+    /// The `loop_continue` action (`"retry_current_node"` or
+    /// `"skip_next_spec"`) to apply when `auto_continue_at` fires. `None`
+    /// (or any value other than `"skip_next_spec"`) defaults to
+    /// `retry_current_node` — see [`crate::scheduler::cron_scheduler`]'s
+    /// auto-continue fire branch.
+    #[serde(default)]
+    pub auto_continue_action: Option<String>,
     /// The pool a run against this loop is currently — or most recently —
     /// drew from, persisted the moment that run starts (`None` for a
     /// bound-spec run). Interrupted runs (a quota failure, a daemon restart)
@@ -421,6 +440,29 @@ impl Loop {
     /// never fires twice.
     pub fn is_autorun_due(&self, now: DateTime<Utc>) -> bool {
         self.autorun_at.is_some_and(|at| now >= at) && self.is_fireable()
+    }
+
+    /// Whether `auto_continue_at` has been reached at `now`, independent of
+    /// status. Used by the scheduler to decide when a schedule is stale (the
+    /// loop left `Paused` some other way before firing) and must be cleared
+    /// even though it won't actually resume the loop — see
+    /// [`Self::is_auto_continue_due`] for the status-gated check that decides
+    /// whether to fire.
+    pub fn is_auto_continue_time_reached(&self, now: DateTime<Utc>) -> bool {
+        self.auto_continue_at.is_some_and(|at| now >= at)
+    }
+
+    /// Whether this loop's one-shot `auto_continue_at` schedule should
+    /// actually fire a deferred `loop_continue` at `now`.
+    ///
+    /// Deliberately Paused-only — unlike [`Self::is_autorun_due`], which is
+    /// due on any *fireable* (non-`Running`/`Paused`) status. Deferring a
+    /// resume only makes sense while the loop is sitting `Paused`; if it left
+    /// that state some other way (manual `loop_continue`, failure) before the
+    /// scheduled time, the schedule is stale — the scheduler clears it
+    /// without firing rather than waiting here for `Paused` to recur.
+    pub fn is_auto_continue_due(&self, now: DateTime<Utc>) -> bool {
+        self.auto_continue_at.is_some_and(|at| now >= at) && self.status == LoopStatus::Paused
     }
 }
 
@@ -867,6 +909,8 @@ Task:
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
             active_run_pool_id: None,
             on_completed: None,
         }
@@ -951,6 +995,48 @@ Task:
             assert!(
                 !lp.is_autorun_due(chrono::Utc::now()),
                 "{status:?} loop must not fire autorun_at"
+            );
+        }
+    }
+
+    #[test]
+    fn past_auto_continue_at_is_due_while_paused() {
+        let mut lp = loop_with_trigger(LoopStatus::Paused, None);
+        lp.auto_continue_at = Some(chrono::Utc::now() - chrono::Duration::minutes(1));
+        assert!(lp.is_auto_continue_due(chrono::Utc::now()));
+    }
+
+    #[test]
+    fn future_auto_continue_at_is_not_due() {
+        let mut lp = loop_with_trigger(LoopStatus::Paused, None);
+        lp.auto_continue_at = Some(chrono::Utc::now() + chrono::Duration::hours(1));
+        assert!(!lp.is_auto_continue_due(chrono::Utc::now()));
+    }
+
+    #[test]
+    fn no_auto_continue_at_is_never_due() {
+        let lp = loop_with_trigger(LoopStatus::Paused, None);
+        assert!(!lp.is_auto_continue_due(chrono::Utc::now()));
+    }
+
+    #[test]
+    fn past_auto_continue_at_is_not_due_while_not_paused() {
+        for status in [
+            LoopStatus::Draft,
+            LoopStatus::Running,
+            LoopStatus::Completed,
+            LoopStatus::Failed,
+        ] {
+            let mut lp = loop_with_trigger(status, None);
+            lp.auto_continue_at = Some(chrono::Utc::now() - chrono::Duration::minutes(1));
+            assert!(
+                !lp.is_auto_continue_due(chrono::Utc::now()),
+                "{status:?} loop must not fire auto_continue_at"
+            );
+            assert!(
+                lp.is_auto_continue_time_reached(chrono::Utc::now()),
+                "{status:?} loop's auto_continue_at time itself must still register as reached \
+                 so the scheduler can clear the stale schedule"
             );
         }
     }

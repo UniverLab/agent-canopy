@@ -812,6 +812,20 @@ pub struct LoopScheduleAutorunParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopScheduleContinueParams {
+    /// Loop ID.
+    pub loop_id: String,
+    /// ISO 8601 timestamp at which a still-paused loop should auto-continue,
+    /// e.g. "2026-07-10T09:00:00Z". Fires once, then the schedule is
+    /// cleared. Omit (or pass null) to cancel any pending auto-continue
+    /// schedule instead of setting a new one.
+    pub at: Option<String>,
+    /// `loop_continue` action to apply when it fires: retry_current_node or
+    /// skip_next_spec. Defaults to retry_current_node when omitted.
+    pub action: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LoopCompleteNodeParams {
     /// The exact node run ID this report belongs to (given to you in the
     /// [REPORTING] section of your prompt). Required so a report can never

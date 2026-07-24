@@ -3065,6 +3065,8 @@ impl TaskTriggerHandler {
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
             active_run_pool_id: None,
             on_completed: None,
         };
@@ -4966,6 +4968,84 @@ impl TaskTriggerHandler {
         )))
     }
 
+    /// Schedule a one-shot deferred resume for a loop that is (or will be)
+    /// `Paused` — the counterpart to `loop_schedule_autorun` for a loop a
+    /// user paused on purpose (e.g. to stop burning quota right now) rather
+    /// than one that failed. When the scheduler reaches `at` and the loop is
+    /// still `Paused`, it fires the exact `loop_continue` action requested
+    /// here — preserving the paused cursor/context — instead of
+    /// `autorun_at`'s reset-and-relaunch. If the loop is no longer `Paused`
+    /// by then (resumed manually, failed, completed, running), the schedule
+    /// is cleared without firing; it never double-runs. Always one-shot.
+    #[tool(
+        name = "loop_schedule_continue",
+        description = "Schedule a one-shot deferred loop_continue for a paused loop at a future ISO 8601 time, or cancel a pending one. When the scheduler reaches that time and the loop is still `paused`, it fires loop_continue with `action` (retry_current_node by default, or skip_next_spec) — resuming with the paused cursor/context intact, never resetting or relaunching. If the loop is no longer paused by then (already continued manually, failed, completed, running), the schedule is cleared without firing. The schedule always clears after firing (one-shot). Omit `at` (or pass null) to cancel any pending auto-continue instead of scheduling one — a no-op (not an error) if nothing was scheduled. Use this instead of loop_schedule_autorun to defer resuming a loop you paused on purpose, e.g. to stop burning quota now and pick back up automatically at a later time."
+    )]
+    async fn loop_schedule_continue(
+        &self,
+        Parameters(LoopScheduleContinueParams {
+            loop_id,
+            at,
+            action,
+        }): Parameters<LoopScheduleContinueParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let Some(existing) = self
+            .db
+            .get_loop(&loop_id)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        else {
+            return Ok(error_result(&format!(
+                "No loop found with ID '{}'",
+                loop_id
+            )));
+        };
+
+        let Some(at) = at else {
+            let previously_scheduled = existing.auto_continue_at;
+            self.db
+                .clear_loop_auto_continue(&loop_id)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            return Ok(success_result(&match previously_scheduled {
+                Some(previous_at) => format!(
+                    "Loop '{}' auto-continue scheduled for {} was cancelled.",
+                    loop_id,
+                    previous_at.to_rfc3339()
+                ),
+                None => format!("Loop '{}' had no pending auto-continue to cancel.", loop_id),
+            }));
+        };
+
+        let action = action.unwrap_or_else(|| "retry_current_node".to_string());
+        if action != "retry_current_node" && action != "skip_next_spec" {
+            return Ok(error_result(
+                "loop_schedule_continue action must be retry_current_node or skip_next_spec.",
+            ));
+        }
+
+        let at = match chrono::DateTime::parse_from_rfc3339(&at) {
+            Ok(dt) => dt.with_timezone(&chrono::Utc),
+            Err(e) => {
+                return Ok(error_result(&format!(
+                    "Invalid ISO 8601 timestamp '{}': {}",
+                    at, e
+                )));
+            }
+        };
+
+        self.db
+            .schedule_loop_auto_continue(&loop_id, at, Some(&action))
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        self.scheduler_notify.notify_one();
+
+        Ok(success_result(&format!(
+            "Loop '{}' scheduled to auto-continue ({}) at {}",
+            loop_id,
+            action,
+            at.to_rfc3339()
+        )))
+    }
+
     #[tool(
         name = "loop_pause",
         description = "Pause a running loop after the current node finishes."
@@ -5411,7 +5491,7 @@ fn format_system_time(time: std::time::SystemTime) -> String {
 /// member's `loop_id` column stays `None` (pool membership never binds it),
 /// so `list_loop_specs(loop_id)` alone can't see it (B18): the loop's
 /// persisted `active_run_pool_id` is what names the pool to look in instead.
-fn handle_skip_next_spec(db: &Database, loop_id: &str) -> Result<(), McpError> {
+pub(crate) fn handle_skip_next_spec(db: &Database, loop_id: &str) -> Result<(), McpError> {
     let bound_running = db
         .list_loop_specs(loop_id)
         .map_err(internal_error)?
@@ -5437,7 +5517,7 @@ fn handle_skip_next_spec(db: &Database, loop_id: &str) -> Result<(), McpError> {
 
 /// Validate that a running spec exists for `retry_current_node` — the same
 /// lookup shape as [`handle_skip_next_spec`] but only checks, never mutates.
-fn handle_retry_current_node(db: &Database, loop_id: &str) -> Result<(), McpError> {
+pub(crate) fn handle_retry_current_node(db: &Database, loop_id: &str) -> Result<(), McpError> {
     let bound_running = db
         .list_loop_specs(loop_id)
         .map_err(internal_error)?
@@ -5905,8 +5985,8 @@ mod tests {
     };
     use crate::daemon::params::{
         LoopCopyEnsembleParams, LoopCopyNodeParams, LoopRunParams, LoopScheduleAutorunParams,
-        PoolAddSpecParams, PoolCreateParams, PoolListParams, QueueAddSpecParams, QueueCreateParams,
-        QueueListParams,
+        LoopScheduleContinueParams, PoolAddSpecParams, PoolCreateParams, PoolListParams,
+        QueueAddSpecParams, QueueCreateParams, QueueListParams,
     };
     use crate::db::Database;
     use crate::domain::blueprints::Blueprint;
@@ -6186,6 +6266,8 @@ mod tests {
             started_at: None,
             completed_at: Some(chrono::Utc::now()),
             autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
             active_run_pool_id: None,
             on_completed: None,
         })
@@ -6268,6 +6350,8 @@ mod tests {
             started_at: None,
             completed_at: Some(chrono::Utc::now()),
             autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
             active_run_pool_id: Some("pool-1".to_string()),
             on_completed: None,
         })
@@ -6809,6 +6893,8 @@ mod tests {
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
             active_run_pool_id: None,
             on_completed: None,
         })
@@ -6845,6 +6931,8 @@ mod tests {
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
             active_run_pool_id: None,
             on_completed: None,
         })
@@ -6976,6 +7064,8 @@ mod tests {
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
             active_run_pool_id: None,
             on_completed: None,
         })
@@ -7418,6 +7508,8 @@ mod tests {
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
             active_run_pool_id: None,
             on_completed: None,
         })
@@ -7462,6 +7554,8 @@ mod tests {
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
             active_run_pool_id: None,
             on_completed: None,
         })
@@ -7510,6 +7604,8 @@ mod tests {
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
             active_run_pool_id: None,
             on_completed: None,
         })
@@ -7548,6 +7644,8 @@ mod tests {
             started_at: None,
             completed_at: None,
             autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
             active_run_pool_id: None,
             on_completed: None,
         }
@@ -7647,6 +7745,211 @@ mod tests {
         assert!(!result.is_error.unwrap_or(false), "{result:?}");
         let text = result_text(&result);
         assert!(text.contains("no pending autorun"), "{text}");
+    }
+
+    // ── loop_schedule_continue: deferred resume of a paused loop ───────
+
+    /// Setting a schedule on a paused loop must persist `auto_continue_at`
+    /// and default the action to `retry_current_node` when omitted.
+    #[tokio::test]
+    async fn loop_schedule_continue_sets_pending_schedule_with_default_action() {
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let (dir, db, handler) = queue_test_handler();
+        let loop_id = "loop-paused-continue";
+        db.insert_loop(&autorun_test_loop(
+            loop_id,
+            &dir.path().to_string_lossy(),
+            LoopStatus::Paused,
+        ))
+        .unwrap();
+        let scheduled_at = chrono::DateTime::from_timestamp(
+            (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp(),
+            0,
+        )
+        .unwrap();
+
+        let result = handler
+            .loop_schedule_continue(Parameters(LoopScheduleContinueParams {
+                loop_id: loop_id.to_string(),
+                at: Some(scheduled_at.to_rfc3339()),
+                action: None,
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        let text = result_text(&result);
+        assert!(text.contains("retry_current_node"), "{text}");
+        let lp = db.get_loop(loop_id).unwrap().unwrap();
+        assert_eq!(lp.auto_continue_at, Some(scheduled_at));
+        assert_eq!(
+            lp.auto_continue_action.as_deref(),
+            Some("retry_current_node")
+        );
+    }
+
+    /// An explicit `skip_next_spec` action must be persisted as given.
+    #[tokio::test]
+    async fn loop_schedule_continue_persists_explicit_skip_action() {
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let (dir, db, handler) = queue_test_handler();
+        let loop_id = "loop-paused-continue-skip";
+        db.insert_loop(&autorun_test_loop(
+            loop_id,
+            &dir.path().to_string_lossy(),
+            LoopStatus::Paused,
+        ))
+        .unwrap();
+
+        handler
+            .loop_schedule_continue(Parameters(LoopScheduleContinueParams {
+                loop_id: loop_id.to_string(),
+                at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+                action: Some("skip_next_spec".to_string()),
+            }))
+            .await
+            .unwrap();
+
+        let lp = db.get_loop(loop_id).unwrap().unwrap();
+        assert_eq!(lp.auto_continue_action.as_deref(), Some("skip_next_spec"));
+    }
+
+    /// An invalid action must be rejected without touching the schedule.
+    #[tokio::test]
+    async fn loop_schedule_continue_rejects_invalid_action() {
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let (dir, db, handler) = queue_test_handler();
+        let loop_id = "loop-paused-continue-bad-action";
+        db.insert_loop(&autorun_test_loop(
+            loop_id,
+            &dir.path().to_string_lossy(),
+            LoopStatus::Paused,
+        ))
+        .unwrap();
+
+        let result = handler
+            .loop_schedule_continue(Parameters(LoopScheduleContinueParams {
+                loop_id: loop_id.to_string(),
+                at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+                action: Some("not_a_real_action".to_string()),
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.is_error.unwrap_or(false), "{result:?}");
+        let lp = db.get_loop(loop_id).unwrap().unwrap();
+        assert!(
+            lp.auto_continue_at.is_none(),
+            "an invalid action must not schedule anything"
+        );
+    }
+
+    /// Omitting `at` must cancel a pending auto-continue schedule, mirroring
+    /// `loop_schedule_autorun`'s cancel semantics (B41).
+    #[tokio::test]
+    async fn loop_schedule_continue_cancels_pending_schedule() {
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let (dir, db, handler) = queue_test_handler();
+        let loop_id = "loop-paused-continue-cancel";
+        db.insert_loop(&autorun_test_loop(
+            loop_id,
+            &dir.path().to_string_lossy(),
+            LoopStatus::Paused,
+        ))
+        .unwrap();
+        db.schedule_loop_auto_continue(
+            loop_id,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            Some("retry_current_node"),
+        )
+        .unwrap();
+
+        let result = handler
+            .loop_schedule_continue(Parameters(LoopScheduleContinueParams {
+                loop_id: loop_id.to_string(),
+                at: None,
+                action: None,
+            }))
+            .await
+            .unwrap();
+
+        let text = result_text(&result);
+        assert!(text.contains("cancelled"), "{text}");
+        let lp = db.get_loop(loop_id).unwrap().unwrap();
+        assert!(
+            lp.auto_continue_at.is_none(),
+            "cancel must clear auto_continue_at"
+        );
+        assert_eq!(
+            lp.status,
+            LoopStatus::Paused,
+            "cancelling must not touch loop status"
+        );
+    }
+
+    /// Cancelling when nothing is scheduled must succeed and say so.
+    #[tokio::test]
+    async fn loop_schedule_continue_cancel_with_nothing_scheduled_is_not_an_error() {
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let (dir, db, handler) = queue_test_handler();
+        let loop_id = "loop-paused-no-continue";
+        db.insert_loop(&autorun_test_loop(
+            loop_id,
+            &dir.path().to_string_lossy(),
+            LoopStatus::Paused,
+        ))
+        .unwrap();
+
+        let result = handler
+            .loop_schedule_continue(Parameters(LoopScheduleContinueParams {
+                loop_id: loop_id.to_string(),
+                at: None,
+                action: None,
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        let text = result_text(&result);
+        assert!(text.contains("no pending auto-continue"), "{text}");
+    }
+
+    /// Scheduling `loop_schedule_continue` must never touch `autorun_at`,
+    /// and vice versa — the two schedules must stay fully independent so
+    /// they can never be conflated at fire time.
+    #[tokio::test]
+    async fn loop_schedule_continue_and_loop_schedule_autorun_are_independent() {
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let (dir, db, handler) = queue_test_handler();
+        let loop_id = "loop-independent-schedules";
+        db.insert_loop(&autorun_test_loop(
+            loop_id,
+            &dir.path().to_string_lossy(),
+            LoopStatus::Paused,
+        ))
+        .unwrap();
+
+        handler
+            .loop_schedule_continue(Parameters(LoopScheduleContinueParams {
+                loop_id: loop_id.to_string(),
+                at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+                action: None,
+            }))
+            .await
+            .unwrap();
+
+        let lp = db.get_loop(loop_id).unwrap().unwrap();
+        assert!(lp.auto_continue_at.is_some());
+        assert!(
+            lp.autorun_at.is_none(),
+            "loop_schedule_continue must not set autorun_at"
+        );
     }
 
     // ── U10: copy nodes and ensembles ────────────────────────────────

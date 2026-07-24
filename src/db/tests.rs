@@ -102,6 +102,8 @@ fn sample_loop(id: &str) -> Loop {
         started_at: None,
         completed_at: None,
         autorun_at: None,
+        auto_continue_at: None,
+        auto_continue_action: None,
         active_run_pool_id: None,
         on_completed: None,
     }
@@ -2144,6 +2146,65 @@ fn active_run_pool_id_migration_is_idempotent_and_a_pre_b8_database_opens_cleanl
     let db = Database::new(&path).expect("reopen db after migration already applied");
     let lp = db.get_loop("legacy-loop").unwrap().unwrap();
     assert_eq!(lp.active_run_pool_id.as_deref(), Some("pool-1"));
+}
+
+#[test]
+fn auto_continue_migration_is_idempotent_and_a_pre_migration_database_opens_cleanly() {
+    // Simulate a database written before `auto_continue_at`/`auto_continue_action`
+    // existed: `loops` has every other current column, including `autorun_at`.
+    let tmp = NamedTempFile::new().expect("create temp file");
+    let path = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+
+    {
+        let conn = rusqlite::Connection::open(&path).expect("open raw legacy db");
+        conn.execute_batch(
+            "CREATE TABLE loops (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                workdir TEXT NOT NULL,
+                status TEXT NOT NULL,
+                trigger_type TEXT,
+                trigger_config TEXT,
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER,
+                autorun_at INTEGER,
+                spec_pool TEXT,
+                active_run_pool_id TEXT,
+                on_completed TEXT
+             );
+             INSERT INTO loops (id, name, workdir, status, created_at)
+                 VALUES ('legacy-loop', 'Legacy', '/tmp', 'paused', 0);",
+        )
+        .expect("seed legacy schema");
+    }
+
+    // Opening the DB (Database::new runs the migration) must succeed and add
+    // both new columns, NULL on the existing row.
+    let db = Database::new(&path).expect("open pre-auto-continue db, running migration");
+    let lp = db.get_loop("legacy-loop").unwrap().unwrap();
+    assert_eq!(lp.name, "Legacy");
+    assert_eq!(lp.auto_continue_at, None);
+    assert_eq!(lp.auto_continue_action, None);
+
+    // The new columns are actually usable after migration.
+    let at = chrono::DateTime::from_timestamp(
+        (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp(),
+        0,
+    )
+    .unwrap();
+    db.schedule_loop_auto_continue("legacy-loop", at, Some("skip_next_spec"))
+        .unwrap();
+    drop(db);
+
+    // Reopening after the migration already ran must be a no-op: same data,
+    // no error (idempotent).
+    let db = Database::new(&path).expect("reopen db after migration already applied");
+    let lp = db.get_loop("legacy-loop").unwrap().unwrap();
+    assert_eq!(lp.auto_continue_at, Some(at));
+    assert_eq!(lp.auto_continue_action.as_deref(), Some("skip_next_spec"));
 }
 
 #[test]

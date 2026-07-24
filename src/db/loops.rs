@@ -30,8 +30,8 @@ impl Database {
         let (trigger_type, trigger_config) = encode_loop_trigger(lp.trigger.as_ref())?;
         let on_completed = encode_loop_completion_hook(lp.on_completed.as_ref())?;
         conn.execute(
-            "INSERT INTO loops (id, name, description, workdir, status, trigger_type, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO loops (id, name, description, workdir, status, trigger_type, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 &lp.id,
                 &lp.name,
@@ -46,6 +46,8 @@ impl Database {
                 lp.autorun_at.map(|value| value.timestamp()),
                 &lp.active_run_pool_id,
                 on_completed,
+                lp.auto_continue_at.map(|value| value.timestamp()),
+                &lp.auto_continue_action,
             ],
         )?;
         Ok(())
@@ -86,8 +88,63 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action
              FROM loops WHERE autorun_at IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], map_loop_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Schedule a one-shot deferred resume for a *paused* loop at `at`: the
+    /// scheduler fires the `loop_continue` action `action` (defaults to
+    /// `retry_current_node` when `None`) once `at` is reached, but only if
+    /// the loop is still `Paused` — see
+    /// [`crate::domain::loops::Loop::is_auto_continue_due`]. Distinct from
+    /// [`Self::schedule_loop_autorun`], which resets-and-relaunches instead
+    /// of resuming in place.
+    pub fn schedule_loop_auto_continue(
+        &self,
+        loop_id: &str,
+        at: DateTime<Utc>,
+        action: Option<&str>,
+    ) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE loops SET auto_continue_at = ?1, auto_continue_action = ?2 WHERE id = ?3",
+            params![at.timestamp(), action, loop_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Clear a loop's pending one-shot auto-continue schedule, without
+    /// touching status.
+    pub fn clear_loop_auto_continue(&self, loop_id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE loops SET auto_continue_at = NULL, auto_continue_action = NULL WHERE id = ?1",
+            params![loop_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Loops with a pending one-shot auto-continue schedule (regardless of
+    /// trigger or current status — callers gate firing on
+    /// [`crate::domain::loops::Loop::is_auto_continue_due`]).
+    pub fn list_pending_auto_continue_loops(&self) -> Result<Vec<Loop>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action
+             FROM loops WHERE auto_continue_at IS NOT NULL",
         )?;
         let rows = stmt.query_map([], map_loop_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -145,7 +202,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action
              FROM loops WHERE trigger_type = ?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![trigger_type], map_loop_row)?;
@@ -190,7 +247,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action
              FROM loops WHERE id = ?1",
         )?;
 
@@ -205,10 +262,10 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let sql = if workdir.is_some() {
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action
              FROM loops WHERE workdir = ?1 ORDER BY created_at DESC"
         } else {
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action
              FROM loops ORDER BY created_at DESC"
         };
         let mut stmt = conn.prepare(sql)?;
@@ -1236,7 +1293,7 @@ impl Database {
 
         let orphaned: Vec<Loop> = {
             let mut stmt = tx.prepare(
-                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed
+                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action
                  FROM loops WHERE status = ?1",
             )?;
             let rows = stmt.query_map(params![LoopStatus::Running.as_str()], map_loop_row)?;
@@ -1601,6 +1658,11 @@ fn map_loop_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Loop> {
             .as_deref()
             .map(decode_loop_completion_hook)
             .transpose()?,
+        auto_continue_at: row
+            .get::<_, Option<i64>>(12)?
+            .map(from_timestamp)
+            .transpose()?,
+        auto_continue_action: row.get(13)?,
     })
 }
 

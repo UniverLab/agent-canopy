@@ -215,7 +215,9 @@ impl Database {
                 autorun_at INTEGER,
                 spec_pool TEXT,
                 active_run_pool_id TEXT,
-                on_completed TEXT
+                on_completed TEXT,
+                auto_continue_at INTEGER,
+                auto_continue_action TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_loops_workdir_created
@@ -569,6 +571,30 @@ impl Database {
         if !has_autorun_at {
             conn.execute("ALTER TABLE loops ADD COLUMN autorun_at INTEGER", [])
                 .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // One-shot deferred-resume-while-paused schedule (distinct from
+        // `autorun_at`'s reset-and-relaunch — see
+        // [`crate::domain::loops::Loop::auto_continue_at`]); older databases
+        // predate the columns.
+        for (column, sql_type) in [
+            ("auto_continue_at", "INTEGER"),
+            ("auto_continue_action", "TEXT"),
+        ] {
+            let has_column: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('loops') WHERE name = ?1",
+                    [column],
+                    |row| Ok(row.get::<_, i32>(0)? > 0),
+                )
+                .unwrap_or(false);
+            if !has_column {
+                conn.execute(
+                    &format!("ALTER TABLE loops ADD COLUMN {column} {sql_type}"),
+                    [],
+                )
+                .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+            }
         }
 
         // `spec_pool` (7f2efdf) was an unused template model, retired in favor
