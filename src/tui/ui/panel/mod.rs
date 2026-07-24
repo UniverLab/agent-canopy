@@ -5,7 +5,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Color;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::theme::Theme;
@@ -44,9 +44,10 @@ fn render_panel_block<'a>(
     area: Rect,
     border_color: Color,
     title: Option<Span<'a>>,
+    theme: &Theme,
 ) -> Rect {
     let mut block = Block::default()
-        .borders(Borders::ALL)
+        .borders(super::borders_for(theme))
         .border_style(Style::default().fg(border_color));
 
     if let Some(title) = title {
@@ -586,7 +587,7 @@ pub(super) fn draw_log_panel(frame: &mut Frame, area: Rect, app: &mut App, theme
                 .add_modifier(Modifier::BOLD),
         )
     });
-    let inner = render_panel_block(frame, area, border_color, title);
+    let inner = render_panel_block(frame, area, border_color, title, theme);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -1571,7 +1572,7 @@ pub(super) fn draw_split_panel(
             .add_modifier(Modifier::BOLD),
     );
 
-    let inner = render_panel_block(frame, area, border_color, Some(title));
+    let inner = render_panel_block(frame, area, border_color, Some(title), theme);
     if inner.width == 0 || inner.height == 0 {
         return;
     }

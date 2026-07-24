@@ -1,7 +1,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
 use super::centered_rect;
@@ -26,7 +26,7 @@ pub fn draw_loop_editor_dialog(frame: &mut Frame, app: &App, theme: &Theme) {
 
     let block = Block::default()
         .title(dialog.title.as_str())
-        .borders(Borders::ALL)
+        .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(border_color))
         .style(Style::default().bg(Color::Rgb(15, 25, 15)));
     let inner = block.inner(area);

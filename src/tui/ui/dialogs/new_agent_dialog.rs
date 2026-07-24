@@ -1,7 +1,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
 use super::{centered_rect, draw_dialog_left_wave, truncate_str};
@@ -100,7 +100,7 @@ pub fn draw_new_agent_dialog(frame: &mut Frame, app: &App, theme: &Theme) {
 
     let block = Block::default()
         .title(dialog_title(dialog))
-        .borders(Borders::ALL)
+        .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(accent))
         .style(Style::default().bg(Color::Rgb(15, 25, 15)));
 

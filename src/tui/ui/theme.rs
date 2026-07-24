@@ -4,9 +4,6 @@
 
 use ratatui::style::Color;
 
-/// `panel_bg`, `sidebar_bg`, and `show_borders` stay unread until T5 wires
-/// up the borderless modern theme.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {
     pub border_color: Color,
@@ -31,6 +28,25 @@ impl Theme {
             header_color: Color::Rgb(76, 175, 80),
             dim_text: Color::Rgb(150, 150, 170),
             show_borders: true,
+        }
+    }
+
+    /// Borderless, background-contrast look (T5): panels are separated by
+    /// differing background colors instead of box-drawing borders.
+    ///
+    /// Nothing constructs this outside tests yet — theme selection/persistence
+    /// is T6's job — so the compiler can't see a production caller.
+    #[allow(dead_code)]
+    pub fn modern() -> Self {
+        let panel_bg = Color::Rgb(25, 25, 35);
+        Self {
+            border_color: panel_bg,
+            panel_bg,
+            sidebar_bg: Color::Rgb(18, 18, 25),
+            selected_bg: Color::Rgb(40, 40, 55),
+            header_color: Color::Rgb(160, 160, 170),
+            dim_text: Color::Rgb(90, 90, 100),
+            show_borders: false,
         }
     }
 }
@@ -60,5 +76,87 @@ mod tests {
         assert_eq!(theme.header_color, Color::Rgb(76, 175, 80));
         assert_eq!(theme.dim_text, Color::Rgb(150, 150, 170));
         assert!(theme.show_borders);
+    }
+
+    #[test]
+    fn modern_is_borderless() {
+        assert!(!Theme::modern().show_borders);
+    }
+
+    #[test]
+    fn modern_reproduces_spec_values() {
+        let theme = Theme::modern();
+        assert_eq!(theme.panel_bg, Color::Rgb(25, 25, 35));
+        assert_eq!(theme.border_color, theme.panel_bg);
+        assert_eq!(theme.sidebar_bg, Color::Rgb(18, 18, 25));
+        assert_eq!(theme.selected_bg, Color::Rgb(40, 40, 55));
+        assert_eq!(theme.header_color, Color::Rgb(160, 160, 170));
+        assert_eq!(theme.dim_text, Color::Rgb(90, 90, 100));
+    }
+
+    #[test]
+    fn borders_for_classic_draws_all_sides() {
+        use ratatui::widgets::Borders;
+        let borders = crate::tui::ui::borders_for(&Theme::classic());
+        assert_eq!(borders, Borders::ALL);
+        assert!(!borders.is_empty());
+    }
+
+    #[test]
+    fn borders_for_modern_draws_no_sides() {
+        use ratatui::widgets::Borders;
+        let borders = crate::tui::ui::borders_for(&Theme::modern());
+        assert_eq!(borders, Borders::NONE);
+        assert!(borders.is_empty());
+    }
+
+    #[test]
+    fn test_backend_classic_draws_box_glyphs_modern_does_not() {
+        use ratatui::backend::TestBackend;
+        use ratatui::widgets::{Block, Borders};
+        use ratatui::Terminal;
+
+        let render = |borders: Borders| -> String {
+            let backend = TestBackend::new(10, 5);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| {
+                    let block = Block::default()
+                        .borders(borders)
+                        .border_style(ratatui::style::Style::default().fg(Color::White));
+                    frame.render_widget(block, frame.area());
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let mut text = String::new();
+            for y in 0..buffer.area.height {
+                for x in 0..buffer.area.width {
+                    text.push_str(buffer[(x, y)].symbol());
+                }
+                text.push('\n');
+            }
+            text
+        };
+
+        let classic = render(Borders::ALL);
+        let modern = render(Borders::NONE);
+
+        // Borders::ALL paints corners on the top-left of a 10-wide frame.
+        assert!(
+            classic.starts_with('┌'),
+            "Borders::ALL should paint a top-left corner glyph\n{classic}"
+        );
+        // Borders::NONE paints no glyphs at all in the frame interior.
+        for line in modern.lines() {
+            assert!(
+                !line.contains('─')
+                    && !line.contains('│')
+                    && !line.contains('┌')
+                    && !line.contains('┐')
+                    && !line.contains('└')
+                    && !line.contains('┘'),
+                "Borders::NONE must not contain any box-drawing glyphs\nline: {line:?}\nfull:\n{modern}"
+            );
+        }
     }
 }

@@ -4,11 +4,11 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 
 use super::theme::Theme;
-use super::{last_two_segments, truncate_str, BG_HOVER, INTERACTIVE_COLOR};
+use super::{borders_for, last_two_segments, truncate_str, BG_HOVER, INTERACTIVE_COLOR};
 use super::{STATUS_DISABLED, STATUS_FAIL, STATUS_OK, STATUS_RUNNING};
 use crate::domain::loops::{Loop, LoopStatus};
 use crate::tui::agent::AgentStatus;
@@ -23,6 +23,11 @@ pub(super) fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App, theme: 
     app.project_click_map.clear();
     app.layer_header_click_map.clear();
     app.sidebar_visible_capacity = 0;
+
+    frame.render_widget(
+        Paragraph::new("").style(Style::default().bg(theme.sidebar_bg)),
+        area,
+    );
 
     let areas = split_sidebar_content(area, app, theme);
 
@@ -40,6 +45,7 @@ pub(super) fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App, theme: 
                 theme.dim_text
             }),
             rag_border_style(app, theme),
+            theme,
             |frame, inner| draw_rag_info(frame, inner, app, theme),
         );
     }
@@ -102,13 +108,18 @@ fn split_top_panel(content: Rect, enabled: bool, top_height: u16) -> (Option<Rec
     (Some(top), bottom)
 }
 
-fn section_block<'a>(title: &'a str, title_style: Style, border_style: Style) -> Block<'a> {
+fn section_block<'a>(
+    title: &'a str,
+    title_style: Style,
+    border_style: Style,
+    theme: &Theme,
+) -> Block<'a> {
     Block::default()
         .title_bottom(
             Line::from(Span::styled(title, title_style))
                 .alignment(ratatui::layout::Alignment::Right),
         )
-        .borders(Borders::ALL)
+        .borders(borders_for(theme))
         .border_style(border_style)
 }
 
@@ -118,9 +129,10 @@ fn render_titled_panel(
     title: &str,
     title_style: Style,
     border_style: Style,
+    theme: &Theme,
     render_inner: impl FnOnce(&mut Frame, Rect),
 ) {
-    let block = section_block(title, title_style, border_style);
+    let block = section_block(title, title_style, border_style, theme);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     render_inner(frame, inner);
@@ -215,6 +227,7 @@ fn render_brain_or_graph(frame: &mut Frame, area: Rect, app: &App, theme: &Theme
             " project graph ",
             Style::default().fg(theme.dim_text),
             Style::default().fg(theme.dim_text),
+            theme,
             |frame, inner| draw_project_graph(frame, inner, app),
         );
         return;
@@ -567,6 +580,7 @@ fn draw_automation_body(
             " loops ",
             Style::default().fg(theme.dim_text),
             automation_border_style(app, AutomationKind::Loop, theme),
+            theme,
             |frame, inner| draw_automation_loops_list(frame, inner, app, theme),
         );
     }
@@ -579,6 +593,7 @@ fn draw_knowledge_body(frame: &mut Frame, area: Rect, app: &mut App, theme: &The
         " projects ",
         Style::default().fg(theme.dim_text),
         knowledge_border_style(app, theme),
+        theme,
         |frame, inner| draw_projects_list(frame, inner, app, theme),
     );
 }
@@ -675,6 +690,7 @@ fn render_agent_list_panel(
         title,
         Style::default().fg(theme.dim_text),
         border_style,
+        theme,
         |frame, inner| draw_agent_list(frame, inner, indices, app, accent, theme),
     );
 }
@@ -695,6 +711,7 @@ fn render_groups_panel(
         " groups ",
         Style::default().fg(theme.dim_text),
         agent_section_border_style(app, section, theme),
+        theme,
         |frame, inner| draw_groups_list(frame, inner, app, theme),
     );
 }
@@ -1602,7 +1619,7 @@ fn draw_project_relation_dialog(
 
     let block = Block::default()
         .title(format!(" Link: {} ", dialog.from_name))
-        .borders(Borders::ALL)
+        .borders(borders_for(theme))
         .border_style(Style::default().fg(theme.header_color));
     frame.render_widget(block, area);
 
@@ -1718,6 +1735,15 @@ mod tests {
     /// a `width`x`height` TestBackend and returns the screen contents as a
     /// flat string for substring assertions.
     fn render_sidebar_text(project_count: usize, width: u16, height: u16) -> String {
+        render_sidebar_text_themed(project_count, width, height, &Theme::classic())
+    }
+
+    fn render_sidebar_text_themed(
+        project_count: usize,
+        width: u16,
+        height: u16,
+        theme: &Theme,
+    ) -> String {
         use crate::db::Database;
         use crate::domain::loops::{Loop, LoopStatus};
         use crate::domain::project::Project;
@@ -1770,7 +1796,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_sidebar(frame, area, &mut app, &Theme::classic());
+                draw_sidebar(frame, area, &mut app, theme);
             })
             .unwrap();
 
@@ -1803,6 +1829,41 @@ mod tests {
     fn automation_layer_shows_running_loop() {
         let text = render_sidebar_text(1, 34, 40);
         assert!(text.contains("Probe Loop"), "expected loop name visible");
+    }
+
+    #[test]
+    fn modern_theme_drops_border_glyphs_where_classic_shows_them() {
+        // T5: a modern-rendered sidebar must have no box-drawing border glyphs,
+        // while the classic-rendered sidebar must still show them — the
+        // background contrast alone is expected to separate panels.
+        let border_glyphs = ['─', '│', '┌', '┐', '└', '┘', '├', '┤', '┬', '┴', '┼'];
+        let assert_no_borders = |label: &str, text: &str| {
+            for glyph in border_glyphs {
+                assert!(
+                    !text.contains(glyph),
+                    "{label} render unexpectedly contains border glyph {glyph:?}\n--- text ---\n{text}"
+                );
+            }
+        };
+
+        let classic_text = render_sidebar_text_themed(1, 34, 40, &Theme::classic());
+        assert!(
+            border_glyphs.iter().any(|g| classic_text.contains(*g)),
+            "classic render should still draw box-drawing borders\n--- text ---\n{classic_text}"
+        );
+
+        let modern_text = render_sidebar_text_themed(1, 34, 40, &Theme::modern());
+        assert_no_borders("modern", &modern_text);
+        // And the labels that the modern sidebar still owes the user must
+        // survive (sanity: we didn't accidentally turn the whole area blank).
+        assert!(
+            modern_text.contains("Live"),
+            "modern must keep the Live label"
+        );
+        assert!(
+            modern_text.contains("Automation"),
+            "modern must keep the Automation label"
+        );
     }
 
     #[test]

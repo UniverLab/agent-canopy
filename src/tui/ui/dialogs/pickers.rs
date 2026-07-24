@@ -1,7 +1,7 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph};
 use ratatui::Frame;
 
 use super::centered_rect;
@@ -31,7 +31,7 @@ pub fn draw_split_picker(frame: &mut Frame, app: &App, theme: &Theme) {
 
     let block = Block::default()
         .title(" Split con... ")
-        .borders(Borders::ALL)
+        .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(Color::Green))
         .style(Style::default().bg(Color::Rgb(15, 25, 15)));
     let inner = block.inner(area);
@@ -155,7 +155,7 @@ pub fn draw_suggestion_picker(
         );
         frame.render_widget(Clear, area);
         let block = Block::default()
-            .borders(Borders::ALL)
+            .borders(crate::tui::ui::borders_for(theme))
             .border_style(Style::default().fg(theme.border_color))
             .style(Style::default().bg(Color::Rgb(15, 15, 25)));
         let inner = block.inner(area);
@@ -204,7 +204,7 @@ pub fn draw_suggestion_picker(
 
     let block = Block::default()
         .title(title)
-        .borders(Borders::ALL)
+        .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(theme.header_color))
         .style(Style::default().bg(Color::Rgb(15, 25, 15)));
     let inner = block.inner(area);

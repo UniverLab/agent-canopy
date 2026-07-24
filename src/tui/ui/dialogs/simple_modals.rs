@@ -1,7 +1,7 @@
 use ratatui::layout::{Alignment, Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
 use super::{centered_rect, draw_dialog_left_wave};
@@ -50,7 +50,7 @@ fn draw_modal_confirm(frame: &mut Frame, title: &str, text: &str, theme: &Theme)
 
     let block = Block::default()
         .title(title)
-        .borders(Borders::ALL)
+        .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(theme.header_color))
         .style(Style::default().bg(Color::Rgb(15, 25, 15)));
     let inner = block.inner(area);
@@ -145,7 +145,7 @@ pub fn draw_legend(frame: &mut Frame, app: &mut App, theme: &Theme) {
 
     let block = Block::default()
         .title(" Canopy Missions ")
-        .borders(Borders::ALL)
+        .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(theme.header_color))
         .style(Style::default().bg(Color::Rgb(12, 20, 12)));
     let inner = block.inner(area);

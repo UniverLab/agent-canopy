@@ -1,6 +1,6 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
 use super::{draw_dialog_left_wave, truncate_str};
@@ -442,7 +442,7 @@ pub fn draw_simple_prompt_dialog(
     let title = " Prompt Builder ";
     let block = Block::default()
         .title(title)
-        .borders(Borders::ALL)
+        .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(accent))
         .style(Style::default().bg(Color::Rgb(15, 25, 15)));
 
@@ -872,7 +872,7 @@ pub fn draw_simple_prompt_dialog(
     // Draw @ file picker dropdown if active
     if dialog.at_picker.is_some() {
         let anchor = picker_anchor_area.unwrap_or(inner);
-        draw_at_picker_dropdown(frame, area, anchor, accent, dialog);
+        draw_at_picker_dropdown(frame, area, anchor, accent, dialog, theme);
     }
 
     // Draw picker modal if open

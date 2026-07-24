@@ -1,7 +1,7 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::tui::app::types::App;
@@ -23,7 +23,7 @@ pub fn draw_knowledge_dialog(frame: &mut Frame, app: &App, theme: &Theme) {
         } else {
             " New Knowledge "
         })
-        .borders(Borders::ALL)
+        .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(ACCENT));
 
     let inner = block.inner(dialog_area);
@@ -107,9 +107,14 @@ fn draw_field(
     theme: &Theme,
 ) {
     let border_color = if focused { ACCENT } else { theme.border_color };
+    let title_style = if focused {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
     let block = Block::default()
-        .title(format!(" {} ", label))
-        .borders(Borders::ALL)
+        .title(Span::styled(format!(" {} ", label), title_style))
+        .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(border_color));
 
     let inner = block.inner(area);
@@ -133,9 +138,14 @@ fn draw_multiline_field(
     theme: &Theme,
 ) {
     let border_color = if focused { ACCENT } else { theme.border_color };
+    let title_style = if focused {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
     let block = Block::default()
-        .title(format!(" {} ", label))
-        .borders(Borders::ALL)
+        .title(Span::styled(format!(" {} ", label), title_style))
+        .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(border_color));
 
     let inner = block.inner(area);

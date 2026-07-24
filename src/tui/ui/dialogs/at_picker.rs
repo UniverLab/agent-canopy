@@ -1,9 +1,10 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph};
 use ratatui::Frame;
 
 use crate::tui::app::dialog::SimplePromptDialog;
+use crate::tui::ui::theme::Theme;
 
 // Old function removed - using simple prompt dialog instead
 pub(crate) fn draw_at_picker_dropdown(
@@ -12,6 +13,7 @@ pub(crate) fn draw_at_picker_dropdown(
     anchor_area: ratatui::layout::Rect,
     accent: Color,
     dialog: &SimplePromptDialog,
+    theme: &Theme,
 ) {
     let Some(picker) = &dialog.at_picker else {
         return;
@@ -54,7 +56,7 @@ pub(crate) fn draw_at_picker_dropdown(
     let title = format!(" {} ", picker.title());
     let block = Block::default()
         .title(title)
-        .borders(Borders::ALL)
+        .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(accent))
         .style(Style::default().bg(Color::Rgb(10, 20, 10)));
     let inner = block.inner(drop_area);

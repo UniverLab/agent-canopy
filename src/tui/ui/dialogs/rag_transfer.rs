@@ -1,6 +1,6 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
 use super::{centered_rect, draw_dialog_left_wave, truncate_str};
@@ -27,7 +27,7 @@ pub fn draw_rag_transfer_modal(frame: &mut Frame, app: &App, theme: &Theme) {
 
     let block = Block::default()
         .title(" Transfer RAG Result ")
-        .borders(Borders::ALL)
+        .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(theme.header_color))
         .style(Style::default().bg(Color::Rgb(15, 25, 15)));
     let inner = block.inner(area);

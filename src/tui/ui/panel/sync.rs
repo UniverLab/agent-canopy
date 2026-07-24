@@ -2,7 +2,7 @@ use chrono::{Local, TimeZone};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 
 use crate::domain::sync::{MessageKind, MissionImpact, SyncMessage, WorkspaceStatus};
@@ -25,7 +25,7 @@ pub(crate) fn draw_activity_panel(
             ))
             .alignment(ratatui::layout::Alignment::Right),
         )
-        .borders(Borders::ALL)
+        .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(theme.border_color));
     let inner = block.inner(area);
     frame.render_widget(block, area);

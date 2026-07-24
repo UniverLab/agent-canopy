@@ -1,6 +1,6 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
 use super::{centered_rect, draw_dialog_left_wave, truncate_str};
@@ -48,7 +48,7 @@ fn draw_ctx_preview(frame: &mut Frame, app: &App, theme: &Theme) {
     };
     let block = Block::default()
         .title(format!(" Context Transfer — from: {src_id} "))
-        .borders(Borders::ALL)
+        .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(accent))
         .style(Style::default().bg(Color::Rgb(15, 25, 15)));
 
@@ -132,7 +132,7 @@ fn draw_ctx_picker(frame: &mut Frame, app: &App, theme: &Theme) {
 
     let block = Block::default()
         .title(" Select Destination Agent ")
-        .borders(Borders::ALL)
+        .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(src_accent))
         .style(Style::default().bg(Color::Rgb(15, 25, 15)));
 

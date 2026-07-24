@@ -1,6 +1,6 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
 use super::centered_rect;
@@ -32,7 +32,7 @@ pub(crate) fn draw_section_picker_modal(
             let title = " Add Section ";
             let block = Block::default()
                 .title(title)
-                .borders(Borders::ALL)
+                .borders(crate::tui::ui::borders_for(theme))
                 .border_style(Style::default().fg(accent))
                 .style(Style::default().bg(Color::Rgb(15, 25, 15)));
 
@@ -84,7 +84,7 @@ pub(crate) fn draw_section_picker_modal(
             let title = " Custom Section ";
             let block = Block::default()
                 .title(title)
-                .borders(Borders::ALL)
+                .borders(crate::tui::ui::borders_for(theme))
                 .border_style(Style::default().fg(accent))
                 .style(Style::default().bg(Color::Rgb(15, 25, 15)));
 
@@ -139,7 +139,7 @@ pub(crate) fn draw_section_picker_modal(
             let title = " Remove Section ";
             let block = Block::default()
                 .title(title)
-                .borders(Borders::ALL)
+                .borders(crate::tui::ui::borders_for(theme))
                 .border_style(Style::default().fg(accent))
                 .style(Style::default().bg(Color::Rgb(15, 25, 15)));
 
@@ -192,7 +192,7 @@ pub(crate) fn draw_section_picker_modal(
 
             let block = Block::default()
                 .title(" Tools — Pick a Skill ")
-                .borders(Borders::ALL)
+                .borders(crate::tui::ui::borders_for(theme))
                 .border_style(Style::default().fg(accent))
                 .style(Style::default().bg(Color::Rgb(10, 20, 30)));
 
@@ -269,7 +269,7 @@ pub(crate) fn draw_section_picker_modal(
 
             let block = Block::default()
                 .title(" Project Context ")
-                .borders(Borders::ALL)
+                .borders(crate::tui::ui::borders_for(theme))
                 .border_style(Style::default().fg(accent))
                 .style(Style::default().bg(Color::Rgb(10, 20, 30)));
 
@@ -350,7 +350,7 @@ pub(crate) fn draw_section_picker_modal(
 
             let block = Block::default()
                 .title(" Preset ")
-                .borders(Borders::ALL)
+                .borders(crate::tui::ui::borders_for(theme))
                 .border_style(Style::default().fg(accent))
                 .style(Style::default().bg(Color::Rgb(10, 20, 30)));
 

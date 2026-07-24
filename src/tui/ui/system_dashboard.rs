@@ -4,7 +4,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Color;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 
 use crate::domain::canopy_config::TemperatureUnit;
@@ -96,7 +96,7 @@ pub fn render_system_dashboard(
                         ))
                         .alignment(ratatui::layout::Alignment::Right),
                     )
-                    .borders(Borders::ALL)
+                    .borders(crate::tui::ui::borders_for(theme))
                     .border_style(Style::default().fg(theme.border_color)),
             )
             .style(Style::default().fg(theme.dim_text)),

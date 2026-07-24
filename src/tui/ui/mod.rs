@@ -33,6 +33,16 @@ pub(crate) const STATUS_FAIL: Color = Color::Rgb(229, 57, 53);
 pub(crate) const STATUS_WAIT_ON: Color = Color::Rgb(255, 255, 0);
 pub(crate) const STATUS_WAIT_OFF: Color = Color::Rgb(30, 30, 30);
 
+/// Border set for a themed panel: `ALL` for classic, `NONE` for modern
+/// (which separates panels by background-color contrast instead).
+pub(crate) fn borders_for(theme: &Theme) -> ratatui::widgets::Borders {
+    if theme.show_borders {
+        ratatui::widgets::Borders::ALL
+    } else {
+        ratatui::widgets::Borders::NONE
+    }
+}
+
 // ── Layout ──────────────────────────────────────────────────────
 
 /// Width in columns of the agent sidebar when visible. Shared by the layout
@@ -45,7 +55,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let theme = Theme::classic();
     let full = frame.area();
     frame.render_widget(
-        ratatui::widgets::Paragraph::new("").style(Style::default().bg(Color::Rgb(18, 18, 18))),
+        ratatui::widgets::Paragraph::new("").style(Style::default().bg(theme.panel_bg)),
         full,
     );
 
