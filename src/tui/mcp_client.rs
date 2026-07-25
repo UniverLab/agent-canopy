@@ -186,10 +186,7 @@ fn find_header_end(raw: &[u8]) -> Option<usize> {
 /// was decoded so far) since responses are read until EOF or timeout.
 fn decode_chunked(mut raw: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    loop {
-        let Some(line_end) = raw.windows(2).position(|w| w == b"\r\n") else {
-            break;
-        };
+    while let Some(line_end) = raw.windows(2).position(|w| w == b"\r\n") {
         let size_line = String::from_utf8_lossy(&raw[..line_end]);
         let size_hex = size_line.split(';').next().unwrap_or("").trim();
         let Ok(size) = usize::from_str_radix(size_hex, 16) else {

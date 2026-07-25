@@ -951,11 +951,8 @@ fn draw_project_history_tab(frame: &mut Frame, area: Rect, app: &mut App, theme:
         return;
     }
 
-    let mut y = area.y;
-    for (idx, entry) in entries.iter().enumerate() {
-        if y >= area.y + area.height {
-            break;
-        }
+    let visible_count = (area.height as usize).min(entries.len());
+    for (y, (idx, entry)) in (area.y..).zip(entries.iter().take(visible_count).enumerate()) {
         let is_selected = idx == selected;
         let (style, marker) = selected_row_style(is_selected, theme);
         let kind_label = match entry.kind {
@@ -981,7 +978,6 @@ fn draw_project_history_tab(frame: &mut Frame, area: Rect, app: &mut App, theme:
         ]);
         frame.render_widget(Paragraph::new(line), Rect::new(area.x, y, area.width, 1));
         app.project_tab_row_click_map.push((idx, y, y + 1));
-        y += 1;
     }
 }
 

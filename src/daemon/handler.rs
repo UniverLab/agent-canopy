@@ -4253,12 +4253,13 @@ impl TaskTriggerHandler {
             }
 
             if new_len > old_len {
-                let mut next_position = owner_nodes
+                let start_position = owner_nodes
                     .last()
                     .map(|node| node.position + 1)
                     .unwrap_or(1);
-                let mut next_member_position = old_len as i64;
-                for (platform, model) in &members[old_len..new_len] {
+                for (i, (platform, model)) in members[old_len..new_len].iter().enumerate() {
+                    let next_position = start_position + i as i64;
+                    let next_member_position = old_len as i64 + i as i64;
                     let node_id = uuid::Uuid::new_v4().to_string();
                     let node = LoopNode {
                         id: node_id.clone(),
@@ -4301,8 +4302,6 @@ impl TaskTriggerHandler {
                     self.db
                         .add_ensemble_member(&member, &node, &entry_edge, &join_edge)
                         .map_err(internal_error)?;
-                    next_position += 1;
-                    next_member_position += 1;
                 }
             } else if new_len < old_len {
                 for existing in &old_members[new_len..old_len] {

@@ -696,7 +696,7 @@ impl Database {
             });
         }
 
-        entries.sort_by(|a, b| b.at.cmp(&a.at));
+        entries.sort_by_key(|b| std::cmp::Reverse(b.at));
         entries.truncate(limit);
         Ok(entries)
     }
