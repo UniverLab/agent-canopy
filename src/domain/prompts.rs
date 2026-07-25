@@ -210,4 +210,70 @@ mod tests {
 
         assert_eq!(resolve_prompt_preset(&prompts, "totally-custom"), "");
     }
+
+    #[test]
+    fn builtin_prompt_preset_specs_returns_non_empty() {
+        let specs = builtin_prompt_preset_specs();
+        assert!(!specs.is_empty());
+        assert_eq!(specs.len(), 3);
+    }
+
+    #[test]
+    fn builtin_prompt_preset_specs_has_expected_names() {
+        let names: Vec<&str> = builtin_prompt_preset_specs()
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(names, vec!["implementer", "reviewer", "resilience"]);
+    }
+
+    #[test]
+    fn builtin_prompt_preset_specs_have_non_empty_content() {
+        for (name, content) in builtin_prompt_preset_specs() {
+            assert!(
+                !content.is_empty(),
+                "preset '{name}' must have non-empty content"
+            );
+        }
+    }
+
+    #[test]
+    fn implementer_preset_contains_spec_content_placeholder() {
+        let specs = builtin_prompt_preset_specs();
+        let (_, content) = specs.iter().find(|(n, _)| *n == "implementer").unwrap();
+        assert!(
+            content.contains("{{spec_content}}"),
+            "implementer preset must contain {{{{spec_content}}}} placeholder"
+        );
+    }
+
+    #[test]
+    fn implementer_preset_contains_previous_feedback_placeholder() {
+        let specs = builtin_prompt_preset_specs();
+        let (_, content) = specs.iter().find(|(n, _)| *n == "implementer").unwrap();
+        assert!(
+            content.contains("{{previous_feedback}}"),
+            "implementer preset must contain {{{{previous_feedback}}}} placeholder"
+        );
+    }
+
+    #[test]
+    fn reviewer_preset_contains_spec_content_placeholder() {
+        let specs = builtin_prompt_preset_specs();
+        let (_, content) = specs.iter().find(|(n, _)| *n == "reviewer").unwrap();
+        assert!(
+            content.contains("{{spec_content}}"),
+            "reviewer preset must contain {{{{spec_content}}}} placeholder"
+        );
+    }
+
+    #[test]
+    fn resilience_preset_contains_previous_feedback_placeholder() {
+        let specs = builtin_prompt_preset_specs();
+        let (_, content) = specs.iter().find(|(n, _)| *n == "resilience").unwrap();
+        assert!(
+            content.contains("{{previous_feedback}}"),
+            "resilience preset must contain {{{{previous_feedback}}}} placeholder"
+        );
+    }
 }

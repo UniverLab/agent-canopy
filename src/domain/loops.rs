@@ -691,8 +691,8 @@ pub struct EnsembleDetails {
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_spec_description_template, LoopEdgeCondition, LoopNodeKind, LoopRunStatus,
-        LoopSpecStatus, LoopStatus,
+        validate_spec_description_template, LoopEdgeCondition, LoopNodeKind, LoopResetOutcome,
+        LoopRunStatus, LoopSpecStatus, LoopStatus, SpecAdminStatusOutcome,
     };
 
     #[test]
@@ -1037,6 +1037,1591 @@ Task:
                 lp.is_auto_continue_time_reached(chrono::Utc::now()),
                 "{status:?} loop's auto_continue_at time itself must still register as reached \
                  so the scheduler can clear the stale schedule"
+            );
+        }
+    }
+
+    // ── validate_spec_description_template: edge cases ──────────────────
+
+    #[test]
+    fn spec_template_empty_input_fails() {
+        let err = validate_spec_description_template("").unwrap_err();
+        assert!(err.contains("must include sections"));
+    }
+
+    #[test]
+    fn spec_template_whitespace_only_input_fails() {
+        let err = validate_spec_description_template("   \n  \t  ").unwrap_err();
+        assert!(err.contains("must include sections"));
+    }
+
+    #[test]
+    fn spec_template_missing_all_sections_fails() {
+        let err = validate_spec_description_template("Just some random text").unwrap_err();
+        assert!(err.contains("missing required sections"));
+        assert!(err.contains("functional requirements"));
+        assert!(err.contains("non-functional requirements"));
+        assert!(err.contains("objective / expected outcome"));
+        assert!(err.contains("constraints"));
+        assert!(err.contains("guidelines"));
+        assert!(err.contains("in scope"));
+        assert!(err.contains("out of scope"));
+    }
+
+    #[test]
+    fn spec_template_only_one_section_fails_with_rest_missing() {
+        let desc = "Functional Requirements:\n- Something\n";
+        let err = validate_spec_description_template(desc).unwrap_err();
+        let missing_part = err.split("missing required sections:").nth(1).unwrap();
+        let missing_list = missing_part.split('.').next().unwrap().trim();
+        assert!(missing_list.contains("non-functional requirements"));
+        assert!(missing_list.contains("constraints"));
+        assert!(missing_list.contains("guidelines"));
+        assert!(missing_list.contains("in scope"));
+        assert!(missing_list.contains("out of scope"));
+        assert!(missing_list.contains("objective / expected outcome"));
+    }
+
+    #[test]
+    fn spec_template_case_insensitive_matching() {
+        let desc = r#"
+FUNCTIONAL REQUIREMENTS:
+- Build the thing
+
+NON-FUNCTIONAL REQUIREMENTS:
+- Keep it fast
+
+OBJECTIVE:
+Ship it
+
+CONSTRAINTS:
+Don't break prod
+
+GUIDELINES:
+Keep it simple
+
+IN SCOPE:
+Backend
+
+OUT OF SCOPE:
+Frontend
+"#;
+        assert!(validate_spec_description_template(desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_mixed_case_matches() {
+        let desc = r#"
+Functional requirements:
+- Build
+
+Non-Functional Requirements:
+- Speed
+
+Objective:
+Done
+
+Constraints:
+Safe
+
+Guidelines:
+Clean
+
+In Scope:
+API
+
+Out of Scope:
+UI
+"#;
+        assert!(validate_spec_description_template(desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_h3_markdown_headings_match() {
+        let desc = r#"
+### Functional Requirements
+- Build
+
+### Non-Functional Requirements
+- Fast
+
+### Objective
+Ship
+
+### Constraints
+Safe
+
+### Guidelines
+Simple
+
+### In Scope
+API
+
+### Out of Scope
+UI
+"#;
+        assert!(validate_spec_description_template(desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_h2_markdown_headings_match() {
+        let desc = r#"
+## Functional Requirements
+- Build
+
+## Non-Functional Requirements
+- Fast
+
+## Objective
+Ship
+
+## Constraints
+Safe
+
+## Guidelines
+Simple
+
+## In Scope
+API
+
+## Out of Scope
+UI
+"#;
+        assert!(validate_spec_description_template(desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_dash_list_markers_match() {
+        let desc = r#"
+- Functional Requirements:
+  - Build
+
+- Non-Functional Requirements:
+  - Fast
+
+- Objective:
+  - Ship
+
+- Constraints:
+  - Safe
+
+- Guidelines:
+  - Simple
+
+- In Scope:
+  - API
+
+- Out of Scope:
+  - UI
+"#;
+        assert!(validate_spec_description_template(desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_star_list_markers_match() {
+        let desc = r#"
+* Functional Requirements:
+  * Build
+
+* Non-Functional Requirements:
+  * Fast
+
+* Objective:
+  * Ship
+
+* Constraints:
+  * Safe
+
+* Guidelines:
+  * Simple
+
+* In Scope:
+  * API
+
+* Out of Scope:
+  * UI
+"#;
+        assert!(validate_spec_description_template(desc).is_ok());
+    }
+
+    // ── validate_spec_description_template: individual alias matching ───
+
+    fn full_desc_with(section_index: usize, alias: &str) -> String {
+        let sections = [
+            ("Functional Requirements", "Build"),
+            ("Non-Functional Requirements", "Fast"),
+            ("Objective", "Done"),
+            ("Constraints", "Safe"),
+            ("Guidelines", "Simple"),
+            ("In Scope", "API"),
+            ("Out of Scope", "UI"),
+        ];
+        let mut lines = Vec::new();
+        for (i, (canonical, value)) in sections.iter().enumerate() {
+            let heading = if i == section_index { alias } else { canonical };
+            lines.push(format!("{heading}:"));
+            lines.push(format!("- {value}"));
+        }
+        lines.join("\n")
+    }
+
+    #[test]
+    fn spec_template_requerimientos_funcionales_matches() {
+        let desc = full_desc_with(0, "Requerimientos funcionales");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_requisitos_funcionales_matches() {
+        let desc = full_desc_with(0, "Requisitos funcionales");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_non_functional_requirements_matches() {
+        let desc = full_desc_with(1, "Non-Functional Requirements");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_non_functional_no_hyphen_matches() {
+        let desc = full_desc_with(1, "Non functional requirements");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_requerimientos_no_funcionales_matches() {
+        let desc = full_desc_with(1, "Requerimientos no funcionales");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_requisitos_no_funcionales_matches() {
+        let desc = full_desc_with(1, "Requisitos no funcionales");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_objective_matches() {
+        let desc = full_desc_with(2, "Objective");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_expected_outcome_matches() {
+        let desc = full_desc_with(2, "Expected Outcome");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_objetivo_matches() {
+        let desc = full_desc_with(2, "Objetivo");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_resultado_esperado_matches() {
+        let desc = full_desc_with(2, "Resultado esperado");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_constraints_matches() {
+        let desc = full_desc_with(3, "Constraints");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_what_to_respect_matches() {
+        let desc = full_desc_with(3, "What to respect");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_restrictions_matches() {
+        let desc = full_desc_with(3, "Restrictions");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_restricciones_matches() {
+        let desc = full_desc_with(3, "Restricciones");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_que_respetar_matches() {
+        let desc = full_desc_with(3, "Que respetar");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_que_respetar_accent_matches() {
+        let desc = full_desc_with(3, "Qué respetar");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_guidelines_matches() {
+        let desc = full_desc_with(4, "Guidelines");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_lineamientos_matches() {
+        let desc = full_desc_with(4, "Lineamientos");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_guidance_matches() {
+        let desc = full_desc_with(4, "Guidance");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_lineas_guia_matches() {
+        let desc = full_desc_with(4, "Lineas guia");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_lineas_guia_accent_matches() {
+        let desc = full_desc_with(4, "Líneas guía");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_in_scope_matches() {
+        let desc = full_desc_with(5, "In Scope");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_scope_in_matches() {
+        let desc = full_desc_with(5, "Scope In");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_que_si_matches() {
+        let desc = full_desc_with(5, "Que si");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_que_si_accent_matches() {
+        let desc = full_desc_with(5, "Qué sí");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_incluye_matches() {
+        let desc = full_desc_with(5, "Incluye");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_out_of_scope_matches() {
+        let desc = full_desc_with(6, "Out of Scope");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_scope_out_matches() {
+        let desc = full_desc_with(6, "Scope Out");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_que_no_matches() {
+        let desc = full_desc_with(6, "Que no");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_que_no_accent_matches() {
+        let desc = full_desc_with(6, "Qué no");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_excluye_matches() {
+        let desc = full_desc_with(6, "Excluye");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    // ── validate_spec_description_template: newline variant matching ────
+
+    #[test]
+    fn spec_template_alias_with_newline_matches() {
+        let desc = full_desc_with(2, "objective");
+        assert!(validate_spec_description_template(&desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_alias_without_colon_or_newline_fails() {
+        let desc = "objective some extra text after it without colon\n";
+        let err = validate_spec_description_template(desc).unwrap_err();
+        assert!(err.contains("objective / expected outcome"));
+    }
+
+    // ── validate_spec_description_template: error message format ────────
+
+    #[test]
+    fn spec_template_error_contains_expected_sections_list() {
+        let err = validate_spec_description_template("Hello").unwrap_err();
+        assert!(err.contains("Expected sections:"));
+        assert!(err.contains("functional requirements"));
+        assert!(err.contains("non-functional requirements"));
+        assert!(err.contains("objective / expected outcome"));
+        assert!(err.contains("constraints"));
+        assert!(err.contains("guidelines"));
+        assert!(err.contains("in scope"));
+        assert!(err.contains("out of scope"));
+    }
+
+    #[test]
+    fn spec_template_error_lists_only_missing_sections() {
+        let desc = r#"
+Functional Requirements:
+- Build
+
+Non-Functional Requirements:
+- Fast
+
+Objective:
+- Done
+
+Constraints:
+- Safe
+
+Guidelines:
+- Simple
+
+In Scope:
+- API
+"#;
+        let err = validate_spec_description_template(desc).unwrap_err();
+        // "missing required sections:" should list only "out of scope"
+        let missing_part = err.split("missing required sections:").nth(1).unwrap();
+        let missing_list = missing_part.split('.').next().unwrap().trim();
+        assert_eq!(missing_list, "out of scope");
+    }
+
+    // ── required_spec_section_names ─────────────────────────────────────
+
+    #[test]
+    fn required_section_names_contains_all_canonical_names() {
+        let names = super::required_spec_section_names();
+        assert!(names.contains("functional requirements"));
+        assert!(names.contains("non-functional requirements"));
+        assert!(names.contains("objective / expected outcome"));
+        assert!(names.contains("constraints"));
+        assert!(names.contains("guidelines"));
+        assert!(names.contains("in scope"));
+        assert!(names.contains("out of scope"));
+    }
+
+    #[test]
+    fn required_section_names_has_seven_entries() {
+        let names = super::required_spec_section_names();
+        let count = names.split(", ").count();
+        assert_eq!(count, 7);
+    }
+
+    // ── LoopStatus: as_str / from_str roundtrip ─────────────────────────
+
+    #[test]
+    fn loop_status_as_str_from_str_roundtrip() {
+        let statuses = [
+            LoopStatus::Draft,
+            LoopStatus::Running,
+            LoopStatus::Paused,
+            LoopStatus::Completed,
+            LoopStatus::Failed,
+        ];
+        for s in statuses {
+            let s_str = s.as_str();
+            assert_eq!(
+                LoopStatus::from_str(s_str),
+                s,
+                "roundtrip failed for {s_str}"
+            );
+        }
+    }
+
+    #[test]
+    fn loop_status_from_str_unknown_defaults_to_draft() {
+        let unknowns = ["", "DRAFT", "Running", "PENDING", "unknown", "123"];
+        for input in unknowns {
+            assert_eq!(
+                LoopStatus::from_str(input),
+                LoopStatus::Draft,
+                "expected Draft for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn loop_status_as_str_returns_lowercase() {
+        for s in [
+            LoopStatus::Draft,
+            LoopStatus::Running,
+            LoopStatus::Paused,
+            LoopStatus::Completed,
+            LoopStatus::Failed,
+        ] {
+            assert_eq!(s.as_str(), s.as_str().to_lowercase());
+        }
+    }
+
+    // ── LoopSpecStatus: as_str / from_str roundtrip ─────────────────────
+
+    #[test]
+    fn loop_spec_status_as_str_from_str_roundtrip() {
+        let statuses = [
+            LoopSpecStatus::Pending,
+            LoopSpecStatus::Running,
+            LoopSpecStatus::Completed,
+            LoopSpecStatus::Failed,
+            LoopSpecStatus::Skipped,
+        ];
+        for s in statuses {
+            let s_str = s.as_str();
+            assert_eq!(
+                LoopSpecStatus::from_str(s_str),
+                s,
+                "roundtrip failed for {s_str}"
+            );
+        }
+    }
+
+    #[test]
+    fn loop_spec_status_from_str_unknown_defaults_to_pending() {
+        let unknowns = ["", "PENDING", "Running", "DONE", "unknown", "xyz"];
+        for input in unknowns {
+            assert_eq!(
+                LoopSpecStatus::from_str(input),
+                LoopSpecStatus::Pending,
+                "expected Pending for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn loop_spec_status_as_str_returns_lowercase() {
+        for s in [
+            LoopSpecStatus::Pending,
+            LoopSpecStatus::Running,
+            LoopSpecStatus::Completed,
+            LoopSpecStatus::Failed,
+            LoopSpecStatus::Skipped,
+        ] {
+            assert_eq!(s.as_str(), s.as_str().to_lowercase());
+        }
+    }
+
+    #[test]
+    fn loop_spec_status_pending_is_distinct_from_running() {
+        assert_ne!(
+            LoopSpecStatus::Pending.as_str(),
+            LoopSpecStatus::Running.as_str()
+        );
+    }
+
+    // ── LoopNodeKind: as_str / from_str / display_str roundtrip ─────────
+
+    #[test]
+    fn loop_node_kind_as_str_from_str_roundtrip() {
+        let kinds = [
+            LoopNodeKind::Agent,
+            LoopNodeKind::Check,
+            LoopNodeKind::Gate,
+            LoopNodeKind::Join,
+        ];
+        for k in kinds {
+            let k_str = k.as_str();
+            assert_eq!(
+                LoopNodeKind::from_str(k_str),
+                Some(k),
+                "roundtrip failed for {k_str}"
+            );
+        }
+    }
+
+    #[test]
+    fn loop_node_kind_from_str_invalid_returns_none() {
+        let invalids = ["", "AGENT", "Agent", "ensemble", "unknown", "workflow"];
+        for input in invalids {
+            assert_eq!(
+                LoopNodeKind::from_str(input),
+                None,
+                "expected None for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn loop_node_kind_display_str_matches_as_str_except_join() {
+        for k in [
+            LoopNodeKind::Agent,
+            LoopNodeKind::Check,
+            LoopNodeKind::Gate,
+        ] {
+            assert_eq!(k.display_str(), k.as_str());
+        }
+        assert_eq!(LoopNodeKind::Join.display_str(), "quorum");
+        assert_ne!(LoopNodeKind::Join.display_str(), LoopNodeKind::Join.as_str());
+    }
+
+    #[test]
+    fn loop_node_kind_as_str_returns_lowercase() {
+        for k in [
+            LoopNodeKind::Agent,
+            LoopNodeKind::Check,
+            LoopNodeKind::Gate,
+            LoopNodeKind::Join,
+        ] {
+            assert_eq!(k.as_str(), k.as_str().to_lowercase());
+        }
+    }
+
+    // ── LoopEdgeCondition: as_str / from_str roundtrip ──────────────────
+
+    #[test]
+    fn loop_edge_condition_as_str_from_str_roundtrip() {
+        let conds = [
+            LoopEdgeCondition::Pass,
+            LoopEdgeCondition::Fail,
+            LoopEdgeCondition::Always,
+        ];
+        for c in conds {
+            let c_str = c.as_str();
+            assert_eq!(
+                LoopEdgeCondition::from_str(c_str),
+                Some(c),
+                "roundtrip failed for {c_str}"
+            );
+        }
+    }
+
+    #[test]
+    fn loop_edge_condition_from_str_invalid_returns_none() {
+        let invalids = ["", "PASS", "Pass", "never", "sometimes", "123"];
+        for input in invalids {
+            assert_eq!(
+                LoopEdgeCondition::from_str(input),
+                None,
+                "expected None for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn loop_edge_condition_as_str_returns_lowercase() {
+        for c in [
+            LoopEdgeCondition::Pass,
+            LoopEdgeCondition::Fail,
+            LoopEdgeCondition::Always,
+        ] {
+            assert_eq!(c.as_str(), c.as_str().to_lowercase());
+        }
+    }
+
+    // ── LoopRunStatus: as_str / from_str roundtrip ──────────────────────
+
+    #[test]
+    fn loop_run_status_as_str_from_str_roundtrip() {
+        let statuses = [
+            LoopRunStatus::Running,
+            LoopRunStatus::Pass,
+            LoopRunStatus::Fail,
+        ];
+        for s in statuses {
+            let s_str = s.as_str();
+            assert_eq!(
+                LoopRunStatus::from_str(s_str),
+                s,
+                "roundtrip failed for {s_str}"
+            );
+        }
+    }
+
+    #[test]
+    fn loop_run_status_from_str_unknown_defaults_to_running() {
+        let unknowns = ["", "RUNNING", "Running", "done", "unknown", "42"];
+        for input in unknowns {
+            assert_eq!(
+                LoopRunStatus::from_str(input),
+                LoopRunStatus::Running,
+                "expected Running for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn loop_run_status_as_str_returns_lowercase() {
+        for s in [
+            LoopRunStatus::Running,
+            LoopRunStatus::Pass,
+            LoopRunStatus::Fail,
+        ] {
+            assert_eq!(s.as_str(), s.as_str().to_lowercase());
+        }
+    }
+
+    // ── SpecAdminStatusOutcome: variant construction & equality ─────────
+
+    #[test]
+    fn spec_admin_status_outcome_success_variants() {
+        let a = SpecAdminStatusOutcome::Success;
+        assert!(matches!(a, SpecAdminStatusOutcome::Success));
+    }
+
+    #[test]
+    fn spec_admin_status_outcome_not_found_variants() {
+        let a = SpecAdminStatusOutcome::NotFound;
+        assert!(matches!(a, SpecAdminStatusOutcome::NotFound));
+    }
+
+    #[test]
+    fn spec_admin_status_outcome_not_standalone_carries_id() {
+        let outcome = SpecAdminStatusOutcome::NotStandalone("spec-42".to_string());
+        match outcome {
+            SpecAdminStatusOutcome::NotStandalone(id) => assert_eq!(id, "spec-42"),
+            _ => panic!("expected NotStandalone"),
+        }
+    }
+
+    #[test]
+    fn spec_admin_status_outcome_active_run_carries_ids() {
+        let outcome = SpecAdminStatusOutcome::ActiveRun {
+            loop_id: "loop-1".to_string(),
+            run_id: "run-2".to_string(),
+        };
+        match outcome {
+            SpecAdminStatusOutcome::ActiveRun { loop_id, run_id } => {
+                assert_eq!(loop_id, "loop-1");
+                assert_eq!(run_id, "run-2");
+            }
+            _ => panic!("expected ActiveRun"),
+        }
+    }
+
+    #[test]
+    fn spec_admin_status_outcome_variants_are_distinct() {
+        let success = SpecAdminStatusOutcome::Success;
+        let not_found = SpecAdminStatusOutcome::NotFound;
+        let not_standalone = SpecAdminStatusOutcome::NotStandalone("x".to_string());
+        let active_run = SpecAdminStatusOutcome::ActiveRun {
+            loop_id: "a".to_string(),
+            run_id: "b".to_string(),
+        };
+        assert_ne!(format!("{success:?}"), format!("{not_found:?}"));
+        assert_ne!(format!("{not_standalone:?}"), format!("{active_run:?}"));
+    }
+
+    // ── LoopResetOutcome: variant construction & equality ───────────────
+
+    #[test]
+    fn loop_reset_outcome_not_found() {
+        let a = LoopResetOutcome::NotFound;
+        assert!(matches!(a, LoopResetOutcome::NotFound));
+    }
+
+    #[test]
+    fn loop_reset_outcome_running() {
+        let a = LoopResetOutcome::Running;
+        assert!(matches!(a, LoopResetOutcome::Running));
+    }
+
+    #[test]
+    fn loop_reset_outcome_invalid_spec_carries_id() {
+        let outcome = LoopResetOutcome::InvalidSpec("bad-spec".to_string());
+        match outcome {
+            LoopResetOutcome::InvalidSpec(id) => assert_eq!(id, "bad-spec"),
+            _ => panic!("expected InvalidSpec"),
+        }
+    }
+
+    #[test]
+    fn loop_reset_outcome_reset_carries_count() {
+        let outcome = LoopResetOutcome::Reset { spec_count: 5 };
+        match outcome {
+            LoopResetOutcome::Reset { spec_count } => assert_eq!(spec_count, 5),
+            _ => panic!("expected Reset"),
+        }
+    }
+
+    #[test]
+    fn loop_reset_outcome_variants_are_distinct() {
+        let not_found = LoopResetOutcome::NotFound;
+        let running = LoopResetOutcome::Running;
+        let invalid = LoopResetOutcome::InvalidSpec("x".to_string());
+        let reset = LoopResetOutcome::Reset { spec_count: 0 };
+        assert_ne!(format!("{not_found:?}"), format!("{running:?}"));
+        assert_ne!(format!("{invalid:?}"), format!("{reset:?}"));
+    }
+
+    // ── LoopStatus: equality & Debug ────────────────────────────────────
+
+    #[test]
+    fn loop_status_variants_are_distinct() {
+        let all = [
+            LoopStatus::Draft,
+            LoopStatus::Running,
+            LoopStatus::Paused,
+            LoopStatus::Completed,
+            LoopStatus::Failed,
+        ];
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                let a = all[i];
+                let b = all[j];
+                assert_ne!(a, b, "{a:?} should differ from {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn loop_status_debug_format_matches_variant_name() {
+        assert_eq!(format!("{:?}", LoopStatus::Draft), "Draft");
+        assert_eq!(format!("{:?}", LoopStatus::Running), "Running");
+        assert_eq!(format!("{:?}", LoopStatus::Paused), "Paused");
+        assert_eq!(format!("{:?}", LoopStatus::Completed), "Completed");
+        assert_eq!(format!("{:?}", LoopStatus::Failed), "Failed");
+    }
+
+    // ── LoopSpecStatus: equality & Debug ────────────────────────────────
+
+    #[test]
+    fn loop_spec_status_variants_are_distinct() {
+        let all = [
+            LoopSpecStatus::Pending,
+            LoopSpecStatus::Running,
+            LoopSpecStatus::Completed,
+            LoopSpecStatus::Failed,
+            LoopSpecStatus::Skipped,
+        ];
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                let a = all[i];
+                let b = all[j];
+                assert_ne!(a, b, "{a:?} should differ from {b:?}");
+            }
+        }
+    }
+
+    // ── LoopNodeKind: equality & Debug ──────────────────────────────────
+
+    #[test]
+    fn loop_node_kind_variants_are_distinct() {
+        let all = [
+            LoopNodeKind::Agent,
+            LoopNodeKind::Check,
+            LoopNodeKind::Gate,
+            LoopNodeKind::Join,
+        ];
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                let a = all[i];
+                let b = all[j];
+                assert_ne!(a, b, "{a:?} should differ from {b:?}");
+            }
+        }
+    }
+
+    // ── LoopEdgeCondition: equality & Debug ─────────────────────────────
+
+    #[test]
+    fn loop_edge_condition_variants_are_distinct() {
+        let all = [
+            LoopEdgeCondition::Pass,
+            LoopEdgeCondition::Fail,
+            LoopEdgeCondition::Always,
+        ];
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                let a = all[i];
+                let b = all[j];
+                assert_ne!(a, b, "{a:?} should differ from {b:?}");
+            }
+        }
+    }
+
+    // ── LoopRunStatus: equality & Debug ─────────────────────────────────
+
+    #[test]
+    fn loop_run_status_variants_are_distinct() {
+        let all = [
+            LoopRunStatus::Running,
+            LoopRunStatus::Pass,
+            LoopRunStatus::Fail,
+        ];
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                let a = all[i];
+                let b = all[j];
+                assert_ne!(a, b, "{a:?} should differ from {b:?}");
+            }
+        }
+    }
+
+    // ── Clone: all status enums are Clone ───────────────────────────────
+
+    #[test]
+    fn loop_status_is_clone() {
+        let s = LoopStatus::Running;
+        let cloned = s.clone();
+        assert_eq!(s, cloned);
+    }
+
+    #[test]
+    fn loop_spec_status_is_clone() {
+        let s = LoopSpecStatus::Failed;
+        let cloned = s.clone();
+        assert_eq!(s, cloned);
+    }
+
+    #[test]
+    fn loop_node_kind_is_clone() {
+        let k = LoopNodeKind::Join;
+        let cloned = k.clone();
+        assert_eq!(k, cloned);
+    }
+
+    #[test]
+    fn loop_edge_condition_is_clone() {
+        let c = LoopEdgeCondition::Always;
+        let cloned = c.clone();
+        assert_eq!(c, cloned);
+    }
+
+    #[test]
+    fn loop_run_status_is_clone() {
+        let s = LoopRunStatus::Pass;
+        let cloned = s.clone();
+        assert_eq!(s, cloned);
+    }
+
+    // ── Loop: is_fireable exhaustive coverage ───────────────────────────
+
+    #[test]
+    fn loop_is_fireable_exhaustive() {
+        let expected_fireable = [
+            (LoopStatus::Draft, true),
+            (LoopStatus::Running, false),
+            (LoopStatus::Paused, false),
+            (LoopStatus::Completed, true),
+            (LoopStatus::Failed, true),
+        ];
+        for (status, expected) in expected_fireable {
+            let lp = loop_with_trigger(status, None);
+            assert_eq!(
+                lp.is_fireable(),
+                expected,
+                "{status:?}.is_fireable() should be {expected}"
+            );
+        }
+    }
+
+    // ── Loop: trigger_type_label exhaustive ─────────────────────────────
+
+    #[test]
+    fn loop_trigger_type_label_exhaustive() {
+        let lp_manual = loop_with_trigger(LoopStatus::Draft, None);
+        assert_eq!(lp_manual.trigger_type_label(), "manual");
+
+        let lp_cron = loop_with_trigger(
+            LoopStatus::Draft,
+            Some(super::Trigger::Cron {
+                schedule_expr: "* * * * *".to_string(),
+            }),
+        );
+        assert_eq!(lp_cron.trigger_type_label(), "cron");
+
+        let lp_watch = loop_with_trigger(
+            LoopStatus::Draft,
+            Some(super::Trigger::Watch {
+                path: "/tmp".to_string(),
+                events: vec![],
+                debounce_seconds: 2,
+                recursive: false,
+            }),
+        );
+        assert_eq!(lp_watch.trigger_type_label(), "watch");
+    }
+
+    // ── Loop: schedule_expr / watch_path exhaustive ─────────────────────
+
+    #[test]
+    fn loop_schedule_expr_only_some_for_cron() {
+        let cron = loop_with_trigger(
+            LoopStatus::Draft,
+            Some(super::Trigger::Cron {
+                schedule_expr: "0 9 * * 1-5".to_string(),
+            }),
+        );
+        assert_eq!(cron.schedule_expr(), Some("0 9 * * 1-5"));
+
+        let manual = loop_with_trigger(LoopStatus::Draft, None);
+        assert_eq!(manual.schedule_expr(), None);
+
+        let watch = loop_with_trigger(
+            LoopStatus::Draft,
+            Some(super::Trigger::Watch {
+                path: "/src".to_string(),
+                events: vec![],
+                debounce_seconds: 2,
+                recursive: false,
+            }),
+        );
+        assert_eq!(watch.schedule_expr(), None);
+    }
+
+    #[test]
+    fn loop_watch_path_only_some_for_watch() {
+        let watch = loop_with_trigger(
+            LoopStatus::Draft,
+            Some(super::Trigger::Watch {
+                path: "/data".to_string(),
+                events: vec![super::WatchEvent::Modify],
+                debounce_seconds: 2,
+                recursive: false,
+            }),
+        );
+        assert_eq!(watch.watch_path(), Some("/data"));
+
+        let cron = loop_with_trigger(
+            LoopStatus::Draft,
+            Some(super::Trigger::Cron {
+                schedule_expr: "* * * * *".to_string(),
+            }),
+        );
+        assert_eq!(cron.watch_path(), None);
+
+        let manual = loop_with_trigger(LoopStatus::Draft, None);
+        assert_eq!(manual.watch_path(), None);
+    }
+
+    // ── Loop: is_autorun_due edge cases ─────────────────────────────────
+
+    #[test]
+    fn loop_autorun_due_exactly_at_threshold() {
+        let now = chrono::Utc::now();
+        let mut lp = loop_with_trigger(LoopStatus::Completed, None);
+        lp.autorun_at = Some(now);
+        assert!(lp.is_autorun_due(now));
+    }
+
+    #[test]
+    fn loop_autorun_not_due_one_second_before() {
+        let now = chrono::Utc::now();
+        let mut lp = loop_with_trigger(LoopStatus::Completed, None);
+        lp.autorun_at = Some(now + chrono::Duration::seconds(1));
+        assert!(!lp.is_autorun_due(now));
+    }
+
+    // ── Loop: is_auto_continue_due edge cases ───────────────────────────
+
+    #[test]
+    fn loop_auto_continue_due_exactly_at_threshold() {
+        let now = chrono::Utc::now();
+        let mut lp = loop_with_trigger(LoopStatus::Paused, None);
+        lp.auto_continue_at = Some(now);
+        assert!(lp.is_auto_continue_due(now));
+    }
+
+    #[test]
+    fn loop_auto_continue_not_due_one_second_before() {
+        let now = chrono::Utc::now();
+        let mut lp = loop_with_trigger(LoopStatus::Paused, None);
+        lp.auto_continue_at = Some(now + chrono::Duration::seconds(1));
+        assert!(!lp.is_auto_continue_due(now));
+    }
+
+    #[test]
+    fn loop_auto_continue_time_reached_independent_of_status() {
+        let now = chrono::Utc::now();
+        for status in [
+            LoopStatus::Draft,
+            LoopStatus::Running,
+            LoopStatus::Paused,
+            LoopStatus::Completed,
+            LoopStatus::Failed,
+        ] {
+            let mut lp = loop_with_trigger(status, None);
+            lp.auto_continue_at = Some(now - chrono::Duration::seconds(1));
+            assert!(
+                lp.is_auto_continue_time_reached(now),
+                "{status:?}: time_reached should be true"
+            );
+        }
+    }
+
+    #[test]
+    fn loop_auto_continue_time_not_reached_in_future() {
+        let now = chrono::Utc::now();
+        let mut lp = loop_with_trigger(LoopStatus::Paused, None);
+        lp.auto_continue_at = Some(now + chrono::Duration::hours(1));
+        assert!(!lp.is_auto_continue_time_reached(now));
+    }
+
+    #[test]
+    fn loop_auto_continue_time_not_reached_when_none() {
+        let lp = loop_with_trigger(LoopStatus::Paused, None);
+        assert!(!lp.is_auto_continue_time_reached(chrono::Utc::now()));
+    }
+
+    // ── Loop: is_cron / is_watch exhaustive ─────────────────────────────
+
+    #[test]
+    fn loop_is_cron_and_is_watch_exhaustive() {
+        let manual = loop_with_trigger(LoopStatus::Draft, None);
+        assert!(!manual.is_cron());
+        assert!(!manual.is_watch());
+
+        let cron = loop_with_trigger(
+            LoopStatus::Draft,
+            Some(super::Trigger::Cron {
+                schedule_expr: "* * * * *".to_string(),
+            }),
+        );
+        assert!(cron.is_cron());
+        assert!(!cron.is_watch());
+
+        let watch = loop_with_trigger(
+            LoopStatus::Draft,
+            Some(super::Trigger::Watch {
+                path: "/x".to_string(),
+                events: vec![],
+                debounce_seconds: 2,
+                recursive: false,
+            }),
+        );
+        assert!(!watch.is_cron());
+        assert!(watch.is_watch());
+    }
+
+    // ── serde: LoopStatus roundtrip ─────────────────────────────────────
+
+    #[test]
+    fn loop_status_serde_roundtrip() {
+        let statuses = [
+            LoopStatus::Draft,
+            LoopStatus::Running,
+            LoopStatus::Paused,
+            LoopStatus::Completed,
+            LoopStatus::Failed,
+        ];
+        for s in statuses {
+            let json = serde_json::to_string(&s).unwrap();
+            let deserialized: LoopStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized, s, "serde roundtrip failed for {json}");
+        }
+    }
+
+    #[test]
+    fn loop_status_serde_uses_snake_case() {
+        assert_eq!(serde_json::to_string(&LoopStatus::Draft).unwrap(), "\"draft\"");
+        assert_eq!(
+            serde_json::to_string(&LoopStatus::Running).unwrap(),
+            "\"running\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LoopStatus::Completed).unwrap(),
+            "\"completed\""
+        );
+    }
+
+    // ── serde: LoopSpecStatus roundtrip ─────────────────────────────────
+
+    #[test]
+    fn loop_spec_status_serde_roundtrip() {
+        let statuses = [
+            LoopSpecStatus::Pending,
+            LoopSpecStatus::Running,
+            LoopSpecStatus::Completed,
+            LoopSpecStatus::Failed,
+            LoopSpecStatus::Skipped,
+        ];
+        for s in statuses {
+            let json = serde_json::to_string(&s).unwrap();
+            let deserialized: LoopSpecStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized, s, "serde roundtrip failed for {json}");
+        }
+    }
+
+    #[test]
+    fn loop_spec_status_serde_uses_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&LoopSpecStatus::Pending).unwrap(),
+            "\"pending\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LoopSpecStatus::Skipped).unwrap(),
+            "\"skipped\""
+        );
+    }
+
+    // ── serde: LoopNodeKind roundtrip ───────────────────────────────────
+
+    #[test]
+    fn loop_node_kind_serde_roundtrip() {
+        let kinds = [
+            LoopNodeKind::Agent,
+            LoopNodeKind::Check,
+            LoopNodeKind::Gate,
+            LoopNodeKind::Join,
+        ];
+        for k in kinds {
+            let json = serde_json::to_string(&k).unwrap();
+            let deserialized: LoopNodeKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized, k, "serde roundtrip failed for {json}");
+        }
+    }
+
+    #[test]
+    fn loop_node_kind_serde_uses_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&LoopNodeKind::Agent).unwrap(),
+            "\"agent\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LoopNodeKind::Gate).unwrap(),
+            "\"gate\""
+        );
+    }
+
+    // ── serde: LoopEdgeCondition roundtrip ──────────────────────────────
+
+    #[test]
+    fn loop_edge_condition_serde_roundtrip() {
+        let conds = [
+            LoopEdgeCondition::Pass,
+            LoopEdgeCondition::Fail,
+            LoopEdgeCondition::Always,
+        ];
+        for c in conds {
+            let json = serde_json::to_string(&c).unwrap();
+            let deserialized: LoopEdgeCondition = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized, c, "serde roundtrip failed for {json}");
+        }
+    }
+
+    #[test]
+    fn loop_edge_condition_serde_uses_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&LoopEdgeCondition::Pass).unwrap(),
+            "\"pass\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LoopEdgeCondition::Always).unwrap(),
+            "\"always\""
+        );
+    }
+
+    // ── serde: LoopRunStatus roundtrip ──────────────────────────────────
+
+    #[test]
+    fn loop_run_status_serde_roundtrip() {
+        let statuses = [
+            LoopRunStatus::Running,
+            LoopRunStatus::Pass,
+            LoopRunStatus::Fail,
+        ];
+        for s in statuses {
+            let json = serde_json::to_string(&s).unwrap();
+            let deserialized: LoopRunStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized, s, "serde roundtrip failed for {json}");
+        }
+    }
+
+    #[test]
+    fn loop_run_status_serde_uses_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&LoopRunStatus::Running).unwrap(),
+            "\"running\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LoopRunStatus::Pass).unwrap(),
+            "\"pass\""
+        );
+    }
+
+    // ── serde: deserialization from string variants ─────────────────────
+
+    #[test]
+    fn loop_status_deserialize_from_json_string() {
+        let input = "\"completed\"";
+        let s: LoopStatus = serde_json::from_str(input).unwrap();
+        assert_eq!(s, LoopStatus::Completed);
+    }
+
+    #[test]
+    fn loop_spec_status_deserialize_from_json_string() {
+        let input = "\"skipped\"";
+        let s: LoopSpecStatus = serde_json::from_str(input).unwrap();
+        assert_eq!(s, LoopSpecStatus::Skipped);
+    }
+
+    #[test]
+    fn loop_node_kind_deserialize_from_json_string() {
+        let input = "\"join\"";
+        let k: LoopNodeKind = serde_json::from_str(input).unwrap();
+        assert_eq!(k, LoopNodeKind::Join);
+    }
+
+    #[test]
+    fn loop_edge_condition_deserialize_from_json_string() {
+        let input = "\"always\"";
+        let c: LoopEdgeCondition = serde_json::from_str(input).unwrap();
+        assert_eq!(c, LoopEdgeCondition::Always);
+    }
+
+    #[test]
+    fn loop_run_status_deserialize_from_json_string() {
+        let input = "\"fail\"";
+        let s: LoopRunStatus = serde_json::from_str(input).unwrap();
+        assert_eq!(s, LoopRunStatus::Fail);
+    }
+
+    // ── SpecAdminStatusOutcome: clone & Debug ───────────────────────────
+
+    #[test]
+    fn spec_admin_status_outcome_success_is_clone() {
+        let a = SpecAdminStatusOutcome::Success;
+        let b = a.clone();
+        assert!(matches!(b, SpecAdminStatusOutcome::Success));
+    }
+
+    #[test]
+    fn spec_admin_status_outcome_not_found_is_clone() {
+        let a = SpecAdminStatusOutcome::NotFound;
+        let b = a.clone();
+        assert!(matches!(b, SpecAdminStatusOutcome::NotFound));
+    }
+
+    #[test]
+    fn spec_admin_status_outcome_not_standalone_is_clone() {
+        let a = SpecAdminStatusOutcome::NotStandalone("s1".to_string());
+        let b = a.clone();
+        match b {
+            SpecAdminStatusOutcome::NotStandalone(id) => assert_eq!(id, "s1"),
+            _ => panic!("expected clone of NotStandalone"),
+        }
+    }
+
+    #[test]
+    fn spec_admin_status_outcome_active_run_is_clone() {
+        let a = SpecAdminStatusOutcome::ActiveRun {
+            loop_id: "l1".to_string(),
+            run_id: "r1".to_string(),
+        };
+        let b = a.clone();
+        match b {
+            SpecAdminStatusOutcome::ActiveRun { loop_id, run_id } => {
+                assert_eq!(loop_id, "l1");
+                assert_eq!(run_id, "r1");
+            }
+            _ => panic!("expected clone of ActiveRun"),
+        }
+    }
+
+    // ── LoopResetOutcome: clone & Debug ─────────────────────────────────
+
+    #[test]
+    fn loop_reset_outcome_is_clone() {
+        let outcomes = [
+            LoopResetOutcome::NotFound,
+            LoopResetOutcome::Running,
+            LoopResetOutcome::InvalidSpec("x".to_string()),
+            LoopResetOutcome::Reset { spec_count: 3 },
+        ];
+        for o in outcomes {
+            let cloned = o.clone();
+            assert_eq!(format!("{o:?}"), format!("{cloned:?}"));
+        }
+    }
+
+    // ── validate_spec_description_template: mixed format markers ────────
+
+    #[test]
+    fn spec_template_mixed_h2_and_colon_markers() {
+        let desc = r#"
+## Functional Requirements:
+- Build
+
+Non-Functional Requirements:
+- Fast
+
+## Objective:
+Done
+
+- Constraints:
+  Safe
+
+* Guidelines:
+  Simple
+
+- In Scope:
+  API
+
+## Out of Scope:
+UI
+"#;
+        assert!(validate_spec_description_template(desc).is_ok());
+    }
+
+    #[test]
+    fn spec_template_each_section_can_be_detected_independently() {
+        let sections = [
+            "Functional Requirements",
+            "Non-Functional Requirements",
+            "Objective",
+            "Constraints",
+            "Guidelines",
+            "In Scope",
+            "Out of Scope",
+        ];
+        for (i, section) in sections.iter().enumerate() {
+            let desc = full_desc_with(i, section);
+            assert!(
+                validate_spec_description_template(&desc).is_ok(),
+                "section {section} should have been detected but was reported missing"
+            );
+        }
+    }
+
+    #[test]
+    fn spec_template_all_aliases_for_functional_requirements() {
+        let aliases = [
+            "Functional Requirements",
+            "functional requirements",
+            "Requerimientos funcionales",
+            "Requisitos funcionales",
+        ];
+        for alias in aliases {
+            let desc = format!(
+                "{alias}:\n- x\nNon-Functional Requirements:\n- y\nObjective:\n- z\nConstraints:\n- w\nGuidelines:\n- v\nIn Scope:\n- u\nOut of Scope:\n- t\n"
+            );
+            assert!(
+                validate_spec_description_template(&desc).is_ok(),
+                "alias {alias:?} should match"
+            );
+        }
+    }
+
+    #[test]
+    fn spec_template_all_aliases_for_constraints() {
+        let aliases = [
+            "Constraints",
+            "What to respect",
+            "Restrictions",
+            "Restricciones",
+            "Que respetar",
+            "Qué respetar",
+        ];
+        for alias in aliases {
+            let desc = format!(
+                "Functional Requirements:\n- x\nNon-Functional Requirements:\n- y\nObjective:\n- z\n{alias}:\n- w\nGuidelines:\n- v\nIn Scope:\n- u\nOut of Scope:\n- t\n"
+            );
+            assert!(
+                validate_spec_description_template(&desc).is_ok(),
+                "alias {alias:?} should match"
+            );
+        }
+    }
+
+    #[test]
+    fn spec_template_all_aliases_for_guidelines() {
+        let aliases = [
+            "Guidelines",
+            "Lineamientos",
+            "Guidance",
+            "Lineas guia",
+            "Líneas guía",
+        ];
+        for alias in aliases {
+            let desc = format!(
+                "Functional Requirements:\n- x\nNon-Functional Requirements:\n- y\nObjective:\n- z\nConstraints:\n- w\n{alias}:\n- v\nIn Scope:\n- u\nOut of Scope:\n- t\n"
+            );
+            assert!(
+                validate_spec_description_template(&desc).is_ok(),
+                "alias {alias:?} should match"
+            );
+        }
+    }
+
+    #[test]
+    fn spec_template_all_aliases_for_in_scope() {
+        let aliases = ["In Scope", "Scope In", "Que si", "Qué sí", "Incluye"];
+        for alias in aliases {
+            let desc = format!(
+                "Functional Requirements:\n- x\nNon-Functional Requirements:\n- y\nObjective:\n- z\nConstraints:\n- w\nGuidelines:\n- v\n{alias}:\n- u\nOut of Scope:\n- t\n"
+            );
+            assert!(
+                validate_spec_description_template(&desc).is_ok(),
+                "alias {alias:?} should match"
+            );
+        }
+    }
+
+    #[test]
+    fn spec_template_all_aliases_for_out_of_scope() {
+        let aliases = [
+            "Out of Scope",
+            "Scope Out",
+            "Que no",
+            "Qué no",
+            "Excluye",
+        ];
+        for alias in aliases {
+            let desc = format!(
+                "Functional Requirements:\n- x\nNon-Functional Requirements:\n- y\nObjective:\n- z\nConstraints:\n- w\nGuidelines:\n- v\nIn Scope:\n- u\n{alias}:\n- t\n"
+            );
+            assert!(
+                validate_spec_description_template(&desc).is_ok(),
+                "alias {alias:?} should match"
+            );
+        }
+    }
+
+    #[test]
+    fn spec_template_all_aliases_for_non_functional_requirements() {
+        let aliases = [
+            "Non-Functional Requirements",
+            "Non functional requirements",
+            "Requerimientos no funcionales",
+            "Requisitos no funcionales",
+        ];
+        for alias in aliases {
+            let desc = format!(
+                "Functional Requirements:\n- x\n{alias}:\n- y\nObjective:\n- z\nConstraints:\n- w\nGuidelines:\n- v\nIn Scope:\n- u\nOut of Scope:\n- t\n"
+            );
+            assert!(
+                validate_spec_description_template(&desc).is_ok(),
+                "alias {alias:?} should match"
+            );
+        }
+    }
+
+    #[test]
+    fn spec_template_all_aliases_for_objective() {
+        let aliases = [
+            "Objective",
+            "Expected Outcome",
+            "Objetivo",
+            "Resultado esperado",
+        ];
+        for alias in aliases {
+            let desc = format!(
+                "Functional Requirements:\n- x\nNon-Functional Requirements:\n- y\n{alias}:\n- z\nConstraints:\n- w\nGuidelines:\n- v\nIn Scope:\n- u\nOut of Scope:\n- t\n"
+            );
+            assert!(
+                validate_spec_description_template(&desc).is_ok(),
+                "alias {alias:?} should match"
             );
         }
     }

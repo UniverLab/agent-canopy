@@ -283,4 +283,131 @@ mod tests {
         };
         assert!(validate_blueprint_deletable(&bp).is_ok());
     }
+
+    #[test]
+    fn builtin_blueprint_specs_returns_non_empty_list() {
+        let specs = builtin_blueprint_specs();
+        assert!(!specs.is_empty());
+        assert_eq!(specs.len(), 5);
+    }
+
+    #[test]
+    fn builtin_blueprint_specs_each_has_name_kind_config() {
+        for (name, _kind, config) in builtin_blueprint_specs() {
+            assert!(!name.is_empty(), "blueprint name must not be empty");
+            assert!(
+                config.is_object(),
+                "blueprint '{name}' config must be a JSON object"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_blueprint_specs_kinds_are_agent_or_check() {
+        for (name, kind, _) in builtin_blueprint_specs() {
+            assert!(
+                kind == LoopNodeKind::Agent || kind == LoopNodeKind::Check,
+                "blueprint '{name}' kind must be Agent or Check, got {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_blueprint_config_with_empty_overrides_returns_template() {
+        let template = serde_json::json!({ "a": 1, "b": 2 });
+        let overrides = serde_json::json!({});
+        let merged = merge_blueprint_config(&template, Some(&overrides));
+        assert_eq!(merged, template);
+    }
+
+    #[test]
+    fn merge_blueprint_config_with_non_object_overrides_returns_template() {
+        let template = serde_json::json!({ "a": 1 });
+        let overrides = serde_json::json!("just a string");
+        let merged = merge_blueprint_config(&template, Some(&overrides));
+        assert_eq!(merged, template);
+    }
+
+    #[test]
+    fn merge_blueprint_config_non_object_template_treated_as_empty() {
+        let template = serde_json::json!("not an object");
+        let overrides = serde_json::json!({ "key": "val" });
+        let merged = merge_blueprint_config(&template, Some(&overrides));
+        assert_eq!(merged["key"], "val");
+        assert!(merged.as_object().unwrap().len() == 1);
+    }
+
+    #[test]
+    fn merge_blueprint_config_override_does_not_mutate_template() {
+        let template = serde_json::json!({ "platform": "claude" });
+        let overrides = serde_json::json!({ "platform": "mimo" });
+        let _ = merge_blueprint_config(&template, Some(&overrides));
+        assert_eq!(template["platform"], "claude");
+    }
+
+    #[test]
+    fn blueprint_serde_roundtrip() {
+        let bp = Blueprint {
+            id: "test-id".to_string(),
+            name: "test-bp".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({ "platform": "claude", "prompt_preset": "implementer" }),
+            builtin: true,
+            created_at: Utc::now(),
+        };
+
+        let json = serde_json::to_string(&bp).unwrap();
+        let deserialized: Blueprint = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.id, bp.id);
+        assert_eq!(deserialized.name, bp.name);
+        assert_eq!(deserialized.kind, bp.kind);
+        assert_eq!(deserialized.config, bp.config);
+        assert_eq!(deserialized.builtin, bp.builtin);
+    }
+
+    #[test]
+    fn ensemble_blueprint_serde_roundtrip() {
+        let ebp = EnsembleBlueprint {
+            id: "ens-1".to_string(),
+            name: "test-ensemble".to_string(),
+            prompt_template: "Do the thing\n\n{{spec_content}}".to_string(),
+            members: vec![
+                ("openrouter".to_string(), Some("deepseek/deepseek-chat-v3.1:free".to_string())),
+                ("claude".to_string(), None),
+            ],
+            min_pass: Some(1),
+            builtin: false,
+            created_at: Utc::now(),
+        };
+
+        let json = serde_json::to_string(&ebp).unwrap();
+        let deserialized: EnsembleBlueprint = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.id, ebp.id);
+        assert_eq!(deserialized.name, ebp.name);
+        assert_eq!(deserialized.prompt_template, ebp.prompt_template);
+        assert_eq!(deserialized.members, ebp.members);
+        assert_eq!(deserialized.min_pass, ebp.min_pass);
+        assert_eq!(deserialized.builtin, ebp.builtin);
+    }
+
+    #[test]
+    fn builtin_blueprint_specs_check_blueprints_have_command() {
+        let mut count = 0;
+        for (name, kind, config) in builtin_blueprint_specs() {
+            if kind == LoopNodeKind::Check {
+                count += 1;
+                assert!(
+                    config.get("command").is_some(),
+                    "check blueprint '{name}' must have a 'command' field"
+                );
+                assert!(
+                    !config["command"].as_str().unwrap_or("").is_empty(),
+                    "check blueprint '{name}' must have a non-empty 'command'"
+                );
+            }
+        }
+        assert_eq!(count, 2);
+    }
 }

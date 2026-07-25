@@ -337,4 +337,74 @@ mod tests {
 
         let _ = seeds::remove_seed(&seed_id);
     }
+
+    #[test]
+    fn instruction_file_for_claude() {
+        assert_eq!(instruction_file_for_cli("claude"), "CLAUDE.md");
+    }
+
+    #[test]
+    fn instruction_file_for_gemini() {
+        assert_eq!(instruction_file_for_cli("gemini"), "GEMINI.md");
+    }
+
+    #[test]
+    fn instruction_file_for_copilot() {
+        assert_eq!(
+            instruction_file_for_cli("copilot"),
+            ".github/copilot-instructions.md"
+        );
+    }
+
+    #[test]
+    fn instruction_file_for_opencode() {
+        assert_eq!(instruction_file_for_cli("opencode"), "AGENTS.md");
+    }
+
+    #[test]
+    fn instruction_file_for_kiro() {
+        assert_eq!(instruction_file_for_cli("kiro"), "AGENTS.md");
+    }
+
+    #[test]
+    fn instruction_file_for_codex() {
+        assert_eq!(instruction_file_for_cli("codex"), "AGENTS.md");
+    }
+
+    #[test]
+    fn instruction_file_for_mistral() {
+        assert_eq!(instruction_file_for_cli("mistral"), "AGENTS.md");
+    }
+
+    #[test]
+    fn instruction_file_for_unknown_falls_back_to_agents_md() {
+        assert_eq!(instruction_file_for_cli("nonexistent-cli"), "AGENTS.md");
+        assert_eq!(instruction_file_for_cli(""), "AGENTS.md");
+    }
+
+    #[test]
+    fn gardener_instructions_mentions_seed_nursery_heading() {
+        assert!(GARDENER_INSTRUCTIONS.contains("# Seed Nursery"));
+    }
+
+    #[test]
+    fn gardener_instructions_covers_all_required_fields() {
+        assert!(GARDENER_INSTRUCTIONS.contains("**name**"));
+        assert!(GARDENER_INSTRUCTIONS.contains("directives"));
+        assert!(GARDENER_INSTRUCTIONS.contains("traits"));
+    }
+
+    #[test]
+    fn gardener_instructions_contains_toml_format_example() {
+        assert!(GARDENER_INSTRUCTIONS.contains("```toml"));
+        assert!(GARDENER_INSTRUCTIONS.contains("name = \"TheName\""));
+        assert!(GARDENER_INSTRUCTIONS.contains("[directives]"));
+        assert!(GARDENER_INSTRUCTIONS.contains("[traits]"));
+    }
+
+    #[test]
+    fn gardener_instructions_mentions_process_steps() {
+        assert!(GARDENER_INSTRUCTIONS.contains("## Process"));
+        assert!(GARDENER_INSTRUCTIONS.contains("identity.toml"));
+    }
 }
