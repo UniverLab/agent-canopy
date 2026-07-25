@@ -6014,20 +6014,26 @@ impl ServerHandler for TaskTriggerHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_ensemble_unit, handle_retry_current_node, handle_skip_next_spec, header_str,
-        loop_details_json, loop_run_status_guard, missing_sync_identity_error, node_copy_note,
-        perform_loop_reset, plan_ensemble_copy, plan_node_copy, resolve_graph_target,
-        resolve_node_kind_and_config, resolve_reported_run, validate_blueprint_exists,
-        validate_ensemble_members, validate_node_config, validate_node_not_ensemble_owned,
-        validate_pool_exists, validate_pool_member_removable, validate_pool_not_consumed,
-        validate_pool_reorder, validate_pool_reorder_locking, validate_spec_deletable,
-        validate_spec_exists, BuiltEnsembleUnit, EnsembleMemberParams, EnsembleUnitSpec,
-        TaskTriggerHandler, MISSING_SYNC_IDENTITY_MESSAGE,
+        build_ensemble_unit, build_get_tools_response, build_id_result, build_json_result,
+        build_loop_completion_hook, build_loop_trigger, build_loop_update_response,
+        build_node_update_response, build_spec_update_response, handle_retry_current_node,
+        handle_skip_next_spec, header_str, json_value_kind_name, loop_details_json,
+        loop_run_status_guard, loop_trigger_json, member_node_config, missing_sync_identity_error,
+        node_copy_note, perform_loop_reset, plan_ensemble_copy, plan_node_copy, rag_result_json,
+        resolve_graph_target, resolve_node_kind_and_config, resolve_reported_run, spec_summary_json,
+        validate_absolute_dir, validate_at_least_one_bool, validate_blueprint_exists,
+        validate_edge_condition, validate_ensemble_members, validate_non_empty,
+        validate_node_config, validate_node_kind, validate_node_not_ensemble_owned,
+        validate_not_join_kind, validate_pool_exists, validate_pool_member_removable,
+        validate_pool_not_consumed, validate_pool_reorder, validate_pool_reorder_locking,
+        validate_spec_deletable, validate_spec_exists, validate_spec_set_status_target,
+        validate_spec_status, validate_spec_workdir, BuiltEnsembleUnit, EnsembleMemberParams,
+        EnsembleUnitSpec, TaskTriggerHandler, MISSING_SYNC_IDENTITY_MESSAGE,
     };
     use crate::daemon::params::{
-        LoopCopyEnsembleParams, LoopCopyNodeParams, LoopRunParams, LoopScheduleAutorunParams,
-        LoopScheduleContinueParams, PoolAddSpecParams, PoolCreateParams, PoolListParams,
-        QueueAddSpecParams, QueueCreateParams, QueueListParams,
+        LoopCompletionHookParams, LoopCopyEnsembleParams, LoopCopyNodeParams, LoopRunParams,
+        LoopScheduleAutorunParams, LoopScheduleContinueParams, LoopTriggerParams, PoolAddSpecParams,
+        PoolCreateParams, PoolListParams, QueueAddSpecParams, QueueCreateParams, QueueListParams,
     };
     use crate::db::Database;
     use crate::domain::blueprints::Blueprint;
@@ -6035,6 +6041,7 @@ mod tests {
         Ensemble, EnsembleMember, Loop, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind,
         LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus,
     };
+    use crate::domain::models::{Agent, Trigger};
     use crate::domain::pools::Pool;
     use crate::shared::sync_identity::CANOPY_AGENT_ID_HEADER;
     use tempfile::tempdir;
@@ -8367,5 +8374,1063 @@ mod tests {
             .map(|n| n.id.as_str())
             .collect();
         assert!(!runs.iter().any(|r| new_ids.contains(&r.node_id.as_str())));
+    }
+
+    // ── validate_non_empty ──────────────────────────────────────────
+
+    #[test]
+    fn validate_non_empty_rejects_empty_string() {
+        assert!(validate_non_empty("", "name").is_err());
+    }
+
+    #[test]
+    fn validate_non_empty_rejects_whitespace_only() {
+        assert!(validate_non_empty("   ", "name").is_err());
+        assert!(validate_non_empty("\t\n", "name").is_err());
+    }
+
+    #[test]
+    fn validate_non_empty_accepts_valid_value() {
+        assert!(validate_non_empty("hello", "name").is_ok());
+        assert!(validate_non_empty("  hello  ", "name").is_ok());
+    }
+
+    #[test]
+    fn validate_non_empty_error_includes_field_name() {
+        let err = validate_non_empty("", "workdir").unwrap_err();
+        assert!(err.contains("workdir"), "{err}");
+        assert!(err.contains("must not be empty"), "{err}");
+    }
+
+    // ── validate_absolute_dir ───────────────────────────────────────
+
+    #[test]
+    fn validate_absolute_dir_rejects_relative_path() {
+        assert!(validate_absolute_dir("relative/path").is_err());
+    }
+
+    #[test]
+    fn validate_absolute_dir_rejects_nonexistent_directory() {
+        let err = validate_absolute_dir("/nonexistent/dir/path").unwrap_err();
+        assert!(err.contains("existing directory"), "{err}");
+    }
+
+    #[test]
+    fn validate_absolute_dir_accepts_existing_directory() {
+        let dir = tempdir().unwrap();
+        assert!(validate_absolute_dir(dir.path().to_str().unwrap()).is_ok());
+    }
+
+    // ── validate_spec_workdir ───────────────────────────────────────
+
+    #[test]
+    fn validate_spec_workdir_rejects_relative_path() {
+        let err = validate_spec_workdir("relative/path").unwrap_err();
+        assert!(err.contains("absolute path"), "{err}");
+    }
+
+    #[test]
+    fn validate_spec_workdir_accepts_absolute_path() {
+        assert!(validate_spec_workdir("/some/absolute/path").is_ok());
+    }
+
+    #[test]
+    fn validate_spec_workdir_does_not_require_existing_directory() {
+        assert!(validate_spec_workdir("/nonexistent/dir/path").is_ok());
+    }
+
+    // ── build_loop_trigger ──────────────────────────────────────────
+
+    #[test]
+    fn build_loop_trigger_none_returns_none() {
+        assert!(build_loop_trigger(&None).unwrap().is_none());
+    }
+
+    #[test]
+    fn build_loop_trigger_manual_returns_none() {
+        let params = LoopTriggerParams {
+            kind: "manual".to_string(),
+            schedule: None,
+            path: None,
+            events: None,
+            debounce_seconds: None,
+            recursive: None,
+        };
+        assert!(build_loop_trigger(&Some(params)).unwrap().is_none());
+    }
+
+    #[test]
+    fn build_loop_trigger_empty_kind_returns_none() {
+        let params = LoopTriggerParams {
+            kind: "".to_string(),
+            schedule: None,
+            path: None,
+            events: None,
+            debounce_seconds: None,
+            recursive: None,
+        };
+        assert!(build_loop_trigger(&Some(params)).unwrap().is_none());
+    }
+
+    #[test]
+    fn build_loop_trigger_cron_requires_schedule() {
+        let params = LoopTriggerParams {
+            kind: "cron".to_string(),
+            schedule: None,
+            path: None,
+            events: None,
+            debounce_seconds: None,
+            recursive: None,
+        };
+        let err = build_loop_trigger(&Some(params)).unwrap_err();
+        assert!(err.contains("schedule"), "{err}");
+    }
+
+    #[test]
+    fn build_loop_trigger_cron_rejects_empty_schedule() {
+        let params = LoopTriggerParams {
+            kind: "cron".to_string(),
+            schedule: Some("".to_string()),
+            path: None,
+            events: None,
+            debounce_seconds: None,
+            recursive: None,
+        };
+        let err = build_loop_trigger(&Some(params)).unwrap_err();
+        assert!(err.contains("schedule"), "{err}");
+    }
+
+    #[test]
+    fn build_loop_trigger_watch_requires_path() {
+        let params = LoopTriggerParams {
+            kind: "watch".to_string(),
+            schedule: None,
+            path: None,
+            events: Some(vec!["modify".to_string()]),
+            debounce_seconds: None,
+            recursive: None,
+        };
+        let err = build_loop_trigger(&Some(params)).unwrap_err();
+        assert!(err.contains("path"), "{err}");
+    }
+
+    #[test]
+    fn build_loop_trigger_watch_rejects_relative_path() {
+        let params = LoopTriggerParams {
+            kind: "watch".to_string(),
+            schedule: None,
+            path: Some("relative/path".to_string()),
+            events: Some(vec!["modify".to_string()]),
+            debounce_seconds: None,
+            recursive: None,
+        };
+        let err = build_loop_trigger(&Some(params)).unwrap_err();
+        assert!(err.contains("absolute"), "{err}");
+    }
+
+    #[test]
+    fn build_loop_trigger_watch_requires_events() {
+        let params = LoopTriggerParams {
+            kind: "watch".to_string(),
+            schedule: None,
+            path: Some("/tmp/test".to_string()),
+            events: None,
+            debounce_seconds: None,
+            recursive: None,
+        };
+        let err = build_loop_trigger(&Some(params)).unwrap_err();
+        assert!(err.contains("event"), "{err}");
+    }
+
+    #[test]
+    fn build_loop_trigger_watch_accepts_valid_config() {
+        let params = LoopTriggerParams {
+            kind: "watch".to_string(),
+            schedule: None,
+            path: Some("/tmp/test".to_string()),
+            events: Some(vec!["create".to_string(), "modify".to_string()]),
+            debounce_seconds: Some(5),
+            recursive: Some(true),
+        };
+        let trigger = build_loop_trigger(&Some(params)).unwrap().unwrap();
+        match trigger {
+            Trigger::Watch {
+                path,
+                events,
+                debounce_seconds,
+                recursive,
+            } => {
+                assert_eq!(path, "/tmp/test");
+                assert_eq!(events.len(), 2);
+                assert_eq!(debounce_seconds, 5);
+                assert!(recursive);
+            }
+            other => panic!("expected Trigger::Watch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_loop_trigger_unknown_kind_returns_error() {
+        let params = LoopTriggerParams {
+            kind: "unknown".to_string(),
+            schedule: None,
+            path: None,
+            events: None,
+            debounce_seconds: None,
+            recursive: None,
+        };
+        let err = build_loop_trigger(&Some(params)).unwrap_err();
+        assert!(err.contains("Unknown trigger kind"), "{err}");
+        assert!(err.contains("unknown"), "{err}");
+    }
+
+    // ── build_loop_completion_hook ──────────────────────────────────
+
+    #[test]
+    fn build_loop_completion_hook_rejects_empty_platform() {
+        let params = LoopCompletionHookParams {
+            platform: "".to_string(),
+            model: None,
+            prompt: "run tests".to_string(),
+            timeout_minutes: None,
+        };
+        let err = build_loop_completion_hook(&params).unwrap_err();
+        assert!(err.contains("platform"), "{err}");
+    }
+
+    #[test]
+    fn build_loop_completion_hook_rejects_whitespace_platform() {
+        let params = LoopCompletionHookParams {
+            platform: "   ".to_string(),
+            model: None,
+            prompt: "run tests".to_string(),
+            timeout_minutes: None,
+        };
+        let err = build_loop_completion_hook(&params).unwrap_err();
+        assert!(err.contains("platform"), "{err}");
+    }
+
+    #[test]
+    fn build_loop_completion_hook_rejects_empty_prompt() {
+        let params = LoopCompletionHookParams {
+            platform: "claude".to_string(),
+            model: None,
+            prompt: "".to_string(),
+            timeout_minutes: None,
+        };
+        let err = build_loop_completion_hook(&params).unwrap_err();
+        assert!(err.contains("prompt"), "{err}");
+    }
+
+    #[test]
+    fn build_loop_completion_hook_rejects_whitespace_prompt() {
+        let params = LoopCompletionHookParams {
+            platform: "claude".to_string(),
+            model: None,
+            prompt: "  \t  ".to_string(),
+            timeout_minutes: None,
+        };
+        let err = build_loop_completion_hook(&params).unwrap_err();
+        assert!(err.contains("prompt"), "{err}");
+    }
+
+    #[test]
+    fn build_loop_completion_hook_accepts_valid_config() {
+        let params = LoopCompletionHookParams {
+            platform: "claude".to_string(),
+            model: Some("opus-4".to_string()),
+            prompt: "{{loop_name}} completed".to_string(),
+            timeout_minutes: Some(10),
+        };
+        let hook = build_loop_completion_hook(&params).unwrap();
+        assert_eq!(hook.platform, "claude");
+        assert_eq!(hook.model, Some("opus-4".to_string()));
+        assert_eq!(hook.prompt, "{{loop_name}} completed");
+        assert_eq!(hook.timeout_minutes, Some(10));
+    }
+
+    #[test]
+    fn build_loop_completion_hook_strips_whitespace() {
+        let params = LoopCompletionHookParams {
+            platform: "  claude  ".to_string(),
+            model: Some("  opus  ".to_string()),
+            prompt: "  test  ".to_string(),
+            timeout_minutes: None,
+        };
+        let hook = build_loop_completion_hook(&params).unwrap();
+        assert_eq!(hook.platform, "claude");
+        assert_eq!(hook.model, Some("opus".to_string()));
+        assert_eq!(hook.prompt, "test");
+    }
+
+    #[test]
+    fn build_loop_completion_hook_empty_model_becomes_none() {
+        let params = LoopCompletionHookParams {
+            platform: "claude".to_string(),
+            model: Some("  ".to_string()),
+            prompt: "test".to_string(),
+            timeout_minutes: None,
+        };
+        let hook = build_loop_completion_hook(&params).unwrap();
+        assert!(hook.model.is_none());
+    }
+
+    // ── member_node_config ──────────────────────────────────────────
+
+    #[test]
+    fn member_node_config_produces_correct_shape() {
+        let config = member_node_config("claude", Some("opus-4"), "do the thing", 30);
+        assert_eq!(config["platform"], "claude");
+        assert_eq!(config["model"], "opus-4");
+        assert_eq!(config["prompt_template"], "do the thing");
+        assert_eq!(config["timeout_minutes"], 30);
+    }
+
+    #[test]
+    fn member_node_config_null_model_when_none() {
+        let config = member_node_config("claude", None, "prompt", 15);
+        assert_eq!(config["platform"], "claude");
+        assert!(config["model"].is_null());
+    }
+
+    // ── validate_edge_condition ─────────────────────────────────────
+
+    #[test]
+    fn validate_edge_condition_accepts_pass() {
+        assert_eq!(
+            validate_edge_condition("pass").unwrap(),
+            LoopEdgeCondition::Pass
+        );
+    }
+
+    #[test]
+    fn validate_edge_condition_accepts_fail() {
+        assert_eq!(
+            validate_edge_condition("fail").unwrap(),
+            LoopEdgeCondition::Fail
+        );
+    }
+
+    #[test]
+    fn validate_edge_condition_accepts_always() {
+        assert_eq!(
+            validate_edge_condition("always").unwrap(),
+            LoopEdgeCondition::Always
+        );
+    }
+
+    #[test]
+    fn validate_edge_condition_trims_whitespace() {
+        assert_eq!(
+            validate_edge_condition("  pass  ").unwrap(),
+            LoopEdgeCondition::Pass
+        );
+    }
+
+    #[test]
+    fn validate_edge_condition_rejects_invalid() {
+        let err = validate_edge_condition("sometimes").unwrap_err();
+        assert!(err.contains("pass"), "{err}");
+        assert!(err.contains("fail"), "{err}");
+        assert!(err.contains("always"), "{err}");
+    }
+
+    // ── validate_node_kind ──────────────────────────────────────────
+
+    #[test]
+    fn validate_node_kind_accepts_agent() {
+        assert_eq!(validate_node_kind("agent").unwrap(), LoopNodeKind::Agent);
+    }
+
+    #[test]
+    fn validate_node_kind_accepts_check() {
+        assert_eq!(validate_node_kind("check").unwrap(), LoopNodeKind::Check);
+    }
+
+    #[test]
+    fn validate_node_kind_accepts_gate() {
+        assert_eq!(validate_node_kind("gate").unwrap(), LoopNodeKind::Gate);
+    }
+
+    #[test]
+    fn validate_node_kind_accepts_join() {
+        assert_eq!(validate_node_kind("join").unwrap(), LoopNodeKind::Join);
+    }
+
+    #[test]
+    fn validate_node_kind_trims_whitespace() {
+        assert_eq!(
+            validate_node_kind("  agent  ").unwrap(),
+            LoopNodeKind::Agent
+        );
+    }
+
+    #[test]
+    fn validate_node_kind_rejects_invalid() {
+        let err = validate_node_kind("invalid").unwrap_err();
+        assert!(err.contains("agent"), "{err}");
+        assert!(err.contains("check"), "{err}");
+        assert!(err.contains("gate"), "{err}");
+    }
+
+    // ── validate_not_join_kind ──────────────────────────────────────
+
+    #[test]
+    fn validate_not_join_kind_rejects_join() {
+        let err = validate_not_join_kind(LoopNodeKind::Join).unwrap_err();
+        assert!(err.contains("engine-managed"), "{err}");
+        assert!(err.contains("loop_add_ensemble"), "{err}");
+    }
+
+    #[test]
+    fn validate_not_join_kind_accepts_agent() {
+        assert!(validate_not_join_kind(LoopNodeKind::Agent).is_ok());
+    }
+
+    #[test]
+    fn validate_not_join_kind_accepts_check() {
+        assert!(validate_not_join_kind(LoopNodeKind::Check).is_ok());
+    }
+
+    #[test]
+    fn validate_not_join_kind_accepts_gate() {
+        assert!(validate_not_join_kind(LoopNodeKind::Gate).is_ok());
+    }
+
+    // ── validate_spec_status ────────────────────────────────────────
+
+    #[test]
+    fn validate_spec_status_accepts_all_valid_statuses() {
+        assert_eq!(
+            validate_spec_status("pending").unwrap(),
+            LoopSpecStatus::Pending
+        );
+        assert_eq!(
+            validate_spec_status("running").unwrap(),
+            LoopSpecStatus::Running
+        );
+        assert_eq!(
+            validate_spec_status("completed").unwrap(),
+            LoopSpecStatus::Completed
+        );
+        assert_eq!(
+            validate_spec_status("failed").unwrap(),
+            LoopSpecStatus::Failed
+        );
+        assert_eq!(
+            validate_spec_status("skipped").unwrap(),
+            LoopSpecStatus::Skipped
+        );
+    }
+
+    #[test]
+    fn validate_spec_status_is_case_insensitive() {
+        assert_eq!(
+            validate_spec_status("PENDING").unwrap(),
+            LoopSpecStatus::Pending
+        );
+        assert_eq!(
+            validate_spec_status("Running").unwrap(),
+            LoopSpecStatus::Running
+        );
+    }
+
+    #[test]
+    fn validate_spec_status_trims_whitespace() {
+        assert_eq!(
+            validate_spec_status("  pending  ").unwrap(),
+            LoopSpecStatus::Pending
+        );
+    }
+
+    #[test]
+    fn validate_spec_status_rejects_invalid() {
+        let err = validate_spec_status("unknown").unwrap_err();
+        assert!(err.contains("pending"), "{err}");
+        assert!(err.contains("running"), "{err}");
+        assert!(err.contains("completed"), "{err}");
+        assert!(err.contains("failed"), "{err}");
+        assert!(err.contains("skipped"), "{err}");
+    }
+
+    // ── validate_spec_set_status_target ─────────────────────────────
+
+    #[test]
+    fn validate_spec_set_status_target_accepts_valid() {
+        assert_eq!(
+            validate_spec_set_status_target("pending").unwrap(),
+            LoopSpecStatus::Pending
+        );
+        assert_eq!(
+            validate_spec_set_status_target("completed").unwrap(),
+            LoopSpecStatus::Completed
+        );
+        assert_eq!(
+            validate_spec_set_status_target("skipped").unwrap(),
+            LoopSpecStatus::Skipped
+        );
+    }
+
+    #[test]
+    fn validate_spec_set_status_target_rejects_running() {
+        let err = validate_spec_set_status_target("running").unwrap_err();
+        assert!(err.contains("pending"), "{err}");
+        assert!(err.contains("completed"), "{err}");
+        assert!(err.contains("skipped"), "{err}");
+    }
+
+    #[test]
+    fn validate_spec_set_status_target_rejects_failed() {
+        let err = validate_spec_set_status_target("failed").unwrap_err();
+        assert!(err.contains("pending"), "{err}");
+        assert!(err.contains("completed"), "{err}");
+        assert!(err.contains("skipped"), "{err}");
+    }
+
+    #[test]
+    fn validate_spec_set_status_target_rejects_invalid() {
+        assert!(validate_spec_set_status_target("unknown").is_err());
+    }
+
+    // ── json_value_kind_name ────────────────────────────────────────
+
+    #[test]
+    fn json_value_kind_name_null() {
+        assert_eq!(json_value_kind_name(&serde_json::Value::Null), "null");
+    }
+
+    #[test]
+    fn json_value_kind_name_bool() {
+        assert_eq!(
+            json_value_kind_name(&serde_json::json!(true)),
+            "a boolean"
+        );
+    }
+
+    #[test]
+    fn json_value_kind_name_number() {
+        assert_eq!(
+            json_value_kind_name(&serde_json::json!(42)),
+            "a number"
+        );
+    }
+
+    #[test]
+    fn json_value_kind_name_string() {
+        assert_eq!(
+            json_value_kind_name(&serde_json::json!("hello")),
+            "a JSON-encoded string"
+        );
+    }
+
+    #[test]
+    fn json_value_kind_name_array() {
+        assert_eq!(
+            json_value_kind_name(&serde_json::json!([1, 2, 3])),
+            "an array"
+        );
+    }
+
+    #[test]
+    fn json_value_kind_name_object() {
+        assert_eq!(
+            json_value_kind_name(&serde_json::json!({"key": "value"})),
+            "an object"
+        );
+    }
+
+    // ── validate_at_least_one_bool ──────────────────────────────────
+
+    #[test]
+    fn validate_at_least_one_bool_rejects_all_false() {
+        let err = validate_at_least_one_bool(&[false, false, false], "fields").unwrap_err();
+        assert!(err.contains("fields"), "{err}");
+        assert!(err.contains("at least one"), "{err}");
+    }
+
+    #[test]
+    fn validate_at_least_one_bool_accepts_one_true() {
+        assert!(validate_at_least_one_bool(&[false, true, false], "fields").is_ok());
+    }
+
+    #[test]
+    fn validate_at_least_one_bool_accepts_all_true() {
+        assert!(validate_at_least_one_bool(&[true, true, true], "fields").is_ok());
+    }
+
+    // ── validate_pool_reorder ───────────────────────────────────────
+
+    #[test]
+    fn validate_pool_reorder_accepts_valid_permutation() {
+        let current = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let reordered = vec!["c".to_string(), "a".to_string(), "b".to_string()];
+        assert!(validate_pool_reorder(&current, &reordered).is_ok());
+    }
+
+    #[test]
+    fn validate_pool_reorder_accepts_same_order() {
+        let current = vec!["a".to_string(), "b".to_string()];
+        let reordered = vec!["a".to_string(), "b".to_string()];
+        assert!(validate_pool_reorder(&current, &reordered).is_ok());
+    }
+
+    #[test]
+    fn validate_pool_reorder_rejects_length_mismatch() {
+        let current = vec!["a".to_string(), "b".to_string()];
+        let reordered = vec!["a".to_string()];
+        let err = validate_pool_reorder(&current, &reordered).unwrap_err();
+        assert!(err.contains("2"), "{err}");
+        assert!(err.contains("1"), "{err}");
+    }
+
+    #[test]
+    fn validate_pool_reorder_rejects_duplicate() {
+        let current = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let reordered = vec!["a".to_string(), "a".to_string(), "b".to_string()];
+        let err = validate_pool_reorder(&current, &reordered).unwrap_err();
+        assert!(err.contains("a"), "{err}");
+        assert!(err.contains("more than once"), "{err}");
+    }
+
+    #[test]
+    fn validate_pool_reorder_rejects_unknown_id() {
+        let current = vec!["a".to_string(), "b".to_string()];
+        let reordered = vec!["a".to_string(), "x".to_string()];
+        let err = validate_pool_reorder(&current, &reordered).unwrap_err();
+        assert!(err.contains("x"), "{err}");
+        assert!(err.contains("no spec"), "{err}");
+    }
+
+    // ── spec_summary_json ───────────────────────────────────────────
+
+    #[test]
+    fn spec_summary_json_includes_required_fields() {
+        let spec = LoopSpec {
+            id: "spec-1".to_string(),
+            loop_id: Some("loop-1".to_string()),
+            name: "My Spec".to_string(),
+            description: Some("does stuff".to_string()),
+            position: 3,
+            parallelizable: true,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: Some("/tmp/project".to_string()),
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        let json = spec_summary_json(&spec);
+        assert_eq!(json["id"], "spec-1");
+        assert_eq!(json["loop_id"], "loop-1");
+        assert_eq!(json["name"], "My Spec");
+        assert_eq!(json["description"], "does stuff");
+        assert_eq!(json["position"], 3);
+        assert_eq!(json["parallelizable"], true);
+        assert_eq!(json["status"], "pending");
+        assert_eq!(json["workdir"], "/tmp/project");
+        assert!(json.get("completed_via").is_none());
+    }
+
+    #[test]
+    fn spec_summary_json_includes_completed_via_when_set() {
+        let spec = LoopSpec {
+            id: "spec-2".to_string(),
+            loop_id: None,
+            name: "Done".to_string(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Completed,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+            completed_via: Some("loop_reset".to_string()),
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        let json = spec_summary_json(&spec);
+        assert_eq!(json["completed_via"], "loop_reset");
+    }
+
+    // ── blueprint_json ──────────────────────────────────────────────
+
+    #[test]
+    fn blueprint_json_includes_all_fields() {
+        let bp = Blueprint {
+            id: "bp-1".to_string(),
+            name: "my-blueprint".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "claude"}),
+            builtin: true,
+            created_at: chrono::Utc::now(),
+        };
+        let json = super::blueprint_json(&bp);
+        assert_eq!(json["id"], "bp-1");
+        assert_eq!(json["name"], "my-blueprint");
+        assert_eq!(json["kind"], "agent");
+        assert_eq!(json["builtin"], true);
+        assert_eq!(json["config"]["platform"], "claude");
+    }
+
+    #[test]
+    fn blueprint_json_non_builtin() {
+        let bp = Blueprint {
+            id: "bp-2".to_string(),
+            name: "custom".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "true"}),
+            builtin: false,
+            created_at: chrono::Utc::now(),
+        };
+        let json = super::blueprint_json(&bp);
+        assert_eq!(json["builtin"], false);
+        assert_eq!(json["kind"], "check");
+    }
+
+    // ── build_id_result / build_json_result ─────────────────────────
+
+    #[test]
+    fn build_id_result_contains_key_and_id() {
+        let result = build_id_result("abc-123", "loop_id");
+        let text = format!("{:?}", result.content);
+        assert!(text.contains("abc-123"), "{text}");
+        assert!(text.contains("loop_id"), "{text}");
+        assert!(result.is_error != Some(true));
+    }
+
+    #[test]
+    fn build_json_result_contains_value() {
+        let value = serde_json::json!({"key": "value", "count": 42});
+        let result = build_json_result(&value);
+        let text = format!("{:?}", result.content);
+        assert!(text.contains("key"), "{text}");
+        assert!(text.contains("value"), "{text}");
+        assert!(text.contains("42"), "{text}");
+        assert!(result.is_error != Some(true));
+    }
+
+    // ── loop_trigger_json ───────────────────────────────────────────
+
+    fn make_loop_with_trigger(trigger: Option<Trigger>) -> Loop {
+        Loop {
+            id: "loop-1".to_string(),
+            name: "Test Loop".to_string(),
+            description: None,
+            workdir: "/tmp".to_string(),
+            status: LoopStatus::Draft,
+            trigger,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_pool_id: None,
+            on_completed: None,
+        }
+    }
+
+    #[test]
+    fn loop_trigger_json_manual() {
+        let lp = make_loop_with_trigger(None);
+        let json = loop_trigger_json(&lp);
+        assert_eq!(json["type"], "manual");
+        assert!(json.get("schedule").is_none());
+        assert!(json.get("path").is_none());
+    }
+
+    #[test]
+    fn loop_trigger_json_cron() {
+        let lp = make_loop_with_trigger(Some(Trigger::Cron {
+            schedule_expr: "0 9 * * *".to_string(),
+        }));
+        let json = loop_trigger_json(&lp);
+        assert_eq!(json["type"], "cron");
+        assert_eq!(json["schedule"], "0 9 * * *");
+    }
+
+    #[test]
+    fn loop_trigger_json_watch() {
+        let lp = make_loop_with_trigger(Some(Trigger::Watch {
+            path: "/tmp/project".to_string(),
+            events: vec![
+                crate::domain::models::WatchEvent::Create,
+                crate::domain::models::WatchEvent::Modify,
+            ],
+            debounce_seconds: 3,
+            recursive: true,
+        }));
+        let json = loop_trigger_json(&lp);
+        assert_eq!(json["type"], "watch");
+        assert_eq!(json["path"], "/tmp/project");
+        let events = json["events"].as_array().unwrap();
+        assert!(events.contains(&serde_json::json!("create")));
+        assert!(events.contains(&serde_json::json!("modify")));
+    }
+
+    // ── build_get_tools_response ────────────────────────────────────
+
+    #[test]
+    fn build_get_tools_response_session_start() {
+        let json = build_get_tools_response("session_start");
+        assert_eq!(json["scope"], "session_start");
+        assert_eq!(json["risk"], "low");
+        assert!(json["protocol"].is_array());
+        assert!(json["tools"].is_array());
+    }
+
+    #[test]
+    fn build_get_tools_response_file_write() {
+        let json = build_get_tools_response("file_write");
+        assert_eq!(json["scope"], "file_write");
+        assert_eq!(json["risk"], "high");
+    }
+
+    #[test]
+    fn build_get_tools_response_test_run() {
+        let json = build_get_tools_response("test_run");
+        assert_eq!(json["scope"], "test_run");
+        assert_eq!(json["risk"], "medium");
+    }
+
+    #[test]
+    fn build_get_tools_response_close_session() {
+        let json = build_get_tools_response("close_session");
+        assert_eq!(json["scope"], "close_session");
+        assert_eq!(json["risk"], "low");
+    }
+
+    #[test]
+    fn build_get_tools_response_multi_agent() {
+        let json = build_get_tools_response("multi_agent");
+        assert_eq!(json["scope"], "multi_agent");
+        assert_eq!(json["risk"], "varies");
+    }
+
+    // ── rag_result_json ─────────────────────────────────────────────
+
+    #[test]
+    fn rag_result_json_includes_all_fields() {
+        let search_result = crate::rag::vector_store::SearchResult {
+            id: "sr-1".to_string(),
+            file_path: "/tmp/doc.md".to_string(),
+            content: "some content here".to_string(),
+            created_at: 0,
+            distance: Some(0.42f32),
+        };
+        let json = rag_result_json(&search_result);
+        assert_eq!(json["source"], "/tmp/doc.md");
+        assert_eq!(json["content"], "some content here");
+        assert!(json["distance"].as_f64().unwrap() > 0.41);
+        assert!(json["distance"].as_f64().unwrap() < 0.43);
+    }
+
+    // ── node_copy_note ──────────────────────────────────────────────
+
+    #[test]
+    fn node_copy_note_wired() {
+        let note = node_copy_note("src-1", "new-1", true);
+        assert!(note.contains("src-1"), "{note}");
+        assert!(note.contains("new-1"), "{note}");
+        assert!(!note.contains("NO"), "{note}");
+    }
+
+    #[test]
+    fn node_copy_note_unwired() {
+        let note = node_copy_note("src-2", "new-2", false);
+        assert!(note.contains("src-2"), "{note}");
+        assert!(note.contains("new-2"), "{note}");
+        assert!(note.contains("NO"), "{note}");
+        assert!(note.contains("loop_add_edge"), "{note}");
+    }
+
+    // ── build_loop_update_response / build_spec_update_response / build_node_update_response ──
+
+    #[test]
+    fn build_loop_update_response_contains_loop_id() {
+        let result = build_loop_update_response("loop-42");
+        let text = format!("{:?}", result.content);
+        assert!(text.contains("loop-42"), "{text}");
+        assert!(text.contains("updated"), "{text}");
+        assert!(result.is_error != Some(true));
+    }
+
+    #[test]
+    fn build_spec_update_response_contains_spec_id() {
+        let result = build_spec_update_response("spec-99");
+        let text = format!("{:?}", result.content);
+        assert!(text.contains("spec-99"), "{text}");
+        assert!(text.contains("updated"), "{text}");
+        assert!(result.is_error != Some(true));
+    }
+
+    #[test]
+    fn build_node_update_response_contains_node_id() {
+        let result = build_node_update_response("node-7");
+        let text = format!("{:?}", result.content);
+        assert!(text.contains("node-7"), "{text}");
+        assert!(text.contains("updated"), "{text}");
+        assert!(result.is_error != Some(true));
+    }
+
+    // ── validate_node_config edge cases ─────────────────────────────
+
+    #[test]
+    fn validate_node_config_gate_without_evaluate_defaults_to_output_contains() {
+        // When "evaluate" is absent, it defaults to "output_contains", so "value" is required.
+        let config = serde_json::json!({});
+        let err = validate_node_config(LoopNodeKind::Gate, &config).unwrap_err();
+        assert!(err.contains("value"), "{err}");
+    }
+
+    #[test]
+    fn validate_node_config_gate_with_non_output_contains_evaluate_skips_value_check() {
+        let config = serde_json::json!({"evaluate": "exit_code_0"});
+        assert!(validate_node_config(LoopNodeKind::Gate, &config).is_ok());
+    }
+
+    #[test]
+    fn validate_node_config_agent_with_cli_only() {
+        let config = serde_json::json!({"cli": "codex"});
+        assert!(validate_node_config(LoopNodeKind::Agent, &config).is_ok());
+    }
+
+    #[test]
+    fn validate_node_config_agent_with_both_platform_and_cli() {
+        let config = serde_json::json!({"platform": "claude", "cli": "codex"});
+        assert!(validate_node_config(LoopNodeKind::Agent, &config).is_ok());
+    }
+
+    #[test]
+    fn validate_node_config_rejects_non_object() {
+        let cases = [
+            serde_json::json!(null),
+            serde_json::json!(42),
+            serde_json::json!("string"),
+            serde_json::json!([1, 2]),
+        ];
+        for config in &cases {
+            let err = validate_node_config(LoopNodeKind::Agent, config).unwrap_err();
+            assert!(err.contains("JSON object"), "{err}");
+        }
+    }
+
+    #[test]
+    fn validate_node_config_agent_rejects_empty_platform_and_cli() {
+        let config = serde_json::json!({"platform": "", "cli": ""});
+        let err = validate_node_config(LoopNodeKind::Agent, &config).unwrap_err();
+        assert!(err.contains("platform"), "{err}");
+    }
+
+    #[test]
+    fn validate_node_config_agent_rejects_whitespace_only_platform() {
+        let config = serde_json::json!({"platform": "   "});
+        let err = validate_node_config(LoopNodeKind::Agent, &config).unwrap_err();
+        assert!(err.contains("platform"), "{err}");
+    }
+
+    // ── missing_sync_identity_error ─────────────────────────────────
+
+    #[test]
+    fn missing_sync_identity_error_message_matches_constant() {
+        let err = missing_sync_identity_error();
+        assert_eq!(err.message, MISSING_SYNC_IDENTITY_MESSAGE);
+    }
+
+    // ── LoopEdgeCondition::from_str / LoopNodeKind::from_str (domain) ──
+
+    #[test]
+    fn loop_edge_condition_from_str_roundtrip() {
+        for cond in [
+            LoopEdgeCondition::Pass,
+            LoopEdgeCondition::Fail,
+            LoopEdgeCondition::Always,
+        ] {
+            let s = cond.as_str();
+            assert_eq!(LoopEdgeCondition::from_str(s), Some(cond));
+        }
+    }
+
+    #[test]
+    fn loop_edge_condition_from_str_invalid() {
+        assert_eq!(LoopEdgeCondition::from_str("sometimes"), None);
+        assert_eq!(LoopEdgeCondition::from_str(""), None);
+    }
+
+    #[test]
+    fn loop_node_kind_from_str_roundtrip() {
+        for kind in [
+            LoopNodeKind::Agent,
+            LoopNodeKind::Check,
+            LoopNodeKind::Gate,
+            LoopNodeKind::Join,
+        ] {
+            let s = kind.as_str();
+            assert_eq!(LoopNodeKind::from_str(s), Some(kind));
+        }
+    }
+
+    #[test]
+    fn loop_node_kind_from_str_invalid() {
+        assert_eq!(LoopNodeKind::from_str("invalid"), None);
+        assert_eq!(LoopNodeKind::from_str(""), None);
+    }
+
+    #[test]
+    fn loop_spec_status_from_str_roundtrip() {
+        for status in [
+            LoopSpecStatus::Pending,
+            LoopSpecStatus::Running,
+            LoopSpecStatus::Completed,
+            LoopSpecStatus::Failed,
+            LoopSpecStatus::Skipped,
+        ] {
+            let s = status.as_str();
+            assert_eq!(LoopSpecStatus::from_str(s), status);
+        }
+    }
+
+    #[test]
+    fn loop_spec_status_from_str_defaults_to_pending() {
+        assert_eq!(LoopSpecStatus::from_str("unknown"), LoopSpecStatus::Pending);
+        assert_eq!(LoopSpecStatus::from_str(""), LoopSpecStatus::Pending);
+    }
+
+    // ── build_loop_trigger: cron with invalid expression ────────────
+
+    #[test]
+    fn build_loop_trigger_cron_invalid_expression() {
+        let params = LoopTriggerParams {
+            kind: "cron".to_string(),
+            schedule: Some("not-a-cron".to_string()),
+            path: None,
+            events: None,
+            debounce_seconds: None,
+            recursive: None,
+        };
+        let err = build_loop_trigger(&Some(params)).unwrap_err();
+        assert!(err.contains("Invalid cron expression"), "{err}");
+    }
+
+    #[test]
+    fn build_loop_trigger_cron_valid_expression() {
+        let params = LoopTriggerParams {
+            kind: "cron".to_string(),
+            schedule: Some("*/5 * * * *".to_string()),
+            path: None,
+            events: None,
+            debounce_seconds: None,
+            recursive: None,
+        };
+        let trigger = build_loop_trigger(&Some(params)).unwrap().unwrap();
+        match trigger {
+            Trigger::Cron { schedule_expr } => {
+                assert_eq!(schedule_expr, "*/5 * * * *");
+            }
+            other => panic!("expected Trigger::Cron, got {other:?}"),
+        }
     }
 }
