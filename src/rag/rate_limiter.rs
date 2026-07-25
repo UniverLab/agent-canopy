@@ -57,4 +57,27 @@ mod tests {
         let err = rl.check().unwrap_err();
         assert!(err >= 1);
     }
+
+    #[test]
+    fn retry_after_does_not_exceed_60() {
+        let mut rl = RateLimiter::new(1);
+        rl.check().unwrap();
+        let err = rl.check().unwrap_err();
+        assert!(err <= 60);
+    }
+
+    #[test]
+    fn rate_limiter_works_with_large_limit() {
+        let mut rl = RateLimiter::new(100);
+        for _ in 0..100 {
+            assert!(rl.check().is_ok());
+        }
+        assert!(rl.check().is_err());
+    }
+
+    #[test]
+    fn new_sets_correct_max_per_minute() {
+        let rl = RateLimiter::new(42);
+        assert_eq!(rl.max_per_minute, 42);
+    }
 }

@@ -916,11 +916,180 @@ mod tests {
     }
 
     #[test]
+    fn parse_rfc3339_ts_valid_timestamp() {
+        assert_eq!(parse_rfc3339_ts("2024-01-15T10:30:00Z"), 1705314600);
+    }
+
+    #[test]
+    fn parse_rfc3339_ts_valid_with_offset() {
+        // 2024-01-15T10:30:00+05:00 == 2024-01-15T05:30:00Z == 1705296600
+        assert_eq!(parse_rfc3339_ts("2024-01-15T10:30:00+05:00"), 1705296600);
+    }
+
+    #[test]
+    fn parse_rfc3339_ts_invalid_returns_zero() {
+        assert_eq!(parse_rfc3339_ts("not-a-timestamp"), 0);
+    }
+
+    #[test]
+    fn parse_rfc3339_ts_empty_string_returns_zero() {
+        assert_eq!(parse_rfc3339_ts(""), 0);
+    }
+
+    #[test]
+    fn parse_rfc3339_ts_partial_date_returns_zero() {
+        assert_eq!(parse_rfc3339_ts("2024-01-15"), 0);
+    }
+
+    #[test]
+    fn parse_rfc3339_ts_epoch() {
+        assert_eq!(parse_rfc3339_ts("1970-01-01T00:00:00Z"), 0);
+    }
+
+    #[test]
+    fn parse_rfc3339_ts_negative_epoch() {
+        assert_eq!(parse_rfc3339_ts("1969-12-31T23:59:59Z"), -1);
+    }
+
+    #[test]
+    fn delete_interactive_sessions_empty_vec_returns_zero() {
+        let db = test_db();
+        let deleted = db.delete_interactive_sessions(&[]).unwrap();
+        assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn hard_cascade_skip_reason_describe_texts() {
+        assert_eq!(
+            HardCascadeSkipReason::RunningLoop.describe(),
+            "has a running loop"
+        );
+        assert_eq!(
+            HardCascadeSkipReason::ActiveSession.describe(),
+            "has an active/resumed interactive session"
+        );
+    }
+
+    #[test]
+    fn hard_cascade_counts_is_empty_true_when_all_zero() {
+        let counts = HardCascadeCounts::default();
+        assert!(counts.is_empty());
+    }
+
+    #[test]
+    fn hard_cascade_counts_is_empty_false_when_any_nonzero() {
+        let mut counts = HardCascadeCounts::default();
+        counts.ensembles = 1;
+        assert!(!counts.is_empty());
+    }
+
+    #[test]
+    fn hard_cascade_counts_is_empty_false_for_each_field() {
+        let fields = [
+            "loops",
+            "interactive_sessions",
+            "terminal_sessions",
+            "last_prompts",
+            "scheduled_sends",
+            "failed_scheduled_sends",
+            "sync_messages",
+            "sync_locks",
+            "intelligence_nodes",
+            "loop_specs",
+            "loop_nodes",
+            "loop_edges",
+            "loop_runs",
+            "loop_completion_hook_runs",
+            "ensembles",
+            "ensemble_members",
+            "pool_members",
+            "seed_sessions",
+            "intelligence_edges",
+        ];
+        for field in &fields {
+            let mut counts = HardCascadeCounts::default();
+            // Set each field to 1 individually
+            match *field {
+                "loops" => counts.loops = 1,
+                "interactive_sessions" => counts.interactive_sessions = 1,
+                "terminal_sessions" => counts.terminal_sessions = 1,
+                "last_prompts" => counts.last_prompts = 1,
+                "scheduled_sends" => counts.scheduled_sends = 1,
+                "failed_scheduled_sends" => counts.failed_scheduled_sends = 1,
+                "sync_messages" => counts.sync_messages = 1,
+                "sync_locks" => counts.sync_locks = 1,
+                "intelligence_nodes" => counts.intelligence_nodes = 1,
+                "loop_specs" => counts.loop_specs = 1,
+                "loop_nodes" => counts.loop_nodes = 1,
+                "loop_edges" => counts.loop_edges = 1,
+                "loop_runs" => counts.loop_runs = 1,
+                "loop_completion_hook_runs" => counts.loop_completion_hook_runs = 1,
+                "ensembles" => counts.ensembles = 1,
+                "ensemble_members" => counts.ensemble_members = 1,
+                "pool_members" => counts.pool_members = 1,
+                "seed_sessions" => counts.seed_sessions = 1,
+                "intelligence_edges" => counts.intelligence_edges = 1,
+                _ => unreachable!(),
+            }
+            assert!(!counts.is_empty(), "is_empty should be false when {field} = 1");
+        }
+    }
+
+    #[test]
+    fn list_cleanable_interactive_sessions_includes_orphaned_and_error() {
+        let db = test_db();
+        // Insert as active, then mark orphaned
+        db.insert_interactive_session(
+            "s-orphaned",
+            "s-orphaned",
+            "opencode",
+            "/tmp",
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+        db.mark_session_orphaned("s-orphaned").unwrap();
+
+        // Insert as active, then finish with error (non-zero exit code)
+        db.insert_interactive_session(
+            "s-error",
+            "s-error",
+            "opencode",
+            "/tmp",
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+        db.finish_interactive_session("s-error", 1).unwrap();
+
+        let rows = db.list_cleanable_interactive_sessions().unwrap();
+        let ids: HashSet<&str> = rows.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains("s-orphaned"));
+        assert!(ids.contains("s-error"));
+    }
+
+    #[test]
+    fn list_cleanable_interactive_sessions_empty_db() {
+        let db = test_db();
+        let rows = db.list_cleanable_interactive_sessions().unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn project_dependent_counts_empty_workdir() {
+        let db = test_db();
+        let counts = db.project_dependent_counts("").unwrap();
+        assert_eq!(counts.loops, 0);
+        assert_eq!(counts.interactive_sessions, 0);
+        assert_eq!(counts.terminal_sessions, 0);
+    }
+
+    #[test]
     fn cascade_delete_orphan_project_preserves_other_projects_pool_members() {
-        // A pool membership belongs to a *pool*, not a project; only the
-        // pool membership's spec (which is loop-bound to the deleted
-        // project) should be removed. The pool itself, and any membership
-        // attached to a different (unrelated) spec, must remain.
         let db = test_db();
         let workdir = "/proj-pool";
         db.upsert_project(&make_project("hash-p", workdir)).unwrap();

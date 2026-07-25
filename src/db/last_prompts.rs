@@ -153,4 +153,99 @@ mod tests {
         assert_eq!(last.prompt_text, "new prompt");
         assert_eq!(last.id, "lp-new");
     }
+
+    #[test]
+    fn last_prompt_with_none_builder_state() {
+        let db = test_db();
+        db.insert_last_prompt("lp-1", "/proj", "text", None, Utc::now())
+            .unwrap();
+
+        let last = db.get_last_prompt_for_workdir("/proj").unwrap().unwrap();
+        assert!(last.builder_state.is_none());
+    }
+
+    #[test]
+    fn last_prompt_stores_full_builder_state_json() {
+        let db = test_db();
+        let state = r#"{"sections":[{"title":"s1","content":"c1"}],"tools":["bash"]}"#;
+        db.insert_last_prompt("lp-1", "/proj", "prompt", Some(state), Utc::now())
+            .unwrap();
+
+        let last = db.get_last_prompt_for_workdir("/proj").unwrap().unwrap();
+        assert_eq!(last.builder_state.as_deref(), Some(state));
+    }
+
+    #[test]
+    fn last_prompt_multiple_inserts_all_retrievable_as_latest() {
+        let db = test_db();
+        let t1 = Utc::now() - chrono::Duration::minutes(10);
+        let t2 = Utc::now() - chrono::Duration::minutes(5);
+        let t3 = Utc::now();
+
+        db.insert_last_prompt("lp-1", "/proj", "first", None, t1)
+            .unwrap();
+        db.insert_last_prompt("lp-2", "/proj", "second", None, t2)
+            .unwrap();
+        db.insert_last_prompt("lp-3", "/proj", "third", None, t3)
+            .unwrap();
+
+        let last = db.get_last_prompt_for_workdir("/proj").unwrap().unwrap();
+        assert_eq!(last.id, "lp-3");
+        assert_eq!(last.prompt_text, "third");
+    }
+
+    #[test]
+    fn last_prompt_empty_text() {
+        let db = test_db();
+        db.insert_last_prompt("lp-empty", "/proj", "", None, Utc::now())
+            .unwrap();
+
+        let last = db
+            .get_last_prompt_for_workdir("/proj")
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.prompt_text, "");
+    }
+
+    #[test]
+    fn last_prompt_long_text() {
+        let db = test_db();
+        let long_text = "x".repeat(100_000);
+        db.insert_last_prompt("lp-long", "/proj", &long_text, None, Utc::now())
+            .unwrap();
+
+        let last = db
+            .get_last_prompt_for_workdir("/proj")
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.prompt_text.len(), 100_000);
+    }
+
+    #[test]
+    fn last_prompt_unique_ids() {
+        let db = test_db();
+        let t1 = Utc::now() - chrono::Duration::seconds(1);
+        let t2 = Utc::now();
+        db.insert_last_prompt("lp-a", "/proj", "a", None, t1)
+            .unwrap();
+        db.insert_last_prompt("lp-b", "/proj", "b", None, t2)
+            .unwrap();
+
+        let last = db.get_last_prompt_for_workdir("/proj").unwrap().unwrap();
+        assert_eq!(last.id, "lp-b");
+    }
+
+    #[test]
+    fn last_prompt_preserves_timestamp() {
+        let db = test_db();
+        let ts = Utc::now();
+        db.insert_last_prompt("lp-ts", "/proj", "text", None, ts)
+            .unwrap();
+
+        let last = db
+            .get_last_prompt_for_workdir("/proj")
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.created_at.timestamp(), ts.timestamp());
+    }
 }

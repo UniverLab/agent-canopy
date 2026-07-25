@@ -725,4 +725,288 @@ mod tests {
         // The close marker should remove the intent
         assert!(summary.active_intents.is_empty());
     }
+
+    #[test]
+    fn summarize_sync_context_mission_close_before_intent_keeps_it() {
+        // Close at ts=5, intent at ts=10: intent is newer, so it survives.
+        let intent_payload = serde_json::to_string(&IntentPayload {
+            mission: "New mission".into(),
+            impact: MissionImpact::Low,
+            description: "details".into(),
+        })
+        .unwrap();
+        let close_payload = serde_json::json!({
+            "mission_closed": true,
+            "mission": "Old mission",
+            "impact": "low"
+        })
+        .to_string();
+
+        let messages = vec![
+            sync_message(
+                1,
+                "agent-a",
+                "copilot",
+                MessageKind::Info,
+                Some(close_payload),
+                5,
+            ),
+            sync_message(
+                2,
+                "agent-a",
+                "copilot",
+                MessageKind::Intent,
+                Some(intent_payload),
+                10,
+            ),
+        ];
+
+        let active = HashSet::from([String::from("agent-a")]);
+        let summary = summarize_sync_context(&messages, &active, 10);
+        assert_eq!(summary.active_intents.len(), 1);
+        assert_eq!(summary.active_intents[0].mission, "New mission");
+    }
+
+    #[test]
+    fn summarize_sync_context_multiple_agents_sorted_by_since() {
+        let intent_a = serde_json::to_string(&IntentPayload {
+            mission: "Mission A".into(),
+            impact: MissionImpact::Low,
+            description: "a".into(),
+        })
+        .unwrap();
+        let intent_b = serde_json::to_string(&IntentPayload {
+            mission: "Mission B".into(),
+            impact: MissionImpact::Low,
+            description: "b".into(),
+        })
+        .unwrap();
+
+        let messages = vec![
+            sync_message(1, "agent-b", "claude", MessageKind::Intent, Some(intent_b), 20),
+            sync_message(2, "agent-a", "copilot", MessageKind::Intent, Some(intent_a), 10),
+        ];
+
+        let active =
+            HashSet::from([String::from("agent-a"), String::from("agent-b")]);
+        let summary = summarize_sync_context(&messages, &active, 10);
+
+        assert_eq!(summary.active_intents.len(), 2);
+        // sorted by since: agent-a at 10, agent-b at 20
+        assert_eq!(summary.active_intents[0].agent_id, "agent-a");
+        assert_eq!(summary.active_intents[1].agent_id, "agent-b");
+    }
+
+    #[test]
+    fn summarize_sync_context_chatter_takes_last_n_reversed() {
+        let messages = vec![
+            sync_message(1, "a", "a", MessageKind::Query, None, 1),
+            sync_message(2, "b", "b", MessageKind::Answer, None, 2),
+            sync_message(3, "c", "c", MessageKind::Query, None, 3),
+            sync_message(4, "d", "d", MessageKind::Answer, None, 4),
+            sync_message(5, "e", "e", MessageKind::Query, None, 5),
+        ];
+
+        let summary = summarize_sync_context(&messages, &HashSet::new(), 3);
+        assert_eq!(summary.recent_chatter.len(), 3);
+        // Should be the last 3 in chronological order
+        assert_eq!(summary.recent_chatter[0].id, 3);
+        assert_eq!(summary.recent_chatter[1].id, 4);
+        assert_eq!(summary.recent_chatter[2].id, 5);
+    }
+
+    #[test]
+    fn summarize_sync_context_vibe_prefers_unstable_over_testing() {
+        // Agent A has Unstable status (Breaking impact, no explicit status msg)
+        let intent_a = serde_json::to_string(&IntentPayload {
+            mission: "Breaking change".into(),
+            impact: MissionImpact::Breaking,
+            description: "a".into(),
+        })
+        .unwrap();
+        // Agent B has Testing status (explicit status message)
+        let intent_b = serde_json::to_string(&IntentPayload {
+            mission: "Testing".into(),
+            impact: MissionImpact::Low,
+            description: "b".into(),
+        })
+        .unwrap();
+        let status_testing = serde_json::to_string(&StatusPayload {
+            status: WorkspaceStatus::Testing,
+            message: "tests".into(),
+        })
+        .unwrap();
+
+        let messages = vec![
+            sync_message(1, "agent-a", "a", MessageKind::Intent, Some(intent_a), 10),
+            sync_message(2, "agent-b", "b", MessageKind::Intent, Some(intent_b), 11),
+            sync_message(3, "agent-b", "b", MessageKind::Status, Some(status_testing), 12),
+        ];
+
+        let active = HashSet::from([String::from("agent-a"), String::from("agent-b")]);
+        let summary = summarize_sync_context(&messages, &active, 10);
+        assert_eq!(summary.vibe, WorkspaceStatus::Unstable);
+    }
+
+    #[test]
+    fn summarize_sync_context_intent_with_no_status_uses_default() {
+        let intent = serde_json::to_string(&IntentPayload {
+            mission: "Just intent".into(),
+            impact: MissionImpact::High,
+            description: "no status update".into(),
+        })
+        .unwrap();
+
+        let messages = vec![sync_message(
+            1,
+            "agent-a",
+            "copilot",
+            MessageKind::Intent,
+            Some(intent),
+            10,
+        )];
+
+        let active = HashSet::from([String::from("agent-a")]);
+        let summary = summarize_sync_context(&messages, &active, 10);
+        assert_eq!(summary.active_intents[0].status, WorkspaceStatus::Stable);
+    }
+
+    #[test]
+    fn message_kind_from_str_case_sensitive() {
+        assert!(MessageKind::from_str("Info").is_none());
+        assert!(MessageKind::from_str("INFO").is_none());
+    }
+
+    #[test]
+    fn mission_impact_from_str_case_sensitive() {
+        assert!(MissionImpact::from_str("Low").is_none());
+        assert!(MissionImpact::from_str("HIGH").is_none());
+    }
+
+    #[test]
+    fn workspace_status_from_str_case_sensitive() {
+        assert!(WorkspaceStatus::from_str("Stable").is_none());
+        assert!(WorkspaceStatus::from_str("TESTING").is_none());
+    }
+
+    #[test]
+    fn sync_message_serde_roundtrip() {
+        let msg = SyncMessage {
+            id: 42,
+            workdir: "/repo".into(),
+            agent_id: "agent-x".into(),
+            agent_name: "test-agent".into(),
+            kind: MessageKind::Query,
+            message: "hello".into(),
+            payload: Some(r#"{"key":"value"}"#.into()),
+            created_at: 12345,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let deserialized: SyncMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.id, 42);
+        assert_eq!(deserialized.kind, MessageKind::Query);
+        assert_eq!(deserialized.payload, Some(r#"{"key":"value"}"#.into()));
+    }
+
+    #[test]
+    fn intent_payload_serde_roundtrip() {
+        let payload = IntentPayload {
+            mission: "test".into(),
+            impact: MissionImpact::Breaking,
+            description: "desc".into(),
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let deserialized: IntentPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.mission, "test");
+        assert_eq!(deserialized.impact, MissionImpact::Breaking);
+    }
+
+    #[test]
+    fn status_payload_serde_roundtrip() {
+        let payload = StatusPayload {
+            status: WorkspaceStatus::Unstable,
+            message: "unstable now".into(),
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let deserialized: StatusPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.status, WorkspaceStatus::Unstable);
+        assert_eq!(deserialized.message, "unstable now");
+    }
+
+    #[test]
+    fn active_intent_serde_roundtrip() {
+        let intent = ActiveIntent {
+            agent_id: "a".into(),
+            agent_name: "b".into(),
+            mission: "m".into(),
+            impact: MissionImpact::High,
+            description: "d".into(),
+            status: WorkspaceStatus::Testing,
+            since: 99,
+        };
+        let json = serde_json::to_string(&intent).unwrap();
+        let deserialized: ActiveIntent = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.since, 99);
+        assert_eq!(deserialized.impact, MissionImpact::High);
+    }
+
+    #[test]
+    fn sync_context_snapshot_serde_roundtrip() {
+        let snapshot = SyncContextSnapshot {
+            active_intents: vec![],
+            recent_chatter: vec![],
+            vibe: WorkspaceStatus::Stable,
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let deserialized: SyncContextSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.vibe, WorkspaceStatus::Stable);
+        assert!(deserialized.active_intents.is_empty());
+    }
+
+    #[test]
+    fn is_mission_closed_malformed_json() {
+        let msg = SyncMessage {
+            id: 1,
+            workdir: "/repo".into(),
+            agent_id: "a".into(),
+            agent_name: "b".into(),
+            kind: MessageKind::Info,
+            message: "test".into(),
+            payload: Some("{not valid json".into()),
+            created_at: 10,
+        };
+        assert!(!is_mission_closed(&msg));
+    }
+
+    #[test]
+    fn is_mission_closed_missing_mission_closed_key() {
+        let json = serde_json::json!({"other_key": true}).to_string();
+        let msg = SyncMessage {
+            id: 1,
+            workdir: "/repo".into(),
+            agent_id: "a".into(),
+            agent_name: "b".into(),
+            kind: MessageKind::Info,
+            message: "test".into(),
+            payload: Some(json),
+            created_at: 10,
+        };
+        assert!(!is_mission_closed(&msg));
+    }
+
+    #[test]
+    fn default_status_for_impact_all_variants() {
+        assert_eq!(
+            default_status_for_impact(MissionImpact::Low),
+            WorkspaceStatus::Stable
+        );
+        assert_eq!(
+            default_status_for_impact(MissionImpact::High),
+            WorkspaceStatus::Stable
+        );
+        assert_eq!(
+            default_status_for_impact(MissionImpact::Breaking),
+            WorkspaceStatus::Unstable
+        );
+    }
 }

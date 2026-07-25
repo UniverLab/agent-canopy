@@ -508,4 +508,127 @@ mod tests {
         let spec = PasteSubmitSpec::from_cli_config(Some(&config));
         assert_eq!(spec.presses, 1);
     }
+
+    #[test]
+    fn default_paste_submit_presses_is_one() {
+        assert_eq!(default_paste_submit_presses(), 1);
+    }
+
+    #[test]
+    fn cli_config_default_construction() {
+        let config = CliConfig::default();
+        assert!(config.name.is_empty());
+        assert!(config.binary.is_empty());
+        assert!(config.headless_mode.is_empty());
+        assert!(config.model_flag.is_none());
+        assert!(!config.supports_working_dir);
+        assert!(config.working_dir_flag.is_none());
+        assert!(config.env_vars.is_empty());
+        assert!(config.interactive_args.is_none());
+        assert!(config.fallback_interactive_args.is_none());
+        assert!(config.resume_args.is_none());
+        assert!(config.session_list_cmd.is_none());
+        assert!(config.session_resume_cmd.is_none());
+        assert!(config.session_id_set_flag.is_none());
+        assert!(config.session_list_format_args.is_none());
+        assert!(config.session_id_pattern.is_none());
+        assert!(config.models_list_cmd.is_none());
+        assert!(config.accent_color.is_none());
+        assert!(config.yolo_flag.is_none());
+        assert!(config.instruction_file.is_none());
+        assert!(!config.prompt_via_stdin);
+        assert!(config.paste_submit_delay_ms.is_none());
+        assert!(config.paste_submit_key.is_none());
+        // Default derive uses u8::default() = 0, not the serde default fn
+        assert_eq!(config.paste_submit_presses, 0);
+    }
+
+    #[test]
+    fn cli_config_serde_roundtrip() {
+        let config = sample_cli_config();
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: CliConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.name, "opencode");
+        assert_eq!(deserialized.binary, "opencode");
+        assert!(deserialized.supports_working_dir);
+        assert_eq!(deserialized.model_flag.as_deref(), Some("--model"));
+    }
+
+    #[test]
+    fn cli_config_deserialize_from_minimal_json() {
+        let json = r#"{"name":"test"}"#;
+        let config: CliConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.name, "test");
+        assert!(config.binary.is_empty());
+        assert!(!config.prompt_via_stdin);
+        assert_eq!(config.paste_submit_presses, 1);
+    }
+
+    #[test]
+    fn cli_config_deserialize_from_empty_object() {
+        let config: CliConfig = serde_json::from_str("{}").unwrap();
+        assert!(config.name.is_empty());
+        assert!(config.binary.is_empty());
+    }
+
+    #[test]
+    fn cli_registry_serde_roundtrip() {
+        let mut registry = CliRegistry::new();
+        registry.available_clis.push(sample_cli_config());
+        let json = serde_json::to_string(&registry).unwrap();
+        let deserialized: CliRegistry = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.version, 2);
+        assert_eq!(deserialized.available_clis.len(), 1);
+        assert_eq!(deserialized.available_clis[0].name, "opencode");
+    }
+
+    #[test]
+    fn cli_registry_get_returns_none_for_missing() {
+        let registry = CliRegistry::new();
+        assert!(registry.get("anything").is_none());
+    }
+
+    #[test]
+    fn cli_registry_names_empty() {
+        let registry = CliRegistry::new();
+        assert!(registry.names().is_empty());
+    }
+
+    #[test]
+    fn paste_submit_spec_default_values() {
+        let spec = PasteSubmitSpec::default();
+        assert_eq!(spec.settle, std::time::Duration::from_millis(30));
+        assert_eq!(spec.submit_key, b"\r");
+        assert_eq!(spec.presses, 1);
+    }
+
+    #[test]
+    fn paste_submit_spec_from_cli_config_all_overrides() {
+        let mut config = sample_cli_config();
+        config.paste_submit_delay_ms = Some(100);
+        config.paste_submit_key = Some("lf".to_string());
+        config.paste_submit_presses = 3;
+        let spec = PasteSubmitSpec::from_cli_config(Some(&config));
+        assert_eq!(spec.settle, std::time::Duration::from_millis(100));
+        assert_eq!(spec.submit_key, b"\n");
+        assert_eq!(spec.presses, 3);
+    }
+
+    #[test]
+    fn cli_config_accent_color_serde_roundtrip() {
+        let mut config = sample_cli_config();
+        config.accent_color = Some([255, 128, 0]);
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: CliConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.accent_color, Some([255, 128, 0]));
+    }
+
+    #[test]
+    fn cli_config_accent_color_none_by_default() {
+        let config = sample_cli_config();
+        assert!(config.accent_color.is_none());
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: CliConfig = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.accent_color.is_none());
+    }
 }

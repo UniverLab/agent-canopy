@@ -263,4 +263,126 @@ mod tests {
         .unwrap());
         assert!(!dir.path().join("SKILL.md.sync-new").exists());
     }
+
+    #[test]
+    fn hash_empty_content() {
+        let h = hash(b"");
+        assert_eq!(h.len(), 32);
+        // SHA-256 of empty string is well-known
+        let expected: [u8; 32] = Sha256::digest(b"").into();
+        assert_eq!(h, expected);
+    }
+
+    #[test]
+    fn hash_deterministic() {
+        let h1 = hash(b"hello world");
+        let h2 = hash(b"hello world");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn hash_different_for_different_content() {
+        let h1 = hash(b"content A");
+        let h2 = hash(b"content B");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn decide_sync_action_force_on_existing_identical() {
+        assert_eq!(
+            decide_sync_action(Some(b"same"), b"same", true),
+            SyncAction::Write
+        );
+    }
+
+    #[test]
+    fn decide_sync_action_no_force_on_missing() {
+        assert_eq!(decide_sync_action(None, b"new", false), SyncAction::Write);
+    }
+
+    #[test]
+    fn decide_sync_action_force_on_missing() {
+        assert_eq!(decide_sync_action(None, b"new", true), SyncAction::Write);
+    }
+
+    #[test]
+    fn sync_new_path_appends_suffix() {
+        let dest = Path::new("/tmp/SKILL.md");
+        let new_path = sync_new_path(dest);
+        assert_eq!(new_path, PathBuf::from("/tmp/SKILL.md.sync-new"));
+    }
+
+    #[test]
+    fn sync_new_path_handles_no_extension() {
+        let dest = Path::new("/tmp/README");
+        let new_path = sync_new_path(dest);
+        assert_eq!(new_path, PathBuf::from("/tmp/README.sync-new"));
+    }
+
+    #[test]
+    fn sync_new_path_handles_dotfile() {
+        let dest = Path::new("/tmp/.hidden");
+        let new_path = sync_new_path(dest);
+        assert_eq!(new_path, PathBuf::from("/tmp/.hidden.sync-new"));
+    }
+
+    #[test]
+    fn sync_write_on_new_file_creates_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("new_file.txt");
+
+        let wrote = sync_write(&dest, "source", b"content", false).unwrap();
+        assert!(wrote);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"content");
+    }
+
+    #[test]
+    fn sync_action_debug_trait() {
+        // Ensure SyncAction can be debug-formatted (derives Debug)
+        assert_eq!(format!("{:?}", SyncAction::Write), "Write");
+        assert_eq!(format!("{:?}", SyncAction::Unchanged), "Unchanged");
+        assert_eq!(format!("{:?}", SyncAction::Skip), "Skip");
+    }
+
+    #[test]
+    fn sync_action_equality() {
+        assert_eq!(SyncAction::Write, SyncAction::Write);
+        assert_ne!(SyncAction::Write, SyncAction::Skip);
+        assert_ne!(SyncAction::Unchanged, SyncAction::Skip);
+    }
+
+    #[test]
+    fn sync_write_empty_content_to_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("empty.txt");
+
+        let wrote = sync_write(&dest, "source", b"", false).unwrap();
+        assert!(wrote);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"");
+    }
+
+    #[test]
+    fn sync_write_skip_preserves_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("file.txt");
+        std::fs::write(&dest, b"original").unwrap();
+
+        let wrote = sync_write(&dest, "source", b"different", false).unwrap();
+        assert!(!wrote);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"original");
+    }
+
+    #[test]
+    fn sync_write_force_overwrites_and_clears_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("file.txt");
+        let sidecar = dir.path().join("file.txt.sync-new");
+        std::fs::write(&dest, b"old").unwrap();
+        std::fs::write(&sidecar, b"stale sidecar").unwrap();
+
+        let wrote = sync_write(&dest, "source", b"new", true).unwrap();
+        assert!(wrote);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+        assert!(!sidecar.exists());
+    }
 }

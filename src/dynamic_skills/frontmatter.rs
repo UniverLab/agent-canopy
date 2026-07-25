@@ -92,4 +92,101 @@ mod tests {
         let content = "just plain text, no heading, no frontmatter";
         assert_eq!(parse_description(content), "");
     }
+
+    #[test]
+    fn literal_block_scalar_description() {
+        let content = "---\ndescription: |\n  Line one.\n  Line two.\nname: test\n---\n# Title\n";
+        // The literal block scalar should join lines
+        let desc = parse_description(content);
+        assert!(desc.contains("Line one."));
+        assert!(desc.contains("Line two."));
+    }
+
+    #[test]
+    fn single_quoted_description() {
+        let content = "---\ndescription: 'A single quoted description.'\n---\n";
+        assert_eq!(parse_description(content), "A single quoted description.");
+    }
+
+    #[test]
+    fn unquoted_description() {
+        let content = "---\ndescription: An unquoted description.\n---\n";
+        assert_eq!(parse_description(content), "An unquoted description.");
+    }
+
+    #[test]
+    fn empty_description_falls_back_to_heading() {
+        let content = "---\ndescription: \n---\n# Fallback Heading\n";
+        assert_eq!(parse_description(content), "Fallback Heading");
+    }
+
+    #[test]
+    fn empty_description_and_no_heading_returns_empty() {
+        let content = "---\ndescription: \n---\n";
+        assert_eq!(parse_description(content), "");
+    }
+
+    #[test]
+    fn only_frontmatter_delimiters_no_content() {
+        let content = "---\n---\n";
+        assert_eq!(parse_description(content), "");
+    }
+
+    #[test]
+    fn frontmatter_without_ending_delimiter_treats_all_as_body() {
+        // When no closing ---, all lines after the first --- become the body.
+        // The description key IS found, so it returns the value.
+        let content = "---\ndescription: test\n";
+        assert_eq!(parse_description(content), "test");
+    }
+
+    #[test]
+    fn description_with_special_characters() {
+        let content = "---\ndescription: \"A skill for C++ and .NET!\"\n---\n";
+        assert_eq!(parse_description(content), "A skill for C++ and .NET!");
+    }
+
+    #[test]
+    fn heading_with_multiple_hashes() {
+        let content = "### Deeply Nested Heading\n";
+        assert_eq!(parse_description(content), "Deeply Nested Heading");
+    }
+
+    #[test]
+    fn heading_with_leading_whitespace() {
+        let content = "   # Indented Heading\n";
+        assert_eq!(parse_description(content), "Indented Heading");
+    }
+
+    #[test]
+    fn folded_block_scalar_with_blank_line() {
+        let content = "---\ndescription: >\n  First paragraph.\n\n  Second paragraph.\n---\n";
+        let desc = parse_description(content);
+        // Folded scalar should join lines, keeping the blank line separation
+        assert!(desc.contains("First paragraph."));
+        assert!(desc.contains("Second paragraph."));
+    }
+
+    #[test]
+    fn frontmatter_description_takes_precedence_over_heading() {
+        let content = "---\ndescription: \"From frontmatter\"\n---\n# From Heading\n";
+        assert_eq!(parse_description(content), "From frontmatter");
+    }
+
+    #[test]
+    fn empty_content_returns_empty() {
+        assert_eq!(parse_description(""), "");
+    }
+
+    #[test]
+    fn multiple_frontmatter_keys_description_first() {
+        let content = "---\ndescription: \"First key\"\nname: test\nversion: 1.0\n---\n";
+        assert_eq!(parse_description(content), "First key");
+    }
+
+    #[test]
+    fn multiple_frontmatter_keys_description_last() {
+        let content = "---\nname: test\nversion: 1.0\ndescription: \"Last key\"\n---\n";
+        assert_eq!(parse_description(content), "Last key");
+    }
 }

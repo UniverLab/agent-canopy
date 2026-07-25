@@ -767,4 +767,85 @@ mod tests {
         assert!(message.contains("canopy-test-fixture-cli-missing"));
         assert!(message.contains("/usr/bin:/bin"));
     }
+
+    #[test]
+    fn resolution_step_label_absolute_path() {
+        assert_eq!(ResolutionStep::AbsolutePath.label(), "absolute path");
+    }
+
+    #[test]
+    fn resolution_step_label_path() {
+        assert_eq!(ResolutionStep::Path.label(), "PATH");
+    }
+
+    #[test]
+    fn resolution_step_equality() {
+        assert_eq!(ResolutionStep::AbsolutePath, ResolutionStep::AbsolutePath);
+        assert_eq!(ResolutionStep::Path, ResolutionStep::Path);
+        assert_ne!(ResolutionStep::AbsolutePath, ResolutionStep::Path);
+    }
+
+    #[test]
+    fn extract_session_ids_invalid_regex_returns_empty() {
+        let mut s = sample_strategy();
+        s.session_id_pattern = Some("[invalid".to_string());
+        let ids = s.extract_session_ids(r#"[{"id":"ses_X"}]"#);
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn extract_session_ids_no_match_returns_empty() {
+        let mut s = sample_strategy();
+        s.session_id_pattern = Some(r#""id"\s*:\s*"([^"]+)""#.to_string());
+        let ids = s.extract_session_ids("no ids here at all");
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn extract_session_ids_uses_group_1_when_present() {
+        let mut s = sample_strategy();
+        s.session_id_pattern = Some(r#"session_(\w+)"#.to_string());
+        let ids = s.extract_session_ids("session_abc session_xyz");
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains("abc"));
+        assert!(ids.contains("xyz"));
+    }
+
+    #[test]
+    fn extract_session_ids_falls_back_to_full_match_without_group() {
+        let mut s = sample_strategy();
+        s.session_id_pattern = Some(r#""id"\s*:\s*"[^"]+""#.to_string());
+        let ids = s.extract_session_ids(r#""id": "ses_full""#);
+        assert_eq!(ids.len(), 1);
+        // Without a capture group, the full match is used
+        assert!(ids.contains(r#""id": "ses_full""#));
+    }
+
+    #[test]
+    fn with_stdin_forced_preserves_all_other_fields() {
+        let mut strategy = sample_strategy();
+        strategy.session_id_set_flag = Some("--sid".to_string());
+        strategy.session_list_cmd = Some("ls".to_string());
+        strategy.session_resume_cmd = Some("--resume".to_string());
+
+        let forced = strategy.with_stdin_forced();
+
+        assert!(forced.prompt_via_stdin);
+        assert_eq!(forced.session_id_set_flag.as_deref(), Some("--sid"));
+        assert_eq!(forced.session_list_cmd.as_deref(), Some("ls"));
+        assert_eq!(forced.session_resume_cmd.as_deref(), Some("--resume"));
+        assert_eq!(forced.binary, strategy.binary);
+        assert_eq!(forced.headless_mode, strategy.headless_mode);
+    }
+
+    #[test]
+    fn binary_resolution_error_display() {
+        let err = BinaryResolutionError {
+            binary: "my-cli".to_string(),
+            path: "/usr/bin:/bin".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("my-cli"));
+        assert!(msg.contains("/usr/bin:/bin"));
+    }
 }

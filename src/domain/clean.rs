@@ -645,4 +645,497 @@ mod tests {
         }
         .is_empty());
     }
+
+    // ── cutoff_timestamp ───────────────────────────────────────────────
+
+    #[test]
+    fn cutoff_timestamp_zero_retention() {
+        let now = 1_000_000_000_i64;
+        assert_eq!(cutoff_timestamp(now, 0), now);
+    }
+
+    #[test]
+    fn cutoff_timestamp_one_day() {
+        let now = 1_000_000_000_i64;
+        assert_eq!(cutoff_timestamp(now, 1), now - 86_400);
+    }
+
+    #[test]
+    fn cutoff_timestamp_large_retention() {
+        let now = 1_000_000_000_i64;
+        assert_eq!(cutoff_timestamp(now, 365), now - 365 * 86_400);
+    }
+
+    // ── reclaimed_bytes ────────────────────────────────────────────────
+
+    #[test]
+    fn reclaimed_bytes_sums_all_file_candidates() {
+        let plan = CleanPlan {
+            session_ids: vec!["s1".to_string()],
+            log_files: vec![FileCandidate {
+                path: PathBuf::from("/a.log"),
+                key: "a".to_string(),
+                mtime: 0,
+                size_bytes: 100,
+            }],
+            terminal_dirs: vec![FileCandidate {
+                path: PathBuf::from("/b"),
+                key: "b".to_string(),
+                mtime: 0,
+                size_bytes: 200,
+            }],
+            rag_residue_files: vec![FileCandidate {
+                path: PathBuf::from("/c.tmp"),
+                key: "c".to_string(),
+                mtime: 0,
+                size_bytes: 300,
+            }],
+            orphaned_projects: vec![],
+        };
+        assert_eq!(plan.reclaimed_bytes(), 600);
+    }
+
+    #[test]
+    fn reclaimed_bytes_ignores_orphaned_projects() {
+        let plan = CleanPlan {
+            session_ids: vec![],
+            log_files: vec![],
+            terminal_dirs: vec![],
+            rag_residue_files: vec![],
+            orphaned_projects: vec![OrphanProjectReport {
+                hash: "h".to_string(),
+                name: "n".to_string(),
+                missing_path: "/missing".to_string(),
+                dependents: ProjectDependentCounts::default(),
+            }],
+        };
+        assert_eq!(plan.reclaimed_bytes(), 0);
+    }
+
+    // ── CleanPlan::is_empty with partial data ──────────────────────────
+
+    #[test]
+    fn clean_plan_not_empty_when_only_sessions() {
+        let plan = CleanPlan {
+            session_ids: vec!["s1".to_string()],
+            log_files: vec![],
+            terminal_dirs: vec![],
+            rag_residue_files: vec![],
+            orphaned_projects: vec![],
+        };
+        assert!(!plan.is_empty());
+    }
+
+    #[test]
+    fn clean_plan_not_empty_when_only_logs() {
+        let plan = CleanPlan {
+            session_ids: vec![],
+            log_files: vec![FileCandidate {
+                path: PathBuf::from("/a.log"),
+                key: "a".to_string(),
+                mtime: 0,
+                size_bytes: 10,
+            }],
+            terminal_dirs: vec![],
+            rag_residue_files: vec![],
+            orphaned_projects: vec![],
+        };
+        assert!(!plan.is_empty());
+    }
+
+    #[test]
+    fn clean_plan_not_empty_when_only_rag_residue() {
+        let plan = CleanPlan {
+            session_ids: vec![],
+            log_files: vec![],
+            terminal_dirs: vec![],
+            rag_residue_files: vec![FileCandidate {
+                path: PathBuf::from("/a.tmp"),
+                key: "a".to_string(),
+                mtime: 0,
+                size_bytes: 5,
+            }],
+            orphaned_projects: vec![],
+        };
+        assert!(!plan.is_empty());
+    }
+
+    // ── HardCascadePlan::is_empty ──────────────────────────────────────
+
+    #[test]
+    fn hard_cascade_plan_empty_when_no_targets() {
+        let plan = HardCascadePlan {
+            targets: vec![],
+            skips: vec![HardCascadeSkip {
+                hash: "h".to_string(),
+                name: "n".to_string(),
+                missing_path: "/p".to_string(),
+                reason: HardCascadeSkipReason::RunningLoop,
+            }],
+        };
+        // is_empty only checks targets, not skips
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn hard_cascade_plan_not_empty_with_targets() {
+        let plan = HardCascadePlan {
+            targets: vec![HardCascadeTarget {
+                hash: "h".to_string(),
+                name: "n".to_string(),
+                missing_path: "/p".to_string(),
+                counts: HardCascadeCounts {
+                    loops: 1,
+                    ..Default::default()
+                },
+            }],
+            skips: vec![],
+        };
+        assert!(!plan.is_empty());
+    }
+
+    // ── HardCascadeCounts edge cases ───────────────────────────────────
+
+    #[test]
+    fn hard_cascade_counts_any_nonzero_field_makes_it_not_empty() {
+        assert!(!HardCascadeCounts {
+            loops: 0,
+            interactive_sessions: 0,
+            terminal_sessions: 0,
+            last_prompts: 1,
+            ..Default::default()
+        }
+        .is_empty());
+        assert!(!HardCascadeCounts {
+            ensembles: 1,
+            ..Default::default()
+        }
+        .is_empty());
+        assert!(!HardCascadeCounts {
+            intelligence_edges: 1,
+            ..Default::default()
+        }
+        .is_empty());
+    }
+
+    #[test]
+    fn hard_cascade_counts_all_fields_zero() {
+        let c = HardCascadeCounts {
+            loops: 0,
+            interactive_sessions: 0,
+            terminal_sessions: 0,
+            last_prompts: 0,
+            scheduled_sends: 0,
+            failed_scheduled_sends: 0,
+            sync_messages: 0,
+            sync_locks: 0,
+            intelligence_nodes: 0,
+            loop_specs: 0,
+            loop_nodes: 0,
+            loop_edges: 0,
+            loop_runs: 0,
+            loop_completion_hook_runs: 0,
+            ensembles: 0,
+            ensemble_members: 0,
+            pool_members: 0,
+            seed_sessions: 0,
+            intelligence_edges: 0,
+        };
+        assert!(c.is_empty());
+    }
+
+    // ── HardCascadeSkipReason ──────────────────────────────────────────
+
+    #[test]
+    fn hard_cascade_skip_reason_eq() {
+        assert_eq!(
+            HardCascadeSkipReason::RunningLoop,
+            HardCascadeSkipReason::RunningLoop
+        );
+        assert_eq!(
+            HardCascadeSkipReason::ActiveSession,
+            HardCascadeSkipReason::ActiveSession
+        );
+        assert_ne!(
+            HardCascadeSkipReason::RunningLoop,
+            HardCascadeSkipReason::ActiveSession
+        );
+    }
+
+    #[test]
+    fn hard_cascade_skip_reason_debug() {
+        let _ = format!("{:?}", HardCascadeSkipReason::RunningLoop);
+        let _ = format!("{:?}", HardCascadeSkipReason::ActiveSession);
+    }
+
+    // ── plan_session_cleanup edge cases ────────────────────────────────
+
+    #[test]
+    fn plan_session_cleanup_empty_input() {
+        let plan = plan_session_cleanup(&[], 1_000_000);
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn plan_session_cleanup_keeps_active_even_if_ancient() {
+        let sessions = vec![session("s1", "active", 0)];
+        let plan = plan_session_cleanup(&sessions, 1_000_000);
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn plan_session_cleanup_keeps_resumed_even_if_ancient() {
+        let sessions = vec![session("s1", "resumed", 0)];
+        let plan = plan_session_cleanup(&sessions, 1_000_000);
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn plan_session_cleanup_mixed_statuses_and_ages() {
+        let sessions = vec![
+            session("s1", "completed", 0),
+            session("s2", "active", 0),
+            session("s3", "orphaned", 0),
+            session("s4", "error", 0),
+            session("s5", "completed", 1_000_000),
+        ];
+        let plan = plan_session_cleanup(&sessions, 1_000_000);
+        assert_eq!(plan.len(), 3);
+        assert!(plan.contains(&"s1".to_string()));
+        assert!(plan.contains(&"s3".to_string()));
+        assert!(plan.contains(&"s4".to_string()));
+    }
+
+    // ── plan_orphan_file_cleanup edge cases ────────────────────────────
+
+    #[test]
+    fn plan_orphan_file_cleanup_empty_inputs() {
+        let plan = plan_orphan_file_cleanup(&[], &HashSet::new(), 1_000_000);
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn plan_orphan_file_cleanup_all_known_keys() {
+        let files = vec![FileCandidate {
+            path: PathBuf::from("/a.log"),
+            key: "a".to_string(),
+            mtime: 0,
+            size_bytes: 10,
+        }];
+        let known: HashSet<String> = ["a".to_string()].into_iter().collect();
+        let plan = plan_orphan_file_cleanup(&files, &known, 1_000_000);
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn plan_orphan_file_cleanup_all_recent() {
+        let files = vec![FileCandidate {
+            path: PathBuf::from("/a.log"),
+            key: "unknown".to_string(),
+            mtime: 2_000_000,
+            size_bytes: 10,
+        }];
+        let known = HashSet::new();
+        let plan = plan_orphan_file_cleanup(&files, &known, 1_000_000);
+        assert!(plan.is_empty());
+    }
+
+    // ── plan_rag_residue_cleanup edge cases ────────────────────────────
+
+    #[test]
+    fn plan_rag_residue_cleanup_empty_input() {
+        let plan = plan_rag_residue_cleanup(&[], 1_000_000);
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn plan_rag_residue_cleanup_ignores_non_residue_files() {
+        let files = vec![
+            FileCandidate {
+                path: PathBuf::from("/a.json"),
+                key: "a".to_string(),
+                mtime: 0,
+                size_bytes: 10,
+            },
+            FileCandidate {
+                path: PathBuf::from("/b.lance"),
+                key: "b".to_string(),
+                mtime: 0,
+                size_bytes: 10,
+            },
+        ];
+        let plan = plan_rag_residue_cleanup(&files, 1_000_000);
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn plan_rag_residue_cleanup_matches_partial_extension() {
+        let files = vec![
+            FileCandidate {
+                path: PathBuf::from("/a.tmp"),
+                key: "a".to_string(),
+                mtime: 0,
+                size_bytes: 10,
+            },
+            FileCandidate {
+                path: PathBuf::from("/b.partial"),
+                key: "b".to_string(),
+                mtime: 0,
+                size_bytes: 20,
+            },
+            FileCandidate {
+                path: PathBuf::from("/c.tmpp"),
+                key: "c".to_string(),
+                mtime: 0,
+                size_bytes: 30,
+            },
+        ];
+        let plan = plan_rag_residue_cleanup(&files, 1_000_000);
+        // .tmp and .partial match; .tmpp does not
+        assert_eq!(plan.len(), 2);
+    }
+
+    #[test]
+    fn plan_rag_residue_cleanup_recent_files_excluded() {
+        let files = vec![FileCandidate {
+            path: PathBuf::from("/a.tmp"),
+            key: "a".to_string(),
+            mtime: 2_000_000,
+            size_bytes: 10,
+        }];
+        let plan = plan_rag_residue_cleanup(&files, 1_000_000);
+        assert!(plan.is_empty());
+    }
+
+    // ── plan_orphaned_projects edge cases ───────────────────────────────
+
+    #[test]
+    fn plan_orphaned_projects_empty_input() {
+        let plan = plan_orphaned_projects(&[]);
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn plan_orphaned_projects_all_existing() {
+        let candidates = vec![ProjectCandidate {
+            hash: "a".to_string(),
+            name: "a".to_string(),
+            path: "/a".to_string(),
+            workdir_exists: true,
+            dependents: ProjectDependentCounts::default(),
+        }];
+        let plan = plan_orphaned_projects(&candidates);
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn plan_orphaned_projects_all_missing() {
+        let candidates = vec![
+            ProjectCandidate {
+                hash: "a".to_string(),
+                name: "a".to_string(),
+                path: "/a".to_string(),
+                workdir_exists: false,
+                dependents: ProjectDependentCounts::default(),
+            },
+            ProjectCandidate {
+                hash: "b".to_string(),
+                name: "b".to_string(),
+                path: "/b".to_string(),
+                workdir_exists: false,
+                dependents: ProjectDependentCounts::default(),
+            },
+        ];
+        let plan = plan_orphaned_projects(&candidates);
+        assert_eq!(plan.len(), 2);
+    }
+
+    // ── plan_hard_cascade edge cases ───────────────────────────────────
+
+    #[test]
+    fn hard_plan_empty_candidates() {
+        let plan = plan_hard_cascade(&[]);
+        assert!(plan.is_empty());
+        assert!(plan.skips.is_empty());
+    }
+
+    #[test]
+    fn hard_plan_skips_only_when_counts_nonempty() {
+        // Missing workdir but zero counts → not a target (nothing to cascade)
+        let candidates = vec![hard_candidate(
+            "a",
+            "a",
+            "/a",
+            false,
+            HardCascadeCounts::default(),
+            None,
+        )];
+        let plan = plan_hard_cascade(&candidates);
+        assert!(plan.is_empty());
+        assert!(plan.skips.is_empty());
+    }
+
+    #[test]
+    fn hard_plan_both_targets_and_skips() {
+        let candidates = vec![
+            hard_candidate(
+                "target",
+                "t",
+                "/t",
+                false,
+                HardCascadeCounts {
+                    loops: 1,
+                    ..Default::default()
+                },
+                None,
+            ),
+            hard_candidate(
+                "skip",
+                "s",
+                "/s",
+                false,
+                HardCascadeCounts {
+                    interactive_sessions: 1,
+                    ..Default::default()
+                },
+                Some(HardCascadeSkipReason::ActiveSession),
+            ),
+            hard_candidate(
+                "exists",
+                "e",
+                "/e",
+                true,
+                HardCascadeCounts {
+                    loops: 1,
+                    ..Default::default()
+                },
+                None,
+            ),
+        ];
+        let plan = plan_hard_cascade(&candidates);
+        assert_eq!(plan.targets.len(), 1);
+        assert_eq!(plan.targets[0].hash, "target");
+        assert_eq!(plan.skips.len(), 1);
+        assert_eq!(plan.skips[0].hash, "skip");
+    }
+
+    // ── is_rag_residue_name ────────────────────────────────────────────
+
+    #[test]
+    fn is_rag_residue_name_true_for_tmp_and_partial() {
+        assert!(is_rag_residue_name(std::path::Path::new("/a.tmp")));
+        assert!(is_rag_residue_name(std::path::Path::new("/a.partial")));
+    }
+
+    #[test]
+    fn is_rag_residue_name_false_for_other_extensions() {
+        assert!(!is_rag_residue_name(std::path::Path::new("/a.json")));
+        assert!(!is_rag_residue_name(std::path::Path::new("/a.log")));
+        assert!(!is_rag_residue_name(std::path::Path::new("/a.lance")));
+    }
+
+    #[test]
+    fn is_rag_residue_name_false_for_no_extension() {
+        assert!(!is_rag_residue_name(std::path::Path::new("/noext")));
+    }
 }

@@ -442,6 +442,136 @@ mod tests {
         assert!(!is_target_alive("session-missing", &[]));
     }
 
+    #[test]
+    fn is_target_alive_empty_live_list() {
+        assert!(!is_target_alive("any", &[]));
+    }
+
+    #[test]
+    fn is_target_alive_multiple_live_sessions() {
+        let live = vec![
+            "s1".to_string(),
+            "s2".to_string(),
+            "s3".to_string(),
+        ];
+        assert!(is_target_alive("s1", &live));
+        assert!(is_target_alive("s2", &live));
+        assert!(is_target_alive("s3", &live));
+        assert!(!is_target_alive("s4", &live));
+    }
+
+    #[test]
+    fn is_target_alive_exact_match_not_substring() {
+        let live = vec!["session-abc".to_string()];
+        assert!(is_target_alive("session-abc", &live));
+        assert!(!is_target_alive("session", &live));
+        assert!(!is_target_alive("session-abc-extra", &live));
+    }
+
+    #[test]
+    fn list_due_scheduled_sends_empty_db() {
+        let db = test_db();
+        let due = db.list_due_scheduled_sends(Utc::now()).unwrap();
+        assert!(due.is_empty());
+    }
+
+    #[test]
+    fn list_due_scheduled_sends_ordered_by_fire_time() {
+        let db = test_db();
+        let now = Utc::now();
+        db.insert_scheduled_send("ss-c", "third", "s", None, now + chrono::Duration::hours(3))
+            .unwrap();
+        db.insert_scheduled_send("ss-a", "first", "s", None, now + chrono::Duration::hours(1))
+            .unwrap();
+        db.insert_scheduled_send("ss-b", "second", "s", None, now + chrono::Duration::hours(2))
+            .unwrap();
+
+        let due = db
+            .list_due_scheduled_sends(now + chrono::Duration::hours(10))
+            .unwrap();
+        let ids: Vec<&str> = due.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["ss-a", "ss-b", "ss-c"]);
+    }
+
+    #[test]
+    fn delete_nonexistent_scheduled_send_returns_false() {
+        let db = test_db();
+        assert!(!db.delete_scheduled_send("nonexistent").unwrap());
+    }
+
+    #[test]
+    fn reassign_no_matching_sends_returns_zero() {
+        let db = test_db();
+        let fire = Utc::now() + chrono::Duration::hours(1);
+        db.insert_scheduled_send("ss-1", "prompt", "session-a", None, fire)
+            .unwrap();
+
+        let moved = db.reassign_scheduled_sends("session-b", "session-c").unwrap();
+        assert_eq!(moved, 0);
+        // Original send is untouched
+        let pending = db
+            .list_pending_scheduled_sends_for_session("session-a")
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn reassign_moves_all_matching_sends() {
+        let db = test_db();
+        let fire = Utc::now() + chrono::Duration::hours(1);
+        db.insert_scheduled_send("ss-1", "p1", "old", None, fire)
+            .unwrap();
+        db.insert_scheduled_send("ss-2", "p2", "old", None, fire)
+            .unwrap();
+        db.insert_scheduled_send("ss-3", "p3", "other", None, fire)
+            .unwrap();
+
+        let moved = db.reassign_scheduled_sends("old", "new").unwrap();
+        assert_eq!(moved, 2);
+
+        assert!(db
+            .list_pending_scheduled_sends_for_session("old")
+            .unwrap()
+            .is_empty());
+        let pending_new = db
+            .list_pending_scheduled_sends_for_session("new")
+            .unwrap();
+        assert_eq!(pending_new.len(), 2);
+    }
+
+    #[test]
+    fn drop_missing_targets_with_all_live_keeps_everything() {
+        let db = test_db();
+        let fire = Utc::now() + chrono::Duration::hours(1);
+        db.insert_scheduled_send("ss-1", "p1", "s1", None, fire)
+            .unwrap();
+        db.insert_scheduled_send("ss-2", "p2", "s2", None, fire)
+            .unwrap();
+
+        let dropped = db
+            .drop_scheduled_sends_missing_targets(&["s1".to_string(), "s2".to_string()])
+            .unwrap();
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            db.list_due_scheduled_sends(Utc::now() + chrono::Duration::days(1))
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn scheduled_send_with_none_workdir_round_trips() {
+        let db = test_db();
+        let fire = Utc::now();
+        db.insert_scheduled_send("ss-nw", "prompt", "session", None, fire)
+            .unwrap();
+
+        let due = db.list_due_scheduled_sends(Utc::now()).unwrap();
+        assert_eq!(due.len(), 1);
+        assert!(due[0].workdir.is_none());
+    }
+
     /// A due scheduled send is processed and removed — a second poll at the
     /// same (fake, injected) time must not find it again. Exercises the
     /// "fires once" requirement without depending on real wall-clock sleeps.

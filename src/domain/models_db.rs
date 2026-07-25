@@ -817,4 +817,287 @@ mod tests {
         assert_eq!(load.source, CatalogSource::Live);
         assert_eq!(load.catalog.ids, vec!["opencode/fresh".to_string()]);
     }
+
+    // ── infer_size_hint ────────────────────────────────────────────────
+
+    #[test]
+    fn infer_size_hint_detects_billion_parameters() {
+        assert_eq!(infer_size_hint("model-7b", None), Some("7B".to_string()));
+        assert_eq!(
+            infer_size_hint("llama-3.1-70b-instruct", None),
+            Some("70B".to_string())
+        );
+        assert_eq!(
+            infer_size_hint("model-0.5b", None),
+            Some("0.5B".to_string())
+        );
+    }
+
+    #[test]
+    fn infer_size_hint_detects_million_parameters() {
+        assert_eq!(
+            infer_size_hint("model-125m", None),
+            Some("125M".to_string())
+        );
+    }
+
+    #[test]
+    fn infer_size_hint_detects_named_sizes() {
+        assert_eq!(
+            infer_size_hint("bge-small-en", None),
+            Some("small".to_string())
+        );
+        assert_eq!(
+            infer_size_hint("bge-large-en", None),
+            Some("large".to_string())
+        );
+        assert_eq!(
+            infer_size_hint("bge-base-en", None),
+            Some("base".to_string())
+        );
+    }
+
+    #[test]
+    fn infer_size_hint_checks_name_field_too() {
+        assert_eq!(
+            infer_size_hint("some-model", Some("Some 7B Model")),
+            Some("7B".to_string())
+        );
+    }
+
+    #[test]
+    fn infer_size_hint_returns_none_for_no_match() {
+        assert_eq!(infer_size_hint("claude-sonnet-4-6", None), None);
+        assert_eq!(infer_size_hint("gpt-4o", None), None);
+    }
+
+    #[test]
+    fn infer_size_hint_case_insensitive() {
+        assert_eq!(
+            infer_size_hint("model-SMALL-v2", None),
+            Some("small".to_string())
+        );
+        assert_eq!(
+            infer_size_hint("model-LARGE-v2", None),
+            Some("large".to_string())
+        );
+    }
+
+    // ── suggestions_for ────────────────────────────────────────────────
+
+    fn test_catalog() -> ModelCatalog {
+        ModelCatalog {
+            models: vec![
+                ModelEntry {
+                    id: "claude-sonnet-4-6".to_string(),
+                    name: "Claude Sonnet 4.6".to_string(),
+                    provider: "anthropic".to_string(),
+                    release_date: None,
+                    size_hint: None,
+                },
+                ModelEntry {
+                    id: "gpt-4o".to_string(),
+                    name: "GPT-4o".to_string(),
+                    provider: "openai".to_string(),
+                    release_date: None,
+                    size_hint: None,
+                },
+                ModelEntry {
+                    id: "gemini-2.5-pro".to_string(),
+                    name: "Gemini 2.5 Pro".to_string(),
+                    provider: "google".to_string(),
+                    release_date: None,
+                    size_hint: None,
+                },
+                ModelEntry {
+                    id: "claude-haiku-3.5".to_string(),
+                    name: "Claude Haiku 3.5".to_string(),
+                    provider: "anthropic".to_string(),
+                    release_date: None,
+                    size_hint: None,
+                },
+            ],
+            fetched_at: SystemTime::now(),
+        }
+    }
+
+    #[test]
+    fn suggestions_for_filters_by_provider() {
+        let catalog = test_catalog();
+        let results = suggestions_for(&catalog, "claude", "");
+        // claude only maps to anthropic
+        assert!(results.iter().all(|m| m.provider == "anthropic"));
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn suggestions_for_filters_by_query() {
+        let catalog = test_catalog();
+        let results = suggestions_for(&catalog, "claude", "sonnet");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn suggestions_for_query_is_case_insensitive() {
+        let catalog = test_catalog();
+        let results = suggestions_for(&catalog, "claude", "SONNET");
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn suggestions_for_empty_query_returns_all_matching_providers() {
+        let catalog = test_catalog();
+        let results = suggestions_for(&catalog, "claude", "");
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn suggestions_for_unknown_cli_returns_all_models() {
+        let catalog = test_catalog();
+        // Unknown CLI → empty providers list → all models pass the filter
+        let results = suggestions_for(&catalog, "unknown-cli", "");
+        assert_eq!(results.len(), 4);
+    }
+
+    #[test]
+    fn suggestions_for_query_matches_name_field() {
+        let catalog = test_catalog();
+        let results = suggestions_for(&catalog, "claude", "Haiku");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "claude-haiku-3.5");
+    }
+
+    // ── CatalogSource::as_str ──────────────────────────────────────────
+
+    #[test]
+    fn catalog_source_as_str() {
+        assert_eq!(CatalogSource::Live.as_str(), "live");
+        assert_eq!(CatalogSource::Cache.as_str(), "cache");
+        assert_eq!(CatalogSource::Stale.as_str(), "stale");
+    }
+
+    #[test]
+    fn catalog_source_serde_round_trip() {
+        let live = serde_json::to_string(&CatalogSource::Live).unwrap();
+        assert_eq!(live, "\"live\"");
+        let cache = serde_json::to_string(&CatalogSource::Cache).unwrap();
+        assert_eq!(cache, "\"cache\"");
+        let stale = serde_json::to_string(&CatalogSource::Stale).unwrap();
+        assert_eq!(stale, "\"stale\"");
+    }
+
+    #[test]
+    fn catalog_source_deserialize() {
+        let live: CatalogSource = serde_json::from_str("\"live\"").unwrap();
+        assert_eq!(live, CatalogSource::Live);
+        let cache: CatalogSource = serde_json::from_str("\"cache\"").unwrap();
+        assert_eq!(cache, CatalogSource::Cache);
+        let stale: CatalogSource = serde_json::from_str("\"stale\"").unwrap();
+        assert_eq!(stale, CatalogSource::Stale);
+    }
+
+    // ── ModelEntry serialization ───────────────────────────────────────
+
+    #[test]
+    fn model_entry_round_trip() {
+        let entry = ModelEntry {
+            id: "test-model".to_string(),
+            name: "Test Model".to_string(),
+            provider: "test-provider".to_string(),
+            release_date: Some("2025-01-01".to_string()),
+            size_hint: Some("7B".to_string()),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let deserialized: ModelEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.id, "test-model");
+        assert_eq!(deserialized.name, "Test Model");
+        assert_eq!(deserialized.provider, "test-provider");
+        assert_eq!(deserialized.release_date.as_deref(), Some("2025-01-01"));
+        assert_eq!(deserialized.size_hint.as_deref(), Some("7B"));
+    }
+
+    #[test]
+    fn model_entry_optional_fields_none() {
+        let entry = ModelEntry {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            provider: "test".to_string(),
+            release_date: None,
+            size_hint: None,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let deserialized: ModelEntry = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.release_date.is_none());
+        assert!(deserialized.size_hint.is_none());
+    }
+
+    // ── providers_for_cli ──────────────────────────────────────────────
+
+    #[test]
+    fn providers_for_cli_all_known() {
+        assert_eq!(providers_for_cli("claude"), &["anthropic"]);
+        assert_eq!(providers_for_cli("codex"), &["openai"]);
+        assert_eq!(providers_for_cli("mistral"), &["mistral"]);
+        assert_eq!(providers_for_cli("copilot").len(), 6);
+        assert_eq!(providers_for_cli("gemini"), &["google"]);
+        assert_eq!(providers_for_cli("qwen"), &["alibaba"]);
+        assert!(providers_for_cli("kiro").contains(&"anthropic"));
+        assert!(providers_for_cli("kiro").contains(&"google"));
+        assert!(providers_for_cli("opencode").contains(&"opencode"));
+        assert!(providers_for_cli("opencode").contains(&"opencode-go"));
+    }
+
+    // ── parse_native_ids edge cases ────────────────────────────────────
+
+    #[test]
+    fn parse_native_ids_empty_output() {
+        assert_eq!(parse_native_ids(""), Vec::<String>::new());
+        assert_eq!(parse_native_ids("\n\n\n"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn parse_native_ids_single_line() {
+        assert_eq!(
+            parse_native_ids("opencode/big-pickle"),
+            vec!["opencode/big-pickle".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_native_ids_trims_whitespace() {
+        assert_eq!(
+            parse_native_ids("  opencode/big-pickle  \n  opencode/mimo-v2.5-free  \n"),
+            vec![
+                "opencode/big-pickle".to_string(),
+                "opencode/mimo-v2.5-free".to_string()
+            ]
+        );
+    }
+
+    // ── resolve_native edge cases ──────────────────────────────────────
+
+    #[test]
+    fn resolve_native_no_cache_and_successful_enumerate() {
+        let load = resolve_native(false, || None, || Some(native(&["m1"], Duration::ZERO))).unwrap();
+        assert_eq!(load.source, CatalogSource::Live);
+        assert_eq!(load.catalog.ids, vec!["m1".to_string()]);
+    }
+
+    #[test]
+    fn force_refresh_enumeration_failure_returns_none_without_cache() {
+        assert!(resolve_native(true, || None, || None).is_none());
+    }
+
+    #[test]
+    fn force_refresh_with_cache_but_failed_enumeration_returns_stale() {
+        let load = resolve_native(
+            true,
+            || Some(native(&["cached"], Duration::from_secs(1))),
+            || None,
+        )
+        .unwrap();
+        assert_eq!(load.source, CatalogSource::Stale);
+        assert_eq!(load.catalog.ids, vec!["cached".to_string()]);
+    }
 }
