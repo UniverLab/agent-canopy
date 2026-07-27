@@ -86,10 +86,9 @@ impl TerminalSelection {
     }
 }
 
-/// The sidebar's three thematic layers, stacked between the pinned RAG
-/// summary (top) and sysinfo dashboard (bottom). Each is independently
-/// collapsible; `App::sidebar_layer` tracks which one currently has
-/// keyboard/mouse focus.
+/// The sidebar's three thematic tabs, shown one at a time below the pinned
+/// RAG summary (top) and above the sysinfo dashboard (bottom).
+/// `App::sidebar_layer` tracks which one is currently active.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SidebarLayer {
     /// Interactive agents + terminals — the things with a PTY right now.
@@ -333,12 +332,8 @@ pub struct App {
     // UI state
     pub(crate) selected: usize,
     pub(crate) focus: Focus,
-    /// Which sidebar layer currently has keyboard/mouse focus.
+    /// Which sidebar tab (Live / Automation / Knowledge) is active.
     pub(crate) sidebar_layer: SidebarLayer,
-    /// Persisted (see `db::state`) collapsed state for each layer.
-    pub(crate) live_collapsed: bool,
-    pub(crate) automation_collapsed: bool,
-    pub(crate) knowledge_collapsed: bool,
     /// Which of Automation's two sub-lists is active for navigation.
     pub(crate) automation_kind: AutomationKind,
     /// `Some(tab)` while a project is entered (Focus tab bar showing);
@@ -401,9 +396,10 @@ pub struct App {
     pub(crate) project_tab_click_map: Vec<(ProjectTab, u16, u16)>,
     /// Mouse hit-test rows for the active tab's list, populated during draw.
     pub(crate) project_tab_row_click_map: Vec<(usize, u16, u16)>,
-    /// Mouse hit-test rows for the three layer headers, populated during
-    /// draw: clicking toggles that layer's collapsed state.
-    pub(crate) layer_header_click_map: Vec<(SidebarLayer, u16, u16)>,
+    /// Mouse hit-test cells for the sidebar's tab strip, populated during
+    /// draw: `(tab, row, col_start, col_end)` — clicking switches the active
+    /// tab.
+    pub(crate) sidebar_tab_click_map: Vec<(SidebarLayer, u16, u16, u16)>,
     pub(crate) loops: Vec<Loop>,
     pub(crate) selected_loop_id: Option<String>,
     pub(crate) loop_details: Option<LoopDetails>,

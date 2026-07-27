@@ -36,13 +36,13 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Them
                 let mut h = vec![
                     ("↑↓", "highlight"),
                     ("Enter", "open project"),
-                    ("F2", "layer"),
+                    ("F2", "tab"),
                 ];
                 h.push(("Esc", "home"));
                 h
             } else {
                 let is_bg = matches!(app.selected_agent(), Some(AgentEntry::Agent(_)));
-                let mut h = vec![("↑↓", "nav"), ("Enter", "focus"), ("F2", "layer")];
+                let mut h = vec![("↑↓", "nav"), ("Enter", "focus"), ("F2", "tab")];
                 if is_bg {
                     h.push(("e", "edit"));
                     h.push(("d", "toggle"));

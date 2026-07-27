@@ -1,5 +1,6 @@
-//! Sidebar rendering — layered: RAG (pinned top) → Live → Automation →
-//! Knowledge (projects) → sysinfo (pinned bottom).
+//! Sidebar rendering — RAG (pinned top) → tab bar (Live / Automation /
+//! Knowledge, exactly one visible at a time, full remaining height) →
+//! sysinfo (pinned bottom).
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -21,7 +22,7 @@ pub(super) fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App, theme: 
     app.sidebar_click_map.clear();
     app.automation_loop_click_map.clear();
     app.project_click_map.clear();
-    app.layer_header_click_map.clear();
+    app.sidebar_tab_click_map.clear();
     app.sidebar_visible_capacity = 0;
 
     frame.render_widget(
@@ -50,7 +51,7 @@ pub(super) fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App, theme: 
         );
     }
 
-    let brain_area = draw_sidebar_layers(frame, content_below, app, theme);
+    let brain_area = draw_sidebar_tabs(frame, content_below, app, theme);
     render_brain_or_graph(frame, brain_area, app, theme);
 
     render_dashboard_if_present(frame, areas.dashboard, app, theme);
@@ -245,14 +246,6 @@ fn layer_label(layer: SidebarLayer) -> &'static str {
     }
 }
 
-fn layer_collapsed(app: &App, layer: SidebarLayer) -> bool {
-    match layer {
-        SidebarLayer::Live => app.live_collapsed,
-        SidebarLayer::Automation => app.automation_collapsed,
-        SidebarLayer::Knowledge => app.knowledge_collapsed,
-    }
-}
-
 fn layer_count(app: &App, layer: SidebarLayer) -> usize {
     match layer {
         SidebarLayer::Live => {
@@ -274,45 +267,72 @@ fn layer_focused(app: &App, layer: SidebarLayer) -> bool {
         && app.sidebar_layer == layer
 }
 
-/// Draws a layer's 1-row collapsible header (`▾ Live (3)`), registers it in
-/// `layer_header_click_map`, and returns the row it occupies.
-fn draw_layer_header(
-    frame: &mut Frame,
-    area: Rect,
-    app: &mut App,
-    layer: SidebarLayer,
-    theme: &Theme,
-) {
-    if area.height == 0 {
+const SIDEBAR_TABS: [SidebarLayer; 3] = [
+    SidebarLayer::Live,
+    SidebarLayer::Automation,
+    SidebarLayer::Knowledge,
+];
+
+/// Fits `"{label} ({count})"` into `width` columns, shortening the label
+/// first. The count is the signal worth glancing at across a tab switch, so
+/// it's the last thing to give up space — a cramped column reads
+/// `"Automa… (12)"` rather than losing the number entirely.
+fn tab_cell_text(label: &str, count: usize, width: usize) -> String {
+    let suffix = format!(" ({count})");
+    let suffix_len = suffix.chars().count();
+    if width <= suffix_len {
+        return truncate_str(suffix.trim_start(), width);
+    }
+    format!("{}{suffix}", truncate_str(label, width - suffix_len))
+}
+
+/// Draws the sidebar's `Live / Automation / Knowledge` tab strip: one cell
+/// per tab, each an equal share of `area.width` (the last cell absorbs the
+/// rounding remainder so the three always cover the full row exactly — no
+/// gap for the background paint underneath to show through). The active
+/// tab's cell is filled with `theme.header_color`; inactive cells are
+/// dimmed text on the sidebar background. Registers each cell's hit box in
+/// `sidebar_tab_click_map` for mouse clicks.
+fn draw_sidebar_tab_bar(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
+    if area.height == 0 || area.width == 0 {
         return;
     }
-    let collapsed = layer_collapsed(app, layer);
-    let arrow = if collapsed { "▸" } else { "▾" };
-    let focused = layer_focused(app, layer);
-    let fg = if focused {
-        theme.header_color
-    } else {
-        Color::White
-    };
-    let text = format!(
-        " {arrow} {} ({}) ",
-        layer_label(layer),
-        layer_count(app, layer)
-    );
-    let bg = if focused {
-        theme.selected_bg
-    } else {
-        Color::Reset
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            text,
-            Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
-        )))
-        .style(Style::default().bg(bg)),
-        Rect::new(area.x, area.y, area.width, 1),
-    );
-    app.layer_header_click_map.push((layer, area.y, area.y + 1));
+    let col_w = area.width / SIDEBAR_TABS.len() as u16;
+    let mut x = area.x;
+    for (i, &layer) in SIDEBAR_TABS.iter().enumerate() {
+        let width = if i + 1 == SIDEBAR_TABS.len() {
+            area.x + area.width - x
+        } else {
+            col_w
+        };
+        if width == 0 {
+            break;
+        }
+
+        let active = app.sidebar_layer == layer;
+        let text = tab_cell_text(layer_label(layer), layer_count(app, layer), width as usize);
+        let (fg, bg) = if active {
+            (Color::Black, theme.header_color)
+        } else {
+            (theme.dim_text, Color::Reset)
+        };
+        let modifier = if active {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                text,
+                Style::default().fg(fg).add_modifier(modifier),
+            )))
+            .style(Style::default().bg(bg)),
+            Rect::new(x, area.y, width, 1),
+        );
+        app.sidebar_tab_click_map
+            .push((layer, area.y, x, x + width));
+        x += width;
+    }
 }
 
 // ── Layer bodies ─────────────────────────────────────────────────
@@ -421,81 +441,37 @@ fn groups_list_demand(count: usize) -> u16 {
     }
 }
 
-fn live_body_demand(app: &App, interactive: &[usize], terminal: &[usize]) -> u16 {
-    card_list_demand(interactive.len())
-        + card_list_demand(terminal.len())
-        + groups_list_demand(app.split_groups.len())
-}
-
-fn automation_body_demand(app: &App, background: &[usize]) -> u16 {
-    card_list_demand(background.len()) + card_list_demand(app.active_loops().len())
-}
-
-fn knowledge_body_demand(app: &App) -> u16 {
-    if app.projects.is_empty() {
-        2
-    } else {
-        card_list_demand(app.projects.len())
-    }
-}
-
-/// Lays out and draws the three sidebar layers top-to-bottom, returning the
-/// leftover area (for the project graph / Brian's Brain).
-fn draw_sidebar_layers(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) -> Rect {
+/// Draws the sidebar's tab strip plus the active tab's body, which fills all
+/// remaining height — exactly one tab is visible at a time, so there's no
+/// more space-sharing between layers (`fair_section_heights` is still used
+/// *within* a tab's own sub-sections, e.g. Live's interactive/terminal/
+/// groups panels). Returns the leftover area for the project graph / Brian's
+/// Brain — now always empty, since the active tab claims the full height,
+/// but `render_brain_or_graph` already no-ops on a zero-height area.
+fn draw_sidebar_tabs(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) -> Rect {
     let (background_indices, interactive_indices, terminal_indices) = agent_indices_by_kind(app);
 
-    let header_budget = 3.min(area.height);
-    let body_budget = area.height.saturating_sub(header_budget);
-    let demands = [
-        if app.live_collapsed {
-            0
-        } else {
-            live_body_demand(app, &interactive_indices, &terminal_indices)
-        },
-        if app.automation_collapsed {
-            0
-        } else {
-            automation_body_demand(app, &background_indices)
-        },
-        if app.knowledge_collapsed {
-            0
-        } else {
-            knowledge_body_demand(app)
-        },
-    ];
-    let alloc = fair_section_heights(&demands, body_budget);
-
     let mut remaining = area;
-
-    if let Some(header) = take_top(&mut remaining, 1) {
-        draw_layer_header(frame, header, app, SidebarLayer::Live, theme);
+    if let Some(bar) = take_top(&mut remaining, 1) {
+        draw_sidebar_tab_bar(frame, bar, app, theme);
     }
-    if let Some(body) = take_top(&mut remaining, alloc[0]) {
-        draw_live_body(
+
+    match app.sidebar_layer {
+        SidebarLayer::Live => draw_live_body(
             frame,
-            body,
+            remaining,
             app,
             &interactive_indices,
             &terminal_indices,
             theme,
-        );
+        ),
+        SidebarLayer::Automation => {
+            draw_automation_body(frame, remaining, app, &background_indices, theme);
+        }
+        SidebarLayer::Knowledge => draw_knowledge_body(frame, remaining, app, theme),
     }
 
-    if let Some(header) = take_top(&mut remaining, 1) {
-        draw_layer_header(frame, header, app, SidebarLayer::Automation, theme);
-    }
-    if let Some(body) = take_top(&mut remaining, alloc[1]) {
-        draw_automation_body(frame, body, app, &background_indices, theme);
-    }
-
-    if let Some(header) = take_top(&mut remaining, 1) {
-        draw_layer_header(frame, header, app, SidebarLayer::Knowledge, theme);
-    }
-    if let Some(body) = take_top(&mut remaining, alloc[2]) {
-        draw_knowledge_body(frame, body, app, theme);
-    }
-
-    remaining
+    Rect::new(area.x, area.y + area.height, area.width, 0)
 }
 
 fn draw_live_body(
@@ -1733,7 +1709,10 @@ mod tests {
     /// Builds an App backed by a fresh temp DB with `project_count` registered
     /// projects and one loop named "Probe Loop", then renders the sidebar into
     /// a `width`x`height` TestBackend and returns the screen contents as a
-    /// flat string for substring assertions.
+    /// flat string for substring assertions. The `Live` tab is active by
+    /// default (matching `App::new`) — use `render_sidebar_text_on_tab` to
+    /// assert on Automation's or Knowledge's body, since only the active
+    /// tab renders.
     fn render_sidebar_text(project_count: usize, width: u16, height: u16) -> String {
         render_sidebar_text_themed(project_count, width, height, &Theme::classic())
     }
@@ -1743,6 +1722,16 @@ mod tests {
         width: u16,
         height: u16,
         theme: &Theme,
+    ) -> String {
+        render_sidebar_text_on_tab(project_count, width, height, theme, SidebarLayer::Live)
+    }
+
+    fn render_sidebar_text_on_tab(
+        project_count: usize,
+        width: u16,
+        height: u16,
+        theme: &Theme,
+        active_layer: SidebarLayer,
     ) -> String {
         use crate::db::Database;
         use crate::domain::loops::{Loop, LoopStatus};
@@ -1788,6 +1777,7 @@ mod tests {
 
         let data_dir = tempfile::tempdir().unwrap();
         let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
+        app.sidebar_layer = active_layer;
         assert!(
             !app.active_loops().is_empty(),
             "loop should be loaded from db"
@@ -1815,22 +1805,51 @@ mod tests {
 
     #[test]
     fn layer_headers_render_with_counts() {
-        let text = render_sidebar_text(2, 34, 40);
-        assert!(text.contains("Live"), "expected Live layer header");
-        assert!(
-            text.contains("Automation"),
-            "expected Automation layer header"
-        );
+        // Wide enough that no tab cell needs to shorten its label to fit
+        // (see `tab_cell_text`'s own narrow-width tests below).
+        let text = render_sidebar_text(2, 45, 40);
+        assert!(text.contains("Live"), "expected Live tab label");
+        assert!(text.contains("Automation"), "expected Automation tab label");
         assert!(
             text.contains("Knowledge (2)"),
-            "expected Knowledge layer header with count"
+            "expected Knowledge tab label with count"
         );
     }
 
     #[test]
     fn automation_layer_shows_running_loop() {
-        let text = render_sidebar_text(1, 34, 40);
+        let text =
+            render_sidebar_text_on_tab(1, 45, 40, &Theme::classic(), SidebarLayer::Automation);
         assert!(text.contains("Probe Loop"), "expected loop name visible");
+    }
+
+    #[test]
+    fn inactive_tabs_bodies_are_not_rendered() {
+        // The whole point of tabs over stacked layers: exactly one body is
+        // visible at a time. A project ("only-in-knowledge") and the
+        // always-present "Probe Loop" (Automation) must not leak into the
+        // Live tab's render, and vice versa.
+        let live_text =
+            render_sidebar_text_on_tab(1, 45, 40, &Theme::classic(), SidebarLayer::Live);
+        assert!(
+            !live_text.contains("Probe Loop"),
+            "Automation's body must not render while Live is active"
+        );
+        assert!(
+            !live_text.contains("project0"),
+            "Knowledge's body must not render while Live is active"
+        );
+
+        let knowledge_text =
+            render_sidebar_text_on_tab(1, 45, 40, &Theme::classic(), SidebarLayer::Knowledge);
+        assert!(
+            knowledge_text.contains("project0"),
+            "Knowledge's body must render while Knowledge is active"
+        );
+        assert!(
+            !knowledge_text.contains("Probe Loop"),
+            "Automation's body must not render while Knowledge is active"
+        );
     }
 
     #[test]
@@ -1848,13 +1867,13 @@ mod tests {
             }
         };
 
-        let classic_text = render_sidebar_text_themed(1, 34, 40, &Theme::classic());
+        let classic_text = render_sidebar_text_themed(1, 45, 40, &Theme::classic());
         assert!(
             border_glyphs.iter().any(|g| classic_text.contains(*g)),
             "classic render should still draw box-drawing borders\n--- text ---\n{classic_text}"
         );
 
-        let modern_text = render_sidebar_text_themed(1, 34, 40, &Theme::modern());
+        let modern_text = render_sidebar_text_themed(1, 45, 40, &Theme::modern());
         assert_no_borders("modern", &modern_text);
         // And the labels that the modern sidebar still owes the user must
         // survive (sanity: we didn't accidentally turn the whole area blank).
@@ -1881,55 +1900,6 @@ mod tests {
             !text.contains(" history "),
             "history must not be a top-level section"
         );
-    }
-
-    #[test]
-    fn collapsed_layer_hides_its_body() {
-        use crate::db::Database;
-        use crate::tui::app::App;
-        use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
-        use std::sync::Arc;
-
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
-        let db = Arc::new(Database::new(&path).unwrap());
-        db.upsert_project(&crate::domain::project::Project {
-            hash: "hash0".to_string(),
-            path: "/tmp/project0".to_string(),
-            name: "project0".to_string(),
-            description: None,
-            tags: None,
-            indexed_at: None,
-            created_at: 0,
-        })
-        .unwrap();
-
-        let data_dir = tempfile::tempdir().unwrap();
-        let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
-        app.knowledge_collapsed = true;
-
-        let backend = TestBackend::new(34, 40);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                let area = frame.area();
-                draw_sidebar(frame, area, &mut app, &Theme::classic());
-            })
-            .unwrap();
-
-        let buffer = terminal.backend().buffer().clone();
-        let mut text = String::new();
-        for y in 0..buffer.area.height {
-            for x in 0..buffer.area.width {
-                text.push_str(buffer[(x, y)].symbol());
-            }
-            text.push('\n');
-        }
-
-        assert!(text.contains("Knowledge (1)"), "header still shows count");
-        assert!(!text.contains("project0"), "collapsed layer hides its body");
     }
 
     #[test]
@@ -1964,6 +1934,9 @@ mod tests {
         let data_dir = tempfile::tempdir().unwrap();
         let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
         assert_eq!(app.projects.len(), 2, "projects should be loaded from db");
+        // Only the active tab's body renders now — Knowledge must be active
+        // for its project rows to draw at all.
+        app.sidebar_layer = SidebarLayer::Knowledge;
 
         let backend = TestBackend::new(34, 40);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2137,5 +2110,160 @@ mod tests {
             pty_session_status_color(false, &AgentStatus::Exited(0), true, false, 0),
             STATUS_FAIL
         );
+    }
+
+    #[test]
+    fn layer_label_all_variants() {
+        assert_eq!(layer_label(SidebarLayer::Live), "Live");
+        assert_eq!(layer_label(SidebarLayer::Automation), "Automation");
+        assert_eq!(layer_label(SidebarLayer::Knowledge), "Knowledge");
+    }
+
+    #[test]
+    fn tab_cell_text_fits_without_truncation_when_there_is_room() {
+        assert_eq!(tab_cell_text("Automation", 3, 20), "Automation (3)");
+    }
+
+    #[test]
+    fn tab_cell_text_shortens_the_label_but_keeps_the_count() {
+        // "Automation (12)" is 15 chars; at width 11 the label must give up
+        // space first so " (12)" always survives intact.
+        let text = tab_cell_text("Automation", 12, 11);
+        assert_eq!(text.chars().count(), 11);
+        assert!(
+            text.ends_with(" (12)"),
+            "count must survive truncation: {text:?}"
+        );
+    }
+
+    #[test]
+    fn tab_cell_text_extreme_narrow_width_still_fits_exactly() {
+        let text = tab_cell_text("Knowledge", 2, 3);
+        assert_eq!(text.chars().count(), 3);
+    }
+
+    #[test]
+    fn draw_sidebar_tab_bar_registers_three_equal_click_cells_spanning_the_full_width() {
+        use crate::db::Database;
+        use crate::tui::app::App;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::sync::Arc;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
+
+        let backend = TestBackend::new(33, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_sidebar(frame, area, &mut app, &Theme::classic());
+            })
+            .unwrap();
+
+        assert_eq!(app.sidebar_tab_click_map.len(), 3);
+        let layers: Vec<SidebarLayer> = app
+            .sidebar_tab_click_map
+            .iter()
+            .map(|&(layer, _, _, _)| layer)
+            .collect();
+        assert_eq!(
+            layers,
+            vec![
+                SidebarLayer::Live,
+                SidebarLayer::Automation,
+                SidebarLayer::Knowledge
+            ]
+        );
+        // The three cells must tile the row with no gap and no overlap.
+        let first_col = app.sidebar_tab_click_map[0].2;
+        let last_col_end = app.sidebar_tab_click_map[2].3;
+        assert_eq!(last_col_end - first_col, 33);
+        for pair in app.sidebar_tab_click_map.windows(2) {
+            assert_eq!(pair[0].3, pair[1].2, "cells must be contiguous");
+        }
+    }
+
+    #[test]
+    fn fair_section_heights_empty() {
+        assert_eq!(fair_section_heights(&[], 20), Vec::<u16>::new());
+    }
+
+    #[test]
+    fn fair_section_heights_single_section() {
+        assert_eq!(fair_section_heights(&[10], 20), vec![10]);
+    }
+
+    #[test]
+    fn fair_section_heights_budget_exactly_matches_demand() {
+        assert_eq!(fair_section_heights(&[5, 5, 5], 15), vec![5, 5, 5]);
+    }
+
+    #[test]
+    fn fair_section_heights_budget_exceeds_demand() {
+        assert_eq!(fair_section_heights(&[3, 3], 20), vec![3, 3]);
+    }
+
+    #[test]
+    fn fair_section_heights_budget_falls_short() {
+        let result = fair_section_heights(&[10, 10], 10);
+        assert_eq!(result.iter().sum::<u16>(), 10);
+    }
+
+    #[test]
+    fn fair_section_heights_one_small_one_large() {
+        let result = fair_section_heights(&[2, 20], 12);
+        assert_eq!(result[0], 2);
+        assert_eq!(result[1], 10);
+        assert_eq!(result.iter().sum::<u16>(), 12);
+    }
+
+    #[test]
+    fn fair_section_heights_budget_zero() {
+        assert_eq!(fair_section_heights(&[10, 10], 0), vec![0, 0]);
+    }
+
+    #[test]
+    fn fair_section_heights_many_sections() {
+        let result = fair_section_heights(&[5, 5, 5, 5, 5], 10);
+        assert_eq!(result.iter().sum::<u16>(), 10);
+        for &v in &result {
+            assert!(v <= 5);
+        }
+    }
+
+    #[test]
+    fn card_list_demand_empty() {
+        assert_eq!(card_list_demand(0), 0);
+    }
+
+    #[test]
+    fn card_list_demand_one() {
+        assert_eq!(card_list_demand(1), 6);
+    }
+
+    #[test]
+    fn card_list_demand_many() {
+        assert_eq!(card_list_demand(5), 22);
+    }
+
+    #[test]
+    fn groups_list_demand_empty() {
+        assert_eq!(groups_list_demand(0), 0);
+    }
+
+    #[test]
+    fn groups_list_demand_one() {
+        assert_eq!(groups_list_demand(1), 4);
+    }
+
+    #[test]
+    fn groups_list_demand_many() {
+        assert_eq!(groups_list_demand(3), 8);
     }
 }

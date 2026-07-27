@@ -206,6 +206,17 @@ fn cycle_sidebar_layer_and_normalize_focus(app: &mut App) {
     }
 }
 
+/// A left-click on a sidebar tab label: switch to it and, like the F2/
+/// right-click cycle, back out of a deep `Focus::Agent` view to Preview —
+/// the newly active tab's own selection (if any) is what should be shown,
+/// not whatever agent happened to be focused on the previous tab.
+fn switch_sidebar_tab_and_normalize_focus(app: &mut App, layer: SidebarLayer) {
+    app.switch_sidebar_tab(layer);
+    if matches!(app.focus, Focus::Agent) {
+        app.focus = Focus::Preview;
+    }
+}
+
 fn dispatch_focus_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
     match app.focus {
         Focus::Home => handle_home_key(app, code, modifiers),
@@ -331,14 +342,14 @@ fn handle_prompt_dialog_mouse(app: &mut App, mouse: &MouseEvent) {
     }
 }
 
-// ── Mouse: layered sidebar (hover, click, scroll, right-click) ──────
+// ── Mouse: tabbed sidebar (hover, click, scroll, right-click) ───────
 
-/// Handle a mouse event landing on the sidebar: layer-header clicks
-/// (collapse toggle), left-click to select/enter a row in whichever layer
-/// it belongs to (Live/Automation agent card, Automation loop card,
-/// Knowledge project row), scroll to page the hovered layer's list, and
-/// right-click as a shortcut for F2 (cycle layer). Returns `true` if the
-/// event was consumed and no further mouse handling should run.
+/// Handle a mouse event landing on the sidebar: tab-bar clicks (switch the
+/// active tab), left-click to select/enter a row in the active tab's body
+/// (Live/Automation agent card, Automation loop card, Knowledge project
+/// row), scroll to page the active tab's list, and right-click as a
+/// shortcut for F2 (cycle tab). Returns `true` if the event was consumed
+/// and no further mouse handling should run.
 fn handle_sidebar_mouse(app: &mut App, mouse: &MouseEvent) -> bool {
     let in_sidebar = app.sidebar_visible && mouse.column < sidebar_width(app);
 
@@ -355,7 +366,7 @@ fn handle_sidebar_mouse(app: &mut App, mouse: &MouseEvent) -> bool {
             true
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            handle_sidebar_left_click(app, mouse.row);
+            handle_sidebar_left_click(app, mouse.row, mouse.column);
             true
         }
         MouseEventKind::Down(MouseButton::Right) => {
@@ -374,9 +385,9 @@ fn handle_sidebar_mouse(app: &mut App, mouse: &MouseEvent) -> bool {
     }
 }
 
-fn handle_sidebar_left_click(app: &mut App, row: u16) {
-    if let Some(layer) = layer_header_at(app, row) {
-        app.toggle_layer_collapsed(layer);
+fn handle_sidebar_left_click(app: &mut App, row: u16, col: u16) {
+    if let Some(layer) = sidebar_tab_at(app, row, col) {
+        switch_sidebar_tab_and_normalize_focus(app, layer);
         return;
     }
     if let Some(idx) = sidebar_agent_at(app, row) {
@@ -415,13 +426,13 @@ fn handle_sidebar_left_click(app: &mut App, row: u16) {
     }
 }
 
-/// Map a sidebar row to the layer whose header was clicked, via the click
+/// Map a sidebar (row, col) to the tab cell rendered there, via the click
 /// map populated during draw.
-fn layer_header_at(app: &App, row: u16) -> Option<SidebarLayer> {
-    app.layer_header_click_map
+fn sidebar_tab_at(app: &App, row: u16, col: u16) -> Option<SidebarLayer> {
+    app.sidebar_tab_click_map
         .iter()
-        .find(|&&(_, start, end)| row >= start && row < end)
-        .map(|&(layer, _, _)| layer)
+        .find(|&&(_, tab_row, start, end)| row == tab_row && col >= start && col < end)
+        .map(|&(layer, _, _, _)| layer)
 }
 
 /// Map a sidebar row (terminal row coordinate) to the agent index rendered
@@ -1188,6 +1199,102 @@ mod sidebar_mouse_tests {
             KeyModifiers::NONE
         ));
         assert_eq!(app.sidebar_layer, crate::tui::app::SidebarLayer::Automation);
+    }
+
+    #[test]
+    fn f2_cycles_through_all_three_tabs_when_all_have_content() {
+        use crate::domain::models::{SplitGroup, SplitOrientation};
+
+        // 3 background agents (Automation) from `app_with_agents`, plus a
+        // split group (Live) and a project (Knowledge) so every tab has
+        // something to land on and the ring wraps all the way around.
+        let mut app = app_with_agents(3);
+        app.agents.push(AgentEntry::Group(0));
+        app.split_groups.push(SplitGroup {
+            id: "g1".to_string(),
+            orientation: SplitOrientation::Horizontal,
+            session_a: "a".to_string(),
+            session_b: "b".to_string(),
+            created_at: Utc::now(),
+        });
+        app.projects
+            .push(crate::domain::project::Project::new("/tmp/proj"));
+
+        assert_eq!(app.sidebar_layer, crate::tui::app::SidebarLayer::Live);
+
+        assert!(handle_global_key(
+            &mut app,
+            KeyCode::F(2),
+            KeyModifiers::NONE
+        ));
+        assert_eq!(app.sidebar_layer, crate::tui::app::SidebarLayer::Automation);
+
+        assert!(handle_global_key(
+            &mut app,
+            KeyCode::F(2),
+            KeyModifiers::NONE
+        ));
+        assert_eq!(app.sidebar_layer, crate::tui::app::SidebarLayer::Knowledge);
+
+        assert!(handle_global_key(
+            &mut app,
+            KeyCode::F(2),
+            KeyModifiers::NONE
+        ));
+        assert_eq!(
+            app.sidebar_layer,
+            crate::tui::app::SidebarLayer::Live,
+            "the ring wraps back to Live"
+        );
+    }
+
+    #[test]
+    fn clicking_a_sidebar_tab_switches_it() {
+        let mut app = app_with_agents(3);
+        app.sidebar_tab_click_map = vec![
+            (crate::tui::app::SidebarLayer::Live, 0, 0, 11),
+            (crate::tui::app::SidebarLayer::Automation, 0, 11, 22),
+            (crate::tui::app::SidebarLayer::Knowledge, 0, 22, 33),
+        ];
+        app.focus = Focus::Agent;
+
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 15, // inside the Automation cell [11, 22)
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        let consumed = handle_sidebar_mouse(&mut app, &mouse);
+
+        assert!(consumed);
+        assert_eq!(app.sidebar_layer, crate::tui::app::SidebarLayer::Automation);
+        assert!(
+            matches!(app.focus, Focus::Preview),
+            "clicking a tab must back out of a deep Focus::Agent view"
+        );
+    }
+
+    #[test]
+    fn clicking_an_empty_sidebar_tab_still_switches_to_it() {
+        // Knowledge has no projects — a keyboard F2 cycle would skip it, but
+        // a deliberate click on its label must still land there so the
+        // empty state ("No registered projects") is reachable.
+        let mut app = app_with_agents(3);
+        app.sidebar_tab_click_map = vec![
+            (crate::tui::app::SidebarLayer::Live, 0, 0, 11),
+            (crate::tui::app::SidebarLayer::Automation, 0, 11, 22),
+            (crate::tui::app::SidebarLayer::Knowledge, 0, 22, 33),
+        ];
+
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 25,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_sidebar_mouse(&mut app, &mouse);
+
+        assert_eq!(app.sidebar_layer, crate::tui::app::SidebarLayer::Knowledge);
     }
 }
 

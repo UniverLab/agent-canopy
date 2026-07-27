@@ -52,15 +52,6 @@ impl App {
         let system_monitor_active = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let system_info_rx = spawn_system_monitor(&system_monitor_active);
         let mission_manager = Self::init_mission_manager(Arc::clone(&db))?;
-        let is_collapsed = |layer| {
-            db.get_state(layer_collapsed_state_key(layer))
-                .ok()
-                .flatten()
-                .is_some_and(|v| v == "1")
-        };
-        let live_collapsed = is_collapsed(SidebarLayer::Live);
-        let automation_collapsed = is_collapsed(SidebarLayer::Automation);
-        let knowledge_collapsed = is_collapsed(SidebarLayer::Knowledge);
 
         let mut app = Self {
             db,
@@ -85,9 +76,6 @@ impl App {
             selected: 0,
             focus: Focus::Home,
             sidebar_layer: SidebarLayer::Live,
-            live_collapsed,
-            automation_collapsed,
-            knowledge_collapsed,
             automation_kind: AutomationKind::Agent,
             project_focus: None,
             selected_project_history: 0,
@@ -116,7 +104,7 @@ impl App {
             project_click_map: Vec::new(),
             project_tab_click_map: Vec::new(),
             project_tab_row_click_map: Vec::new(),
-            layer_header_click_map: Vec::new(),
+            sidebar_tab_click_map: Vec::new(),
             loops: Vec::new(),
             selected_loop_id: None,
             loop_details: None,
@@ -441,14 +429,6 @@ impl App {
     }
 
     fn navigate_live(&mut self, forward: bool) {
-        // The layer may have been collapsed (e.g. a header click) while it
-        // was the active layer with a row selected; treat that exactly like
-        // an empty layer rather than moving the cursor further into a list
-        // that no longer renders.
-        if self.live_collapsed {
-            self.cross_layer(SidebarLayer::Live, forward);
-            return;
-        }
         let indices = self.live_indices();
         if indices.is_empty() {
             self.cross_layer(SidebarLayer::Live, forward);
@@ -476,12 +456,6 @@ impl App {
     /// true end crosses to the next/previous layer (`cross_layer`) instead
     /// of bouncing between the two sub-lists.
     fn navigate_automation(&mut self, forward: bool) {
-        // See the equivalent guard in `navigate_live`: a header click can
-        // collapse the layer we're currently navigating.
-        if self.automation_collapsed {
-            self.cross_layer(SidebarLayer::Automation, forward);
-            return;
-        }
         let agent_indices = self.automation_agent_indices();
         let loop_ids: Vec<String> = self
             .active_loops()
@@ -526,9 +500,7 @@ impl App {
     }
 
     fn navigate_projects_next(&mut self) {
-        // See the equivalent guard in `navigate_live`: a header click can
-        // collapse the layer we're currently navigating.
-        if self.knowledge_collapsed || self.projects.is_empty() {
+        if self.projects.is_empty() {
             self.cross_layer(SidebarLayer::Knowledge, true);
             return;
         }
@@ -542,7 +514,7 @@ impl App {
     }
 
     fn navigate_projects_prev(&mut self) {
-        if self.knowledge_collapsed || self.projects.is_empty() {
+        if self.projects.is_empty() {
             self.cross_layer(SidebarLayer::Knowledge, false);
             return;
         }
@@ -582,46 +554,10 @@ impl App {
         }
     }
 
-    /// Whether `layer`'s body is currently collapsed (nothing rendered below
-    /// its header), mirroring `sidebar::layer_collapsed`.
-    fn layer_is_collapsed(&self, layer: SidebarLayer) -> bool {
-        match layer {
-            SidebarLayer::Live => self.live_collapsed,
-            SidebarLayer::Automation => self.automation_collapsed,
-            SidebarLayer::Knowledge => self.knowledge_collapsed,
-        }
-    }
-
-    /// Whether `layer` has anything to select, ignoring its collapsed state
-    /// — used to tell "collapsed but has rows underneath" (focus the header)
-    /// apart from "collapsed and genuinely empty" (skip it like before).
-    fn layer_has_any_items(&self, layer: SidebarLayer) -> bool {
-        match layer {
-            SidebarLayer::Live => !self.live_indices().is_empty(),
-            SidebarLayer::Automation => {
-                !self.automation_agent_indices().is_empty() || !self.active_loops().is_empty()
-            }
-            SidebarLayer::Knowledge => !self.projects.is_empty(),
-        }
-    }
-
     /// Try focusing the first/last navigable item of `layer`. Returns
     /// `false` (and touches nothing) if `layer` has nothing to select, so
     /// `cross_layer` can keep looking.
-    ///
-    /// A collapsed layer renders no rows below its header, so there is
-    /// nothing to select yet: focus lands on the header (`sidebar_layer`
-    /// switches to it, highlighting it) without disturbing `selected` /
-    /// `selected_loop_id` / `selected_project`, so no cursor is left on an
-    /// invisible row.
     fn enter_layer(&mut self, layer: SidebarLayer, forward: bool) -> bool {
-        if self.layer_is_collapsed(layer) {
-            if self.layer_has_any_items(layer) {
-                self.sidebar_layer = layer;
-                return true;
-            }
-            return false;
-        }
         match layer {
             SidebarLayer::Live => {
                 let indices = self.live_indices();
@@ -1358,8 +1294,8 @@ impl App {
         }
     }
 
-    /// Jump directly to the next sidebar layer (F2 / right-click), skipping
-    /// layers with nothing to select — a keyboard-only shortcut alongside
+    /// Jump directly to the next sidebar tab (F2 / right-click), skipping
+    /// tabs with nothing to select — a keyboard-only shortcut alongside
     /// arrow-key ring navigation.
     pub(crate) fn cycle_sidebar_layer(&mut self) {
         self.agents_rag_focused = false;
@@ -1438,25 +1374,17 @@ impl App {
         }
     }
 
-    /// Toggle a sidebar layer's collapsed state and persist it (see
-    /// `App::new`, which restores it) — functional requirement 1.
-    pub(crate) fn toggle_layer_collapsed(&mut self, layer: SidebarLayer) {
-        let collapsed = match layer {
-            SidebarLayer::Live => {
-                self.live_collapsed = !self.live_collapsed;
-                self.live_collapsed
-            }
-            SidebarLayer::Automation => {
-                self.automation_collapsed = !self.automation_collapsed;
-                self.automation_collapsed
-            }
-            SidebarLayer::Knowledge => {
-                self.knowledge_collapsed = !self.knowledge_collapsed;
-                self.knowledge_collapsed
-            }
-        };
-        let key = layer_collapsed_state_key(layer);
-        let _ = self.db.set_state(key, if collapsed { "1" } else { "0" });
+    /// Mouse click on a sidebar tab label — switches straight to it,
+    /// entering its first item when it has one (consistent with
+    /// `cycle_sidebar_layer`'s keyboard behavior). Unlike the keyboard
+    /// cycle, this also switches into a tab with nothing to select, since a
+    /// deliberate click on a visible tab must always land there — a click on
+    /// `Automation (0)` should show its empty state, not silently no-op.
+    pub(crate) fn switch_sidebar_tab(&mut self, layer: SidebarLayer) {
+        self.agents_rag_focused = false;
+        if !self.enter_layer(layer, true) {
+            self.sidebar_layer = layer;
+        }
     }
 
     pub fn activate_playground(&mut self) {
@@ -3059,16 +2987,6 @@ fn spawn_system_monitor(
     system_info_rx
 }
 
-/// `daemon_state` key under which a sidebar layer's collapsed state
-/// persists across sessions (functional requirement 1).
-fn layer_collapsed_state_key(layer: SidebarLayer) -> &'static str {
-    match layer {
-        SidebarLayer::Live => "sidebar_layer_live_collapsed",
-        SidebarLayer::Automation => "sidebar_layer_automation_collapsed",
-        SidebarLayer::Knowledge => "sidebar_layer_knowledge_collapsed",
-    }
-}
-
 fn load_cli_usage() -> crate::domain::usage_stats::CliUsage {
     let mut usage = dirs::home_dir()
         .map(|h| crate::domain::usage_stats::CliUsage::load(&h.join(".canopy")))
@@ -3639,74 +3557,32 @@ mod tests {
     }
 
     #[test]
-    fn entering_a_collapsed_but_nonempty_layer_focuses_its_header_without_selecting_a_row() {
+    fn switch_sidebar_tab_lands_on_an_empty_tab_instead_of_refusing() {
+        // Unlike `cycle_sidebar_layer` (which skips empty layers so
+        // keyboard cycling never lands somewhere with nothing to select), a
+        // deliberate mouse click on a tab must always switch to it — even
+        // Automation with nothing running, so its empty state is reachable.
         let db = test_db();
         let data_dir = tempdir().expect("create data dir");
         let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        assert_eq!(app.sidebar_layer, SidebarLayer::Live);
 
-        // One background agent — Automation has something to select, but
-        // it's collapsed, so nothing under its header is rendered.
-        app.agents = vec![AgentEntry::Agent(crate::domain::models::Agent {
-            id: "bg-1".to_string(),
-            prompt: String::new(),
-            trigger: None,
-            cli: crate::domain::models::Cli::new("claude"),
-            model: None,
-            working_dir: None,
-            enabled: true,
-            enable_at: None,
-            created_at: chrono::Utc::now(),
-            log_path: "/tmp/bg-collapsed.log".to_string(),
-            timeout_minutes: 15,
-            expires_at: None,
-            last_run_at: None,
-            last_run_ok: None,
-            last_triggered_at: None,
-            trigger_count: 0,
-        })];
-        app.automation_collapsed = true;
-        // A sentinel far outside Automation's single valid index (0): if
-        // `enter_layer` incorrectly selected into the collapsed list, this
-        // would change to 0 instead of staying untouched.
-        app.selected = 999;
+        app.switch_sidebar_tab(SidebarLayer::Automation);
 
-        // Arrow-down from Home: Live is empty so it's skipped, landing on
-        // Automation, which is collapsed but not empty.
-        app.focus_sidebar_from_edge(true);
-
-        assert_eq!(
-            app.sidebar_layer,
-            SidebarLayer::Automation,
-            "focus should land on the collapsed layer's header"
-        );
-        assert_eq!(
-            app.selected, 999,
-            "a collapsed layer must not have a row selected into its invisible list"
-        );
+        assert_eq!(app.sidebar_layer, SidebarLayer::Automation);
     }
 
     #[test]
-    fn entering_a_collapsed_and_genuinely_empty_layer_is_skipped_like_before() {
+    fn switch_sidebar_tab_selects_first_item_when_the_tab_has_content() {
         let db = test_db();
         db.upsert_project(&make_project("hash0", "/tmp/proj0"))
             .unwrap();
-
         let data_dir = tempdir().expect("create data dir");
         let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
-        // No agents and no loops: Automation has nothing to select at all,
-        // collapsed or not, so it must still be skipped in favor of the
-        // next navigable layer (Knowledge, which has our one project) —
-        // exactly like the pre-existing empty-layer behavior.
-        app.automation_collapsed = true;
-        app.selected = 999;
 
-        app.focus_sidebar_from_edge(true);
+        app.switch_sidebar_tab(SidebarLayer::Knowledge);
 
-        assert_eq!(
-            app.sidebar_layer,
-            SidebarLayer::Knowledge,
-            "a collapsed AND empty layer must still be skipped, not focused"
-        );
+        assert_eq!(app.sidebar_layer, SidebarLayer::Knowledge);
         assert_eq!(app.selected_project, 0);
     }
 
