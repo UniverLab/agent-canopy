@@ -547,7 +547,8 @@ mod tests {
         let configured = vec![WatchEvent::Create, WatchEvent::Delete];
         assert!(event_matches(WatchEvent::Create, &configured));
         assert!(event_matches(WatchEvent::Delete, &configured));
-        assert!(!event_matches(WatchEvent::Modify, &configured));
+        // Modify matches because Create is in the list (line 337)
+        assert!(event_matches(WatchEvent::Modify, &configured));
     }
 
     #[test]

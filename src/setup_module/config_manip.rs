@@ -447,7 +447,8 @@ mod tests {
         // Use a simpler case: string with escaped backslash
         let input = r#"{"key": "path\\to\\file"}"#;
         let out = strip_jsonc_comments(input);
-        assert!(out.contains("path\\to\\file"));
+        // handle_string_char preserves \\ as two chars
+        assert!(out.contains("path\\\\to\\\\file"));
     }
 
     #[test]

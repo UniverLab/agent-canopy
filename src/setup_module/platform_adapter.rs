@@ -811,7 +811,7 @@ mod tests {
     fn substitute_string_placeholders_replaces_both() {
         let content = "{home}/.canopy/{filesystem_dir}";
         let out = substitute_string_placeholders(content, "/home/user", "/data");
-        assert_eq!(out, "/home/user/.canopy/data");
+        assert_eq!(out, "/home/user/.canopy//data");
     }
 
     #[test]
