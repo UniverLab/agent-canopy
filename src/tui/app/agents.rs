@@ -1155,4 +1155,66 @@ mod tests {
         assert_eq!(cols, 500);
         assert_eq!(rows, 1000);
     }
+
+    #[test]
+    fn selection_after_mutation_anchor_present_at_same_position() {
+        assert_eq!(selection_after_mutation(&["A", "B", "C"], Some("A"), 0), 0);
+    }
+
+    #[test]
+    fn selection_after_mutation_anchor_at_end() {
+        assert_eq!(selection_after_mutation(&["A", "B", "C"], Some("C"), 0), 2);
+    }
+
+    #[test]
+    fn selection_after_mutation_single_element_no_anchor() {
+        assert_eq!(selection_after_mutation(&["X"], None, 0), 0);
+    }
+
+    #[test]
+    fn strip_ansi_codes_nested_sequences() {
+        assert_eq!(
+            strip_ansi_codes("\x1b[1m\x1b[31mbold red\x1b[0m\x1b[0m"),
+            "bold red"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_codes_color256() {
+        assert_eq!(
+            strip_ansi_codes("\x1b[38;5;42mhello\x1b[0m"),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_codes_rgb_color() {
+        assert_eq!(
+            strip_ansi_codes("\x1b[38;2;255;128;0mcolored\x1b[0m"),
+            "colored"
+        );
+    }
+
+    #[test]
+    fn brain_needs_reinit_none_vs_none() {
+        assert!(brain_needs_reinit(&None, 5, 5));
+    }
+
+    #[test]
+    fn brain_needs_reinit_exact_match_no_reinit() {
+        let brain = make_brain(15, 25, 10);
+        assert!(!brain_needs_reinit(&Some(brain), 15, 25));
+    }
+
+    #[test]
+    fn effective_brain_dims_width_exactly_minimum() {
+        let (cols, _rows) = effective_brain_dims((6, 100));
+        assert_eq!(cols, 6);
+    }
+
+    #[test]
+    fn effective_brain_dims_height_exactly_minimum() {
+        let (_cols, rows) = effective_brain_dims((100, 3));
+        assert_eq!(rows, 3);
+    }
 }

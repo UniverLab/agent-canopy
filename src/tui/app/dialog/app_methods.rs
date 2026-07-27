@@ -1477,4 +1477,121 @@ mod tests {
         app.open_edit_dialog();
         assert!(app.new_agent_dialog.is_none());
     }
+
+    // ── push_intents / push_chatter ─────────────────────────────
+
+    #[test]
+    fn push_intents_empty_does_not_add_header() {
+        let mut lines = Vec::new();
+        App::push_intents(&mut lines, &[]);
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn push_intents_adds_header_and_items() {
+        use crate::domain::sync::{ActiveIntent, MissionImpact, WorkspaceStatus};
+        let mut lines = Vec::new();
+        let intents = vec![ActiveIntent {
+            agent_id: "agent-a-id".to_string(),
+            agent_name: "agent-a".to_string(),
+            impact: MissionImpact::High,
+            mission: "deploy".to_string(),
+            description: "ship it".to_string(),
+            status: WorkspaceStatus::Stable,
+            since: Utc::now().timestamp(),
+        }];
+        App::push_intents(&mut lines, &intents);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "active missions:");
+        assert!(lines[1].contains("agent-a"));
+        assert!(lines[1].contains("deploy"));
+    }
+
+    #[test]
+    fn push_chatter_empty_does_not_add_header() {
+        let mut lines = Vec::new();
+        App::push_chatter(&mut lines, &[]);
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn push_chatter_adds_header_and_items() {
+        use crate::domain::sync::SyncMessage;
+        let mut lines = Vec::new();
+        let messages = vec![SyncMessage {
+            id: 1,
+            workdir: "/tmp".to_string(),
+            agent_id: "agent-b-id".to_string(),
+            agent_name: "agent-b".to_string(),
+            kind: crate::domain::sync::MessageKind::Info,
+            message: "hello".to_string(),
+            payload: None,
+            created_at: Utc::now().timestamp(),
+        }];
+        App::push_chatter(&mut lines, &messages);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "recent messages:");
+        assert!(lines[1].contains("agent-b"));
+        assert!(lines[1].contains("hello"));
+    }
+
+    // ── update_prompt_config ────────────────────────────────────
+
+    #[test]
+    fn update_prompt_config_on_object() {
+        let config = serde_json::json!({"prompt_template": "old", "key": "val"});
+        let result = App::update_prompt_config(&config, "new prompt");
+        assert_eq!(
+            result.get("prompt_template").and_then(|v| v.as_str()),
+            Some("new prompt")
+        );
+        assert_eq!(result.get("key").and_then(|v| v.as_str()), Some("val"));
+    }
+
+    #[test]
+    fn update_prompt_config_on_non_object() {
+        let config = serde_json::json!("just a string");
+        let result = App::update_prompt_config(&config, "prompt");
+        assert_eq!(
+            result.get("prompt_template").and_then(|v| v.as_str()),
+            Some("prompt")
+        );
+    }
+
+    #[test]
+    fn update_prompt_config_empty_object() {
+        let config = serde_json::json!({});
+        let result = App::update_prompt_config(&config, "p");
+        assert_eq!(
+            result.get("prompt_template").and_then(|v| v.as_str()),
+            Some("p")
+        );
+    }
+
+    // ── build_system_context_parts ──────────────────────────────
+
+    #[test]
+    fn build_system_context_parts_fallback_when_no_activity() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        let (workdir, intents, chatter) = app.build_system_context_parts();
+        assert!(!workdir.is_empty());
+        assert!(intents.is_empty());
+        assert!(chatter.is_empty());
+    }
+
+    // ── populate_dialog_from_agent: cli not in available list ───
+
+    #[test]
+    fn populate_dialog_from_agent_cli_not_in_list() {
+        let mut agent = cron_agent("cron-x");
+        agent.cli = Cli::new("unknown-cli");
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.available_clis = vec![Cli::new("opencode"), Cli::new("claude")];
+        dialog.cli_configs = vec![None, None];
+        populate_dialog_from_agent(&mut dialog, &agent);
+        // cli_index stays at 0 (default) since unknown-cli is not in available_clis
+        assert_eq!(dialog.cli_index, 0);
+    }
 }

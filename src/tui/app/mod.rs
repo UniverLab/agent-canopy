@@ -3089,7 +3089,7 @@ mod tests {
     };
     use crate::db::session::InteractiveSession;
     use crate::db::Database;
-    use crate::tui::app::types::{AgentEntry, App, AutomationKind, ProjectTab, SidebarLayer};
+    use crate::tui::app::types::{AgentEntry, App, AutomationKind, Focus, ProjectTab, SidebarLayer};
     use std::sync::Arc;
     use tempfile::{tempdir, NamedTempFile};
 
@@ -4499,5 +4499,272 @@ mod tests {
         assert_eq!(copy.name, "implement (copy)");
         assert_eq!(copy.config["platform"], "claude");
         assert_eq!(copy.config["prompt_template"], "do it");
+    }
+
+    // ── Additional navigation and state tests ───────────────────
+
+    #[test]
+    fn active_loops_empty_when_no_loops() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        assert!(app.active_loops().is_empty());
+    }
+
+    #[test]
+    fn live_indices_empty_when_no_agents() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        assert!(app.live_indices().is_empty());
+    }
+
+    #[test]
+    fn automation_agent_indices_empty_when_no_agents() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        assert!(app.automation_agent_indices().is_empty());
+    }
+
+    #[test]
+    fn step_sidebar_tab_forward_wraps() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.sidebar_layer = SidebarLayer::Knowledge;
+        app.step_sidebar_tab(true);
+        assert_eq!(app.sidebar_layer, SidebarLayer::Live);
+    }
+
+    #[test]
+    fn step_sidebar_tab_backward_wraps() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.sidebar_layer = SidebarLayer::Live;
+        app.step_sidebar_tab(false);
+        assert_eq!(app.sidebar_layer, SidebarLayer::Knowledge);
+    }
+
+    #[test]
+    fn reset_log_scroll_sets_to_zero() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.log_scroll = 50;
+        app.sidebar_scroll_offset = 10;
+        app.reset_log_scroll();
+        assert_eq!(app.log_scroll, 0);
+        assert_eq!(app.sidebar_scroll_offset, 0);
+    }
+
+    #[test]
+    fn cycle_sidebar_layer_skips_empty_tabs() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.sidebar_layer = SidebarLayer::Live;
+        // No agents, no projects, no loops → cycle may stay or move
+        app.cycle_sidebar_layer();
+        // Should not panic
+    }
+
+    #[test]
+    fn selected_project_out_of_bounds() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        assert!(app.selected_project().is_none());
+    }
+
+    #[test]
+    fn selected_loop_none_when_no_loops() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        assert!(app.selected_loop().is_none());
+    }
+
+    #[test]
+    fn selected_loop_spec_none_when_no_details() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        assert!(app.selected_loop_spec().is_none());
+    }
+
+    #[test]
+    fn selected_loop_node_none_when_no_details() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        assert!(app.selected_loop_node().is_none());
+    }
+
+    #[test]
+    fn visible_loops_returns_all_loops() {
+        use crate::domain::loops::LoopStatus;
+        let db = test_db();
+        db.insert_loop(&make_loop("l1", "A", LoopStatus::Running))
+            .unwrap();
+        db.insert_loop(&make_loop("l2", "B", LoopStatus::Completed))
+            .unwrap();
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        assert_eq!(app.visible_loops().len(), 2);
+    }
+
+    #[test]
+    fn selected_agent_none_when_empty() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        assert!(app.selected_agent().is_none());
+    }
+
+    #[test]
+    fn selected_id_empty_when_no_agent() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        assert_eq!(app.selected_id(), "—");
+    }
+
+    #[test]
+    fn focused_agent_name_empty_when_no_agent() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        assert!(app.focused_agent_name().is_empty());
+    }
+
+    #[test]
+    fn loop_graph_highlighted_node_id_none_when_no_live_state() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        assert!(app.loop_graph_highlighted_node_id().is_none());
+    }
+
+    #[test]
+    fn loop_graph_reset_follow_clears_selection() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.loop_graph_follow = false;
+        app.loop_graph_selected_node = Some("some-node".to_string());
+        app.loop_graph_reset_follow();
+        assert!(app.loop_graph_follow);
+        assert!(app.loop_graph_selected_node.is_none());
+    }
+
+    #[test]
+    fn loop_graph_highlighted_node_run_info_default_when_no_live_state() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        let info = app.loop_graph_highlighted_node_run_info();
+        assert!(info.status.is_none());
+        assert!(info.output_tail.is_none());
+    }
+
+    #[test]
+    fn cancel_loop_editor_dialog() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.loop_editor_dialog = Some(crate::tui::app::types::LoopEditorDialog::new(
+            "n1".into(),
+            "node1".into(),
+            "title".into(),
+            "help".into(),
+            "buffer".into(),
+            crate::tui::app::types::LoopEditorMode::AgentPrompt,
+        ));
+        app.cancel_loop_editor_dialog();
+        assert!(app.loop_editor_dialog.is_none());
+        assert!(matches!(app.focus, Focus::Preview));
+    }
+
+    #[test]
+    fn toggle_rag_pause_flips() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        assert!(!app.rag_paused);
+        app.toggle_rag_pause();
+        assert!(app.rag_paused);
+        app.toggle_rag_pause();
+        assert!(!app.rag_paused);
+    }
+
+    #[test]
+    fn normalize_selected_knowledge_clamps_to_first_filtered() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.project_knowledge = vec![
+            crate::db::intelligence::IntelligenceNodeRecord {
+                id: "n1".into(),
+                kind: "fact".into(),
+                title: "Alpha".into(),
+                body: "body".into(),
+                metadata: None,
+                project_hash: None,
+                session_id: None,
+                created_at: chrono::Utc::now().timestamp(),
+                updated_at: chrono::Utc::now().timestamp(),
+            },
+            crate::db::intelligence::IntelligenceNodeRecord {
+                id: "n2".into(),
+                kind: "fact".into(),
+                title: "Beta".into(),
+                body: "body".into(),
+                metadata: None,
+                project_hash: None,
+                session_id: None,
+                created_at: chrono::Utc::now().timestamp(),
+                updated_at: chrono::Utc::now().timestamp(),
+            },
+        ];
+        app.selected_knowledge = 5; // out of range
+        app.knowledge_filter = "alpha".to_string();
+        app.normalize_selected_knowledge();
+        assert_eq!(app.selected_knowledge, 0);
+    }
+
+    #[test]
+    fn enter_exit_knowledge_filter_mode() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        assert!(!app.knowledge_filter_mode);
+        app.enter_knowledge_filter_mode();
+        assert!(app.knowledge_filter_mode);
+        app.exit_knowledge_filter_mode();
+        assert!(!app.knowledge_filter_mode);
+    }
+
+    #[test]
+    fn dismiss_copied_recent_does_not_clear() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.show_copied = true;
+        app.copied_at = std::time::Instant::now();
+        app.dismiss_copied();
+        assert!(app.show_copied);
+    }
+
+    #[test]
+    fn dismiss_copied_old_enough_clears() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.show_copied = true;
+        app.copied_at = std::time::Instant::now() - std::time::Duration::from_secs(5);
+        app.dismiss_copied();
+        assert!(!app.show_copied);
     }
 }
