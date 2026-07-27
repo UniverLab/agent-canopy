@@ -138,8 +138,11 @@ pub fn run_setup(force_skills: bool) -> Result<()> {
 
         // ── Download / warm-up the model ──────────────────────────
         wiz.render()?;
-        let model_cache_dir = canopy_dir.join("models");
-        download_local_model_for_setup(&embeddings_model, &model_cache_dir)?;
+        #[cfg(feature = "local-embeddings")]
+        {
+            let model_cache_dir = canopy_dir.join("models");
+            download_local_model_for_setup(&embeddings_model, &model_cache_dir)?;
+        }
         wiz.add(format!(
             "\x1b[32m✓\x1b[0m Model ready: {}",
             embeddings_model
@@ -407,6 +410,7 @@ fn select_local_embeddings_model(current: &str) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("Unknown embeddings model selection"))
 }
 
+#[cfg(feature = "local-embeddings")]
 fn download_local_model_for_setup(model_id: &str, cache_dir: &std::path::Path) -> Result<()> {
     println!("  \x1b[90mDownloading model to ~/.canopy/models/ (only needed once)…\x1b[0m");
     println!();

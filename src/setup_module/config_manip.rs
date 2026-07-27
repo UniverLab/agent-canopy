@@ -596,7 +596,7 @@ mod tests {
         let mut out = String::new();
         let mut result = true;
         while result {
-            if let Some(&ch) = chars.peek() {
+            if let Some(ch) = chars.next() {
                 result = handle_string_char(ch, &mut chars, &mut out);
             } else {
                 break;

@@ -22,12 +22,17 @@ pub fn client_from_config(config: &CanopyConfig) -> Result<Box<dyn EmbeddingClie
     match provider_for_model(model) {
         Some(EmbeddingProvider::OpenAi) => Ok(Box::new(OpenAIEmbeddingClient::from_env(model)?)),
         Some(EmbeddingProvider::Gemini) => Ok(Box::new(GeminiEmbeddingClient::from_env(model)?)),
+        #[cfg(feature = "local-embeddings")]
         Some(EmbeddingProvider::Local) => {
             let cache_dir = dirs::home_dir()
                 .ok_or_else(|| anyhow!("No home directory found"))?
                 .join(".canopy")
                 .join("models");
             Ok(Box::new(LocalEmbeddingClient::new(model, &cache_dir)?))
+        }
+        #[cfg(not(feature = "local-embeddings"))]
+        Some(EmbeddingProvider::Local) => {
+            bail!("Local embeddings require the 'local-embeddings' feature")
         }
         None => bail!("Unsupported embeddings model: {model}"),
     }
@@ -255,6 +260,7 @@ impl EmbeddingClient for GeminiEmbeddingClient {
 ///
 /// The model file is downloaded from HuggingFace on first use and cached in
 /// `~/.canopy/models/`. No API key is required.
+#[cfg(feature = "local-embeddings")]
 pub struct LocalEmbeddingClient {
     // fastembed::TextEmbedding is Send but not Sync; wrapping in Mutex makes
     // the struct Sync so it satisfies the EmbeddingClient bound.
@@ -262,6 +268,7 @@ pub struct LocalEmbeddingClient {
     dimensions: usize,
 }
 
+#[cfg(feature = "local-embeddings")]
 impl LocalEmbeddingClient {
     pub fn new(model_id: &str, cache_dir: &std::path::Path) -> Result<Self> {
         std::fs::create_dir_all(cache_dir)
@@ -288,6 +295,7 @@ impl LocalEmbeddingClient {
     }
 }
 
+#[cfg(feature = "local-embeddings")]
 impl EmbeddingClient for LocalEmbeddingClient {
     fn embed(&self, text: &str) -> Result<Vec<f32>> {
         let mut model = self
@@ -312,6 +320,7 @@ impl EmbeddingClient for LocalEmbeddingClient {
 
 /// Download (or verify) a local embedding model, showing download progress.
 /// Called during interactive setup so the model is ready before indexing begins.
+#[cfg(feature = "local-embeddings")]
 pub fn download_local_model(model_id: &str, cache_dir: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(cache_dir)
         .with_context(|| format!("Cannot create model cache dir: {}", cache_dir.display()))?;
@@ -325,6 +334,7 @@ pub fn download_local_model(model_id: &str, cache_dir: &std::path::Path) -> Resu
     Ok(())
 }
 
+#[cfg(feature = "local-embeddings")]
 fn model_id_to_fastembed(model_id: &str) -> Result<fastembed::EmbeddingModel> {
     match model_id.trim().to_ascii_lowercase().as_str() {
         "baai/bge-small-en-v1.5" => Ok(fastembed::EmbeddingModel::BGESmallENV15),

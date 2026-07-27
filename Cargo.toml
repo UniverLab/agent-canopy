@@ -121,7 +121,7 @@ futures = "0.3"
 pdf-extract = "0.10.0"
 
 # Local embedding models via ONNX Runtime (no API key required)
-fastembed = "5"
+fastembed = { version = "5", optional = true }
 
 # Unix process management (kill, setsid)
 [target.'cfg(unix)'.dependencies]
@@ -133,6 +133,7 @@ tempfile = "3.8"
 
 [features]
 default = []
+local-embeddings = ["dep:fastembed"]
 
 [lints.clippy]
 # Production quality lints
