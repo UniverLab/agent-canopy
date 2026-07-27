@@ -1299,19 +1299,46 @@ impl App {
     /// arrow-key ring navigation.
     pub(crate) fn cycle_sidebar_layer(&mut self) {
         self.agents_rag_focused = false;
-        let start = self.sidebar_layer;
-        let ring = [
-            SidebarLayer::Live,
-            SidebarLayer::Automation,
-            SidebarLayer::Knowledge,
-        ];
-        let start_idx = ring.iter().position(|&l| l == start).unwrap_or(0);
+        let ring = Self::SIDEBAR_TAB_RING;
+        let start_idx = Self::sidebar_tab_index(self.sidebar_layer);
         for step in 1..=ring.len() {
             let layer = ring[(start_idx + step) % ring.len()];
             if self.enter_layer(layer, true) {
                 return;
             }
         }
+    }
+
+    /// Left-to-right order of the sidebar tab strip. Mirrors `SIDEBAR_TABS`
+    /// in the renderer, which is what Shift+←/→ has to agree with for the
+    /// arrows to move the way the strip looks.
+    const SIDEBAR_TAB_RING: [SidebarLayer; 3] = [
+        SidebarLayer::Live,
+        SidebarLayer::Automation,
+        SidebarLayer::Knowledge,
+    ];
+
+    fn sidebar_tab_index(layer: SidebarLayer) -> usize {
+        Self::SIDEBAR_TAB_RING
+            .iter()
+            .position(|&l| l == layer)
+            .unwrap_or(0)
+    }
+
+    /// Shift+←/→ — move exactly one tab in `forward`'s direction, wrapping
+    /// at the ends. Deliberately does NOT skip empty tabs the way F2 does:
+    /// a directional key that silently jumps two cells because the one in
+    /// between was empty reads as a bug, and the empty tab's own state is
+    /// worth seeing.
+    pub(crate) fn step_sidebar_tab(&mut self, forward: bool) {
+        let ring = Self::SIDEBAR_TAB_RING;
+        let idx = Self::sidebar_tab_index(self.sidebar_layer);
+        let next = if forward {
+            (idx + 1) % ring.len()
+        } else {
+            idx.checked_sub(1).unwrap_or(ring.len() - 1)
+        };
+        self.switch_sidebar_tab(ring[next]);
     }
 
     /// Enter a highlighted project's Focus tab bar (functional requirement
@@ -1379,7 +1406,7 @@ impl App {
     /// `cycle_sidebar_layer`'s keyboard behavior). Unlike the keyboard
     /// cycle, this also switches into a tab with nothing to select, since a
     /// deliberate click on a visible tab must always land there — a click on
-    /// `Automation (0)` should show its empty state, not silently no-op.
+    /// an empty Automation should show its empty state, not silently no-op.
     pub(crate) fn switch_sidebar_tab(&mut self, layer: SidebarLayer) {
         self.agents_rag_focused = false;
         if !self.enter_layer(layer, true) {

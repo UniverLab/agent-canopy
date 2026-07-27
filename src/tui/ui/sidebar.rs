@@ -246,20 +246,6 @@ fn layer_label(layer: SidebarLayer) -> &'static str {
     }
 }
 
-fn layer_count(app: &App, layer: SidebarLayer) -> usize {
-    match layer {
-        SidebarLayer::Live => {
-            let (_, interactive, terminal) = agent_indices_by_kind(app);
-            interactive.len() + terminal.len() + app.split_groups.len()
-        }
-        SidebarLayer::Automation => {
-            let (background, _, _) = agent_indices_by_kind(app);
-            background.len() + app.active_loops().len()
-        }
-        SidebarLayer::Knowledge => app.projects.len(),
-    }
-}
-
 fn layer_focused(app: &App, layer: SidebarLayer) -> bool {
     matches!(app.focus, Focus::Home | Focus::Preview)
         && !app.playground_active
@@ -273,17 +259,15 @@ const SIDEBAR_TABS: [SidebarLayer; 3] = [
     SidebarLayer::Knowledge,
 ];
 
-/// Fits `"{label} ({count})"` into `width` columns, shortening the label
-/// first. The count is the signal worth glancing at across a tab switch, so
-/// it's the last thing to give up space — a cramped column reads
-/// `"Automa… (12)"` rather than losing the number entirely.
-fn tab_cell_text(label: &str, count: usize, width: usize) -> String {
-    let suffix = format!(" ({count})");
-    let suffix_len = suffix.chars().count();
-    if width <= suffix_len {
-        return truncate_str(suffix.trim_start(), width);
-    }
-    format!("{}{suffix}", truncate_str(label, width - suffix_len))
+/// Centers `label` in `width` columns, truncating it if the cell is too
+/// narrow. Tabs carry the label alone: at the real `SIDEBAR_WIDTH` each cell
+/// is 11 columns, which fits every full word only once the item count is
+/// gone — and a count that forces `"Automa… (12)"` costs more legibility
+/// than it buys, since the tab's own body shows the items anyway.
+fn tab_cell_text(label: &str, width: usize) -> String {
+    let text = truncate_str(label, width);
+    let pad = width.saturating_sub(text.chars().count()) / 2;
+    format!("{}{text}", " ".repeat(pad))
 }
 
 /// Draws the sidebar's `Live / Automation / Knowledge` tab strip: one cell
@@ -310,7 +294,7 @@ fn draw_sidebar_tab_bar(frame: &mut Frame, area: Rect, app: &mut App, theme: &Th
         }
 
         let active = app.sidebar_layer == layer;
-        let text = tab_cell_text(layer_label(layer), layer_count(app, layer), width as usize);
+        let text = tab_cell_text(layer_label(layer), width as usize);
         let (fg, bg) = if active {
             (Color::Black, theme.header_color)
         } else {
@@ -1804,16 +1788,32 @@ mod tests {
     }
 
     #[test]
-    fn layer_headers_render_with_counts() {
+    fn tab_bar_renders_every_layer_label() {
         // Wide enough that no tab cell needs to shorten its label to fit
         // (see `tab_cell_text`'s own narrow-width tests below).
         let text = render_sidebar_text(2, 45, 40);
         assert!(text.contains("Live"), "expected Live tab label");
         assert!(text.contains("Automation"), "expected Automation tab label");
+        assert!(text.contains("Knowledge"), "expected Knowledge tab label");
         assert!(
-            text.contains("Knowledge (2)"),
-            "expected Knowledge tab label with count"
+            !text.contains("Knowledge (2)"),
+            "tabs carry the label alone, no item count: {text}"
         );
+    }
+
+    #[test]
+    fn every_tab_label_fits_uncut_at_the_real_sidebar_width() {
+        // The reason the count is gone: 33 columns / 3 tabs leaves 11 per
+        // cell, which fits "Automation" and "Knowledge" but not either of
+        // them followed by a count.
+        let cell = super::super::SIDEBAR_WIDTH as usize / SIDEBAR_TABS.len();
+        for layer in SIDEBAR_TABS {
+            let label = layer_label(layer);
+            assert!(
+                !tab_cell_text(label, cell).contains('…'),
+                "{label} must not be truncated at {cell} columns"
+            );
+        }
     }
 
     #[test]
@@ -2120,25 +2120,22 @@ mod tests {
     }
 
     #[test]
-    fn tab_cell_text_fits_without_truncation_when_there_is_room() {
-        assert_eq!(tab_cell_text("Automation", 3, 20), "Automation (3)");
+    fn tab_cell_text_centers_the_label_when_there_is_room() {
+        // 20 columns, 10-char label → 5 columns of padding each side, but
+        // only the leading half is materialized (the cell's own background
+        // covers the trailing half).
+        assert_eq!(tab_cell_text("Automation", 20), "     Automation");
     }
 
     #[test]
-    fn tab_cell_text_shortens_the_label_but_keeps_the_count() {
-        // "Automation (12)" is 15 chars; at width 11 the label must give up
-        // space first so " (12)" always survives intact.
-        let text = tab_cell_text("Automation", 12, 11);
-        assert_eq!(text.chars().count(), 11);
-        assert!(
-            text.ends_with(" (12)"),
-            "count must survive truncation: {text:?}"
-        );
+    fn tab_cell_text_truncates_a_label_too_wide_for_its_cell() {
+        let text = tab_cell_text("Automation", 6);
+        assert_eq!(text, "Autom…");
     }
 
     #[test]
     fn tab_cell_text_extreme_narrow_width_still_fits_exactly() {
-        let text = tab_cell_text("Knowledge", 2, 3);
+        let text = tab_cell_text("Knowledge", 3);
         assert_eq!(text.chars().count(), 3);
     }
 

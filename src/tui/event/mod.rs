@@ -182,6 +182,20 @@ fn handle_global_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> b
         return true;
     }
 
+    // Shift+←/→ walks the sidebar tab strip. Scoped to Home/Preview on
+    // purpose: plain ←/→ already means "collapse/expand loop" there and
+    // "move split focus" inside Focus::Agent, so claiming the shifted pair
+    // globally would shadow a binding the agent view owns.
+    if matches!(code, KeyCode::Left | KeyCode::Right)
+        && modifiers.contains(KeyModifiers::SHIFT)
+        && matches!(app.focus, Focus::Home | Focus::Preview)
+        && !app.playground_active
+        && app.project_focus.is_none()
+    {
+        app.step_sidebar_tab(code == KeyCode::Right);
+        return true;
+    }
+
     if code == KeyCode::F(3) {
         app.toggle_activity_panel();
         return true;
@@ -1246,6 +1260,78 @@ mod sidebar_mouse_tests {
             crate::tui::app::SidebarLayer::Live,
             "the ring wraps back to Live"
         );
+    }
+
+    #[test]
+    fn shift_arrows_step_one_sidebar_tab_each_way_and_wrap() {
+        let mut app = app_with_agents(3);
+        app.focus = Focus::Home;
+        assert_eq!(app.sidebar_layer, crate::tui::app::SidebarLayer::Live);
+
+        assert!(handle_global_key(
+            &mut app,
+            KeyCode::Right,
+            KeyModifiers::SHIFT
+        ));
+        assert_eq!(app.sidebar_layer, crate::tui::app::SidebarLayer::Automation);
+
+        // Knowledge is empty here — unlike F2, the arrow still lands on it.
+        assert!(handle_global_key(
+            &mut app,
+            KeyCode::Right,
+            KeyModifiers::SHIFT
+        ));
+        assert_eq!(app.sidebar_layer, crate::tui::app::SidebarLayer::Knowledge);
+
+        assert!(handle_global_key(
+            &mut app,
+            KeyCode::Right,
+            KeyModifiers::SHIFT
+        ));
+        assert_eq!(
+            app.sidebar_layer,
+            crate::tui::app::SidebarLayer::Live,
+            "stepping right off the end wraps to the first tab"
+        );
+
+        assert!(handle_global_key(
+            &mut app,
+            KeyCode::Left,
+            KeyModifiers::SHIFT
+        ));
+        assert_eq!(
+            app.sidebar_layer,
+            crate::tui::app::SidebarLayer::Knowledge,
+            "stepping left off the start wraps to the last tab"
+        );
+    }
+
+    #[test]
+    fn unshifted_arrows_do_not_switch_sidebar_tabs() {
+        // Plain ←/→ belongs to the loop expand/collapse handler; only the
+        // shifted pair is ours.
+        let mut app = app_with_agents(3);
+        app.focus = Focus::Home;
+        assert!(!handle_global_key(
+            &mut app,
+            KeyCode::Right,
+            KeyModifiers::NONE
+        ));
+        assert_eq!(app.sidebar_layer, crate::tui::app::SidebarLayer::Live);
+    }
+
+    #[test]
+    fn shift_arrows_are_not_claimed_inside_a_focused_agent() {
+        // Focus::Agent gives ←/→ to the split-pane focus handler; stealing
+        // the shifted pair globally would shadow it.
+        let mut app = app_with_agents(3);
+        app.focus = Focus::Agent;
+        assert!(!handle_global_key(
+            &mut app,
+            KeyCode::Right,
+            KeyModifiers::SHIFT
+        ));
+        assert_eq!(app.sidebar_layer, crate::tui::app::SidebarLayer::Live);
     }
 
     #[test]
