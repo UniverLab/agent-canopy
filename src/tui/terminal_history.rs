@@ -825,4 +825,233 @@ mod tests {
         hist.update_scrollback(&scrollback);
         assert!(hist.scrollback.len() <= MAX_SCROLLBACK_LINES);
     }
+
+    // ── Additional edge cases ────────────────────────────────────
+
+    #[test]
+    fn record_same_cmd_different_cwd_creates_separate_entries() {
+        let mut hist = SessionHistory::default();
+        hist.record("ls", "/home/user/a");
+        hist.record("ls", "/home/user/b");
+        assert_eq!(hist.commands.len(), 2);
+    }
+
+    #[test]
+    fn filter_exact_match() {
+        let mut hist = SessionHistory::default();
+        hist.record("cargo", "/tmp");
+        let matches = hist.filter("cargo");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].cmd, "cargo");
+    }
+
+    #[test]
+    fn filter_no_prefix_match() {
+        let mut hist = SessionHistory::default();
+        hist.record("cargo build", "/tmp");
+        let matches = hist.filter("build");
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn filter_multiple_matches_sorted_by_count() {
+        let mut hist = SessionHistory::default();
+        hist.record("git status", "/tmp");
+        hist.record("git push", "/tmp");
+        hist.record("git push", "/tmp");
+        let matches = hist.filter("git");
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].cmd, "git push");
+        assert_eq!(matches[0].count, 2);
+    }
+
+    #[test]
+    fn ghost_suggestion_longer_prefix() {
+        let mut hist = SessionHistory::default();
+        hist.record("cargo build --release", "/p");
+        hist.record("cargo build", "/p");
+        let suggestion = hist.ghost_suggestion("cargo build");
+        assert_eq!(suggestion, Some("cargo build --release"));
+    }
+
+    #[test]
+    fn known_directories_deduplicates_same_dir() {
+        let mut hist = SessionHistory::default();
+        hist.record("ls", "/tmp");
+        hist.record("pwd", "/tmp");
+        hist.record("echo", "/tmp");
+        let dirs = hist.known_directories();
+        assert_eq!(dirs.len(), 1);
+        assert_eq!(dirs[0], "/tmp");
+    }
+
+    #[test]
+    fn known_directories_sorted_by_count() {
+        let mut hist = SessionHistory::default();
+        hist.record("a", "/dir_a");
+        hist.record("b", "/dir_b");
+        hist.record("c", "/dir_b");
+        let dirs = hist.known_directories();
+        assert_eq!(dirs[0], "/dir_b");
+        assert_eq!(dirs[1], "/dir_a");
+    }
+
+    #[test]
+    fn picker_move_up_stays_at_top() {
+        let mut hist = SessionHistory::default();
+        hist.record("cargo build", "/tmp");
+        let mut picker = SuggestionPicker::from_history("cargo", &hist, "/tmp");
+        picker.move_up();
+        picker.move_up();
+        assert_eq!(picker.selected, 0);
+    }
+
+    #[test]
+    fn picker_move_down_stays_at_bottom() {
+        let mut hist = SessionHistory::default();
+        hist.record("cargo build", "/tmp");
+        let mut picker = SuggestionPicker::from_history("cargo", &hist, "/tmp");
+        picker.move_down();
+        picker.move_down();
+        assert_eq!(picker.selected, 0);
+    }
+
+    #[test]
+    fn picker_apply_filter() {
+        let mut hist = SessionHistory::default();
+        hist.record("cargo build", "/tmp");
+        hist.record("cargo test", "/tmp");
+        hist.record("git push", "/tmp");
+        let mut picker = SuggestionPicker::from_history("", &hist, "/tmp");
+        assert_eq!(picker.items.len(), 3);
+        picker.apply_filter("cargo");
+        assert_eq!(picker.items.len(), 2);
+    }
+
+    #[test]
+    fn picker_visible_items() {
+        let mut hist = SessionHistory::default();
+        for i in 0..20 {
+            hist.record(&format!("cmd-{i}"), "/tmp");
+        }
+        let picker = SuggestionPicker::from_history("cmd", &hist, "/tmp");
+        assert_eq!(picker.visible_items().len(), SuggestionPicker::MAX_VISIBLE);
+    }
+
+    #[test]
+    fn picker_visible_count() {
+        let mut hist = SessionHistory::default();
+        hist.record("cargo build", "/tmp");
+        let picker = SuggestionPicker::from_history("cargo", &hist, "/tmp");
+        assert_eq!(picker.visible_count(), 1);
+    }
+
+    #[test]
+    fn picker_selected_text() {
+        let mut hist = SessionHistory::default();
+        hist.record("cargo build", "/tmp");
+        let picker = SuggestionPicker::from_history("cargo", &hist, "/tmp");
+        assert_eq!(picker.selected_text(), Some("cargo build"));
+    }
+
+    #[test]
+    fn picker_empty_items_selected_text() {
+        let hist = SessionHistory::default();
+        let picker = SuggestionPicker::from_history("xyz", &hist, "/tmp");
+        assert!(picker.selected_text().is_none());
+    }
+
+    #[test]
+    fn picker_from_history_cwd_abbreviation() {
+        let mut hist = SessionHistory::default();
+        hist.record("ls", "/home/user/project");
+        let picker = SuggestionPicker::from_history("ls", &hist, "/home/user/project");
+        // CWD matches, so abbreviation should be "."
+        assert!(picker.items[0].label.contains("."));
+    }
+
+    #[test]
+    fn picker_from_history_different_cwd_shows_path() {
+        let mut hist = SessionHistory::default();
+        hist.record("ls", "/home/user/project");
+        let picker = SuggestionPicker::from_history("ls", &hist, "/tmp");
+        // CWD differs, so abbreviation should show the path
+        assert!(!picker.items[0].label.contains("cwd:."));
+    }
+
+    #[test]
+    fn merge_history_entry_takes_newer_last_run() {
+        let mut merged = SessionHistory::default();
+        let old_entry = CommandEntry {
+            cmd: "ls".to_string(),
+            cwd: "/tmp".to_string(),
+            last_run: chrono::Utc::now() - chrono::Duration::hours(1),
+            count: 1,
+        };
+        let new_entry = CommandEntry {
+            cmd: "ls".to_string(),
+            cwd: "/tmp".to_string(),
+            last_run: chrono::Utc::now(),
+            count: 2,
+        };
+        merge_history_entry(&mut merged, old_entry);
+        merge_history_entry(&mut merged, new_entry);
+        assert_eq!(merged.commands.len(), 1);
+        assert_eq!(merged.commands[0].count, 3);
+    }
+
+    #[test]
+    fn merge_history_entry_different_cwd() {
+        let mut merged = SessionHistory::default();
+        let entry1 = CommandEntry {
+            cmd: "ls".to_string(),
+            cwd: "/a".to_string(),
+            last_run: chrono::Utc::now(),
+            count: 1,
+        };
+        let entry2 = CommandEntry {
+            cmd: "ls".to_string(),
+            cwd: "/b".to_string(),
+            last_run: chrono::Utc::now(),
+            count: 2,
+        };
+        merge_history_entry(&mut merged, entry1);
+        merge_history_entry(&mut merged, entry2);
+        assert_eq!(merged.commands.len(), 2);
+    }
+
+    #[test]
+    fn filter_empty_string_matches_all() {
+        let mut hist = SessionHistory::default();
+        hist.record("cargo build", "/tmp");
+        hist.record("git push", "/tmp");
+        let matches = hist.filter("");
+        assert_eq!(matches.len(), 2);
+    }
+
+    #[test]
+    fn enforce_limit_reduces_to_max() {
+        let mut hist = SessionHistory::default();
+        for i in 0..600 {
+            hist.record(&format!("cmd-{i}"), "/tmp");
+        }
+        assert_eq!(hist.commands.len(), MAX_ENTRIES);
+    }
+
+    #[test]
+    fn scrollback_enforce_limit() {
+        let mut hist = SessionHistory::default();
+        for _ in 0..3000 {
+            hist.scrollback.push("line".to_string());
+        }
+        hist.enforce_limit();
+        assert!(hist.scrollback.len() <= MAX_SCROLLBACK_LINES);
+    }
+
+    #[test]
+    fn record_whitespace_only_ignored() {
+        let mut hist = SessionHistory::default();
+        hist.record("  \t  ", "/tmp");
+        assert!(hist.commands.is_empty());
+    }
 }

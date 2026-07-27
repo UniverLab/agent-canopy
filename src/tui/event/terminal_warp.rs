@@ -707,4 +707,183 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod buffer_helper_tests {
+    use super::*;
+    use crate::tui::agent::InteractiveAgent;
+
+    fn make_agent() -> InteractiveAgent {
+        InteractiveAgent::spawn_terminal(
+            "cat",
+            "/tmp",
+            80,
+            24,
+            Some("test-buffer"),
+            &[],
+            ratatui::style::Color::White,
+        )
+        .expect("spawn")
+    }
+
+    #[test]
+    fn input_text_empty_initially() {
+        let agent = make_agent();
+        assert_eq!(input_text(&agent), "");
+    }
+
+    #[test]
+    fn trimmed_input_text_empty_initially() {
+        let agent = make_agent();
+        assert_eq!(trimmed_input_text(&agent), "");
+    }
+
+    #[test]
+    fn input_is_blank_initially() {
+        let agent = make_agent();
+        assert!(input_is_blank(&agent));
+    }
+
+    #[test]
+    fn buffer_len_zero_initially() {
+        let agent = make_agent();
+        assert_eq!(buffer_len(&agent), 0);
+    }
+
+    #[test]
+    fn replace_input_buffer_sets_content() {
+        let agent = make_agent();
+        replace_input_buffer(&agent, "hello world");
+        assert_eq!(input_text(&agent), "hello world");
+        assert_eq!(buffer_len(&agent), 11);
+        assert!(!input_is_blank(&agent));
+    }
+
+    #[test]
+    fn clear_input_buffer_empties_content() {
+        let agent = make_agent();
+        replace_input_buffer(&agent, "hello");
+        clear_input_buffer(&agent);
+        assert_eq!(input_text(&agent), "");
+        assert!(input_is_blank(&agent));
+    }
+
+    #[test]
+    fn trimmed_input_text_trims_whitespace() {
+        let agent = make_agent();
+        replace_input_buffer(&agent, "  hello  ");
+        assert_eq!(trimmed_input_text(&agent), "hello");
+    }
+
+    #[test]
+    fn trimmed_input_text_blank_after_trim() {
+        let agent = make_agent();
+        replace_input_buffer(&agent, "   ");
+        assert!(input_is_blank(&agent));
+        assert_eq!(trimmed_input_text(&agent), "");
+    }
+
+    #[test]
+    fn input_text_with_newlines() {
+        let agent = make_agent();
+        replace_input_buffer(&agent, "line1\nline2\n");
+        assert_eq!(input_text(&agent), "line1\nline2\n");
+        assert!(!input_is_blank(&agent));
+    }
+}
+
+#[cfg(test)]
+mod cd_picker_edge_cases {
+    use super::*;
+
+    #[test]
+    fn is_cd_command_with_multiple_spaces() {
+        assert!(is_cd_command("cd   /tmp"));
+    }
+
+    #[test]
+    fn is_cd_command_cd_only() {
+        assert!(is_cd_command("cd"));
+    }
+
+    #[test]
+    fn is_cd_picker_request_matches_cd_command() {
+        assert!(is_cd_picker_request("cd /some/path"));
+    }
+
+    #[test]
+    fn is_cd_picker_request_matches_empty() {
+        assert!(is_cd_picker_request(""));
+    }
+
+    #[test]
+    fn is_cd_picker_request_rejects_non_cd() {
+        assert!(!is_cd_picker_request("ls -la"));
+        assert!(!is_cd_picker_request("pwd"));
+        assert!(!is_cd_picker_request("echo hello"));
+    }
+}
+
+#[cfg(test)]
+mod is_direct_submit_edge_cases {
+    use super::*;
+
+    #[test]
+    fn ctrl_d_is_direct_submit() {
+        assert!(is_direct_submit(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn enter_is_direct_submit() {
+        assert!(is_direct_submit(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn ctrl_c_is_direct_submit() {
+        assert!(is_direct_submit(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn regular_char_is_not() {
+        assert!(!is_direct_submit(KeyCode::Char('x'), KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn ctrl_a_is_not() {
+        assert!(!is_direct_submit(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn shift_enter_is_not() {
+        assert!(!is_direct_submit(
+            KeyCode::Enter,
+            KeyModifiers::SHIFT
+        ));
+    }
+}
+
+#[cfg(test)]
+mod should_skip_warp_sync_tests {
+    use super::*;
+    use crate::tui::agent::InteractiveAgent;
+
+    fn make_agent() -> InteractiveAgent {
+        InteractiveAgent::spawn_terminal(
+            "cat",
+            "/tmp",
+            80,
+            24,
+            Some("test-skip"),
+            &[],
+            ratatui::style::Color::White,
+        )
+        .expect("spawn")
+    }
+
+    #[test]
+    fn agent_not_in_alternate_screen_does_not_skip() {
+        let agent = make_agent();
+        assert!(!should_skip_warp_sync(&agent));
+    }
+}
+
 // ── Dialog: new agent creation ──────────────────────────────────────

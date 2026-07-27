@@ -1696,6 +1696,7 @@ mod tests {
     use super::panel_focus_colors;
     use super::split_warp_areas;
     use super::warp;
+    use super::*;
     use crate::tui::agent::screen::VtCell;
     use crate::tui::agent::ScreenSnapshot;
     use crate::tui::app::types::{App, Focus};
@@ -1703,6 +1704,7 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui::style::Color;
     use ratatui::Terminal;
+    use std::sync::Arc;
 
     fn render_to_text(
         width: u16,
@@ -1905,5 +1907,407 @@ mod tests {
             panel_focus_colors(Focus::Preview, None, &theme),
             (theme.border_color, theme.border_color)
         );
+    }
+
+    #[test]
+    fn format_unix_timestamp_valid() {
+        let ts = 1_700_000_000; // 2023-11-14 22:13:20 UTC
+        let result = format_unix_timestamp(ts);
+        assert!(result.contains("2023"), "Should contain year: {result}");
+    }
+
+    #[test]
+    fn format_unix_timestamp_zero() {
+        let result = format_unix_timestamp(0);
+        // Epoch 0 is 1970-01-01 UTC, displayed as local time
+        assert!(!result.is_empty(), "Should produce a string: {result}");
+    }
+
+    #[test]
+    fn render_wrapped_paragraph_zero_area() {
+        let backend = TestBackend::new(10, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| {
+            let area = Rect::new(0, 0, 0, 0);
+            render_wrapped_paragraph(frame, area, vec![]);
+        }).unwrap();
+    }
+
+    #[test]
+    fn render_panel_block_with_title() {
+        let backend = TestBackend::new(30, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::classic();
+        terminal.draw(|frame| {
+            let area = frame.area();
+            let title = Span::styled(" Test ", Style::default().fg(Color::White));
+            let inner = render_panel_block(frame, area, Color::Cyan, Some(title), &theme);
+            assert!(inner.width > 0);
+            assert!(inner.height > 0);
+        }).unwrap();
+    }
+
+    #[test]
+    fn render_panel_block_without_title() {
+        let backend = TestBackend::new(30, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::classic();
+        terminal.draw(|frame| {
+            let area = frame.area();
+            let inner = render_panel_block(frame, area, Color::Cyan, None, &theme);
+            assert!(inner.width > 0);
+            assert!(inner.height > 0);
+        }).unwrap();
+    }
+
+    #[test]
+    fn render_panel_block_modern_theme_no_borders() {
+        let backend = TestBackend::new(30, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::modern();
+        terminal.draw(|frame| {
+            let area = frame.area();
+            let inner = render_panel_block(frame, area, Color::Cyan, None, &theme);
+            // Modern theme: no borders, so inner == area
+            assert_eq!(inner, area);
+        }).unwrap();
+    }
+
+    #[test]
+    fn set_cursor_from_snapshot_scrolled_no_cursor() {
+        let backend = TestBackend::new(20, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let snap = ScreenSnapshot {
+            cells: vec![],
+            cursor_row: 5,
+            cursor_col: 5,
+            scrolled: true,
+        };
+        terminal.draw(|frame| {
+            let area = Rect::new(0, 0, 20, 10);
+            set_cursor_from_snapshot(frame, area, &snap);
+        }).unwrap();
+        // Scrolled: no cursor set
+    }
+
+    #[test]
+    fn set_cursor_from_snapshot_zero_area() {
+        let backend = TestBackend::new(20, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let snap = ScreenSnapshot {
+            cells: vec![],
+            cursor_row: 0,
+            cursor_col: 0,
+            scrolled: false,
+        };
+        terminal.draw(|frame| {
+            let area = Rect::new(0, 0, 0, 0);
+            set_cursor_from_snapshot(frame, area, &snap);
+        }).unwrap();
+    }
+
+    #[test]
+    fn labeled_value_line_renders() {
+        let theme = Theme::classic();
+        let line = labeled_value_line("Key: ", Span::raw("value"), &theme);
+        assert_eq!(line.width(), 10); // "Key: " + "value"
+    }
+
+    #[test]
+    fn selected_row_style_selected() {
+        let theme = Theme::classic();
+        let (style, marker) = selected_row_style(true, &theme);
+        assert_eq!(style.bg, Some(theme.selected_bg));
+        assert_eq!(marker, "›");
+    }
+
+    #[test]
+    fn selected_row_style_not_selected() {
+        let theme = Theme::classic();
+        let (style, marker) = selected_row_style(false, &theme);
+        assert_eq!(style.bg, None);
+        assert_eq!(marker, " ");
+    }
+
+    #[test]
+    fn panel_mode_label_preview() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(db, data_dir.path()).unwrap();
+        app.focus = Focus::Preview;
+        assert_eq!(panel_mode_label(&app), Some(" Preview "));
+    }
+
+    #[test]
+    fn panel_mode_label_agent() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(db, data_dir.path()).unwrap();
+        app.focus = Focus::Agent;
+        assert_eq!(panel_mode_label(&app), Some(" Focus "));
+    }
+
+    #[test]
+    fn panel_mode_label_home() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(db, data_dir.path()).unwrap();
+        app.focus = Focus::Home;
+        assert_eq!(panel_mode_label(&app), None);
+    }
+
+    #[test]
+    fn show_home_fallback_empty_agents_and_projects() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(db, data_dir.path()).unwrap();
+        app.focus = Focus::Home;
+        assert!(show_home_fallback(&app));
+    }
+
+    #[test]
+    fn show_home_fallback_not_when_dialog_open() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(db, data_dir.path()).unwrap();
+        app.focus = Focus::NewAgentDialog;
+        assert!(!show_home_fallback(&app));
+    }
+
+    #[test]
+    fn draw_log_panel_zero_area_no_panic() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(db, data_dir.path()).unwrap();
+        let backend = TestBackend::new(20, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::classic();
+        terminal.draw(|frame| {
+            let area = Rect::new(0, 0, 0, 0);
+            draw_log_panel(frame, area, &mut app, &theme);
+        }).unwrap();
+    }
+
+    #[test]
+    fn draw_split_panel_zero_area_no_panic() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(db, data_dir.path()).unwrap();
+        let backend = TestBackend::new(20, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::classic();
+        terminal.draw(|frame| {
+            let area = Rect::new(0, 0, 0, 0);
+            draw_split_panel(frame, area, &mut app, "test-session", true, &theme);
+        }).unwrap();
+    }
+
+    #[test]
+    fn draw_corrupt_agent_panel_renders() {
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let corrupt = crate::domain::models::CorruptAgent {
+            id: "bad-agent".to_string(),
+            enabled: false,
+            error: "failed to parse JSON".to_string(),
+        };
+        terminal.draw(|frame| {
+            let area = frame.area();
+            draw_corrupt_agent_panel(frame, area, &corrupt);
+        }).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(text.contains("bad-agent"), "Should show agent id: {text}");
+        assert!(text.contains("corrupt config"), "Should show corrupt config: {text}");
+    }
+
+    #[test]
+    fn draw_home_panel_renders() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let app = App::new(db, data_dir.path()).unwrap();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| {
+            let area = frame.area();
+            draw_home_panel(frame, area, &app);
+        }).unwrap();
+    }
+
+    #[test]
+    fn rag_file_icon_and_color_indexed() {
+        let theme = Theme::classic();
+        let (icon, color) = rag_file_icon_and_color("indexed", &theme);
+        assert_eq!(icon, "✓");
+        assert_eq!(color, Color::Green);
+    }
+
+    #[test]
+    fn rag_file_icon_and_color_deleted() {
+        let theme = Theme::classic();
+        let (icon, color) = rag_file_icon_and_color("deleted", &theme);
+        assert_eq!(icon, "○");
+        assert_eq!(color, theme.dim_text);
+    }
+
+    #[test]
+    fn rag_file_icon_and_color_error() {
+        let theme = Theme::classic();
+        let (icon, color) = rag_file_icon_and_color("error", &theme);
+        assert_eq!(icon, "✗");
+        assert_eq!(color, Color::Red);
+    }
+
+    #[test]
+    fn rag_file_detail_error_with_message() {
+        use crate::db::project::RagPerFileStatus;
+        let file = RagPerFileStatus {
+            file_path: "test.rs".to_string(),
+            last_event_type: "error".to_string(),
+            last_detail: Some("parse failed".to_string()),
+            times_indexed: 0,
+            last_at: 0,
+        };
+        let detail = rag_file_detail(&file, 50);
+        assert!(detail.starts_with("error:"));
+    }
+
+    #[test]
+    fn rag_file_detail_error_no_message() {
+        use crate::db::project::RagPerFileStatus;
+        let file = RagPerFileStatus {
+            file_path: "test.rs".to_string(),
+            last_event_type: "error".to_string(),
+            last_detail: None,
+            times_indexed: 0,
+            last_at: 0,
+        };
+        let detail = rag_file_detail(&file, 50);
+        assert_eq!(detail, "error");
+    }
+
+    #[test]
+    fn rag_file_detail_deleted() {
+        use crate::db::project::RagPerFileStatus;
+        let file = RagPerFileStatus {
+            file_path: "test.rs".to_string(),
+            last_event_type: "deleted".to_string(),
+            last_detail: None,
+            times_indexed: 0,
+            last_at: 0,
+        };
+        let detail = rag_file_detail(&file, 50);
+        assert_eq!(detail, "deleted");
+    }
+
+    #[test]
+    fn rag_file_detail_indexed() {
+        use crate::db::project::RagPerFileStatus;
+        let file = RagPerFileStatus {
+            file_path: "test.rs".to_string(),
+            last_event_type: "indexed".to_string(),
+            last_detail: None,
+            times_indexed: 3,
+            last_at: 0,
+        };
+        let detail = rag_file_detail(&file, 50);
+        assert_eq!(detail, "indexed ×3");
+    }
+
+    #[test]
+    fn visible_playground_window_basic() {
+        let area = Rect::new(0, 0, 80, 20);
+        let (max_visible, scroll_start) = visible_playground_window(area, 0);
+        assert!(max_visible > 0);
+        assert_eq!(scroll_start, 0);
+    }
+
+    #[test]
+    fn visible_playground_window_scrolled() {
+        let area = Rect::new(0, 0, 80, 20);
+        let (max_visible, scroll_start) = visible_playground_window(area, 10);
+        assert!(scroll_start > 0 || max_visible >= 10);
+    }
+
+    #[test]
+    fn playground_scope_label_global() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let app = App::new(db, data_dir.path()).unwrap();
+        assert_eq!(playground_scope_label(&app), "Global");
+    }
+
+    #[test]
+    fn detail_progress_line_all_visible() {
+        let theme = Theme::classic();
+        let result = detail_progress_line(5, 10, 0, &theme);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn detail_progress_line_partial() {
+        let theme = Theme::classic();
+        let result = detail_progress_line(100, 10, 50, &theme);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn rag_status_lines_empty_queue() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(db, data_dir.path()).unwrap();
+        app.rag_info.queued_items = 0;
+        let theme = Theme::classic();
+        let lines = rag_summary_lines(&app, "● ready", theme.header_color, String::new(), &theme);
+        assert!(!lines.is_empty());
+    }
+
+    #[test]
+    fn rag_status_lines_with_queue() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let app = App::new(db, data_dir.path()).unwrap();
+        let theme = Theme::classic();
+        let lines = rag_summary_lines(&app, "● ready", theme.header_color, "3 queued".to_string(), &theme);
+        assert!(!lines.is_empty());
     }
 }

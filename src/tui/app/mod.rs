@@ -3082,7 +3082,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     use super::process_matches_cli;
     use super::{
-        build_resumed_session_args, process_is_alive, process_outlives_grace, should_resume_session,
+        adaptive_change_score, adaptive_poll_interval_ms, blend_optional_f32, blend_optional_f64,
+        build_resumed_session_args, calculate_log_hash, lerp_f32, lerp_u64, log_contains_error,
+        log_contains_spawn, log_contains_success, process_is_alive, process_outlives_grace,
+        sample_from, should_resume_session, SystemSample,
     };
     use crate::db::session::InteractiveSession;
     use crate::db::Database;
@@ -3611,6 +3614,825 @@ mod tests {
 
         assert_eq!(app.sidebar_layer, SidebarLayer::Knowledge);
         assert_eq!(app.selected_project, 0);
+    }
+
+    // ── Pure helper tests ────────────────────────────────────────
+
+    #[test]
+    fn calculate_log_hash_empty_string() {
+        assert_eq!(calculate_log_hash(""), 0);
+    }
+
+    #[test]
+    fn calculate_log_hash_deterministic() {
+        let h1 = calculate_log_hash("hello world");
+        let h2 = calculate_log_hash("hello world");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn calculate_log_hash_different_inputs() {
+        let h1 = calculate_log_hash("hello");
+        let h2 = calculate_log_hash("world");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn log_contains_error_positive() {
+        assert!(log_contains_error("ERROR: something broke"));
+        assert!(log_contains_error("FAILED to connect"));
+        assert!(log_contains_error("EXCEPTION thrown"));
+        assert!(log_contains_error("PANIC in module"));
+        assert!(log_contains_error("SEGFAULT detected"));
+        assert!(log_contains_error("TIMED OUT after 30s"));
+        assert!(log_contains_error("CONNECTION REFUSED"));
+        assert!(log_contains_error("PERMISSION DENIED"));
+        assert!(log_contains_error("HALTED unexpectedly"));
+        assert!(log_contains_error("PROBLEMA detectado"));
+        assert!(log_contains_error("FALLO en el sistema"));
+        assert!(log_contains_error("FALLANDO test"));
+    }
+
+    #[test]
+    fn log_contains_error_negative() {
+        assert!(!log_contains_error("everything is fine"));
+        assert!(!log_contains_error("SUCCESS all done"));
+        assert!(!log_contains_error(""));
+    }
+
+    #[test]
+    fn log_contains_success_positive() {
+        assert!(log_contains_success("SUCCESS"));
+        assert!(log_contains_success("ALL TESTS PASSED"));
+        assert!(log_contains_success("BUILD SUCCEEDED"));
+        assert!(log_contains_success("FINISHED task"));
+        assert!(log_contains_success("COMPLETED"));
+        assert!(log_contains_success("DONE."));
+        assert!(log_contains_success("STABILIZED"));
+        assert!(log_contains_success("READY to deploy"));
+        assert!(log_contains_success("CONVERGED"));
+        assert!(log_contains_success("DEPLOYED to prod"));
+        assert!(log_contains_success("EXCELENTE resultado"));
+        assert!(log_contains_success("COMPLETADO"));
+        assert!(log_contains_success("HECHO"));
+        assert!(log_contains_success("LISTO"));
+        assert!(log_contains_success("TERMINADO"));
+    }
+
+    #[test]
+    fn log_contains_success_negative() {
+        assert!(!log_contains_success("ERROR: failed"));
+        assert!(!log_contains_success("running tests..."));
+        assert!(!log_contains_success(""));
+    }
+
+    #[test]
+    fn log_contains_spawn_positive() {
+        assert!(log_contains_spawn("SPAWNING agent"));
+        assert!(log_contains_spawn("STARTING UP server"));
+        assert!(log_contains_spawn("BOOTSTRAPPING cluster"));
+        assert!(log_contains_spawn("INITIALIZING module"));
+    }
+
+    #[test]
+    fn log_contains_spawn_negative() {
+        assert!(!log_contains_spawn("agent stopped"));
+        assert!(!log_contains_spawn("DONE"));
+        assert!(!log_contains_spawn(""));
+    }
+
+    #[test]
+    fn lerp_f32_midpoint() {
+        assert!((lerp_f32(0.0, 10.0, 0.5) - 5.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn lerp_f32_endpoints() {
+        assert!((lerp_f32(0.0, 10.0, 0.0) - 0.0).abs() < f32::EPSILON);
+        assert!((lerp_f32(0.0, 10.0, 1.0) - 10.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn lerp_f32_negative() {
+        assert!((lerp_f32(10.0, 0.0, 0.5) - 5.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn lerp_u64_midpoint() {
+        assert_eq!(lerp_u64(0, 100, 0.5), 50);
+    }
+
+    #[test]
+    fn lerp_u64_endpoints() {
+        assert_eq!(lerp_u64(0, 100, 0.0), 0);
+        assert_eq!(lerp_u64(0, 100, 1.0), 100);
+    }
+
+    #[test]
+    fn blend_optional_f32_both_present() {
+        assert_eq!(blend_optional_f32(Some(0.0), Some(10.0), 0.5), Some(5.0));
+    }
+
+    #[test]
+    fn blend_optional_f32_first_none() {
+        assert_eq!(blend_optional_f32(None, Some(10.0), 0.5), Some(10.0));
+    }
+
+    #[test]
+    fn blend_optional_f32_second_none() {
+        assert_eq!(blend_optional_f32(Some(0.0), None, 0.5), None);
+    }
+
+    #[test]
+    fn blend_optional_f32_both_none() {
+        assert_eq!(blend_optional_f32(None, None, 0.5), None);
+    }
+
+    #[test]
+    fn blend_optional_f64_both_present() {
+        let result = blend_optional_f64(Some(0.0), Some(10.0), 0.5);
+        assert!((result.unwrap() - 5.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn blend_optional_f64_first_none() {
+        assert_eq!(blend_optional_f64(None, Some(10.0), 0.5), Some(10.0));
+    }
+
+    #[test]
+    fn adaptive_change_score_identical() {
+        let s = SystemSample {
+            cpu_usage: 50.0,
+            mem_pct: 60.0,
+            load: 1.0,
+            cpu_temp: 40.0,
+            gpu_usage: 30.0,
+            gpu_temp: 50.0,
+        };
+        assert!((adaptive_change_score(s, s) - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn adaptive_change_score_max_change() {
+        let prev = SystemSample {
+            cpu_usage: 0.0,
+            mem_pct: 0.0,
+            load: 0.0,
+            cpu_temp: 0.0,
+            gpu_usage: 0.0,
+            gpu_temp: 0.0,
+        };
+        let next = SystemSample {
+            cpu_usage: 100.0,
+            mem_pct: 100.0,
+            load: 2.0,
+            cpu_temp: 20.0,
+            gpu_usage: 100.0,
+            gpu_temp: 20.0,
+        };
+        let score = adaptive_change_score(prev, next);
+        assert!(score > 0.8);
+        assert!(score <= 1.0);
+    }
+
+    #[test]
+    fn adaptive_poll_interval_ms_fast_when_high_change() {
+        let ms = adaptive_poll_interval_ms(1.0);
+        assert!(ms <= 1000);
+    }
+
+    #[test]
+    fn adaptive_poll_interval_ms_slow_when_no_change() {
+        let ms = adaptive_poll_interval_ms(0.0);
+        assert!(ms >= 2500);
+    }
+
+    #[test]
+    fn adaptive_poll_interval_ms_clamped() {
+        let ms_low = adaptive_poll_interval_ms(-1.0);
+        let ms_high = adaptive_poll_interval_ms(2.0);
+        assert!(ms_low >= 500);
+        assert!(ms_high <= 3000);
+    }
+
+    #[test]
+    fn sample_from_basic_conversion() {
+        let info = crate::system::SystemInfo {
+            cpu_usage: 42.5,
+            memory_used: 4_000_000_000,
+            memory_total: 8_000_000_000,
+            load_average: Some(1.5),
+            cpu_temperature: Some(55.0),
+            gpu_info: Some(crate::system::GpuInfo {
+                name: "RTX 4090".to_string(),
+                vendor: "NVIDIA".to_string(),
+                usage: Some(70.0),
+                temperature: Some(65.0),
+                vram_used: Some(8_000_000_000),
+                vram_total: Some(24_000_000_000),
+                power_watts: Some(300.0),
+                power_limit_watts: Some(450.0),
+            }),
+            ..crate::system::SystemInfo::default()
+        };
+        let sample = sample_from(&info);
+        assert!((sample.cpu_usage - 42.5).abs() < f32::EPSILON);
+        assert!((sample.mem_pct - 50.0).abs() < 0.1);
+        assert!((sample.load - 1.5).abs() < f32::EPSILON);
+        assert!((sample.cpu_temp - 55.0).abs() < f32::EPSILON);
+        assert!((sample.gpu_usage - 70.0).abs() < f32::EPSILON);
+        assert!((sample.gpu_temp - 65.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn sample_from_zero_memory_total() {
+        let info = crate::system::SystemInfo {
+            memory_used: 1000,
+            memory_total: 0,
+            ..crate::system::SystemInfo::default()
+        };
+        let sample = sample_from(&info);
+        assert!((sample.mem_pct).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn sample_from_no_gpu() {
+        let info = crate::system::SystemInfo {
+            gpu_info: None,
+            ..crate::system::SystemInfo::default()
+        };
+        let sample = sample_from(&info);
+        assert!((sample.gpu_usage).abs() < f32::EPSILON);
+        assert!((sample.gpu_temp).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn sidebar_tab_index_returns_correct_index() {
+        assert_eq!(App::sidebar_tab_index(SidebarLayer::Live), 0);
+        assert_eq!(App::sidebar_tab_index(SidebarLayer::Automation), 1);
+        assert_eq!(App::sidebar_tab_index(SidebarLayer::Knowledge), 2);
+    }
+
+    #[test]
+    fn update_prompt_config_on_object() {
+        let config = serde_json::json!({"platform": "claude", "model": "sonnet"});
+        let result = App::update_prompt_config(&config, "new prompt here");
+        assert_eq!(result["prompt_template"], "new prompt here");
+        assert_eq!(result["platform"], "claude");
+        assert_eq!(result["model"], "sonnet");
+    }
+
+    #[test]
+    fn update_prompt_config_on_non_object() {
+        let config = serde_json::json!("just a string");
+        let result = App::update_prompt_config(&config, "prompt text");
+        assert_eq!(result["prompt_template"], "prompt text");
+    }
+
+    #[test]
+    fn update_prompt_config_preserves_existing_prompt_template() {
+        let config = serde_json::json!({"prompt_template": "old prompt"});
+        let result = App::update_prompt_config(&config, "replaced");
+        assert_eq!(result["prompt_template"], "replaced");
+    }
+
+    #[test]
+    fn update_prompt_config_empty_object() {
+        let config = serde_json::json!({});
+        let result = App::update_prompt_config(&config, "test");
+        assert_eq!(result["prompt_template"], "test");
+    }
+
+    #[test]
+    fn terminal_selection_normalized_ordering() {
+        let sel = crate::tui::app::types::TerminalSelection {
+            agent: (true, 0),
+            start: (5, 10),
+            end: (2, 3),
+            dragging: false,
+        };
+        let (s, e) = sel.normalized();
+        assert_eq!(s, (2, 3));
+        assert_eq!(e, (5, 10));
+    }
+
+    #[test]
+    fn terminal_selection_normalized_already_ordered() {
+        let sel = crate::tui::app::types::TerminalSelection {
+            agent: (false, 1),
+            start: (1, 2),
+            end: (3, 4),
+            dragging: false,
+        };
+        let (s, e) = sel.normalized();
+        assert_eq!(s, (1, 2));
+        assert_eq!(e, (3, 4));
+    }
+
+    #[test]
+    fn terminal_selection_normalized_equal_endpoints() {
+        let sel = crate::tui::app::types::TerminalSelection {
+            agent: (true, 0),
+            start: (2, 3),
+            end: (2, 3),
+            dragging: false,
+        };
+        let (s, e) = sel.normalized();
+        assert_eq!(s, (2, 3));
+        assert_eq!(e, (2, 3));
+    }
+
+    // ── LoopEditorDialog tests ──────────────────────────────────
+
+    #[test]
+    fn loop_editor_dialog_new_sets_cursor_at_end() {
+        let dialog = crate::tui::app::types::LoopEditorDialog::new(
+            "n1".into(),
+            "node1".into(),
+            "title".into(),
+            "help".into(),
+            "hello world".into(),
+            crate::tui::app::types::LoopEditorMode::AgentPrompt,
+        );
+        assert_eq!(dialog.cursor, 11); // "hello world" has 11 chars
+    }
+
+    #[test]
+    fn loop_editor_dialog_char_len() {
+        let mut dialog = crate::tui::app::types::LoopEditorDialog::new(
+            "n1".into(),
+            "node1".into(),
+            "".into(),
+            "".into(),
+            "abc".into(),
+            crate::tui::app::types::LoopEditorMode::NodeConfig,
+        );
+        assert_eq!(dialog.char_len(), 3);
+        dialog.insert_str("de");
+        assert_eq!(dialog.char_len(), 5);
+    }
+
+    #[test]
+    fn loop_editor_dialog_insert_char() {
+        let mut dialog = crate::tui::app::types::LoopEditorDialog::new(
+            "n1".into(),
+            "node1".into(),
+            "".into(),
+            "".into(),
+            "ac".into(),
+            crate::tui::app::types::LoopEditorMode::AgentPrompt,
+        );
+        dialog.cursor = 1;
+        dialog.insert_char('b');
+        assert_eq!(dialog.buffer, "abc");
+        assert_eq!(dialog.cursor, 2);
+    }
+
+    #[test]
+    fn loop_editor_dialog_backspace() {
+        let mut dialog = crate::tui::app::types::LoopEditorDialog::new(
+            "n1".into(),
+            "node1".into(),
+            "".into(),
+            "".into(),
+            "abc".into(),
+            crate::tui::app::types::LoopEditorMode::AgentPrompt,
+        );
+        dialog.backspace();
+        assert_eq!(dialog.buffer, "ab");
+        assert_eq!(dialog.cursor, 2);
+    }
+
+    #[test]
+    fn loop_editor_dialog_backspace_at_zero() {
+        let mut dialog = crate::tui::app::types::LoopEditorDialog::new(
+            "n1".into(),
+            "node1".into(),
+            "".into(),
+            "".into(),
+            "abc".into(),
+            crate::tui::app::types::LoopEditorMode::AgentPrompt,
+        );
+        dialog.cursor = 0;
+        dialog.backspace();
+        assert_eq!(dialog.buffer, "abc");
+    }
+
+    #[test]
+    fn loop_editor_dialog_move_left_right() {
+        let mut dialog = crate::tui::app::types::LoopEditorDialog::new(
+            "n1".into(),
+            "node1".into(),
+            "".into(),
+            "".into(),
+            "abc".into(),
+            crate::tui::app::types::LoopEditorMode::AgentPrompt,
+        );
+        dialog.move_left();
+        assert_eq!(dialog.cursor, 2);
+        dialog.move_right();
+        assert_eq!(dialog.cursor, 3);
+        dialog.move_right(); // At end
+        assert_eq!(dialog.cursor, 3);
+    }
+
+    #[test]
+    fn loop_editor_dialog_move_home_end() {
+        let mut dialog = crate::tui::app::types::LoopEditorDialog::new(
+            "n1".into(),
+            "node1".into(),
+            "".into(),
+            "".into(),
+            "hello".into(),
+            crate::tui::app::types::LoopEditorMode::AgentPrompt,
+        );
+        dialog.move_home();
+        assert_eq!(dialog.cursor, 0);
+        dialog.move_end();
+        assert_eq!(dialog.cursor, 5);
+    }
+
+    // ── Knowledge filter tests ──────────────────────────────────
+
+    #[test]
+    fn filtered_knowledge_indices_empty_filter_returns_all() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.project_knowledge = vec![
+            crate::db::intelligence::IntelligenceNodeRecord {
+                id: "n1".into(),
+                kind: "fact".into(),
+                title: "Fact One".into(),
+                body: "body one".into(),
+                metadata: None,
+                project_hash: None,
+                session_id: None,
+                created_at: chrono::Utc::now().timestamp(),
+                updated_at: chrono::Utc::now().timestamp(),
+            },
+            crate::db::intelligence::IntelligenceNodeRecord {
+                id: "n2".into(),
+                kind: "pattern".into(),
+                title: "Pattern Two".into(),
+                body: "body two".into(),
+                metadata: None,
+                project_hash: None,
+                session_id: None,
+                created_at: chrono::Utc::now().timestamp(),
+                updated_at: chrono::Utc::now().timestamp(),
+            },
+        ];
+        app.knowledge_filter.clear();
+        let indices = app.filtered_knowledge_indices();
+        assert_eq!(indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn filtered_knowledge_indices_filter_matches_title() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.project_knowledge = vec![
+            crate::db::intelligence::IntelligenceNodeRecord {
+                id: "n1".into(),
+                kind: "fact".into(),
+                title: "Rust Ownership".into(),
+                body: "body".into(),
+                metadata: None,
+                project_hash: None,
+                session_id: None,
+                created_at: chrono::Utc::now().timestamp(),
+                updated_at: chrono::Utc::now().timestamp(),
+            },
+            crate::db::intelligence::IntelligenceNodeRecord {
+                id: "n2".into(),
+                kind: "fact".into(),
+                title: "Python GIL".into(),
+                body: "body".into(),
+                metadata: None,
+                project_hash: None,
+                session_id: None,
+                created_at: chrono::Utc::now().timestamp(),
+                updated_at: chrono::Utc::now().timestamp(),
+            },
+        ];
+        app.knowledge_filter = "rust".to_string();
+        let indices = app.filtered_knowledge_indices();
+        assert_eq!(indices, vec![0]);
+    }
+
+    #[test]
+    fn filtered_knowledge_indices_filter_matches_body() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.project_knowledge = vec![
+            crate::db::intelligence::IntelligenceNodeRecord {
+                id: "n1".into(),
+                kind: "fact".into(),
+                title: "Title".into(),
+                body: "contains the word pattern".into(),
+                metadata: None,
+                project_hash: None,
+                session_id: None,
+                created_at: chrono::Utc::now().timestamp(),
+                updated_at: chrono::Utc::now().timestamp(),
+            },
+        ];
+        app.knowledge_filter = "pattern".to_string();
+        let indices = app.filtered_knowledge_indices();
+        assert_eq!(indices, vec![0]);
+    }
+
+    #[test]
+    fn filtered_knowledge_indices_filter_matches_kind() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.project_knowledge = vec![
+            crate::db::intelligence::IntelligenceNodeRecord {
+                id: "n1".into(),
+                kind: "fact".into(),
+                title: "Title".into(),
+                body: "body".into(),
+                metadata: None,
+                project_hash: None,
+                session_id: None,
+                created_at: chrono::Utc::now().timestamp(),
+                updated_at: chrono::Utc::now().timestamp(),
+            },
+            crate::db::intelligence::IntelligenceNodeRecord {
+                id: "n2".into(),
+                kind: "pattern".into(),
+                title: "Title".into(),
+                body: "body".into(),
+                metadata: None,
+                project_hash: None,
+                session_id: None,
+                created_at: chrono::Utc::now().timestamp(),
+                updated_at: chrono::Utc::now().timestamp(),
+            },
+        ];
+        app.knowledge_filter = "pattern".to_string();
+        let indices = app.filtered_knowledge_indices();
+        assert_eq!(indices, vec![1]);
+    }
+
+    #[test]
+    fn filtered_knowledge_indices_no_match() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.project_knowledge = vec![crate::db::intelligence::IntelligenceNodeRecord {
+            id: "n1".into(),
+            kind: "fact".into(),
+            title: "Title".into(),
+            body: "body".into(),
+            metadata: None,
+            project_hash: None,
+            session_id: None,
+            created_at: chrono::Utc::now().timestamp(),
+            updated_at: chrono::Utc::now().timestamp(),
+        }];
+        app.knowledge_filter = "zzz_not_found".to_string();
+        let indices = app.filtered_knowledge_indices();
+        assert!(indices.is_empty());
+    }
+
+    // ── ProjectTab tests ────────────────────────────────────────
+
+    #[test]
+    fn project_tab_labels() {
+        assert_eq!(ProjectTab::Overview.label(), "Overview");
+        assert_eq!(ProjectTab::Backlog.label(), "Backlog");
+        assert_eq!(ProjectTab::Knowledge.label(), "Knowledge");
+        assert_eq!(ProjectTab::History.label(), "History");
+    }
+
+    #[test]
+    fn project_tab_hotkeys() {
+        assert_eq!(ProjectTab::Overview.hotkey(), 'o');
+        assert_eq!(ProjectTab::Backlog.hotkey(), 'b');
+        assert_eq!(ProjectTab::Knowledge.hotkey(), 'k');
+        assert_eq!(ProjectTab::History.hotkey(), 'h');
+    }
+
+    #[test]
+    fn project_tab_all_has_four_entries() {
+        assert_eq!(ProjectTab::ALL.len(), 4);
+    }
+
+    // ── AgentEntry::id tests ────────────────────────────────────
+
+    #[test]
+    fn agent_entry_id_for_agent() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        let entry = AgentEntry::Agent(crate::domain::models::Agent {
+            id: "bg-1".to_string(),
+            prompt: String::new(),
+            trigger: None,
+            cli: crate::domain::models::Cli::new("claude"),
+            model: None,
+            working_dir: None,
+            enabled: true,
+            enable_at: None,
+            created_at: chrono::Utc::now(),
+            log_path: "/tmp/bg-1.log".to_string(),
+            timeout_minutes: 15,
+            expires_at: None,
+            last_run_at: None,
+            last_run_ok: None,
+            last_triggered_at: None,
+            trigger_count: 0,
+        });
+        assert_eq!(entry.id(&app), "bg-1");
+    }
+
+    #[test]
+    fn agent_entry_id_for_corrupt() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        let entry = AgentEntry::Corrupt(crate::domain::models::CorruptAgent {
+            id: "corrupt-1".to_string(),
+            enabled: false,
+            error: "corrupt row".to_string(),
+        });
+        assert_eq!(entry.id(&app), "corrupt-1");
+    }
+
+    #[test]
+    fn agent_entry_id_for_group_out_of_bounds() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        let entry = AgentEntry::Group(99);
+        assert_eq!(entry.id(&app), "?");
+    }
+
+    #[test]
+    fn agent_entry_id_for_interactive_out_of_bounds() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        let entry = AgentEntry::Interactive(99);
+        assert_eq!(entry.id(&app), "?");
+    }
+
+    #[test]
+    fn agent_entry_id_for_terminal_out_of_bounds() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        let entry = AgentEntry::Terminal(99);
+        assert_eq!(entry.id(&app), "?");
+    }
+
+    #[test]
+    fn agent_entry_id_for_orphaned_out_of_bounds() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        let entry = AgentEntry::Orphaned(99);
+        assert_eq!(entry.id(&app), "?");
+    }
+
+    // ── Navigation edge cases ───────────────────────────────────
+
+    #[test]
+    fn select_next_empty_agents_stays_put() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.agents.clear();
+        app.selected = 0;
+        app.sidebar_layer = SidebarLayer::Live;
+        app.select_next();
+        // Should not panic, stays at 0
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn select_prev_empty_agents_stays_put() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.agents.clear();
+        app.selected = 0;
+        app.sidebar_layer = SidebarLayer::Live;
+        app.select_prev();
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn select_agent_at_out_of_bounds_does_nothing() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.agents.clear();
+        let prev = app.selected;
+        app.select_agent_at(999);
+        assert_eq!(app.selected, prev);
+    }
+
+    #[test]
+    fn scroll_log_down_and_up() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.log_scroll = 10;
+        app.scroll_log_down();
+        assert_eq!(app.log_scroll, 13);
+        app.scroll_log_up();
+        assert_eq!(app.log_scroll, 10);
+    }
+
+    #[test]
+    fn scroll_log_up_at_zero_stays_zero() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.log_scroll = 0;
+        app.scroll_log_up();
+        assert_eq!(app.log_scroll, 0);
+    }
+
+    // ── active_loops filtering ───────────────────────────────────
+
+    #[test]
+    fn active_loops_excludes_completed_and_failed() {
+        use crate::domain::loops::LoopStatus;
+        let db = test_db();
+        db.insert_loop(&make_loop("l1", "Running", LoopStatus::Running))
+            .unwrap();
+        db.insert_loop(&make_loop("l2", "Draft", LoopStatus::Draft))
+            .unwrap();
+        db.insert_loop(&make_loop("l3", "Paused", LoopStatus::Paused))
+            .unwrap();
+        db.insert_loop(&make_loop("l4", "Completed", LoopStatus::Completed))
+            .unwrap();
+        db.insert_loop(&make_loop("l5", "Failed", LoopStatus::Failed))
+            .unwrap();
+
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        let active: Vec<&str> = app.active_loops().iter().map(|lp| lp.id.as_str()).collect();
+        assert!(!active.contains(&"l4"));
+        assert!(!active.contains(&"l5"));
+        assert!(active.contains(&"l1"));
+        assert!(active.contains(&"l2"));
+        assert!(active.contains(&"l3"));
+    }
+
+    // ── Playground state tests ───────────────────────────────────
+
+    #[test]
+    fn activate_deactivate_playground() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        assert!(!app.playground_active);
+
+        app.playground_query = "test query".to_string();
+        app.playground_selected = 5;
+        app.playground_active = true;
+        app.activate_playground();
+        assert!(app.playground_active);
+        assert!(app.playground_query.is_empty());
+        assert_eq!(app.playground_selected, 0);
+
+        app.deactivate_playground();
+        assert!(!app.playground_active);
+        assert!(app.playground_query.is_empty());
+    }
+
+    // ── Playground search edge cases ─────────────────────────────
+
+    #[test]
+    fn poll_playground_search_no_rx_returns_early() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.playground_search_rx = None;
+        // Should not panic
+        app.poll_playground_search();
+    }
+
+    #[test]
+    fn poll_playground_search_disconnected_cleans_up() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.playground_search_rx = Some(rx);
+        app.playground_search_pending = true;
+        drop(tx);
+        app.poll_playground_search();
+        assert!(app.playground_search_rx.is_none());
+        assert!(!app.playground_search_pending);
     }
 
     #[test]

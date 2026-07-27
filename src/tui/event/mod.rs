@@ -1769,3 +1769,299 @@ mod split_selection_tests {
         assert!(handled);
     }
 }
+
+#[cfg(test)]
+mod tick_duration_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn app_for_tick(focus: Focus) -> App {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(db, dir.path()).unwrap();
+        app.focus = focus;
+        app
+    }
+
+    #[test]
+    fn agent_focus_returns_50ms() {
+        let app = app_for_tick(Focus::Agent);
+        assert_eq!(tick_duration(&app), Duration::from_millis(50));
+    }
+
+    #[test]
+    fn preview_focus_returns_100ms() {
+        let app = app_for_tick(Focus::Preview);
+        assert_eq!(tick_duration(&app), Duration::from_millis(100));
+    }
+
+    #[test]
+    fn home_without_brain_returns_200ms() {
+        let app = app_for_tick(Focus::Home);
+        assert_eq!(tick_duration(&app), Duration::from_millis(200));
+    }
+
+    #[test]
+    fn new_agent_dialog_returns_50ms() {
+        let app = app_for_tick(Focus::NewAgentDialog);
+        assert_eq!(tick_duration(&app), Duration::from_millis(50));
+    }
+
+    #[test]
+    fn prompt_template_dialog_returns_50ms() {
+        let app = app_for_tick(Focus::PromptTemplateDialog);
+        assert_eq!(tick_duration(&app), Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod scroll_direction_tests {
+    use super::*;
+
+    #[test]
+    fn scroll_up_returns_positive() {
+        assert_eq!(
+            scroll_direction(MouseEventKind::ScrollUp),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn scroll_down_returns_negative() {
+        assert_eq!(
+            scroll_direction(MouseEventKind::ScrollDown),
+            Some(-1)
+        );
+    }
+
+    #[test]
+    fn other_mouse_kinds_return_none() {
+        assert!(scroll_direction(MouseEventKind::Moved).is_none());
+        assert!(scroll_direction(MouseEventKind::Down(MouseButton::Left)).is_none());
+        assert!(scroll_direction(MouseEventKind::Up(MouseButton::Left)).is_none());
+        assert!(scroll_direction(MouseEventKind::Drag(MouseButton::Left)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod rect_contains_point_tests {
+    use super::*;
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn point_inside_rect() {
+        let rect = Rect::new(5, 10, 20, 10);
+        assert!(rect_contains_point(rect, 10, 12));
+        assert!(rect_contains_point(rect, 5, 10)); // top-left corner
+        assert!(rect_contains_point(rect, 24, 19)); // bottom-right corner
+    }
+
+    #[test]
+    fn point_outside_rect() {
+        let rect = Rect::new(5, 10, 20, 10);
+        assert!(!rect_contains_point(rect, 4, 10)); // left
+        assert!(!rect_contains_point(rect, 25, 10)); // right edge
+        assert!(!rect_contains_point(rect, 10, 9)); // above
+        assert!(!rect_contains_point(rect, 10, 20)); // below
+    }
+
+    #[test]
+    fn zero_size_rect() {
+        let rect = Rect::new(5, 10, 0, 0);
+        assert!(!rect_contains_point(rect, 5, 10));
+    }
+}
+
+#[cfg(test)]
+mod clamp_sidebar_scroll_tests {
+    use super::*;
+
+    #[test]
+    fn scroll_down_increments() {
+        assert_eq!(clamp_sidebar_scroll(0, 20, 8, -1), 1);
+    }
+
+    #[test]
+    fn scroll_down_clamps_at_max() {
+        // total=20, max_visible=8 → max_offset=12
+        assert_eq!(clamp_sidebar_scroll(12, 20, 8, -1), 12);
+        assert_eq!(clamp_sidebar_scroll(13, 20, 8, -1), 12, "should not exceed max");
+    }
+
+    #[test]
+    fn scroll_up_decrements() {
+        assert_eq!(clamp_sidebar_scroll(5, 20, 8, 1), 4);
+    }
+
+    #[test]
+    fn scroll_up_clamps_at_zero() {
+        assert_eq!(clamp_sidebar_scroll(0, 20, 8, 1), 0);
+    }
+
+    #[test]
+    fn empty_list_stays_at_zero() {
+        assert_eq!(clamp_sidebar_scroll(0, 0, 8, -1), 0);
+        assert_eq!(clamp_sidebar_scroll(0, 0, 8, 1), 0);
+    }
+}
+
+#[cfg(test)]
+mod sidebar_tab_at_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn make_app() -> App {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        App::new(db, dir.path()).unwrap()
+    }
+
+    #[test]
+    fn finds_tab_by_position() {
+        let mut app = make_app();
+        app.sidebar_tab_click_map = vec![
+            (SidebarLayer::Live, 0, 0, 11),
+            (SidebarLayer::Automation, 0, 11, 22),
+            (SidebarLayer::Knowledge, 0, 22, 33),
+        ];
+
+        assert_eq!(sidebar_tab_at(&app, 0, 5), Some(SidebarLayer::Live));
+        assert_eq!(
+            sidebar_tab_at(&app, 0, 15),
+            Some(SidebarLayer::Automation)
+        );
+        assert_eq!(
+            sidebar_tab_at(&app, 0, 25),
+            Some(SidebarLayer::Knowledge)
+        );
+    }
+
+    #[test]
+    fn wrong_row_returns_none() {
+        let mut app = make_app();
+        app.sidebar_tab_click_map = vec![(SidebarLayer::Live, 0, 0, 11)];
+
+        assert!(sidebar_tab_at(&app, 1, 5).is_none());
+    }
+}
+
+#[cfg(test)]
+mod sidebar_agent_at_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn finds_agent_by_row() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(db, dir.path()).unwrap();
+        app.sidebar_click_map = vec![
+            (0, 0, 3),
+            (1, 4, 7),
+            (2, 8, 11),
+        ];
+
+        assert_eq!(sidebar_agent_at(&app, 1), Some(0));
+        assert_eq!(sidebar_agent_at(&app, 5), Some(1));
+        assert_eq!(sidebar_agent_at(&app, 9), Some(2));
+        assert!(sidebar_agent_at(&app, 3).is_none());
+    }
+}
+
+#[cfg(test)]
+mod is_terminal_agent_selected_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn no_selection_returns_false() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(db, dir.path()).unwrap();
+        assert!(!is_terminal_agent_selected(&app));
+    }
+}
+
+#[cfg(test)]
+mod mouse_pty_position_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn mouse_at(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Moved,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn make_app() -> App {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        App::new(db, dir.path()).unwrap()
+    }
+
+    #[test]
+    fn inside_panel_returns_relative_coords() {
+        let mut app = make_app();
+        app.last_panel_x = 10;
+        app.last_panel_y = 5;
+        app.last_panel_inner = (40, 20);
+
+        assert_eq!(
+            mouse_pty_position(&app, &mouse_at(15, 8)),
+            Some((5, 3))
+        );
+    }
+
+    #[test]
+    fn outside_panel_returns_none() {
+        let mut app = make_app();
+        app.last_panel_x = 10;
+        app.last_panel_y = 5;
+        app.last_panel_inner = (40, 20);
+
+        assert!(mouse_pty_position(&app, &mouse_at(3, 8)).is_none());
+        assert!(mouse_pty_position(&app, &mouse_at(55, 8)).is_none());
+        assert!(mouse_pty_position(&app, &mouse_at(15, 3)).is_none());
+        assert!(mouse_pty_position(&app, &mouse_at(15, 30)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod clamped_pty_position_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn clamps_to_panel_bounds() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(db, dir.path()).unwrap();
+        app.last_panel_x = 10;
+        app.last_panel_y = 5;
+        app.last_panel_inner = (40, 20);
+
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 999,
+            row: 999,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(clamped_pty_position(&app, &mouse), (39, 19));
+    }
+}

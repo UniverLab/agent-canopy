@@ -1260,4 +1260,326 @@ mod tests {
         assert!(!text.contains('‹') && !text.contains('›'));
         assert!(!text.contains('◀') && !text.contains('▶'));
     }
+
+    #[test]
+    fn dialog_title_new_agent() {
+        let mut d = NewAgentDialog::new(Some("."));
+        d.task_type = NewTaskType::Interactive;
+        assert_eq!(dialog_title(&d), " New Agent ");
+    }
+
+    #[test]
+    fn dialog_title_edit_background() {
+        let mut d = NewAgentDialog::new(Some("."));
+        d.task_type = NewTaskType::Background;
+        d.edit_id = Some("test-id".to_string());
+        assert_eq!(dialog_title(&d), " Edit Background ");
+    }
+
+    #[test]
+    fn dialog_title_edit_interactive() {
+        let mut d = NewAgentDialog::new(Some("."));
+        d.task_type = NewTaskType::Interactive;
+        d.edit_id = Some("test-id".to_string());
+        assert_eq!(dialog_title(&d), " Edit Agent ");
+    }
+
+    #[test]
+    fn dialog_title_edit_terminal() {
+        let mut d = NewAgentDialog::new(Some("."));
+        d.task_type = NewTaskType::Terminal;
+        d.edit_id = Some("test-id".to_string());
+        assert_eq!(dialog_title(&d), " Edit Terminal ");
+    }
+
+    #[test]
+    fn task_type_label_all_variants() {
+        assert_eq!(task_type_label(NewTaskType::Interactive), "Interactive");
+        assert_eq!(task_type_label(NewTaskType::Terminal), "Terminal");
+        assert_eq!(task_type_label(NewTaskType::Background), "Background");
+    }
+
+    #[test]
+    fn interactive_mode_label_all_variants() {
+        assert_eq!(interactive_mode_label(NewTaskMode::Interactive), "New");
+        assert_eq!(interactive_mode_label(NewTaskMode::Resume), "Resume");
+    }
+
+    #[test]
+    fn background_trigger_label_all_variants() {
+        assert_eq!(background_trigger_label(BackgroundTrigger::Cron), "Cron");
+        assert_eq!(background_trigger_label(BackgroundTrigger::Watch), "Watch");
+    }
+
+    #[test]
+    fn filter_display_empty() {
+        assert_eq!(filter_display(""), "type to filter");
+    }
+
+    #[test]
+    fn filter_display_non_empty() {
+        assert_eq!(filter_display("claude"), "claude");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_short() {
+        assert_eq!(truncate_with_ellipsis("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_exact() {
+        assert_eq!(truncate_with_ellipsis("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_long() {
+        let result = truncate_with_ellipsis("hello world", 5);
+        assert!(result.contains("…"));
+        assert!(result.chars().count() <= 6); // 5 + ellipsis
+    }
+
+    #[test]
+    fn cron_value_empty() {
+        let mut d = NewAgentDialog::new(Some("."));
+        d.cron_expr = String::new();
+        let val = cron_value(&d);
+        assert!(val.contains("* * * * *"));
+    }
+
+    #[test]
+    fn cron_value_with_expr() {
+        let mut d = NewAgentDialog::new(Some("."));
+        d.cron_expr = "30 9 * * 1-5".to_string();
+        let val = cron_value(&d);
+        assert!(val.contains("30 9 * * 1-5"));
+    }
+
+    #[test]
+    fn help_text_interactive() {
+        let mut d = NewAgentDialog::new(Some("."));
+        d.task_type = NewTaskType::Interactive;
+        let text = help_text(&d);
+        assert!(text.contains("launch"));
+    }
+
+    #[test]
+    fn help_text_background() {
+        let mut d = NewAgentDialog::new(Some("."));
+        d.task_type = NewTaskType::Background;
+        let text = help_text(&d);
+        assert!(text.contains("create"));
+    }
+
+    #[test]
+    fn help_text_terminal() {
+        let mut d = NewAgentDialog::new(Some("."));
+        d.task_type = NewTaskType::Terminal;
+        let text = help_text(&d);
+        assert!(text.contains("launch"));
+    }
+
+    #[test]
+    fn model_value_empty() {
+        let mut d = NewAgentDialog::new(Some("."));
+        d.model = String::new();
+        let val = model_value(&d);
+        assert!(val.contains("optional"));
+    }
+
+    #[test]
+    fn model_value_with_model() {
+        let mut d = NewAgentDialog::new(Some("."));
+        d.model = "claude-3-opus".to_string();
+        let val = model_value(&d);
+        assert!(val.contains("claude-3-opus"));
+    }
+
+    #[test]
+    fn identity_label_with_seed() {
+        use crate::tui::app::dialog::new_agent::SeedOption;
+        let mut d = NewAgentDialog::new(Some("."));
+        d.seed_options = vec![SeedOption::Seed {
+            name: "My Seed".to_string(),
+            id: "seed-1".to_string(),
+        }];
+        let label = identity_label(&d);
+        assert_eq!(label, "My Seed");
+    }
+
+    #[test]
+    fn identity_label_plant_new() {
+        use crate::tui::app::dialog::new_agent::SeedOption;
+        let mut d = NewAgentDialog::new(Some("."));
+        d.seed_options = vec![SeedOption::PlantNewSeed];
+        let label = identity_label(&d);
+        assert!(label.contains("New"));
+    }
+
+    #[test]
+    fn identity_label_none() {
+        let mut d = NewAgentDialog::new(Some("."));
+        d.seed_options = vec![];
+        let label = identity_label(&d);
+        assert_eq!(label, "None");
+    }
+
+    #[test]
+    fn field_layout_for_interactive() {
+        let layout = FieldLayout::for_task(NewTaskType::Interactive);
+        assert_eq!(layout.cli, 2);
+        assert_eq!(layout.identity, 5);
+    }
+
+    #[test]
+    fn field_layout_for_terminal() {
+        let layout = FieldLayout::for_task(NewTaskType::Terminal);
+        assert_eq!(layout.cli, 0);
+        assert_eq!(layout.identity, 0);
+    }
+
+    #[test]
+    fn field_layout_for_background() {
+        let layout = FieldLayout::for_task(NewTaskType::Background);
+        assert_eq!(layout.cli, 2);
+        assert_eq!(layout.identity, 0);
+    }
+
+    #[test]
+    fn picker_window_basic() {
+        let w = PickerWindow::new(5, 20, 6);
+        assert_eq!(w.scroll, 0);
+        assert!(!w.has_above);
+        assert!(w.has_below);
+    }
+
+    #[test]
+    fn picker_window_scrolled() {
+        let w = PickerWindow::new(15, 20, 6);
+        assert!(w.scroll > 0);
+        assert!(w.has_above);
+    }
+
+    #[test]
+    fn picker_window_at_end() {
+        let w = PickerWindow::new(19, 20, 6);
+        assert!(!w.has_below);
+    }
+
+    #[test]
+    fn picker_window_empty() {
+        let w = PickerWindow::new(0, 0, 6);
+        assert!(!w.has_above);
+        assert!(!w.has_below);
+    }
+
+    #[test]
+    fn prompt_field_width_very_small_terminal() {
+        let w = prompt_field_width(ratatui::layout::Rect::new(0, 0, 10, 10));
+        assert!(w >= 10);
+    }
+
+    #[test]
+    fn prompt_field_width_large_terminal() {
+        let w = prompt_field_width(ratatui::layout::Rect::new(0, 0, 200, 40));
+        assert!(w > 50);
+    }
+
+    #[test]
+    fn prompt_visual_line_count_mixed_wrap_and_newlines() {
+        let d = dialog_with("abcde\n12345678");
+        // "abcde" = 1 line, "12345678" at width 4 = 2 lines (4+4)
+        // But hard newline counts as a break point too
+        let count = prompt_visual_line_count(&d, 4);
+        assert!(count >= 3, "expected >= 3, got {count}");
+    }
+
+    #[test]
+    fn prompt_visual_line_range_at_boundary() {
+        let d = dialog_with("abcdefghij");
+        // At width 4: line 0 = [0,4), line 1 = [4,8), line 2 = [8,10)
+        assert_eq!(prompt_visual_line_range(&d, 2, 4), (8, 10));
+    }
+
+    #[test]
+    fn session_picker_label_no_selection() {
+        let mut d = NewAgentDialog::new(Some("."));
+        d.selected_session = None;
+        let label = session_picker_label(&d);
+        assert!(label.contains("pick session"));
+    }
+
+    #[test]
+    fn session_picker_label_with_selection() {
+        let mut d = NewAgentDialog::new(Some("."));
+        d.selected_session = Some(("id-1".to_string(), "My Session".to_string()));
+        let label = session_picker_label(&d);
+        assert!(label.contains("My Session"));
+    }
+
+    #[test]
+    fn focus_style_focused() {
+        let style = focus_style(0, 0, Color::Cyan);
+        assert_eq!(style.bg, Some(Color::Cyan));
+    }
+
+    #[test]
+    fn focus_style_unfocused() {
+        let style = focus_style(1, 0, Color::Cyan);
+        assert_eq!(style.fg, Some(Color::White));
+    }
+
+    #[test]
+    fn picker_item_style_selected() {
+        let style = picker_item_style(Color::Cyan, true);
+        assert_eq!(style.bg, Some(Color::Cyan));
+    }
+
+    #[test]
+    fn picker_item_style_not_selected() {
+        let style = picker_item_style(Color::Cyan, false);
+        assert_eq!(style.fg, Some(Color::White));
+    }
+
+    #[test]
+    fn picker_detail_style_selected() {
+        let selected_style = Style::default().fg(Color::Black).bg(Color::Cyan);
+        let style = picker_detail_style(true, selected_style, &Theme::classic());
+        assert_eq!(style.bg, Some(Color::Cyan));
+    }
+
+    #[test]
+    fn picker_detail_style_not_selected() {
+        let selected_style = Style::default().fg(Color::Black).bg(Color::Cyan);
+        let theme = Theme::classic();
+        let style = picker_detail_style(false, selected_style, &theme);
+        assert_eq!(style.fg, Some(theme.dim_text));
+    }
+
+    #[test]
+    fn session_picker_label_truncates_long_title() {
+        let mut d = NewAgentDialog::new(Some("."));
+        d.selected_session = Some(("id".to_string(), "A".repeat(100)));
+        let label = session_picker_label(&d);
+        assert!(label.chars().count() < 60);
+    }
+
+    #[test]
+    fn interactive_mode_row_resume_unconfigured() {
+        let mut d = NewAgentDialog::new(Some("."));
+        d.task_mode = NewTaskMode::Resume;
+        d.session_entries = vec![];
+        d.cli_configs = vec![None];
+        d.cli_index = 0;
+        let line = interactive_mode_row(&d, Color::Cyan, &Theme::classic());
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("not configured"));
+    }
+
+    #[test]
+    fn push_spaced_row_adds_empty_line() {
+        let mut lines = Vec::new();
+        push_spaced_row(&mut lines, Line::from("test"));
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].spans.is_empty());
+    }
 }

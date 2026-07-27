@@ -1334,4 +1334,204 @@ mod tests {
             generate_top_border("A Very Long Title That Exceeds Width", 10, Style::default());
         assert_eq!(line.width(), 10);
     }
+
+    #[test]
+    fn wrap_preserves_newline_at_end() {
+        let styled = vec![("hello\n".to_string(), None)];
+        let lines = wrap_styled_content(styled, None, 40, Color::Black);
+        // "hello" on first line, empty second line
+        assert_eq!(lines.len(), 2);
+        assert_eq!(line_text(&lines[0]), "hello");
+    }
+
+    #[test]
+    fn wrap_multiple_newlines() {
+        let styled = vec![("a\nb\nc".to_string(), None)];
+        let lines = wrap_styled_content(styled, None, 40, Color::Black);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(line_text(&lines[0]), "a");
+        assert_eq!(line_text(&lines[1]), "b");
+        assert_eq!(line_text(&lines[2]), "c");
+    }
+
+    #[test]
+    fn wrap_tab_expands_to_spaces() {
+        let styled = vec![("a\tb".to_string(), None)];
+        let lines = wrap_styled_content(styled, None, 40, Color::Black);
+        let text = line_text(&lines[0]);
+        assert!(text.contains("b"));
+        // Tab should be expanded to spaces
+        assert!(text.len() > 3);
+    }
+
+    #[test]
+    fn wrap_tab_at_width_boundary() {
+        let styled = vec![("abcd\tef".to_string(), None)];
+        let lines = wrap_styled_content(styled, None, 5, Color::Black);
+        // Tab after "abcd" (col 4) wraps to next line
+        assert!(lines.len() >= 2);
+    }
+
+    #[test]
+    fn wrap_cursor_in_middle() {
+        let styled = vec![("hello".to_string(), None)];
+        let lines = wrap_styled_content(styled, Some(2), 40, Color::Black);
+        // Cursor at position 2 should be visible
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn wrap_cursor_at_start() {
+        let styled = vec![("hello".to_string(), None)];
+        let lines = wrap_styled_content(styled, Some(0), 40, Color::Black);
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn wrap_styled_content_with_accent_color() {
+        let styled = vec![
+            ("hello ".to_string(), Some(Color::Red)),
+            ("world".to_string(), Some(Color::Blue)),
+        ];
+        let lines = wrap_styled_content(styled, None, 40, Color::Black);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(line_text(&lines[0]), "hello world");
+    }
+
+    #[test]
+    fn centered_rect_fixed_wider_than_area() {
+        let area = ratatui::layout::Rect::new(0, 0, 50, 20);
+        let result = centered_rect_fixed(100, 10, area);
+        // Should be clamped to area width
+        assert!(result.width <= 50);
+    }
+
+    #[test]
+    fn centered_rect_fixed_taller_than_area() {
+        let area = ratatui::layout::Rect::new(0, 0, 100, 10);
+        let result = centered_rect_fixed(50, 20, area);
+        // Should be clamped to area height
+        assert!(result.height <= 10);
+    }
+
+    #[test]
+    fn centered_rect_fixed_zero_dimensions() {
+        let area = ratatui::layout::Rect::new(0, 0, 0, 0);
+        let result = centered_rect_fixed(10, 5, area);
+        // Should handle gracefully
+        assert!(result.width >= 1);
+        assert!(result.height >= 1);
+    }
+
+    #[test]
+    fn active_send_shortcut_both_variants() {
+        let (key1, desc1) = active_send_shortcut_label(true);
+        let (key2, desc2) = active_send_shortcut_label(false);
+        assert_eq!(desc1, "send");
+        assert_eq!(desc2, "send");
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn all_shortcut_hints_includes_mandatory() {
+        let hints = all_shortcut_hints("Ctrl+S ", "send", false);
+        let keys: Vec<String> = hints.iter().map(|h| h.key.trim().to_string()).collect();
+        assert!(keys.contains(&"Ctrl+S".to_string()));
+        assert!(keys.contains(&"Esc".to_string()));
+    }
+
+    #[test]
+    fn all_shortcut_hints_with_scheduled() {
+        let hints = all_shortcut_hints("Ctrl+S ", "send", true);
+        let keys: Vec<String> = hints.iter().map(|h| h.key.trim().to_string()).collect();
+        assert!(keys.contains(&"Ctrl+P".to_string()));
+    }
+
+    #[test]
+    fn select_shortcut_hints_tiny_width() {
+        let hints = select_shortcut_hints(1, "Ctrl+S ", "send", false);
+        let keys: Vec<String> = hints.iter().map(|h| h.key.trim().to_string()).collect();
+        assert!(keys.contains(&"Ctrl+S".to_string()));
+        assert!(keys.contains(&"Esc".to_string()));
+    }
+
+    #[test]
+    fn style_collapsed_paste_blocks_unclosed_bracket() {
+        let result = style_collapsed_paste_blocks(
+            "text [Pasted ~3 lines more text here",
+            Color::Red,
+            Color::Black,
+        );
+        // No closing bracket, so rest is treated as normal text
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn style_collapsed_paste_blocks_multiple_pastes() {
+        let result = style_collapsed_paste_blocks(
+            "[Pasted ~2 lines] and [Pasted ~3 lines]",
+            Color::Red,
+            Color::Black,
+        );
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn scheduled_row_text_empty_prompt() {
+        let fire = chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let row = scheduled_row_text(fire, "", 40);
+        assert!(row.contains("00:00"));
+    }
+
+    #[test]
+    fn scheduled_row_text_multiline_prompt() {
+        let fire = chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+            .unwrap()
+            .and_hms_opt(12, 30, 0)
+            .unwrap();
+        let row = scheduled_row_text(fire, "first line\nsecond line\nthird line", 40);
+        assert!(row.contains("first line"));
+        assert!(!row.contains("second line"));
+    }
+
+    #[test]
+    fn shortcut_hint_width() {
+        let hint = ShortcutHint {
+            key: "Ctrl+S ".to_string(),
+            desc: "send  ".to_string(),
+            priority: 1,
+        };
+        // "Ctrl+S " (7 chars) + "send  " (6 chars) = 13
+        assert_eq!(hint.width(), 13);
+    }
+
+    #[test]
+    fn wrap_content_exactly_field_width() {
+        let styled = vec![("abcde".to_string(), None)];
+        let lines = wrap_styled_content(styled, None, 5, Color::Black);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(line_text(&lines[0]), "abcde");
+    }
+
+    #[test]
+    fn wrap_content_one_over_field_width() {
+        let styled = vec![("abcdef".to_string(), None)];
+        let lines = wrap_styled_content(styled, None, 5, Color::Black);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(line_text(&lines[0]), "abcde");
+        assert_eq!(line_text(&lines[1]), "f");
+    }
+
+    #[test]
+    fn wrap_content_empty_segments() {
+        let styled = vec![
+            (String::new(), None),
+            ("hello".to_string(), None),
+        ];
+        let lines = wrap_styled_content(styled, None, 40, Color::Black);
+        assert_eq!(line_text(&lines[0]), "hello");
+    }
 }

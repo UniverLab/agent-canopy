@@ -1874,6 +1874,7 @@ fn strip_resources_section(prompt: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Datelike;
     use tempfile::tempdir;
 
     #[test]
@@ -2613,6 +2614,995 @@ mod tests {
     fn raw_edit_scroll_initially_none() {
         let dialog = SimplePromptDialog::new();
         assert!(dialog.raw_edit_scroll.is_none());
+    }
+
+    // ── field_digit_width ────────────────────────────────────────
+
+    #[test]
+    fn field_digit_width_year_is_4() {
+        assert_eq!(field_digit_width(0), 4);
+    }
+
+    #[test]
+    fn field_digit_width_month_is_2() {
+        assert_eq!(field_digit_width(1), 2);
+    }
+
+    #[test]
+    fn field_digit_width_day_is_2() {
+        assert_eq!(field_digit_width(2), 2);
+    }
+
+    #[test]
+    fn field_digit_width_hour_is_2() {
+        assert_eq!(field_digit_width(3), 2);
+    }
+
+    #[test]
+    fn field_digit_width_minute_is_2() {
+        assert_eq!(field_digit_width(4), 2);
+    }
+
+    // ── days_in_month ────────────────────────────────────────────
+
+    #[test]
+    fn days_in_month_january() {
+        assert_eq!(days_in_month(2024, 1), 31);
+    }
+
+    #[test]
+    fn days_in_month_february_leap_year() {
+        assert_eq!(days_in_month(2024, 2), 29);
+    }
+
+    #[test]
+    fn days_in_month_february_non_leap() {
+        assert_eq!(days_in_month(2023, 2), 28);
+    }
+
+    #[test]
+    fn days_in_month_april() {
+        assert_eq!(days_in_month(2024, 4), 30);
+    }
+
+    #[test]
+    fn days_in_month_december() {
+        assert_eq!(days_in_month(2024, 12), 31);
+    }
+
+    // ── add_months ───────────────────────────────────────────────
+
+    #[test]
+    fn add_months_forward() {
+        let dt = chrono::NaiveDate::from_ymd_opt(2024, 1, 15)
+            .unwrap()
+            .and_hms_opt(10, 30, 0)
+            .unwrap();
+        let result = add_months(dt, 3).unwrap();
+        assert_eq!(result.month(), 4);
+        assert_eq!(result.year(), 2024);
+    }
+
+    #[test]
+    fn add_months_backward() {
+        let dt = chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
+            .unwrap()
+            .and_hms_opt(10, 30, 0)
+            .unwrap();
+        let result = add_months(dt, -1).unwrap();
+        assert_eq!(result.month(), 2);
+    }
+
+    #[test]
+    fn add_months_year_rollover() {
+        let dt = chrono::NaiveDate::from_ymd_opt(2024, 11, 15)
+            .unwrap()
+            .and_hms_opt(10, 30, 0)
+            .unwrap();
+        let result = add_months(dt, 2).unwrap();
+        assert_eq!(result.month(), 1);
+        assert_eq!(result.year(), 2025);
+    }
+
+    #[test]
+    fn add_months_day_clamping() {
+        // Jan 31 + 1 month = Feb 29 (2024 is leap)
+        let dt = chrono::NaiveDate::from_ymd_opt(2024, 1, 31)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+        let result = add_months(dt, 1).unwrap();
+        assert_eq!(result.month(), 2);
+        assert_eq!(result.day(), 29);
+    }
+
+    // ── with_field ───────────────────────────────────────────────
+
+    #[test]
+    fn with_field_year() {
+        let dt = chrono::NaiveDate::from_ymd_opt(2024, 6, 15)
+            .unwrap()
+            .and_hms_opt(10, 30, 0)
+            .unwrap();
+        let result = with_field(dt, 0, 2030).unwrap();
+        assert_eq!(result.year(), 2030);
+        assert_eq!(result.month(), 6);
+        assert_eq!(result.day(), 15);
+    }
+
+    #[test]
+    fn with_field_month_clamps_day() {
+        let dt = chrono::NaiveDate::from_ymd_opt(2024, 1, 31)
+            .unwrap()
+            .and_hms_opt(10, 30, 0)
+            .unwrap();
+        let result = with_field(dt, 1, 2).unwrap();
+        assert_eq!(result.month(), 2);
+        assert_eq!(result.day(), 29); // Clamped to Feb 29 (leap year)
+    }
+
+    #[test]
+    fn with_field_day_clamped_to_month_length() {
+        let dt = chrono::NaiveDate::from_ymd_opt(2024, 2, 15)
+            .unwrap()
+            .and_hms_opt(10, 30, 0)
+            .unwrap();
+        let result = with_field(dt, 2, 31).unwrap();
+        assert_eq!(result.day(), 29); // Feb 2024 has 29 days
+    }
+
+    #[test]
+    fn with_field_hour_clamped() {
+        let dt = chrono::NaiveDate::from_ymd_opt(2024, 6, 15)
+            .unwrap()
+            .and_hms_opt(10, 30, 0)
+            .unwrap();
+        let result = with_field(dt, 3, 25).unwrap();
+        assert_eq!(result.hour(), 23);
+    }
+
+    #[test]
+    fn with_field_minute_clamped() {
+        let dt = chrono::NaiveDate::from_ymd_opt(2024, 6, 15)
+            .unwrap()
+            .and_hms_opt(10, 30, 0)
+            .unwrap();
+        let result = with_field(dt, 4, 65).unwrap();
+        assert_eq!(result.minute(), 59);
+    }
+
+    // ── strip_resources_section ──────────────────────────────────
+
+    #[test]
+    fn strip_resources_section_removes_present_section() {
+        let input = "before\n# [RESOURCES]: Knowledge Base & Data\n<resources>\n  <resource>\n    path: /foo\n  </resource>\n</resources>\n\nafter";
+        let result = strip_resources_section(input);
+        assert!(result.starts_with("before"));
+        assert!(result.ends_with("after"));
+        assert!(!result.contains("RESOURCES"));
+    }
+
+    #[test]
+    fn strip_resources_section_no_section_unchanged() {
+        let input = "no resources section here";
+        assert_eq!(strip_resources_section(input), input);
+    }
+
+    #[test]
+    fn strip_resources_section_missing_closing_tag() {
+        let input = "# [RESOURCES]: Knowledge Base & Data\n<resources>\n  content\n";
+        assert_eq!(strip_resources_section(input), input);
+    }
+
+    // ── format_indexed_xml_section ────────────────────────────────
+
+    #[test]
+    fn format_indexed_xml_section_empty_items() {
+        assert!(format_indexed_xml_section("header", "outer", "item", &[]).is_none());
+    }
+
+    #[test]
+    fn format_indexed_xml_section_with_items() {
+        let items = vec!["item1".to_string(), "item2".to_string()];
+        let result = format_indexed_xml_section("# Header\n", "outer", "item", &items).unwrap();
+        assert!(result.contains("# Header"));
+        assert!(result.contains("<outer>"));
+        assert!(result.contains("</outer>"));
+        assert!(result.contains("<item>"));
+        assert!(result.contains("item1"));
+        assert!(result.contains("item2"));
+    }
+
+    // ── push_xml_item ────────────────────────────────────────────
+
+    #[test]
+    fn push_xml_item_basic() {
+        let mut result = String::new();
+        push_xml_item(&mut result, "tag", "content here");
+        assert!(result.contains("<tag>"));
+        assert!(result.contains("content here"));
+        assert!(result.contains("</tag>"));
+    }
+
+    #[test]
+    fn push_xml_item_multiline() {
+        let mut result = String::new();
+        push_xml_item(&mut result, "tag", "line1\nline2");
+        assert!(result.contains("line1"));
+        assert!(result.contains("line2"));
+    }
+
+    // ── append_tool_skill ────────────────────────────────────────
+
+    #[test]
+    fn append_tool_skill_basic() {
+        let mut result = String::new();
+        append_tool_skill(&mut result, "skill:code-engineering");
+        assert!(result.contains("<skill>"));
+        assert!(result.contains("skill:code-engineering"));
+        assert!(result.contains("</skill>"));
+    }
+
+    // ── visual_line_count edge cases ─────────────────────────────
+
+    #[test]
+    fn visual_line_count_empty_string() {
+        assert_eq!(SimplePromptDialog::visual_line_count("", 40), 1);
+    }
+
+    #[test]
+    fn visual_line_count_single_line() {
+        assert_eq!(SimplePromptDialog::visual_line_count("hello", 40), 1);
+    }
+
+    #[test]
+    fn visual_line_count_zero_width() {
+        assert_eq!(SimplePromptDialog::visual_line_count("hello", 0), 1);
+    }
+
+    #[test]
+    fn visual_line_count_newlines() {
+        assert_eq!(SimplePromptDialog::visual_line_count("a\nb\nc", 40), 3);
+    }
+
+    #[test]
+    fn visual_line_count_soft_wrap() {
+        // 10 chars in a field_width of 5 → 2 visual lines
+        assert_eq!(SimplePromptDialog::visual_line_count("abcdefghij", 5), 2);
+    }
+
+    #[test]
+    fn visual_line_count_tabs() {
+        // Tab at col 0 takes 4 cols, 'x' at col 4 within width 5 → 1 line total
+        assert_eq!(SimplePromptDialog::visual_line_count("\tx", 5), 1);
+    }
+
+    #[test]
+    fn visual_line_count_tab_no_wrap() {
+        // Tab at col 0 takes 4 cols, then "ab" (2 chars) → col 6, within width 10
+        assert_eq!(SimplePromptDialog::visual_line_count("\tab", 10), 1);
+    }
+
+    // ── max_visible_lines ────────────────────────────────────────
+
+    #[test]
+    fn max_visible_lines_instruction_section() {
+        assert_eq!(SimplePromptDialog::max_visible_lines("instruction_1"), 5);
+    }
+
+    #[test]
+    fn max_visible_lines_other_section() {
+        assert_eq!(SimplePromptDialog::max_visible_lines("context_1"), 3);
+        assert_eq!(SimplePromptDialog::max_visible_lines("goal_1"), 3);
+        assert_eq!(SimplePromptDialog::max_visible_lines("tools_1"), 3);
+    }
+
+    // ── section_type ─────────────────────────────────────────────
+
+    #[test]
+    fn section_type_instruction() {
+        assert_eq!(SimplePromptDialog::section_type("instruction_1"), "instruction");
+        assert_eq!(SimplePromptDialog::section_type("instruction"), "instruction");
+    }
+
+    #[test]
+    fn section_type_context() {
+        assert_eq!(SimplePromptDialog::section_type("context_2"), "context");
+    }
+
+    #[test]
+    fn section_type_unknown() {
+        assert_eq!(SimplePromptDialog::section_type("custom_thing"), "custom_thing");
+    }
+
+    // ── section_matches_prefix ───────────────────────────────────
+
+    #[test]
+    fn section_matches_prefix_exact() {
+        assert!(SimplePromptDialog::section_matches_prefix("instruction", "instruction"));
+    }
+
+    #[test]
+    fn section_matches_prefix_with_suffix() {
+        assert!(SimplePromptDialog::section_matches_prefix("instruction_1", "instruction"));
+    }
+
+    #[test]
+    fn section_matches_prefix_no_match() {
+        assert!(!SimplePromptDialog::section_matches_prefix("context_1", "instruction"));
+    }
+
+    // ── is_tools_section ─────────────────────────────────────────
+
+    #[test]
+    fn is_tools_section_exact() {
+        assert!(SimplePromptDialog::is_tools_section("tools"));
+    }
+
+    #[test]
+    fn is_tools_section_with_suffix() {
+        assert!(SimplePromptDialog::is_tools_section("tools_1"));
+    }
+
+    #[test]
+    fn is_tools_section_no_match() {
+        assert!(!SimplePromptDialog::is_tools_section("context"));
+        assert!(!SimplePromptDialog::is_tools_section("tool"));
+    }
+
+    // ── is_file_reference ────────────────────────────────────────
+
+    #[test]
+    fn is_file_reference_valid() {
+        assert!(SimplePromptDialog::is_file_reference("@src/lib.rs"));
+        assert!(SimplePromptDialog::is_file_reference("@file.txt"));
+        assert!(SimplePromptDialog::is_file_reference("@a"));
+    }
+
+    #[test]
+    fn is_file_reference_single_at() {
+        assert!(!SimplePromptDialog::is_file_reference("@"));
+    }
+
+    #[test]
+    fn is_file_reference_special_chars() {
+        assert!(!SimplePromptDialog::is_file_reference("@file with spaces"));
+        assert!(SimplePromptDialog::is_file_reference("@file_name-1.0.rs"));
+    }
+
+    // ── resolve_rag_scope ────────────────────────────────────────
+
+    #[test]
+    fn resolve_rag_scope_global_prefix() {
+        let (scope, query) = SimplePromptDialog::resolve_rag_scope("global:my query", None);
+        assert!(matches!(scope, RagScope::Global));
+        assert_eq!(query, "my query");
+    }
+
+    #[test]
+    fn resolve_rag_scope_project_prefix() {
+        let (scope, query) =
+            SimplePromptDialog::resolve_rag_scope("project:abc123:my query", None);
+        assert!(matches!(scope, RagScope::Project("abc123")));
+        assert_eq!(query, "my query");
+    }
+
+    #[test]
+    fn resolve_rag_scope_no_prefix_with_default() {
+        let (scope, query) = SimplePromptDialog::resolve_rag_scope("my query", Some("hash1"));
+        assert!(matches!(scope, RagScope::Project("hash1")));
+        assert_eq!(query, "my query");
+    }
+
+    #[test]
+    fn resolve_rag_scope_no_prefix_no_default() {
+        let (scope, query) = SimplePromptDialog::resolve_rag_scope("my query", None);
+        assert!(matches!(scope, RagScope::Global));
+        assert_eq!(query, "my query");
+    }
+
+    // ── next_file_reference ──────────────────────────────────────
+
+    #[test]
+    fn next_file_reference_finds_at() {
+        let text = "look at @src/lib.rs for details";
+        let result = SimplePromptDialog::next_file_reference(text, 0);
+        assert!(result.is_some());
+        let (pos, _ref, next) = result.unwrap();
+        assert_eq!(pos, 8); // "look at @" — @ is at index 8
+        assert_eq!(_ref, "@src/lib.rs");
+        assert!(next > pos);
+    }
+
+    #[test]
+    fn next_file_reference_no_at() {
+        let text = "no references here";
+        assert!(SimplePromptDialog::next_file_reference(text, 0).is_none());
+    }
+
+    #[test]
+    fn next_file_reference_with_offset() {
+        let text = "first @one then @two";
+        let (pos1, ref1, next1) = SimplePromptDialog::next_file_reference(text, 0).unwrap();
+        assert_eq!(pos1, 6);
+        assert_eq!(ref1, "@one");
+        let (pos2, ref2, _) = SimplePromptDialog::next_file_reference(text, next1).unwrap();
+        assert_eq!(pos2, 16);
+        assert_eq!(ref2, "@two");
+    }
+
+    // ── focus navigation ─────────────────────────────────────────
+
+    #[test]
+    fn focus_next_wraps_from_last_to_send() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.add_section("goal");
+        let last = dialog.enabled_sections.len();
+        dialog.focused_section = last; // last section
+        dialog.focus_next();
+        assert_eq!(dialog.focused_section, 0); // send control
+    }
+
+    #[test]
+    fn focus_next_wraps_from_send_to_first() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.focused_section = 0;
+        dialog.focus_next();
+        assert_eq!(dialog.focused_section, 1);
+    }
+
+    #[test]
+    fn focus_prev_from_send_goes_to_last() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.add_section("goal");
+        dialog.focused_section = 0;
+        dialog.focus_prev();
+        assert_eq!(dialog.focused_section, dialog.enabled_sections.len());
+    }
+
+    #[test]
+    fn focus_prev_from_first_goes_to_send() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.focused_section = 1;
+        dialog.focus_prev();
+        assert_eq!(dialog.focused_section, 0);
+    }
+
+    #[test]
+    fn focused_section_index_send_returns_none() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.focused_section = 0;
+        assert!(dialog.focused_section_index().is_none());
+    }
+
+    #[test]
+    fn focused_section_index_section_returns_some() {
+        let dialog = SimplePromptDialog::new();
+        assert_eq!(dialog.focused_section_index(), Some(0));
+    }
+
+    // ── send display ─────────────────────────────────────────────
+
+    #[test]
+    fn send_display_now() {
+        let dialog = SimplePromptDialog::new();
+        assert_eq!(dialog.send_display(), "now");
+    }
+
+    #[test]
+    fn send_display_date_no_time() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.send_choice = SendChoice::Date;
+        assert_eq!(dialog.send_display(), "date");
+    }
+
+    #[test]
+    fn send_display_date_with_time() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.send_choice = SendChoice::Date;
+        dialog.send_at = Some(
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 20)
+                .unwrap()
+                .and_hms_opt(14, 30, 0)
+                .unwrap(),
+        );
+        assert_eq!(dialog.send_display(), "2026-07-20 14:30");
+    }
+
+    // ── send toggle and clear ────────────────────────────────────
+
+    #[test]
+    fn send_toggle_now_to_date() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.send_toggle();
+        assert_eq!(dialog.send_choice, SendChoice::Date);
+    }
+
+    #[test]
+    fn send_toggle_date_to_now_clears() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.send_choice = SendChoice::Date;
+        dialog.send_at = Some(chrono::Local::now().naive_local());
+        dialog.send_edit = Some(SendAtEdit {
+            value: chrono::Local::now().naive_local(),
+            field: 0,
+            typed: 0,
+            typed_len: 0,
+        });
+        dialog.send_toggle();
+        assert_eq!(dialog.send_choice, SendChoice::Now);
+        assert!(dialog.send_at.is_none());
+        assert!(dialog.send_edit.is_none());
+    }
+
+    #[test]
+    fn clear_send_at() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.send_choice = SendChoice::Date;
+        dialog.send_at = Some(chrono::Local::now().naive_local());
+        dialog.send_edit = Some(SendAtEdit {
+            value: chrono::Local::now().naive_local(),
+            field: 0,
+            typed: 0,
+            typed_len: 0,
+        });
+        dialog.clear_send_at();
+        assert_eq!(dialog.send_choice, SendChoice::Now);
+        assert!(dialog.send_at.is_none());
+        assert!(dialog.send_edit.is_none());
+    }
+
+    // ── send_edit operations ─────────────────────────────────────
+
+    #[test]
+    fn send_edit_move_clamps_field() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.send_begin_edit();
+        dialog.send_edit_move(10);
+        let edit = dialog.send_edit.unwrap();
+        assert_eq!(edit.field, 4); // clamped to minute
+        dialog.send_edit_move(-100);
+        let edit = dialog.send_edit.unwrap();
+        assert_eq!(edit.field, 0); // clamped to year
+    }
+
+    #[test]
+    fn send_edit_adjust_day() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.send_begin_edit();
+        dialog.send_edit.as_mut().unwrap().field = 2; // day
+        dialog.send_edit_adjust(1);
+        let edit = dialog.send_edit.unwrap();
+        assert_eq!(edit.value.day(), chrono::Local::now().naive_local().day() + 1);
+    }
+
+    #[test]
+    fn send_edit_type_digit_auto_advances_field() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.send_begin_edit();
+        dialog.send_edit.as_mut().unwrap().field = 3; // hour (width 2)
+        dialog.send_edit_type_digit(1);
+        // After 1 digit (not yet full), typed=1, typed_len=1
+        assert_eq!(dialog.send_edit.as_ref().unwrap().typed, 1);
+        assert_eq!(dialog.send_edit.as_ref().unwrap().typed_len, 1);
+        dialog.send_edit_type_digit(4);
+        // After 2 digits (field full), auto-advances to minute, typed resets
+        assert_eq!(dialog.send_edit.as_ref().unwrap().field, 4);
+        assert_eq!(dialog.send_edit.as_ref().unwrap().typed, 0);
+    }
+
+    #[test]
+    fn send_edit_confirm_past_rejects() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.send_begin_edit();
+        dialog.send_edit.as_mut().unwrap().value = chrono::NaiveDateTime::default(); // epoch
+        assert!(!dialog.send_edit_confirm());
+        assert!(dialog.send_error.is_some());
+    }
+
+    #[test]
+    fn send_edit_cancel_no_prior_send_returns_now() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.send_begin_edit();
+        dialog.send_edit_cancel();
+        assert!(dialog.send_edit.is_none());
+        assert_eq!(dialog.send_choice, SendChoice::Now);
+    }
+
+    #[test]
+    fn send_edit_cancel_with_prior_send_stays_date() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.send_choice = SendChoice::Date;
+        dialog.send_at = Some(chrono::Local::now().naive_local());
+        dialog.send_begin_edit();
+        dialog.send_edit_cancel();
+        assert!(dialog.send_edit.is_none());
+        assert_eq!(dialog.send_choice, SendChoice::Date);
+    }
+
+    // ── is_send_at_focused ───────────────────────────────────────
+
+    #[test]
+    fn is_send_at_focused_true() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.focused_section = 0;
+        assert!(dialog.is_send_at_focused());
+    }
+
+    #[test]
+    fn is_send_at_focused_false_on_section() {
+        let dialog = SimplePromptDialog::new();
+        assert!(!dialog.is_send_at_focused());
+    }
+
+    // ── total_focusable ──────────────────────────────────────────
+
+    #[test]
+    fn total_focusable_empty_sections() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.enabled_sections.clear();
+        assert_eq!(dialog.total_focusable(), 1); // just send control
+    }
+
+    #[test]
+    fn total_focusable_with_sections() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.add_section("goal");
+        dialog.add_section("context");
+        // instruction_1 + goal_1 + context_1 = 3 sections + send = 4
+        assert_eq!(dialog.total_focusable(), 4);
+    }
+
+    // ── section_entries and section_lines ─────────────────────────
+
+    #[test]
+    fn section_entries_filters_empty() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.set_section_content("instruction_1", "  ".to_string());
+        assert!(dialog.section_entries("instruction").is_empty());
+    }
+
+    #[test]
+    fn section_entries_includes_non_empty() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.set_section_content("instruction_1", "do something".to_string());
+        assert_eq!(dialog.section_entries("instruction").len(), 1);
+    }
+
+    #[test]
+    fn section_lines_splits_multiline() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.set_section_content("instruction_1", "line1\nline2\nline3".to_string());
+        let lines = dialog.section_lines("instruction");
+        assert_eq!(lines.len(), 3);
+    }
+
+    // ── build_body ───────────────────────────────────────────────
+
+    #[test]
+    fn build_body_empty_dialog() {
+        let dialog = SimplePromptDialog::new();
+        let body = dialog.build_body();
+        assert!(!body.contains("GOAL"));
+        assert!(!body.contains("CONTEXT"));
+        assert!(body.contains("INSTRUCTIONS"));
+    }
+
+    #[test]
+    fn build_body_with_goal() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.set_section_content("instruction_1", "do it".to_string());
+        dialog.add_section_with_content("goal", "ship the feature".to_string());
+        let body = dialog.build_body();
+        assert!(body.contains("GOAL"));
+        assert!(body.contains("ship the feature"));
+    }
+
+    // ── collect_tool_lines ───────────────────────────────────────
+
+    #[test]
+    fn collect_tool_lines_empty() {
+        let dialog = SimplePromptDialog::new();
+        assert!(dialog.collect_tool_lines().is_empty());
+    }
+
+    #[test]
+    fn collect_tool_lines_with_content() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.add_section_with_content("tools", "skill:code-engineering\nskill:rust-idiomatic".to_string());
+        let lines = dialog.collect_tool_lines();
+        assert_eq!(lines.len(), 2);
+    }
+
+    // ── PromptBuilderSession round-trip ──────────────────────────
+
+    #[test]
+    fn prompt_builder_session_from_dialog_copies_all_fields() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.set_section_content("instruction_1", "test".to_string());
+        dialog.add_section_with_content("context", "ctx".to_string());
+        dialog.send_choice = SendChoice::Date;
+        dialog.send_at = Some(chrono::Local::now().naive_local());
+
+        let session = PromptBuilderSession::from_dialog(&dialog);
+        assert_eq!(
+            session.sections.get("instruction_1").map(String::as_str),
+            Some("test")
+        );
+        // Find the context section (it will have a generated name like "context_1" or "context_2")
+        let ctx_val = session
+            .sections
+            .iter()
+            .find(|(k, _)| k.starts_with("context"))
+            .map(|(_, v)| v.as_str());
+        assert_eq!(ctx_val, Some("ctx"));
+        // send_at is persisted in PromptBuilderSession
+        assert!(session.send_at.is_some());
+    }
+
+    // ── PersistedBuilderState round-trip ─────────────────────────
+
+    #[test]
+    fn persisted_builder_state_excludes_send_at() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.set_section_content("instruction_1", "test".to_string());
+        dialog.send_choice = SendChoice::Date;
+        dialog.send_at = Some(chrono::Local::now().naive_local());
+
+        let snapshot = PersistedBuilderState::from_dialog(&dialog);
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let restored: PersistedBuilderState = serde_json::from_str(&json).unwrap();
+
+        let mut target = SimplePromptDialog::new();
+        restored.restore_into(&mut target);
+        // send_at must NOT be restored from persisted state
+        assert!(target.send_at.is_none());
+    }
+
+    // ── get_removable_sections ───────────────────────────────────
+
+    #[test]
+    fn get_removable_sections_single_instruction_not_removable() {
+        let dialog = SimplePromptDialog::new();
+        let removable = dialog.get_removable_sections();
+        assert!(removable.is_empty());
+    }
+
+    #[test]
+    fn get_removable_sections_multiple_instructions_all_removable() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.add_section("instruction");
+        let removable = dialog.get_removable_sections();
+        assert_eq!(removable.len(), 2);
+    }
+
+    #[test]
+    fn get_removable_sections_non_instruction_always_removable() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.add_section("context");
+        let removable = dialog.get_removable_sections();
+        assert!(removable.iter().any(|(id, _)| id.starts_with("context")));
+    }
+
+    // ── remove_section protection ────────────────────────────────
+
+    #[test]
+    fn remove_section_last_instruction_protected() {
+        let mut dialog = SimplePromptDialog::new();
+        let id = dialog.enabled_sections[0].clone();
+        dialog.remove_section(&id);
+        // Should not have removed it
+        assert_eq!(dialog.enabled_sections.len(), 1);
+    }
+
+    #[test]
+    fn remove_section_non_instruction_removable() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.add_section("context");
+        let ctx_id = dialog
+            .enabled_sections
+            .iter()
+            .find(|id| id.starts_with("context"))
+            .cloned()
+            .unwrap();
+        let len_before = dialog.enabled_sections.len();
+        dialog.remove_section(&ctx_id);
+        assert_eq!(dialog.enabled_sections.len(), len_before - 1);
+    }
+
+    // ── get_section_content / set_section_content ─────────────────
+
+    #[test]
+    fn get_section_content_missing_returns_empty() {
+        let dialog = SimplePromptDialog::new();
+        assert!(dialog.get_section_content("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn set_section_content_round_trip() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.set_section_content("instruction_1", "hello".to_string());
+        assert_eq!(dialog.get_section_content("instruction_1"), "hello");
+    }
+
+    // ── section_content_for_build with collapsed paste ────────────
+
+    #[test]
+    fn section_content_for_build_returns_collapsed_paste() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.set_section_content("instruction_1", "[Pasted ~3 lines]".to_string());
+        dialog.collapsed_pastes.insert(
+            "instruction_1".to_string(),
+            "real content\nmore lines\nfinal".to_string(),
+        );
+        assert_eq!(
+            dialog.section_content_for_build("instruction_1"),
+            Some("real content\nmore lines\nfinal")
+        );
+    }
+
+    // ── should_collapse_paste ────────────────────────────────────
+
+    #[test]
+    fn should_collapse_paste_single_short_line() {
+        assert!(!SimplePromptDialog::should_collapse_paste("hello"));
+    }
+
+    #[test]
+    fn should_collapse_paste_multiline() {
+        assert!(SimplePromptDialog::should_collapse_paste("line1\nline2"));
+    }
+
+    #[test]
+    fn should_collapse_paste_long_line() {
+        assert!(SimplePromptDialog::should_collapse_paste(&"a".repeat(201)));
+    }
+
+    #[test]
+    fn should_collapse_paste_exactly_200_chars() {
+        assert!(!SimplePromptDialog::should_collapse_paste(&"a".repeat(200)));
+    }
+
+    // ── expand_collapsed_paste ───────────────────────────────────
+
+    #[test]
+    fn expand_collapsed_paste_restores_content() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.set_section_content("instruction_1", "[Pasted ~2 lines]".to_string());
+        dialog.collapsed_pastes.insert(
+            "instruction_1".to_string(),
+            "real\ncontent".to_string(),
+        );
+        dialog.expand_collapsed_paste("instruction_1");
+        assert_eq!(dialog.get_section_content("instruction_1"), "real\ncontent");
+        assert!(!dialog.has_collapsed_paste("instruction_1"));
+    }
+
+    #[test]
+    fn expand_collapsed_paste_noop_without_paste() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.set_section_content("instruction_1", "normal".to_string());
+        dialog.expand_collapsed_paste("instruction_1");
+        assert_eq!(dialog.get_section_content("instruction_1"), "normal");
+    }
+
+    // ── cursor_in_collapsed_placeholder ───────────────────────────
+
+    #[test]
+    fn cursor_in_collapsed_placeholder_no_paste() {
+        let dialog = SimplePromptDialog::new();
+        assert!(!dialog.cursor_in_collapsed_placeholder("instruction_1"));
+    }
+
+    // ── scroll_raw_preview ───────────────────────────────────────
+
+    #[test]
+    fn scroll_raw_preview_clamps() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.raw_preview = Some("line1\nline2\nline3".to_string());
+        dialog.scroll_raw_preview(100);
+        assert_eq!(dialog.raw_preview_scroll, 2); // max = 3 lines - 1 = 2
+    }
+
+    #[test]
+    fn scroll_raw_preview_negative_clamps_to_zero() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.raw_preview = Some("line1\nline2".to_string());
+        dialog.raw_preview_scroll = 0;
+        dialog.scroll_raw_preview(-5);
+        assert_eq!(dialog.raw_preview_scroll, 0);
+    }
+
+    // ── load_flat_text ───────────────────────────────────────────
+
+    #[test]
+    fn load_flat_text_resets_counters() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.add_section("goal");
+        dialog.add_section("context");
+        dialog.load_flat_text("recovered");
+        assert_eq!(dialog.enabled_sections.len(), 1);
+        assert_eq!(dialog.get_section_content("instruction_1"), "recovered");
+    }
+
+    // ── insert_collapsed_paste_at_cursor short text ──────────────
+
+    #[test]
+    fn insert_collapsed_paste_short_text_not_collapsed() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.insert_collapsed_paste_at_cursor("instruction_1", "short", 80);
+        assert_eq!(dialog.get_section_content("instruction_1"), "short");
+        assert!(!dialog.has_collapsed_paste("instruction_1"));
+    }
+
+    // ── backspace_collapsed_paste without paste ───────────────────
+
+    #[test]
+    fn backspace_collapsed_paste_noop_without_paste() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.set_section_content("instruction_1", "normal text".to_string());
+        dialog.backspace_collapsed_paste("instruction_1", 80);
+        assert_eq!(dialog.get_section_content("instruction_1"), "normal text");
+    }
+
+    // ── add_resource_reference ───────────────────────────────────
+
+    #[test]
+    fn add_resource_reference_no_existing_section() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.add_resource_reference("/path/to/file");
+        assert!(dialog
+            .enabled_sections
+            .iter()
+            .any(|id| id.starts_with("resources")));
+        assert_eq!(
+            dialog.get_section_content(
+                &dialog
+                    .resources_section_id()
+                    .unwrap()
+            ),
+            "/path/to/file"
+        );
+    }
+
+    #[test]
+    fn add_resource_reference_appends_to_existing() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.add_section_with_content("resources", "existing".to_string());
+        dialog.add_resource_reference("/new/path");
+        let content = dialog.get_section_content(&dialog.resources_section_id().unwrap());
+        assert!(content.contains("existing"));
+        assert!(content.contains("/new/path"));
+    }
+
+    // ── resources_section_id ─────────────────────────────────────
+
+    #[test]
+    fn resources_section_id_none_when_empty() {
+        let dialog = SimplePromptDialog::new();
+        assert!(dialog.resources_section_id().is_none());
+    }
+
+    #[test]
+    fn resources_section_id_found() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.add_section("resources");
+        assert!(dialog.resources_section_id().is_some());
+    }
+
+    // ── display name ─────────────────────────────────────────────
+
+    #[test]
+    fn section_display_name_with_number() {
+        let name = SimplePromptDialog::section_display_name("instruction_1");
+        assert!(name.contains("Instruction"));
+        assert!(name.contains("1"));
+    }
+
+    #[test]
+    fn section_display_name_without_number() {
+        let name = SimplePromptDialog::section_display_name("tools");
+        assert!(name.contains("Tools"));
     }
 }
 

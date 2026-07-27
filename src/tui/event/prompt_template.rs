@@ -2114,3 +2114,355 @@ mod send_at_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod should_expand_tests {
+    use super::should_expand_on_key;
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+
+    #[test]
+    fn char_keys_expand() {
+        assert!(should_expand_on_key(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(should_expand_on_key(KeyCode::Char('z'), KeyModifiers::SHIFT));
+        assert!(should_expand_on_key(KeyCode::Char(' '), KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn backspace_and_delete_expand() {
+        assert!(should_expand_on_key(
+            KeyCode::Backspace,
+            KeyModifiers::NONE
+        ));
+        assert!(should_expand_on_key(KeyCode::Delete, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn enter_with_modifier_expands() {
+        assert!(should_expand_on_key(
+            KeyCode::Enter,
+            KeyModifiers::CONTROL
+        ));
+    }
+
+    #[test]
+    fn enter_without_modifier_does_not_expand() {
+        assert!(!should_expand_on_key(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn navigation_keys_do_not_expand() {
+        assert!(!should_expand_on_key(KeyCode::Up, KeyModifiers::NONE));
+        assert!(!should_expand_on_key(KeyCode::Down, KeyModifiers::NONE));
+        assert!(!should_expand_on_key(KeyCode::Left, KeyModifiers::NONE));
+        assert!(!should_expand_on_key(KeyCode::Right, KeyModifiers::NONE));
+        assert!(!should_expand_on_key(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(!should_expand_on_key(
+            KeyCode::BackTab,
+            KeyModifiers::SHIFT
+        ));
+    }
+
+    #[test]
+    fn other_keys_do_not_expand() {
+        assert!(!should_expand_on_key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!should_expand_on_key(
+            KeyCode::PageUp,
+            KeyModifiers::NONE
+        ));
+        assert!(!should_expand_on_key(
+            KeyCode::PageDown,
+            KeyModifiers::NONE
+        ));
+        assert!(!should_expand_on_key(KeyCode::Home, KeyModifiers::NONE));
+        assert!(!should_expand_on_key(KeyCode::End, KeyModifiers::NONE));
+    }
+}
+
+#[cfg(test)]
+mod focused_section_name_tests {
+    use super::focused_section_name;
+    use crate::tui::app::dialog::SimplePromptDialog;
+
+    #[test]
+    fn focus_zero_returns_none() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.focused_section = 0;
+        assert!(focused_section_name(&mut dialog).is_none());
+    }
+
+    #[test]
+    fn focus_one_returns_first_section() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.focused_section = 1;
+        assert_eq!(
+            focused_section_name(&mut dialog),
+            Some("instruction_1".to_string())
+        );
+    }
+
+    #[test]
+    fn stale_focus_is_clamped() {
+        let mut dialog = SimplePromptDialog::new();
+        // Only 1 enabled section; focus 5 is out of bounds.
+        dialog.focused_section = 5;
+        let name = focused_section_name(&mut dialog);
+        assert!(name.is_some());
+        assert_eq!(dialog.focused_section, 1, "should be clamped to valid index");
+    }
+
+    #[test]
+    fn no_enabled_sections_returns_none_for_nonzero_focus() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.enabled_sections.clear();
+        dialog.focused_section = 1;
+        assert!(focused_section_name(&mut dialog).is_none());
+    }
+}
+
+#[cfg(test)]
+mod normalize_altgr_char_tests {
+    use super::normalize_altgr_char;
+
+    #[test]
+    fn maps_q_q_and_2_to_at() {
+        assert_eq!(normalize_altgr_char('q'), '@');
+        assert_eq!(normalize_altgr_char('Q'), '@');
+        assert_eq!(normalize_altgr_char('2'), '@');
+    }
+
+    #[test]
+    fn other_chars_pass_through() {
+        assert_eq!(normalize_altgr_char('a'), 'a');
+        assert_eq!(normalize_altgr_char('z'), 'z');
+        assert_eq!(normalize_altgr_char(' '), ' ');
+        assert_eq!(normalize_altgr_char('1'), '1');
+    }
+}
+
+#[cfg(test)]
+mod is_instruction_section_tests {
+    use super::is_instruction_section;
+
+    #[test]
+    fn plain_instruction() {
+        assert!(is_instruction_section("instruction"));
+    }
+
+    #[test]
+    fn numbered_instruction() {
+        assert!(is_instruction_section("instruction_1"));
+        assert!(is_instruction_section("instruction_42"));
+    }
+
+    #[test]
+    fn non_instruction_sections() {
+        assert!(!is_instruction_section("tools"));
+        assert!(!is_instruction_section("project_context"));
+        assert!(!is_instruction_section("context"));
+        assert!(!is_instruction_section(""));
+        assert!(!is_instruction_section("instructions"));
+    }
+}
+
+#[cfg(test)]
+mod picker_navigation_tests {
+    use super::*;
+    use crate::db::Database;
+    use crate::tui::app::dialog::{ProjectPickerEntry, SectionPickerMode, SimplePromptDialog};
+    use std::sync::Arc;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn skills_picker_up_at_zero_wraps() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.picker_mode = SectionPickerMode::SkillsPicker {
+            selected: 0,
+            entries: vec![
+                ("s1".into(), "r1".into(), "skill".into()),
+                ("s2".into(), "r2".into(), "skill".into()),
+            ],
+            replace_id: None,
+        };
+        handle_skills_picker_key(&mut dialog, 0, 2, KeyCode::Up);
+        if let SectionPickerMode::SkillsPicker { selected, .. } = &dialog.picker_mode {
+            assert_eq!(*selected, 1, "wraps to last");
+        } else {
+            panic!("expected SkillsPicker");
+        }
+    }
+
+    #[test]
+    fn skills_picker_down_at_end_wraps() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.picker_mode = SectionPickerMode::SkillsPicker {
+            selected: 1,
+            entries: vec![
+                ("s1".into(), "r1".into(), "skill".into()),
+                ("s2".into(), "r2".into(), "skill".into()),
+            ],
+            replace_id: None,
+        };
+        handle_skills_picker_key(&mut dialog, 1, 2, KeyCode::Down);
+        if let SectionPickerMode::SkillsPicker { selected, .. } = &dialog.picker_mode {
+            assert_eq!(*selected, 0, "wraps to first");
+        } else {
+            panic!("expected SkillsPicker");
+        }
+    }
+
+    #[test]
+    fn skills_picker_esc_closes() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.picker_mode = SectionPickerMode::SkillsPicker {
+            selected: 0,
+            entries: vec![("s1".into(), "r1".into(), "skill".into())],
+            replace_id: None,
+        };
+        handle_skills_picker_key(&mut dialog, 0, 1, KeyCode::Esc);
+        assert_eq!(dialog.picker_mode, SectionPickerMode::None);
+    }
+
+    #[test]
+    fn project_picker_navigation() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.picker_mode = SectionPickerMode::ProjectPicker {
+            selected: 0,
+            entries: vec![
+                ProjectPickerEntry {
+                    hash: "h1".into(),
+                    name: "p1".into(),
+                    path: "/p1".into(),
+                },
+                ProjectPickerEntry {
+                    hash: "h2".into(),
+                    name: "p2".into(),
+                    path: "/p2".into(),
+                },
+            ],
+        };
+        handle_project_picker_key(&mut dialog, 0, 2, KeyCode::Down);
+        if let SectionPickerMode::ProjectPicker { selected, .. } = &dialog.picker_mode {
+            assert_eq!(*selected, 1);
+        } else {
+            panic!("expected ProjectPicker");
+        }
+    }
+
+    #[test]
+    fn project_picker_esc_closes() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.picker_mode = SectionPickerMode::ProjectPicker {
+            selected: 0,
+            entries: vec![ProjectPickerEntry {
+                hash: "h1".into(),
+                name: "p1".into(),
+                path: "/p1".into(),
+            }],
+        };
+        handle_project_picker_key(&mut dialog, 0, 1, KeyCode::Esc);
+        assert_eq!(dialog.picker_mode, SectionPickerMode::None);
+    }
+
+    #[test]
+    fn add_custom_section_esc_closes() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.picker_mode = SectionPickerMode::AddCustom {
+            input: "test".into(),
+        };
+        handle_add_custom_section_key(&mut dialog, "test".into(), KeyCode::Esc);
+        assert_eq!(dialog.picker_mode, SectionPickerMode::None);
+    }
+
+    #[test]
+    fn add_custom_section_char_appends() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.picker_mode = SectionPickerMode::AddCustom {
+            input: String::new(),
+        };
+        handle_add_custom_section_key(&mut dialog, String::new(), KeyCode::Char('x'));
+        if let SectionPickerMode::AddCustom { input } = &dialog.picker_mode {
+            assert_eq!(input, "x");
+        } else {
+            panic!("expected AddCustom");
+        }
+    }
+
+    #[test]
+    fn add_custom_section_backspace_removes() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.picker_mode = SectionPickerMode::AddCustom {
+            input: "abc".into(),
+        };
+        handle_add_custom_section_key(
+            &mut dialog,
+            "abc".into(),
+            KeyCode::Backspace,
+        );
+        if let SectionPickerMode::AddCustom { input } = &dialog.picker_mode {
+            assert_eq!(input, "ab");
+        } else {
+            panic!("expected AddCustom");
+        }
+    }
+
+    #[test]
+    fn remove_section_picker_navigation() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.picker_mode = SectionPickerMode::RemoveSection { selected: 1 };
+        handle_remove_section_picker_key(&mut dialog, 1, KeyCode::Up);
+        if let SectionPickerMode::RemoveSection { selected } = &dialog.picker_mode {
+            assert_eq!(*selected, 0);
+        } else {
+            panic!("expected RemoveSection");
+        }
+    }
+
+    #[test]
+    fn remove_section_picker_esc_closes() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.picker_mode = SectionPickerMode::RemoveSection { selected: 0 };
+        handle_remove_section_picker_key(&mut dialog, 0, KeyCode::Esc);
+        assert_eq!(dialog.picker_mode, SectionPickerMode::None);
+    }
+
+    fn test_db() -> Arc<Database> {
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        Arc::new(Database::new(&path).expect("create test db"))
+    }
+
+    #[test]
+    fn add_section_picker_up_at_zero_is_noop() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.picker_mode = SectionPickerMode::AddSection { selected: 0 };
+        let db = test_db();
+        let workdir = Path::new("/tmp");
+        handle_add_section_picker_key(&mut dialog, 0, &db, workdir, KeyCode::Up).unwrap();
+        if let SectionPickerMode::AddSection { selected } = &dialog.picker_mode {
+            assert_eq!(*selected, 0, "should stay at 0");
+        } else {
+            panic!("expected AddSection");
+        }
+    }
+
+    #[test]
+    fn add_section_picker_custom_switches_mode() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.picker_mode = SectionPickerMode::AddSection { selected: 0 };
+        let db = test_db();
+        let workdir = Path::new("/tmp");
+        handle_add_section_picker_key(
+            &mut dialog,
+            0,
+            &db,
+            workdir,
+            KeyCode::Char('c'),
+        )
+        .unwrap();
+        assert!(matches!(
+            dialog.picker_mode,
+            SectionPickerMode::AddCustom { .. }
+        ));
+    }
+}

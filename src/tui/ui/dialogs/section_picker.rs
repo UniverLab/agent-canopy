@@ -457,3 +457,328 @@ pub(crate) fn draw_section_picker_modal(
         SectionPickerMode::None => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::app::dialog::{SectionPickerMode, SimplePromptDialog};
+    use crate::tui::app::types::App;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::sync::Arc;
+
+    fn make_app_with_prompt_dialog() -> App {
+        use crate::db::Database;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(db, data_dir.path()).unwrap();
+        app.simple_prompt_dialog = Some(SimplePromptDialog::new());
+        app
+    }
+
+    fn render_to_text(width: u16, height: u16, draw: impl FnOnce(&mut ratatui::Frame, ratatui::layout::Rect)) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| {
+            let area = frame.area();
+            draw(frame, area);
+        }).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn draw_section_picker_none_does_nothing() {
+        let app = make_app_with_prompt_dialog();
+        let theme = Theme::classic();
+        let text = render_to_text(80, 24, |frame, _area| {
+            draw_section_picker_modal(frame, &app, Color::Cyan, &SectionPickerMode::None, &theme);
+        });
+        // None mode should render nothing from the modal
+        assert!(!text.contains("Add Section"));
+    }
+
+    #[test]
+    fn draw_section_picker_no_dialog_returns_early() {
+        let mut app = make_app_with_prompt_dialog();
+        app.simple_prompt_dialog = None;
+        let theme = Theme::classic();
+        let text = render_to_text(80, 24, |frame, _area| {
+            draw_section_picker_modal(
+                frame,
+                &app,
+                Color::Cyan,
+                &SectionPickerMode::AddSection { selected: 0 },
+                &theme,
+            );
+        });
+        // Without dialog, nothing renders
+        assert!(!text.contains("Add Section"));
+    }
+
+    #[test]
+    fn draw_add_section_picker() {
+        let app = make_app_with_prompt_dialog();
+        let theme = Theme::classic();
+        let text = render_to_text(80, 24, |frame, _area| {
+            draw_section_picker_modal(
+                frame,
+                &app,
+                Color::Cyan,
+                &SectionPickerMode::AddSection { selected: 0 },
+                &theme,
+            );
+        });
+        assert!(text.contains("Add Section"), "Should render Add Section title: {text}");
+        assert!(text.contains("select"), "Should show hint: {text}");
+    }
+
+    #[test]
+    fn draw_add_custom_section_picker() {
+        let app = make_app_with_prompt_dialog();
+        let theme = Theme::classic();
+        let text = render_to_text(80, 24, |frame, _area| {
+            draw_section_picker_modal(
+                frame,
+                &app,
+                Color::Cyan,
+                &SectionPickerMode::AddCustom {
+                    input: "my_section".to_string(),
+                },
+                &theme,
+            );
+        });
+        assert!(text.contains("Custom Section"), "Should render Custom Section title: {text}");
+        assert!(text.contains("my_section"), "Should show input: {text}");
+    }
+
+    #[test]
+    fn draw_add_custom_section_picker_empty_input() {
+        let app = make_app_with_prompt_dialog();
+        let theme = Theme::classic();
+        let text = render_to_text(80, 24, |frame, _area| {
+            draw_section_picker_modal(
+                frame,
+                &app,
+                Color::Cyan,
+                &SectionPickerMode::AddCustom {
+                    input: String::new(),
+                },
+                &theme,
+            );
+        });
+        assert!(text.contains("Custom Section"), "Should render Custom Section title: {text}");
+        // Empty input still shows the cursor
+        assert!(text.contains('│'), "Should show cursor: {text}");
+    }
+
+    #[test]
+    fn draw_remove_section_picker() {
+        let app = make_app_with_prompt_dialog();
+        let theme = Theme::classic();
+        let text = render_to_text(80, 24, |frame, _area| {
+            draw_section_picker_modal(
+                frame,
+                &app,
+                Color::Cyan,
+                &SectionPickerMode::RemoveSection { selected: 0 },
+                &theme,
+            );
+        });
+        assert!(text.contains("Remove Section"), "Should render Remove Section title: {text}");
+        assert!(text.contains("cancel"), "Should show cancel hint: {text}");
+    }
+
+    #[test]
+    fn draw_skills_picker() {
+        let app = make_app_with_prompt_dialog();
+        let theme = Theme::classic();
+        let entries = vec![
+            ("Skill A".to_string(), "skill_a".to_string(), "skill".to_string()),
+            ("Skill B".to_string(), "skill_b".to_string(), "global".to_string()),
+        ];
+        let text = render_to_text(80, 24, |frame, _area| {
+            draw_section_picker_modal(
+                frame,
+                &app,
+                Color::Cyan,
+                &SectionPickerMode::SkillsPicker {
+                    selected: 0,
+                    entries,
+                    replace_id: None,
+                },
+                &theme,
+            );
+        });
+        assert!(text.contains("Tools"), "Should render Tools title: {text}");
+        assert!(text.contains("skill_a"), "Should show skill name: {text}");
+    }
+
+    #[test]
+    fn draw_skills_picker_empty() {
+        let app = make_app_with_prompt_dialog();
+        let theme = Theme::classic();
+        let text = render_to_text(80, 24, |frame, _area| {
+            draw_section_picker_modal(
+                frame,
+                &app,
+                Color::Cyan,
+                &SectionPickerMode::SkillsPicker {
+                    selected: 0,
+                    entries: vec![],
+                    replace_id: None,
+                },
+                &theme,
+            );
+        });
+        assert!(text.contains("No skills found"), "Should show empty message: {text}");
+    }
+
+    #[test]
+    fn draw_project_picker() {
+        let app = make_app_with_prompt_dialog();
+        let theme = Theme::classic();
+        let entries = vec![
+            crate::tui::app::dialog::ProjectPickerEntry {
+                name: "My Project".to_string(),
+                hash: "abc123".to_string(),
+                path: "/tmp/myproject".to_string(),
+            },
+        ];
+        let text = render_to_text(80, 24, |frame, _area| {
+            draw_section_picker_modal(
+                frame,
+                &app,
+                Color::Cyan,
+                &SectionPickerMode::ProjectPicker {
+                    selected: 0,
+                    entries,
+                },
+                &theme,
+            );
+        });
+        assert!(text.contains("Project Context"), "Should render Project Context title: {text}");
+        assert!(text.contains("My Project"), "Should show project name: {text}");
+    }
+
+    #[test]
+    fn draw_project_picker_empty() {
+        let app = make_app_with_prompt_dialog();
+        let theme = Theme::classic();
+        let text = render_to_text(80, 24, |frame, _area| {
+            draw_section_picker_modal(
+                frame,
+                &app,
+                Color::Cyan,
+                &SectionPickerMode::ProjectPicker {
+                    selected: 0,
+                    entries: vec![],
+                },
+                &theme,
+            );
+        });
+        assert!(text.contains("No registered projects"), "Should show empty message: {text}");
+    }
+
+    #[test]
+    fn draw_preset_picker() {
+        let app = make_app_with_prompt_dialog();
+        let theme = Theme::classic();
+        let entries = vec![
+            ("preset_a".to_string(), "Preview A".to_string(), String::new()),
+            ("preset_b".to_string(), "Preview B".to_string(), String::new()),
+        ];
+        let text = render_to_text(80, 24, |frame, _area| {
+            draw_section_picker_modal(
+                frame,
+                &app,
+                Color::Cyan,
+                &SectionPickerMode::PresetPicker {
+                    selected: 0,
+                    entries,
+                    filter: String::new(),
+                },
+                &theme,
+            );
+        });
+        assert!(text.contains("Preset"), "Should render Preset title: {text}");
+        assert!(text.contains("preset_a"), "Should show preset name: {text}");
+    }
+
+    #[test]
+    fn draw_preset_picker_empty() {
+        let app = make_app_with_prompt_dialog();
+        let theme = Theme::classic();
+        let text = render_to_text(80, 24, |frame, _area| {
+            draw_section_picker_modal(
+                frame,
+                &app,
+                Color::Cyan,
+                &SectionPickerMode::PresetPicker {
+                    selected: 0,
+                    entries: vec![],
+                    filter: String::new(),
+                },
+                &theme,
+            );
+        });
+        assert!(text.contains("no presets"), "Should show empty message: {text}");
+    }
+
+    #[test]
+    fn draw_preset_picker_with_filter() {
+        let app = make_app_with_prompt_dialog();
+        let theme = Theme::classic();
+        let entries = vec![
+            ("preset_a".to_string(), "Preview A".to_string(), String::new()),
+            ("preset_b".to_string(), "Preview B".to_string(), String::new()),
+        ];
+        let text = render_to_text(80, 24, |frame, _area| {
+            draw_section_picker_modal(
+                frame,
+                &app,
+                Color::Cyan,
+                &SectionPickerMode::PresetPicker {
+                    selected: 0,
+                    entries,
+                    filter: "aaa".to_string(),
+                },
+                &theme,
+            );
+        });
+        assert!(text.contains("aaa"), "Should show filter text: {text}");
+    }
+
+    #[test]
+    fn draw_preset_picker_filter_matches_nothing() {
+        let app = make_app_with_prompt_dialog();
+        let theme = Theme::classic();
+        let entries = vec![
+            ("preset_a".to_string(), "Preview A".to_string(), String::new()),
+        ];
+        let text = render_to_text(80, 24, |frame, _area| {
+            draw_section_picker_modal(
+                frame,
+                &app,
+                Color::Cyan,
+                &SectionPickerMode::PresetPicker {
+                    selected: 0,
+                    entries,
+                    filter: "zzz".to_string(),
+                },
+                &theme,
+            );
+        });
+        assert!(text.contains("no presets match"), "Should show no match message: {text}");
+    }
+}

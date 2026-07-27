@@ -524,4 +524,65 @@ mod tests {
             assert_eq!(*step, format!("step {i}"));
         }
     }
+
+    // ── Additional edge cases ────────────────────────────────────
+
+    #[test]
+    fn theme_choice_modern_roundtrip() {
+        let result = theme_choice_to_config_value(THEME_OPTION_MODERN);
+        assert_eq!(result, "modern");
+    }
+
+    #[test]
+    fn theme_choice_classic_roundtrip() {
+        let result = theme_choice_to_config_value(THEME_OPTION_CLASSIC);
+        assert_eq!(result, "classic");
+    }
+
+    #[test]
+    fn theme_choice_empty_string() {
+        assert_eq!(theme_choice_to_config_value(""), "classic");
+    }
+
+    #[test]
+    fn theme_choice_arbitrary_string() {
+        assert_eq!(theme_choice_to_config_value("anything"), "classic");
+    }
+
+    #[test]
+    fn wizard_state_new_has_zero_steps() {
+        let wiz = WizardState::new();
+        assert_eq!(wiz.steps.len(), 0);
+    }
+
+    #[test]
+    fn wizard_state_add_single_step() {
+        let mut wiz = WizardState::new();
+        wiz.add("single step".to_string());
+        assert_eq!(wiz.steps.len(), 1);
+        assert_eq!(wiz.steps[0], "single step");
+    }
+
+    #[test]
+    fn wizard_state_add_many_steps() {
+        let mut wiz = WizardState::new();
+        for i in 0..100 {
+            wiz.add(format!("step {i}"));
+        }
+        assert_eq!(wiz.steps.len(), 100);
+    }
+
+    #[test]
+    fn theme_choice_case_sensitivity() {
+        // "Modern (borderless)" is the exact constant
+        assert_eq!(
+            theme_choice_to_config_value("Modern (borderless)"),
+            "modern"
+        );
+        // Different casing should fall back to classic
+        assert_eq!(
+            theme_choice_to_config_value("modern (borderless)"),
+            "classic"
+        );
+    }
 }

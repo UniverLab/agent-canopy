@@ -2175,4 +2175,184 @@ mod additional_tests {
         assert!(result.contains("Hello"), "{result}");
         assert!(result.contains("World"), "{result}");
     }
+
+    // ── extract_tag_name edge cases ──────────────────────────────
+
+    #[test]
+    fn extract_tag_name_empty_string() {
+        assert_eq!(extract_tag_name(""), "");
+    }
+
+    #[test]
+    fn extract_tag_name_just_angle_bracket() {
+        assert_eq!(extract_tag_name("<"), "");
+    }
+
+    #[test]
+    fn extract_tag_name_no_closing_bracket() {
+        assert_eq!(extract_tag_name("<div class='x'"), "div");
+    }
+
+    #[test]
+    fn extract_tag_name_nested_angle() {
+        // Tag with inner '>' — stops at first '>'
+        assert_eq!(extract_tag_name("<div>a>b</div>"), "div");
+    }
+
+    // ── decode_html_entity edge cases ────────────────────────────
+
+    #[test]
+    fn decode_entity_long_entity_breaks_at_8_chars() {
+        // Entity longer than 8 chars breaks early and returns space
+        assert_eq!(decode_entity("verylongentity"), " ");
+    }
+
+    #[test]
+    fn decode_entity_single_char() {
+        assert_eq!(decode_entity("a"), " ");
+    }
+
+    // ── strip_html_to_text more scenarios ────────────────────────
+
+    #[test]
+    fn strip_html_to_text_multiple_block_tags() {
+        let html = "<h1>Title</h1><p>Para1</p><p>Para2</p><div>Div</div>";
+        let text = strip_html_to_text(html);
+        assert!(text.contains("Title"), "{text}");
+        assert!(text.contains("Para1"), "{text}");
+        assert!(text.contains("Para2"), "{text}");
+        assert!(text.contains("Div"), "{text}");
+    }
+
+    #[test]
+    fn strip_html_to_text_entity_in_text() {
+        let html = "<p>a&amp;b</p>";
+        let text = strip_html_to_text(html);
+        assert!(text.contains("a&b"), "{text}");
+    }
+
+    #[test]
+    fn strip_html_to_text_only_tags_no_text() {
+        let html = "<div><p></p></div>";
+        let text = strip_html_to_text(html);
+        assert!(text.trim().is_empty(), "expected empty: {text}");
+    }
+
+    #[test]
+    fn strip_html_to_text_nested_script() {
+        let html = "<div>before<script>var x=1;</script>after</div>";
+        let text = strip_html_to_text(html);
+        assert!(text.contains("before"), "{text}");
+        assert!(text.contains("after"), "{text}");
+        assert!(!text.contains("var"), "{text}");
+    }
+
+    // ── collapse_blank_lines edge cases ──────────────────────────
+
+    #[test]
+    fn collapse_blank_lines_only_blanks() {
+        let input = "\n\n\n\n";
+        let result = collapse_blank_lines(input);
+        assert_eq!(result, "\n");
+    }
+
+    #[test]
+    fn collapse_blank_lines_mixed() {
+        let input = "a\n\n\nb\n\nc\n";
+        let result = collapse_blank_lines(input);
+        assert_eq!(result, "a\n\nb\n\nc\n");
+    }
+
+    #[test]
+    fn collapse_blank_lines_trailing_blank() {
+        let input = "a\n\n";
+        let result = collapse_blank_lines(input);
+        assert_eq!(result, "a\n\n");
+    }
+
+    // ── is_html_bytes more edge cases ────────────────────────────
+
+    #[test]
+    fn is_html_bytes_lowercase_html() {
+        assert!(is_html_bytes(b"<html>"));
+    }
+
+    #[test]
+    fn is_html_bytes_uppercase_html() {
+        assert!(is_html_bytes(b"<HTML>"));
+    }
+
+    #[test]
+    fn is_html_bytes_mixed_case_doctype() {
+        assert!(is_html_bytes(b"<!DoCtYpE html>"));
+    }
+
+    // ── salvage_printable_text edge cases ────────────────────────
+
+    #[test]
+    fn salvage_printable_text_single_long_run() {
+        let text = b"This is a single long printable run of text that exceeds the minimum";
+        let result = salvage_printable_text(text);
+        assert!(result.contains("single long printable"), "{result}");
+    }
+
+    #[test]
+    fn salvage_printable_text_newlines_and_tabs() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"line1\nline2\ttab");
+        let result = salvage_printable_text(&bytes);
+        assert!(result.contains("line1"), "{result}");
+        assert!(result.contains("line2"), "{result}");
+    }
+
+    // ── is_block_level_tag edge cases ────────────────────────────
+
+    #[test]
+    fn is_block_level_tag_empty_string() {
+        assert!(!is_block_level_tag(""));
+    }
+
+    #[test]
+    fn is_block_level_tag_unknown_tag() {
+        assert!(!is_block_level_tag("custom-element"));
+    }
+
+    // ── Queue edge cases ─────────────────────────────────────────
+
+    #[test]
+    fn queue_pop_empty_returns_none() {
+        let mut q = Queue::new();
+        assert!(q.pop().is_none());
+    }
+
+    #[test]
+    fn queue_push_same_path_moves_to_end() {
+        let mut q = Queue::new();
+        q.push("/a.md");
+        q.push("/b.md");
+        q.push("/a.md");
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.pop(), Some("/b.md".to_string()));
+        assert_eq!(q.pop(), Some("/a.md".to_string()));
+    }
+
+    // ── extract_file_content edge cases ──────────────────────────
+
+    #[test]
+    fn extract_file_content_text_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "hello world").unwrap();
+        let result = extract_file_content(&path, "text").unwrap();
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn extract_file_content_md_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.md");
+        std::fs::write(&path, "# Title\nContent").unwrap();
+        let result = extract_file_content(&path, "markdown").unwrap();
+        assert!(result.contains("Title"));
+    }
 }

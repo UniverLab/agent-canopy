@@ -193,6 +193,243 @@ mod tests {
             assert!(result.ends_with("."));
         }
     }
+
+    #[test]
+    fn draw_quit_confirm_renders_without_panic() {
+        use crate::tui::app::types::App;
+        use crate::db::Database;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::sync::Arc;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let _app = App::new(db, data_dir.path()).unwrap();
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::classic();
+        terminal.draw(|frame| {
+            draw_quit_confirm(frame, &theme);
+        }).unwrap();
+    }
+
+    #[test]
+    fn draw_delete_project_confirm_renders_without_panic() {
+        use crate::tui::app::types::App;
+        use crate::db::Database;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::sync::Arc;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let _app = App::new(db, data_dir.path()).unwrap();
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::classic();
+        terminal.draw(|frame| {
+            draw_delete_project_confirm(frame, &theme);
+        }).unwrap();
+    }
+
+    #[test]
+    fn draw_delete_loop_confirm_renders_without_panic() {
+        use crate::tui::app::types::App;
+        use crate::db::Database;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::sync::Arc;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let _app = App::new(db, data_dir.path()).unwrap();
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::classic();
+        terminal.draw(|frame| {
+            draw_delete_loop_confirm(frame, &theme);
+        }).unwrap();
+    }
+
+    #[test]
+    fn draw_modal_confirm_narrow_width() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(30, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::classic();
+        terminal.draw(|frame| {
+            draw_modal_confirm(frame, " Title ", "Short text", &theme);
+        }).unwrap();
+    }
+
+    #[test]
+    fn draw_modal_confirm_very_narrow_width() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(10, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::classic();
+        terminal.draw(|frame| {
+            draw_modal_confirm(frame, " Title ", "Text", &theme);
+        }).unwrap();
+    }
+
+    #[test]
+    fn draw_modal_confirm_long_text_wraps() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(40, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::classic();
+        let long_text = "This is a very long text that should wrap across multiple lines in the dialog box";
+        terminal.draw(|frame| {
+            draw_modal_confirm(frame, " Title ", long_text, &theme);
+        }).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(text.contains("Title"), "Should show title: {text}");
+    }
+
+    #[test]
+    fn draw_modal_confirm_multiline_text() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(40, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::classic();
+        terminal.draw(|frame| {
+            draw_modal_confirm(frame, " Title ", "Line 1\nLine 2\nLine 3", &theme);
+        }).unwrap();
+    }
+
+    #[test]
+    fn format_uptime_precise_one_second() {
+        assert_eq!(format_uptime_precise(1), "1s");
+    }
+
+    #[test]
+    fn format_uptime_precise_boundary_one_hour() {
+        assert_eq!(format_uptime_precise(3600), "1h 0m 0s");
+    }
+
+    #[test]
+    fn format_uptime_precise_boundary_one_day() {
+        assert_eq!(format_uptime_precise(86400), "1d 0h 0m 0s");
+    }
+
+    #[test]
+    fn category_label_returns_correct_string_for_each_variant() {
+        assert_eq!(category_label(&MissionCategory::Environment), "Environment");
+        assert_eq!(category_label(&MissionCategory::Loop), "Loop");
+    }
+
+    #[test]
+    fn mission_unlock_text_with_empty_icon() {
+        let result = mission_unlock_text("", "Title", &MissionCategory::Seeds);
+        assert!(result.contains("Title"));
+        assert!(result.contains("Seeds"));
+    }
+
+    #[test]
+    fn draw_legend_renders_without_panic() {
+        use crate::tui::app::types::App;
+        use crate::db::Database;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::sync::Arc;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(db, data_dir.path()).unwrap();
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::classic();
+        terminal.draw(|frame| {
+            draw_legend(frame, &mut app, &theme);
+        }).unwrap();
+    }
+
+    #[test]
+    fn draw_legend_with_zero_missions() {
+        use crate::tui::app::types::App;
+        use crate::db::Database;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::sync::Arc;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(db, data_dir.path()).unwrap();
+        app.legend_selected = 0;
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::classic();
+        terminal.draw(|frame| {
+            draw_legend(frame, &mut app, &theme);
+        }).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(text.contains("Missions"), "Should show Missions title: {text}");
+    }
+
+    #[test]
+    fn draw_quit_confirm_shows_quit_text() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::classic();
+        terminal.draw(|frame| {
+            draw_quit_confirm(frame, &theme);
+        }).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(text.contains("Quit"), "Should show Quit: {text}");
+    }
 }
 
 pub fn draw_legend(frame: &mut Frame, app: &mut App, theme: &Theme) {

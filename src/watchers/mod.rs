@@ -600,4 +600,112 @@ mod tests {
         let kind = notify::EventKind::Any;
         assert_eq!(map_event_kind(&kind, "test"), None);
     }
+
+    // ── Additional edge cases ────────────────────────────────────
+
+    #[test]
+    fn resolve_watch_target_file_with_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, "content").unwrap();
+        let target = resolve_watch_target(file_path.to_str().unwrap());
+        assert_eq!(target.path, dir.path());
+        assert_eq!(target.file_filter.as_deref(), Some("test.txt"));
+    }
+
+    #[test]
+    fn resolve_watch_target_nested_dir() {
+        let target = resolve_watch_target("/tmp/nested/dir");
+        assert_eq!(target.path, PathBuf::from("/tmp/nested/dir"));
+        assert!(target.file_filter.is_none());
+    }
+
+    #[test]
+    fn watch_mode_recursive_with_file_filter() {
+        assert_eq!(watch_mode(true, true), RecursiveMode::NonRecursive);
+    }
+
+    #[test]
+    fn event_matches_empty_config() {
+        assert!(!event_matches(WatchEvent::Create, &[]));
+    }
+
+    #[test]
+    fn event_matches_all_event_types() {
+        let all = vec![
+            WatchEvent::Create,
+            WatchEvent::Modify,
+            WatchEvent::Delete,
+            WatchEvent::Move,
+        ];
+        assert!(event_matches(WatchEvent::Create, &all));
+        assert!(event_matches(WatchEvent::Modify, &all));
+        assert!(event_matches(WatchEvent::Delete, &all));
+        assert!(event_matches(WatchEvent::Move, &all));
+    }
+
+    #[test]
+    fn event_matches_only_modify_config() {
+        assert!(event_matches(WatchEvent::Modify, &[WatchEvent::Modify]));
+        assert!(!event_matches(WatchEvent::Create, &[WatchEvent::Modify]));
+    }
+
+    #[test]
+    fn event_matches_move_not_in_create_list_v2() {
+        assert!(!event_matches(WatchEvent::Move, &[WatchEvent::Create]));
+    }
+
+    #[test]
+    fn map_event_kind_create_folder() {
+        let kind = notify::EventKind::Create(notify::event::CreateKind::Folder);
+        assert_eq!(map_event_kind(&kind, "test"), Some(WatchEvent::Create));
+    }
+
+    #[test]
+    fn map_event_kind_modify_metadata() {
+        let kind = notify::EventKind::Modify(notify::event::ModifyKind::Metadata(
+            notify::event::MetadataKind::Any,
+        ));
+        assert_eq!(map_event_kind(&kind, "test"), Some(WatchEvent::Modify));
+    }
+
+    #[test]
+    fn map_event_kind_remove_folder() {
+        let kind = notify::EventKind::Remove(notify::event::RemoveKind::Folder);
+        assert_eq!(map_event_kind(&kind, "test"), Some(WatchEvent::Delete));
+    }
+
+    #[test]
+    fn resolve_watch_target_path_with_trailing_slash() {
+        let target = resolve_watch_target("/tmp/");
+        assert_eq!(target.path, PathBuf::from("/tmp"));
+        assert!(target.file_filter.is_none());
+    }
+
+    #[test]
+    fn event_matches_create_also_matches_modify() {
+        assert!(event_matches(WatchEvent::Modify, &[WatchEvent::Create]));
+    }
+
+    #[test]
+    fn event_matches_delete_does_not_match_create() {
+        assert!(!event_matches(WatchEvent::Delete, &[WatchEvent::Create]));
+    }
+
+    #[test]
+    fn map_event_kind_modify_name_to() {
+        let kind = notify::EventKind::Modify(notify::event::ModifyKind::Name(
+            notify::event::RenameMode::To,
+        ));
+        assert_eq!(map_event_kind(&kind, "test"), Some(WatchEvent::Move));
+    }
+
+    #[test]
+    fn map_event_kind_modify_name_from() {
+        let kind = notify::EventKind::Modify(notify::event::ModifyKind::Name(
+            notify::event::RenameMode::From,
+        ));
+        assert_eq!(map_event_kind(&kind, "test"), Some(WatchEvent::Move));
+    }
+
 }

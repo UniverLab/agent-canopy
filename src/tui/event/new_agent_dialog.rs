@@ -1087,4 +1087,151 @@ mod tests {
         // field_width=4: c(0) a(1) f(2) é(3) on line 0, x(4) y(5) z(6) on line 1
         assert_eq!(visual_line_of_char(&d, 4, 4), 1); // x is on line 1
     }
+
+    #[test]
+    fn wrapped_index_empty_len() {
+        assert!(wrapped_index(0, 0, true).is_none());
+        assert!(wrapped_index(0, 0, false).is_none());
+    }
+
+    #[test]
+    fn wrapped_index_single_element() {
+        assert_eq!(wrapped_index(0, 1, true), Some(0));
+        assert_eq!(wrapped_index(0, 1, false), Some(0));
+    }
+
+    #[test]
+    fn wrapped_index_forward_wraps() {
+        assert_eq!(wrapped_index(2, 3, true), Some(0));
+        assert_eq!(wrapped_index(0, 3, true), Some(1));
+    }
+
+    #[test]
+    fn wrapped_index_backward_wraps() {
+        assert_eq!(wrapped_index(0, 3, false), Some(2));
+        assert_eq!(wrapped_index(2, 3, false), Some(1));
+    }
+
+    #[test]
+    fn visual_line_of_char_at_line_zero() {
+        let d = dialog_with("hello world");
+        assert_eq!(start_of_visual_line_at(&d, 0, 30), 0);
+    }
+
+    #[test]
+    fn visual_line_of_char_at_with_wrap() {
+        let d = dialog_with("abcdefghij");
+        // field_width=4: line 0 starts at 0, line 1 starts at 4, line 2 starts at 8
+        assert_eq!(start_of_visual_line_at(&d, 0, 4), 0);
+        assert_eq!(start_of_visual_line_at(&d, 1, 4), 4);
+        assert_eq!(start_of_visual_line_at(&d, 2, 4), 8);
+    }
+
+    #[test]
+    fn end_of_visual_line_at_line_zero() {
+        let d = dialog_with("hello world");
+        assert_eq!(end_of_visual_line_at(&d, 0, 30, 11), 11);
+    }
+
+    #[test]
+    fn end_of_visual_line_at_with_wrap() {
+        let d = dialog_with("abcdefghij");
+        assert_eq!(end_of_visual_line_at(&d, 0, 4, 10), 4);
+        assert_eq!(end_of_visual_line_at(&d, 1, 4, 10), 8);
+        assert_eq!(end_of_visual_line_at(&d, 2, 4, 10), 10);
+    }
+
+    #[test]
+    fn start_of_visual_line_at_beyond_last_line() {
+        let d = dialog_with("abc");
+        // field_width=30 → 1 line. Asking for line 1 returns end of string.
+        assert_eq!(start_of_visual_line_at(&d, 1, 30), 3);
+    }
+
+    #[test]
+    fn end_of_visual_line_at_beyond_last_line() {
+        let d = dialog_with("abc");
+        assert_eq!(end_of_visual_line_at(&d, 1, 30, 3), 3);
+    }
+
+    #[test]
+    fn prompt_field_width_for_80_col() {
+        let width = prompt_field_width_for(80);
+        // Should be reasonable: between 10 and 80
+        assert!(width >= 10);
+        assert!(width < 80);
+    }
+
+    #[test]
+    fn prompt_field_width_for_40_col() {
+        let width = prompt_field_width_for(40);
+        assert!(width >= 10);
+    }
+
+    #[test]
+    fn prompt_field_width_for_1_col() {
+        let width = prompt_field_width_for(1);
+        assert!(width >= 10);
+    }
+
+    #[test]
+    fn prompt_field_width_for_100_col() {
+        let width = prompt_field_width_for(100);
+        assert!(width >= 10);
+        assert!(width < 100);
+    }
+
+    #[test]
+    fn visual_line_of_char_with_hard_newlines_and_wrap() {
+        let d = dialog_with("ab\ncdef");
+        // field_width=3: "ab" on line 0, "\n" at pos 2, "c" at pos 3 is line 1
+        assert_eq!(visual_line_of_char(&d, 0, 3), 0); // 'a'
+        assert_eq!(visual_line_of_char(&d, 2, 3), 0); // '\n'
+        assert_eq!(visual_line_of_char(&d, 3, 3), 1); // 'c'
+        assert_eq!(visual_line_of_char(&d, 4, 3), 1); // 'd'
+    }
+
+    #[test]
+    fn move_prompt_visual_up_from_first_line_returns_none() {
+        let d = dialog_with("hello");
+        assert!(move_prompt_visual(&d, 0, 30, false).is_none());
+    }
+
+    #[test]
+    fn move_prompt_visual_down_from_last_line_returns_none() {
+        let d = dialog_with("ab");
+        assert!(move_prompt_visual(&d, 1, 30, true).is_none());
+    }
+
+    #[test]
+    fn move_prompt_visual_down_through_wrap() {
+        let d = dialog_with("abcdefghij");
+        // cursor at col 2 of line 0 (pos 2), move down → line 1 col 2 (pos 6)
+        let new_cursor = move_prompt_visual(&d, 2, 4, true).expect("should move");
+        assert_eq!(new_cursor, 6);
+    }
+
+    #[test]
+    fn move_prompt_visual_up_through_wrap() {
+        let d = dialog_with("abcdefghij");
+        // cursor at col 2 of line 1 (pos 6), move up → line 0 col 2 (pos 2)
+        let new_cursor = move_prompt_visual(&d, 6, 4, false).expect("should move");
+        assert_eq!(new_cursor, 2);
+    }
+
+    #[test]
+    fn end_of_visual_line_multiline() {
+        let d = dialog_with("line1\nline2");
+        // at char 7 (pos in "line2"), field_width=30
+        let end = end_of_visual_line(&d, 7, 30, 11);
+        assert_eq!(end, 11);
+    }
+
+    #[test]
+    fn start_of_visual_line_multiline() {
+        let d = dialog_with("line1\nline2");
+        // at char 7 (in "line2")
+        let start = start_of_visual_line(&d, 7, 30);
+        assert_eq!(start, 6); // after the '\n'
+    }
 }

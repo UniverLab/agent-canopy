@@ -574,4 +574,124 @@ mod tests {
         let text = value["result"]["content"][0]["text"].as_str().unwrap();
         assert_eq!(text, "Agent 'x' updated successfully. schedule: 30 * * * *");
     }
+
+    // ── parse_sse_messages edge cases ────────────────────────────
+
+    #[test]
+    fn parse_sse_empty_body_returns_empty() {
+        let messages = parse_sse_messages("");
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn parse_sse_only_keepalive_returns_empty() {
+        let body = "retry: 3000\n\n";
+        let messages = parse_sse_messages(body);
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn parse_sse_whitespace_data_lines_are_kept() {
+        let body = "data: \ndata: hello\n\n";
+        let messages = parse_sse_messages(body);
+        // First line is empty string after "data: ", second is "hello"
+        // flush_sse_event joins them: "" + "\n" + "hello" = "\nhello"
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("hello"));
+    }
+
+    #[test]
+    fn parse_sse_multiple_events_with_keepalives() {
+        let body = "retry: 3000\n\ndata: {\"id\":1}\n\ndata: {\"id\":2}\n\n";
+        let messages = parse_sse_messages(body);
+        assert_eq!(messages, vec!["{\"id\":1}", "{\"id\":2}"]);
+    }
+
+    #[test]
+    fn parse_sse_data_without_space_prefix() {
+        let body = "data:{\"id\":1}\n\n";
+        let messages = parse_sse_messages(body);
+        assert_eq!(messages, vec!["{\"id\":1}"]);
+    }
+
+    #[test]
+    fn parse_sse_triple_multiline_data() {
+        let body = "data: line1\ndata: line2\ndata: line3\n\n";
+        let messages = parse_sse_messages(body);
+        assert_eq!(messages, vec!["line1\nline2\nline3"]);
+    }
+
+    // ── build_jsonrpc_transport_error edge cases ─────────────────
+
+    #[test]
+    fn transport_error_preserves_string_id() {
+        let error = build_jsonrpc_transport_error(r#"{"jsonrpc":"2.0","id":"abc"}"#, "boom");
+        let value: serde_json::Value = serde_json::from_str(&error).unwrap();
+        assert_eq!(value["id"], "abc");
+        assert_eq!(value["error"]["code"], -32000);
+        assert_eq!(value["error"]["data"], "boom");
+    }
+
+    #[test]
+    fn transport_error_message_format() {
+        let error = build_jsonrpc_transport_error("{}", "test error");
+        let value: serde_json::Value = serde_json::from_str(&error).unwrap();
+        assert_eq!(value["jsonrpc"], "2.0");
+        assert_eq!(value["error"]["message"], "canopy bridge transport error");
+    }
+
+    // ── resolve_agent_identity_from_values edge cases ─────────────
+
+    #[test]
+    fn resolve_identity_empty_arg_with_env() {
+        let identity = resolve_agent_identity_from_values(
+            Some("".to_string()),
+            Some("env-id".to_string()),
+            "fallback".to_string(),
+        );
+        assert_eq!(identity.agent_id, "env-id");
+        assert!(!identity.is_standalone);
+    }
+
+    #[test]
+    fn resolve_identity_whitespace_arg_with_env() {
+        let identity = resolve_agent_identity_from_values(
+            Some("  ".to_string()),
+            Some("env-id".to_string()),
+            "fallback".to_string(),
+        );
+        assert_eq!(identity.agent_id, "env-id");
+        assert!(!identity.is_standalone);
+    }
+
+    #[test]
+    fn resolve_identity_arg_over_env() {
+        let identity = resolve_agent_identity_from_values(
+            Some("arg-id".to_string()),
+            Some("env-id".to_string()),
+            "fallback".to_string(),
+        );
+        assert_eq!(identity.agent_id, "arg-id");
+    }
+
+    #[test]
+    fn resolve_identity_both_empty() {
+        let identity = resolve_agent_identity_from_values(
+            Some("".to_string()),
+            Some("".to_string()),
+            "fallback".to_string(),
+        );
+        assert_eq!(identity.agent_id, "fallback");
+        assert!(identity.is_standalone);
+    }
+
+    #[test]
+    fn resolve_identity_arg_trims_whitespace() {
+        let identity = resolve_agent_identity_from_values(
+            Some("  my-id  ".to_string()),
+            None,
+            "fallback".to_string(),
+        );
+        assert_eq!(identity.agent_id, "my-id");
+    }
 }

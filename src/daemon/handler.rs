@@ -9434,7 +9434,7 @@ mod tests {
 #[cfg(test)]
 mod additional_tests {
     use super::*;
-    use crate::daemon::params::{LoopCompletionHookParams, LoopTriggerParams};
+    use crate::daemon::params::{EnsembleMemberParams, LoopCompletionHookParams, LoopTriggerParams};
     use crate::db::Database;
     use crate::domain::loops::{
         Loop, LoopNode, LoopNodeKind, LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus,
@@ -10773,5 +10773,1165 @@ mod additional_tests {
     #[test]
     fn validate_absolute_dir_relative() {
         assert!(validate_absolute_dir("relative").is_err());
+    }
+}
+
+// ── Additional coverage tests for handler.rs ─────────────────────
+// Tests targeting uncovered functions: transport_details,
+// append_temporal_agents_section, loop_run_blocker, loop_node_json,
+// loop_edge_json, loop_run_json, ensemble_details_json,
+// loop_completion_hook_json, loop_completion_hook_run_json,
+// format_system_time, model_result_footer, build_ensemble_unit,
+// and edge-case branches across validation functions.
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use crate::daemon::params::EnsembleMemberParams;
+    use crate::db::Database;
+    use crate::domain::loops::{
+        Ensemble, EnsembleDetails, EnsembleMember, Loop, LoopCompletionHook,
+        LoopCompletionHookRun, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind, LoopNodeRun,
+        LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus,
+    };
+    use crate::domain::models::{Agent, Cli};
+    use crate::domain::pools::Pool;
+    use tempfile::tempdir;
+
+    fn standalone_spec(id: &str) -> LoopSpec {
+        LoopSpec {
+            id: id.to_string(),
+            loop_id: None,
+            name: id.to_string(),
+            description: None,
+            position: 0,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        }
+    }
+
+    fn running_spec(id: &str) -> LoopSpec {
+        let mut spec = standalone_spec(id);
+        spec.status = LoopSpecStatus::Running;
+        spec
+    }
+
+    fn make_agent(id: &str) -> Agent {
+        Agent {
+            id: id.to_string(),
+            prompt: "test prompt".to_string(),
+            trigger: None,
+            cli: Cli("opencode".to_string()),
+            model: None,
+            working_dir: None,
+            enabled: true,
+            enable_at: None,
+            created_at: chrono::Utc::now(),
+            log_path: "/tmp/test.log".to_string(),
+            timeout_minutes: 15,
+            expires_at: None,
+            last_run_at: None,
+            last_run_ok: None,
+            last_triggered_at: None,
+            trigger_count: 0,
+        }
+    }
+
+    fn make_loop(loop_id: &str, status: LoopStatus) -> Loop {
+        Loop {
+            id: loop_id.to_string(),
+            name: loop_id.to_string(),
+            description: None,
+            workdir: "/tmp".to_string(),
+            status,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_pool_id: None,
+            on_completed: None,
+        }
+    }
+
+    fn loop_run_row(
+        id: &str,
+        loop_id: &str,
+        spec_id: &str,
+        status: LoopRunStatus,
+    ) -> LoopNodeRun {
+        LoopNodeRun {
+            id: id.to_string(),
+            loop_id: loop_id.to_string(),
+            spec_id: spec_id.to_string(),
+            node_id: "node-1".to_string(),
+            status,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: (status != LoopRunStatus::Running).then(chrono::Utc::now),
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        }
+    }
+
+    fn insert_test_loop(db: &Database, id: &str) {
+        db.insert_loop(&make_loop(id, LoopStatus::Draft)).unwrap();
+    }
+
+    fn insert_test_node(db: &Database, id: &str, spec_id: &str) {
+        db.insert_loop_node(&LoopNode {
+            id: id.to_string(),
+            spec_id: Some(spec_id.to_string()),
+            loop_id: None,
+            name: id.to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "true"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+    }
+
+    // ── transport_details ──────────────────────────────────────────
+
+    #[test]
+    fn transport_details_streamable_http() {
+        let (transport, port_str) = super::transport_details(8080);
+        assert_eq!(transport, "Streamable HTTP");
+        assert_eq!(port_str, "8080");
+    }
+
+    #[test]
+    fn transport_details_stdio() {
+        let (transport, port_str) = super::transport_details(0);
+        assert_eq!(transport, "stdio");
+        assert_eq!(port_str, "N/A");
+    }
+
+    #[test]
+    fn transport_details_large_port() {
+        let (transport, port_str) = super::transport_details(65535);
+        assert_eq!(transport, "Streamable HTTP");
+        assert_eq!(port_str, "65535");
+    }
+
+    // ── append_temporal_agents_section ──────────────────────────────
+
+    #[test]
+    fn append_temporal_empty_agents() {
+        let mut status = "Canopy v0.1.0".to_string();
+        super::append_temporal_agents_section(&mut status, &[]);
+        assert_eq!(status, "Canopy v0.1.0");
+    }
+
+    #[test]
+    fn append_temporal_no_expiring() {
+        let mut status = "status".to_string();
+        let agents = vec![make_agent("a1")];
+        super::append_temporal_agents_section(&mut status, &agents);
+        assert_eq!(status, "status");
+    }
+
+    #[test]
+    fn append_temporal_active_expiry() {
+        let mut status = "status".to_string();
+        let mut a = make_agent("exp");
+        a.expires_at = Some(chrono::Utc::now() + chrono::Duration::minutes(10));
+        super::append_temporal_agents_section(&mut status, &[a]);
+        assert!(status.contains("Temporal agents:"));
+        assert!(status.contains("exp"));
+        assert!(status.contains("remaining"));
+    }
+
+    #[test]
+    fn append_temporal_expired() {
+        let mut status = "status".to_string();
+        let mut a = make_agent("old");
+        a.expires_at = Some(chrono::Utc::now() - chrono::Duration::minutes(5));
+        super::append_temporal_agents_section(&mut status, &[a]);
+        assert!(status.contains("EXPIRED"));
+    }
+
+    #[test]
+    fn append_temporal_skips_disabled() {
+        let mut status = "status".to_string();
+        let mut a = make_agent("dis");
+        a.enabled = false;
+        a.expires_at = Some(chrono::Utc::now() + chrono::Duration::minutes(10));
+        super::append_temporal_agents_section(&mut status, &[a]);
+        assert_eq!(status, "status");
+    }
+
+    #[test]
+    fn append_temporal_multiple_agents() {
+        let mut status = String::new();
+        let mut a1 = make_agent("a1");
+        a1.expires_at = Some(chrono::Utc::now() + chrono::Duration::minutes(10));
+        let mut a2 = make_agent("a2");
+        a2.expires_at = Some(chrono::Utc::now() + chrono::Duration::minutes(5));
+        let a3 = make_agent("a3"); // no expiry
+        super::append_temporal_agents_section(&mut status, &[a1, a2, a3]);
+        assert!(status.contains("a1"));
+        assert!(status.contains("a2"));
+        assert!(!status.contains("a3"));
+    }
+
+    // ── loop_run_blocker ───────────────────────────────────────────
+
+    #[test]
+    fn blocker_present() {
+        let run = LoopNodeRun {
+            id: "r1".into(),
+            loop_id: "l1".into(),
+            spec_id: "s1".into(),
+            node_id: "n1".into(),
+            status: LoopRunStatus::Fail,
+            input: None,
+            output: Some(serde_json::json!({"blocker": "needs review"})),
+            started_at: chrono::Utc::now(),
+            completed_at: Some(chrono::Utc::now()),
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        };
+        assert_eq!(
+            super::loop_run_blocker(&run).as_deref(),
+            Some("needs review")
+        );
+    }
+
+    #[test]
+    fn blocker_no_output() {
+        let run = LoopNodeRun {
+            id: "r2".into(),
+            loop_id: "l1".into(),
+            spec_id: "s1".into(),
+            node_id: "n1".into(),
+            status: LoopRunStatus::Pass,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: Some(chrono::Utc::now()),
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        };
+        assert!(super::loop_run_blocker(&run).is_none());
+    }
+
+    #[test]
+    fn blocker_no_blocker_key() {
+        let run = LoopNodeRun {
+            id: "r3".into(),
+            loop_id: "l1".into(),
+            spec_id: "s1".into(),
+            node_id: "n1".into(),
+            status: LoopRunStatus::Fail,
+            input: None,
+            output: Some(serde_json::json!({"result": "failed"})),
+            started_at: chrono::Utc::now(),
+            completed_at: Some(chrono::Utc::now()),
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        };
+        assert!(super::loop_run_blocker(&run).is_none());
+    }
+
+    #[test]
+    fn blocker_non_string_value() {
+        let run = LoopNodeRun {
+            id: "r4".into(),
+            loop_id: "l1".into(),
+            spec_id: "s1".into(),
+            node_id: "n1".into(),
+            status: LoopRunStatus::Fail,
+            input: None,
+            output: Some(serde_json::json!({"blocker": 42})),
+            started_at: chrono::Utc::now(),
+            completed_at: Some(chrono::Utc::now()),
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        };
+        assert!(super::loop_run_blocker(&run).is_none());
+    }
+
+    // ── loop_node_json ─────────────────────────────────────────────
+
+    #[test]
+    fn node_json_agent() {
+        let node = LoopNode {
+            id: "n1".into(),
+            spec_id: Some("s1".into()),
+            loop_id: None,
+            name: "implement".into(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "claude"}),
+            position: 5,
+            created_at: chrono::Utc::now(),
+        };
+        let json = super::loop_node_json(&node);
+        assert_eq!(json["id"], "n1");
+        assert_eq!(json["spec_id"], "s1");
+        assert!(json["loop_id"].is_null());
+        assert_eq!(json["kind"], "agent");
+        assert_eq!(json["position"], 5);
+    }
+
+    #[test]
+    fn node_json_join_displays_quorum() {
+        let node = LoopNode {
+            id: "j1".into(),
+            spec_id: None,
+            loop_id: Some("l1".into()),
+            name: "quorum".into(),
+            kind: LoopNodeKind::Join,
+            config: serde_json::json!({}),
+            position: 10,
+            created_at: chrono::Utc::now(),
+        };
+        let json = super::loop_node_json(&node);
+        assert_eq!(json["kind"], "quorum");
+    }
+
+    // ── loop_edge_json ─────────────────────────────────────────────
+
+    #[test]
+    fn edge_json_all_fields() {
+        let edge = LoopEdge {
+            id: "e1".into(),
+            spec_id: Some("s1".into()),
+            loop_id: None,
+            from_node: "n1".into(),
+            to_node: "n2".into(),
+            condition: LoopEdgeCondition::Pass,
+        };
+        let json = super::loop_edge_json(&edge);
+        assert_eq!(json["id"], "e1");
+        assert_eq!(json["from_node"], "n1");
+        assert_eq!(json["to_node"], "n2");
+        assert_eq!(json["condition"], "pass");
+    }
+
+    #[test]
+    fn edge_json_loop_owner() {
+        let edge = LoopEdge {
+            id: "e2".into(),
+            spec_id: None,
+            loop_id: Some("l1".into()),
+            from_node: "n1".into(),
+            to_node: "n2".into(),
+            condition: LoopEdgeCondition::Always,
+        };
+        let json = super::loop_edge_json(&edge);
+        assert_eq!(json["loop_id"], "l1");
+        assert!(json["spec_id"].is_null());
+        assert_eq!(json["condition"], "always");
+    }
+
+    // ── loop_run_json ──────────────────────────────────────────────
+
+    #[test]
+    fn run_json_pass_with_output() {
+        let run = LoopNodeRun {
+            id: "r1".into(),
+            loop_id: "l1".into(),
+            spec_id: "s1".into(),
+            node_id: "n1".into(),
+            status: LoopRunStatus::Pass,
+            input: Some(serde_json::json!({"key": "val"})),
+            output: Some(serde_json::json!({"result": "ok"})),
+            started_at: chrono::Utc::now(),
+            completed_at: Some(chrono::Utc::now()),
+            iteration: 3,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        };
+        let json = super::loop_run_json(&run);
+        assert_eq!(json["status"], "pass");
+        assert_eq!(json["iteration"], 3);
+        assert_eq!(json["input"]["key"], "val");
+        assert_eq!(json["output"]["result"], "ok");
+    }
+
+    #[test]
+    fn run_json_running_no_completed() {
+        let run = LoopNodeRun {
+            id: "r2".into(),
+            loop_id: "l1".into(),
+            spec_id: "s1".into(),
+            node_id: "n1".into(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        };
+        let json = super::loop_run_json(&run);
+        assert!(json["completed_at"].is_null());
+    }
+
+    #[test]
+    fn run_json_fail() {
+        let run = LoopNodeRun {
+            id: "r3".into(),
+            loop_id: "l1".into(),
+            spec_id: "s1".into(),
+            node_id: "n1".into(),
+            status: LoopRunStatus::Fail,
+            input: None,
+            output: Some(serde_json::json!({"blocker": "stuck"})),
+            started_at: chrono::Utc::now(),
+            completed_at: Some(chrono::Utc::now()),
+            iteration: 2,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        };
+        let json = super::loop_run_json(&run);
+        assert_eq!(json["status"], "fail");
+        assert_eq!(json["iteration"], 2);
+    }
+
+    // ── ensemble_details_json ──────────────────────────────────────
+
+    #[test]
+    fn ensemble_json_full() {
+        let details = EnsembleDetails {
+            ensemble: Ensemble {
+                id: "ens1".into(),
+                spec_id: Some("s1".into()),
+                loop_id: None,
+                name: "proposers".into(),
+                prompt_template: "draft".into(),
+                join_node_id: "j1".into(),
+                entry_from_node: "kickoff".into(),
+                entry_condition: LoopEdgeCondition::Always,
+                min_pass: 2,
+                straggler_timeout_minutes: Some(10),
+                timeout_minutes: 30,
+                on_pass_to: "arbiter".into(),
+                on_fail_to: Some("cleanup".into()),
+                created_at: chrono::Utc::now(),
+            },
+            members: vec![
+                EnsembleMember {
+                    ensemble_id: "ens1".into(),
+                    node_id: "m1".into(),
+                    position: 0,
+                    platform: "claude".into(),
+                    model: None,
+                },
+                EnsembleMember {
+                    ensemble_id: "ens1".into(),
+                    node_id: "m2".into(),
+                    position: 1,
+                    platform: "codex".into(),
+                    model: Some("o1".into()),
+                },
+            ],
+        };
+        let json = super::ensemble_details_json(&details);
+        assert_eq!(json["id"], "ens1");
+        assert_eq!(json["min_pass"], 2);
+        assert_eq!(json["effective_straggler_timeout_minutes"], 10);
+        assert_eq!(json["on_fail_to"], "cleanup");
+        assert_eq!(json["members"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn ensemble_json_no_straggler() {
+        let details = EnsembleDetails {
+            ensemble: Ensemble {
+                id: "ens2".into(),
+                spec_id: None,
+                loop_id: Some("l1".into()),
+                name: "t".into(),
+                prompt_template: "t".into(),
+                join_node_id: "j".into(),
+                entry_from_node: "f".into(),
+                entry_condition: LoopEdgeCondition::Always,
+                min_pass: 1,
+                straggler_timeout_minutes: None,
+                timeout_minutes: 45,
+                on_pass_to: "to".into(),
+                on_fail_to: None,
+                created_at: chrono::Utc::now(),
+            },
+            members: vec![EnsembleMember {
+                ensemble_id: "ens2".into(),
+                node_id: "m1".into(),
+                position: 0,
+                platform: "claude".into(),
+                model: None,
+            }],
+        };
+        let json = super::ensemble_details_json(&details);
+        assert_eq!(json["effective_straggler_timeout_minutes"], 45);
+        assert!(json["on_fail_to"].is_null());
+    }
+
+    // ── loop_completion_hook_json ──────────────────────────────────
+
+    #[test]
+    fn hook_json_full() {
+        let hook = LoopCompletionHook {
+            platform: "claude".into(),
+            model: Some("opus-4".into()),
+            prompt: "{{loop_name}} done".into(),
+            timeout_minutes: Some(10),
+        };
+        let json = super::loop_completion_hook_json(&hook);
+        assert_eq!(json["platform"], "claude");
+        assert_eq!(json["model"], "opus-4");
+        assert_eq!(json["timeout_minutes"], 10);
+    }
+
+    #[test]
+    fn hook_json_no_model() {
+        let hook = LoopCompletionHook {
+            platform: "mimo".into(),
+            model: None,
+            prompt: "t".into(),
+            timeout_minutes: None,
+        };
+        let json = super::loop_completion_hook_json(&hook);
+        assert!(json["model"].is_null());
+        assert!(json["timeout_minutes"].is_null());
+    }
+
+    // ── loop_completion_hook_run_json ──────────────────────────────
+
+    #[test]
+    fn hook_run_json_full() {
+        let run = LoopCompletionHookRun {
+            id: "chr1".into(),
+            loop_id: "l1".into(),
+            status: LoopRunStatus::Pass,
+            output: Some(serde_json::json!({"summary": "done"})),
+            summary: Some("ok".into()),
+            started_at: chrono::Utc::now(),
+            completed_at: Some(chrono::Utc::now()),
+            pid: Some(123),
+            boot_id: None,
+        };
+        let json = super::loop_completion_hook_run_json(&run);
+        assert_eq!(json["id"], "chr1");
+        assert_eq!(json["status"], "pass");
+        assert_eq!(json["summary"], "ok");
+    }
+
+    #[test]
+    fn hook_run_json_no_completed() {
+        let run = LoopCompletionHookRun {
+            id: "chr2".into(),
+            loop_id: "l1".into(),
+            status: LoopRunStatus::Running,
+            output: None,
+            summary: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            pid: None,
+            boot_id: None,
+        };
+        let json = super::loop_completion_hook_run_json(&run);
+        assert!(json["completed_at"].is_null());
+        assert!(json["summary"].is_null());
+    }
+
+    // ── format_system_time ─────────────────────────────────────────
+
+    #[test]
+    fn format_system_time_now() {
+        let formatted = super::format_system_time(std::time::SystemTime::now());
+        assert!(chrono::DateTime::parse_from_rfc3339(&formatted).is_ok());
+    }
+
+    // ── model_result_footer ────────────────────────────────────────
+
+    #[test]
+    fn footer_live_source() {
+        use crate::domain::models_db::CatalogSource;
+        let f = super::model_result_footer("Models:", CatalogSource::Live, std::time::SystemTime::now());
+        assert!(f.contains("Source: live"));
+        assert!(!f.contains("out of date"));
+    }
+
+    #[test]
+    fn footer_stale_source() {
+        use crate::domain::models_db::CatalogSource;
+        let f = super::model_result_footer("Models:", CatalogSource::Stale, std::time::SystemTime::now());
+        assert!(f.contains("Source: stale"));
+        assert!(f.contains("out of date"));
+    }
+
+    // ── build_ensemble_unit: with and without on_fail_to ───────────
+
+    #[test]
+    fn ensemble_unit_with_fail_to() {
+        let members = vec![("claude".into(), None), ("codex".into(), Some("o1".into()))];
+        let built = build_ensemble_unit(&EnsembleUnitSpec {
+            spec_id: Some("s1".into()),
+            loop_id: None,
+            name: "failing",
+            prompt_template: "do it",
+            members: &members,
+            entry_from_node: "kickoff",
+            entry_condition: LoopEdgeCondition::Always,
+            on_pass_to: "arbiter",
+            on_fail_to: Some("cleanup"),
+            min_pass: 1,
+            timeout_minutes: 30,
+            straggler_timeout_minutes: Some(10),
+            start_position: 1,
+        });
+        assert_eq!(built.ensemble.on_fail_to.as_deref(), Some("cleanup"));
+        assert_eq!(built.ensemble.straggler_timeout_minutes, Some(10));
+        let fail_edges: Vec<_> = built.edges.iter()
+            .filter(|e| e.condition == LoopEdgeCondition::Fail)
+            .collect();
+        assert_eq!(fail_edges.len(), 1);
+    }
+
+    #[test]
+    fn ensemble_unit_no_fail_to() {
+        let members = vec![("claude".into(), None)];
+        let built = build_ensemble_unit(&EnsembleUnitSpec {
+            spec_id: None,
+            loop_id: Some("l1".into()),
+            name: "no-fail",
+            prompt_template: "p",
+            members: &members,
+            entry_from_node: "start",
+            entry_condition: LoopEdgeCondition::Pass,
+            on_pass_to: "end",
+            on_fail_to: None,
+            min_pass: 1,
+            timeout_minutes: 15,
+            straggler_timeout_minutes: None,
+            start_position: 5,
+        });
+        assert!(built.ensemble.on_fail_to.is_none());
+        let fail_edges: Vec<_> = built.edges.iter()
+            .filter(|e| e.condition == LoopEdgeCondition::Fail)
+            .collect();
+        assert!(fail_edges.is_empty());
+    }
+
+    #[test]
+    fn ensemble_unit_positions_sequential() {
+        let members = vec![("p1".into(), None), ("p2".into(), None), ("p3".into(), None)];
+        let built = build_ensemble_unit(&EnsembleUnitSpec {
+            spec_id: None,
+            loop_id: Some("l1".into()),
+            name: "pos",
+            prompt_template: "p",
+            members: &members,
+            entry_from_node: "start",
+            entry_condition: LoopEdgeCondition::Always,
+            on_pass_to: "end",
+            on_fail_to: None,
+            min_pass: 3,
+            timeout_minutes: 30,
+            straggler_timeout_minutes: None,
+            start_position: 10,
+        });
+        for (i, member) in built.members.iter().enumerate() {
+            assert_eq!(member.position, i as i64);
+        }
+        for (i, node) in built.member_nodes.iter().enumerate() {
+            assert_eq!(node.position, 10 + i as i64);
+        }
+        assert_eq!(built.join_node.position, 13);
+    }
+
+    // ── validate_position_conflict: no loop and empty loop ─────────
+
+    #[test]
+    fn position_conflict_no_loop() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        assert!(validate_position_conflict(&db, None, "spec-x", 1).is_ok());
+    }
+
+    #[test]
+    fn position_conflict_empty_loop() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        insert_test_loop(&db, "loop-empty");
+        assert!(validate_position_conflict(&db, Some("loop-empty"), "spec-x", 0).is_ok());
+    }
+
+    // ── validate_node_position_conflict: edge cases ────────────────
+
+    #[test]
+    fn node_position_no_owner() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let node = LoopNode {
+            id: "n1".into(),
+            spec_id: None,
+            loop_id: None,
+            name: "n1".into(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+        assert!(validate_node_position_conflict(&db, &node, "n1", 1).is_ok());
+    }
+
+    #[test]
+    fn node_position_empty_siblings() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        db.insert_loop_spec(&standalone_spec("s1")).unwrap();
+        let node = LoopNode {
+            id: "n1".into(),
+            spec_id: Some("s1".into()),
+            loop_id: None,
+            name: "n1".into(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "claude"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+        assert!(validate_node_position_conflict(&db, &node, "n1", 5).is_ok());
+    }
+
+    #[test]
+    fn node_position_no_conflict_different_position() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        db.insert_loop_spec(&standalone_spec("s1")).unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "n1".into(),
+            spec_id: Some("s1".into()),
+            loop_id: None,
+            name: "n1".into(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "claude"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        let node = LoopNode {
+            id: "n2".into(),
+            spec_id: Some("s1".into()),
+            loop_id: None,
+            name: "n2".into(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "true"}),
+            position: 5,
+            created_at: chrono::Utc::now(),
+        };
+        assert!(validate_node_position_conflict(&db, &node, "n2", 2).is_ok());
+    }
+
+    // ── validate_pool_not_consumed edge cases ──────────────────────
+
+    #[test]
+    fn pool_not_consumed_empty_pool() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        db.insert_pool(&Pool {
+            id: "pool-e".into(),
+            name: "empty".into(),
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        assert!(validate_pool_not_consumed(&db, "pool-e", "loop-1").is_ok());
+    }
+
+    #[test]
+    fn pool_not_consumed_pending_spec() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        db.insert_loop_spec(&standalone_spec("s1")).unwrap();
+        db.insert_pool(&Pool {
+            id: "pool-p".into(),
+            name: "pool-p".into(),
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.append_pool_member("pool-p", "s1", None).unwrap();
+        assert!(validate_pool_not_consumed(&db, "pool-p", "loop-other").is_ok());
+    }
+
+    #[test]
+    fn pool_not_consumed_own_loop() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        db.insert_loop_spec(&running_spec("s-owned")).unwrap();
+        db.insert_loop(&make_loop("loop-owner", LoopStatus::Running)).unwrap();
+        db.insert_pool(&Pool {
+            id: "pool-o".into(),
+            name: "pool-o".into(),
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.append_pool_member("pool-o", "s-owned", None).unwrap();
+        insert_test_node(&db, "n1", "s-owned");
+        db.insert_loop_run(&loop_run_row("run1", "loop-owner", "s-owned", LoopRunStatus::Running))
+            .unwrap();
+        assert!(validate_pool_not_consumed(&db, "pool-o", "loop-owner").is_ok());
+    }
+
+    // ── validate_pool_member_removable edge cases ──────────────────
+
+    #[test]
+    fn pool_member_removable_pending() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        db.insert_loop_spec(&standalone_spec("s1")).unwrap();
+        db.insert_pool(&Pool {
+            id: "pool-r".into(),
+            name: "pool-r".into(),
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        assert!(validate_pool_member_removable(&db, "pool-r", "s1").is_ok());
+    }
+
+    #[test]
+    fn pool_member_removable_nonexistent() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        db.insert_pool(&Pool {
+            id: "pool-r".into(),
+            name: "pool-r".into(),
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        assert!(validate_pool_member_removable(&db, "pool-r", "ghost").is_ok());
+    }
+
+    // ── resolve_reported_run: stale statuses ───────────────────────
+
+    #[test]
+    fn reported_run_rejects_pass_status() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        insert_test_loop(&db, "l1");
+        db.insert_loop_spec(&standalone_spec("s1")).unwrap();
+        insert_test_node(&db, "n1", "s1");
+        db.insert_loop_run(&loop_run_row("r1", "l1", "s1", LoopRunStatus::Pass))
+            .unwrap();
+        let result = resolve_reported_run(&db, "r1", "n1").unwrap();
+        assert!(result.expect_err("pass run must be stale").is_error.unwrap_or(false));
+    }
+
+    #[test]
+    fn reported_run_rejects_fail_status() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        insert_test_loop(&db, "l1");
+        db.insert_loop_spec(&standalone_spec("s1")).unwrap();
+        insert_test_node(&db, "n1", "s1");
+        db.insert_loop_run(&loop_run_row("r1", "l1", "s1", LoopRunStatus::Fail))
+            .unwrap();
+        let result = resolve_reported_run(&db, "r1", "n1").unwrap();
+        assert!(result.expect_err("fail run must be stale").is_error.unwrap_or(false));
+    }
+
+    // ── validate_pool_reorder_locking edge cases ───────────────────
+
+    #[test]
+    fn reorder_locking_all_pending() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        db.insert_loop_spec(&standalone_spec("a")).unwrap();
+        db.insert_loop_spec(&standalone_spec("b")).unwrap();
+        db.insert_loop_spec(&standalone_spec("c")).unwrap();
+        db.insert_pool(&Pool { id: "p1".into(), name: "p1".into(), created_at: chrono::Utc::now() }).unwrap();
+        for id in ["a", "b", "c"] { db.append_pool_member("p1", id, None).unwrap(); }
+        let current = db.list_pool_member_spec_ids("p1").unwrap();
+        let order = vec!["c".into(), "a".into(), "b".into()];
+        assert!(validate_pool_reorder_locking(&db, &current, &order).is_ok());
+    }
+
+    #[test]
+    fn reorder_locking_failed_spec_locked() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let mut f = standalone_spec("f");
+        f.status = LoopSpecStatus::Failed;
+        db.insert_loop_spec(&f).unwrap();
+        db.insert_loop_spec(&standalone_spec("p")).unwrap();
+        db.insert_pool(&Pool { id: "p1".into(), name: "p1".into(), created_at: chrono::Utc::now() }).unwrap();
+        db.append_pool_member("p1", "f", None).unwrap();
+        db.append_pool_member("p1", "p", None).unwrap();
+        let current = db.list_pool_member_spec_ids("p1").unwrap();
+        let order = vec!["p".into(), "f".into()];
+        let err = validate_pool_reorder_locking(&db, &current, &order).unwrap_err();
+        assert!(err.contains("failed"), "{err}");
+    }
+
+    #[test]
+    fn reorder_locking_skipped_spec_locked() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let mut s = standalone_spec("s");
+        s.status = LoopSpecStatus::Skipped;
+        db.insert_loop_spec(&s).unwrap();
+        db.insert_loop_spec(&standalone_spec("p")).unwrap();
+        db.insert_pool(&Pool { id: "p1".into(), name: "p1".into(), created_at: chrono::Utc::now() }).unwrap();
+        db.append_pool_member("p1", "s", None).unwrap();
+        db.append_pool_member("p1", "p", None).unwrap();
+        let current = db.list_pool_member_spec_ids("p1").unwrap();
+        let order = vec!["p".into(), "s".into()];
+        let err = validate_pool_reorder_locking(&db, &current, &order).unwrap_err();
+        assert!(err.contains("skipped"), "{err}");
+    }
+
+    #[test]
+    fn reorder_locking_mixed_pending_and_running() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        db.insert_loop_spec(&running_spec("r")).unwrap();
+        db.insert_loop_spec(&standalone_spec("p1")).unwrap();
+        db.insert_loop_spec(&standalone_spec("p2")).unwrap();
+        db.insert_pool(&Pool { id: "p1".into(), name: "p1".into(), created_at: chrono::Utc::now() }).unwrap();
+        db.append_pool_member("p1", "r", None).unwrap();
+        db.append_pool_member("p1", "p1", None).unwrap();
+        db.append_pool_member("p1", "p2", None).unwrap();
+        let current = db.list_pool_member_spec_ids("p1").unwrap();
+        let order = vec!["r".into(), "p2".into(), "p1".into()];
+        assert!(validate_pool_reorder_locking(&db, &current, &order).is_ok());
+    }
+
+    // ── validate_pool_reorder: all permutations ────────────────────
+
+    #[test]
+    fn pool_reorder_all_perms_of_three() {
+        let current = vec!["a".into(), "b".into(), "c".into()];
+        for perm in [
+            ["a", "b", "c"],
+            ["a", "c", "b"],
+            ["b", "a", "c"],
+            ["b", "c", "a"],
+            ["c", "a", "b"],
+            ["c", "b", "a"],
+        ] {
+            let reordered: Vec<String> = perm.into_iter().map(String::from).collect();
+            assert!(validate_pool_reorder(&current, &reordered).is_ok());
+        }
+    }
+
+    #[test]
+    fn pool_reorder_empty() {
+        assert!(validate_pool_reorder(&[], &[]).is_ok());
+    }
+
+    #[test]
+    fn pool_reorder_large_pool() {
+        let current: Vec<String> = (0..100).map(|i| format!("s{i}")).collect();
+        let mut reordered = current.clone();
+        reordered.reverse();
+        assert!(validate_pool_reorder(&current, &reordered).is_ok());
+    }
+
+    // ── validate_ensemble_members: boundaries ──────────────────────
+
+    #[test]
+    fn ensemble_exactly_min() {
+        let m: Vec<EnsembleMemberParams> = (0..2)
+            .map(|i| EnsembleMemberParams { platform: format!("p{i}"), model: None })
+            .collect();
+        assert!(validate_ensemble_members(&m).is_ok());
+    }
+
+    #[test]
+    fn ensemble_exactly_max() {
+        let m: Vec<EnsembleMemberParams> = (0..8)
+            .map(|i| EnsembleMemberParams { platform: format!("p{i}"), model: None })
+            .collect();
+        assert!(validate_ensemble_members(&m).is_ok());
+    }
+
+    #[test]
+    fn ensemble_above_max() {
+        let m: Vec<EnsembleMemberParams> = (0..9)
+            .map(|i| EnsembleMemberParams { platform: format!("p{i}"), model: None })
+            .collect();
+        assert!(validate_ensemble_members(&m).unwrap_err().contains("2-8"));
+    }
+
+    #[test]
+    fn ensemble_empty_model_becomes_none() {
+        let m = vec![
+            EnsembleMemberParams { platform: "claude".into(), model: Some("".into()) },
+            EnsembleMemberParams { platform: "mimo".into(), model: None },
+        ];
+        let result = validate_ensemble_members(&m).unwrap();
+        assert_eq!(result[0].1, None);
+        assert_eq!(result[1].1, None);
+    }
+
+    // ── validate_node_config: gate edge cases ─────────────────────
+
+    #[test]
+    fn gate_empty_evaluate_and_value() {
+        let config = serde_json::json!({"evaluate": "", "value": ""});
+        let err = validate_node_config(LoopNodeKind::Gate, &config).unwrap_err();
+        assert!(err.contains("value"), "{err}");
+    }
+
+    // ── spec_summary_json: all statuses ────────────────────────────
+
+    #[test]
+    fn spec_summary_all_statuses() {
+        for status in [
+            LoopSpecStatus::Pending,
+            LoopSpecStatus::Running,
+            LoopSpecStatus::Completed,
+            LoopSpecStatus::Failed,
+            LoopSpecStatus::Skipped,
+        ] {
+            let mut spec = standalone_spec("s");
+            spec.status = status;
+            let json = spec_summary_json(&spec);
+            assert_eq!(json["status"], status.as_str());
+        }
+    }
+
+    // ── validate_non_empty: unicode and special chars ───────────────
+
+    #[test]
+    fn non_empty_unicode() {
+        assert!(validate_non_empty("こんにちは", "f").is_ok());
+    }
+
+    #[test]
+    fn non_empty_mixed_whitespace() {
+        assert!(validate_non_empty(" \t\n ", "f").is_err());
+    }
+
+    // ── validate_absolute_dir: trailing slash ──────────────────────
+
+    #[test]
+    fn absolute_dir_trailing_slash() {
+        let dir = tempdir().unwrap();
+        let path = format!("{}/", dir.path().to_string_lossy());
+        assert!(validate_absolute_dir(&path).is_ok());
+    }
+
+    // ── validate_spec_set_status_target: all valid ─────────────────
+
+    #[test]
+    fn set_status_target_all_valid() {
+        assert!(validate_spec_set_status_target("pending").is_ok());
+        assert!(validate_spec_set_status_target("completed").is_ok());
+        assert!(validate_spec_set_status_target("skipped").is_ok());
+    }
+
+    // ── validate_at_least_one_bool: mixed ──────────────────────────
+
+    #[test]
+    fn at_least_one_mixed() {
+        assert!(validate_at_least_one_bool(&[false, true, false, true], "f").is_ok());
+        assert!(validate_at_least_one_bool(&[false, false, false, false], "f").is_err());
+    }
+
+    // ── build_id_result: various keys ──────────────────────────────
+
+    #[test]
+    fn id_result_spec_id() {
+        let r = build_id_result("abc", "spec_id");
+        let t = format!("{:?}", r.content);
+        assert!(t.contains("spec_id") && t.contains("abc"));
+    }
+
+    #[test]
+    fn id_result_ensemble_id() {
+        let r = build_id_result("ens-1", "ensemble_id");
+        let t = format!("{:?}", r.content);
+        assert!(t.contains("ensemble_id") && t.contains("ens-1"));
+    }
+
+    #[test]
+    fn id_result_queue_id() {
+        let r = build_id_result("q-1", "queue_id");
+        let t = format!("{:?}", r.content);
+        assert!(t.contains("queue_id") && t.contains("q-1"));
+    }
+
+    // ── build_json_result: nested ──────────────────────────────────
+
+    #[test]
+    fn json_result_nested() {
+        let v = serde_json::json!({"mapping": {"old": "new"}, "wired": true});
+        let r = build_json_result(&v);
+        let t = format!("{:?}", r.content);
+        assert!(t.contains("mapping") && t.contains("old"));
+    }
+
+    // ── member_node_config edge cases ──────────────────────────────
+
+    #[test]
+    fn member_config_zero_timeout() {
+        let c = member_node_config("claude", None, "p", 0);
+        assert_eq!(c["timeout_minutes"], 0);
+    }
+
+    // ── resolve_graph_target: whitespace-only ──────────────────────
+
+    #[test]
+    fn graph_target_whitespace_both() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let err = resolve_graph_target(&db, Some("   "), Some("  ")).unwrap_err();
+        assert!(err.contains("exactly one"), "{err}");
+    }
+
+    // ── rag_result_json: negative distance ─────────────────────────
+
+    #[test]
+    fn rag_negative_distance() {
+        use crate::rag::vector_store::SearchResult;
+        let r = SearchResult {
+            id: "sr-neg".into(),
+            file_path: "/t.md".into(),
+            content: "c".into(),
+            created_at: 0,
+            distance: Some(-0.5),
+        };
+        let json = rag_result_json(&r);
+        assert!(json["distance"].as_f64().unwrap() < 0.0);
+    }
+
+    // ── node_copy_note edge cases ──────────────────────────────────
+
+    #[test]
+    fn copy_note_wired() {
+        let n = node_copy_note("src", "dst", true);
+        assert!(n.contains("src") && n.contains("dst") && !n.contains("Unwired"));
+    }
+
+    #[test]
+    fn copy_note_unwired() {
+        let n = node_copy_note("src", "dst", false);
+        assert!(n.contains("Unwired") && n.contains("loop_add_edge"));
     }
 }

@@ -622,4 +622,130 @@ mod tests {
         };
         assert_eq!(snap.selection_text((0, 0), (0, 2)), "日x");
     }
+
+    // ── from_vt100 color conversion ─────────────────────────────
+
+    #[test]
+    fn from_vt100_default_color() {
+        assert_eq!(from_vt100(vt100::Color::Default), ratatui::style::Color::Reset);
+    }
+
+    #[test]
+    fn from_vt100_indexed_color() {
+        assert_eq!(
+            from_vt100(vt100::Color::Idx(42)),
+            ratatui::style::Color::Indexed(42)
+        );
+    }
+
+    #[test]
+    fn from_vt100_rgb_color() {
+        assert_eq!(
+            from_vt100(vt100::Color::Rgb(100, 200, 50)),
+            ratatui::style::Color::Rgb(100, 200, 50)
+        );
+    }
+
+    #[test]
+    fn from_vt100_indexed_zero() {
+        assert_eq!(
+            from_vt100(vt100::Color::Idx(0)),
+            ratatui::style::Color::Indexed(0)
+        );
+    }
+
+    #[test]
+    fn from_vt100_indexed_max() {
+        assert_eq!(
+            from_vt100(vt100::Color::Idx(255)),
+            ratatui::style::Color::Indexed(255)
+        );
+    }
+
+    // ── selection_text edge cases ────────────────────────────────
+
+    #[test]
+    fn selection_text_single_char() {
+        let snap = snapshot(&["abc"], 10);
+        assert_eq!(snap.selection_text((0, 1), (0, 1)), "b");
+    }
+
+    #[test]
+    fn selection_text_full_row() {
+        let snap = snapshot(&["hello"], 10);
+        assert_eq!(snap.selection_text((0, 0), (0, 4)), "hello");
+    }
+
+    #[test]
+    fn selection_text_empty_row() {
+        let snap = snapshot(&[""], 10);
+        let result = snap.selection_text((0, 0), (0, 0));
+        assert!(result.is_empty() || result == " ");
+    }
+
+    #[test]
+    fn selection_text_two_rows_no_overlap() {
+        let snap = snapshot(&["aaa", "bbb"], 10);
+        assert_eq!(snap.selection_text((0, 0), (1, 2)), "aaa\nbbb");
+    }
+
+    #[test]
+    fn selection_text_none_cells_are_spaces() {
+        let mut snap = snapshot(&["abc"], 5);
+        // Set one cell to None
+        snap.cells[0][1] = None;
+        assert_eq!(snap.selection_text((0, 0), (0, 2)), "a c");
+    }
+
+    #[test]
+    fn selection_text_reversed_endpoints() {
+        let snap = snapshot(&["hello"], 10);
+        // Reversed: start > end
+        assert_eq!(snap.selection_text((0, 4), (0, 0)), "hello");
+    }
+
+    #[test]
+    #[allow(clippy::vec_init_then_push)]
+    fn selection_text_wide_char_with_continuation() {
+        let mut row: Vec<Option<VtCell>> = Vec::new();
+        // "AB" as two normal chars
+        row.push(cell("A"));
+        row.push(cell("B"));
+        // "日" as wide char + continuation
+        row.push(cell("日"));
+        row.push(Some(VtCell {
+            ch: String::new(),
+            fg: ratatui::style::Color::Reset,
+            bg: ratatui::style::Color::Reset,
+            bold: false,
+            underline: false,
+            inverse: false,
+            wide_continuation: true,
+        }));
+        row.push(cell("C"));
+        row.resize_with(10, || cell(""));
+        let snap = ScreenSnapshot {
+            cells: vec![row],
+            cursor_row: 0,
+            cursor_col: 0,
+            scrolled: false,
+        };
+        assert_eq!(snap.selection_text((0, 0), (0, 4)), "AB日C");
+    }
+
+    #[test]
+    fn selection_text_empty_ch_cell() {
+        let mut snap = snapshot(&["abc"], 5);
+        // Set one cell to have empty ch
+        snap.cells[0][1] = Some(VtCell {
+            ch: String::new(),
+            fg: ratatui::style::Color::Reset,
+            bg: ratatui::style::Color::Reset,
+            bold: false,
+            underline: false,
+            inverse: false,
+            wide_continuation: false,
+        });
+        assert_eq!(snap.selection_text((0, 0), (0, 2)), "a c");
+    }
 }

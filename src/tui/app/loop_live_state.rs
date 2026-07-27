@@ -982,6 +982,317 @@ mod tests {
             .unwrap();
     }
 
+    // ── json_to_text ─────────────────────────────────────────────
+
+    #[test]
+    fn json_to_text_string_passthrough() {
+        assert_eq!(json_to_text(&json!("hello world")), "hello world");
+    }
+
+    #[test]
+    fn json_to_text_null_returns_empty() {
+        assert_eq!(json_to_text(&Value::Null), "");
+    }
+
+    #[test]
+    fn json_to_text_number_returns_to_string() {
+        assert_eq!(json_to_text(&json!(42)), "42");
+        assert_eq!(json_to_text(&json!(2.72)), "2.72");
+    }
+
+    #[test]
+    fn json_to_text_object_with_blocker() {
+        let val = json!({"blocker": "needs human review", "extra": "ignored"});
+        assert_eq!(json_to_text(&val), "Blocker: needs human review");
+    }
+
+    #[test]
+    fn json_to_text_object_with_summary() {
+        let val = json!({"summary": "task completed successfully"});
+        assert_eq!(json_to_text(&val), "task completed successfully");
+    }
+
+    #[test]
+    fn json_to_text_object_blocker_takes_precedence_over_summary() {
+        let val = json!({"blocker": "stuck", "summary": "partial"});
+        assert_eq!(json_to_text(&val), "Blocker: stuck");
+    }
+
+    #[test]
+    fn json_to_text_object_fallback_to_pretty_print() {
+        let val = json!({"key": "value", "count": 3});
+        let result = json_to_text(&val);
+        assert!(result.contains("\"key\""));
+        assert!(result.contains("\"value\""));
+    }
+
+    #[test]
+    fn json_to_text_array_joins_with_newlines() {
+        let val = json!(["line1", "line2", "line3"]);
+        assert_eq!(json_to_text(&val), "line1\nline2\nline3");
+    }
+
+    #[test]
+    fn json_to_text_nested_array() {
+        let val = json!([["a", "b"], ["c"]]);
+        assert_eq!(json_to_text(&val), "a\nb\nc");
+    }
+
+    #[test]
+    fn json_to_text_empty_array() {
+        let val = json!([]);
+        assert_eq!(json_to_text(&val), "");
+    }
+
+    #[test]
+    fn json_to_text_empty_object_pretty_prints() {
+        let val = json!({});
+        assert_eq!(json_to_text(&val), "{}");
+    }
+
+    // ── tail_lines ──────────────────────────────────────────────
+
+    #[test]
+    fn tail_lines_empty_string() {
+        assert_eq!(tail_lines("", 10), "");
+    }
+
+    #[test]
+    fn tail_lines_fewer_than_n() {
+        assert_eq!(tail_lines("a\nb\nc", 10), "a\nb\nc");
+    }
+
+    #[test]
+    fn tail_lines_exactly_n() {
+        assert_eq!(tail_lines("a\nb\nc", 3), "a\nb\nc");
+    }
+
+    #[test]
+    fn tail_lines_more_than_n() {
+        assert_eq!(tail_lines("a\nb\nc\nd\ne", 3), "c\nd\ne");
+    }
+
+    #[test]
+    fn tail_lines_single_line() {
+        assert_eq!(tail_lines("only one", 5), "only one");
+    }
+
+    #[test]
+    fn tail_lines_zero_n_returns_empty() {
+        assert_eq!(tail_lines("a\nb", 0), "");
+    }
+
+    #[test]
+    fn tail_lines_preserves_empty_lines() {
+        let input = "a\n\nb\n\nc";
+        let result = tail_lines(input, 10);
+        assert_eq!(result, "a\n\nb\n\nc");
+    }
+
+    // ── extract_output_tail ─────────────────────────────────────
+
+    #[test]
+    fn extract_output_tail_none_input() {
+        assert!(extract_output_tail(&None).is_none());
+    }
+
+    #[test]
+    fn extract_output_tail_empty_string() {
+        assert!(extract_output_tail(&Some(json!(""))).is_none());
+    }
+
+    #[test]
+    fn extract_output_tail_whitespace_only() {
+        // Whitespace-only string still produces a result (it's not empty)
+        let result = extract_output_tail(&Some(json!("   \n  \n  ")));
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn extract_output_tail_array_value() {
+        let val = json!(["line1", "line2"]);
+        let tail = extract_output_tail(&Some(val)).unwrap();
+        assert!(tail.contains("line1"));
+        assert!(tail.contains("line2"));
+    }
+
+    #[test]
+    fn extract_output_tail_numeric_value() {
+        let val = json!(42);
+        let tail = extract_output_tail(&Some(val)).unwrap();
+        assert_eq!(tail, "42");
+    }
+
+    #[test]
+    fn extract_output_tail_object_without_blocker_or_summary() {
+        let val = json!({"raw": "data"});
+        let tail = extract_output_tail(&Some(val)).unwrap();
+        assert!(tail.contains("raw"));
+    }
+
+    // ── NodeRunInfo::from_run and default ────────────────────────
+
+    #[test]
+    fn node_run_info_default_is_empty() {
+        let info = NodeRunInfo::default();
+        assert!(info.status.is_none());
+        assert!(info.started_at.is_none());
+        assert!(info.iteration.is_none());
+        assert!(info.output_tail.is_none());
+    }
+
+    #[test]
+    fn node_run_info_from_run_captures_all_fields() {
+        let run = make_run(
+            "lp1",
+            "s1",
+            "n1",
+            LoopRunStatus::Pass,
+            3,
+            Some(json!({"summary": "all good"})),
+        );
+        let info = NodeRunInfo::from_run(&run);
+        assert_eq!(info.status, Some(LoopRunStatus::Pass));
+        assert!(info.started_at.is_some());
+        assert_eq!(info.iteration, Some(3));
+        assert_eq!(info.output_tail.as_deref(), Some("all good"));
+    }
+
+    #[test]
+    fn node_run_info_from_run_with_none_output() {
+        let run = make_run("lp1", "s1", "n1", LoopRunStatus::Running, 1, None);
+        let info = NodeRunInfo::from_run(&run);
+        assert_eq!(info.status, Some(LoopRunStatus::Running));
+        assert!(info.output_tail.is_none());
+    }
+
+    // ── resolve_node_run_info edge cases ─────────────────────────
+
+    #[test]
+    fn resolve_node_run_info_no_runs_returns_default() {
+        let db = test_db();
+        let info = resolve_node_run_info(&db, "nonexistent-spec", "nonexistent-node");
+        assert!(info.status.is_none());
+    }
+
+    #[test]
+    fn resolve_node_run_info_finds_completed_run() {
+        let db = test_db();
+        let lp = make_loop("lp1", LoopStatus::Running);
+        db.insert_loop(&lp).unwrap();
+        db.insert_loop_spec(&make_spec("s1", "lp1", LoopSpecStatus::Running, 1))
+            .unwrap();
+
+        db.insert_loop_run(&make_run(
+            "lp1",
+            "s1",
+            "n1",
+            LoopRunStatus::Pass,
+            1,
+            Some(json!("completed")),
+        ))
+        .unwrap();
+
+        let info = resolve_node_run_info(&db, "s1", "n1");
+        assert_eq!(info.status, Some(LoopRunStatus::Pass));
+        assert_eq!(info.output_tail.as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn resolve_node_run_info_wrong_spec_returns_default() {
+        let db = test_db();
+        let lp = make_loop("lp1", LoopStatus::Running);
+        db.insert_loop(&lp).unwrap();
+        db.insert_loop_spec(&make_spec("s1", "lp1", LoopSpecStatus::Running, 1))
+            .unwrap();
+
+        db.insert_loop_run(&make_run(
+            "lp1",
+            "s1",
+            "n1",
+            LoopRunStatus::Pass,
+            1,
+            Some(json!("done")),
+        ))
+        .unwrap();
+
+        // Wrong spec_id — the active run won't match and listing runs for
+        // a nonexistent spec returns empty.
+        let info = resolve_node_run_info(&db, "s-other", "n1");
+        assert!(info.status.is_none());
+    }
+
+    // ── assemble_loop_live_state edge cases ──────────────────────
+
+    #[test]
+    fn paused_loop_has_no_current_spec() {
+        let db = test_db();
+        let lp = make_loop("lp1", LoopStatus::Paused);
+        db.insert_loop(&lp).unwrap();
+        db.insert_loop_spec(&make_spec("s1", "lp1", LoopSpecStatus::Completed, 1))
+            .unwrap();
+        db.insert_loop_spec(&make_spec("s2", "lp1", LoopSpecStatus::Skipped, 2))
+            .unwrap();
+
+        let details = details_from_loop(&db, &lp);
+        let state = assemble_loop_live_state(&db, &details).unwrap();
+        assert!(state.current_spec_id.is_none());
+        assert_eq!(state.done_count, 1); // Only Completed counts
+    }
+
+    #[test]
+    fn watch_trigger_type_label() {
+        let db = test_db();
+        let mut lp = make_loop("lp1", LoopStatus::Draft);
+        lp.trigger = Some(crate::domain::models::Trigger::Watch {
+            path: "/tmp/watch".to_string(),
+            events: vec![crate::domain::models::WatchEvent::Modify],
+            debounce_seconds: 5,
+            recursive: false,
+        });
+        db.insert_loop(&lp).unwrap();
+        let details = details_from_loop(&db, &lp);
+        let state = assemble_loop_live_state(&db, &details).unwrap();
+        assert_eq!(state.trigger_type, "watch");
+        assert_eq!(state.watch_path.as_deref(), Some("/tmp/watch"));
+        assert!(state.schedule_expr.is_none());
+    }
+
+    #[test]
+    fn manual_trigger_type_label() {
+        let db = test_db();
+        let lp = make_loop("lp1", LoopStatus::Draft);
+        db.insert_loop(&lp).unwrap();
+        let details = details_from_loop(&db, &lp);
+        let state = assemble_loop_live_state(&db, &details).unwrap();
+        assert_eq!(state.trigger_type, "manual");
+    }
+
+    #[test]
+    fn multiple_specs_progress_counting() {
+        let db = test_db();
+        let lp = make_loop("lp1", LoopStatus::Running);
+        db.insert_loop(&lp).unwrap();
+
+        db.insert_loop_spec(&make_spec("s1", "lp1", LoopSpecStatus::Completed, 1))
+            .unwrap();
+        db.insert_loop_spec(&make_spec("s2", "lp1", LoopSpecStatus::Completed, 2))
+            .unwrap();
+        db.insert_loop_spec(&make_spec("s3", "lp1", LoopSpecStatus::Running, 3))
+            .unwrap();
+        db.insert_loop_spec(&make_spec("s4", "lp1", LoopSpecStatus::Pending, 4))
+            .unwrap();
+        db.insert_loop_spec(&make_spec("s5", "lp1", LoopSpecStatus::Skipped, 5))
+            .unwrap();
+
+        let details = details_from_loop(&db, &lp);
+        let state = assemble_loop_live_state(&db, &details).unwrap();
+
+        assert_eq!(state.done_count, 2);
+        assert_eq!(state.total_count, 5);
+        assert_eq!(state.current_spec_id.as_deref(), Some("s3"));
+    }
+
     #[test]
     fn ensembles_live_info_reports_join_and_per_member_status() {
         let db = test_db();

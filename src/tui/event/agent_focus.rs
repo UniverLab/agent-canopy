@@ -1048,4 +1048,96 @@ mod tests {
     fn dismisses_exited_session_f10_split_and_exited() {
         assert!(!dismisses_exited_session(KeyCode::F(10), true, true));
     }
+
+    #[test]
+    fn dismisses_exited_session_various_keys() {
+        assert!(!dismisses_exited_session(KeyCode::Char('a'), false, true));
+        assert!(!dismisses_exited_session(KeyCode::Enter, false, true));
+        assert!(!dismisses_exited_session(KeyCode::Tab, false, true));
+        assert!(!dismisses_exited_session(KeyCode::Down, false, true));
+    }
+
+    #[test]
+    fn shift_scroll_request_left_is_none() {
+        assert!(shift_scroll_request(KeyCode::Left).is_none());
+    }
+
+    #[test]
+    fn shift_scroll_request_right_is_none() {
+        assert!(shift_scroll_request(KeyCode::Right).is_none());
+    }
+
+    #[test]
+    fn shift_scroll_request_pageup_is_none() {
+        assert!(shift_scroll_request(KeyCode::PageUp).is_none());
+    }
+
+    #[test]
+    fn shift_scroll_request_pagedown_is_none() {
+        assert!(shift_scroll_request(KeyCode::PageDown).is_none());
+    }
+
+    #[test]
+    fn standard_scroll_request_pageup_scrolled() {
+        assert_eq!(
+            standard_scroll_request(KeyCode::PageUp, true),
+            Some((true, 15))
+        );
+    }
+
+    #[test]
+    fn standard_scroll_request_pagedown_scrolled() {
+        assert_eq!(
+            standard_scroll_request(KeyCode::PageDown, true),
+            Some((false, 15))
+        );
+    }
+
+    #[test]
+    fn standard_scroll_request_tab_is_none() {
+        assert!(standard_scroll_request(KeyCode::Tab, false).is_none());
+    }
+
+    #[test]
+    fn standard_scroll_request_esc_is_none() {
+        assert!(standard_scroll_request(KeyCode::Esc, false).is_none());
+    }
+
+    #[test]
+    fn is_focus_cycle_key_all_variants() {
+        // Only Up/Down with SHIFT are focus cycle keys
+        assert!(is_focus_cycle_key(KeyCode::Up, KeyModifiers::SHIFT));
+        assert!(is_focus_cycle_key(KeyCode::Down, KeyModifiers::SHIFT));
+        // Other keys with SHIFT are not
+        assert!(!is_focus_cycle_key(KeyCode::Left, KeyModifiers::SHIFT));
+        assert!(!is_focus_cycle_key(KeyCode::Right, KeyModifiers::SHIFT));
+        // Without SHIFT, not cycle keys
+        assert!(!is_focus_cycle_key(KeyCode::Up, KeyModifiers::NONE));
+        assert!(!is_focus_cycle_key(KeyCode::Down, KeyModifiers::NONE));
+        // Control alone is not enough
+        assert!(!is_focus_cycle_key(
+            KeyCode::Up,
+            KeyModifiers::CONTROL
+        ));
+    }
+
+    #[test]
+    fn dismisses_exited_session_all_combos() {
+        // esc, not split, exited
+        assert!(dismisses_exited_session(KeyCode::Esc, false, true));
+        // esc, not split, not exited
+        assert!(!dismisses_exited_session(KeyCode::Esc, false, false));
+        // esc, split, exited
+        assert!(!dismisses_exited_session(KeyCode::Esc, true, true));
+        // esc, split, not exited
+        assert!(!dismisses_exited_session(KeyCode::Esc, true, false));
+        // f10, not split, exited
+        assert!(dismisses_exited_session(KeyCode::F(10), false, true));
+        // f10, not split, not exited
+        assert!(!dismisses_exited_session(KeyCode::F(10), false, false));
+        // f10, split, exited
+        assert!(!dismisses_exited_session(KeyCode::F(10), true, true));
+        // f10, split, not exited
+        assert!(!dismisses_exited_session(KeyCode::F(10), true, false));
+    }
 }

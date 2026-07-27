@@ -1149,4 +1149,332 @@ mod tests {
         assert_eq!(stored.prompt, "updated prompt");
         assert_eq!(stored.model.as_deref(), Some("updated-model"));
     }
+
+    // ── Free helper tests ────────────────────────────────────────
+
+    #[test]
+    fn new_short_id_has_prefix() {
+        let id = new_short_id("agent");
+        assert!(id.starts_with("agent-"));
+        assert!(id.len() > "agent-".len());
+    }
+
+    #[test]
+    fn new_short_id_unique() {
+        let id1 = new_short_id("test");
+        let id2 = new_short_id("test");
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn agent_log_path_ends_with_log_extension() {
+        let path = agent_log_path("agent-123");
+        assert!(path.ends_with(".log"));
+        assert!(path.contains("agent-123"));
+    }
+
+    #[test]
+    fn pty_dimensions_fallback_to_terminal_size() {
+        let (cols, rows) = pty_dimensions((0, 0));
+        assert!(cols > 0);
+        assert!(rows > 0);
+    }
+
+    #[test]
+    fn pty_dimensions_uses_panel_size_when_available() {
+        let (cols, rows) = pty_dimensions((100, 50));
+        assert_eq!(cols, 100);
+        assert_eq!(rows, 50);
+    }
+
+    // ── apply_scheduled_edit edge cases ──────────────────────────
+
+    #[test]
+    fn apply_scheduled_edit_empty_cron_preserves() {
+        let mut agent = cron_agent("cron-1");
+        let mut dialog = dialog_with_clis(&agent);
+        dialog.prompt = "test".to_string();
+        dialog.cron_expr = String::new();
+        apply_scheduled_edit(&mut agent, &dialog, None);
+        if let Some(Trigger::Cron { schedule_expr }) = &agent.trigger {
+            assert!(schedule_expr.is_empty());
+        } else {
+            panic!("expected Cron trigger");
+        }
+    }
+
+    #[test]
+    fn apply_scheduled_edit_model_none() {
+        let mut agent = cron_agent("cron-1");
+        let mut dialog = dialog_with_clis(&agent);
+        dialog.prompt = "test".to_string();
+        apply_scheduled_edit(&mut agent, &dialog, None);
+        assert!(agent.model.is_none());
+    }
+
+    #[test]
+    fn apply_scheduled_edit_model_some() {
+        let mut agent = cron_agent("cron-1");
+        let mut dialog = dialog_with_clis(&agent);
+        dialog.prompt = "test".to_string();
+        apply_scheduled_edit(&mut agent, &dialog, Some("gpt-4"));
+        assert_eq!(agent.model.as_deref(), Some("gpt-4"));
+    }
+
+    // ── apply_watcher_edit edge cases ────────────────────────────
+
+    #[test]
+    fn apply_watcher_edit_model_none() {
+        let mut agent = watch_agent("watch-1");
+        let mut dialog = dialog_with_clis(&agent);
+        dialog.prompt = "test".to_string();
+        dialog.watch_path = "/new/path".to_string();
+        dialog.watch_events = vec!["modify".to_string()];
+        apply_watcher_edit(&mut agent, &dialog, None);
+        assert!(agent.model.is_none());
+    }
+
+    #[test]
+    fn apply_watcher_edit_model_some() {
+        let mut agent = watch_agent("watch-1");
+        let mut dialog = dialog_with_clis(&agent);
+        dialog.prompt = "test".to_string();
+        dialog.watch_path = "/new/path".to_string();
+        dialog.watch_events = vec!["modify".to_string()];
+        apply_watcher_edit(&mut agent, &dialog, Some("gpt-4"));
+        assert_eq!(agent.model.as_deref(), Some("gpt-4"));
+    }
+
+    // ── populate_dialog_from_agent edge cases ────────────────────
+
+    #[test]
+    fn populate_dialog_from_agent_no_trigger() {
+        let mut agent = cron_agent("cron-1");
+        agent.trigger = None;
+        let mut dialog = dialog_with_clis(&agent);
+        populate_dialog_from_agent(&mut dialog, &agent);
+        assert!(matches!(dialog.background_trigger, BackgroundTrigger::Cron));
+    }
+
+    // ── close_new_agent_dialog ───────────────────────────────────
+
+    #[test]
+    fn close_new_agent_dialog_with_prev_focus() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.prev_focus = Some(Focus::Agent);
+        app.new_agent_dialog = Some(dialog);
+        app.close_new_agent_dialog();
+        assert!(app.new_agent_dialog.is_none());
+        assert!(matches!(app.focus, Focus::Agent));
+    }
+
+    #[test]
+    fn close_new_agent_dialog_without_prev_focus() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        let dialog = NewAgentDialog::new(None);
+        app.new_agent_dialog = Some(dialog);
+        app.close_new_agent_dialog();
+        assert!(app.new_agent_dialog.is_none());
+        assert!(matches!(app.focus, Focus::Home));
+    }
+
+    #[test]
+    fn close_new_agent_dialog_none() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.close_new_agent_dialog();
+        assert!(matches!(app.focus, Focus::Home));
+    }
+
+    // ── close_launchpad_dialog ───────────────────────────────────
+
+    #[test]
+    fn close_launchpad_dialog_clears_both() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        // Set up both dialogs via the normal open path
+        app.new_agent_dialog = Some(NewAgentDialog::new(None));
+        app.launchpad_dialog = app
+            .new_agent_dialog
+            .as_ref()
+            .and_then(|d| LaunchpadDialog::for_workdir(&db, &d.working_dir).ok());
+        app.pending_launch_dialog = app.new_agent_dialog.take();
+        app.close_launchpad_dialog();
+        assert!(app.launchpad_dialog.is_none());
+        assert!(app.pending_launch_dialog.is_none());
+    }
+
+    // ── close_simple_prompt_dialog ───────────────────────────────
+
+    #[test]
+    fn close_simple_prompt_dialog_persists_session() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        let mut dialog = SimplePromptDialog::new();
+        dialog.set_section_content("instruction_1", "test prompt".to_string());
+        dialog.prev_focus = Some(Focus::Agent);
+        app.simple_prompt_dialog = Some(dialog);
+
+        app.close_simple_prompt_dialog();
+        assert!(app.simple_prompt_dialog.is_none());
+        assert!(matches!(app.focus, Focus::Agent));
+        // Session should be persisted
+        let key = app.current_prompt_session_key();
+        assert!(app.prompt_builder_sessions.contains_key(&key));
+    }
+
+    #[test]
+    fn discard_simple_prompt_dialog_does_not_persist() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        let mut dialog = SimplePromptDialog::new();
+        dialog.set_section_content("instruction_1", "test prompt".to_string());
+        dialog.prev_focus = Some(Focus::Agent);
+        app.simple_prompt_dialog = Some(dialog);
+
+        app.discard_simple_prompt_dialog();
+        assert!(app.simple_prompt_dialog.is_none());
+        let key = app.current_prompt_session_key();
+        assert!(!app.prompt_builder_sessions.contains_key(&key));
+    }
+
+    #[test]
+    fn close_simple_prompt_dialog_no_dialog() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.close_simple_prompt_dialog();
+        assert!(matches!(app.focus, Focus::Agent));
+    }
+
+    // ── launch_scheduled edge cases ──────────────────────────────
+
+    #[test]
+    fn launch_scheduled_empty_prompt_does_nothing() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.prompt = String::new();
+        dialog.task_type = NewTaskType::Background;
+        dialog.background_trigger = BackgroundTrigger::Cron;
+        app.launch_scheduled(&dialog, None).expect("should not error");
+        // No agent should have been created
+        let agents = db.list_agents().unwrap();
+        assert!(agents.is_empty());
+    }
+
+    // ── launch_watcher edge cases ────────────────────────────────
+
+    #[test]
+    fn launch_watcher_empty_prompt_does_nothing() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.prompt = String::new();
+        dialog.watch_path = "/tmp".to_string();
+        dialog.task_type = NewTaskType::Background;
+        dialog.background_trigger = BackgroundTrigger::Watch;
+        app.launch_watcher(&dialog, None).expect("should not error");
+        let agents = db.list_agents().unwrap();
+        assert!(agents.is_empty());
+    }
+
+    #[test]
+    fn launch_watcher_empty_watch_path_does_nothing() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.prompt = "test".to_string();
+        dialog.watch_path = String::new();
+        dialog.task_type = NewTaskType::Background;
+        dialog.background_trigger = BackgroundTrigger::Watch;
+        app.launch_watcher(&dialog, None).expect("should not error");
+        let agents = db.list_agents().unwrap();
+        assert!(agents.is_empty());
+    }
+
+    #[test]
+    fn launch_watcher_empty_events_does_nothing() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.prompt = "test".to_string();
+        dialog.watch_path = "/tmp".to_string();
+        dialog.watch_events.clear();
+        dialog.task_type = NewTaskType::Background;
+        dialog.background_trigger = BackgroundTrigger::Watch;
+        app.launch_watcher(&dialog, None).expect("should not error");
+        let agents = db.list_agents().unwrap();
+        assert!(agents.is_empty());
+    }
+
+    // ── launch_new_agent edge cases ──────────────────────────────
+
+    #[test]
+    fn launch_new_agent_no_dialog_does_nothing() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.launch_new_agent().expect("should not error");
+        assert!(app.new_agent_dialog.is_none());
+    }
+
+    // ── open_new_agent_dialog ────────────────────────────────────
+
+    #[test]
+    fn open_new_agent_dialog_sets_focus() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.open_new_agent_dialog();
+        assert!(app.new_agent_dialog.is_some());
+        assert!(matches!(app.focus, Focus::NewAgentDialog));
+    }
+
+    #[test]
+    fn open_new_agent_dialog_captures_prev_focus() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.focus = Focus::Agent;
+        app.open_new_agent_dialog();
+        let dialog = app.new_agent_dialog.as_ref().unwrap();
+        assert!(matches!(dialog.prev_focus, Some(Focus::Agent)));
+    }
+
+    // ── open_edit_dialog edge cases ──────────────────────────────
+
+    #[test]
+    fn open_edit_dialog_no_selection_does_nothing() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.open_edit_dialog();
+        assert!(app.new_agent_dialog.is_none());
+    }
+
+    #[test]
+    fn open_edit_dialog_non_agent_entry_does_nothing() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        // Add a non-agent entry (terminal index 0, but no terminal agents exist)
+        app.agents = vec![AgentEntry::Terminal(0)];
+        app.selected = 0;
+        app.open_edit_dialog();
+        assert!(app.new_agent_dialog.is_none());
+    }
 }

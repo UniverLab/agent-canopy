@@ -1685,6 +1685,7 @@ fn draw_project_relation_dialog(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn needed_agents(count: u16) -> u16 {
         count * 4 + 2
@@ -2262,5 +2263,286 @@ mod tests {
     #[test]
     fn groups_list_demand_many() {
         assert_eq!(groups_list_demand(3), 8);
+    }
+
+    #[test]
+    fn scroll_state_no_items() {
+        let s = scroll_state(0, None, 5);
+        assert_eq!(s.start, 0);
+        assert!(!s.has_up);
+        assert!(!s.has_down);
+    }
+
+    #[test]
+    fn scroll_state_fewer_items_than_visible() {
+        let s = scroll_state(3, None, 10);
+        assert_eq!(s.start, 0);
+        assert!(!s.has_up);
+        assert!(!s.has_down);
+    }
+
+    #[test]
+    fn scroll_state_selected_below_visible() {
+        let s = scroll_state(20, Some(15), 5);
+        assert_eq!(s.start, 11);
+        assert!(s.has_up);
+        assert!(s.has_down);
+    }
+
+    #[test]
+    fn scroll_state_selected_at_top() {
+        let s = scroll_state(20, Some(0), 5);
+        assert_eq!(s.start, 0);
+        assert!(!s.has_up);
+        assert!(s.has_down);
+    }
+
+    #[test]
+    fn scroll_state_selected_at_end() {
+        let s = scroll_state(20, Some(19), 5);
+        assert_eq!(s.start, 15);
+        assert!(s.has_up);
+        assert!(!s.has_down);
+    }
+
+    #[test]
+    fn scroll_state_with_offset_shifts_start() {
+        let s = scroll_state_with_offset(20, Some(0), 5, 3);
+        assert_eq!(s.start, 3);
+        assert!(s.has_up);
+    }
+
+    #[test]
+    fn scroll_state_with_offset_clamped_to_max() {
+        let s = scroll_state_with_offset(20, Some(19), 5, 100);
+        assert_eq!(s.start, 15);
+    }
+
+    #[test]
+    fn render_sidebar_card_line_short_area() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(20, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| {
+            let area = Rect::new(0, 0, 20, 1);
+            render_sidebar_card_line(
+                frame,
+                area,
+                0,
+                Color::Reset,
+                STATUS_OK,
+                vec![Span::raw("test")],
+            );
+        }).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for x in 0..buffer.area.width {
+            text.push_str(buffer[(x, 0)].symbol());
+        }
+        assert!(text.contains("test"));
+    }
+
+    #[test]
+    fn render_sidebar_card_line_beyond_height() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(20, 2);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| {
+            let area = Rect::new(0, 0, 20, 2);
+            // line_offset=2 is beyond height, should not panic
+            render_sidebar_card_line(
+                frame,
+                area,
+                2,
+                Color::Reset,
+                STATUS_OK,
+                vec![Span::raw("test")],
+            );
+        }).unwrap();
+    }
+
+    #[test]
+    fn group_row_style_selected_and_active() {
+        let theme = Theme::classic();
+        let style = group_row_style(true, true, &theme);
+        assert_eq!(style.bg, theme.selected_bg);
+        assert_eq!(style.fg, theme.header_color);
+        assert!(style.modifier.contains(Modifier::BOLD));
+        assert_eq!(style.prefix_color, Color::Green);
+        assert_eq!(style.active_tag, " ●");
+    }
+
+    #[test]
+    fn group_row_style_not_selected_not_active() {
+        let theme = Theme::classic();
+        let style = group_row_style(false, false, &theme);
+        assert_eq!(style.bg, Color::Reset);
+        assert_eq!(style.fg, Color::White);
+        assert!(style.modifier.is_empty());
+        assert_eq!(style.prefix_color, theme.dim_text);
+        assert_eq!(style.active_tag, "");
+    }
+
+    #[test]
+    fn group_row_style_selected_not_active() {
+        let theme = Theme::classic();
+        let style = group_row_style(true, false, &theme);
+        assert_eq!(style.bg, theme.selected_bg);
+        assert_eq!(style.fg, theme.header_color);
+        assert!(style.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn group_row_style_active_not_selected() {
+        let theme = Theme::classic();
+        let style = group_row_style(false, true, &theme);
+        assert_eq!(style.bg, Color::Reset);
+        assert_eq!(style.fg, Color::Green);
+        assert!(style.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn project_title_style_selected_and_focused() {
+        let theme = Theme::classic();
+        let style = project_title_style(true, true, &theme);
+        assert_eq!(style.bg, Some(theme.header_color));
+        assert_eq!(style.fg, Some(Color::Black));
+    }
+
+    #[test]
+    fn project_title_style_selected_not_focused() {
+        let theme = Theme::classic();
+        let style = project_title_style(true, false, &theme);
+        assert_eq!(style.bg, Some(theme.selected_bg));
+        assert_eq!(style.fg, Some(Color::White));
+    }
+
+    #[test]
+    fn project_title_style_not_selected() {
+        let theme = Theme::classic();
+        let style = project_title_style(false, false, &theme);
+        assert_eq!(style.bg, None);
+        assert_eq!(style.fg, Some(theme.header_color));
+    }
+
+    #[test]
+    fn project_meta_style_selected() {
+        let theme = Theme::classic();
+        let style = project_meta_style(true, &theme);
+        assert_eq!(style.fg, Some(Color::White));
+        assert_eq!(style.bg, Some(theme.selected_bg));
+    }
+
+    #[test]
+    fn project_meta_style_not_selected() {
+        let theme = Theme::classic();
+        let style = project_meta_style(false, &theme);
+        assert_eq!(style.fg, Some(theme.dim_text));
+    }
+
+    #[test]
+    fn rag_info_title_when_paused() {
+        use crate::db::Database;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
+        app.rag_paused = true;
+        assert_eq!(rag_info_title(&app), " ragInfo ⏸ ");
+    }
+
+    #[test]
+    fn rag_info_title_when_not_paused() {
+        use crate::db::Database;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
+        app.rag_paused = false;
+        assert_eq!(rag_info_title(&app), " ragInfo ");
+    }
+
+    #[test]
+    fn rag_queue_text_with_items() {
+        use crate::db::Database;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
+        app.rag_info.queued_items = 5;
+        assert_eq!(rag_queue_text(&app), "5 queued");
+    }
+
+    #[test]
+    fn rag_queue_text_zero_items() {
+        use crate::db::Database;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
+        app.rag_info.queued_items = 0;
+        assert_eq!(rag_queue_text(&app), "");
+    }
+
+    #[test]
+    fn pulse_active_cycles_through_phases() {
+        let a = pulse_active(0);
+        let b = pulse_active(10);
+        assert_ne!(a, b);
+        assert_ne!(a, super::super::STATUS_WAIT_OFF);
+        assert_ne!(b, super::super::STATUS_WAIT_OFF);
+    }
+
+    #[test]
+    fn pulse_cycles_through_phases() {
+        let a = pulse(Color::Red, 0);
+        let b = pulse(Color::Red, 10);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn draw_sidebar_renders_without_panic() {
+        use crate::db::Database;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
+        let backend = TestBackend::new(33, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| {
+            draw_sidebar(frame, frame.area(), &mut app, &Theme::classic());
+        }).unwrap();
+    }
+
+    #[test]
+    fn draw_sidebar_modern_theme_no_panic() {
+        use crate::db::Database;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
+        let backend = TestBackend::new(33, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| {
+            draw_sidebar(frame, frame.area(), &mut app, &Theme::modern());
+        }).unwrap();
     }
 }
