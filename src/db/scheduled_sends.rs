@@ -449,11 +449,7 @@ mod tests {
 
     #[test]
     fn is_target_alive_multiple_live_sessions() {
-        let live = vec![
-            "s1".to_string(),
-            "s2".to_string(),
-            "s3".to_string(),
-        ];
+        let live = vec!["s1".to_string(), "s2".to_string(), "s3".to_string()];
         assert!(is_target_alive("s1", &live));
         assert!(is_target_alive("s2", &live));
         assert!(is_target_alive("s3", &live));
@@ -483,8 +479,14 @@ mod tests {
             .unwrap();
         db.insert_scheduled_send("ss-a", "first", "s", None, now + chrono::Duration::hours(1))
             .unwrap();
-        db.insert_scheduled_send("ss-b", "second", "s", None, now + chrono::Duration::hours(2))
-            .unwrap();
+        db.insert_scheduled_send(
+            "ss-b",
+            "second",
+            "s",
+            None,
+            now + chrono::Duration::hours(2),
+        )
+        .unwrap();
 
         let due = db
             .list_due_scheduled_sends(now + chrono::Duration::hours(10))
@@ -506,7 +508,9 @@ mod tests {
         db.insert_scheduled_send("ss-1", "prompt", "session-a", None, fire)
             .unwrap();
 
-        let moved = db.reassign_scheduled_sends("session-b", "session-c").unwrap();
+        let moved = db
+            .reassign_scheduled_sends("session-b", "session-c")
+            .unwrap();
         assert_eq!(moved, 0);
         // Original send is untouched
         let pending = db
@@ -533,9 +537,7 @@ mod tests {
             .list_pending_scheduled_sends_for_session("old")
             .unwrap()
             .is_empty());
-        let pending_new = db
-            .list_pending_scheduled_sends_for_session("new")
-            .unwrap();
+        let pending_new = db.list_pending_scheduled_sends_for_session("new").unwrap();
         assert_eq!(pending_new.len(), 2);
     }
 

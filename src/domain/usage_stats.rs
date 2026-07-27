@@ -196,10 +196,7 @@ mod tests {
         usage.save(dir.path()).unwrap();
         let loaded = CliUsage::load(dir.path());
         assert_eq!(loaded.get("kiro"), 2);
-        assert_eq!(
-            loaded.first_run_at.as_deref(),
-            Some("2024-06-15T12:00:00Z")
-        );
+        assert_eq!(loaded.first_run_at.as_deref(), Some("2024-06-15T12:00:00Z"));
     }
 
     #[test]

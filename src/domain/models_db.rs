@@ -1079,7 +1079,8 @@ mod tests {
 
     #[test]
     fn resolve_native_no_cache_and_successful_enumerate() {
-        let load = resolve_native(false, || None, || Some(native(&["m1"], Duration::ZERO))).unwrap();
+        let load =
+            resolve_native(false, || None, || Some(native(&["m1"], Duration::ZERO))).unwrap();
         assert_eq!(load.source, CatalogSource::Live);
         assert_eq!(load.catalog.ids, vec!["m1".to_string()]);
     }

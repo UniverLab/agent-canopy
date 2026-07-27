@@ -81,7 +81,10 @@ mod tests {
     #[test]
     fn ragignore_path_appends_filename() {
         let dir = Path::new("/some/data/dir");
-        assert_eq!(ragignore_path(dir), PathBuf::from("/some/data/dir/ragignore"));
+        assert_eq!(
+            ragignore_path(dir),
+            PathBuf::from("/some/data/dir/ragignore")
+        );
     }
 
     #[test]

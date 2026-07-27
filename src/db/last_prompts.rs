@@ -200,10 +200,7 @@ mod tests {
         db.insert_last_prompt("lp-empty", "/proj", "", None, Utc::now())
             .unwrap();
 
-        let last = db
-            .get_last_prompt_for_workdir("/proj")
-            .unwrap()
-            .unwrap();
+        let last = db.get_last_prompt_for_workdir("/proj").unwrap().unwrap();
         assert_eq!(last.prompt_text, "");
     }
 
@@ -214,10 +211,7 @@ mod tests {
         db.insert_last_prompt("lp-long", "/proj", &long_text, None, Utc::now())
             .unwrap();
 
-        let last = db
-            .get_last_prompt_for_workdir("/proj")
-            .unwrap()
-            .unwrap();
+        let last = db.get_last_prompt_for_workdir("/proj").unwrap().unwrap();
         assert_eq!(last.prompt_text.len(), 100_000);
     }
 
@@ -242,10 +236,7 @@ mod tests {
         db.insert_last_prompt("lp-ts", "/proj", "text", None, ts)
             .unwrap();
 
-        let last = db
-            .get_last_prompt_for_workdir("/proj")
-            .unwrap()
-            .unwrap();
+        let last = db.get_last_prompt_for_workdir("/proj").unwrap().unwrap();
         assert_eq!(last.created_at.timestamp(), ts.timestamp());
     }
 }

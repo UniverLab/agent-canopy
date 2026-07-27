@@ -483,10 +483,7 @@ mod tests {
     fn resolve_watch_target_nonexistent_file_with_parent() {
         let target = resolve_watch_target("/tmp/nonexistent_file.txt");
         assert_eq!(target.path, PathBuf::from("/tmp"));
-        assert_eq!(
-            target.file_filter.as_deref(),
-            Some("nonexistent_file.txt")
-        );
+        assert_eq!(target.file_filter.as_deref(), Some("nonexistent_file.txt"));
     }
 
     #[test]
@@ -537,18 +534,12 @@ mod tests {
     fn event_matches_modify_matches_create_config() {
         // When "create" is configured, "modify" events also match (notify
         // reports modifies as creates on some platforms).
-        assert!(event_matches(
-            WatchEvent::Modify,
-            &[WatchEvent::Create]
-        ));
+        assert!(event_matches(WatchEvent::Modify, &[WatchEvent::Create]));
     }
 
     #[test]
     fn event_matches_modify_does_not_match_only_delete() {
-        assert!(!event_matches(
-            WatchEvent::Modify,
-            &[WatchEvent::Delete]
-        ));
+        assert!(!event_matches(WatchEvent::Modify, &[WatchEvent::Delete]));
     }
 
     #[test]
@@ -566,10 +557,7 @@ mod tests {
 
     #[test]
     fn event_matches_move_not_in_create_list() {
-        assert!(!event_matches(
-            WatchEvent::Move,
-            &[WatchEvent::Create]
-        ));
+        assert!(!event_matches(WatchEvent::Move, &[WatchEvent::Create]));
     }
 
     #[test]

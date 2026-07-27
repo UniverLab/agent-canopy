@@ -6020,20 +6020,22 @@ mod tests {
         handle_skip_next_spec, header_str, json_value_kind_name, loop_details_json,
         loop_run_status_guard, loop_trigger_json, member_node_config, missing_sync_identity_error,
         node_copy_note, perform_loop_reset, plan_ensemble_copy, plan_node_copy, rag_result_json,
-        resolve_graph_target, resolve_node_kind_and_config, resolve_reported_run, spec_summary_json,
-        validate_absolute_dir, validate_at_least_one_bool, validate_blueprint_exists,
-        validate_edge_condition, validate_ensemble_members, validate_non_empty,
+        resolve_graph_target, resolve_node_kind_and_config, resolve_reported_run,
+        spec_summary_json, validate_absolute_dir, validate_at_least_one_bool,
+        validate_blueprint_exists, validate_edge_condition, validate_ensemble_members,
         validate_node_config, validate_node_kind, validate_node_not_ensemble_owned,
-        validate_not_join_kind, validate_pool_exists, validate_pool_member_removable,
-        validate_pool_not_consumed, validate_pool_reorder, validate_pool_reorder_locking,
-        validate_spec_deletable, validate_spec_exists, validate_spec_set_status_target,
-        validate_spec_status, validate_spec_workdir, BuiltEnsembleUnit, EnsembleMemberParams,
-        EnsembleUnitSpec, TaskTriggerHandler, MISSING_SYNC_IDENTITY_MESSAGE,
+        validate_non_empty, validate_not_join_kind, validate_pool_exists,
+        validate_pool_member_removable, validate_pool_not_consumed, validate_pool_reorder,
+        validate_pool_reorder_locking, validate_spec_deletable, validate_spec_exists,
+        validate_spec_set_status_target, validate_spec_status, validate_spec_workdir,
+        BuiltEnsembleUnit, EnsembleMemberParams, EnsembleUnitSpec, TaskTriggerHandler,
+        MISSING_SYNC_IDENTITY_MESSAGE,
     };
     use crate::daemon::params::{
         LoopCompletionHookParams, LoopCopyEnsembleParams, LoopCopyNodeParams, LoopRunParams,
-        LoopScheduleAutorunParams, LoopScheduleContinueParams, LoopTriggerParams, PoolAddSpecParams,
-        PoolCreateParams, PoolListParams, QueueAddSpecParams, QueueCreateParams, QueueListParams,
+        LoopScheduleAutorunParams, LoopScheduleContinueParams, LoopTriggerParams,
+        PoolAddSpecParams, PoolCreateParams, PoolListParams, QueueAddSpecParams, QueueCreateParams,
+        QueueListParams,
     };
     use crate::db::Database;
     use crate::domain::blueprints::Blueprint;
@@ -8901,18 +8903,12 @@ mod tests {
 
     #[test]
     fn json_value_kind_name_bool() {
-        assert_eq!(
-            json_value_kind_name(&serde_json::json!(true)),
-            "a boolean"
-        );
+        assert_eq!(json_value_kind_name(&serde_json::json!(true)), "a boolean");
     }
 
     #[test]
     fn json_value_kind_name_number() {
-        assert_eq!(
-            json_value_kind_name(&serde_json::json!(42)),
-            "a number"
-        );
+        assert_eq!(json_value_kind_name(&serde_json::json!(42)), "a number");
     }
 
     #[test]
@@ -9438,16 +9434,14 @@ mod tests {
 #[cfg(test)]
 mod additional_tests {
     use super::*;
-    use crate::daemon::params::{
-        LoopCompletionHookParams, LoopTriggerParams,
-    };
+    use crate::daemon::params::{LoopCompletionHookParams, LoopTriggerParams};
     use crate::db::Database;
     use crate::domain::loops::{
-        Loop, LoopNode, LoopNodeKind,
-        LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus,
+        Loop, LoopNode, LoopNodeKind, LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus,
+        LoopStatus,
     };
-    use crate::domain::pools::Pool;
     use crate::domain::models::Trigger;
+    use crate::domain::pools::Pool;
     use tempfile::tempdir;
 
     fn standalone_spec(id: &str) -> LoopSpec {
@@ -9550,8 +9544,7 @@ mod additional_tests {
         let mut spec = standalone_spec("spec-a");
         spec.loop_id = Some("loop-1".to_string());
         db.insert_loop_spec(&spec).unwrap();
-        let error =
-            validate_position_conflict(&db, Some("loop-1"), "spec-x", 0).unwrap_err();
+        let error = validate_position_conflict(&db, Some("loop-1"), "spec-x", 0).unwrap_err();
         assert!(error.contains("position 0"), "{error}");
         assert!(error.contains("loop-1"), "{error}");
     }
@@ -9968,8 +9961,13 @@ mod additional_tests {
         insert_test_loop(&db, "loop-1");
         db.insert_loop_spec(&standalone_spec("spec-a")).unwrap();
         insert_test_node(&db, "node-1", "spec-a");
-        db.insert_loop_run(&loop_run_row("run-1", "loop-1", "spec-a", LoopRunStatus::Running))
-            .unwrap();
+        db.insert_loop_run(&loop_run_row(
+            "run-1",
+            "loop-1",
+            "spec-a",
+            LoopRunStatus::Running,
+        ))
+        .unwrap();
 
         let result = resolve_reported_run(&db, "run-1", "wrong-node").unwrap();
         let err = result.expect_err("mismatched node_id must be rejected");
@@ -10158,7 +10156,13 @@ mod additional_tests {
 
     #[test]
     fn build_get_tools_response_all_scopes_are_objects() {
-        for scope in ["session_start", "file_write", "test_run", "close_session", "multi_agent"] {
+        for scope in [
+            "session_start",
+            "file_write",
+            "test_run",
+            "close_session",
+            "multi_agent",
+        ] {
             let json = build_get_tools_response(scope);
             assert!(json.is_object(), "scope '{scope}' should be an object");
             assert!(json["scope"].as_str().is_some());

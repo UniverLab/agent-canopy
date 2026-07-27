@@ -1825,7 +1825,9 @@ mod additional_tests {
 
     #[test]
     fn is_html_bytes_detects_doctype() {
-        assert!(is_html_bytes(b"<!DOCTYPE html><html><body>hello</body></html>"));
+        assert!(is_html_bytes(
+            b"<!DOCTYPE html><html><body>hello</body></html>"
+        ));
     }
 
     #[test]
@@ -1910,16 +1912,38 @@ mod additional_tests {
 
     #[test]
     fn is_block_level_tag_true_for_common_blocks() {
-        for tag in ["p", "div", "br", "li", "h1", "h2", "h3", "h4", "h5", "h6",
-                     "tr", "td", "th", "blockquote", "section", "article"] {
-            assert!(is_block_level_tag(tag), "expected '{tag}' to be block-level");
+        for tag in [
+            "p",
+            "div",
+            "br",
+            "li",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "tr",
+            "td",
+            "th",
+            "blockquote",
+            "section",
+            "article",
+        ] {
+            assert!(
+                is_block_level_tag(tag),
+                "expected '{tag}' to be block-level"
+            );
         }
     }
 
     #[test]
     fn is_block_level_tag_false_for_inline() {
         for tag in ["span", "a", "em", "strong", "img", "b", "i", "code"] {
-            assert!(!is_block_level_tag(tag), "expected '{tag}' to NOT be block-level");
+            assert!(
+                !is_block_level_tag(tag),
+                "expected '{tag}' to NOT be block-level"
+            );
         }
     }
 
@@ -2123,7 +2147,10 @@ mod additional_tests {
         let html = "<p>one</p><p>two</p>";
         let text = strip_html_to_text(html);
         // Block-level tags (p) should produce newlines.
-        assert!(text.contains("\n"), "block tags should add newlines: {text}");
+        assert!(
+            text.contains("\n"),
+            "block tags should add newlines: {text}"
+        );
     }
 
     // ── Queue push with empty string ──────────────────────────────

@@ -583,7 +583,13 @@ mod tests {
         let mut current = PathBuf::from("/tmp");
         let mut filter = String::new();
         assert!(matches!(
-            handle_browse_key(KeyCode::Enter, &subdirs, &mut cursor, &mut current, &mut filter),
+            handle_browse_key(
+                KeyCode::Enter,
+                &subdirs,
+                &mut cursor,
+                &mut current,
+                &mut filter
+            ),
             BrowseAction::Confirm
         ));
     }
@@ -595,7 +601,13 @@ mod tests {
         let mut current = PathBuf::from("/tmp");
         let mut filter = String::new();
         assert!(matches!(
-            handle_browse_key(KeyCode::Esc, &subdirs, &mut cursor, &mut current, &mut filter),
+            handle_browse_key(
+                KeyCode::Esc,
+                &subdirs,
+                &mut cursor,
+                &mut current,
+                &mut filter
+            ),
             BrowseAction::Cancel
         ));
     }
@@ -606,7 +618,13 @@ mod tests {
         let mut cursor = 1;
         let mut current = PathBuf::from("/tmp");
         let mut filter = String::new();
-        let _ = handle_browse_key(KeyCode::Up, &subdirs, &mut cursor, &mut current, &mut filter);
+        let _ = handle_browse_key(
+            KeyCode::Up,
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+        );
         assert_eq!(cursor, 0);
     }
 
@@ -616,7 +634,13 @@ mod tests {
         let mut cursor = 0;
         let mut current = PathBuf::from("/tmp");
         let mut filter = String::new();
-        let _ = handle_browse_key(KeyCode::Up, &subdirs, &mut cursor, &mut current, &mut filter);
+        let _ = handle_browse_key(
+            KeyCode::Up,
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+        );
         assert_eq!(cursor, 0);
     }
 

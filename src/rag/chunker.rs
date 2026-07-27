@@ -814,7 +814,10 @@ mod additional_tests {
         let result = split_paragraph(&text);
         assert!(result.len() >= 2, "must split into multiple chunks");
         let joined: String = result.join("");
-        assert!(joined.len() >= text.len(), "joined chunks must cover original text");
+        assert!(
+            joined.len() >= text.len(),
+            "joined chunks must cover original text"
+        );
     }
 
     #[test]
@@ -992,10 +995,8 @@ mod additional_tests {
 
     #[test]
     fn merge_similar_chunks_threshold_one_identical_still_merges() {
-        let chunks = annotate_similarity(vec![
-            "alpha beta gamma".into(),
-            "alpha beta gamma".into(),
-        ]);
+        let chunks =
+            annotate_similarity(vec!["alpha beta gamma".into(), "alpha beta gamma".into()]);
         let result = merge_similar_chunks(chunks, 1.0);
         assert_eq!(result.len(), 1);
     }
@@ -1022,10 +1023,8 @@ mod additional_tests {
 
     #[test]
     fn merge_similar_chunks_negative_threshold_clamps_to_zero() {
-        let chunks = annotate_similarity(vec![
-            "alpha beta gamma".into(),
-            "delta epsilon zeta".into(),
-        ]);
+        let chunks =
+            annotate_similarity(vec!["alpha beta gamma".into(), "delta epsilon zeta".into()]);
         let result = merge_similar_chunks(chunks, -1.0);
         assert_eq!(result.len(), 1);
     }
@@ -1066,7 +1065,8 @@ mod additional_tests {
 
     #[test]
     fn chunk_markdown_texts_multiple_h1_sections() {
-        let md = "# Section 1\n\nText one.\n\n# Section 2\n\nText two.\n\n# Section 3\n\nText three.";
+        let md =
+            "# Section 1\n\nText one.\n\n# Section 2\n\nText two.\n\n# Section 3\n\nText three.";
         let result = chunk_markdown_texts(md);
         assert!(result.len() >= 3);
     }

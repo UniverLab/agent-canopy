@@ -982,11 +982,17 @@ mod tests {
         let mut configs: PlatformConfigs = BTreeMap::new();
 
         let mut cursor = BTreeMap::new();
-        cursor.insert("github".to_string(), serde_json::json!({"url": "from-cursor"}));
+        cursor.insert(
+            "github".to_string(),
+            serde_json::json!({"url": "from-cursor"}),
+        );
         configs.insert("cursor".to_string(), cursor);
 
         let mut claude = BTreeMap::new();
-        claude.insert("github".to_string(), serde_json::json!({"url": "from-claude"}));
+        claude.insert(
+            "github".to_string(),
+            serde_json::json!({"url": "from-claude"}),
+        );
         configs.insert("claude".to_string(), claude);
 
         let unified = build_unified_servers(&configs);
@@ -1802,9 +1808,7 @@ mod tests {
 
     #[test]
     fn missing_servers_is_vector_of_tuples() {
-        let missing: MissingServers = vec![
-            ("platform".to_string(), "server".to_string()),
-        ];
+        let missing: MissingServers = vec![("platform".to_string(), "server".to_string())];
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].0, "platform");
         assert_eq!(missing[0].1, "server");

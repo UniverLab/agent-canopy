@@ -373,7 +373,10 @@ mod tests {
             name: "test-ensemble".to_string(),
             prompt_template: "Do the thing\n\n{{spec_content}}".to_string(),
             members: vec![
-                ("openrouter".to_string(), Some("deepseek/deepseek-chat-v3.1:free".to_string())),
+                (
+                    "openrouter".to_string(),
+                    Some("deepseek/deepseek-chat-v3.1:free".to_string()),
+                ),
                 ("claude".to_string(), None),
             ],
             min_pass: Some(1),

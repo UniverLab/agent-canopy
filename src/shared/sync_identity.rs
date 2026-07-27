@@ -65,10 +65,7 @@ mod tests {
             HeaderName::try_from(name).unwrap(),
             HeaderValue::from_str(value).unwrap(),
         );
-        let (parts, _) = Request::builder()
-            .body(())
-            .unwrap()
-            .into_parts();
+        let (parts, _) = Request::builder().body(()).unwrap().into_parts();
         let mut parts = parts;
         parts.headers = headers;
         parts

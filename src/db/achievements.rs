@@ -147,7 +147,9 @@ mod tests {
         store.unlock(MissionId::FireflyCatcher).unwrap();
 
         let reloaded = AchievementStore::load(db).unwrap();
-        assert!(reloaded.unlock_timestamp(MissionId::FireflyCatcher).is_some());
+        assert!(reloaded
+            .unlock_timestamp(MissionId::FireflyCatcher)
+            .is_some());
     }
 
     #[test]

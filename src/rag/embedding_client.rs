@@ -734,14 +734,8 @@ mod tests {
 
     #[test]
     fn model_dimensions_case_insensitive_for_known_models() {
-        assert_eq!(
-            model_dimensions("Text-Embedding-3-Small").unwrap(),
-            1536
-        );
-        assert_eq!(
-            model_dimensions("TEXT-EMBEDDING-3-LARGE").unwrap(),
-            3072
-        );
+        assert_eq!(model_dimensions("Text-Embedding-3-Small").unwrap(), 1536);
+        assert_eq!(model_dimensions("TEXT-EMBEDDING-3-LARGE").unwrap(), 3072);
     }
 
     #[test]

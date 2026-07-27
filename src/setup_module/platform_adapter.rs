@@ -801,9 +801,9 @@ mod tests {
     // ── New tests for pure helper functions ─────────────────────────────
 
     use super::{
-        clone_object_entries, clone_object_entries_except, format_matrix_header,
-        infer_server_kind, initial_platform_config, matrix_separator_width, platform_servers_root_key,
-        pick_allowed_value, rename_mapped_fields, resolve_required_field_value,
+        clone_object_entries, clone_object_entries_except, format_matrix_header, infer_server_kind,
+        initial_platform_config, matrix_separator_width, pick_allowed_value,
+        platform_servers_root_key, rename_mapped_fields, resolve_required_field_value,
         substitute_placeholders, substitute_string_placeholders, ServerKind,
     };
 

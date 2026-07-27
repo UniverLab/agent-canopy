@@ -783,12 +783,25 @@ mod tests {
         .unwrap();
 
         let messages = vec![
-            sync_message(1, "agent-b", "claude", MessageKind::Intent, Some(intent_b), 20),
-            sync_message(2, "agent-a", "copilot", MessageKind::Intent, Some(intent_a), 10),
+            sync_message(
+                1,
+                "agent-b",
+                "claude",
+                MessageKind::Intent,
+                Some(intent_b),
+                20,
+            ),
+            sync_message(
+                2,
+                "agent-a",
+                "copilot",
+                MessageKind::Intent,
+                Some(intent_a),
+                10,
+            ),
         ];
 
-        let active =
-            HashSet::from([String::from("agent-a"), String::from("agent-b")]);
+        let active = HashSet::from([String::from("agent-a"), String::from("agent-b")]);
         let summary = summarize_sync_context(&messages, &active, 10);
 
         assert_eq!(summary.active_intents.len(), 2);
@@ -840,7 +853,14 @@ mod tests {
         let messages = vec![
             sync_message(1, "agent-a", "a", MessageKind::Intent, Some(intent_a), 10),
             sync_message(2, "agent-b", "b", MessageKind::Intent, Some(intent_b), 11),
-            sync_message(3, "agent-b", "b", MessageKind::Status, Some(status_testing), 12),
+            sync_message(
+                3,
+                "agent-b",
+                "b",
+                MessageKind::Status,
+                Some(status_testing),
+                12,
+            ),
         ];
 
         let active = HashSet::from([String::from("agent-a"), String::from("agent-b")]);

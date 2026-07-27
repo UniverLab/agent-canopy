@@ -760,10 +760,7 @@ mod formatting_unit_tests {
         let out = format_catalog_models(&catalog);
         let new_pos = out.find("new-model").unwrap();
         let old_pos = out.find("old-model").unwrap();
-        assert!(
-            new_pos < old_pos,
-            "newer model should appear first"
-        );
+        assert!(new_pos < old_pos, "newer model should appear first");
     }
 
     #[test]
@@ -827,10 +824,12 @@ mod formatting_unit_tests {
             models,
             fetched_at: SystemTime::now(),
         };
-        let slugs: Vec<&str> = (0..15).map(|i| {
-            // Leak a small string so we get &str; fine for tests
-            Box::leak(format!("provider-{i}").into_boxed_str()) as &str
-        }).collect();
+        let slugs: Vec<&str> = (0..15)
+            .map(|i| {
+                // Leak a small string so we get &str; fine for tests
+                Box::leak(format!("provider-{i}").into_boxed_str()) as &str
+            })
+            .collect();
         // Should not panic; bounded by MAX_PROVIDERS
         let _ = format_platform_models(&catalog, &slugs);
     }
@@ -867,9 +866,7 @@ mod formatting_unit_tests {
 
     #[test]
     fn native_models_many_providers_capped() {
-        let ids: Vec<String> = (0..30)
-            .map(|i| format!("prov{i}/model-{i}"))
-            .collect();
+        let ids: Vec<String> = (0..30).map(|i| format!("prov{i}/model-{i}")).collect();
         let out = format_native_models(&ids);
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines.len() <= MAX_PROVIDERS * MODELS_PER_PROVIDER);
@@ -877,9 +874,7 @@ mod formatting_unit_tests {
 
     #[test]
     fn native_models_many_models_per_provider_capped() {
-        let ids: Vec<String> = (0..30)
-            .map(|i| format!("anthropic/model-{i}"))
-            .collect();
+        let ids: Vec<String> = (0..30).map(|i| format!("anthropic/model-{i}")).collect();
         let out = format_native_models(&ids);
         let anthropic_lines = out.lines().filter(|l| l.contains("Anthropic")).count();
         assert!(anthropic_lines <= MODELS_PER_PROVIDER);

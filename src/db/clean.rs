@@ -1033,7 +1033,10 @@ mod tests {
                 "intelligence_edges" => counts.intelligence_edges = 1,
                 _ => unreachable!(),
             }
-            assert!(!counts.is_empty(), "is_empty should be false when {field} = 1");
+            assert!(
+                !counts.is_empty(),
+                "is_empty should be false when {field} = 1"
+            );
         }
     }
 

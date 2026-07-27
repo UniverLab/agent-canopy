@@ -1664,15 +1664,14 @@ In Scope:
 
     #[test]
     fn loop_node_kind_display_str_matches_as_str_except_join() {
-        for k in [
-            LoopNodeKind::Agent,
-            LoopNodeKind::Check,
-            LoopNodeKind::Gate,
-        ] {
+        for k in [LoopNodeKind::Agent, LoopNodeKind::Check, LoopNodeKind::Gate] {
             assert_eq!(k.display_str(), k.as_str());
         }
         assert_eq!(LoopNodeKind::Join.display_str(), "quorum");
-        assert_ne!(LoopNodeKind::Join.display_str(), LoopNodeKind::Join.as_str());
+        assert_ne!(
+            LoopNodeKind::Join.display_str(),
+            LoopNodeKind::Join.as_str()
+        );
     }
 
     #[test]
@@ -2224,7 +2223,10 @@ In Scope:
 
     #[test]
     fn loop_status_serde_uses_snake_case() {
-        assert_eq!(serde_json::to_string(&LoopStatus::Draft).unwrap(), "\"draft\"");
+        assert_eq!(
+            serde_json::to_string(&LoopStatus::Draft).unwrap(),
+            "\"draft\""
+        );
         assert_eq!(
             serde_json::to_string(&LoopStatus::Running).unwrap(),
             "\"running\""
@@ -2412,7 +2414,10 @@ In Scope:
         let a = SpecAdminStatusOutcome::NotStandalone("s1".to_string());
         let b = a.clone();
         match (&a, &b) {
-            (SpecAdminStatusOutcome::NotStandalone(o), SpecAdminStatusOutcome::NotStandalone(c)) => {
+            (
+                SpecAdminStatusOutcome::NotStandalone(o),
+                SpecAdminStatusOutcome::NotStandalone(c),
+            ) => {
                 assert_eq!(o, c);
                 assert_eq!(c, "s1");
             }
@@ -2588,13 +2593,7 @@ UI
 
     #[test]
     fn spec_template_all_aliases_for_out_of_scope() {
-        let aliases = [
-            "Out of Scope",
-            "Scope Out",
-            "Que no",
-            "Qué no",
-            "Excluye",
-        ];
+        let aliases = ["Out of Scope", "Scope Out", "Que no", "Qué no", "Excluye"];
         for alias in aliases {
             let desc = format!(
                 "Functional Requirements:\n- x\nNon-Functional Requirements:\n- y\nObjective:\n- z\nConstraints:\n- w\nGuidelines:\n- v\nIn Scope:\n- u\n{alias}:\n- t\n"
