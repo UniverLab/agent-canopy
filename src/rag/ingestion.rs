@@ -1724,3 +1724,428 @@ mod tests {
         assert_eq!(events.len(), 1);
     }
 }
+
+#[cfg(test)]
+mod additional_tests {
+    use super::*;
+
+    // ── Queue ──────────────────────────────────────────────────────
+
+    #[test]
+    fn queue_new_is_empty() {
+        let mut q = Queue::new();
+        assert_eq!(q.len(), 0);
+        assert!(q.pop().is_none());
+    }
+
+    #[test]
+    fn queue_push_and_pop_round_trip() {
+        let mut q = Queue::new();
+        assert!(q.push("/a.md"));
+        assert!(q.push("/b.md"));
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.pop(), Some("/a.md".to_string()));
+        assert_eq!(q.pop(), Some("/b.md".to_string()));
+        assert_eq!(q.len(), 0);
+        assert!(q.pop().is_none());
+    }
+
+    #[test]
+    fn queue_push_duplicate_moves_to_end() {
+        let mut q = Queue::new();
+        q.push("/a.md");
+        q.push("/b.md");
+        q.push("/c.md");
+        // Re-push /b.md — it should move to the end.
+        q.push("/b.md");
+        assert_eq!(q.len(), 3);
+        assert_eq!(q.pop(), Some("/a.md".to_string()));
+        assert_eq!(q.pop(), Some("/c.md".to_string()));
+        assert_eq!(q.pop(), Some("/b.md".to_string()));
+    }
+
+    #[test]
+    fn queue_push_rejects_when_full() {
+        let mut q = Queue::new();
+        for i in 0..QUEUE_MAX {
+            assert!(q.push(&format!("/file-{i}.md")));
+        }
+        assert_eq!(q.len(), QUEUE_MAX);
+        assert!(!q.push("/overflow.md"));
+        assert_eq!(q.len(), QUEUE_MAX);
+    }
+
+    #[test]
+    fn queue_pop_removes_from_set() {
+        let mut q = Queue::new();
+        q.push("/a.md");
+        q.pop();
+        // Re-push after pop — set should allow it.
+        assert!(q.push("/a.md"));
+        assert_eq!(q.len(), 1);
+    }
+
+    // ── indexing_dir_summary ───────────────────────────────────────
+
+    #[test]
+    fn indexing_dir_summary_empty_returns_empty() {
+        assert_eq!(indexing_dir_summary(&[]), "");
+    }
+
+    #[test]
+    fn indexing_dir_summary_single_dir() {
+        let paths = vec![
+            "/home/user/docs/a.md".to_string(),
+            "/home/user/docs/b.md".to_string(),
+        ];
+        let summary = indexing_dir_summary(&paths);
+        assert!(summary.contains("in docs"), "{summary}");
+    }
+
+    #[test]
+    fn indexing_dir_summary_multiple_dirs() {
+        let paths = vec![
+            "/home/user/docs/a.md".to_string(),
+            "/home/user/projects/b.md".to_string(),
+        ];
+        let summary = indexing_dir_summary(&paths);
+        assert!(summary.contains("across 2 dirs"), "{summary}");
+    }
+
+    #[test]
+    fn indexing_dir_summary_files_with_no_parent() {
+        let paths = vec!["standalone.md".to_string()];
+        let summary = indexing_dir_summary(&paths);
+        // Files with no parent dir produce an empty dir string; the summary
+        // still formats it as " in " (the leaf of "" is "").
+        assert!(summary.contains(" in"), "{summary}");
+    }
+
+    // ── is_html_bytes ─────────────────────────────────────────────
+
+    #[test]
+    fn is_html_bytes_detects_doctype() {
+        assert!(is_html_bytes(b"<!DOCTYPE html><html><body>hello</body></html>"));
+    }
+
+    #[test]
+    fn is_html_bytes_detects_html_tag() {
+        assert!(is_html_bytes(b"<html><head></head><body></body></html>"));
+    }
+
+    #[test]
+    fn is_html_bytes_detects_html_with_leading_bom() {
+        assert!(is_html_bytes(b"\xef\xbb\xbf<!doctype html>"));
+    }
+
+    #[test]
+    fn is_html_bytes_rejects_pdf_magic() {
+        assert!(!is_html_bytes(b"%PDF-1.4 some pdf content"));
+    }
+
+    #[test]
+    fn is_html_bytes_rejects_random_binary() {
+        assert!(!is_html_bytes(&[0x00, 0x01, 0x02, 0x03, 0xFF, 0xFE]));
+    }
+
+    #[test]
+    fn is_html_bytes_rejects_empty() {
+        assert!(!is_html_bytes(b""));
+    }
+
+    #[test]
+    fn is_html_bytes_rejects_short_input() {
+        assert!(!is_html_bytes(b"<h"));
+    }
+
+    // ── decode_entity ─────────────────────────────────────────────
+
+    #[test]
+    fn decode_entity_known_entities() {
+        assert_eq!(decode_entity("amp"), "&");
+        assert_eq!(decode_entity("lt"), "<");
+        assert_eq!(decode_entity("gt"), ">");
+        assert_eq!(decode_entity("nbsp"), " ");
+        assert_eq!(decode_entity("#160"), " ");
+        assert_eq!(decode_entity("quot"), "\"");
+        assert_eq!(decode_entity("apos"), "'");
+        assert_eq!(decode_entity("#39"), "'");
+    }
+
+    #[test]
+    fn decode_entity_unknown_returns_space() {
+        assert_eq!(decode_entity("unknown"), " ");
+        assert_eq!(decode_entity(""), " ");
+    }
+
+    // ── extract_tag_name ──────────────────────────────────────────
+
+    #[test]
+    fn extract_tag_name_simple() {
+        assert_eq!(extract_tag_name("<div>"), "div");
+    }
+
+    #[test]
+    fn extract_tag_name_with_attributes() {
+        assert_eq!(extract_tag_name("<img src=\"x.png\" />"), "img");
+    }
+
+    #[test]
+    fn extract_tag_name_closing_tag() {
+        assert_eq!(extract_tag_name("</p>"), "p");
+    }
+
+    #[test]
+    fn extract_tag_name_self_closing() {
+        // Note: the function doesn't strip trailing '/' since it's not in the split criteria.
+        assert_eq!(extract_tag_name("<br/>"), "br/");
+    }
+
+    #[test]
+    fn extract_tag_name_with_whitespace() {
+        assert_eq!(extract_tag_name("<H1>"), "h1");
+    }
+
+    // ── is_block_level_tag ────────────────────────────────────────
+
+    #[test]
+    fn is_block_level_tag_true_for_common_blocks() {
+        for tag in ["p", "div", "br", "li", "h1", "h2", "h3", "h4", "h5", "h6",
+                     "tr", "td", "th", "blockquote", "section", "article"] {
+            assert!(is_block_level_tag(tag), "expected '{tag}' to be block-level");
+        }
+    }
+
+    #[test]
+    fn is_block_level_tag_false_for_inline() {
+        for tag in ["span", "a", "em", "strong", "img", "b", "i", "code"] {
+            assert!(!is_block_level_tag(tag), "expected '{tag}' to NOT be block-level");
+        }
+    }
+
+    // ── collapse_blank_lines ──────────────────────────────────────
+
+    #[test]
+    fn collapse_blank_lines_collapses_consecutive_blanks() {
+        let input = "line1\n\n\n\nline2\n";
+        let result = collapse_blank_lines(input);
+        assert_eq!(result, "line1\n\nline2\n");
+    }
+
+    #[test]
+    fn collapse_blank_lines_preserves_single_blank() {
+        let input = "line1\n\nline2\n";
+        let result = collapse_blank_lines(input);
+        assert_eq!(result, "line1\n\nline2\n");
+    }
+
+    #[test]
+    fn collapse_blank_lines_no_blanks() {
+        let input = "line1\nline2\nline3\n";
+        let result = collapse_blank_lines(input);
+        assert_eq!(result, "line1\nline2\nline3\n");
+    }
+
+    #[test]
+    fn collapse_blank_lines_empty_input() {
+        assert_eq!(collapse_blank_lines(""), "");
+    }
+
+    // ── salvage_printable_text ────────────────────────────────────
+
+    #[test]
+    fn salvage_printable_text_extracts_long_runs() {
+        let mut bytes = vec![0xFF; 20];
+        bytes.extend_from_slice(b"Hello World this is text");
+        bytes.extend_from_slice(&[0xFF; 20]);
+        let result = salvage_printable_text(&bytes);
+        assert!(result.contains("Hello World this is text"), "{result}");
+    }
+
+    #[test]
+    fn salvage_printable_text_ignores_short_runs() {
+        let mut bytes = vec![0xFF; 10];
+        bytes.extend_from_slice(b"ab"); // only 2 chars, below MIN_RUN
+        bytes.extend_from_slice(&[0xFF; 10]);
+        let result = salvage_printable_text(&bytes);
+        assert!(result.is_empty(), "short runs should be ignored: {result}");
+    }
+
+    #[test]
+    fn salvage_printable_text_empty_input() {
+        assert_eq!(salvage_printable_text(b""), "");
+    }
+
+    #[test]
+    fn salvage_printable_text_all_printable() {
+        let text = b"Hello, this is a printable string with enough length to pass the run filter.";
+        let result = salvage_printable_text(text);
+        assert!(result.contains("Hello"), "{result}");
+    }
+
+    #[test]
+    fn salvage_printable_text_all_binary() {
+        let bytes: Vec<u8> = (0..100).map(|i| (i * 37 % 256) as u8).collect();
+        let result = salvage_printable_text(&bytes);
+        // May or may not find short runs, but should not panic.
+        let _ = result;
+    }
+
+    // ── strip_html_to_text ────────────────────────────────────────
+
+    #[test]
+    fn strip_html_to_text_strips_simple_tags() {
+        let html = "<p>Hello <b>world</b></p>";
+        let text = strip_html_to_text(html);
+        assert!(text.contains("Hello"), "{text}");
+        assert!(text.contains("world"), "{text}");
+        assert!(!text.contains("<p>"), "{text}");
+        assert!(!text.contains("<b>"), "{text}");
+    }
+
+    #[test]
+    fn strip_html_to_text_handles_nested_tags() {
+        let html = "<div><p>First</p><p>Second</p></div>";
+        let text = strip_html_to_text(html);
+        assert!(text.contains("First"), "{text}");
+        assert!(text.contains("Second"), "{text}");
+    }
+
+    #[test]
+    fn strip_html_to_text_collapses_whitespace() {
+        let html = "<p>   Hello   </p>";
+        let text = strip_html_to_text(html);
+        // Should not have leading/trailing whitespace from tags.
+        let trimmed = text.trim();
+        assert!(trimmed.contains("Hello"), "{text}");
+    }
+
+    #[test]
+    fn strip_html_to_text_empty_input() {
+        assert_eq!(strip_html_to_text(""), "");
+    }
+
+    // ── is_permanent_rag_error edge cases ─────────────────────────
+
+    #[test]
+    fn is_permanent_rag_error_case_insensitive() {
+        assert!(is_permanent_rag_error("STACK OVERFLOW"));
+        assert!(is_permanent_rag_error("Not A Valid Pdf"));
+    }
+
+    #[test]
+    fn is_permanent_rag_error_empty_string() {
+        assert!(!is_permanent_rag_error(""));
+    }
+
+    #[test]
+    fn is_permanent_rag_error_partial_match_not_enough() {
+        assert!(!is_permanent_rag_error("pdf")); // must be "not a valid pdf"
+    }
+
+    // ── store_loss_detected edge cases ────────────────────────────
+
+    #[test]
+    fn store_loss_detected_both_zero() {
+        // Ledger has 0 files, store has 0 chunks — not a loss.
+        assert!(!store_loss_detected(0, Some(0)));
+    }
+
+    #[test]
+    fn store_loss_detected_store_none() {
+        // Store couldn't open — not treated as loss.
+        assert!(!store_loss_detected(100, None));
+    }
+
+    #[test]
+    fn store_loss_detected_large_ledger_zero_store() {
+        assert!(store_loss_detected(1000, Some(0)));
+    }
+
+    // ── QUEUE_MAX boundary ────────────────────────────────────────
+
+    #[test]
+    fn queue_exactly_at_max_allows_push() {
+        let mut q = Queue::new();
+        for i in 0..QUEUE_MAX {
+            q.push(&format!("/{i}.md"));
+        }
+        // The last push succeeded (len == QUEUE_MAX).
+        assert_eq!(q.len(), QUEUE_MAX);
+    }
+
+    #[test]
+    fn queue_one_over_max_rejects() {
+        let mut q = Queue::new();
+        for i in 0..QUEUE_MAX {
+            q.push(&format!("/{i}.md"));
+        }
+        assert!(!q.push("/overflow.md"));
+    }
+
+    // ── decode_html_entity integration ────────────────────────────
+
+    #[test]
+    fn strip_html_to_text_decodes_entities() {
+        let html = "<p>5&gt;3&amp;2&lt;4</p>";
+        let text = strip_html_to_text(html);
+        assert!(text.contains("5>3&2<4"), "{text}");
+    }
+
+    #[test]
+    fn strip_html_to_text_decodes_nbsp() {
+        let html = "<p>a&nbsp;b</p>";
+        let text = strip_html_to_text(html);
+        assert!(text.contains("a b"), "{text}");
+    }
+
+    // ── HtmlStripState edge cases ─────────────────────────────────
+
+    #[test]
+    fn strip_html_to_text_script_content_skipped() {
+        let html = "<p>before</p><script>alert('xss')</script><p>after</p>";
+        let text = strip_html_to_text(html);
+        assert!(text.contains("before"), "{text}");
+        assert!(text.contains("after"), "{text}");
+        assert!(!text.contains("alert"), "{text}");
+    }
+
+    #[test]
+    fn strip_html_to_text_style_content_skipped() {
+        let html = "<p>text</p><style>.red{color:red}</style>";
+        let text = strip_html_to_text(html);
+        assert!(text.contains("text"), "{text}");
+        assert!(!text.contains("color"), "{text}");
+    }
+
+    #[test]
+    fn strip_html_to_text_block_tags_add_newlines() {
+        let html = "<p>one</p><p>two</p>";
+        let text = strip_html_to_text(html);
+        // Block-level tags (p) should produce newlines.
+        assert!(text.contains("\n"), "block tags should add newlines: {text}");
+    }
+
+    // ── Queue push with empty string ──────────────────────────────
+
+    #[test]
+    fn queue_push_empty_string() {
+        let mut q = Queue::new();
+        assert!(q.push(""));
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.pop(), Some("".to_string()));
+    }
+
+    // ── salvage_printable_text runs joined with space ─────────────
+
+    #[test]
+    fn salvage_printable_text_joins_runs_with_space() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"Hello");
+        bytes.push(0xFF); // separator
+        bytes.extend_from_slice(b"World");
+        let result = salvage_printable_text(&bytes);
+        assert!(result.contains("Hello"), "{result}");
+        assert!(result.contains("World"), "{result}");
+    }
+}

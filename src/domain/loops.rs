@@ -1973,35 +1973,35 @@ In Scope:
     #[test]
     fn loop_status_is_clone() {
         let s = LoopStatus::Running;
-        let cloned = s.clone();
+        let cloned = s;
         assert_eq!(s, cloned);
     }
 
     #[test]
     fn loop_spec_status_is_clone() {
         let s = LoopSpecStatus::Failed;
-        let cloned = s.clone();
+        let cloned = s;
         assert_eq!(s, cloned);
     }
 
     #[test]
     fn loop_node_kind_is_clone() {
         let k = LoopNodeKind::Join;
-        let cloned = k.clone();
+        let cloned = k;
         assert_eq!(k, cloned);
     }
 
     #[test]
     fn loop_edge_condition_is_clone() {
         let c = LoopEdgeCondition::Always;
-        let cloned = c.clone();
+        let cloned = c;
         assert_eq!(c, cloned);
     }
 
     #[test]
     fn loop_run_status_is_clone() {
         let s = LoopRunStatus::Pass;
-        let cloned = s.clone();
+        let cloned = s;
         assert_eq!(s, cloned);
     }
 
@@ -2392,23 +2392,30 @@ In Scope:
     #[test]
     fn spec_admin_status_outcome_success_is_clone() {
         let a = SpecAdminStatusOutcome::Success;
-        let b = a.clone();
+        let b = a;
         assert!(matches!(b, SpecAdminStatusOutcome::Success));
+        fn _assert_clone<T: Clone>() {}
+        _assert_clone::<SpecAdminStatusOutcome>();
     }
 
     #[test]
     fn spec_admin_status_outcome_not_found_is_clone() {
         let a = SpecAdminStatusOutcome::NotFound;
-        let b = a.clone();
+        let b = a;
         assert!(matches!(b, SpecAdminStatusOutcome::NotFound));
+        fn _assert_clone<T: Clone>() {}
+        _assert_clone::<SpecAdminStatusOutcome>();
     }
 
     #[test]
     fn spec_admin_status_outcome_not_standalone_is_clone() {
         let a = SpecAdminStatusOutcome::NotStandalone("s1".to_string());
         let b = a.clone();
-        match b {
-            SpecAdminStatusOutcome::NotStandalone(id) => assert_eq!(id, "s1"),
+        match (&a, &b) {
+            (SpecAdminStatusOutcome::NotStandalone(o), SpecAdminStatusOutcome::NotStandalone(c)) => {
+                assert_eq!(o, c);
+                assert_eq!(c, "s1");
+            }
             _ => panic!("expected clone of NotStandalone"),
         }
     }
@@ -2420,10 +2427,21 @@ In Scope:
             run_id: "r1".to_string(),
         };
         let b = a.clone();
-        match b {
-            SpecAdminStatusOutcome::ActiveRun { loop_id, run_id } => {
-                assert_eq!(loop_id, "l1");
-                assert_eq!(run_id, "r1");
+        match (&a, &b) {
+            (
+                SpecAdminStatusOutcome::ActiveRun {
+                    loop_id: al,
+                    run_id: ar,
+                },
+                SpecAdminStatusOutcome::ActiveRun {
+                    loop_id: bl,
+                    run_id: br,
+                },
+            ) => {
+                assert_eq!(al, bl);
+                assert_eq!(ar, br);
+                assert_eq!(bl, "l1");
+                assert_eq!(br, "r1");
             }
             _ => panic!("expected clone of ActiveRun"),
         }

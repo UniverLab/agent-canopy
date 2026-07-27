@@ -466,3 +466,149 @@ fn log_missing_path(id: &str, path: &str, is_file_filter: bool) {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::models::WatchEvent;
+
+    #[test]
+    fn resolve_watch_target_directory() {
+        let target = resolve_watch_target("/tmp");
+        assert_eq!(target.path, PathBuf::from("/tmp"));
+        assert!(target.file_filter.is_none());
+    }
+
+    #[test]
+    fn resolve_watch_target_nonexistent_file_with_parent() {
+        let target = resolve_watch_target("/tmp/nonexistent_file.txt");
+        assert_eq!(target.path, PathBuf::from("/tmp"));
+        assert_eq!(
+            target.file_filter.as_deref(),
+            Some("nonexistent_file.txt")
+        );
+    }
+
+    #[test]
+    fn resolve_watch_target_nonexistent_path_no_extension() {
+        let target = resolve_watch_target("/tmp/some_dir");
+        assert_eq!(target.path, PathBuf::from("/tmp/some_dir"));
+        assert!(target.file_filter.is_none());
+    }
+
+    #[test]
+    fn resolve_watch_target_root_path() {
+        let target = resolve_watch_target("/");
+        assert_eq!(target.path, PathBuf::from("/"));
+        assert!(target.file_filter.is_none());
+    }
+
+    #[test]
+    fn watch_mode_recursive_no_filter() {
+        assert_eq!(watch_mode(true, false), RecursiveMode::Recursive);
+    }
+
+    #[test]
+    fn watch_mode_non_recursive_no_filter() {
+        assert_eq!(watch_mode(false, false), RecursiveMode::NonRecursive);
+    }
+
+    #[test]
+    fn watch_mode_recursive_with_filter_forces_non_recursive() {
+        assert_eq!(watch_mode(true, true), RecursiveMode::NonRecursive);
+    }
+
+    #[test]
+    fn watch_mode_non_recursive_with_filter() {
+        assert_eq!(watch_mode(false, true), RecursiveMode::NonRecursive);
+    }
+
+    #[test]
+    fn event_matches_exact_match() {
+        assert!(event_matches(WatchEvent::Create, &[WatchEvent::Create]));
+    }
+
+    #[test]
+    fn event_matches_no_match() {
+        assert!(!event_matches(WatchEvent::Create, &[WatchEvent::Delete]));
+    }
+
+    #[test]
+    fn event_matches_modify_matches_create_config() {
+        // When "create" is configured, "modify" events also match (notify
+        // reports modifies as creates on some platforms).
+        assert!(event_matches(
+            WatchEvent::Modify,
+            &[WatchEvent::Create]
+        ));
+    }
+
+    #[test]
+    fn event_matches_modify_does_not_match_only_delete() {
+        assert!(!event_matches(
+            WatchEvent::Modify,
+            &[WatchEvent::Delete]
+        ));
+    }
+
+    #[test]
+    fn event_matches_in_list() {
+        let configured = vec![WatchEvent::Create, WatchEvent::Delete];
+        assert!(event_matches(WatchEvent::Create, &configured));
+        assert!(event_matches(WatchEvent::Delete, &configured));
+        assert!(!event_matches(WatchEvent::Modify, &configured));
+    }
+
+    #[test]
+    fn event_matches_move_exact() {
+        assert!(event_matches(WatchEvent::Move, &[WatchEvent::Move]));
+    }
+
+    #[test]
+    fn event_matches_move_not_in_create_list() {
+        assert!(!event_matches(
+            WatchEvent::Move,
+            &[WatchEvent::Create]
+        ));
+    }
+
+    #[test]
+    fn map_event_kind_returns_create_for_create() {
+        let kind = notify::EventKind::Create(notify::event::CreateKind::File);
+        assert_eq!(map_event_kind(&kind, "test"), Some(WatchEvent::Create));
+    }
+
+    #[test]
+    fn map_event_kind_returns_modify_for_data_change() {
+        let kind = notify::EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Any,
+        ));
+        assert_eq!(map_event_kind(&kind, "test"), Some(WatchEvent::Modify));
+    }
+
+    #[test]
+    fn map_event_kind_returns_move_for_rename() {
+        let kind = notify::EventKind::Modify(notify::event::ModifyKind::Name(
+            notify::event::RenameMode::Any,
+        ));
+        assert_eq!(map_event_kind(&kind, "test"), Some(WatchEvent::Move));
+    }
+
+    #[test]
+    fn map_event_kind_returns_delete_for_remove() {
+        let kind = notify::EventKind::Remove(notify::event::RemoveKind::File);
+        assert_eq!(map_event_kind(&kind, "test"), Some(WatchEvent::Delete));
+    }
+
+    #[test]
+    fn map_event_kind_returns_none_for_access() {
+        let kind = notify::EventKind::Access(notify::event::AccessKind::Read);
+        assert_eq!(map_event_kind(&kind, "test"), None);
+    }
+
+    #[test]
+    fn map_event_kind_returns_none_for_other() {
+        let kind = notify::EventKind::Any;
+        assert_eq!(map_event_kind(&kind, "test"), None);
+    }
+}

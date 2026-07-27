@@ -978,8 +978,10 @@ mod tests {
 
     #[test]
     fn hard_cascade_counts_is_empty_false_when_any_nonzero() {
-        let mut counts = HardCascadeCounts::default();
-        counts.ensembles = 1;
+        let counts = HardCascadeCounts {
+            ensembles: 1,
+            ..HardCascadeCounts::default()
+        };
         assert!(!counts.is_empty());
     }
 
