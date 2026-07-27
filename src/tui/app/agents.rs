@@ -1001,4 +1001,158 @@ mod tests {
     fn selection_after_mutation_empty_list_is_zero() {
         assert_eq!(selection_after_mutation(&[], Some("A"), 3), 0);
     }
+
+    #[test]
+    fn strip_ansi_codes_plain_text() {
+        assert_eq!(strip_ansi_codes("hello"), "hello");
+    }
+
+    #[test]
+    fn strip_ansi_codes_with_escapes() {
+        assert_eq!(strip_ansi_codes("\x1b[31mred\x1b[0m"), "red");
+    }
+
+    #[test]
+    fn strip_ansi_codes_multiple_escapes() {
+        assert_eq!(
+            strip_ansi_codes("\x1b[1m\x1b[32mbold green\x1b[0m"),
+            "bold green"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_codes_empty() {
+        assert_eq!(strip_ansi_codes(""), "");
+    }
+
+    #[test]
+    fn strip_ansi_codes_no_escapes() {
+        assert_eq!(strip_ansi_codes("no escapes here"), "no escapes here");
+    }
+
+    #[test]
+    fn strip_ansi_codes_complex_sequence() {
+        assert_eq!(strip_ansi_codes("\x1b[38;5;196mred256\x1b[0m"), "red256");
+    }
+
+    #[test]
+    fn reverse_sorted_indices_basic() {
+        assert_eq!(reverse_sorted_indices(vec![1, 3, 2]), vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn reverse_sorted_indices_empty() {
+        assert_eq!(reverse_sorted_indices(vec![]), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn reverse_sorted_indices_single() {
+        assert_eq!(reverse_sorted_indices(vec![5]), vec![5]);
+    }
+
+    #[test]
+    fn reverse_sorted_indices_already_sorted() {
+        assert_eq!(reverse_sorted_indices(vec![1, 2, 3]), vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn reverse_sorted_indices_duplicates() {
+        assert_eq!(reverse_sorted_indices(vec![2, 2, 1, 3]), vec![3, 2, 2, 1]);
+    }
+
+    #[test]
+    fn selection_after_mutation_no_anchor() {
+        assert_eq!(selection_after_mutation(&["A", "B", "C"], None, 1), 1);
+    }
+
+    #[test]
+    fn selection_after_mutation_no_anchor_clamps() {
+        assert_eq!(selection_after_mutation(&["A", "B"], None, 5), 1);
+    }
+
+    #[test]
+    fn selection_after_mutation_single_element() {
+        assert_eq!(selection_after_mutation(&["A"], Some("A"), 0), 0);
+    }
+
+    #[test]
+    fn selection_after_mutation_anchor_first() {
+        assert_eq!(selection_after_mutation(&["X", "Y", "Z"], Some("X"), 2), 0);
+    }
+
+    #[test]
+    fn selection_after_mutation_anchor_last() {
+        assert_eq!(selection_after_mutation(&["X", "Y", "Z"], Some("Z"), 0), 2);
+    }
+
+    #[test]
+    fn selection_after_mutation_no_anchor_empty() {
+        assert_eq!(selection_after_mutation(&[], None, 0), 0);
+    }
+
+    #[test]
+    fn brain_needs_reinit_none() {
+        assert!(brain_needs_reinit(&None, 10, 10));
+    }
+
+    #[test]
+    fn brain_needs_reinit_matching_dims() {
+        let brain = make_brain(10, 10, 3);
+        assert!(!brain_needs_reinit(&Some(brain), 10, 10));
+    }
+
+    #[test]
+    fn brain_needs_reinit_different_dims() {
+        let brain = make_brain(10, 10, 3);
+        assert!(brain_needs_reinit(&Some(brain), 20, 20));
+    }
+
+    #[test]
+    fn brain_needs_reinit_different_rows() {
+        let brain = make_brain(10, 10, 3);
+        assert!(brain_needs_reinit(&Some(brain), 20, 10));
+    }
+
+    #[test]
+    fn brain_needs_reinit_different_cols() {
+        let brain = make_brain(10, 10, 3);
+        assert!(brain_needs_reinit(&Some(brain), 10, 20));
+    }
+
+    #[test]
+    fn effective_brain_dims_small() {
+        let (cols, rows) = effective_brain_dims((100, 200));
+        assert!(rows > 0);
+        assert!(cols > 0);
+        assert!(rows <= 200);
+        assert!(cols <= 100);
+    }
+
+    #[test]
+    fn effective_brain_dims_zero_area() {
+        let (cols, rows) = effective_brain_dims((0, 0));
+        assert!(cols > 0);
+        assert!(rows > 0);
+    }
+
+    #[test]
+    fn effective_brain_dims_exactly_minimum() {
+        let (cols, rows) = effective_brain_dims((6, 3));
+        assert_eq!(cols, 6);
+        assert_eq!(rows, 3);
+    }
+
+    #[test]
+    fn effective_brain_dims_below_minimum() {
+        let (cols, rows) = effective_brain_dims((5, 2));
+        assert!(rows > 0);
+        assert!(cols > 0);
+    }
+
+    #[test]
+    fn effective_brain_dims_large() {
+        let (cols, rows) = effective_brain_dims((500, 1000));
+        assert_eq!(cols, 500);
+        assert_eq!(rows, 1000);
+    }
 }

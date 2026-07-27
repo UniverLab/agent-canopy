@@ -331,4 +331,119 @@ mod tests {
         assert_eq!(content.x, SIDEBAR_WIDTH);
         assert_eq!(content.width, body.width - SIDEBAR_WIDTH);
     }
+
+    #[test]
+    fn truncate_str_short_enough() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_str_exact_length() {
+        assert_eq!(truncate_str("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_str_too_long() {
+        assert_eq!(truncate_str("hello world", 5), "hell…");
+    }
+
+    #[test]
+    fn truncate_str_max_one() {
+        assert_eq!(truncate_str("hello", 1), "");
+    }
+
+    #[test]
+    fn truncate_str_empty() {
+        assert_eq!(truncate_str("", 5), "");
+    }
+
+    #[test]
+    fn truncate_str_unicode() {
+        // "café" = 4 chars; truncate to 3 → take(2) → "ca…"
+        assert_eq!(truncate_str("café", 3), "ca…");
+    }
+
+    #[test]
+    fn truncate_str_keep_tail_short_enough() {
+        assert_eq!(truncate_str_keep_tail("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_str_keep_tail_exact() {
+        assert_eq!(truncate_str_keep_tail("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_str_keep_tail_too_long() {
+        assert_eq!(truncate_str_keep_tail("hello world", 5), "…orld");
+    }
+
+    #[test]
+    fn truncate_str_keep_tail_max_one() {
+        assert_eq!(truncate_str_keep_tail("hello", 1), "");
+    }
+
+    #[test]
+    fn truncate_str_keep_tail_empty() {
+        assert_eq!(truncate_str_keep_tail("", 5), "");
+    }
+
+    #[test]
+    fn truncate_str_keep_tail_unicode() {
+        assert_eq!(truncate_str_keep_tail("café", 3), "…fé");
+    }
+
+    #[test]
+    fn last_two_segments_deep_path() {
+        assert_eq!(last_two_segments("/a/b/c/d"), "c/d");
+    }
+
+    #[test]
+    fn last_two_segments_two_levels() {
+        assert_eq!(last_two_segments("/a/b"), "/a/b");
+    }
+
+    #[test]
+    fn last_two_segments_single_level() {
+        assert_eq!(last_two_segments("/a"), "/a");
+    }
+
+    #[test]
+    fn last_two_segments_root() {
+        assert_eq!(last_two_segments("/"), "/");
+    }
+
+    #[test]
+    fn last_two_segments_trailing_slash() {
+        // After trimming trailing slash: "/a/b/" → "/a/b" → parts ["a","b"] → "a/b"
+        // Wait: parts are split by '/', filtered empty, so "/a/b" → ["a","b"]
+        // With parts.len()=2, returns trimmed="/a/b". Hmm, actually the function
+        // returns trimmed.to_string() when parts.len() <= 2. trimmed = "/a/b".
+        assert_eq!(last_two_segments("/a/b/"), "/a/b");
+    }
+
+    #[test]
+    fn last_two_segments_empty() {
+        assert_eq!(last_two_segments(""), "/");
+    }
+
+    #[test]
+    fn last_two_segments_three_levels() {
+        assert_eq!(last_two_segments("/a/b/c"), "b/c");
+    }
+
+    #[test]
+    fn centered_rect_basic() {
+        let area = Rect::new(0, 0, 100, 40);
+        let result = centered_rect(50, 10, area);
+        assert!(result.width > 0);
+        assert_eq!(result.height, 10);
+    }
+
+    #[test]
+    fn centered_rect_full_width() {
+        let area = Rect::new(0, 0, 100, 40);
+        let result = centered_rect(100, 5, area);
+        assert_eq!(result.height, 5);
+    }
 }

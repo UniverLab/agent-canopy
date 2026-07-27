@@ -1219,4 +1219,119 @@ mod tests {
             assert!(keys.contains(&"Esc".to_string()), "width {width}");
         }
     }
+
+    #[test]
+    fn generate_top_border_basic() {
+        let line = generate_top_border(" Title ", 20, Style::default());
+        assert_eq!(line.width(), 20);
+    }
+
+    #[test]
+    fn generate_top_border_empty_title() {
+        let line = generate_top_border("", 10, Style::default());
+        assert_eq!(line.width(), 10);
+    }
+
+    #[test]
+    fn generate_top_border_narrow() {
+        let line = generate_top_border("Hi", 4, Style::default());
+        assert_eq!(line.width(), 4);
+    }
+
+    #[test]
+    fn generate_bottom_border_basic() {
+        let line = generate_bottom_border(20, Style::default());
+        assert_eq!(line.width(), 20);
+    }
+
+    #[test]
+    fn generate_bottom_border_narrow() {
+        let line = generate_bottom_border(3, Style::default());
+        assert_eq!(line.width(), 3);
+    }
+
+    #[test]
+    fn style_collapsed_paste_blocks_basic() {
+        let result = style_collapsed_paste_blocks(
+            "line1\n[Pasted ~3 lines]\nline3",
+            Color::Black,
+            Color::Black,
+        );
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn style_collapsed_paste_blocks_no_paste() {
+        let result = style_collapsed_paste_blocks("hello world", Color::Black, Color::Black);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "hello world");
+        assert!(result[0].1.is_none());
+    }
+
+    #[test]
+    fn style_collapsed_paste_blocks_empty() {
+        let result = style_collapsed_paste_blocks("", Color::Black, Color::Black);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn centered_rect_fixed_basic() {
+        let area = ratatui::layout::Rect::new(0, 0, 100, 40);
+        let result = centered_rect_fixed(50, 10, area);
+        assert!(result.width <= 50);
+        assert_eq!(result.height, 10);
+    }
+
+    #[test]
+    fn centered_rect_fixed_full_width() {
+        let area = ratatui::layout::Rect::new(0, 0, 100, 40);
+        let result = centered_rect_fixed(100, 5, area);
+        assert_eq!(result.height, 5);
+    }
+
+    #[test]
+    fn wrap_empty_content() {
+        // The function always pushes at least one line
+        let lines = wrap_styled_content(vec![], None, 40, Color::Black);
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn wrap_single_short_line() {
+        let lines = wrap_styled_content(vec![("hello".to_string(), None)], None, 40, Color::Black);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(line_text(&lines[0]), "hello");
+    }
+
+    #[test]
+    fn scheduled_row_text_short_prompt() {
+        let fire = chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+            .unwrap()
+            .and_hms_opt(9, 0, 0)
+            .unwrap();
+        let row = scheduled_row_text(fire, "short", 40);
+        assert!(row.contains("09:00"));
+        assert!(row.contains("short"));
+    }
+
+    #[test]
+    fn shortcut_bar_zero_width() {
+        let keys = hint_keys(0);
+        assert!(keys.contains(&"Ctrl+S".to_string()));
+        assert!(keys.contains(&"Esc".to_string()));
+    }
+
+    #[test]
+    fn wrap_with_style() {
+        let styled = vec![("hello".to_string(), Some(Color::Red))];
+        let lines = wrap_styled_content(styled, None, 40, Color::Black);
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn generate_top_border_long_title() {
+        let line =
+            generate_top_border("A Very Long Title That Exceeds Width", 10, Style::default());
+        assert_eq!(line.width(), 10);
+    }
 }

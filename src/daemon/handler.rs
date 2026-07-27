@@ -10219,4 +10219,559 @@ mod additional_tests {
         assert!(error.contains("spec-a"), "{error}");
         assert!(error.contains("skipped"), "{error}");
     }
+
+    // ── node_copy_note ────────────────────────────────────────────
+
+    #[test]
+    fn node_copy_note_wired() {
+        let note = node_copy_note("src", "dst", true);
+        assert!(note.contains("src"));
+        assert!(note.contains("dst"));
+        assert!(!note.contains("Unwired"));
+    }
+
+    #[test]
+    fn node_copy_note_unwired() {
+        let note = node_copy_note("src", "dst", false);
+        assert!(note.contains("Unwired"));
+        assert!(note.contains("src"));
+        assert!(note.contains("dst"));
+        assert!(note.contains("NO incoming or outgoing edges"));
+    }
+
+    // ── json_value_kind_name ──────────────────────────────────────
+
+    #[test]
+    fn json_value_kind_name_null() {
+        assert_eq!(json_value_kind_name(&serde_json::Value::Null), "null");
+    }
+
+    #[test]
+    fn json_value_kind_name_bool() {
+        assert_eq!(json_value_kind_name(&serde_json::json!(true)), "a boolean");
+    }
+
+    #[test]
+    fn json_value_kind_name_number() {
+        assert_eq!(json_value_kind_name(&serde_json::json!(42)), "a number");
+    }
+
+    #[test]
+    fn json_value_kind_name_string() {
+        assert_eq!(
+            json_value_kind_name(&serde_json::json!("hello")),
+            "a JSON-encoded string"
+        );
+    }
+
+    #[test]
+    fn json_value_kind_name_array() {
+        assert_eq!(
+            json_value_kind_name(&serde_json::json!([1, 2])),
+            "an array"
+        );
+    }
+
+    #[test]
+    fn json_value_kind_name_object() {
+        assert_eq!(
+            json_value_kind_name(&serde_json::json!({"a": 1})),
+            "an object"
+        );
+    }
+
+    // ── validate_node_config ──────────────────────────────────────
+
+    #[test]
+    fn validate_node_config_agent_needs_platform() {
+        let config = serde_json::json!({"command": "test"});
+        let err = validate_node_config(LoopNodeKind::Agent, &config).unwrap_err();
+        assert!(err.contains("platform"), "{err}");
+    }
+
+    #[test]
+    fn validate_node_config_agent_with_platform() {
+        let config = serde_json::json!({"platform": "claude"});
+        assert!(validate_node_config(LoopNodeKind::Agent, &config).is_ok());
+    }
+
+    #[test]
+    fn validate_node_config_agent_with_cli() {
+        let config = serde_json::json!({"cli": "opencode"});
+        assert!(validate_node_config(LoopNodeKind::Agent, &config).is_ok());
+    }
+
+    #[test]
+    fn validate_node_config_check_needs_command() {
+        let config = serde_json::json!({"platform": "claude"});
+        let err = validate_node_config(LoopNodeKind::Check, &config).unwrap_err();
+        assert!(err.contains("command"), "{err}");
+    }
+
+    #[test]
+    fn validate_node_config_check_with_command() {
+        let config = serde_json::json!({"command": "cargo test"});
+        assert!(validate_node_config(LoopNodeKind::Check, &config).is_ok());
+    }
+
+    #[test]
+    fn validate_node_config_gate_needs_value_when_output_contains() {
+        let config = serde_json::json!({});
+        let err = validate_node_config(LoopNodeKind::Gate, &config).unwrap_err();
+        assert!(err.contains("value"), "{err}");
+    }
+
+    #[test]
+    fn validate_node_config_gate_with_value() {
+        let config = serde_json::json!({"value": "success"});
+        assert!(validate_node_config(LoopNodeKind::Gate, &config).is_ok());
+    }
+
+    #[test]
+    fn validate_node_config_not_object() {
+        let config = serde_json::json!("not an object");
+        let err = validate_node_config(LoopNodeKind::Agent, &config).unwrap_err();
+        assert!(err.contains("JSON object"), "{err}");
+    }
+
+    #[test]
+    fn validate_node_config_join_always_ok() {
+        let config = serde_json::json!({});
+        assert!(validate_node_config(LoopNodeKind::Join, &config).is_ok());
+    }
+
+    #[test]
+    fn validate_node_config_agent_empty_platform() {
+        let config = serde_json::json!({"platform": "  "});
+        let err = validate_node_config(LoopNodeKind::Agent, &config).unwrap_err();
+        assert!(err.contains("platform"), "{err}");
+    }
+
+    // ── validate_edge_condition ───────────────────────────────────
+
+    #[test]
+    fn validate_edge_condition_pass() {
+        assert!(matches!(
+            validate_edge_condition("pass").unwrap(),
+            LoopEdgeCondition::Pass
+        ));
+    }
+
+    #[test]
+    fn validate_edge_condition_fail() {
+        assert!(matches!(
+            validate_edge_condition("fail").unwrap(),
+            LoopEdgeCondition::Fail
+        ));
+    }
+
+    #[test]
+    fn validate_edge_condition_always() {
+        assert!(matches!(
+            validate_edge_condition("always").unwrap(),
+            LoopEdgeCondition::Always
+        ));
+    }
+
+    #[test]
+    fn validate_edge_condition_invalid() {
+        assert!(validate_edge_condition("sometimes").is_err());
+    }
+
+    #[test]
+    fn validate_edge_condition_with_whitespace() {
+        assert!(matches!(
+            validate_edge_condition("  pass  ").unwrap(),
+            LoopEdgeCondition::Pass
+        ));
+    }
+
+    // ── validate_node_kind ────────────────────────────────────────
+
+    #[test]
+    fn validate_node_kind_agent() {
+        assert!(matches!(
+            validate_node_kind("agent").unwrap(),
+            LoopNodeKind::Agent
+        ));
+    }
+
+    #[test]
+    fn validate_node_kind_check() {
+        assert!(matches!(
+            validate_node_kind("check").unwrap(),
+            LoopNodeKind::Check
+        ));
+    }
+
+    #[test]
+    fn validate_node_kind_gate() {
+        assert!(matches!(
+            validate_node_kind("gate").unwrap(),
+            LoopNodeKind::Gate
+        ));
+    }
+
+    #[test]
+    fn validate_node_kind_invalid() {
+        assert!(validate_node_kind("invalid").is_err());
+    }
+
+    #[test]
+    fn validate_node_kind_with_whitespace() {
+        assert!(matches!(
+            validate_node_kind("  agent  ").unwrap(),
+            LoopNodeKind::Agent
+        ));
+    }
+
+    // ── validate_not_join_kind ────────────────────────────────────
+
+    #[test]
+    fn validate_not_join_kind_rejects_join() {
+        assert!(validate_not_join_kind(LoopNodeKind::Join).is_err());
+    }
+
+    #[test]
+    fn validate_not_join_kind_accepts_agent() {
+        assert!(validate_not_join_kind(LoopNodeKind::Agent).is_ok());
+    }
+
+    #[test]
+    fn validate_not_join_kind_accepts_check() {
+        assert!(validate_not_join_kind(LoopNodeKind::Check).is_ok());
+    }
+
+    #[test]
+    fn validate_not_join_kind_accepts_gate() {
+        assert!(validate_not_join_kind(LoopNodeKind::Gate).is_ok());
+    }
+
+    // ── validate_spec_status ──────────────────────────────────────
+
+    #[test]
+    fn validate_spec_status_all_valid() {
+        assert!(matches!(
+            validate_spec_status("pending").unwrap(),
+            LoopSpecStatus::Pending
+        ));
+        assert!(matches!(
+            validate_spec_status("running").unwrap(),
+            LoopSpecStatus::Running
+        ));
+        assert!(matches!(
+            validate_spec_status("completed").unwrap(),
+            LoopSpecStatus::Completed
+        ));
+        assert!(matches!(
+            validate_spec_status("failed").unwrap(),
+            LoopSpecStatus::Failed
+        ));
+        assert!(matches!(
+            validate_spec_status("skipped").unwrap(),
+            LoopSpecStatus::Skipped
+        ));
+    }
+
+    #[test]
+    fn validate_spec_status_case_insensitive() {
+        assert!(validate_spec_status("PENDING").is_ok());
+        assert!(validate_spec_status("Running").is_ok());
+    }
+
+    #[test]
+    fn validate_spec_status_with_whitespace() {
+        assert!(validate_spec_status("  pending  ").is_ok());
+    }
+
+    #[test]
+    fn validate_spec_status_invalid() {
+        assert!(validate_spec_status("unknown").is_err());
+    }
+
+    // ── validate_spec_set_status_target ───────────────────────────
+
+    #[test]
+    fn validate_spec_set_status_target_valid() {
+        assert!(validate_spec_set_status_target("pending").is_ok());
+        assert!(validate_spec_set_status_target("completed").is_ok());
+        assert!(validate_spec_set_status_target("skipped").is_ok());
+    }
+
+    #[test]
+    fn validate_spec_set_status_target_running_invalid() {
+        assert!(validate_spec_set_status_target("running").is_err());
+    }
+
+    #[test]
+    fn validate_spec_set_status_target_failed_invalid() {
+        assert!(validate_spec_set_status_target("failed").is_err());
+    }
+
+    // ── validate_at_least_one_bool ────────────────────────────────
+
+    #[test]
+    fn validate_at_least_one_bool_all_false() {
+        assert!(validate_at_least_one_bool(&[false, false, false], "test").is_err());
+    }
+
+    #[test]
+    fn validate_at_least_one_bool_one_true() {
+        assert!(validate_at_least_one_bool(&[false, true, false], "test").is_ok());
+    }
+
+    #[test]
+    fn validate_at_least_one_bool_all_true() {
+        assert!(validate_at_least_one_bool(&[true, true], "test").is_ok());
+    }
+
+    #[test]
+    fn validate_at_least_one_bool_empty() {
+        assert!(validate_at_least_one_bool(&[], "test").is_err());
+    }
+
+    // ── missing_sync_identity_error ───────────────────────────────
+
+    #[test]
+    fn missing_sync_identity_error_includes_canopy_identity() {
+        let err = missing_sync_identity_error();
+        assert!(err.message.contains("Canopy session identity"));
+    }
+
+    // ── validate_spec_workdir ─────────────────────────────────────
+
+    #[test]
+    fn validate_spec_workdir_absolute() {
+        assert!(validate_spec_workdir("/tmp").is_ok());
+    }
+
+    #[test]
+    fn validate_spec_workdir_relative() {
+        assert!(validate_spec_workdir("relative/path").is_err());
+    }
+
+    // ── validate_non_empty ────────────────────────────────────────
+
+    #[test]
+    fn validate_non_empty_valid() {
+        assert!(validate_non_empty("hello", "field").is_ok());
+    }
+
+    #[test]
+    fn validate_non_empty_empty() {
+        assert!(validate_non_empty("", "field").is_err());
+    }
+
+    #[test]
+    fn validate_non_empty_whitespace() {
+        assert!(validate_non_empty("   ", "field").is_err());
+    }
+
+    #[test]
+    fn validate_non_empty_error_message() {
+        let err = validate_non_empty("", "my_field").unwrap_err();
+        assert!(err.contains("my_field"));
+    }
+
+    // ── spec_summary_json ─────────────────────────────────────────
+
+    #[test]
+    fn spec_summary_json_basic() {
+        let spec = standalone_spec("spec-1");
+        let json = spec_summary_json(&spec);
+        assert_eq!(json["id"], "spec-1");
+        assert_eq!(json["name"], "spec-1");
+        assert_eq!(json["status"], "pending");
+        assert_eq!(json["parallelizable"], false);
+    }
+
+    #[test]
+    fn spec_summary_json_with_completed_via() {
+        let mut spec = standalone_spec("spec-1");
+        spec.completed_via = Some("test".to_string());
+        let json = spec_summary_json(&spec);
+        assert_eq!(json["completed_via"], "test");
+    }
+
+    #[test]
+    fn spec_summary_json_with_workdir() {
+        let mut spec = standalone_spec("spec-1");
+        spec.workdir = Some("/tmp/project".to_string());
+        let json = spec_summary_json(&spec);
+        assert_eq!(json["workdir"], "/tmp/project");
+    }
+
+    // ── build_get_tools_response ──────────────────────────────────
+
+    #[test]
+    fn build_get_tools_response_session_start() {
+        let json = build_get_tools_response("session_start");
+        assert_eq!(json["scope"], "session_start");
+        assert_eq!(json["risk"], "low");
+        assert!(json["protocol"].is_array());
+        assert!(json["tools"].is_array());
+    }
+
+    #[test]
+    fn build_get_tools_response_file_write() {
+        let json = build_get_tools_response("file_write");
+        assert_eq!(json["scope"], "file_write");
+        assert_eq!(json["risk"], "high");
+    }
+
+    #[test]
+    fn build_get_tools_response_test_run() {
+        let json = build_get_tools_response("test_run");
+        assert_eq!(json["scope"], "test_run");
+        assert_eq!(json["risk"], "medium");
+    }
+
+    #[test]
+    fn build_get_tools_response_close_session() {
+        let json = build_get_tools_response("close_session");
+        assert_eq!(json["scope"], "close_session");
+        assert_eq!(json["risk"], "low");
+    }
+
+    #[test]
+    fn build_get_tools_response_multi_agent() {
+        let json = build_get_tools_response("multi_agent");
+        assert_eq!(json["scope"], "multi_agent");
+        assert_eq!(json["risk"], "varies");
+    }
+
+    // ── loop_run_status_guard ─────────────────────────────────────
+
+    #[test]
+    fn loop_run_status_guard_running() {
+        let err = loop_run_status_guard("loop-1", LoopStatus::Running).unwrap_err();
+        assert!(err.contains("already running"));
+    }
+
+    #[test]
+    fn loop_run_status_guard_completed() {
+        let err = loop_run_status_guard("loop-1", LoopStatus::Completed).unwrap_err();
+        assert!(err.contains("cannot be resumed directly"), "{err}");
+    }
+
+    #[test]
+    fn loop_run_status_guard_failed() {
+        let err = loop_run_status_guard("loop-1", LoopStatus::Failed).unwrap_err();
+        assert!(err.contains("cannot be resumed directly"), "{err}");
+    }
+
+    #[test]
+    fn loop_run_status_guard_draft() {
+        assert!(loop_run_status_guard("loop-1", LoopStatus::Draft).is_ok());
+    }
+
+    // ── loop_trigger_json ─────────────────────────────────────────
+
+    #[test]
+    fn loop_trigger_json_manual() {
+        let lp = Loop {
+            id: "l1".to_string(),
+            name: "l1".to_string(),
+            description: None,
+            workdir: "/tmp".to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_pool_id: None,
+            on_completed: None,
+        };
+        let json = loop_trigger_json(&lp);
+        assert_eq!(json["type"], "manual");
+        assert!(json.get("schedule").is_none());
+    }
+
+    #[test]
+    fn loop_trigger_json_cron() {
+        let lp = Loop {
+            id: "l1".to_string(),
+            name: "l1".to_string(),
+            description: None,
+            workdir: "/tmp".to_string(),
+            status: LoopStatus::Draft,
+            trigger: Some(Trigger::Cron {
+                schedule_expr: "0 9 * * *".to_string(),
+            }),
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_pool_id: None,
+            on_completed: None,
+        };
+        let json = loop_trigger_json(&lp);
+        assert_eq!(json["type"], "cron");
+        assert_eq!(json["schedule"], "0 9 * * *");
+    }
+
+    // ── validate_pool_reorder ─────────────────────────────────────
+
+    #[test]
+    fn validate_pool_reorder_wrong_count() {
+        let current = vec!["a".to_string(), "b".to_string()];
+        let spec_ids = vec!["a".to_string()];
+        assert!(validate_pool_reorder(&current, &spec_ids).is_err());
+    }
+
+    #[test]
+    fn validate_pool_reorder_duplicate() {
+        let current = vec!["a".to_string(), "b".to_string()];
+        let spec_ids = vec!["a".to_string(), "a".to_string()];
+        assert!(validate_pool_reorder(&current, &spec_ids).is_err());
+    }
+
+    #[test]
+    fn validate_pool_reorder_unknown_spec() {
+        let current = vec!["a".to_string(), "b".to_string()];
+        let spec_ids = vec!["a".to_string(), "c".to_string()];
+        assert!(validate_pool_reorder(&current, &spec_ids).is_err());
+    }
+
+    #[test]
+    fn validate_pool_reorder_valid() {
+        let current = vec!["a".to_string(), "b".to_string()];
+        let spec_ids = vec!["b".to_string(), "a".to_string()];
+        assert!(validate_pool_reorder(&current, &spec_ids).is_ok());
+    }
+
+    // ── blueprint_json ────────────────────────────────────────────
+
+    #[test]
+    fn blueprint_json_basic() {
+        let bp = Blueprint {
+            id: "bp-1".to_string(),
+            name: "ensemble-proposers".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({"members": []}),
+            builtin: true,
+            created_at: chrono::Utc::now(),
+        };
+        let json = blueprint_json(&bp);
+        assert_eq!(json["id"], "bp-1");
+        assert_eq!(json["name"], "ensemble-proposers");
+        assert_eq!(json["builtin"], true);
+    }
+
+    // ── validate_absolute_dir ─────────────────────────────────────
+
+    #[test]
+    fn validate_absolute_dir_valid() {
+        assert!(validate_absolute_dir("/tmp").is_ok());
+    }
+
+    #[test]
+    fn validate_absolute_dir_relative() {
+        assert!(validate_absolute_dir("relative").is_err());
+    }
 }

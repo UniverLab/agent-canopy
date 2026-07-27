@@ -592,4 +592,119 @@ pub fn open_terminal_suggestion_picker(app: &mut App, idx: usize) -> Result<()> 
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+
+    #[test]
+    fn is_direct_submit_enter() {
+        assert!(is_direct_submit(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn is_direct_submit_ctrl_c() {
+        assert!(is_direct_submit(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn is_direct_submit_ctrl_d() {
+        assert!(is_direct_submit(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn is_direct_submit_regular_char() {
+        assert!(!is_direct_submit(KeyCode::Char('a'), KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn is_direct_submit_ctrl_a() {
+        assert!(!is_direct_submit(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn is_direct_submit_esc() {
+        assert!(!is_direct_submit(KeyCode::Esc, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn wait_ms_for_key_tab() {
+        assert_eq!(wait_ms_for_key(KeyCode::Tab), TAB_SYNC_WAIT_MS);
+    }
+
+    #[test]
+    fn wait_ms_for_key_enter() {
+        assert_eq!(wait_ms_for_key(KeyCode::Enter), DIRECT_SYNC_WAIT_MS);
+    }
+
+    #[test]
+    fn wait_ms_for_key_char() {
+        assert_eq!(wait_ms_for_key(KeyCode::Char('a')), DIRECT_SYNC_WAIT_MS);
+    }
+
+    #[test]
+    fn wait_ms_for_key_esc() {
+        assert_eq!(wait_ms_for_key(KeyCode::Esc), DIRECT_SYNC_WAIT_MS);
+    }
+
+    #[test]
+    fn is_cd_command_exact() {
+        assert!(is_cd_command("cd"));
+    }
+
+    #[test]
+    fn is_cd_command_with_space() {
+        assert!(is_cd_command("cd /tmp"));
+    }
+
+    #[test]
+    fn is_cd_command_with_tab() {
+        assert!(is_cd_command("cd\t"));
+    }
+
+    #[test]
+    fn is_cd_command_not_cd() {
+        assert!(!is_cd_command("ls"));
+    }
+
+    #[test]
+    fn is_cd_command_not_cd_prefix() {
+        assert!(!is_cd_command("cd2"));
+    }
+
+    #[test]
+    fn is_cd_command_empty() {
+        assert!(!is_cd_command(""));
+    }
+
+    #[test]
+    fn is_cd_picker_request_empty() {
+        assert!(is_cd_picker_request(""));
+    }
+
+    #[test]
+    fn is_cd_picker_request_cd() {
+        assert!(is_cd_picker_request("cd"));
+    }
+
+    #[test]
+    fn is_cd_picker_request_cd_with_path() {
+        assert!(is_cd_picker_request("cd /tmp"));
+    }
+
+    #[test]
+    fn is_cd_picker_request_not_cd() {
+        assert!(!is_cd_picker_request("ls"));
+    }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn constants_are_sensible() {
+        assert!(DIRECT_SYNC_WAIT_MS > 0);
+        assert!(TAB_SYNC_WAIT_MS > DIRECT_SYNC_WAIT_MS);
+        assert!(SCROLL_STEP > 0);
+        assert!(PAGE_SCROLL_STEP > SCROLL_STEP);
+    }
+}
+
 // ── Dialog: new agent creation ──────────────────────────────────────

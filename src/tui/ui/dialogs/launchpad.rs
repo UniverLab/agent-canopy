@@ -190,3 +190,59 @@ pub fn draw_launchpad_dialog(frame: &mut Frame, app: &App, theme: &Theme) {
         frame.set_cursor_position((cursor_x, cursor_y));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mission_view_window_short_text() {
+        let (text, cursor) = mission_view_window("hello", 0, 20);
+        assert_eq!(text, "hello");
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn mission_view_window_exact_width() {
+        let (text, cursor) = mission_view_window("hello", 0, 5);
+        assert_eq!(text, "hello");
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn mission_view_window_long_text_cursor_start() {
+        let (text, cursor) = mission_view_window("hello world this is long", 0, 10);
+        assert_eq!(text.len(), 10);
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn mission_view_window_long_text_cursor_end() {
+        let text = "hello world this is long";
+        let (display, cursor) = mission_view_window(text, text.len(), 10);
+        assert!(display.chars().count() <= 10);
+        assert!(cursor <= 10);
+    }
+
+    #[test]
+    fn mission_view_window_cursor_in_middle() {
+        let text = "abcdef ghijkl mnopqr";
+        let (display, cursor) = mission_view_window(text, 10, 8);
+        assert_eq!(display.len(), 8);
+        assert!(cursor <= 8);
+    }
+
+    #[test]
+    fn mission_view_window_max_cols_zero_becomes_one() {
+        let (text, _) = mission_view_window("hello", 0, 0);
+        assert!(text.len() <= 1);
+    }
+
+    #[test]
+    fn mission_view_window_unicode() {
+        let text = "café résumé";
+        let (display, cursor) = mission_view_window(text, 0, 5);
+        assert!(!display.is_empty());
+        assert!(cursor <= display.chars().count());
+    }
+}

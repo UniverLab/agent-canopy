@@ -917,4 +917,174 @@ mod tests {
         let end = end_of_visual_line(&d, 7, 4, 10);
         assert_eq!(end, 8);
     }
+
+    #[test]
+    fn char_to_byte_index_ascii() {
+        assert_eq!(char_to_byte_index("hello", 0), 0);
+        assert_eq!(char_to_byte_index("hello", 3), 3);
+        assert_eq!(char_to_byte_index("hello", 5), 5);
+    }
+
+    #[test]
+    fn char_to_byte_index_beyond_end() {
+        assert_eq!(char_to_byte_index("hi", 10), 2);
+    }
+
+    #[test]
+    fn char_to_byte_index_empty() {
+        assert_eq!(char_to_byte_index("", 0), 0);
+    }
+
+    #[test]
+    fn char_to_byte_index_multibyte() {
+        let s = "café"; // é is 2 bytes in UTF-8
+        assert_eq!(char_to_byte_index(s, 0), 0);
+        assert_eq!(char_to_byte_index(s, 3), 3); // start of é
+        assert_eq!(char_to_byte_index(s, 4), 5); // after é
+    }
+
+    #[test]
+    fn visual_line_of_char_single_line() {
+        let d = dialog_with("hello");
+        assert_eq!(visual_line_of_char(&d, 0, 10), 0);
+        assert_eq!(visual_line_of_char(&d, 4, 10), 0);
+    }
+
+    #[test]
+    fn visual_line_of_char_at_end() {
+        let d = dialog_with("abc");
+        assert_eq!(visual_line_of_char(&d, 3, 10), 0);
+    }
+
+    #[test]
+    fn visual_line_of_char_empty() {
+        let d = dialog_with("");
+        assert_eq!(visual_line_of_char(&d, 0, 10), 0);
+    }
+
+    #[test]
+    fn visual_line_of_char_exact_boundary() {
+        let d = dialog_with("abcdefgh");
+        // field_width=4: chars 0-3 on line 0, chars 4-7 on line 1
+        assert_eq!(visual_line_of_char(&d, 3, 4), 0);
+        assert_eq!(visual_line_of_char(&d, 4, 4), 1);
+    }
+
+    #[test]
+    fn start_of_visual_line_first_line() {
+        let d = dialog_with("hello");
+        assert_eq!(start_of_visual_line(&d, 2, 10), 0);
+    }
+
+    #[test]
+    fn start_of_visual_line_wrapped() {
+        let d = dialog_with("abcdefghij");
+        // field_width=4: line 0 starts at 0, line 1 starts at 4
+        assert_eq!(start_of_visual_line(&d, 5, 4), 4);
+    }
+
+    #[test]
+    fn start_of_visual_line_at_beginning() {
+        let d = dialog_with("hello");
+        assert_eq!(start_of_visual_line(&d, 0, 10), 0);
+    }
+
+    #[test]
+    fn end_of_visual_line_first_line() {
+        let d = dialog_with("hello");
+        assert_eq!(end_of_visual_line(&d, 2, 10, 5), 5);
+    }
+
+    #[test]
+    fn end_of_visual_line_wrapped() {
+        let d = dialog_with("abcdefghij");
+        // field_width=4: line 0 ends at 4, line 1 ends at 8
+        assert_eq!(end_of_visual_line(&d, 5, 4, 10), 8);
+    }
+
+    #[test]
+    fn end_of_visual_line_at_end() {
+        let d = dialog_with("abc");
+        assert_eq!(end_of_visual_line(&d, 0, 10, 3), 3);
+    }
+
+    #[test]
+    fn move_visual_down_within_line() {
+        let d = dialog_with("abcdefghij");
+        // cursor at col 0 of line 0, move down goes to col 0 of line 1
+        let new_cursor = move_prompt_visual(&d, 0, 4, true).expect("should move");
+        assert_eq!(new_cursor, 4);
+    }
+
+    #[test]
+    fn move_visual_up_from_second_line() {
+        let d = dialog_with("abcdefghij");
+        // cursor at col 0 of line 1 (pos 4), move up goes to col 0 of line 0
+        let new_cursor = move_prompt_visual(&d, 4, 4, false).expect("should move");
+        assert_eq!(new_cursor, 0);
+    }
+
+    #[test]
+    fn prompt_field_width_for_wide_terminal() {
+        let width = prompt_field_width_for(200);
+        assert!(width > 40);
+        assert!(width < 200);
+    }
+
+    #[test]
+    fn prompt_field_width_for_narrow_terminal() {
+        let width = prompt_field_width_for(20);
+        assert!(width >= 10);
+    }
+
+    #[test]
+    fn prompt_field_width_for_minimum() {
+        let width = prompt_field_width_for(0);
+        assert!(width >= 10);
+    }
+
+    #[test]
+    fn insert_text_empty_into_empty() {
+        let mut d = dialog_with("");
+        insert_prompt_text(&mut d, "");
+        assert_eq!(d.prompt, "");
+        assert_eq!(d.prompt_cursor, 0);
+    }
+
+    #[test]
+    fn delete_forward_at_end() {
+        let mut d = dialog_with("abc");
+        d.prompt_cursor = 3;
+        delete_prompt_forward(&mut d);
+        assert_eq!(d.prompt, "abc");
+    }
+
+    #[test]
+    fn delete_forward_empty() {
+        let mut d = dialog_with("");
+        delete_prompt_forward(&mut d);
+        assert_eq!(d.prompt, "");
+    }
+
+    #[test]
+    fn backspace_empty() {
+        let mut d = dialog_with("");
+        backspace_prompt(&mut d);
+        assert_eq!(d.prompt, "");
+    }
+
+    #[test]
+    fn insert_text_unicode() {
+        let mut d = dialog_with("");
+        insert_prompt_text(&mut d, "café");
+        assert_eq!(d.prompt, "café");
+        assert_eq!(d.prompt_cursor, 4);
+    }
+
+    #[test]
+    fn visual_line_of_char_multibyte() {
+        let d = dialog_with("caféxyz");
+        // field_width=4: c(0) a(1) f(2) é(3) on line 0, x(4) y(5) z(6) on line 1
+        assert_eq!(visual_line_of_char(&d, 4, 4), 1); // x is on line 1
+    }
 }

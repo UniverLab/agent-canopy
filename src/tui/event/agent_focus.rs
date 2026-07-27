@@ -950,4 +950,102 @@ mod tests {
     fn other_key_does_not_dismiss_exited_session() {
         assert!(!dismisses_exited_session(KeyCode::Char('x'), false, true));
     }
+
+    #[test]
+    fn shift_scroll_request_up() {
+        assert_eq!(shift_scroll_request(KeyCode::Up), Some((true, 3)));
+    }
+
+    #[test]
+    fn shift_scroll_request_down() {
+        assert_eq!(shift_scroll_request(KeyCode::Down), Some((false, 3)));
+    }
+
+    #[test]
+    fn shift_scroll_request_left() {
+        assert_eq!(shift_scroll_request(KeyCode::Left), None);
+    }
+
+    #[test]
+    fn shift_scroll_request_enter() {
+        assert_eq!(shift_scroll_request(KeyCode::Enter), None);
+    }
+
+    #[test]
+    fn standard_scroll_request_up_scrolled() {
+        assert_eq!(standard_scroll_request(KeyCode::Up, true), Some((true, 3)));
+    }
+
+    #[test]
+    fn standard_scroll_request_up_not_scrolled() {
+        assert_eq!(standard_scroll_request(KeyCode::Up, false), None);
+    }
+
+    #[test]
+    fn standard_scroll_request_down_scrolled() {
+        assert_eq!(
+            standard_scroll_request(KeyCode::Down, true),
+            Some((false, 3))
+        );
+    }
+
+    #[test]
+    fn standard_scroll_request_down_not_scrolled() {
+        assert_eq!(standard_scroll_request(KeyCode::Down, false), None);
+    }
+
+    #[test]
+    fn standard_scroll_request_page_up() {
+        assert_eq!(
+            standard_scroll_request(KeyCode::PageUp, false),
+            Some((true, 15))
+        );
+    }
+
+    #[test]
+    fn standard_scroll_request_page_down() {
+        assert_eq!(
+            standard_scroll_request(KeyCode::PageDown, false),
+            Some((false, 15))
+        );
+    }
+
+    #[test]
+    fn standard_scroll_request_enter() {
+        assert_eq!(standard_scroll_request(KeyCode::Enter, false), None);
+    }
+
+    #[test]
+    fn standard_scroll_request_char() {
+        assert_eq!(standard_scroll_request(KeyCode::Char('a'), false), None);
+    }
+
+    #[test]
+    fn is_focus_cycle_key_ctrl_shift() {
+        // contains(SHIFT) is true even when CONTROL is also set
+        assert!(is_focus_cycle_key(
+            KeyCode::Up,
+            KeyModifiers::SHIFT | KeyModifiers::CONTROL
+        ));
+    }
+
+    #[test]
+    fn dismisses_exited_session_ctrl_esc() {
+        assert!(!dismisses_exited_session(KeyCode::Esc, false, false));
+    }
+
+    #[test]
+    fn dismisses_exited_session_f10_in_split() {
+        assert!(!dismisses_exited_session(KeyCode::F(10), true, false));
+    }
+
+    #[test]
+    fn dismisses_exited_session_f10_not_exited() {
+        assert!(!dismisses_exited_session(KeyCode::F(10), false, false));
+    }
+
+    #[test]
+    fn dismisses_exited_session_f10_split_and_exited() {
+        assert!(!dismisses_exited_session(KeyCode::F(10), true, true));
+    }
 }

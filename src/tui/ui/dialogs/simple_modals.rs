@@ -99,6 +99,102 @@ fn mission_unlock_text(
     )
 }
 
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+    use crate::domain::gamification::MissionCategory;
+
+    #[test]
+    fn format_uptime_precise_seconds_only() {
+        assert_eq!(format_uptime_precise(0), "0s");
+        assert_eq!(format_uptime_precise(59), "59s");
+        assert_eq!(format_uptime_precise(1), "1s");
+    }
+
+    #[test]
+    fn format_uptime_precise_minutes_and_seconds() {
+        assert_eq!(format_uptime_precise(60), "1m 0s");
+        assert_eq!(format_uptime_precise(125), "2m 5s");
+        assert_eq!(format_uptime_precise(3599), "59m 59s");
+    }
+
+    #[test]
+    fn format_uptime_precise_hours_minutes_seconds() {
+        assert_eq!(format_uptime_precise(3600), "1h 0m 0s");
+        assert_eq!(format_uptime_precise(3661), "1h 1m 1s");
+        assert_eq!(format_uptime_precise(86399), "23h 59m 59s");
+    }
+
+    #[test]
+    fn format_uptime_precise_days_hours_minutes() {
+        assert_eq!(format_uptime_precise(86400), "1d 0h 0m 0s");
+        assert_eq!(format_uptime_precise(90061), "1d 1h 1m 1s");
+        assert_eq!(format_uptime_precise(172800), "2d 0h 0m 0s");
+    }
+
+    #[test]
+    fn format_uptime_precise_large_values() {
+        assert_eq!(format_uptime_precise(86400 * 365), "365d 0h 0m 0s");
+        assert_eq!(
+            format_uptime_precise(86400 * 365 + 3600 + 61),
+            "365d 1h 1m 1s"
+        );
+    }
+
+    #[test]
+    fn format_uptime_precise_boundary_59_minutes() {
+        assert_eq!(format_uptime_precise(3540), "59m 0s");
+    }
+
+    #[test]
+    fn category_label_all_variants() {
+        assert_eq!(category_label(&MissionCategory::Environment), "Environment");
+        assert_eq!(
+            category_label(&MissionCategory::Intelligence),
+            "Intelligence"
+        );
+        assert_eq!(category_label(&MissionCategory::Projects), "Projects");
+        assert_eq!(category_label(&MissionCategory::Loop), "Loop");
+        assert_eq!(category_label(&MissionCategory::Seeds), "Seeds");
+        assert_eq!(category_label(&MissionCategory::SysInfo), "System");
+    }
+
+    #[test]
+    fn mission_unlock_text_formats_correctly() {
+        let result = mission_unlock_text("🏆", "First Login", &MissionCategory::Seeds);
+        assert_eq!(result, "Unlocked medal 🏆 First Login in Seeds.");
+    }
+
+    #[test]
+    fn mission_unlock_text_different_category() {
+        let result = mission_unlock_text("⭐", "Code Master", &MissionCategory::Intelligence);
+        assert_eq!(result, "Unlocked medal ⭐ Code Master in Intelligence.");
+    }
+
+    #[test]
+    fn mission_unlock_text_empty_strings() {
+        let result = mission_unlock_text("", "", &MissionCategory::Environment);
+        assert_eq!(result, "Unlocked medal   in Environment.");
+    }
+
+    #[test]
+    fn mission_unlock_text_all_categories() {
+        for cat in &[
+            MissionCategory::Environment,
+            MissionCategory::Intelligence,
+            MissionCategory::Projects,
+            MissionCategory::Loop,
+            MissionCategory::Seeds,
+            MissionCategory::SysInfo,
+        ] {
+            let result = mission_unlock_text("i", "t", cat);
+            assert!(result.starts_with("Unlocked medal i t in "));
+            assert!(result.ends_with("."));
+        }
+    }
+}
+
 pub fn draw_legend(frame: &mut Frame, app: &mut App, theme: &Theme) {
     use crate::domain::gamification::{MissionCategory, MISSIONS};
 

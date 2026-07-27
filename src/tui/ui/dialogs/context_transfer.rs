@@ -233,3 +233,31 @@ fn truncate_path(path: &str, max_chars: usize) -> String {
     let start = trimmed.find('/').map(|p| p + 1).unwrap_or(0);
     format!("…/{}", &trimmed[start..])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_path_short_enough() {
+        assert_eq!(truncate_path("/a/b/c", 20), "/a/b/c");
+    }
+
+    #[test]
+    fn truncate_path_exact_length() {
+        assert_eq!(truncate_path("/a/b/c", 6), "/a/b/c");
+    }
+
+    #[test]
+    fn truncate_path_too_long() {
+        let result = truncate_path("/home/user/project/file.txt", 15);
+        assert!(result.starts_with("…/"));
+        assert!(result.len() <= 17); // "…/" + max_chars
+    }
+
+    #[test]
+    fn truncate_path_single_slash() {
+        let result = truncate_path("/very/long/path/to/something", 5);
+        assert!(result.starts_with("…/"));
+    }
+}

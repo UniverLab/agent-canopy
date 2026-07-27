@@ -411,4 +411,46 @@ mod tests {
         assert_eq!(db.get_state("rag_total_chunks").unwrap(), Some("0".into()));
         assert_eq!(db.get_state("rag_indexed_files").unwrap(), Some("0".into()));
     }
+
+    #[test]
+    fn short_path_home_dir() {
+        if let Some(home) = dirs::home_dir() {
+            let home_str = home.to_string_lossy();
+            let full = format!("{home_str}/Documents/file.txt");
+            assert_eq!(short_path(&full), "~/Documents/file.txt");
+        }
+    }
+
+    #[test]
+    fn short_path_not_home() {
+        assert_eq!(short_path("/tmp/something"), "/tmp/something");
+    }
+
+    #[test]
+    fn short_path_exact_home() {
+        if let Some(home) = dirs::home_dir() {
+            let home_str = home.to_string_lossy();
+            assert_eq!(short_path(&home_str), "~");
+        }
+    }
+
+    #[test]
+    fn format_ts_epoch_zero() {
+        let result = format_ts(0);
+        // UTC epoch zero, depends on local timezone
+        assert!(!result.is_empty());
+        assert!(result.contains(":"));
+    }
+
+    #[test]
+    fn format_ts_recent() {
+        let result = format_ts(1700000000);
+        assert!(result.contains("2023"));
+    }
+
+    #[test]
+    fn format_ts_has_time() {
+        let result = format_ts(1700000000);
+        assert!(result.contains(":"));
+    }
 }

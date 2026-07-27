@@ -590,6 +590,7 @@ fn abbreviate_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn test_record_and_filter() {
@@ -712,5 +713,116 @@ mod tests {
         let picker = SuggestionPicker::from_history("cargo", &hist, "/project");
         assert_eq!(picker.items.len(), 3);
         assert_eq!(picker.mode, PickerMode::CommandHistory);
+    }
+
+    #[test]
+    fn abbreviate_path_home_dir() {
+        if let Some(home) = dirs::home_dir() {
+            let home_str = home.to_string_lossy();
+            let full_path = format!("{home_str}/Documents/file.txt");
+            let result = abbreviate_path(&full_path);
+            assert_eq!(result, "~/Documents/file.txt");
+        }
+    }
+
+    #[test]
+    fn abbreviate_path_not_home() {
+        let result = abbreviate_path("/tmp/something");
+        assert_eq!(result, "/tmp/something");
+    }
+
+    #[test]
+    fn abbreviate_path_exact_home() {
+        if let Some(home) = dirs::home_dir() {
+            let home_str = home.to_string_lossy();
+            let result = abbreviate_path(&home_str);
+            assert_eq!(result, "~");
+        }
+    }
+
+    #[test]
+    fn filter_empty_history() {
+        let hist = SessionHistory::default();
+        let matches = hist.filter("anything");
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn filter_no_match() {
+        let mut hist = SessionHistory::default();
+        hist.record("cargo build", "/tmp");
+        let matches = hist.filter("xyz");
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn ghost_suggestion_no_history() {
+        let hist = SessionHistory::default();
+        assert_eq!(hist.ghost_suggestion("cargo"), None);
+    }
+
+    #[test]
+    fn known_directories_empty() {
+        let hist = SessionHistory::default();
+        let dirs = hist.known_directories();
+        assert!(dirs.is_empty());
+    }
+
+    #[test]
+    fn record_updates_last_run() {
+        let mut hist = SessionHistory::default();
+        hist.record("cmd", "/tmp");
+        let first_time = hist.commands[0].last_run;
+        std::thread::sleep(Duration::from_millis(10));
+        hist.record("cmd", "/tmp");
+        let second_time = hist.commands[0].last_run;
+        assert!(second_time >= first_time);
+    }
+
+    #[test]
+    fn filter_partial_match() {
+        let mut hist = SessionHistory::default();
+        hist.record("cargo build", "/tmp");
+        hist.record("cargo test", "/tmp");
+        let matches = hist.filter("car");
+        assert_eq!(matches.len(), 2);
+    }
+
+    #[test]
+    fn merge_history_entry_deduplicates() {
+        let mut hist = SessionHistory::default();
+        hist.record("ls", "/tmp");
+        hist.record("ls", "/tmp");
+        assert_eq!(hist.commands.len(), 1);
+        assert_eq!(hist.commands[0].count, 2);
+    }
+
+    #[test]
+    fn filter_sorted_by_count_desc() {
+        let mut hist = SessionHistory::default();
+        hist.record("cmd_a", "/tmp");
+        hist.record("cmd_b", "/tmp");
+        hist.record("cmd_b", "/tmp");
+        hist.record("cmd_b", "/tmp");
+        let matches = hist.filter("cmd");
+        assert_eq!(matches[0].cmd, "cmd_b");
+        assert_eq!(matches[1].cmd, "cmd_a");
+    }
+
+    #[test]
+    fn test_scrollback_update() {
+        let mut hist = SessionHistory::default();
+        hist.record("echo hello", "/tmp");
+        let scrollback = vec!["line1".to_string(), "line2".to_string()];
+        hist.update_scrollback(&scrollback);
+        assert_eq!(hist.scrollback.len(), 2);
+    }
+
+    #[test]
+    fn test_scrollback_limit() {
+        let mut hist = SessionHistory::default();
+        let scrollback: Vec<String> = (0..2000).map(|i| format!("line {i}")).collect();
+        hist.update_scrollback(&scrollback);
+        assert!(hist.scrollback.len() <= MAX_SCROLLBACK_LINES);
     }
 }

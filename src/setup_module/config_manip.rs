@@ -645,4 +645,41 @@ mod tests {
         handle_comment_or_slash(&mut chars, &mut out);
         assert_eq!(out, "/");
     }
+
+    #[test]
+    fn strip_jsonc_nested_block_comment() {
+        let input = r#"{"a": /* outer /* inner */ still_comment */ 1}"#;
+        let out = strip_jsonc_comments(input);
+        assert!(out.contains("\"a\""));
+    }
+
+    #[test]
+    fn strip_jsonc_unclosed_block_comment() {
+        let input = r#"{"a": /* unclosed comment}"#;
+        let out = strip_jsonc_comments(input);
+        assert!(out.contains("\"a\""));
+    }
+
+    #[test]
+    fn strip_jsonc_mixed_comments() {
+        let input = r#"{
+  // line comment
+  "a": 1,
+  /* block comment */
+  "b": 2
+}"#;
+        let out = strip_jsonc_comments(input);
+        assert!(out.contains("\"a\": 1"));
+        assert!(out.contains("\"b\": 2"));
+        assert!(!out.contains("line comment"));
+        assert!(!out.contains("block comment"));
+    }
+
+    #[test]
+    fn remove_toml_key_section_str_multiple_sections() {
+        let content = "[[mcp_servers]]\nname = \"a\"\nurl = \"a\"\n[[mcp_servers]]\nname = \"b\"\nurl = \"b\"\n";
+        let result = remove_toml_key_section_str(content, "[[mcp_servers]]");
+        // Should remove ALL [[mcp_servers]] sections
+        assert!(!result.contains("[[mcp_servers]]"));
+    }
 }
