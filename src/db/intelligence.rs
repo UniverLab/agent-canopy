@@ -670,3 +670,113 @@ impl Database {
         Ok(rows.filter_map(|row| row.ok()).collect())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn test_db() -> Database {
+        let dir = tempdir().unwrap();
+        Database::new(&dir.path().join("test.db")).unwrap()
+    }
+
+    fn sample_node_input(id: &str) -> IntelligenceNodeInput {
+        IntelligenceNodeInput {
+            id: Some(id.to_string()),
+            kind: "fact".to_string(),
+            title: format!("Node {id}"),
+            body: "Test body".to_string(),
+            project_hash: Some("proj1".to_string()),
+            session_id: None,
+            metadata: None,
+            relations: None,
+        }
+    }
+
+    #[test]
+    fn upsert_and_get_intelligence_node() {
+        let db = test_db();
+        let input = sample_node_input("node1");
+        db.upsert_intelligence_node(input).unwrap();
+
+        let retrieved = db.get_intelligence_node("node1").unwrap();
+        assert!(retrieved.is_some());
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.id, "node1");
+        assert_eq!(retrieved.title, "Node node1");
+    }
+
+    #[test]
+    fn get_intelligence_node_not_found() {
+        let db = test_db();
+        let result = db.get_intelligence_node("nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn list_intelligence_nodes_empty() {
+        let db = test_db();
+        let nodes = db.list_intelligence_nodes(None, 100).unwrap();
+        assert!(nodes.is_empty());
+    }
+
+    #[test]
+    fn list_intelligence_nodes_with_nodes() {
+        let db = test_db();
+        let input1 = sample_node_input("node1");
+        let input2 = sample_node_input("node2");
+        db.upsert_intelligence_node(input1).unwrap();
+        db.upsert_intelligence_node(input2).unwrap();
+
+        let nodes = db.list_intelligence_nodes(None, 100).unwrap();
+        assert_eq!(nodes.len(), 2);
+    }
+
+    #[test]
+    fn list_intelligence_nodes_by_kind() {
+        let db = test_db();
+        let mut input1 = sample_node_input("node1");
+        input1.kind = "fact".to_string();
+        let mut input2 = sample_node_input("node2");
+        input2.kind = "pattern".to_string();
+        db.upsert_intelligence_node(input1).unwrap();
+        db.upsert_intelligence_node(input2).unwrap();
+
+        let nodes = db.list_intelligence_nodes(Some("fact"), 100).unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].id, "node1");
+    }
+
+    #[test]
+    fn delete_intelligence_node() {
+        let db = test_db();
+        let input = sample_node_input("node1");
+        db.upsert_intelligence_node(input).unwrap();
+
+        db.delete_intelligence_node("node1").unwrap();
+        let retrieved = db.get_intelligence_node("node1").unwrap();
+        assert!(retrieved.is_none());
+    }
+
+    #[test]
+    fn list_intelligence_projects_empty() {
+        let db = test_db();
+        let projects = db.list_intelligence_projects(None, 100).unwrap();
+        assert!(projects.is_empty());
+    }
+
+    #[test]
+    fn list_intelligence_projects_with_projects() {
+        let db = test_db();
+        let mut input1 = sample_node_input("proj1");
+        input1.kind = "project".to_string();
+        let mut input2 = sample_node_input("proj2");
+        input2.kind = "project".to_string();
+        db.upsert_intelligence_node(input1).unwrap();
+        db.upsert_intelligence_node(input2).unwrap();
+
+        let projects = db.list_intelligence_projects(None, 100).unwrap();
+        assert_eq!(projects.len(), 2);
+    }
+}
