@@ -14316,4 +14316,317 @@ mod endpoint_tests {
             .unwrap();
         assert!(is_err(&missing_ensemble));
     }
+
+    // ── sync_* / intelligence_* / get_tools / project_* ────────────
+
+    /// RAII guard: sets the real `CANOPY_AGENT_ID` env var, which
+    /// `resolve_sync_agent_id` falls back to when no request `Parts` header
+    /// is present (as in these direct-call tests). Safe under `cargo
+    /// nextest` (one process per test).
+    struct AgentIdVar {
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl AgentIdVar {
+        fn set(id: &str) -> Self {
+            let prev = std::env::var_os(crate::shared::sync_identity::CANOPY_AGENT_ID_ENV);
+            unsafe {
+                std::env::set_var(crate::shared::sync_identity::CANOPY_AGENT_ID_ENV, id);
+            }
+            AgentIdVar { prev }
+        }
+    }
+
+    impl Drop for AgentIdVar {
+        fn drop(&mut self) {
+            let key = crate::shared::sync_identity::CANOPY_AGENT_ID_ENV;
+            match &self.prev {
+                Some(v) => unsafe { std::env::set_var(key, v) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+    }
+
+    // ── intelligence_upsert / intelligence_search / intelligence_graph_walk
+
+    #[tokio::test]
+    async fn intelligence_upsert_search_and_graph_walk() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let _agent_guard = AgentIdVar::set("agent-intel-1");
+
+        let created = handler
+            .intelligence_upsert(
+                Parameters(IntelligenceUpsertParams {
+                    node_data: IntelligenceNodeParams {
+                        id: Some("fact-1".to_string()),
+                        kind: "fact".to_string(),
+                        title: "Rust is memory safe".to_string(),
+                        body: "Ownership rules prevent data races.".to_string(),
+                        metadata: None,
+                        project_hash: None,
+                        session_id: None,
+                        relations: None,
+                    },
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(!is_err(&created), "{}", text(&created));
+
+        let linked = handler
+            .intelligence_upsert(
+                Parameters(IntelligenceUpsertParams {
+                    node_data: IntelligenceNodeParams {
+                        id: Some("fact-2".to_string()),
+                        kind: "fact".to_string(),
+                        title: "Ownership rules".to_string(),
+                        body: "One owner at a time.".to_string(),
+                        metadata: None,
+                        project_hash: None,
+                        session_id: None,
+                        relations: Some(vec![IntelligenceRelationParams {
+                            to_node_id: "fact-1".to_string(),
+                            relation: "supports".to_string(),
+                            weight: Some(1.0),
+                        }]),
+                    },
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(!is_err(&linked), "{}", text(&linked));
+
+        let searched = handler
+            .intelligence_search(
+                Parameters(IntelligenceSearchParams {
+                    query: "memory safe".to_string(),
+                    kind: Some("fact".to_string()),
+                    limit: Some(5),
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(raw_text(&searched).contains("fact-1"));
+
+        let walked = handler
+            .intelligence_graph_walk(Parameters(IntelligenceGraphWalkParams {
+                node_id: "fact-2".to_string(),
+                depth: Some(2),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&walked), "{}", text(&walked));
+        assert!(raw_text(&walked).contains("fact-1"));
+
+        let missing_root = handler
+            .intelligence_graph_walk(Parameters(IntelligenceGraphWalkParams {
+                node_id: "ghost-node".to_string(),
+                depth: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&missing_root));
+    }
+
+    #[tokio::test]
+    async fn intelligence_get_context_light_and_full() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let _agent_guard = AgentIdVar::set("agent-ctx-1");
+
+        let bad_scope = handler
+            .intelligence_get_context(
+                Parameters(IntelligenceGetContextParams {
+                    scope: "sideways".to_string(),
+                    project_hash: None,
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(is_err(&bad_scope));
+
+        let light = handler
+            .intelligence_get_context(
+                Parameters(IntelligenceGetContextParams {
+                    scope: "light".to_string(),
+                    project_hash: None,
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(!is_err(&light), "{}", text(&light));
+        assert!(raw_text(&light).contains("\"scope\": \"light\""));
+
+        let full = handler
+            .intelligence_get_context(
+                Parameters(IntelligenceGetContextParams {
+                    scope: "full".to_string(),
+                    project_hash: None,
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(!is_err(&full), "{}", text(&full));
+        assert!(raw_text(&full).contains("\"scope\": \"full\""));
+    }
+
+    // ── intelligence_list_projects / intelligence_link_projects ────
+
+    #[tokio::test]
+    async fn intelligence_list_and_link_projects() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        db.register_project_path(dir_a.path()).unwrap();
+        db.register_project_path(dir_b.path()).unwrap();
+        let hash_a = crate::domain::project::workdir_hash(&dir_a.path().to_string_lossy());
+        let hash_b = crate::domain::project::workdir_hash(&dir_b.path().to_string_lossy());
+
+        let listed = handler
+            .intelligence_list_projects(Parameters(IntelligenceListProjectsParams {
+                query: None,
+                limit: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&listed));
+
+        let empty_fields = handler
+            .intelligence_link_projects(Parameters(IntelligenceLinkProjectsParams {
+                from_project_hash: "  ".to_string(),
+                to_project_hash: hash_b.clone(),
+                relation: None,
+                weight: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&empty_fields));
+
+        let linked = handler
+            .intelligence_link_projects(Parameters(IntelligenceLinkProjectsParams {
+                from_project_hash: hash_a,
+                to_project_hash: hash_b,
+                relation: Some("depends_on".to_string()),
+                weight: Some(0.5),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&linked), "{}", text(&linked));
+        assert!(raw_text(&linked).contains("depends_on"));
+    }
+
+    // ── get_tools ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_tools_returns_scoped_protocol() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let _agent_guard = AgentIdVar::set("agent-tools-1");
+
+        let bad_scope = handler
+            .get_tools(
+                Parameters(GetToolsParams {
+                    scope: "sideways".to_string(),
+                    path: None,
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(is_err(&bad_scope));
+
+        let file_write = handler
+            .get_tools(
+                Parameters(GetToolsParams {
+                    scope: "file_write".to_string(),
+                    path: Some("/tmp/a.rs".to_string()),
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(!is_err(&file_write));
+        assert!(raw_text(&file_write).contains("/tmp/a.rs"));
+
+        let session_start = handler
+            .get_tools(
+                Parameters(GetToolsParams {
+                    scope: "session_start".to_string(),
+                    path: None,
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(!is_err(&session_start));
+        assert!(raw_text(&session_start).contains("session_start"));
+    }
+
+    // ── project_search / project_update ─────────────────────────
+
+    #[tokio::test]
+    async fn project_search_and_update() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        let base = tempdir().unwrap();
+        let project_dir = base.path().join("searchable-project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let project = db.register_project_path(&project_dir).unwrap();
+
+        let no_match = handler
+            .project_search(Parameters(ProjectSearchParams {
+                query: "nothing-matches-this-xyz".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(text(&no_match).contains("No projects found"));
+
+        let found = handler
+            .project_search(Parameters(ProjectSearchParams {
+                query: "searchable-project".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(raw_text(&found).contains(&project.hash));
+
+        let updated = handler
+            .project_update(Parameters(ProjectUpdateParams {
+                project_hash: project.hash.clone(),
+                description: Some("A test project".to_string()),
+                tags: Some(vec!["rust".to_string()]),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&updated), "{}", text(&updated));
+
+        let missing = handler
+            .project_update(Parameters(ProjectUpdateParams {
+                project_hash: "not-a-real-hash".to_string(),
+                description: Some("x".to_string()),
+                tags: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&missing));
+    }
+
+    // ── skill_list / skill_get ──
+
+    #[tokio::test]
+    async fn skill_list_empty_and_skill_get_unknown() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+
+        let listed = handler.skill_list().await.unwrap();
+        assert!(!is_err(&listed));
+
+        let missing = handler
+            .skill_get(Parameters(SkillGetParams {
+                name: "unknown-skill".to_string(),
+            }))
+            .await;
+        assert!(missing.is_err());
+    }
 }
