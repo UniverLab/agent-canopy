@@ -427,3 +427,203 @@ impl Database {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::models::{Agent, Cli, Trigger, WatchEvent};
+    use chrono::Utc;
+
+    fn test_db() -> Database {
+        let dir = tempfile::tempdir().unwrap();
+        Database::new(&dir.path().join("test.db")).unwrap()
+    }
+
+    fn sample_agent(id: &str) -> Agent {
+        Agent {
+            id: id.to_string(),
+            prompt: "test prompt".to_string(),
+            trigger: Some(Trigger::Cron {
+                schedule_expr: "0 9 * * *".to_string(),
+            }),
+            cli: Cli::new("opencode"),
+            model: None,
+            working_dir: None,
+            enabled: true,
+            enable_at: None,
+            created_at: Utc::now(),
+            log_path: format!("/tmp/{id}.log"),
+            timeout_minutes: 15,
+            expires_at: None,
+            last_run_at: None,
+            last_run_ok: None,
+            last_triggered_at: None,
+            trigger_count: 0,
+        }
+    }
+
+    #[test]
+    fn upsert_and_get_agent() {
+        let db = test_db();
+        let agent = sample_agent("test-agent");
+        db.upsert_agent(&agent).unwrap();
+
+        let retrieved = db.get_agent("test-agent").unwrap();
+        assert!(retrieved.is_some());
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.id, "test-agent");
+        assert_eq!(retrieved.prompt, "test prompt");
+    }
+
+    #[test]
+    fn get_agent_not_found() {
+        let db = test_db();
+        let result = db.get_agent("nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn list_agents_empty() {
+        let db = test_db();
+        let agents = db.list_agents().unwrap();
+        assert!(agents.is_empty());
+    }
+
+    #[test]
+    fn list_agents_with_agents() {
+        let db = test_db();
+        let agent1 = sample_agent("agent1");
+        let agent2 = sample_agent("agent2");
+        db.upsert_agent(&agent1).unwrap();
+        db.upsert_agent(&agent2).unwrap();
+
+        let agents = db.list_agents().unwrap();
+        assert_eq!(agents.len(), 2);
+    }
+
+    #[test]
+    fn list_cron_agents() {
+        let db = test_db();
+        let cron_agent = sample_agent("cron1");
+        let mut watch_agent = sample_agent("watch1");
+        watch_agent.trigger = Some(Trigger::Watch {
+            path: "/tmp".to_string(),
+            events: vec![WatchEvent::Create],
+            debounce_seconds: 2,
+            recursive: false,
+        });
+
+        db.upsert_agent(&cron_agent).unwrap();
+        db.upsert_agent(&watch_agent).unwrap();
+
+        let cron_agents = db.list_cron_agents().unwrap();
+        assert_eq!(cron_agents.len(), 1);
+        assert_eq!(cron_agents[0].id, "cron1");
+    }
+
+    #[test]
+    fn list_watch_agents() {
+        let db = test_db();
+        let mut cron_agent = sample_agent("cron1");
+        cron_agent.trigger = Some(Trigger::Cron {
+            schedule_expr: "0 9 * * *".to_string(),
+        });
+        let mut watch_agent = sample_agent("watch1");
+        watch_agent.trigger = Some(Trigger::Watch {
+            path: "/tmp".to_string(),
+            events: vec![WatchEvent::Create],
+            debounce_seconds: 2,
+            recursive: false,
+        });
+
+        db.upsert_agent(&cron_agent).unwrap();
+        db.upsert_agent(&watch_agent).unwrap();
+
+        let watch_agents = db.list_watch_agents().unwrap();
+        assert_eq!(watch_agents.len(), 1);
+        assert_eq!(watch_agents[0].id, "watch1");
+    }
+
+    #[test]
+    fn delete_agent() {
+        let db = test_db();
+        let agent = sample_agent("test-agent");
+        db.upsert_agent(&agent).unwrap();
+
+        let deleted = db.delete_agent("test-agent").unwrap();
+        assert!(deleted);
+
+        let retrieved = db.get_agent("test-agent").unwrap();
+        assert!(retrieved.is_none());
+    }
+
+    #[test]
+    fn delete_agent_not_found() {
+        let db = test_db();
+        let deleted = db.delete_agent("nonexistent").unwrap();
+        assert!(!deleted);
+    }
+
+    #[test]
+    fn update_agent_enabled() {
+        let db = test_db();
+        let agent = sample_agent("test-agent");
+        db.upsert_agent(&agent).unwrap();
+
+        db.update_agent_enabled("test-agent", false).unwrap();
+        let retrieved = db.get_agent("test-agent").unwrap().unwrap();
+        assert!(!retrieved.enabled);
+
+        db.update_agent_enabled("test-agent", true).unwrap();
+        let retrieved = db.get_agent("test-agent").unwrap().unwrap();
+        assert!(retrieved.enabled);
+    }
+
+    #[test]
+    fn update_agent_last_run() {
+        let db = test_db();
+        let agent = sample_agent("test-agent");
+        db.upsert_agent(&agent).unwrap();
+
+        db.update_agent_last_run("test-agent", true).unwrap();
+        let retrieved = db.get_agent("test-agent").unwrap().unwrap();
+        assert!(retrieved.last_run_at.is_some());
+        assert_eq!(retrieved.last_run_ok, Some(true));
+    }
+
+    #[test]
+    fn update_agent_triggered() {
+        let db = test_db();
+        let agent = sample_agent("test-agent");
+        db.upsert_agent(&agent).unwrap();
+
+        db.update_agent_triggered("test-agent").unwrap();
+        let retrieved = db.get_agent("test-agent").unwrap().unwrap();
+        assert_eq!(retrieved.trigger_count, 1);
+        assert!(retrieved.last_triggered_at.is_some());
+    }
+
+    #[test]
+    fn list_corrupt_agents_empty() {
+        let db = test_db();
+        let corrupt = db.list_corrupt_agents().unwrap();
+        assert!(corrupt.is_empty());
+    }
+
+    #[test]
+    fn rename_agent() {
+        let db = test_db();
+        let agent = sample_agent("old-id");
+        db.upsert_agent(&agent).unwrap();
+
+        db.rename_agent("old-id", "new-id", "/tmp/new-id.log")
+            .unwrap();
+
+        let old = db.get_agent("old-id").unwrap();
+        assert!(old.is_none());
+
+        let new = db.get_agent("new-id").unwrap().unwrap();
+        assert_eq!(new.id, "new-id");
+        assert_eq!(new.log_path, "/tmp/new-id.log");
+    }
+}
