@@ -189,4 +189,39 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn success_result_creates_success_call_tool_result() {
+        let result = success_result("Operation completed");
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(result.content.len(), 1);
+    }
+
+    #[test]
+    fn error_result_creates_error_call_tool_result() {
+        let result = error_result("Something went wrong");
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(result.content.len(), 1);
+    }
+
+    #[test]
+    fn filter_log_line_handles_malformed_timestamp() {
+        let since = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00+00:00").unwrap();
+        let malformed = "--- [event] at not-a-timestamp ---";
+        assert!(filter_log_line(malformed, &since));
+    }
+
+    #[test]
+    fn filter_log_line_handles_missing_at_marker() {
+        let since = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00+00:00").unwrap();
+        let no_at = "--- [event] without at marker ---";
+        assert!(filter_log_line(no_at, &since));
+    }
+
+    #[test]
+    fn filter_log_line_handles_missing_end_marker() {
+        let since = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00+00:00").unwrap();
+        let no_end = "--- [event] at 2024-01-01T12:00:00+00:00";
+        assert!(filter_log_line(no_end, &since));
+    }
 }

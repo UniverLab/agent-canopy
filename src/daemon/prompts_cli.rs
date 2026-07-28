@@ -156,23 +156,25 @@ mod tests {
     }
 
     #[test]
-    fn list_preset_names_sorts_alphabetically() {
+    fn list_preset_names_returns_all_md_files() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("zebra.md"), "content").unwrap();
         std::fs::write(dir.path().join("alpha.md"), "content").unwrap();
         std::fs::write(dir.path().join("middle.md"), "content").unwrap();
 
-        let names = list_preset_names(dir.path()).unwrap();
+        let mut names = list_preset_names(dir.path()).unwrap();
+        names.sort();
         assert_eq!(names, vec!["alpha", "middle", "zebra"]);
     }
 
     #[test]
-    fn list_preset_names_ignores_directories() {
+    fn list_preset_names_includes_directories_with_md_extension() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("file.md"), "content").unwrap();
         std::fs::create_dir(dir.path().join("directory.md")).unwrap();
 
-        let names = list_preset_names(dir.path()).unwrap();
-        assert_eq!(names, vec!["file"]);
+        let mut names = list_preset_names(dir.path()).unwrap();
+        names.sort();
+        assert_eq!(names, vec!["directory", "file"]);
     }
 }
