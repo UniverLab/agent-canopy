@@ -265,3 +265,101 @@ async fn unresolvable_cli_binary_does_not_leave_run_locked_forever() {
     assert_eq!(exit_code_2, -1);
     assert!(db.get_active_run(&agent.id).unwrap().is_none());
 }
+
+#[test]
+fn resolve_cli_binary_returns_path_for_known_binary() {
+    let cli = Cli::new("sh");
+    let result = super::resolve_cli_binary(&cli);
+    assert!(result.is_ok(), "sh should be resolvable");
+}
+
+#[test]
+fn resolve_cli_binary_returns_error_for_unknown_binary() {
+    let cli = Cli::new("definitely-not-a-real-binary-xyz-12345");
+    let result = super::resolve_cli_binary(&cli);
+    assert!(result.is_err(), "unknown binary should fail");
+}
+
+#[test]
+fn append_to_log_creates_file_and_writes_content() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("test.log");
+    let trigger = crate::domain::models::TriggerType::Manual;
+    let started_at = chrono::Utc::now();
+
+    let result = super::append_to_log(
+        log_path.to_str().unwrap(),
+        "test-agent",
+        &trigger,
+        &started_at,
+        0,
+        b"stdout content",
+        b"stderr content",
+    );
+    assert!(result.is_ok());
+    assert!(log_path.exists());
+
+    let content = std::fs::read_to_string(&log_path).unwrap();
+    assert!(content.contains("test-agent"));
+    assert!(content.contains("exit_code: 0"));
+    assert!(content.contains("stdout content"));
+    assert!(content.contains("stderr content"));
+}
+
+#[test]
+fn append_to_log_handles_empty_output() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("test.log");
+    let trigger = crate::domain::models::TriggerType::Scheduled;
+    let started_at = chrono::Utc::now();
+
+    let result = super::append_to_log(
+        log_path.to_str().unwrap(),
+        "test-agent",
+        &trigger,
+        &started_at,
+        0,
+        b"",
+        b"",
+    );
+    assert!(result.is_ok());
+    assert!(log_path.exists());
+}
+
+#[test]
+fn rotate_log_if_needed_does_nothing_for_small_file() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("test.log");
+    std::fs::write(&log_path, "small content").unwrap();
+
+    let result = super::rotate_log_if_needed(&log_path);
+    assert!(result.is_ok());
+    assert!(log_path.exists());
+    assert!(!dir.path().join("test.log.old").exists());
+}
+
+#[test]
+fn rotate_log_if_needed_rotates_large_file() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("test.log");
+    // Create a file larger than MAX_LOG_SIZE (10MB)
+    let large_content = "x".repeat(11 * 1024 * 1024); // 11MB
+    std::fs::write(&log_path, &large_content).unwrap();
+
+    let result = super::rotate_log_if_needed(&log_path);
+    assert!(result.is_ok());
+    assert!(!log_path.exists(), "original should be renamed");
+    assert!(
+        dir.path().join("test.log.old").exists(),
+        "rotated file should exist"
+    );
+}
+
+#[test]
+fn rotate_log_if_needed_handles_missing_file() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("nonexistent.log");
+
+    let result = super::rotate_log_if_needed(&log_path);
+    assert!(result.is_ok()); // Should succeed even if file doesn't exist
+}
