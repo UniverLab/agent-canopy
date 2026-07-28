@@ -1531,4 +1531,100 @@ mod tests {
         let lines = wrap_styled_content(styled, None, 40, Color::Black);
         assert_eq!(line_text(&lines[0]), "hello");
     }
+
+    /// active_send_shortcut_label returns keyboard-enhancement-dependent labels
+    #[test]
+    fn active_send_shortcut_label_with_enhancement() {
+        let (key, hint) = active_send_shortcut_label(true);
+        assert_eq!(key, "Shift+Enter ");
+        assert_eq!(hint, "send");
+    }
+
+    /// active_send_shortcut_label returns Ctrl+S when enhancement is off
+    #[test]
+    fn active_send_shortcut_label_without_enhancement() {
+        let (key, hint) = active_send_shortcut_label(false);
+        assert_eq!(key, "Ctrl+S ");
+        assert_eq!(hint, "send");
+    }
+
+    /// all_shortcut_hints always includes core shortcuts
+    #[test]
+    fn all_shortcut_hints_includes_core_shortcuts() {
+        let hints = all_shortcut_hints("Ctrl+S ", "send", false);
+        // Should have at least 8 entries (without scheduled)
+        assert!(hints.len() >= 8);
+        // Find key hints
+        let has_ctrl_s = hints.iter().any(|h| h.key.contains("Ctrl+S"));
+        let has_esc = hints.iter().any(|h| h.key.contains("Esc"));
+        assert!(has_ctrl_s, "should include Ctrl+S");
+        assert!(has_esc, "should include Esc");
+    }
+
+    /// all_shortcut_hints includes Ctrl+P only when has_scheduled is true
+    #[test]
+    fn all_shortcut_hints_ctrl_p_conditional() {
+        let without = all_shortcut_hints("Ctrl+S ", "send", false);
+        let with = all_shortcut_hints("Ctrl+S ", "send", true);
+
+        let without_ctrl_p = without.iter().any(|h| h.key.contains("Ctrl+P"));
+        let with_ctrl_p = with.iter().any(|h| h.key.contains("Ctrl+P"));
+
+        assert!(
+            !without_ctrl_p,
+            "should not have Ctrl+P when has_scheduled=false"
+        );
+        assert!(with_ctrl_p, "should have Ctrl+P when has_scheduled=true");
+    }
+
+    /// all_shortcut_hints uses provided send_label and send_hint
+    #[test]
+    fn all_shortcut_hints_uses_provided_labels() {
+        let hints = all_shortcut_hints("Custom ", "action", false);
+        let send_hint = hints
+            .iter()
+            .find(|h| h.key == "Custom ")
+            .expect("should have custom send key");
+        assert_eq!(send_hint.desc, "action  ");
+    }
+
+    /// select_shortcut_hints keeps core hints even when narrow
+    #[test]
+    fn select_shortcut_hints_keeps_core_shortcuts() {
+        // Very narrow width should still keep send and hide
+        let hints = select_shortcut_hints(5, "Ctrl+S ", "send", false);
+        let priorities: Vec<_> = hints.iter().map(|h| h.priority).collect();
+        // Should still have priorities 1 and 2 (send and hide)
+        assert!(priorities.contains(&1), "should keep send (priority 1)");
+        assert!(priorities.contains(&2), "should keep hide (priority 2)");
+    }
+
+    /// select_shortcut_hints returns all hints when width is large
+    #[test]
+    fn select_shortcut_hints_all_fit_when_wide() {
+        let all = all_shortcut_hints("Ctrl+S ", "send", true);
+        let selected = select_shortcut_hints(500, "Ctrl+S ", "send", true);
+        assert_eq!(
+            selected.len(),
+            all.len(),
+            "all hints should fit when width=500"
+        );
+    }
+
+    /// all_shortcut_hints priorities are maintained
+    #[test]
+    fn all_shortcut_hints_have_valid_priorities() {
+        let hints = all_shortcut_hints("Ctrl+S ", "send", true);
+        for hint in &hints {
+            // Priority 1 and 2 are reserved for send/hide
+            // Others should be 3+
+            assert!(hint.priority > 0, "all priorities should be positive");
+        }
+        // Send should have priority 1
+        let send = hints.iter().find(|h| h.key.contains("Ctrl+S"));
+        assert_eq!(send.map(|h| h.priority), Some(1));
+        // Hide should have priority 2
+        let hide = hints.iter().find(|h| h.key.contains("Esc"));
+        assert_eq!(hide.map(|h| h.priority), Some(2));
+    }
 }
