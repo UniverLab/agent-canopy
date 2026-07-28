@@ -155,7 +155,7 @@ mod tests {
         let mut rng = Rng::from_instant(Instant::now());
         for _ in 0..100 {
             let val = rng.between(10, 20);
-            assert!(val >= 10 && val <= 20, "between(10,20) returned {val}");
+            assert!((10..=20).contains(&val), "between(10,20) returned {val}");
         }
     }
 
