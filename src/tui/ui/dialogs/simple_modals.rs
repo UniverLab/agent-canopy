@@ -1,33 +1,41 @@
 use ratatui::layout::{Alignment, Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
-use super::{centered_rect, draw_dialog_left_wave, ACCENT, DIM};
+use super::{centered_rect, draw_dialog_left_wave};
 use crate::tui::app::types::App;
+use crate::tui::ui::theme::Theme;
 
-pub fn draw_quit_confirm(frame: &mut Frame) {
-    draw_modal_confirm(frame, " Quit? ", "Press y/Enter to quit, any key to cancel");
+pub fn draw_quit_confirm(frame: &mut Frame, theme: &Theme) {
+    draw_modal_confirm(
+        frame,
+        " Quit? ",
+        "Press y/Enter to quit, any key to cancel",
+        theme,
+    );
 }
 
-pub fn draw_delete_project_confirm(frame: &mut Frame) {
+pub fn draw_delete_project_confirm(frame: &mut Frame, theme: &Theme) {
     draw_modal_confirm(
         frame,
         " Delete Project? ",
         "Are you sure you want to delete this project?\nY/Enter = Confirm  N/Esc = Cancel",
+        theme,
     );
 }
 
-pub fn draw_delete_workflow_confirm(frame: &mut Frame) {
+pub fn draw_delete_loop_confirm(frame: &mut Frame, theme: &Theme) {
     draw_modal_confirm(
         frame,
-        " Delete Workflow? ",
-        "Are you sure you want to delete this workflow?\nY/Enter = Confirm  N/Esc = Cancel",
+        " Delete Loop? ",
+        "Are you sure you want to delete this loop?\nY/Enter = Confirm  N/Esc = Cancel",
+        theme,
     );
 }
 
-fn draw_modal_confirm(frame: &mut Frame, title: &str, text: &str) {
+fn draw_modal_confirm(frame: &mut Frame, title: &str, text: &str, theme: &Theme) {
     let dialog_width = frame.area().width * 40 / 100;
     let inner_width = dialog_width.saturating_sub(2).max(1);
     let chars_per_line = inner_width as usize;
@@ -42,14 +50,14 @@ fn draw_modal_confirm(frame: &mut Frame, title: &str, text: &str) {
 
     let block = Block::default()
         .title(title)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .borders(crate::tui::ui::borders_for(theme))
+        .border_style(Style::default().fg(theme.header_color))
         .style(Style::default().bg(Color::Rgb(15, 25, 15)));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let msg = Paragraph::new(text)
-        .style(Style::default().fg(ACCENT))
+        .style(Style::default().fg(theme.header_color))
         .alignment(ratatui::layout::Alignment::Center)
         .wrap(ratatui::widgets::Wrap { trim: true });
     frame.render_widget(msg, inner);
@@ -74,7 +82,7 @@ fn category_label(category: &crate::domain::gamification::MissionCategory) -> &'
         MissionCategory::Environment => "Environment",
         MissionCategory::Intelligence => "Intelligence",
         MissionCategory::Projects => "Projects",
-        MissionCategory::Workflow => "Workflow",
+        MissionCategory::Loop => "Loop",
         MissionCategory::Seeds => "Seeds",
         MissionCategory::SysInfo => "System",
     }
@@ -91,14 +99,371 @@ fn mission_unlock_text(
     )
 }
 
-pub fn draw_legend(frame: &mut Frame, app: &mut App) {
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+    use crate::domain::gamification::MissionCategory;
+
+    #[test]
+    fn format_uptime_precise_seconds_only() {
+        assert_eq!(format_uptime_precise(0), "0s");
+        assert_eq!(format_uptime_precise(59), "59s");
+        assert_eq!(format_uptime_precise(1), "1s");
+    }
+
+    #[test]
+    fn format_uptime_precise_minutes_and_seconds() {
+        assert_eq!(format_uptime_precise(60), "1m 0s");
+        assert_eq!(format_uptime_precise(125), "2m 5s");
+        assert_eq!(format_uptime_precise(3599), "59m 59s");
+    }
+
+    #[test]
+    fn format_uptime_precise_hours_minutes_seconds() {
+        assert_eq!(format_uptime_precise(3600), "1h 0m 0s");
+        assert_eq!(format_uptime_precise(3661), "1h 1m 1s");
+        assert_eq!(format_uptime_precise(86399), "23h 59m 59s");
+    }
+
+    #[test]
+    fn format_uptime_precise_days_hours_minutes() {
+        assert_eq!(format_uptime_precise(86400), "1d 0h 0m 0s");
+        assert_eq!(format_uptime_precise(90061), "1d 1h 1m 1s");
+        assert_eq!(format_uptime_precise(172800), "2d 0h 0m 0s");
+    }
+
+    #[test]
+    fn format_uptime_precise_large_values() {
+        assert_eq!(format_uptime_precise(86400 * 365), "365d 0h 0m 0s");
+        assert_eq!(
+            format_uptime_precise(86400 * 365 + 3600 + 61),
+            "365d 1h 1m 1s"
+        );
+    }
+
+    #[test]
+    fn format_uptime_precise_boundary_59_minutes() {
+        assert_eq!(format_uptime_precise(3540), "59m 0s");
+    }
+
+    #[test]
+    fn category_label_all_variants() {
+        assert_eq!(category_label(&MissionCategory::Environment), "Environment");
+        assert_eq!(
+            category_label(&MissionCategory::Intelligence),
+            "Intelligence"
+        );
+        assert_eq!(category_label(&MissionCategory::Projects), "Projects");
+        assert_eq!(category_label(&MissionCategory::Loop), "Loop");
+        assert_eq!(category_label(&MissionCategory::Seeds), "Seeds");
+        assert_eq!(category_label(&MissionCategory::SysInfo), "System");
+    }
+
+    #[test]
+    fn mission_unlock_text_formats_correctly() {
+        let result = mission_unlock_text("🏆", "First Login", &MissionCategory::Seeds);
+        assert_eq!(result, "Unlocked medal 🏆 First Login in Seeds.");
+    }
+
+    #[test]
+    fn mission_unlock_text_different_category() {
+        let result = mission_unlock_text("⭐", "Code Master", &MissionCategory::Intelligence);
+        assert_eq!(result, "Unlocked medal ⭐ Code Master in Intelligence.");
+    }
+
+    #[test]
+    fn mission_unlock_text_empty_strings() {
+        let result = mission_unlock_text("", "", &MissionCategory::Environment);
+        assert_eq!(result, "Unlocked medal   in Environment.");
+    }
+
+    #[test]
+    fn mission_unlock_text_all_categories() {
+        for cat in &[
+            MissionCategory::Environment,
+            MissionCategory::Intelligence,
+            MissionCategory::Projects,
+            MissionCategory::Loop,
+            MissionCategory::Seeds,
+            MissionCategory::SysInfo,
+        ] {
+            let result = mission_unlock_text("i", "t", cat);
+            assert!(result.starts_with("Unlocked medal i t in "));
+            assert!(result.ends_with("."));
+        }
+    }
+
+    #[test]
+    fn draw_quit_confirm_renders_without_panic() {
+        use crate::db::Database;
+        use crate::tui::app::types::App;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::sync::Arc;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let _app = App::new(db, data_dir.path()).unwrap();
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::classic();
+        terminal
+            .draw(|frame| {
+                draw_quit_confirm(frame, &theme);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn draw_delete_project_confirm_renders_without_panic() {
+        use crate::db::Database;
+        use crate::tui::app::types::App;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::sync::Arc;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let _app = App::new(db, data_dir.path()).unwrap();
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::classic();
+        terminal
+            .draw(|frame| {
+                draw_delete_project_confirm(frame, &theme);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn draw_delete_loop_confirm_renders_without_panic() {
+        use crate::db::Database;
+        use crate::tui::app::types::App;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::sync::Arc;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let _app = App::new(db, data_dir.path()).unwrap();
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::classic();
+        terminal
+            .draw(|frame| {
+                draw_delete_loop_confirm(frame, &theme);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn draw_modal_confirm_narrow_width() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(30, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::classic();
+        terminal
+            .draw(|frame| {
+                draw_modal_confirm(frame, " Title ", "Short text", &theme);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn draw_modal_confirm_very_narrow_width() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(10, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::classic();
+        terminal
+            .draw(|frame| {
+                draw_modal_confirm(frame, " Title ", "Text", &theme);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn draw_modal_confirm_long_text_wraps() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(40, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::classic();
+        let long_text =
+            "This is a very long text that should wrap across multiple lines in the dialog box";
+        terminal
+            .draw(|frame| {
+                draw_modal_confirm(frame, " Title ", long_text, &theme);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(text.contains("Title"), "Should show title: {text}");
+    }
+
+    #[test]
+    fn draw_modal_confirm_multiline_text() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(40, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::classic();
+        terminal
+            .draw(|frame| {
+                draw_modal_confirm(frame, " Title ", "Line 1\nLine 2\nLine 3", &theme);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn format_uptime_precise_one_second() {
+        assert_eq!(format_uptime_precise(1), "1s");
+    }
+
+    #[test]
+    fn format_uptime_precise_boundary_one_hour() {
+        assert_eq!(format_uptime_precise(3600), "1h 0m 0s");
+    }
+
+    #[test]
+    fn format_uptime_precise_boundary_one_day() {
+        assert_eq!(format_uptime_precise(86400), "1d 0h 0m 0s");
+    }
+
+    #[test]
+    fn category_label_returns_correct_string_for_each_variant() {
+        assert_eq!(category_label(&MissionCategory::Environment), "Environment");
+        assert_eq!(category_label(&MissionCategory::Loop), "Loop");
+    }
+
+    #[test]
+    fn mission_unlock_text_with_empty_icon() {
+        let result = mission_unlock_text("", "Title", &MissionCategory::Seeds);
+        assert!(result.contains("Title"));
+        assert!(result.contains("Seeds"));
+    }
+
+    #[test]
+    fn draw_legend_renders_without_panic() {
+        use crate::db::Database;
+        use crate::tui::app::types::App;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::sync::Arc;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(db, data_dir.path()).unwrap();
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::classic();
+        terminal
+            .draw(|frame| {
+                draw_legend(frame, &mut app, &theme);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn draw_legend_with_zero_missions() {
+        use crate::db::Database;
+        use crate::tui::app::types::App;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::sync::Arc;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(db, data_dir.path()).unwrap();
+        app.legend_selected = 0;
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::classic();
+        terminal
+            .draw(|frame| {
+                draw_legend(frame, &mut app, &theme);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(
+            text.contains("Missions"),
+            "Should show Missions title: {text}"
+        );
+    }
+
+    #[test]
+    fn draw_quit_confirm_shows_quit_text() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::classic();
+        terminal
+            .draw(|frame| {
+                draw_quit_confirm(frame, &theme);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(text.contains("Quit"), "Should show Quit: {text}");
+    }
+}
+
+pub fn draw_legend(frame: &mut Frame, app: &mut App, theme: &Theme) {
     use crate::domain::gamification::{MissionCategory, MISSIONS};
 
-    let label_style = Style::default().fg(DIM);
+    let label_style = Style::default().fg(theme.dim_text);
     let value_style = Style::default()
         .fg(Color::White)
         .add_modifier(Modifier::BOLD);
-    let accent_style = Style::default().fg(ACCENT);
+    let accent_style = Style::default().fg(theme.header_color);
 
     let session_uptime = format_uptime_precise(app.process_start_time.elapsed().as_secs());
     let canopy_uptime = format_uptime_precise(app.accumulated_uptime_secs());
@@ -137,8 +502,8 @@ pub fn draw_legend(frame: &mut Frame, app: &mut App) {
 
     let block = Block::default()
         .title(" Canopy Missions ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .borders(crate::tui::ui::borders_for(theme))
+        .border_style(Style::default().fg(theme.header_color))
         .style(Style::default().bg(Color::Rgb(12, 20, 12)));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -148,7 +513,7 @@ pub fn draw_legend(frame: &mut Frame, app: &mut App) {
             MissionCategory::Environment => Color::Rgb(100, 220, 100),
             MissionCategory::Intelligence => Color::Rgb(100, 180, 255),
             MissionCategory::Projects => Color::Rgb(255, 200, 80),
-            MissionCategory::Workflow => Color::Rgb(220, 120, 255),
+            MissionCategory::Loop => Color::Rgb(220, 120, 255),
             MissionCategory::Seeds => Color::Rgb(80, 220, 180),
             MissionCategory::SysInfo => Color::Rgb(255, 130, 80),
         }
@@ -240,7 +605,7 @@ pub fn draw_legend(frame: &mut Frame, app: &mut App) {
                 Style::default().fg(Color::Rgb(200, 200, 200))
             };
             mission_lines.push(Line::from(vec![
-                Span::styled(marker, Style::default().fg(ACCENT)),
+                Span::styled(marker, Style::default().fg(theme.header_color)),
                 Span::raw(" "),
                 Span::styled(
                     def.icon,

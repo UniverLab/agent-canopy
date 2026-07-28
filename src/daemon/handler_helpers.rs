@@ -276,6 +276,7 @@ pub(crate) fn new_agent_base(
         model,
         working_dir,
         enabled: true,
+        enable_at: None,
         created_at: Utc::now(),
         log_path,
         timeout_minutes: timeout_minutes.unwrap_or(15),
@@ -434,6 +435,7 @@ mod tests {
     fn watcher_restart_needed_true() {
         let mut params = TaskUpdateParams {
             id: "test".to_string(),
+            new_id: None,
             prompt: None,
             cli: None,
             model: None,
@@ -445,6 +447,7 @@ mod tests {
             debounce_seconds: None,
             recursive: None,
             enabled: None,
+            notify_on_success: None,
         };
         assert!(!watcher_restart_needed(&params));
 
@@ -524,6 +527,7 @@ mod tests {
             model: None,
             working_dir: None,
             enabled: true,
+            enable_at: None,
             created_at: Utc::now(),
             log_path: "/tmp/test.log".to_string(),
             timeout_minutes: 15,
@@ -536,6 +540,7 @@ mod tests {
 
         let params = TaskUpdateParams {
             id: "test".to_string(),
+            new_id: None,
             prompt: Some("new prompt".to_string()),
             cli: None,
             model: None,
@@ -547,6 +552,7 @@ mod tests {
             debounce_seconds: None,
             recursive: None,
             enabled: None,
+            notify_on_success: None,
         };
 
         apply_scalar_updates(&mut agent, &params).unwrap();
@@ -563,6 +569,7 @@ mod tests {
             model: None,
             working_dir: None,
             enabled: true,
+            enable_at: None,
             created_at: Utc::now(),
             log_path: "/tmp/test.log".to_string(),
             timeout_minutes: 15,
@@ -575,6 +582,7 @@ mod tests {
 
         let params = TaskUpdateParams {
             id: "test".to_string(),
+            new_id: None,
             prompt: None,
             cli: None,
             model: None,
@@ -586,6 +594,7 @@ mod tests {
             debounce_seconds: None,
             recursive: None,
             enabled: Some(false),
+            notify_on_success: None,
         };
 
         apply_scalar_updates(&mut agent, &params).unwrap();
@@ -602,6 +611,7 @@ mod tests {
             model: Some("model-1".to_string()),
             working_dir: Some("/original".to_string()),
             enabled: true,
+            enable_at: None,
             created_at: Utc::now(),
             log_path: "/tmp/test.log".to_string(),
             timeout_minutes: 15,
@@ -614,6 +624,7 @@ mod tests {
 
         let params = TaskUpdateParams {
             id: "test".to_string(),
+            new_id: None,
             prompt: None,
             cli: None,
             model: None,
@@ -625,6 +636,7 @@ mod tests {
             debounce_seconds: None,
             recursive: None,
             enabled: None,
+            notify_on_success: None,
         };
 
         apply_scalar_updates(&mut agent, &params).unwrap();
@@ -762,5 +774,107 @@ mod tests {
 
         let result = prepare_watch_task(&params);
         assert!(result.is_err());
+    }
+
+    /// Regression test for T22: `agent_update` on a cron agent with a
+    /// schedule containing `*` (e.g. "30 * * * *") must apply cleanly.
+    /// Uses the real `crate::scheduler::validate_cron` validator, matching
+    /// the scheduler module's own tests for `*`-bearing expressions.
+    #[test]
+    fn apply_trigger_updates_cron_schedule_with_asterisks() {
+        let mut agent = Agent {
+            id: "cron-agent".to_string(),
+            prompt: "run".to_string(),
+            trigger: Some(Trigger::Cron {
+                schedule_expr: "0 9 * * *".to_string(),
+            }),
+            cli: Cli::new("opencode"),
+            model: None,
+            working_dir: None,
+            enabled: true,
+            enable_at: None,
+            created_at: Utc::now(),
+            log_path: "/tmp/test.log".to_string(),
+            timeout_minutes: 15,
+            expires_at: None,
+            last_run_at: None,
+            last_run_ok: None,
+            last_triggered_at: None,
+            trigger_count: 0,
+        };
+
+        let params = TaskUpdateParams {
+            id: "cron-agent".to_string(),
+            new_id: None,
+            prompt: None,
+            cli: None,
+            model: None,
+            schedule: Some("30 * * * *".to_string()),
+            working_dir: None,
+            duration_minutes: None,
+            path: None,
+            events: None,
+            debounce_seconds: None,
+            recursive: None,
+            enabled: None,
+            notify_on_success: None,
+        };
+
+        let result = apply_trigger_updates(&mut agent, &params, &crate::scheduler::validate_cron);
+        assert!(result.is_ok());
+        match agent.trigger {
+            Some(Trigger::Cron { schedule_expr }) => {
+                assert_eq!(schedule_expr, "30 * * * *");
+            }
+            other => panic!("expected Trigger::Cron, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_cron_schedule_valid() {
+        let result = validate_cron_schedule("0 9 * * *", &crate::scheduler::validate_cron, |s| {
+            format!("Invalid: {}", s)
+        });
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_cron_schedule_invalid() {
+        let result = validate_cron_schedule("invalid", &crate::scheduler::validate_cron, |s| {
+            format!("Invalid: {}", s)
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_cron_schedule_empty() {
+        let result = validate_cron_schedule("", &crate::scheduler::validate_cron, |s| {
+            format!("Invalid: {}", s)
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_effective_project_hash_with_explicit_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let result = resolve_effective_project_hash(&db, Some("explicit-hash"), "test-agent");
+        assert_eq!(result, Some("explicit-hash".to_string()));
+    }
+
+    #[test]
+    fn resolve_effective_project_hash_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let result = resolve_effective_project_hash(&db, None, "test-agent");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_effective_project_hash_explicit_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let result = resolve_effective_project_hash(&db, Some("explicit"), "test-agent");
+        assert_eq!(result, Some("explicit".to_string()));
     }
 }

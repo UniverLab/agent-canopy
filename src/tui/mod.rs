@@ -8,9 +8,11 @@ mod agent;
 mod app;
 mod atmosphere;
 mod brians_brain;
+mod clipboard;
 pub(crate) mod context_transfer;
 mod event;
 mod gamification;
+pub(crate) mod mcp_client;
 pub(crate) mod prompt_templates;
 pub(crate) mod terminal_history;
 mod ui;
@@ -20,9 +22,15 @@ pub(crate) use ui::truncate_str_keep_tail;
 
 use anyhow::{Context, Result};
 use ratatui::crossterm::{
-    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
+        LeaveAlternateScreen,
+    },
 };
 use std::io;
 use std::sync::Arc;
@@ -60,10 +68,19 @@ pub fn run_tui() -> Result<()> {
     let db = Arc::new(Database::new(&db_path).context("Failed to open database")?);
     let mut app = App::new(Arc::clone(&db), &data_dir)?;
 
+    // Reap bridge sidecars whose owning process died without cleaning up
+    app.reconcile_bridge_sessions();
     // Auto-resume previously active interactive sessions
     app.auto_resume_sessions();
+    // Load orphaned sessions for TUI visibility
+    if let Ok(orphaned) = app.db.get_orphaned_sessions() {
+        app.orphaned_sessions = orphaned;
+    }
     // Auto-resume previously active terminal sessions
     app.auto_resume_terminal_sessions();
+    // Now that sessions are resumed (and their schedules reassigned), open the
+    // scheduled-send delivery gate and drop schedules whose session is gone.
+    app.restore_scheduled_sends();
 
     // Setup terminal
     enable_raw_mode()?;
@@ -74,6 +91,18 @@ pub fn run_tui() -> Result<()> {
         EnableMouseCapture,
         EnableBracketedPaste
     )?;
+
+    // Enable Kitty keyboard enhancement if supported — allows Shift+Enter
+    // disambiguation. Where unsupported, Ctrl+S remains the fallback send key.
+    let ke_supported = supports_keyboard_enhancement().unwrap_or(false);
+    if ke_supported {
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
+    app.keyboard_enhancement_active = ke_supported;
+
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
 
@@ -82,6 +111,9 @@ pub fn run_tui() -> Result<()> {
 
     // Restore terminal — always, even on error
     disable_raw_mode()?;
+    if ke_supported {
+        execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags)?;
+    }
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,

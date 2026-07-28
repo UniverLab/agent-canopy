@@ -51,6 +51,44 @@ pub struct PromptEntry {
 const MAX_PROMPT_HISTORY: usize = 20;
 const VT_SCROLLBACK_LINES: usize = 5_000;
 
+/// How recently a session must have produced PTY output to count as
+/// "working" (blinking green) rather than merely "healthy but idle" (solid
+/// green) in the status color. Blue is reserved for background agents; see
+/// `session_status_color` in `ui/sidebar.rs`. Kept short enough that the
+/// color reacts within one interaction, long enough to survive brief pauses
+/// between output chunks so a steadily streaming session doesn't flicker.
+pub(crate) const ACTIVITY_IDLE_THRESHOLD_MS: i64 = 12_000;
+
+/// vt100 callbacks that mirror a PTY program's OSC 52 clipboard writes to the
+/// host system clipboard. Without this the parser silently drops OSC 52, so a
+/// harness (Claude Code, opencode, …) reports "copied" but nothing reaches the
+/// real clipboard.
+#[derive(Default)]
+pub(crate) struct ClipboardForwarder;
+
+impl vt100::Callbacks for ClipboardForwarder {
+    fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, _ty: &[u8], data: &[u8]) {
+        let Some(text) = decode_osc52_payload(data) else {
+            return;
+        };
+        // Set off-thread so clipboard I/O never blocks the held vt parser lock.
+        std::thread::spawn(move || crate::tui::clipboard::set_text(&text));
+    }
+}
+
+/// Decode an OSC 52 base64 payload into UTF-8 text, tolerating missing padding.
+fn decode_osc52_payload(data: &[u8]) -> Option<String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(data))
+        .ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// vt100 parser wired with our clipboard-forwarding callbacks.
+pub(crate) type Vt = vt100::Parser<ClipboardForwarder>;
+
 fn apply_canopy_session_env(
     cmd: &mut CommandBuilder,
     agent_id: &str,
@@ -93,7 +131,7 @@ pub struct InteractiveAgent {
     /// PTY writer — send bytes to the agent's stdin.
     pub(crate) writer: Arc<Mutex<Box<dyn Write + Send>>>,
     /// Virtual terminal screen — fed by PTY output (for live rendering with colors).
-    pub(crate) vt: Arc<Mutex<vt100::Parser>>,
+    pub(crate) vt: Arc<Mutex<Vt>>,
     /// Child process handle.
     pub(crate) child: Arc<Mutex<Box<dyn portable_pty::Child + Send>>>,
     /// PTY master — needed for resize.
@@ -109,6 +147,10 @@ pub struct InteractiveAgent {
     pub input_buffer: Arc<Mutex<String>>,
     /// Tracks when the PTY last received output (for detecting idle/waiting state).
     pub(crate) last_output_at: Arc<Mutex<DateTime<Utc>>>,
+    /// Output arriving before this instant does not count as activity (B21):
+    /// a PTY resize (entering a section, layout change) makes every TUI app
+    /// repaint, and that repaint burst must not light up the activity pulse.
+    pub(crate) activity_suppressed_until: Arc<Mutex<DateTime<Utc>>>,
     /// Tracks when the user last viewed/focused this agent.
     last_viewed_at: Arc<Mutex<DateTime<Utc>>>,
     /// Whether the exit notification has already been sent (avoids repeats).
@@ -216,15 +258,18 @@ impl InteractiveAgent {
         let mut reader = pair.master.try_clone_reader()?;
         let master = pair.master;
 
-        let vt = Arc::new(Mutex::new(vt100::Parser::new(
+        let vt = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
             rows,
             cols,
             VT_SCROLLBACK_LINES,
+            ClipboardForwarder,
         )));
         let vt_clone = Arc::clone(&vt);
 
         let last_output_at = Arc::new(Mutex::new(Utc::now()));
         let last_output_at_clone = Arc::clone(&last_output_at);
+        let activity_suppressed_until = Arc::new(Mutex::new(Utc::now()));
+        let suppressed_until_clone = Arc::clone(&activity_suppressed_until);
 
         // Background thread: read PTY output → feed into vt100 parser
         std::thread::spawn(move || {
@@ -236,9 +281,18 @@ impl InteractiveAgent {
                         if let Ok(mut parser) = vt_clone.lock() {
                             parser.process(&tmp[..n]);
                         }
-                        // Stamp last output time so is_waiting_for_input() can detect idle
-                        if let Ok(mut t) = last_output_at_clone.lock() {
-                            *t = Utc::now();
+                        // Stamp last output time so is_waiting_for_input()
+                        // can detect idle — unless this output falls inside a
+                        // post-resize suppression window (a repaint, not real
+                        // activity — B21).
+                        let suppressed = suppressed_until_clone
+                            .lock()
+                            .map(|until| Utc::now() < *until)
+                            .unwrap_or(false);
+                        if !suppressed {
+                            if let Ok(mut t) = last_output_at_clone.lock() {
+                                *t = Utc::now();
+                            }
                         }
                     }
                 }
@@ -267,6 +321,7 @@ impl InteractiveAgent {
             prompt_history: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_PROMPT_HISTORY))),
             input_buffer: Arc::new(Mutex::new(String::new())),
             last_output_at,
+            activity_suppressed_until,
             last_viewed_at: Arc::new(Mutex::new(Utc::now())),
             exit_notified: false,
             warp_mode: false,
@@ -320,15 +375,18 @@ impl InteractiveAgent {
         let mut reader = pair.master.try_clone_reader()?;
         let master = pair.master;
 
-        let vt = Arc::new(Mutex::new(vt100::Parser::new(
+        let vt = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
             rows,
             cols,
             VT_SCROLLBACK_LINES,
+            ClipboardForwarder,
         )));
         let vt_clone = Arc::clone(&vt);
 
         let last_output_at = Arc::new(Mutex::new(Utc::now()));
         let last_output_at_clone = Arc::clone(&last_output_at);
+        let activity_suppressed_until = Arc::new(Mutex::new(Utc::now()));
+        let suppressed_until_clone = Arc::clone(&activity_suppressed_until);
 
         std::thread::spawn(move || {
             let mut tmp = [0u8; 4096];
@@ -339,8 +397,16 @@ impl InteractiveAgent {
                         if let Ok(mut parser) = vt_clone.lock() {
                             parser.process(&tmp[..n]);
                         }
-                        if let Ok(mut t) = last_output_at_clone.lock() {
-                            *t = Utc::now();
+                        // See the sibling reader thread above: repaint bursts
+                        // inside a post-resize window are not activity (B21).
+                        let suppressed = suppressed_until_clone
+                            .lock()
+                            .map(|until| Utc::now() < *until)
+                            .unwrap_or(false);
+                        if !suppressed {
+                            if let Ok(mut t) = last_output_at_clone.lock() {
+                                *t = Utc::now();
+                            }
                         }
                     }
                 }
@@ -371,6 +437,7 @@ impl InteractiveAgent {
             prompt_history: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_PROMPT_HISTORY))),
             input_buffer: Arc::new(Mutex::new(String::new())),
             last_output_at,
+            activity_suppressed_until,
             last_viewed_at: Arc::new(Mutex::new(Utc::now())),
             exit_notified: false,
             warp_mode: true,
@@ -386,6 +453,15 @@ impl InteractiveAgent {
         if let Ok(mut t) = self.last_viewed_at.lock() {
             *t = Utc::now();
         }
+    }
+
+    /// The OS process id of the underlying CLI child, if the PTY exposes it.
+    pub fn pid(&self) -> Option<i64> {
+        self.child
+            .lock()
+            .ok()
+            .and_then(|c| c.process_id())
+            .map(|p| p as i64)
     }
 
     /// Send raw bytes to the agent's PTY stdin.
@@ -442,6 +518,12 @@ impl InteractiveAgent {
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.last_pty_cols = cols;
         self.last_pty_rows = rows;
+        // A resize makes the app repaint; that output burst is not activity.
+        // Suppress activity stamping briefly so switching sections doesn't
+        // light up every session's pulse (B21).
+        if let Ok(mut until) = self.activity_suppressed_until.lock() {
+            *until = Utc::now() + chrono::Duration::seconds(1);
+        }
         // Resize the actual PTY so the process knows about the new size
         if let Ok(m) = self.master.lock() {
             let _ = m.resize(PtySize {
@@ -465,3 +547,34 @@ impl InteractiveAgent {
 
 pub use pty::key_to_bytes;
 pub use screen::ScreenSnapshot;
+
+#[cfg(test)]
+mod tests {
+    use super::decode_osc52_payload;
+    use base64::Engine as _;
+
+    #[test]
+    fn decodes_padded_osc52_payload() {
+        let encoded = base64::engine::general_purpose::STANDARD.encode("hello world");
+        assert_eq!(
+            decode_osc52_payload(encoded.as_bytes()).as_deref(),
+            Some("hello world")
+        );
+    }
+
+    #[test]
+    fn decodes_unpadded_osc52_payload() {
+        // Some emitters strip the `=` padding; we must still decode it.
+        let unpadded = base64::engine::general_purpose::STANDARD_NO_PAD.encode("multi\nline");
+        assert!(!unpadded.ends_with('='));
+        assert_eq!(
+            decode_osc52_payload(unpadded.as_bytes()).as_deref(),
+            Some("multi\nline")
+        );
+    }
+
+    #[test]
+    fn rejects_non_base64_payload() {
+        assert_eq!(decode_osc52_payload(b"!!! not base64 !!!"), None);
+    }
+}

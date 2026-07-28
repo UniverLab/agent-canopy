@@ -215,34 +215,50 @@ impl Database {
         kind: Option<&str>,
         limit: usize,
     ) -> Result<Vec<IntelligenceNodeRecord>> {
-        let query = query.trim();
-        if query.is_empty() {
+        let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+        if terms.is_empty() {
             return Ok(Vec::new());
         }
 
-        let needle = query.to_lowercase();
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
-        let mut stmt = conn.prepare(
+
+        // ?1 is reserved for kind and the final placeholder is the limit; each
+        // term gets its own placeholder in between, reused across all indexed
+        // fields so terms are ANDed together and fields are ORed.
+        let term_clauses: Vec<String> = (0..terms.len())
+            .map(|i| {
+                let p = i + 2;
+                format!(
+                    "(instr(lower(id), ?{p}) > 0 OR instr(lower(kind), ?{p}) > 0 OR \
+                     instr(lower(title), ?{p}) > 0 OR instr(lower(body), ?{p}) > 0 OR \
+                     instr(lower(coalesce(metadata, '')), ?{p}) > 0)"
+                )
+            })
+            .collect();
+        let limit_placeholder = terms.len() + 2;
+        let sql = format!(
             "SELECT id, kind, title, body, metadata, project_hash, session_id, created_at, updated_at
              FROM intelligence_nodes
-             WHERE (?2 IS NULL OR kind = ?2)
-               AND (
-                   instr(lower(id), ?1) > 0 OR
-                   instr(lower(kind), ?1) > 0 OR
-                   instr(lower(title), ?1) > 0 OR
-                   instr(lower(body), ?1) > 0 OR
-                   instr(lower(coalesce(metadata, '')), ?1) > 0
-               )
+             WHERE (?1 IS NULL OR kind = ?1)
+               AND {}
              ORDER BY updated_at DESC
-             LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(
-            rusqlite::params![needle, kind, limit as i64],
-            Self::read_intelligence_node,
-        )?;
+             LIMIT ?{limit_placeholder}",
+            term_clauses.join(" AND ")
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(terms.len() + 2);
+        params.push(Box::new(kind.map(str::to_string)));
+        for term in &terms {
+            params.push(Box::new(term.clone()));
+        }
+        params.push(Box::new(limit as i64));
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(Box::as_ref).collect();
+
+        let rows = stmt.query_map(param_refs.as_slice(), Self::read_intelligence_node)?;
         Ok(rows.filter_map(|row| row.ok()).collect())
     }
 
@@ -652,5 +668,115 @@ impl Database {
             },
         )?;
         Ok(rows.filter_map(|row| row.ok()).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn test_db() -> Database {
+        let dir = tempdir().unwrap();
+        Database::new(&dir.path().join("test.db")).unwrap()
+    }
+
+    fn sample_node_input(id: &str) -> IntelligenceNodeInput {
+        IntelligenceNodeInput {
+            id: Some(id.to_string()),
+            kind: "fact".to_string(),
+            title: format!("Node {id}"),
+            body: "Test body".to_string(),
+            project_hash: Some("proj1".to_string()),
+            session_id: None,
+            metadata: None,
+            relations: None,
+        }
+    }
+
+    #[test]
+    fn upsert_and_get_intelligence_node() {
+        let db = test_db();
+        let input = sample_node_input("node1");
+        db.upsert_intelligence_node(input).unwrap();
+
+        let retrieved = db.get_intelligence_node("node1").unwrap();
+        assert!(retrieved.is_some());
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.id, "node1");
+        assert_eq!(retrieved.title, "Node node1");
+    }
+
+    #[test]
+    fn get_intelligence_node_not_found() {
+        let db = test_db();
+        let result = db.get_intelligence_node("nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn list_intelligence_nodes_empty() {
+        let db = test_db();
+        let nodes = db.list_intelligence_nodes(None, 100).unwrap();
+        assert!(nodes.is_empty());
+    }
+
+    #[test]
+    fn list_intelligence_nodes_with_nodes() {
+        let db = test_db();
+        let input1 = sample_node_input("node1");
+        let input2 = sample_node_input("node2");
+        db.upsert_intelligence_node(input1).unwrap();
+        db.upsert_intelligence_node(input2).unwrap();
+
+        let nodes = db.list_intelligence_nodes(None, 100).unwrap();
+        assert_eq!(nodes.len(), 2);
+    }
+
+    #[test]
+    fn list_intelligence_nodes_by_kind() {
+        let db = test_db();
+        let mut input1 = sample_node_input("node1");
+        input1.kind = "fact".to_string();
+        let mut input2 = sample_node_input("node2");
+        input2.kind = "pattern".to_string();
+        db.upsert_intelligence_node(input1).unwrap();
+        db.upsert_intelligence_node(input2).unwrap();
+
+        let nodes = db.list_intelligence_nodes(Some("fact"), 100).unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].id, "node1");
+    }
+
+    #[test]
+    fn delete_intelligence_node() {
+        let db = test_db();
+        let input = sample_node_input("node1");
+        db.upsert_intelligence_node(input).unwrap();
+
+        db.delete_intelligence_node("node1").unwrap();
+        let retrieved = db.get_intelligence_node("node1").unwrap();
+        assert!(retrieved.is_none());
+    }
+
+    #[test]
+    fn list_intelligence_projects_empty() {
+        let db = test_db();
+        let projects = db.list_intelligence_projects(None, 100).unwrap();
+        assert!(projects.is_empty());
+    }
+
+    #[test]
+    fn list_intelligence_projects_with_projects() {
+        let db = test_db();
+        let mut input1 = sample_node_input("proj1");
+        input1.kind = "project".to_string();
+        let mut input2 = sample_node_input("proj2");
+        input2.kind = "project".to_string();
+        db.upsert_intelligence_node(input1).unwrap();
+        db.upsert_intelligence_node(input2).unwrap();
+
+        let projects = db.list_intelligence_projects(None, 100).unwrap();
+        assert_eq!(projects.len(), 2);
     }
 }

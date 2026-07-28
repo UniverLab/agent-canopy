@@ -1,6 +1,3 @@
-#[cfg(unix)]
-use std::io;
-
 /// Install no-op handlers for SIGHUP and SIGPIPE so that when a PTY child
 /// exits the canopy process is not accidentally terminated.
 #[cfg(unix)]
@@ -15,21 +12,7 @@ pub(crate) fn send_sighup_to_group(child: &mut dyn portable_pty::Child) {
     let Some(pid) = child.process_id().map(|pid| pid as i32) else {
         return;
     };
-    let _ = send_signal_to_group(pid, libc::SIGHUP);
-}
-
-#[cfg(unix)]
-pub(crate) fn send_signal_to_group(pid: i32, signal: i32) -> io::Result<()> {
-    let result = unsafe { libc::killpg(pid, signal) };
-    if result == 0 {
-        return Ok(());
-    }
-
-    let err = io::Error::last_os_error();
-    if err.raw_os_error() == Some(libc::ESRCH) {
-        return Ok(());
-    }
-    Err(err)
+    let _ = crate::daemon::process::send_signal_to_group(pid, libc::SIGHUP);
 }
 /// Convert a crossterm key event to raw bytes for the PTY.
 pub fn key_to_bytes(

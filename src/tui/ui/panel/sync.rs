@@ -2,50 +2,61 @@ use chrono::{Local, TimeZone};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 
 use crate::domain::sync::{MessageKind, MissionImpact, SyncMessage, WorkspaceStatus};
 use crate::tui::app::types::SyncPanelState;
-use crate::tui::ui::{last_two_segments, ACCENT, DIM, ERROR_COLOR, STATUS_OK};
+use crate::tui::ui::theme::Theme;
+use crate::tui::ui::{last_two_segments, ERROR_COLOR, STATUS_OK};
 
 pub(crate) fn draw_activity_panel(
     frame: &mut Frame,
     area: Rect,
     state: &SyncPanelState,
     scroll_offset: u16,
+    theme: &Theme,
 ) {
     let block = Block::default()
         .title(
-            Line::from(Span::styled(" activity ", Style::default().fg(DIM)))
-                .alignment(ratatui::layout::Alignment::Right),
+            Line::from(Span::styled(
+                " activity ",
+                Style::default().fg(theme.dim_text),
+            ))
+            .alignment(ratatui::layout::Alignment::Right),
         )
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(DIM));
+        .borders(crate::tui::ui::borders_for(theme))
+        .border_style(Style::default().fg(theme.border_color));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    draw_sync_section(frame, inner, state, scroll_offset);
+    draw_sync_section(frame, inner, state, scroll_offset, theme);
 }
 
-fn draw_sync_section(frame: &mut Frame, area: Rect, state: &SyncPanelState, scroll_offset: u16) {
+fn draw_sync_section(
+    frame: &mut Frame,
+    area: Rect,
+    state: &SyncPanelState,
+    scroll_offset: u16,
+    theme: &Theme,
+) {
     let w = area.width as usize;
     let vibe_fg = vibe_color(state.vibe);
     let mut lines: Vec<Line> = vec![
         Line::from(vec![
-            Span::styled("vibe ", Style::default().fg(DIM)),
+            Span::styled("vibe ", Style::default().fg(theme.dim_text)),
             Span::styled(
                 state.vibe.as_str(),
                 Style::default().fg(vibe_fg).add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled("participants ", Style::default().fg(DIM)),
+            Span::styled("participants ", Style::default().fg(theme.dim_text)),
             Span::styled(
                 state.participant_count.to_string(),
                 Style::default().fg(Color::White),
             ),
         ]),
         Line::from(vec![
-            Span::styled("workdir ", Style::default().fg(DIM)),
+            Span::styled("workdir ", Style::default().fg(theme.dim_text)),
             Span::styled(
                 last_two_segments(&state.workdir),
                 Style::default().fg(Color::White),
@@ -54,17 +65,25 @@ fn draw_sync_section(frame: &mut Frame, area: Rect, state: &SyncPanelState, scro
         Line::raw(""),
         Line::from(Span::styled(
             "missions",
-            Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.dim_text)
+                .add_modifier(Modifier::BOLD),
         )),
     ];
 
     if state.active_intents.is_empty() {
-        lines.push(Line::from(Span::styled("  none", Style::default().fg(DIM))));
+        lines.push(Line::from(Span::styled(
+            "  none",
+            Style::default().fg(theme.dim_text),
+        )));
     } else {
         for intent in &state.active_intents {
             // Card header: agent · impact · status
             lines.push(Line::from(vec![
-                Span::styled("┌ ", Style::default().fg(intent_color(intent.impact))),
+                Span::styled(
+                    "┌ ",
+                    Style::default().fg(intent_color(intent.impact, theme)),
+                ),
                 Span::styled(
                     &intent.agent_name,
                     Style::default()
@@ -73,13 +92,16 @@ fn draw_sync_section(frame: &mut Frame, area: Rect, state: &SyncPanelState, scro
                 ),
                 Span::styled(
                     format!(" [{}]", intent.impact.as_str()),
-                    Style::default().fg(intent_color(intent.impact)),
+                    Style::default().fg(intent_color(intent.impact, theme)),
                 ),
             ]));
             // Mission text — wrap manually
             for chunk in wrap_text(&intent.mission, w.saturating_sub(2)) {
                 lines.push(Line::from(vec![
-                    Span::styled("│ ", Style::default().fg(intent_color(intent.impact))),
+                    Span::styled(
+                        "│ ",
+                        Style::default().fg(intent_color(intent.impact, theme)),
+                    ),
                     Span::styled(chunk, Style::default().fg(Color::White)),
                 ]));
             }
@@ -87,14 +109,17 @@ fn draw_sync_section(frame: &mut Frame, area: Rect, state: &SyncPanelState, scro
             if !intent.description.is_empty() {
                 for chunk in wrap_text(&intent.description, w.saturating_sub(2)) {
                     lines.push(Line::from(vec![
-                        Span::styled("│ ", Style::default().fg(intent_color(intent.impact))),
-                        Span::styled(chunk, Style::default().fg(DIM)),
+                        Span::styled(
+                            "│ ",
+                            Style::default().fg(intent_color(intent.impact, theme)),
+                        ),
+                        Span::styled(chunk, Style::default().fg(theme.dim_text)),
                     ]));
                 }
             }
             lines.push(Line::from(Span::styled(
                 "└─",
-                Style::default().fg(intent_color(intent.impact)),
+                Style::default().fg(intent_color(intent.impact, theme)),
             )));
         }
     }
@@ -102,14 +127,16 @@ fn draw_sync_section(frame: &mut Frame, area: Rect, state: &SyncPanelState, scro
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         "messages",
-        Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme.dim_text)
+            .add_modifier(Modifier::BOLD),
     )));
 
     let recent_msgs = recent_messages_for_display(&state.recent_messages);
     if state.active_intents.is_empty() && recent_msgs.is_empty() {
         lines.push(Line::from(Span::styled(
             "  nothing to show",
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         )));
     }
     for message in recent_msgs {
@@ -120,7 +147,7 @@ fn draw_sync_section(frame: &mut Frame, area: Rect, state: &SyncPanelState, scro
             MessageKind::Answer => "↳",
             MessageKind::Info => "·",
         };
-        let color = kind_color(message.kind);
+        let color = kind_color(message.kind, theme);
         // Card header: icon · session_name · client
         lines.push(Line::from(vec![
             Span::styled(format!("┌{icon} "), Style::default().fg(color)),
@@ -133,7 +160,7 @@ fn draw_sync_section(frame: &mut Frame, area: Rect, state: &SyncPanelState, scro
             Span::styled("│ ", Style::default().fg(color)),
             Span::styled(
                 format_timestamp(message.created_at),
-                Style::default().fg(DIM),
+                Style::default().fg(theme.dim_text),
             ),
         ]));
         // Message body — wrap
@@ -193,21 +220,21 @@ fn vibe_color(status: WorkspaceStatus) -> Color {
     }
 }
 
-fn intent_color(impact: MissionImpact) -> Color {
+fn intent_color(impact: MissionImpact, theme: &Theme) -> Color {
     match impact {
-        MissionImpact::Low => ACCENT,
+        MissionImpact::Low => theme.header_color,
         MissionImpact::High => Color::Yellow,
         MissionImpact::Breaking => ERROR_COLOR,
     }
 }
 
-fn kind_color(kind: MessageKind) -> Color {
+fn kind_color(kind: MessageKind, theme: &Theme) -> Color {
     match kind {
-        MessageKind::Intent => ACCENT,
+        MessageKind::Intent => theme.header_color,
         MessageKind::Status => Color::Yellow,
         MessageKind::Query => Color::Cyan,
         MessageKind::Answer => STATUS_OK,
-        MessageKind::Info => DIM,
+        MessageKind::Info => theme.dim_text,
     }
 }
 

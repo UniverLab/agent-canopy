@@ -49,6 +49,17 @@ fn default_debounce() -> u64 {
     2
 }
 
+/// An agent row that failed to decode — e.g. a `trigger_config` written
+/// directly to SQLite by an external tool that isn't the JSON `Trigger`
+/// shape canopy expects. Carries just enough to quarantine and report the
+/// row; canopy never guesses at what the malformed data meant.
+#[derive(Debug, Clone)]
+pub struct CorruptAgent {
+    pub id: String,
+    pub enabled: bool,
+    pub error: String,
+}
+
 /// A unified agent — the core entity in canopy.
 ///
 /// An agent can have a trigger (cron schedule or file watcher) or no trigger
@@ -63,6 +74,10 @@ pub struct Agent {
     pub model: Option<String>,
     pub working_dir: Option<String>,
     pub enabled: bool,
+    /// One-shot scheduled enable time. When set and `enabled` is `false`,
+    /// the scheduler enables the agent (and clears this field) once
+    /// `Utc::now() >= enable_at`.
+    pub enable_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     /// Log file path.
     pub log_path: String,
@@ -208,6 +223,16 @@ impl Cli {
             .unwrap_or_else(|| self.0.clone())
     }
 
+    /// Registry-driven paste+submit behavior for delivering a prompt to this
+    /// platform's interactive session as a submitted message. Falls back to
+    /// [`super::cli_config::PasteSubmitSpec::default`] when the platform has
+    /// no registry entry or leaves the fields unset.
+    pub fn paste_submit_spec(&self) -> super::cli_config::PasteSubmitSpec {
+        let registry = Self::load_registry();
+        let config = registry.as_ref().and_then(|r| r.get(self.as_str()));
+        super::cli_config::PasteSubmitSpec::from_cli_config(config)
+    }
+
     pub fn detect_available() -> Vec<Cli> {
         let Some(registry) = Self::load_registry() else {
             return Vec::new();
@@ -253,7 +278,16 @@ impl Cli {
     }
 
     pub fn strategy(&self) -> Box<super::cli_strategy::CliStrategy> {
-        let home = dirs::home_dir().expect("Could not determine home directory");
+        // `CANOPY_HOME_OVERRIDE` lets tests point this at a fixture
+        // `.canopy/config.toml` without mutating the process-wide `HOME` env
+        // var — swapping `HOME` itself raced with concurrently-running
+        // tests that shell out to git (which reads the real `HOME` for
+        // `user.name`/`user.email`), causing unrelated test failures under
+        // `cargo test`'s default parallel execution. Unset in production.
+        let home = std::env::var_os("CANOPY_HOME_OVERRIDE")
+            .map(std::path::PathBuf::from)
+            .or_else(dirs::home_dir)
+            .expect("Could not determine home directory");
         let canopy_dir = home.join(".canopy");
         let config = super::canopy_config::CanopyConfig::load(&canopy_dir);
 
@@ -274,6 +308,12 @@ impl Cli {
             supports_working_dir: cli_config.supports_working_dir,
             working_dir_flag: cli_config.working_dir_flag.clone(),
             env_vars: cli_config.env_vars.clone(),
+            prompt_via_stdin: cli_config.prompt_via_stdin,
+            session_id_set_flag: cli_config.session_id_set_flag.clone(),
+            session_list_cmd: cli_config.session_list_cmd.clone(),
+            session_list_format_args: cli_config.session_list_format_args.clone(),
+            session_id_pattern: cli_config.session_id_pattern.clone(),
+            session_resume_cmd: cli_config.session_resume_cmd.clone(),
         })
     }
 
@@ -340,6 +380,23 @@ impl std::fmt::Display for RunStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
     }
+}
+
+/// Outcome of atomically claiming the right to start a run for an agent
+/// (see [`crate::application::ports::RunRepository::try_start_run`]).
+///
+/// This exists so the "is another run already active" check and the
+/// "insert the new run" write happen under the same lock — a bare
+/// `get_active_run` followed by a separate `insert_run` leaves a window
+/// where two concurrent callers can both see "no active run" and both
+/// start an execution for the same agent.
+#[derive(Debug, Clone)]
+pub enum StartRunOutcome {
+    /// No other run was active; the given run was recorded as active.
+    Started,
+    /// Another run for the same agent is already active; nothing was
+    /// inserted.
+    AlreadyActive(RunLog),
 }
 
 /// Record of a single agent execution.

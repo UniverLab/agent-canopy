@@ -35,10 +35,10 @@ pub struct MissionSnapshot {
     pub project_count: i64,
     pub distinct_project_languages: usize,
     pub gardener_edits: u64,
-    pub workflow_node_count_max: usize,
-    pub completed_workflow_runs: i64,
-    pub total_workflow_node_runs: i64,
-    pub has_parallel_workflow: bool,
+    pub loop_node_count_max: usize,
+    pub completed_loop_runs: i64,
+    pub total_loop_node_runs: i64,
+    pub has_parallel_loop: bool,
     pub seed_count: usize,
     pub max_seed_session_bindings: i64,
     pub agent_running: bool,
@@ -151,22 +151,22 @@ impl MissionManager {
             &mut pending,
         );
         Self::push_if(
-            snapshot.workflow_node_count_max >= 5,
+            snapshot.loop_node_count_max >= 5,
             MissionId::AutomationEngineer,
             &mut pending,
         );
         Self::push_if(
-            snapshot.completed_workflow_runs >= 10,
+            snapshot.completed_loop_runs >= 10,
             MissionId::PipelinePilot,
             &mut pending,
         );
         Self::push_if(
-            snapshot.has_parallel_workflow,
+            snapshot.has_parallel_loop,
             MissionId::ParallelVision,
             &mut pending,
         );
         Self::push_if(
-            snapshot.total_workflow_node_runs >= 100,
+            snapshot.total_loop_node_runs >= 100,
             MissionId::LoopSurvivor,
             &mut pending,
         );

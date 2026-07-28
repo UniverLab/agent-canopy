@@ -49,6 +49,105 @@ pub struct CanopyConfig {
     /// Root path used to discover or group related projects.
     #[serde(default = "default_projects_root")]
     pub projects_root: String,
+
+    /// Seconds of inactivity after which the (lazily-loaded) embedding model
+    /// is dropped from memory. Reloaded transparently on next use.
+    #[serde(default = "default_embeddings_idle_unload_secs")]
+    pub embeddings_idle_unload_secs: u64,
+
+    /// Global cap (F1) on how many ensemble members run concurrently across
+    /// every loop run, shared by the whole daemon so one ensemble can't
+    /// starve another's. An 8-member ensemble queues past this rather than
+    /// fork-bombing the host.
+    #[serde(default = "default_ensemble_concurrency_cap")]
+    pub ensemble_concurrency_cap: usize,
+
+    /// `[clean]` settings for the `canopy clean` CLI command.
+    #[serde(default)]
+    pub clean: CleanConfig,
+
+    /// `[skills]` settings for the dynamic skill store (`~/.canopy/skills/`).
+    #[serde(default)]
+    pub skills: SkillsConfig,
+
+    /// TUI color theme: `"classic"` (bordered) or `"modern"` (borderless).
+    /// A plain `String` (not an enum) so a config written by a newer binary
+    /// with a theme this binary doesn't know about still deserializes fine —
+    /// unknown values are resolved to classic at startup, not rejected here.
+    #[serde(default = "default_theme")]
+    pub theme: String,
+}
+
+/// One configured git source for the dynamic skill store. A skill is a
+/// named top-level directory (containing `SKILL.md`) inside the source repo.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillSourceConfig {
+    /// Git URL (https, ssh, or local path) of the skills registry repo.
+    pub url: String,
+    /// Branch or tag to track. Defaults to the repo's default branch.
+    #[serde(rename = "ref", default)]
+    pub git_ref: Option<String>,
+}
+
+/// Settings for the dynamic skill store, read from the `[skills]` table in
+/// `config.toml`.
+///
+/// Sources are checked in list order for a skill; when two sources publish a
+/// skill with the same name, the *later* source in this list wins — both for
+/// `skill_list`'s merged catalog and for which source a not-yet-installed
+/// skill is fetched from by `skill_get`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillsConfig {
+    #[serde(default = "default_skill_sources")]
+    pub sources: Vec<SkillSourceConfig>,
+    /// Minutes a fetched skill is served from the local store before its
+    /// commit hash is re-checked against the source.
+    #[serde(default = "default_skill_ttl_minutes")]
+    pub ttl_minutes: u64,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            sources: default_skill_sources(),
+            ttl_minutes: default_skill_ttl_minutes(),
+        }
+    }
+}
+
+fn default_skill_sources() -> Vec<SkillSourceConfig> {
+    vec![SkillSourceConfig {
+        url: "https://github.com/UniverLab/skills".to_string(),
+        git_ref: None,
+    }]
+}
+
+fn default_skill_ttl_minutes() -> u64 {
+    15
+}
+
+/// Settings for `canopy clean` (soft cleanup). Read from the `[clean]` table
+/// in `config.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CleanConfig {
+    /// Days of retention before orphaned/error/completed
+    /// `interactive_sessions` rows and orphaned log/terminal/RAG-residue
+    /// artifacts become eligible for removal. Overridable per-run with
+    /// `canopy clean --older-than <days>`.
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u64,
+}
+
+impl Default for CleanConfig {
+    fn default() -> Self {
+        Self {
+            retention_days: default_retention_days(),
+        }
+    }
+}
+
+fn default_retention_days() -> u64 {
+    7
 }
 
 /// Preferred unit for temperature display.
@@ -68,6 +167,18 @@ fn default_mcp_root() -> String {
 
 fn default_similarity_threshold() -> f32 {
     0.25
+}
+
+fn default_embeddings_idle_unload_secs() -> u64 {
+    600
+}
+
+fn default_ensemble_concurrency_cap() -> usize {
+    4
+}
+
+fn default_theme() -> String {
+    "classic".to_string()
 }
 
 fn default_projects_root() -> String {
@@ -138,6 +249,11 @@ impl Default for CanopyConfig {
             rag_personal_dirs: Vec::new(),
             rag_personal_root: String::new(),
             projects_root: default_projects_root(),
+            embeddings_idle_unload_secs: default_embeddings_idle_unload_secs(),
+            ensemble_concurrency_cap: default_ensemble_concurrency_cap(),
+            clean: CleanConfig::default(),
+            skills: SkillsConfig::default(),
+            theme: default_theme(),
         }
     }
 }
@@ -155,6 +271,35 @@ mod tests {
         assert_eq!(config.temperature_unit, TemperatureUnit::Celsius);
         assert_eq!(config.embeddings_model, "");
         assert_eq!(config.similarity_threshold, 0.25);
+        assert_eq!(config.theme, "classic");
+    }
+
+    #[test]
+    fn test_config_without_theme_field_uses_classic_default() {
+        let dir = TempDir::new().unwrap();
+        let canopy_dir = dir.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        // Simulates a config written before the `theme` field existed.
+        let toml = r#"embeddings_model = "intfloat/multilingual-e5-base""#;
+        std::fs::write(canopy_dir.join("config.toml"), toml).unwrap();
+
+        let loaded = CanopyConfig::load(&canopy_dir);
+        assert_eq!(loaded.theme, "classic");
+    }
+
+    #[test]
+    fn test_theme_round_trips_via_config_toml() {
+        let dir = TempDir::new().unwrap();
+        let canopy_dir = dir.path().join(".canopy");
+
+        let config = CanopyConfig {
+            theme: "modern".to_string(),
+            ..CanopyConfig::default()
+        };
+        config.save(&canopy_dir).unwrap();
+
+        let loaded = CanopyConfig::load(&canopy_dir);
+        assert_eq!(loaded.theme, "modern");
     }
 
     #[test]
@@ -193,6 +338,125 @@ mod tests {
 
         let loaded = CanopyConfig::load(&canopy_dir);
         assert_eq!(loaded.rag_personal_dirs, vec!["/old/rag"]);
+    }
+
+    #[test]
+    fn test_config_without_idle_unload_field_uses_default() {
+        let dir = TempDir::new().unwrap();
+        let canopy_dir = dir.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        // Simulates a config written before `embeddings_idle_unload_secs` existed.
+        let toml = r#"embeddings_model = "intfloat/multilingual-e5-base""#;
+        std::fs::write(canopy_dir.join("config.toml"), toml).unwrap();
+
+        let loaded = CanopyConfig::load(&canopy_dir);
+        assert_eq!(loaded.embeddings_idle_unload_secs, 600);
+    }
+
+    #[test]
+    fn test_config_without_ensemble_cap_field_uses_default_of_four() {
+        let dir = TempDir::new().unwrap();
+        let canopy_dir = dir.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        // Simulates a config written before `ensemble_concurrency_cap` existed.
+        let toml = r#"embeddings_model = "intfloat/multilingual-e5-base""#;
+        std::fs::write(canopy_dir.join("config.toml"), toml).unwrap();
+
+        let loaded = CanopyConfig::load(&canopy_dir);
+        assert_eq!(loaded.ensemble_concurrency_cap, 4);
+    }
+
+    #[test]
+    fn test_config_without_clean_section_uses_default_retention_of_seven_days() {
+        let dir = TempDir::new().unwrap();
+        let canopy_dir = dir.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        // Simulates a config written before the `[clean]` table existed.
+        let toml = r#"embeddings_model = "intfloat/multilingual-e5-base""#;
+        std::fs::write(canopy_dir.join("config.toml"), toml).unwrap();
+
+        let loaded = CanopyConfig::load(&canopy_dir);
+        assert_eq!(loaded.clean.retention_days, 7);
+    }
+
+    #[test]
+    fn test_clean_retention_days_round_trips_via_config_toml() {
+        let dir = TempDir::new().unwrap();
+        let canopy_dir = dir.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        let toml = "[clean]\nretention_days = 3\n";
+        std::fs::write(canopy_dir.join("config.toml"), toml).unwrap();
+
+        let loaded = CanopyConfig::load(&canopy_dir);
+        assert_eq!(loaded.clean.retention_days, 3);
+    }
+
+    #[test]
+    fn test_default_skills_config_has_one_source_and_15min_ttl() {
+        let config = CanopyConfig::default();
+        assert_eq!(config.skills.sources.len(), 1);
+        assert_eq!(
+            config.skills.sources[0].url,
+            "https://github.com/UniverLab/skills"
+        );
+        assert_eq!(config.skills.sources[0].git_ref, None);
+        assert_eq!(config.skills.ttl_minutes, 15);
+    }
+
+    #[test]
+    fn test_skills_config_round_trips_via_config_toml() {
+        let dir = TempDir::new().unwrap();
+        let canopy_dir = dir.path().join(".canopy");
+        let config = CanopyConfig {
+            skills: SkillsConfig {
+                sources: vec![
+                    SkillSourceConfig {
+                        url: "https://example.com/skills-a".to_string(),
+                        git_ref: None,
+                    },
+                    SkillSourceConfig {
+                        url: "https://example.com/skills-b".to_string(),
+                        git_ref: Some("v2".to_string()),
+                    },
+                ],
+                ttl_minutes: 30,
+            },
+            ..CanopyConfig::default()
+        };
+        config.save(&canopy_dir).unwrap();
+
+        let loaded = CanopyConfig::load(&canopy_dir);
+        assert_eq!(loaded.skills.sources.len(), 2);
+        assert_eq!(loaded.skills.sources[1].git_ref.as_deref(), Some("v2"));
+        assert_eq!(loaded.skills.ttl_minutes, 30);
+    }
+
+    #[test]
+    fn test_config_without_skills_section_uses_default_source() {
+        let dir = TempDir::new().unwrap();
+        let canopy_dir = dir.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        let toml = r#"embeddings_model = "intfloat/multilingual-e5-base""#;
+        std::fs::write(canopy_dir.join("config.toml"), toml).unwrap();
+
+        let loaded = CanopyConfig::load(&canopy_dir);
+        assert_eq!(loaded.skills.sources.len(), 1);
+        assert_eq!(loaded.skills.ttl_minutes, 15);
+    }
+
+    #[test]
+    fn test_ensemble_concurrency_cap_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let canopy_dir = dir.path().join(".canopy");
+
+        let config = CanopyConfig {
+            ensemble_concurrency_cap: 8,
+            ..CanopyConfig::default()
+        };
+        config.save(&canopy_dir).unwrap();
+
+        let loaded = CanopyConfig::load(&canopy_dir);
+        assert_eq!(loaded.ensemble_concurrency_cap, 8);
     }
 
     #[test]

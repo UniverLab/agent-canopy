@@ -33,19 +33,105 @@ pub(crate) async fn run_bridge(
     port_arg: Option<u16>,
     workdir_arg: Option<PathBuf>,
 ) -> Result<()> {
-    let agent_id = resolve_agent_id(agent_id_arg)?;
+    let identity = resolve_agent_identity(agent_id_arg);
     let workdir = resolve_workdir(workdir_arg)?;
     let port = resolve_bridge_port(port_arg);
 
-    if daemon_reachable(port).await {
-        return run_proxy_loop(port, &agent_id).await;
+    if identity.is_standalone {
+        register_standalone_session(&identity.agent_id, &workdir);
     }
 
-    eprintln!(
-        "canopy bridge: daemon not reachable on port {port}; \
-         falling back to embedded stdio server (no daemon-side coordination)"
-    );
-    run_embedded_stdio(&agent_id, &workdir).await
+    let result = if daemon_reachable(port).await {
+        run_proxy_loop(port, &identity.agent_id).await
+    } else {
+        eprintln!(
+            "canopy bridge: daemon not reachable on port {port}; \
+             falling back to embedded stdio server (no daemon-side coordination)"
+        );
+        run_embedded_stdio(&identity.agent_id, &workdir).await
+    };
+
+    if identity.is_standalone {
+        finish_standalone_session(&identity.agent_id, result.is_ok());
+    }
+
+    result
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct BridgeIdentity {
+    agent_id: String,
+    is_standalone: bool,
+}
+
+fn resolve_agent_identity(agent_id_arg: Option<String>) -> BridgeIdentity {
+    resolve_agent_identity_from_values(
+        agent_id_arg,
+        non_empty_env(CANOPY_AGENT_ID_ENV),
+        format!("standalone-{}", uuid::Uuid::new_v4()),
+    )
+}
+
+fn resolve_agent_identity_from_values(
+    agent_id_arg: Option<String>,
+    env_agent_id: Option<String>,
+    fallback_agent_id: String,
+) -> BridgeIdentity {
+    let env_agent_id = env_agent_id
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+
+    if let Some(agent_id) = agent_id_arg
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or(env_agent_id)
+    {
+        return BridgeIdentity {
+            agent_id,
+            is_standalone: false,
+        };
+    }
+
+    BridgeIdentity {
+        agent_id: fallback_agent_id,
+        is_standalone: true,
+    }
+}
+
+fn register_standalone_session(agent_id: &str, workdir: &str) {
+    // `agent_id` is the generated "standalone-<uuid>" fallback, so reusing it as
+    // the session name keeps `sync_messages.agent_name` distinguishable from a
+    // real session's codename (e.g. "boletus") instead of the bare, collidable
+    // literal "standalone".
+    let result = crate::ensure_data_dir()
+        .and_then(|data_dir| Database::new(&data_dir.join("background_agents.db")))
+        .and_then(|db| {
+            db.insert_interactive_session(
+                agent_id,
+                agent_id,
+                "bridge",
+                workdir,
+                Some("canopy bridge"),
+                Some(std::process::id() as i64),
+                "bridge",
+                crate::system::boot_id().as_deref(),
+            )
+        });
+
+    if let Err(err) = result {
+        eprintln!("canopy bridge: could not register standalone session: {err}");
+    }
+}
+
+fn finish_standalone_session(agent_id: &str, success: bool) {
+    let exit_code = if success { 0 } else { 1 };
+    let result = crate::ensure_data_dir()
+        .and_then(|data_dir| Database::new(&data_dir.join("background_agents.db")))
+        .and_then(|db| db.finish_interactive_session(agent_id, exit_code));
+
+    if let Err(err) = result {
+        eprintln!("canopy bridge: could not finish standalone session: {err}");
+    }
 }
 
 // ── Proxy mode (daemon available) ────────────────────────────────────────────
@@ -312,20 +398,6 @@ fn non_empty_env(name: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-fn resolve_agent_id(agent_id_arg: Option<String>) -> Result<String> {
-    if let Some(id) = agent_id_arg
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .or_else(|| non_empty_env(CANOPY_AGENT_ID_ENV))
-    {
-        return Ok(id);
-    }
-
-    anyhow::bail!(
-        "missing agent id; pass --id <AGENT_ID> or set {CANOPY_AGENT_ID_ENV} in the environment"
-    );
-}
-
 fn resolve_workdir(workdir_arg: Option<PathBuf>) -> Result<String> {
     let workdir = match workdir_arg {
         Some(path) => path,
@@ -409,6 +481,70 @@ mod tests {
     }
 
     #[test]
+    fn resolve_agent_identity_prefers_explicit_arg() {
+        let identity = resolve_agent_identity_from_values(
+            Some(" explicit-id ".to_string()),
+            Some("env-id".to_string()),
+            "fallback-id".to_string(),
+        );
+
+        assert_eq!(
+            identity,
+            BridgeIdentity {
+                agent_id: "explicit-id".to_string(),
+                is_standalone: false,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_agent_identity_uses_env_when_arg_is_missing() {
+        let identity = resolve_agent_identity_from_values(
+            None,
+            Some("env-id".to_string()),
+            "fallback-id".to_string(),
+        );
+
+        assert_eq!(
+            identity,
+            BridgeIdentity {
+                agent_id: "env-id".to_string(),
+                is_standalone: false,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_agent_identity_generates_standalone_when_no_identity_exists() {
+        let identity = resolve_agent_identity_from_values(None, None, "fallback-id".to_string());
+
+        assert_eq!(
+            identity,
+            BridgeIdentity {
+                agent_id: "fallback-id".to_string(),
+                is_standalone: true,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_agent_identity_ignores_blank_env_identity() {
+        let identity = resolve_agent_identity_from_values(
+            None,
+            Some("   ".to_string()),
+            "fallback-id".to_string(),
+        );
+
+        assert_eq!(
+            identity,
+            BridgeIdentity {
+                agent_id: "fallback-id".to_string(),
+                is_standalone: true,
+            }
+        );
+    }
+
+    #[test]
     fn transport_error_preserves_request_id() {
         let error = build_jsonrpc_transport_error("{\"jsonrpc\":\"2.0\",\"id\":42}", "boom");
         let value: serde_json::Value = serde_json::from_str(&error).unwrap();
@@ -421,5 +557,334 @@ mod tests {
         let error = build_jsonrpc_transport_error("not json", "boom");
         let value: serde_json::Value = serde_json::from_str(&error).unwrap();
         assert!(value["id"].is_null());
+    }
+
+    /// Regression test for T22: a daemon SSE response whose JSON payload
+    /// contains a cron schedule string with asterisks (e.g. from an
+    /// `agent_update` success message echoing "30 * * * *") must survive
+    /// `parse_sse_messages` byte-for-byte. This pins that the SSE parser
+    /// does not truncate or mangle the payload at `*` characters.
+    #[test]
+    fn parse_sse_preserves_cron_asterisks_in_payload() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"Agent 'x' updated successfully. schedule: 30 * * * *\"}]}}\n\n";
+        let messages = parse_sse_messages(body);
+
+        assert_eq!(messages.len(), 1);
+        let value: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+        let text = value["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text, "Agent 'x' updated successfully. schedule: 30 * * * *");
+    }
+
+    // ── parse_sse_messages edge cases ────────────────────────────
+
+    #[test]
+    fn parse_sse_empty_body_returns_empty() {
+        let messages = parse_sse_messages("");
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn parse_sse_only_keepalive_returns_empty() {
+        let body = "retry: 3000\n\n";
+        let messages = parse_sse_messages(body);
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn parse_sse_whitespace_data_lines_are_kept() {
+        let body = "data: \ndata: hello\n\n";
+        let messages = parse_sse_messages(body);
+        // First line is empty string after "data: ", second is "hello"
+        // flush_sse_event joins them: "" + "\n" + "hello" = "\nhello"
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("hello"));
+    }
+
+    #[test]
+    fn parse_sse_multiple_events_with_keepalives() {
+        let body = "retry: 3000\n\ndata: {\"id\":1}\n\ndata: {\"id\":2}\n\n";
+        let messages = parse_sse_messages(body);
+        assert_eq!(messages, vec!["{\"id\":1}", "{\"id\":2}"]);
+    }
+
+    #[test]
+    fn parse_sse_data_without_space_prefix() {
+        let body = "data:{\"id\":1}\n\n";
+        let messages = parse_sse_messages(body);
+        assert_eq!(messages, vec!["{\"id\":1}"]);
+    }
+
+    #[test]
+    fn parse_sse_triple_multiline_data() {
+        let body = "data: line1\ndata: line2\ndata: line3\n\n";
+        let messages = parse_sse_messages(body);
+        assert_eq!(messages, vec!["line1\nline2\nline3"]);
+    }
+
+    // ── build_jsonrpc_transport_error edge cases ─────────────────
+
+    #[test]
+    fn transport_error_preserves_string_id() {
+        let error = build_jsonrpc_transport_error(r#"{"jsonrpc":"2.0","id":"abc"}"#, "boom");
+        let value: serde_json::Value = serde_json::from_str(&error).unwrap();
+        assert_eq!(value["id"], "abc");
+        assert_eq!(value["error"]["code"], -32000);
+        assert_eq!(value["error"]["data"], "boom");
+    }
+
+    #[test]
+    fn transport_error_message_format() {
+        let error = build_jsonrpc_transport_error("{}", "test error");
+        let value: serde_json::Value = serde_json::from_str(&error).unwrap();
+        assert_eq!(value["jsonrpc"], "2.0");
+        assert_eq!(value["error"]["message"], "canopy bridge transport error");
+    }
+
+    // ── resolve_agent_identity_from_values edge cases ─────────────
+
+    #[test]
+    fn resolve_identity_empty_arg_with_env() {
+        let identity = resolve_agent_identity_from_values(
+            Some("".to_string()),
+            Some("env-id".to_string()),
+            "fallback".to_string(),
+        );
+        assert_eq!(identity.agent_id, "env-id");
+        assert!(!identity.is_standalone);
+    }
+
+    #[test]
+    fn resolve_identity_whitespace_arg_with_env() {
+        let identity = resolve_agent_identity_from_values(
+            Some("  ".to_string()),
+            Some("env-id".to_string()),
+            "fallback".to_string(),
+        );
+        assert_eq!(identity.agent_id, "env-id");
+        assert!(!identity.is_standalone);
+    }
+
+    #[test]
+    fn resolve_identity_arg_over_env() {
+        let identity = resolve_agent_identity_from_values(
+            Some("arg-id".to_string()),
+            Some("env-id".to_string()),
+            "fallback".to_string(),
+        );
+        assert_eq!(identity.agent_id, "arg-id");
+    }
+
+    #[test]
+    fn resolve_identity_both_empty() {
+        let identity = resolve_agent_identity_from_values(
+            Some("".to_string()),
+            Some("".to_string()),
+            "fallback".to_string(),
+        );
+        assert_eq!(identity.agent_id, "fallback");
+        assert!(identity.is_standalone);
+    }
+
+    #[test]
+    fn resolve_identity_arg_trims_whitespace() {
+        let identity = resolve_agent_identity_from_values(
+            Some("  my-id  ".to_string()),
+            None,
+            "fallback".to_string(),
+        );
+        assert_eq!(identity.agent_id, "my-id");
+    }
+
+    // ── non_empty_env tests ─────────────────────────────────────
+
+    #[test]
+    fn non_empty_env_returns_none_for_missing_var() {
+        std::env::remove_var("CANOPY_TEST_MISSING_VAR");
+        assert!(non_empty_env("CANOPY_TEST_MISSING_VAR").is_none());
+    }
+
+    #[test]
+    fn non_empty_env_returns_none_for_empty_var() {
+        std::env::set_var("CANOPY_TEST_EMPTY_VAR", "");
+        assert!(non_empty_env("CANOPY_TEST_EMPTY_VAR").is_none());
+        std::env::remove_var("CANOPY_TEST_EMPTY_VAR");
+    }
+
+    #[test]
+    fn non_empty_env_returns_none_for_whitespace_var() {
+        std::env::set_var("CANOPY_TEST_WS_VAR", "   ");
+        assert!(non_empty_env("CANOPY_TEST_WS_VAR").is_none());
+        std::env::remove_var("CANOPY_TEST_WS_VAR");
+    }
+
+    #[test]
+    fn non_empty_env_returns_trimmed_value() {
+        std::env::set_var("CANOPY_TEST_VALUE_VAR", "  hello  ");
+        let result = non_empty_env("CANOPY_TEST_VALUE_VAR");
+        assert_eq!(result, Some("hello".to_string()));
+        std::env::remove_var("CANOPY_TEST_VALUE_VAR");
+    }
+
+    // ── resolve_workdir tests ───────────────────────────────────
+
+    #[test]
+    fn resolve_workdir_uses_explicit_arg() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = resolve_workdir(Some(dir.path().to_path_buf())).unwrap();
+        assert!(result.contains(dir.path().file_name().unwrap().to_str().unwrap()));
+    }
+
+    #[test]
+    fn resolve_workdir_falls_back_to_current_dir() {
+        // The cwd is only the *third* source, behind the explicit argument and
+        // CANOPY_WORKDIR. That variable is set for every process the daemon
+        // spawns, so a suite run from inside a canopy session inherits it and
+        // would otherwise measure the env branch while claiming to test the
+        // fallback. Clear it for the duration, then put it back.
+        let saved = std::env::var(CANOPY_WORKDIR_ENV).ok();
+        std::env::remove_var(CANOPY_WORKDIR_ENV);
+
+        let result = resolve_workdir(None).unwrap();
+
+        if let Some(value) = saved {
+            std::env::set_var(CANOPY_WORKDIR_ENV, value);
+        }
+
+        let cwd = std::env::current_dir().unwrap();
+        let canonical = std::fs::canonicalize(&cwd).unwrap();
+        assert_eq!(result, canonical.to_string_lossy().to_string());
+    }
+
+    #[test]
+    fn resolve_workdir_prefers_the_env_var_over_the_current_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = std::env::var(CANOPY_WORKDIR_ENV).ok();
+        std::env::set_var(CANOPY_WORKDIR_ENV, dir.path());
+
+        let result = resolve_workdir(None).unwrap();
+
+        match saved {
+            Some(value) => std::env::set_var(CANOPY_WORKDIR_ENV, value),
+            None => std::env::remove_var(CANOPY_WORKDIR_ENV),
+        }
+
+        let expected = std::fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(result, expected.to_string_lossy().to_string());
+    }
+
+    // ── resolve_bridge_port tests ───────────────────────────────
+
+    #[test]
+    fn resolve_bridge_port_prefers_explicit_arg() {
+        assert_eq!(resolve_bridge_port(Some(9999)), 9999);
+    }
+
+    #[test]
+    fn resolve_bridge_port_defaults_to_7755() {
+        // Remove env var to ensure default
+        std::env::remove_var("CANOPY_PORT");
+        // Without a data dir or state, should default to 7755
+        assert_eq!(resolve_bridge_port(None), 7755);
+    }
+
+    // ── read_port_from_state tests ──────────────────────────────
+
+    #[test]
+    fn read_port_from_state_returns_none_for_missing_db() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_port_from_state(dir.path()).is_none());
+    }
+
+    #[test]
+    fn read_port_from_state_returns_none_for_missing_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let _db = Database::new(&dir.path().join("background_agents.db")).unwrap();
+        // No port set in state
+        assert!(read_port_from_state(dir.path()).is_none());
+    }
+
+    #[test]
+    fn read_port_from_state_returns_port_when_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(&dir.path().join("background_agents.db")).unwrap();
+        db.set_state("port", "8080").unwrap();
+        assert_eq!(read_port_from_state(dir.path()), Some(8080));
+    }
+
+    #[test]
+    fn read_port_from_state_returns_none_for_invalid_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(&dir.path().join("background_agents.db")).unwrap();
+        db.set_state("port", "not-a-number").unwrap();
+        assert!(read_port_from_state(dir.path()).is_none());
+    }
+
+    #[test]
+    fn flush_sse_event_clears_current_and_pushes_message() {
+        let mut current = vec!["line1", "line2"];
+        let mut messages = Vec::new();
+        flush_sse_event(&mut current, &mut messages);
+        assert!(current.is_empty());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0], "line1\nline2");
+    }
+
+    #[test]
+    fn flush_sse_event_does_nothing_when_current_is_empty() {
+        let mut current = Vec::new();
+        let mut messages = Vec::new();
+        flush_sse_event(&mut current, &mut messages);
+        assert!(current.is_empty());
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn flush_sse_event_trims_trailing_newlines() {
+        let mut current = vec!["line1\n", "line2\n"];
+        let mut messages = Vec::new();
+        flush_sse_event(&mut current, &mut messages);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0], "line1\n\nline2\n");
+    }
+
+    #[test]
+    fn build_jsonrpc_transport_error_with_empty_request() {
+        let error = build_jsonrpc_transport_error("", "test error");
+        let value: serde_json::Value = serde_json::from_str(&error).unwrap();
+        assert!(value["id"].is_null());
+        assert_eq!(value["error"]["message"], "canopy bridge transport error");
+        assert_eq!(value["error"]["data"], "test error");
+    }
+
+    #[test]
+    fn build_jsonrpc_transport_error_with_null_id() {
+        let error = build_jsonrpc_transport_error(r#"{"jsonrpc":"2.0","id":null}"#, "error");
+        let value: serde_json::Value = serde_json::from_str(&error).unwrap();
+        assert!(value["id"].is_null());
+    }
+
+    #[test]
+    fn resolve_workdir_with_env_var() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("CANOPY_WORKDIR", dir.path());
+        let result = resolve_workdir(None).unwrap();
+        assert!(result.contains(dir.path().file_name().unwrap().to_str().unwrap()));
+        std::env::remove_var("CANOPY_WORKDIR");
+    }
+
+    #[test]
+    fn resolve_bridge_port_with_env_var() {
+        std::env::set_var("CANOPY_PORT", "9999");
+        let result = resolve_bridge_port(None);
+        assert_eq!(result, 9999);
+        std::env::remove_var("CANOPY_PORT");
+    }
+
+    #[test]
+    fn resolve_bridge_port_with_invalid_env_var() {
+        std::env::set_var("CANOPY_PORT", "not-a-number");
+        let result = resolve_bridge_port(None);
+        assert_eq!(result, 7755); // Should fall back to default
+        std::env::remove_var("CANOPY_PORT");
     }
 }

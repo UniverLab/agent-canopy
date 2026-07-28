@@ -1,31 +1,35 @@
 //! Right panel rendering — PTY output, brain automaton, banner, background_agent/watcher details, log.
 
 use chrono::{Local, TimeZone};
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Color;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Paragraph, Wrap};
 use ratatui::Frame;
 
+use super::theme::Theme;
 use super::{
-    truncate_str, truncate_str_keep_tail, ACCENT, DIM, INTERACTIVE_COLOR, STATUS_DISABLED,
-    STATUS_FAIL, STATUS_OK, STATUS_RUNNING,
+    truncate_str, truncate_str_keep_tail, INTERACTIVE_COLOR, STATUS_DISABLED, STATUS_FAIL,
+    STATUS_OK, STATUS_RUNNING,
 };
 use crate::tui::agent::ScreenSnapshot;
-use crate::tui::app::types::{AgentEntry, App, Focus, ProjectsPanelFocus};
-use crate::tui::app::SidebarMode;
+use crate::tui::app::types::{AgentEntry, App, Focus, ProjectTab, SidebarLayer};
 
+pub mod background_agent;
 pub mod details;
 pub mod home;
 pub mod log_fallback;
+mod loop_live;
 pub mod sync;
 pub mod vt100;
 pub mod warp;
 
+pub(crate) use background_agent::draw_background_agent_panel;
 pub use details::{draw_agent_details, draw_group_details};
 pub(crate) use home::draw_brians_brain;
 pub use log_fallback::draw_log_text;
+use loop_live::draw_loop_live_view;
 pub(crate) use sync::draw_activity_panel;
 use vt100::render_vt_screen;
 #[allow(unused_imports)]
@@ -40,9 +44,10 @@ fn render_panel_block<'a>(
     area: Rect,
     border_color: Color,
     title: Option<Span<'a>>,
+    theme: &Theme,
 ) -> Rect {
     let mut block = Block::default()
-        .borders(Borders::ALL)
+        .borders(super::borders_for(theme))
         .border_style(Style::default().fg(border_color));
 
     if let Some(title) = title {
@@ -129,35 +134,68 @@ fn render_snapshot(
     app: &App,
     _mask_cursor_line: bool,
     show_cursor: bool,
+    selection: Option<vt100::PaneSelection>,
 ) {
-    render_vt_screen(frame, area, snap);
+    render_vt_screen(frame, area, snap, selection);
     if show_cursor {
         set_cursor_from_snapshot(frame, area, snap);
     }
     render_indicators(frame, area, snap, app);
 }
 
-fn split_warp_areas(area: Rect) -> (Rect, Rect) {
-    let input_height = 3;
-    let pty_height = area.height.saturating_sub(input_height);
-    let pty_area = Rect::new(area.x, area.y, area.width, pty_height);
-    let input_area = Rect::new(area.x, area.y + pty_height, area.width, input_height);
-    (pty_area, input_area)
+/// The active mouse selection, if it belongs to the pane's agent.
+fn pane_selection(app: &App, is_terminal: bool, idx: usize) -> Option<vt100::PaneSelection> {
+    let sel = app.terminal_selection?;
+    (sel.agent == (is_terminal, idx)).then(|| sel.normalized())
 }
 
-fn labeled_value_line<'a>(label: &'static str, value: Span<'a>) -> Line<'a> {
-    Line::from(vec![Span::styled(label, Style::default().fg(DIM)), value])
+/// Splits the terminal-warp panel into the PTY output area and the input
+/// box, with a 1-row gap between them. `input_text` is the current buffer
+/// contents (used to size the input box for wrapped/multiline content).
+fn split_warp_areas(area: Rect, input_text: &str) -> (Rect, Rect) {
+    let input_height = warp::input_height(input_text, area.width);
+    let chunks = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(input_height),
+    ])
+    .split(area);
+    (chunks[0], chunks[2])
 }
 
-fn selected_row_style(selected: bool) -> (Style, &'static str) {
+fn warp_input_text(app: &App, idx: usize) -> String {
+    app.terminal_agents
+        .get(idx)
+        .map(|agent| {
+            if agent.is_sensitive_input_active() {
+                String::new()
+            } else {
+                agent
+                    .input_buffer
+                    .lock()
+                    .map(|b| b.clone())
+                    .unwrap_or_default()
+            }
+        })
+        .unwrap_or_default()
+}
+
+fn labeled_value_line<'a>(label: &'static str, value: Span<'a>, theme: &Theme) -> Line<'a> {
+    Line::from(vec![
+        Span::styled(label, Style::default().fg(theme.dim_text)),
+        value,
+    ])
+}
+
+fn selected_row_style(selected: bool, theme: &Theme) -> (Style, &'static str) {
     if selected {
-        (Style::default().bg(super::BG_SELECTED), "›")
+        (Style::default().bg(theme.selected_bg), "›")
     } else {
         (Style::default(), " ")
     }
 }
 
-fn selected_agent_accent(app: &App) -> Option<Color> {
+fn selected_agent_accent(app: &App, theme: &Theme) -> Option<Color> {
     let selected = app.selected_agent()?;
     match selected {
         AgentEntry::Interactive(idx) => app
@@ -168,15 +206,30 @@ fn selected_agent_accent(app: &App) -> Option<Color> {
             .terminal_agents
             .get(*idx)
             .map(|agent| agent.accent_color),
-        _ => Some(ACCENT),
+        _ => Some(theme.header_color),
     }
 }
 
-fn log_panel_border_color(app: &App) -> Color {
-    match app.focus {
-        Focus::Agent | Focus::Preview => selected_agent_accent(app).unwrap_or(DIM),
-        _ => DIM,
+/// Resolves (border color, label color) for the log panel given the current
+/// focus and the selected agent's accent (if any). Pure so it's testable
+/// without constructing a full `App`.
+fn panel_focus_colors(focus: Focus, agent_accent: Option<Color>, theme: &Theme) -> (Color, Color) {
+    let accent = agent_accent.unwrap_or(theme.border_color);
+    match focus {
+        // Full-border accent for real focus.
+        Focus::Agent => (accent, accent),
+        // Preview is quieter: normal border, accent only on the label.
+        Focus::Preview => (theme.border_color, accent),
+        _ => (theme.border_color, theme.border_color),
     }
+}
+
+fn log_panel_border_color(app: &App, theme: &Theme) -> Color {
+    panel_focus_colors(app.focus, selected_agent_accent(app, theme), theme).0
+}
+
+fn panel_mode_label_color(app: &App, theme: &Theme) -> Color {
+    panel_focus_colors(app.focus, selected_agent_accent(app, theme), theme).1
 }
 
 fn panel_mode_label(app: &App) -> Option<&'static str> {
@@ -189,7 +242,7 @@ fn panel_mode_label(app: &App) -> Option<&'static str> {
 
 fn show_home_fallback(app: &App) -> bool {
     app.agents.is_empty()
-        && app.sidebar_mode != SidebarMode::Projects
+        && app.projects.is_empty()
         && !matches!(
             app.focus,
             Focus::NewAgentDialog
@@ -197,7 +250,8 @@ fn show_home_fallback(app: &App) -> bool {
                 | Focus::ContextTransfer
                 | Focus::RagTransfer
                 | Focus::PromptTemplateDialog
-                | Focus::WorkflowEditorDialog
+                | Focus::LoopEditorDialog
+                | Focus::LoopFormDialog
                 | Focus::ProjectRelationDialog
         )
 }
@@ -209,45 +263,53 @@ fn draw_home_panel(frame: &mut Frame, area: Rect, app: &App) {
     draw_canopy_banner_animation(frame, area, app);
 }
 
-fn draw_log_panel_focus(frame: &mut Frame, area: Rect, app: &mut App) -> bool {
+fn draw_log_panel_focus(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) -> bool {
     match app.focus {
         Focus::Home => {
-            if app.sidebar_mode == SidebarMode::Projects {
-                draw_projects_mode_panel(frame, area, app);
-            } else {
-                draw_home_panel(frame, area, app);
-            }
+            draw_home_panel(frame, area, app);
             true
         }
-        Focus::Preview => draw_preview_panel(frame, area, app),
-        Focus::Agent => draw_agent_panel(frame, area, app),
+        Focus::Preview => draw_preview_panel(frame, area, app, theme),
+        Focus::Agent if app.sidebar_layer == SidebarLayer::Knowledge => {
+            draw_project_tabs_panel(frame, area, app, theme);
+            true
+        }
+        Focus::Agent => draw_agent_panel(frame, area, app, theme),
         Focus::NewAgentDialog => draw_new_agent_dialog_background(frame, area, app),
         Focus::LaunchpadDialog
         | Focus::KnowledgeDialog
         | Focus::ContextTransfer
         | Focus::RagTransfer
         | Focus::PromptTemplateDialog
-        | Focus::WorkflowEditorDialog => false,
+        | Focus::LoopEditorDialog
+        | Focus::LoopFormDialog => false,
         Focus::ProjectRelationDialog => {
-            draw_projects_mode_panel(frame, area, app);
+            draw_project_preview_card(frame, area, app, theme);
             true
         }
     }
 }
 
-fn draw_preview_panel(frame: &mut Frame, area: Rect, app: &App) -> bool {
+fn draw_preview_panel(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) -> bool {
     if app.playground_active {
-        draw_playground_panel(frame, area, app);
+        draw_playground_panel(frame, area, app, theme);
         return true;
     }
 
-    if app.sidebar_mode == SidebarMode::Projects {
-        draw_projects_mode_panel(frame, area, app);
+    if app.sidebar_layer == SidebarLayer::Knowledge {
+        draw_project_preview_card(frame, area, app, theme);
+        return true;
+    }
+
+    if app.sidebar_layer == SidebarLayer::Automation
+        && app.automation_kind == crate::tui::app::AutomationKind::Loop
+    {
+        draw_loop_live_view(frame, area, app, theme);
         return true;
     }
 
     if app.agents_rag_focused && app.rag_info.has_rag_activity() {
-        draw_rag_info_overview(frame, area, app);
+        draw_rag_info_overview(frame, area, app, theme);
         return true;
     }
 
@@ -255,12 +317,12 @@ fn draw_preview_panel(frame: &mut Frame, area: Rect, app: &App) -> bool {
         return false;
     };
 
-    draw_selected_preview(frame, area, app, selected)
+    draw_selected_preview(frame, area, app, selected, theme)
 }
 
-fn draw_agent_panel(frame: &mut Frame, area: Rect, app: &mut App) -> bool {
+fn draw_agent_panel(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) -> bool {
     if app.playground_active {
-        draw_playground_panel(frame, area, app);
+        draw_playground_panel(frame, area, app, theme);
         return true;
     }
 
@@ -272,11 +334,49 @@ fn draw_agent_panel(frame: &mut Frame, area: Rect, app: &mut App) -> bool {
         AgentEntry::Interactive(idx) => draw_focused_interactive_panel(frame, area, app, *idx),
         AgentEntry::Terminal(idx) => draw_focused_terminal_panel(frame, area, app, *idx),
         AgentEntry::Group(idx) => {
-            draw_group_details(frame, area, app, *idx);
+            draw_group_details(frame, area, app, *idx, theme);
             true
         }
-        _ => false,
+        AgentEntry::Agent(agent) => {
+            draw_background_agent_panel(frame, area, agent, app, theme);
+            true
+        }
+        AgentEntry::Corrupt(corrupt) => {
+            draw_corrupt_agent_panel(frame, area, corrupt);
+            true
+        }
+        AgentEntry::Orphaned(idx) => {
+            if let Some(session) = app.orphaned_sessions.get(*idx) {
+                let text = format!(
+                    "Orphaned session: {}\nCLI: {}  Workdir: {}\n\nPress 'r' to revive or 'd' to dismiss.",
+                    session.name, session.cli, session.working_dir
+                );
+                let paragraph = ratatui::widgets::Paragraph::new(text)
+                    .style(ratatui::style::Style::default().fg(ratatui::style::Color::Yellow));
+                frame.render_widget(paragraph, area);
+            }
+            true
+        }
     }
+}
+
+/// Renders a corrupt agent row's detail panel: id and parse error, no
+/// attempt to interpret the malformed data.
+fn draw_corrupt_agent_panel(
+    frame: &mut Frame,
+    area: Rect,
+    corrupt: &crate::domain::models::CorruptAgent,
+) {
+    let text = format!(
+        "{} [corrupt config]\n\nThis agent's trigger_config failed to parse and has been \
+         quarantined (disabled). It was not modified or reinterpreted.\n\nError: {}\n\nPress 'd' \
+         to delete this row.",
+        corrupt.id, corrupt.error
+    );
+    let paragraph = ratatui::widgets::Paragraph::new(text)
+        .style(ratatui::style::Style::default().fg(ratatui::style::Color::Red))
+        .wrap(ratatui::widgets::Wrap { trim: false });
+    frame.render_widget(paragraph, area);
 }
 
 fn draw_interactive_preview(frame: &mut Frame, area: Rect, app: &App, idx: usize) -> bool {
@@ -287,7 +387,7 @@ fn draw_interactive_preview(frame: &mut Frame, area: Rect, app: &App, idx: usize
         return false;
     };
 
-    render_snapshot(frame, area, &snap, app, false, false);
+    render_snapshot(frame, area, &snap, app, false, false, None);
     true
 }
 
@@ -299,7 +399,7 @@ fn draw_terminal_preview(frame: &mut Frame, area: Rect, app: &App, idx: usize) -
         return false;
     };
 
-    render_snapshot(frame, area, &snap, app, false, false);
+    render_snapshot(frame, area, &snap, app, false, false, None);
     render_command_chips(frame, area, app, &agent.name);
     true
 }
@@ -319,6 +419,7 @@ fn draw_focused_interactive_panel(frame: &mut Frame, area: Rect, app: &App, idx:
         app,
         agent.is_sensitive_input_active(),
         false,
+        pane_selection(app, false, idx),
     );
     set_focused_interactive_cursor(frame, area, &snap, agent);
     true
@@ -330,14 +431,24 @@ fn draw_focused_terminal_panel(frame: &mut Frame, area: Rect, app: &mut App, idx
     };
 
     let sensitive = agent.is_sensitive_input_active();
-    let warp_mode = agent.warp_mode;
+    // Warp input box only while the shell itself owns the terminal; when a
+    // wizard/TUI/foreground command is running the PTY gets the whole pane.
+    let warp_active = agent.warp_mode && !agent.should_bypass_warp_input();
     let snap = agent.screen_snapshot();
 
-    if !warp_mode {
+    if !warp_active {
         let Some(snap) = snap else {
             return false;
         };
-        render_snapshot(frame, area, &snap, app, sensitive, true);
+        render_snapshot(
+            frame,
+            area,
+            &snap,
+            app,
+            sensitive,
+            true,
+            pane_selection(app, true, idx),
+        );
         return true;
     }
 
@@ -345,16 +456,38 @@ fn draw_focused_terminal_panel(frame: &mut Frame, area: Rect, app: &mut App, idx
     true
 }
 
-fn draw_selected_preview(frame: &mut Frame, area: Rect, app: &App, selected: &AgentEntry) -> bool {
+fn draw_selected_preview(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    selected: &AgentEntry,
+    theme: &Theme,
+) -> bool {
     match selected {
         AgentEntry::Agent(agent) => {
-            draw_agent_details(frame, area, agent, app);
+            draw_agent_details(frame, area, agent, app, theme);
+            true
+        }
+        AgentEntry::Corrupt(corrupt) => {
+            draw_corrupt_agent_panel(frame, area, corrupt);
             true
         }
         AgentEntry::Interactive(idx) => draw_interactive_preview(frame, area, app, *idx),
         AgentEntry::Terminal(idx) => draw_terminal_preview(frame, area, app, *idx),
         AgentEntry::Group(idx) => {
-            draw_group_details(frame, area, app, *idx);
+            draw_group_details(frame, area, app, *idx, theme);
+            true
+        }
+        AgentEntry::Orphaned(idx) => {
+            if let Some(session) = app.orphaned_sessions.get(*idx) {
+                let text = format!(
+                    "Orphaned: {} ({})\nWorkdir: {}",
+                    session.name, session.cli, session.working_dir
+                );
+                let paragraph = ratatui::widgets::Paragraph::new(text)
+                    .style(ratatui::style::Style::default().fg(ratatui::style::Color::Yellow));
+                frame.render_widget(paragraph, area);
+            }
             true
         }
     }
@@ -368,12 +501,21 @@ fn draw_terminal_warp_mode(
     snap: Option<&crate::tui::agent::ScreenSnapshot>,
     _sensitive: bool,
 ) {
-    let (pty_area, input_area) = split_warp_areas(area);
+    let (pty_area, input_area) = split_warp_areas(area, &warp_input_text(app, idx));
     if let Some(snap) = snap {
-        render_snapshot(frame, pty_area, snap, app, false, false);
+        render_snapshot(
+            frame,
+            pty_area,
+            snap,
+            app,
+            false,
+            false,
+            pane_selection(app, true, idx),
+        );
     }
     draw_warp_input_box(frame, input_area, app, idx);
     app.last_panel_inner = (pty_area.width, pty_area.height);
+    app.last_panel_x = pty_area.x;
     app.last_panel_y = pty_area.y;
 }
 
@@ -430,26 +572,28 @@ fn adjusted_interactive_cursor_col(
     cursor_col
 }
 
-pub(super) fn draw_log_panel(frame: &mut Frame, area: Rect, app: &mut App) {
+pub(super) fn draw_log_panel(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     if area.width == 0 || area.height == 0 {
         return;
     }
 
-    let border_color = log_panel_border_color(app);
+    let border_color = log_panel_border_color(app, theme);
+    let label_color = panel_mode_label_color(app, theme);
     let title = panel_mode_label(app).map(|label| {
         Span::styled(
             label,
             Style::default()
-                .fg(border_color)
+                .fg(label_color)
                 .add_modifier(Modifier::BOLD),
         )
     });
-    let inner = render_panel_block(frame, area, border_color, title);
+    let inner = render_panel_block(frame, area, border_color, title, theme);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
 
     app.last_panel_inner = (inner.width, inner.height);
+    app.last_panel_x = inner.x;
     app.last_panel_y = inner.y;
 
     if show_home_fallback(app) {
@@ -457,7 +601,7 @@ pub(super) fn draw_log_panel(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    if draw_log_panel_focus(frame, inner, app) {
+    if draw_log_panel_focus(frame, inner, app, theme) {
         return;
     }
 
@@ -467,6 +611,7 @@ pub(super) fn draw_log_panel(frame: &mut Frame, area: Rect, app: &mut App) {
 fn format_intent_lines(
     state: &crate::tui::app::types::SyncPanelState,
     _area_width: u16,
+    theme: &Theme,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if state.active_intents.is_empty() {
@@ -485,7 +630,7 @@ fn format_intent_lines(
         if !intent.description.trim().is_empty() {
             lines.push(Line::from(Span::styled(
                 format!("    {}", truncate_str(intent.description.trim(), 92)),
-                Style::default().fg(DIM),
+                Style::default().fg(theme.dim_text),
             )));
         }
     }
@@ -519,7 +664,7 @@ fn format_recent_activity_lines(
     lines
 }
 
-fn format_recent_session_lines(sessions: &[(String, String)]) -> Vec<Line<'static>> {
+fn format_recent_session_lines(sessions: &[(String, String)], theme: &Theme) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if sessions.is_empty() {
         lines.push(Line::from("  none"));
@@ -530,7 +675,7 @@ fn format_recent_session_lines(sessions: &[(String, String)]) -> Vec<Line<'stati
         lines.push(Line::from(format!("  - {}", truncate_str(title, 92))));
         lines.push(Line::from(Span::styled(
             format!("    {}", summary),
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         )));
     }
     lines
@@ -540,6 +685,7 @@ fn build_project_overview_lines<'a>(
     project: &'a crate::domain::project::Project,
     project_activity: Option<&crate::tui::app::types::SyncPanelState>,
     recent_sessions: &[(String, String)],
+    theme: &Theme,
 ) -> Vec<Line<'a>> {
     let tags = project.tags.as_deref().unwrap_or("none");
     let indexed = project
@@ -554,10 +700,12 @@ fn build_project_overview_lines<'a>(
 
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("Project ", Style::default().fg(DIM)),
+            Span::styled("Project ", Style::default().fg(theme.dim_text)),
             Span::styled(
                 &project.name,
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.header_color)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(format!("workdir_hash: {}", project.hash)),
@@ -566,10 +714,16 @@ fn build_project_overview_lines<'a>(
         Line::from(format!("created_at: {}", created)),
         Line::from(format!("tags: {}", tags)),
         Line::from(""),
-        Line::from(Span::styled("description", Style::default().fg(DIM))),
+        Line::from(Span::styled(
+            "description",
+            Style::default().fg(theme.dim_text),
+        )),
         Line::from(description),
         Line::from(""),
-        Line::from(Span::styled("workspace context", Style::default().fg(DIM))),
+        Line::from(Span::styled(
+            "workspace context",
+            Style::default().fg(theme.dim_text),
+        )),
     ];
 
     if let Some(state) = project_activity {
@@ -578,7 +732,7 @@ fn build_project_overview_lines<'a>(
             state.participant_count,
             state.vibe.as_str()
         )));
-        lines.extend(format_intent_lines(state, 0));
+        lines.extend(format_intent_lines(state, 0, theme));
         lines.extend(format_recent_activity_lines(state));
     } else {
         lines.push(Line::from("participants: 0  vibe: stable"));
@@ -589,17 +743,17 @@ fn build_project_overview_lines<'a>(
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "recent sessions",
-        Style::default().fg(DIM),
+        Style::default().fg(theme.dim_text),
     )));
-    lines.extend(format_recent_session_lines(recent_sessions));
+    lines.extend(format_recent_session_lines(recent_sessions, theme));
 
     lines
 }
 
-fn draw_project_overview(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_project_overview(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let Some(project) = app.selected_project() else {
         frame.render_widget(
-            Paragraph::new("No registered projects").style(Style::default().fg(DIM)),
+            Paragraph::new("No registered projects").style(Style::default().fg(theme.dim_text)),
             area,
         );
         return;
@@ -607,30 +761,282 @@ fn draw_project_overview(frame: &mut Frame, area: Rect, app: &App) {
 
     let project_activity = app.activity_panel_state_for_workdir(&project.path);
     let recent_sessions = recent_project_session_summaries(app, project, 3);
-    let lines = build_project_overview_lines(project, project_activity.as_ref(), &recent_sessions);
+    let lines =
+        build_project_overview_lines(project, project_activity.as_ref(), &recent_sessions, theme);
 
     render_wrapped_paragraph(frame, area, lines);
 }
 
-fn draw_projects_mode_panel(frame: &mut Frame, area: Rect, app: &App) {
+/// Knowledge layer's Preview (project highlighted, not entered): a cheap
+/// summary card — pending backlog count, knowledge entry count, last
+/// activity, and a badge if a loop is running against this project's
+/// workdir (functional requirement 3). Reads `App::selected_project_preview`,
+/// a cache refreshed on the normal tick cadence — never recomputed here.
+fn draw_project_preview_card(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     if app.playground_active {
-        draw_playground_panel(frame, area, app);
+        draw_playground_panel(frame, area, app, theme);
         return;
     }
 
-    match app.projects_panel_focus {
-        ProjectsPanelFocus::Projects => draw_project_overview(frame, area, app),
-        ProjectsPanelFocus::Workflows => draw_workflow_overview(frame, area, app),
-        ProjectsPanelFocus::Knowledge => draw_knowledge_overview(frame, area, app),
-        ProjectsPanelFocus::RagInfo => draw_rag_queue_overview(frame, area, app),
+    let Some(project) = app.selected_project() else {
+        frame.render_widget(
+            Paragraph::new("No registered projects").style(Style::default().fg(theme.dim_text)),
+            area,
+        );
+        return;
+    };
+
+    let summary = app.selected_project_preview();
+    let running_badge = if summary.is_some_and(|s| s.loop_running) {
+        Span::styled("  ● loop running", Style::default().fg(STATUS_RUNNING))
+    } else {
+        Span::raw("")
+    };
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Project ", Style::default().fg(theme.dim_text)),
+            Span::styled(
+                &project.name,
+                Style::default()
+                    .fg(theme.header_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            running_badge,
+        ]),
+        Line::from(format!("path: {}", project.path)),
+        Line::from(""),
+    ];
+
+    match summary {
+        Some(summary) => {
+            lines.push(Line::from(vec![
+                Span::styled("Backlog: ", Style::default().fg(theme.dim_text)),
+                Span::styled(
+                    summary.pending_backlog.to_string(),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("   Knowledge: ", Style::default().fg(theme.dim_text)),
+                Span::styled(
+                    summary.knowledge_entries.to_string(),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            let last_activity = summary
+                .last_activity
+                .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+                .map(|dt| crate::tui::app::utils::relative_time(&dt))
+                .unwrap_or_else(|| "no activity yet".to_string());
+            lines.push(Line::from(vec![
+                Span::styled("Last activity: ", Style::default().fg(theme.dim_text)),
+                Span::styled(last_activity, Style::default().fg(Color::White)),
+            ]));
+        }
+        None => lines.push(Line::from(Span::styled(
+            "Summary loading…",
+            Style::default().fg(theme.dim_text),
+        ))),
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Enter → Overview | Backlog | Knowledge | History",
+        Style::default().fg(theme.header_color),
+    )));
+
+    render_wrapped_paragraph(frame, area, lines);
+}
+
+/// Knowledge layer's Focus (project entered, `Enter`): the tab bar —
+/// Overview | Backlog | Knowledge | History — plus the active tab's lazily
+/// loaded content (functional requirement 4). Populates
+/// `project_tab_click_map`/`project_tab_row_click_map` for mouse
+/// hit-testing, reusing the same click-map pattern as the sidebar.
+fn draw_project_tabs_panel(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
+    app.project_tab_click_map.clear();
+    app.project_tab_row_click_map.clear();
+
+    if area.height == 0 {
+        return;
+    }
+    let Some(project) = app.selected_project().cloned() else {
+        frame.render_widget(
+            Paragraph::new("No registered projects").style(Style::default().fg(theme.dim_text)),
+            area,
+        );
+        return;
+    };
+    let Some(active_tab) = app.project_focus else {
+        return;
+    };
+
+    let [tab_bar_area, content_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+
+    draw_project_tab_bar(frame, tab_bar_area, app, &project.name, active_tab, theme);
+
+    match active_tab {
+        ProjectTab::Overview => draw_project_overview(frame, content_area, app, theme),
+        ProjectTab::Backlog => draw_backlog_overview(frame, content_area, app, theme),
+        ProjectTab::Knowledge => draw_knowledge_overview(frame, content_area, app, theme),
+        ProjectTab::History => draw_project_history_tab(frame, content_area, app, theme),
     }
 }
 
-fn draw_knowledge_overview(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_project_tab_bar(
+    frame: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    project_name: &str,
+    active_tab: ProjectTab,
+    theme: &Theme,
+) {
+    let mut spans = vec![
+        Span::styled(" ", Style::default()),
+        Span::styled(
+            project_name,
+            Style::default()
+                .fg(theme.header_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+    ];
+    let mut x = area.x
+        + spans
+            .iter()
+            .map(|s| s.content.chars().count() as u16)
+            .sum::<u16>();
+
+    for tab in ProjectTab::ALL {
+        let label = format!(" {} ", tab.label());
+        let start = x;
+        let selected = tab == active_tab;
+        spans.push(Span::styled(
+            label.clone(),
+            if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(theme.header_color)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.dim_text)
+            },
+        ));
+        let width = label.chars().count() as u16;
+        app.project_tab_click_map.push((tab, start, start + width));
+        x += width;
+        spans.push(Span::raw(" "));
+        x += 1;
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Persisted per-project History tab: finished loops + past sessions for
+/// this project's workdir, read straight from the DB (functional
+/// requirement 5) — see `App::selected_project_history_entries`.
+fn draw_project_history_tab(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
+    let selected = app.selected_project_history;
+    let entries = app.selected_project_history_entries().to_vec();
+    if entries.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No history yet for this project.")
+                .style(Style::default().fg(theme.dim_text)),
+            area,
+        );
+        return;
+    }
+
+    let visible_count = (area.height as usize).min(entries.len());
+    for (y, (idx, entry)) in (area.y..).zip(entries.iter().take(visible_count).enumerate()) {
+        let is_selected = idx == selected;
+        let (style, marker) = selected_row_style(is_selected, theme);
+        let kind_label = match entry.kind {
+            crate::db::project::ProjectHistoryKind::Loop => "loop",
+            crate::db::project::ProjectHistoryKind::InteractiveSession => "session",
+            crate::db::project::ProjectHistoryKind::TerminalSession => "terminal",
+        };
+        let when = chrono::DateTime::from_timestamp(entry.at, 0)
+            .map(|dt| crate::tui::app::utils::relative_time(&dt))
+            .unwrap_or_default();
+        let line = Line::from(vec![
+            Span::styled(marker, style.fg(theme.header_color)),
+            Span::raw(" "),
+            Span::styled(format!("[{kind_label}] "), style.fg(theme.dim_text)),
+            Span::styled(
+                truncate_str(&entry.name, area.width.saturating_sub(20) as usize),
+                style.fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {} · {}", entry.status, when),
+                style.fg(theme.dim_text),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), Rect::new(area.x, y, area.width, 1));
+        app.project_tab_row_click_map.push((idx, y, y + 1));
+    }
+}
+
+/// Read-only preview of the selected backlog spec — name + description,
+/// same "focus already previews it" convention as `draw_loop_overview` and
+/// `draw_knowledge_overview` (no dedicated confirm step needed).
+fn draw_backlog_overview(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    if app.backlog_specs.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No backlog specs yet").style(Style::default().fg(theme.dim_text)),
+            area,
+        );
+        return;
+    }
+
+    let Some(spec) = app.backlog_specs.get(app.selected_backlog) else {
+        frame.render_widget(
+            Paragraph::new("No backlog spec selected").style(Style::default().fg(theme.dim_text)),
+            area,
+        );
+        return;
+    };
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Backlog ", Style::default().fg(theme.dim_text)),
+            Span::styled(
+                spec.name.as_str(),
+                Style::default()
+                    .fg(theme.header_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+    ];
+
+    match spec.description.as_deref() {
+        Some(description) if !description.is_empty() => {
+            for line in description.lines() {
+                lines.push(Line::from(Span::styled(
+                    line,
+                    Style::default().fg(Color::White),
+                )));
+            }
+        }
+        _ => lines.push(Line::from(Span::styled(
+            "(no description)",
+            Style::default().fg(theme.dim_text),
+        ))),
+    }
+
+    render_wrapped_paragraph(frame, area, lines);
+}
+
+fn draw_knowledge_overview(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     if app.project_knowledge.is_empty() {
         frame.render_widget(
             Paragraph::new("No knowledge yet. Agents can add facts/patterns.")
-                .style(Style::default().fg(DIM)),
+                .style(Style::default().fg(theme.dim_text)),
             area,
         );
         return;
@@ -638,7 +1044,7 @@ fn draw_knowledge_overview(frame: &mut Frame, area: Rect, app: &App) {
 
     let Some(node) = app.project_knowledge.get(app.selected_knowledge) else {
         frame.render_widget(
-            Paragraph::new("No knowledge selected").style(Style::default().fg(DIM)),
+            Paragraph::new("No knowledge selected").style(Style::default().fg(theme.dim_text)),
             area,
         );
         return;
@@ -651,10 +1057,12 @@ fn draw_knowledge_overview(frame: &mut Frame, area: Rect, app: &App) {
     };
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("Knowledge ", Style::default().fg(DIM)),
+            Span::styled("Knowledge ", Style::default().fg(theme.dim_text)),
             Span::styled(
                 node.title.as_str(),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.header_color)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
             Span::styled(format!("[{}]", node.kind), Style::default().fg(kind_color)),
@@ -672,269 +1080,18 @@ fn draw_knowledge_overview(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
 }
 
-fn draw_rag_queue_overview(frame: &mut Frame, area: Rect, app: &App) {
-    draw_rag_info_overview(frame, area, app);
-}
+fn rag_status(app: &App, theme: &Theme) -> (&'static str, Color) {
+    use crate::rag::status::{compute_rag_model_status, RagModelStatus};
 
-fn draw_workflow_overview(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(workflow) = app.selected_workflow() else {
-        frame.render_widget(
-            Paragraph::new("No workflows yet").style(Style::default().fg(DIM)),
-            area,
-        );
-        return;
-    };
-    let Some(details) = app.selected_workflow_details() else {
-        frame.render_widget(
-            Paragraph::new("Workflow details are unavailable").style(Style::default().fg(DIM)),
-            area,
-        );
-        return;
-    };
-    let Some(spec) = app.selected_workflow_spec() else {
-        frame.render_widget(
-            Paragraph::new("Workflow has no specs yet").style(Style::default().fg(DIM)),
-            area,
-        );
-        return;
-    };
-
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("Workflow ", Style::default().fg(DIM)),
-            Span::styled(
-                workflow.name.as_str(),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                workflow.status.as_str().to_uppercase(),
-                Style::default().fg(Color::White),
-            ),
-        ]),
-        Line::from(format!("Workdir: {}", workflow.workdir)),
-        Line::from(format!(
-            "Spec {}/{}: {} [{}]",
-            app.workflow_selected_spec + 1,
-            details.specs.len(),
-            spec.spec.name,
-            spec.spec.status.as_str()
-        )),
-        Line::from(Span::styled(
-            "Tab section  ·  [ ] spec  ·  ←→ node  ·  Enter/e edit",
-            Style::default().fg(DIM),
-        )),
-        Line::from(""),
-        Line::from(Span::styled("Graph", Style::default().fg(DIM))),
-    ];
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("Graph", Style::default().fg(DIM))));
-
-    if spec.nodes.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  (no nodes yet)",
-            Style::default().fg(DIM),
-        )));
-    } else {
-        lines.extend(workflow_graph_lines(
-            spec,
-            app.workflow_selected_node,
-            area.width,
-        ));
-    }
-
-    if !app.workflow_runs.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Recent runs",
-            Style::default().fg(DIM),
-        )));
-        lines.extend(app.workflow_runs.iter().rev().take(4).map(|run| {
-            Line::from(format!(
-                "  iter {}  {}  {}",
-                run.iteration,
-                run.node_id,
-                run.status.as_str()
-            ))
-        }));
-    }
-
-    render_wrapped_paragraph(frame, area, lines);
-}
-
-fn workflow_node_summary(node: &crate::domain::workflow::WorkflowNode) -> String {
-    match node.kind {
-        crate::domain::workflow::WorkflowNodeKind::Agent => node
-            .config
-            .get("prompt_template")
-            .and_then(serde_json::Value::as_str)
-            .map(|prompt| truncate_str(prompt, 72))
-            .filter(|prompt| !prompt.is_empty())
-            .unwrap_or_else(|| "prompt_template not set".to_string()),
-        crate::domain::workflow::WorkflowNodeKind::Check => node
-            .config
-            .get("command")
-            .and_then(serde_json::Value::as_str)
-            .map(|command| format!("check: {}", truncate_str(command, 72)))
-            .unwrap_or_else(|| "check config".to_string()),
-        crate::domain::workflow::WorkflowNodeKind::Gate => {
-            let evaluate = node
-                .config
-                .get("evaluate")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("gate");
-            let value = node
-                .config
-                .get("value")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            format!("{evaluate}: {}", truncate_str(value, 48))
-        }
-    }
-}
-
-fn workflow_node_box_styles(selected: bool) -> (Style, Style) {
-    if selected {
-        (
-            Style::default().fg(ACCENT),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )
-    } else {
-        (Style::default().fg(DIM), Style::default().fg(Color::White))
-    }
-}
-
-fn workflow_node_content_line(
-    node: &crate::domain::workflow::WorkflowNode,
-    selected: bool,
-    inner: usize,
-) -> Option<Line<'static>> {
-    let summary = workflow_node_summary(node);
-    if summary.is_empty() {
-        return None;
-    }
-
-    let summary_trunc = truncate_str(&summary, inner.saturating_sub(3));
-    let summary_pad = inner.saturating_sub(3 + summary_trunc.len());
-    let summary_line = format!("  │   {}{}│", summary_trunc, " ".repeat(summary_pad));
-    Some(Line::from(Span::styled(
-        summary_line,
-        if selected {
-            Style::default().fg(Color::White)
-        } else {
-            Style::default().fg(DIM)
-        },
-    )))
-}
-
-fn workflow_node_lines(
-    node: &crate::domain::workflow::WorkflowNode,
-    selected: bool,
-    inner: usize,
-) -> Vec<Line<'static>> {
-    let (border_style, text_style) = workflow_node_box_styles(selected);
-    let kind_tag = format!("[{}]", node.kind.as_str());
-    let max_name = inner.saturating_sub(2 + kind_tag.len());
-    let name_display = truncate_str(&node.name, max_name);
-    let spaces = inner.saturating_sub(2 + name_display.len() + kind_tag.len());
-    let marker = if selected { "›" } else { " " };
-
-    let mut lines = vec![
-        Line::from(Span::styled(
-            format!("  ┌{}┐", "─".repeat(inner)),
-            border_style,
-        )),
-        Line::from(Span::styled(
-            format!(
-                "  │{} {}{}{}│",
-                marker,
-                name_display,
-                " ".repeat(spaces),
-                kind_tag
-            ),
-            text_style,
-        )),
-    ];
-
-    if let Some(content) = workflow_node_content_line(node, selected, inner) {
-        lines.push(content);
-    }
-
-    lines.push(Line::from(Span::styled(
-        format!("  └{}┘", "─".repeat(inner)),
-        border_style,
-    )));
-
-    lines
-}
-
-fn workflow_edge_lines(
-    edges: &[(usize, crate::domain::workflow::WorkflowEdgeCondition)],
-    spec_nodes: &[crate::domain::workflow::WorkflowNode],
-) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    for (i, (target_idx, condition)) in edges.iter().enumerate() {
-        let branch = if i == edges.len() - 1 { "└" } else { "├" };
-        let target_name = spec_nodes
-            .get(*target_idx)
-            .map(|n| n.name.clone())
-            .unwrap_or_else(|| "?".to_string());
-        lines.push(Line::from(Span::styled(
-            format!("   {}─ {} → {}", branch, condition.as_str(), target_name),
-            Style::default().fg(DIM),
-        )));
-    }
-    lines
-}
-
-fn workflow_graph_lines(
-    spec: &crate::domain::workflow::WorkflowSpecDetails,
-    selected_node_idx: usize,
-    area_width: u16,
-) -> Vec<Line<'static>> {
-    use std::collections::HashMap;
-
-    let mut outgoing: HashMap<&str, Vec<(usize, crate::domain::workflow::WorkflowEdgeCondition)>> =
-        HashMap::new();
-    for edge in &spec.edges {
-        if let Some(target_idx) = spec.nodes.iter().position(|n| n.id == edge.to_node) {
-            outgoing
-                .entry(edge.from_node.as_str())
-                .or_default()
-                .push((target_idx, edge.condition));
-        }
-    }
-
-    let box_width = (area_width as usize).saturating_sub(4).clamp(22, 48);
-    let inner = box_width.saturating_sub(2);
-
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    for (idx, node) in spec.nodes.iter().enumerate() {
-        let selected = idx == selected_node_idx;
-        lines.extend(workflow_node_lines(node, selected, inner));
-
-        if let Some(edges) = outgoing.get(node.id.as_str()) {
-            lines.extend(workflow_edge_lines(edges, &spec.nodes));
-            lines.push(Line::from(""));
-        } else if idx < spec.nodes.len() - 1 {
-            lines.push(Line::from(""));
-        }
-    }
-
-    lines
-}
-
-fn rag_status(app: &App) -> (&'static str, Color) {
-    if app.rag_paused {
-        ("⏸ paused", Color::Yellow)
-    } else if app.rag_info.processing_items > 0 {
-        ("◉ indexing", Color::Yellow)
-    } else if app.rag_info.queued_items > 0 {
-        ("⏳ pending", Color::Yellow)
-    } else {
-        ("✓ ready", ACCENT)
+    match compute_rag_model_status(
+        app.rag_paused,
+        app.rag_model_loaded,
+        app.rag_info.processing_items,
+    ) {
+        RagModelStatus::Paused => ("⏸ paused", Color::Yellow),
+        RagModelStatus::Ready if app.rag_info.processing_items > 0 => ("◉ indexing", Color::Yellow),
+        RagModelStatus::Ready => ("● ready", theme.header_color),
+        RagModelStatus::Sleeping => ("○ sleeping", theme.dim_text),
     }
 }
 
@@ -951,16 +1108,19 @@ fn rag_summary_lines(
     status_text: &'static str,
     status_color: Color,
     queue_text: String,
+    theme: &Theme,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("Chunks: ", Style::default().fg(DIM)),
+            Span::styled("Chunks: ", Style::default().fg(theme.dim_text)),
             Span::styled(
                 app.rag_info.total_chunks.to_string(),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.header_color)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled("Files: ", Style::default().fg(DIM)),
+            Span::styled("Files: ", Style::default().fg(theme.dim_text)),
             Span::styled(
                 app.rag_info.indexed_files.to_string(),
                 Style::default()
@@ -971,50 +1131,55 @@ fn rag_summary_lines(
         labeled_value_line(
             "Status: ",
             Span::styled(status_text, Style::default().fg(status_color)),
+            theme,
         ),
     ];
     if !queue_text.is_empty() {
         lines.push(labeled_value_line(
             "Queue:  ",
             Span::styled(queue_text, Style::default().fg(Color::White)),
+            theme,
         ));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "Press Enter to open the global RAG playground.",
-        Style::default().fg(ACCENT),
+        Style::default().fg(theme.header_color),
     )));
     lines
 }
 
-fn draw_rag_info_overview(frame: &mut Frame, area: Rect, app: &App) {
-    let (status_text, status_color) = rag_status(app);
-    let mut lines = rag_summary_lines(app, status_text, status_color, rag_queue_text(app));
+fn draw_rag_info_overview(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let (status_text, status_color) = rag_status(app, theme);
+    let mut lines = rag_summary_lines(app, status_text, status_color, rag_queue_text(app), theme);
 
     if !app.rag_file_status.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled("Recent files  ", Style::default().fg(DIM)),
+            Span::styled("Recent files  ", Style::default().fg(theme.dim_text)),
             Span::styled(
                 format!("({}) ", app.rag_file_status.len()),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.header_color)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]));
-        lines.extend(rag_file_status_lines(&app.rag_file_status, area));
+        lines.extend(rag_file_status_lines(&app.rag_file_status, area, theme));
     } else if !app.global_rag_queue.is_empty() {
         lines.extend(rag_queue_lines(
             &app.global_rag_queue,
             app.selected_rag_queue,
+            theme,
         ));
     }
 
     render_wrapped_paragraph(frame, area, lines);
 }
 
-fn rag_file_icon_and_color(event_type: &str) -> (&'static str, Color) {
+fn rag_file_icon_and_color(event_type: &str, theme: &Theme) -> (&'static str, Color) {
     match event_type {
         "indexed" => ("✓", Color::Green),
-        "deleted" => ("○", DIM),
+        "deleted" => ("○", theme.dim_text),
         _ => ("✗", Color::Red),
     }
 }
@@ -1036,8 +1201,9 @@ fn rag_file_entry_lines(
     file: &crate::db::project::RagPerFileStatus,
     name_width: usize,
     detail_width: usize,
+    theme: &Theme,
 ) -> Vec<Line<'static>> {
-    let (icon, icon_color) = rag_file_icon_and_color(&file.last_event_type);
+    let (icon, icon_color) = rag_file_icon_and_color(&file.last_event_type, theme);
     let filename = std::path::Path::new(&file.file_path)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -1056,8 +1222,8 @@ fn rag_file_entry_lines(
             ),
         ]),
         Line::from(vec![
-            Span::styled("   ", Style::default().fg(DIM)),
-            Span::styled(detail, Style::default().fg(DIM)),
+            Span::styled("   ", Style::default().fg(theme.dim_text)),
+            Span::styled(detail, Style::default().fg(theme.dim_text)),
         ]),
     ]
 }
@@ -1065,6 +1231,7 @@ fn rag_file_entry_lines(
 fn rag_file_status_lines(
     files: &[crate::db::project::RagPerFileStatus],
     area: Rect,
+    theme: &Theme,
 ) -> Vec<Line<'static>> {
     let max_rows = (area.height as usize).saturating_sub(8).max(2);
     let name_width = area.width.saturating_sub(4) as usize;
@@ -1072,14 +1239,14 @@ fn rag_file_status_lines(
 
     let mut lines = Vec::new();
     for file in files.iter().take(max_rows) {
-        lines.extend(rag_file_entry_lines(file, name_width, detail_width));
+        lines.extend(rag_file_entry_lines(file, name_width, detail_width, theme));
     }
 
     if max_rows < files.len() {
         let remaining = files.len() - max_rows;
         lines.push(Line::from(Span::styled(
             format!("  … {} more (open playground for full details)", remaining),
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         )));
     }
     lines
@@ -1088,24 +1255,27 @@ fn rag_file_status_lines(
 fn rag_queue_lines(
     queue: &[crate::db::project::RagQueueItem],
     selected: usize,
+    theme: &Theme,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled("Queue items ", Style::default().fg(DIM)),
+            Span::styled("Queue items ", Style::default().fg(theme.dim_text)),
             Span::styled(
                 format!("({})", queue.len()),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.header_color)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]),
     ];
 
     for (idx, item) in queue.iter().enumerate().take(8) {
-        let (line_style, marker) = selected_row_style(idx == selected);
+        let (line_style, marker) = selected_row_style(idx == selected, theme);
         let status_color = if item.status == "processing" {
             Color::Yellow
         } else {
-            ACCENT
+            theme.header_color
         };
         lines.push(Line::from(vec![
             Span::styled(marker, line_style.fg(status_color)),
@@ -1114,62 +1284,67 @@ fn rag_queue_lines(
                 truncate_str(&item.source_path, 40),
                 line_style.fg(Color::White).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!("  {}", item.status), line_style.fg(DIM)),
+            Span::styled(format!("  {}", item.status), line_style.fg(theme.dim_text)),
         ]));
     }
 
     lines
 }
 
-fn draw_playground_panel(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_playground_panel(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     if app.playground_detail_mode {
-        draw_playground_detail(frame, area, app);
+        draw_playground_detail(frame, area, app, theme);
     } else {
-        draw_playground_list(frame, area, app);
+        draw_playground_list(frame, area, app, theme);
     }
 }
 
-fn playground_header_lines(app: &App) -> Vec<Line<'static>> {
+fn playground_header_lines(app: &App, theme: &Theme) -> Vec<Line<'static>> {
     let scope_label = playground_scope_label(app);
     let query = &app.playground_query;
 
     let mut header = vec![Line::from(vec![
-        Span::styled("RAG Playground ", Style::default().fg(DIM)),
+        Span::styled("RAG Playground ", Style::default().fg(theme.dim_text)),
         Span::styled(
             format!("({scope_label}) "),
             Style::default().fg(Color::Yellow),
         ),
         Span::styled(
             format!("· {query}"),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.header_color)
+                .add_modifier(Modifier::BOLD),
         ),
     ])];
 
     if app.playground_search_pending {
         header.push(Line::from(vec![
             Span::styled("  ◉ Searching", Style::default().fg(Color::Yellow)),
-            Span::styled(" · press Esc to cancel", Style::default().fg(DIM)),
+            Span::styled(
+                " · press Esc to cancel",
+                Style::default().fg(theme.dim_text),
+            ),
         ]));
     } else if !app.playground_results.is_empty() {
         header.push(Line::from(vec![
-            Span::styled("  ✓ ", Style::default().fg(ACCENT)),
+            Span::styled("  ✓ ", Style::default().fg(theme.header_color)),
             Span::styled(
                 format!("{} results", app.playground_results.len()),
-                Style::default().fg(ACCENT),
+                Style::default().fg(theme.header_color),
             ),
         ]));
     }
 
     header.push(Line::from(Span::styled(
         "Type to search · ↑↓ navigate · Tab toggle scope · Enter focus · Ctrl+T transfer · Esc close",
-        Style::default().fg(DIM),
+        Style::default().fg(theme.dim_text),
     )));
     header.push(Line::from(""));
 
     header
 }
 
-fn playground_empty_state(app: &App) -> Line<'static> {
+fn playground_empty_state(app: &App, theme: &Theme) -> Line<'static> {
     let message = if app.playground_query.trim().is_empty() {
         "Start typing to search indexed chunks."
     } else if app.playground_search_pending {
@@ -1180,7 +1355,7 @@ fn playground_empty_state(app: &App) -> Line<'static> {
     let color = if app.playground_search_pending {
         Color::Yellow
     } else {
-        DIM
+        theme.dim_text
     };
     Line::from(Span::styled(message, Style::default().fg(color)))
 }
@@ -1205,11 +1380,11 @@ fn project_name_for_chunk<'a>(
         .unwrap_or("?")
 }
 
-fn draw_playground_list(frame: &mut Frame, area: Rect, app: &App) {
-    let mut lines = playground_header_lines(app);
+fn draw_playground_list(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let mut lines = playground_header_lines(app, theme);
 
     if app.playground_results.is_empty() {
-        lines.push(playground_empty_state(app));
+        lines.push(playground_empty_state(app, theme));
         render_wrapped_paragraph(frame, area, lines);
         return;
     }
@@ -1228,18 +1403,19 @@ fn draw_playground_list(frame: &mut Frame, area: Rect, app: &App) {
             project_name_for_chunk(app, chunk),
             idx == app.playground_selected,
             area.width,
+            theme,
         ));
     }
 
     if total > max_visible {
         lines.push(Line::from(Span::styled(
             format!("  {}/{} results", app.playground_selected + 1, total),
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         )));
     } else {
         lines.push(Line::from(Span::styled(
             format!("  {} results", total),
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         )));
     }
 
@@ -1259,14 +1435,15 @@ fn render_chunk_entry<'a>(
     project_name: &'a str,
     selected: bool,
     width: u16,
+    theme: &Theme,
 ) -> Vec<Line<'a>> {
-    let (style, marker) = selected_row_style(selected);
+    let (style, marker) = selected_row_style(selected, theme);
     let dist = chunk
         .distance
         .map_or("—".to_string(), |d| format!("{d:.3}"));
     let path = format!("{} · {} [dist={}]", project_name, chunk.file_path, dist);
     let mut lines = vec![Line::from(vec![
-        Span::styled(marker, style.fg(ACCENT)),
+        Span::styled(marker, style.fg(theme.header_color)),
         Span::raw(" "),
         Span::styled(
             truncate_str(&path, width.saturating_sub(3) as usize),
@@ -1279,7 +1456,7 @@ fn render_chunk_entry<'a>(
             Span::styled("   ", style),
             Span::styled(
                 truncate_str(line, width.saturating_sub(6) as usize),
-                style.fg(DIM),
+                style.fg(theme.dim_text),
             ),
         ]));
     }
@@ -1288,13 +1465,16 @@ fn render_chunk_entry<'a>(
     lines
 }
 
-fn playground_detail_header(chunk: &crate::rag::vector_store::SearchResult) -> Vec<Line<'static>> {
+fn playground_detail_header(
+    chunk: &crate::rag::vector_store::SearchResult,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     let dist = chunk
         .distance
         .map_or("—".to_string(), |d| format!("{d:.4}"));
     vec![
         Line::from(vec![
-            Span::styled("‹ ", Style::default().fg(ACCENT)),
+            Span::styled("‹ ", Style::default().fg(theme.header_color)),
             Span::styled(
                 format!("{} [dist={}]", chunk.file_path, dist),
                 Style::default()
@@ -1304,7 +1484,7 @@ fn playground_detail_header(chunk: &crate::rag::vector_store::SearchResult) -> V
         ]),
         Line::from(Span::styled(
             "↑↓ scroll · Enter/Ctrl+T transfer · Esc back to list",
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         )),
         Line::from(""),
     ]
@@ -1314,6 +1494,7 @@ fn detail_progress_line(
     total_lines: usize,
     visible_lines: usize,
     start: usize,
+    theme: &Theme,
 ) -> Option<Line<'static>> {
     if total_lines <= visible_lines {
         return None;
@@ -1325,16 +1506,16 @@ fn detail_progress_line(
         .min(100);
     Some(Line::from(Span::styled(
         format!("  ── {percent}% ──"),
-        Style::default().fg(DIM),
+        Style::default().fg(theme.dim_text),
     )))
 }
 
-fn draw_playground_detail(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_playground_detail(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let Some(chunk) = app.playground_results.get(app.playground_selected) else {
         return;
     };
 
-    let mut lines = playground_detail_header(chunk);
+    let mut lines = playground_detail_header(chunk, theme);
     let content_lines: Vec<&str> = chunk.content.lines().collect();
     let visible_lines = area.height.saturating_sub(5) as usize;
     let start = (app.playground_scroll as usize).min(content_lines.len().saturating_sub(1));
@@ -1347,7 +1528,7 @@ fn draw_playground_detail(frame: &mut Frame, area: Rect, app: &App) {
         )));
     }
 
-    if let Some(progress) = detail_progress_line(content_lines.len(), visible_lines, start) {
+    if let Some(progress) = detail_progress_line(content_lines.len(), visible_lines, start, theme) {
         lines.push(Line::from(""));
         lines.push(progress);
     }
@@ -1364,6 +1545,7 @@ pub(super) fn draw_split_panel(
     app: &mut App,
     session_name: &str,
     focused: bool,
+    theme: &Theme,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -1371,9 +1553,9 @@ pub(super) fn draw_split_panel(
 
     let found = find_session_by_name(app, session_name);
     let border_color = if focused {
-        found.map_or(DIM, |session| session.accent(app))
+        found.map_or(theme.border_color, |session| session.accent(app))
     } else {
-        DIM
+        theme.border_color
     };
     let title = Span::styled(
         if focused {
@@ -1386,18 +1568,19 @@ pub(super) fn draw_split_panel(
             .add_modifier(Modifier::BOLD),
     );
 
-    let inner = render_panel_block(frame, area, border_color, Some(title));
+    let inner = render_panel_block(frame, area, border_color, Some(title), theme);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
 
     if focused {
         app.last_panel_inner = (inner.width, inner.height);
+        app.last_panel_x = inner.x;
         app.last_panel_y = inner.y;
     }
 
     let Some(session) = found else {
-        render_missing_session(frame, inner, session_name);
+        render_missing_session(frame, inner, session_name, theme);
         return;
     };
 
@@ -1418,6 +1601,7 @@ pub(super) fn draw_split_panel(
         app,
         false,
         focused && matches!(app.focus, Focus::Agent),
+        None,
     );
 }
 
@@ -1429,10 +1613,10 @@ fn draw_split_warp_panel(
     snap: Option<&ScreenSnapshot>,
     focused: bool,
 ) {
-    let (pty_area, input_area) = split_warp_areas(area);
+    let (pty_area, input_area) = split_warp_areas(area, &warp_input_text(app, terminal_idx));
 
     if let Some(snap) = snap {
-        render_snapshot(frame, pty_area, snap, app, false, false);
+        render_snapshot(frame, pty_area, snap, app, false, false, None);
     }
 
     if focused && matches!(app.focus, Focus::Agent) {
@@ -1441,13 +1625,14 @@ fn draw_split_warp_panel(
 
     if focused {
         app.last_panel_inner = (pty_area.width, pty_area.height);
+        app.last_panel_x = pty_area.x;
         app.last_panel_y = pty_area.y;
     }
 }
 
-fn render_missing_session(frame: &mut Frame, area: Rect, session_name: &str) {
+fn render_missing_session(frame: &mut Frame, area: Rect, session_name: &str, theme: &Theme) {
     let message = Paragraph::new(format!("  Session '{session_name}' not found"))
-        .style(Style::default().fg(DIM));
+        .style(Style::default().fg(theme.dim_text));
     frame.render_widget(message, area);
 }
 
@@ -1474,7 +1659,12 @@ impl SessionRef {
 
     fn warp_terminal_idx(self, app: &App) -> Option<usize> {
         match self {
-            SessionRef::Terminal(idx) if app.terminal_agents[idx].warp_mode => Some(idx),
+            SessionRef::Terminal(idx)
+                if app.terminal_agents[idx].warp_mode
+                    && !app.terminal_agents[idx].should_bypass_warp_input() =>
+            {
+                Some(idx)
+            }
             _ => None,
         }
     }
@@ -1500,10 +1690,92 @@ fn find_session_by_name(app: &App, name: &str) -> Option<SessionRef> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::theme::Theme;
     use super::adjusted_interactive_cursor_col;
+    use super::draw_backlog_overview;
+    use super::panel_focus_colors;
+    use super::split_warp_areas;
+    use super::warp;
+    use super::*;
     use crate::tui::agent::screen::VtCell;
     use crate::tui::agent::ScreenSnapshot;
+    use crate::tui::app::types::{App, Focus};
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
     use ratatui::style::Color;
+    use ratatui::Terminal;
+    use std::sync::Arc;
+
+    fn render_to_text(
+        width: u16,
+        height: u16,
+        draw: impl FnOnce(&mut ratatui::Frame, Rect),
+    ) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw(frame, area);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn backlog_overview_previews_selected_spec_name_and_description_read_only() {
+        use crate::db::Database;
+        use crate::domain::loops::{LoopSpec, LoopSpecStatus};
+        use std::sync::Arc;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        db.insert_loop_spec(&LoopSpec {
+            id: "spec-1".to_string(),
+            loop_id: None,
+            name: "Add retry backoff".to_string(),
+            description: Some("## Objective\nRetry requests with backoff.".to_string()),
+            position: 0,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
+        assert_eq!(app.backlog_specs.len(), 1, "backlog spec should be loaded");
+
+        let text = render_to_text(50, 10, |frame, area| {
+            draw_backlog_overview(frame, area, &app, &Theme::classic());
+        });
+
+        assert!(
+            text.contains("Add retry backoff"),
+            "expected spec name in preview, got:\n{text}"
+        );
+        assert!(
+            text.contains("Retry requests with backoff."),
+            "expected spec description in preview, got:\n{text}"
+        );
+    }
 
     #[test]
     fn copilot_cursor_no_longer_shifted_without_inverse() {
@@ -1531,6 +1803,7 @@ mod tests {
             bold: false,
             underline: false,
             inverse: true,
+            wide_continuation: false,
         });
         let snap = ScreenSnapshot {
             cells: vec![row],
@@ -1550,5 +1823,520 @@ mod tests {
             scrolled: false,
         };
         assert_eq!(adjusted_interactive_cursor_col("opencode", &snap), 5);
+    }
+
+    #[test]
+    fn split_warp_areas_reserves_four_rows_for_empty_input() {
+        let area = Rect::new(0, 0, 80, 20);
+        let (pty_area, input_area) = split_warp_areas(area, "");
+        assert_eq!(input_area.height, 4);
+        // 1 row gap + 4 row input box.
+        assert_eq!(pty_area.height, 15);
+    }
+
+    #[test]
+    fn split_warp_areas_leaves_one_row_gap_above_input() {
+        let area = Rect::new(0, 0, 80, 20);
+        let (pty_area, input_area) = split_warp_areas(area, "hello");
+        assert_eq!(input_area.y, pty_area.y + pty_area.height + 1);
+    }
+
+    #[test]
+    fn warp_input_height_short_text_stays_at_base() {
+        // 100 chars at 40 cols wraps to 3 lines, which fits within the
+        // base box without growing it.
+        let text = "a".repeat(100);
+        assert_eq!(warp::input_height(&text, 40), 4);
+    }
+
+    #[test]
+    fn warp_input_height_long_text_grows() {
+        // 200 chars at 40 cols wraps to 5 lines: 2 lines beyond the
+        // 3-line base capacity, so the box grows from 4 to 6 rows.
+        let text = "a".repeat(200);
+        let height = warp::input_height(&text, 40);
+        assert!((5..=6).contains(&height), "height was {height}");
+    }
+
+    #[test]
+    fn warp_input_height_explicit_newlines_grow_and_cap_at_max() {
+        let text = "a\nb\nc\nd\ne\nf\ng"; // 7 lines
+        assert_eq!(warp::input_height(text, 40), 8);
+    }
+
+    #[test]
+    fn warp_input_height_empty_is_base() {
+        assert_eq!(warp::input_height("", 40), 4);
+    }
+
+    #[test]
+    fn focus_agent_draws_full_accent_border() {
+        let theme = Theme::classic();
+        let accent = Color::Rgb(200, 50, 50);
+        let (border, label) = panel_focus_colors(Focus::Agent, Some(accent), &theme);
+        assert_eq!(border, accent);
+        assert_eq!(label, accent);
+    }
+
+    #[test]
+    fn focus_preview_keeps_normal_border_and_accents_only_label() {
+        let theme = Theme::classic();
+        let accent = Color::Rgb(50, 200, 50);
+        let (border, label) = panel_focus_colors(Focus::Preview, Some(accent), &theme);
+        assert_eq!(border, theme.border_color);
+        assert_eq!(label, accent);
+    }
+
+    #[test]
+    fn other_focus_states_use_normal_border_and_label() {
+        let theme = Theme::classic();
+        let accent = Color::Rgb(50, 50, 200);
+        let (border, label) = panel_focus_colors(Focus::Home, Some(accent), &theme);
+        assert_eq!(border, theme.border_color);
+        assert_eq!(label, theme.border_color);
+    }
+
+    #[test]
+    fn missing_accent_falls_back_to_border_color_everywhere() {
+        let theme = Theme::classic();
+        assert_eq!(
+            panel_focus_colors(Focus::Agent, None, &theme),
+            (theme.border_color, theme.border_color)
+        );
+        assert_eq!(
+            panel_focus_colors(Focus::Preview, None, &theme),
+            (theme.border_color, theme.border_color)
+        );
+    }
+
+    #[test]
+    fn format_unix_timestamp_valid() {
+        let ts = 1_700_000_000; // 2023-11-14 22:13:20 UTC
+        let result = format_unix_timestamp(ts);
+        assert!(result.contains("2023"), "Should contain year: {result}");
+    }
+
+    #[test]
+    fn format_unix_timestamp_zero() {
+        let result = format_unix_timestamp(0);
+        // Epoch 0 is 1970-01-01 UTC, displayed as local time
+        assert!(!result.is_empty(), "Should produce a string: {result}");
+    }
+
+    #[test]
+    fn render_wrapped_paragraph_zero_area() {
+        let backend = TestBackend::new(10, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, 0, 0);
+                render_wrapped_paragraph(frame, area, vec![]);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn render_panel_block_with_title() {
+        let backend = TestBackend::new(30, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::classic();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let title = Span::styled(" Test ", Style::default().fg(Color::White));
+                let inner = render_panel_block(frame, area, Color::Cyan, Some(title), &theme);
+                assert!(inner.width > 0);
+                assert!(inner.height > 0);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn render_panel_block_without_title() {
+        let backend = TestBackend::new(30, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::classic();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let inner = render_panel_block(frame, area, Color::Cyan, None, &theme);
+                assert!(inner.width > 0);
+                assert!(inner.height > 0);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn render_panel_block_modern_theme_no_borders() {
+        let backend = TestBackend::new(30, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::modern();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let inner = render_panel_block(frame, area, Color::Cyan, None, &theme);
+                // Modern theme: no borders, so inner == area
+                assert_eq!(inner, area);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn set_cursor_from_snapshot_scrolled_no_cursor() {
+        let backend = TestBackend::new(20, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let snap = ScreenSnapshot {
+            cells: vec![],
+            cursor_row: 5,
+            cursor_col: 5,
+            scrolled: true,
+        };
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, 20, 10);
+                set_cursor_from_snapshot(frame, area, &snap);
+            })
+            .unwrap();
+        // Scrolled: no cursor set
+    }
+
+    #[test]
+    fn set_cursor_from_snapshot_zero_area() {
+        let backend = TestBackend::new(20, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let snap = ScreenSnapshot {
+            cells: vec![],
+            cursor_row: 0,
+            cursor_col: 0,
+            scrolled: false,
+        };
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, 0, 0);
+                set_cursor_from_snapshot(frame, area, &snap);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn labeled_value_line_renders() {
+        let theme = Theme::classic();
+        let line = labeled_value_line("Key: ", Span::raw("value"), &theme);
+        assert_eq!(line.width(), 10); // "Key: " + "value"
+    }
+
+    #[test]
+    fn selected_row_style_selected() {
+        let theme = Theme::classic();
+        let (style, marker) = selected_row_style(true, &theme);
+        assert_eq!(style.bg, Some(theme.selected_bg));
+        assert_eq!(marker, "›");
+    }
+
+    #[test]
+    fn selected_row_style_not_selected() {
+        let theme = Theme::classic();
+        let (style, marker) = selected_row_style(false, &theme);
+        assert_eq!(style.bg, None);
+        assert_eq!(marker, " ");
+    }
+
+    #[test]
+    fn panel_mode_label_preview() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(db, data_dir.path()).unwrap();
+        app.focus = Focus::Preview;
+        assert_eq!(panel_mode_label(&app), Some(" Preview "));
+    }
+
+    #[test]
+    fn panel_mode_label_agent() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(db, data_dir.path()).unwrap();
+        app.focus = Focus::Agent;
+        assert_eq!(panel_mode_label(&app), Some(" Focus "));
+    }
+
+    #[test]
+    fn panel_mode_label_home() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(db, data_dir.path()).unwrap();
+        app.focus = Focus::Home;
+        assert_eq!(panel_mode_label(&app), None);
+    }
+
+    #[test]
+    fn show_home_fallback_empty_agents_and_projects() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(db, data_dir.path()).unwrap();
+        app.focus = Focus::Home;
+        assert!(show_home_fallback(&app));
+    }
+
+    #[test]
+    fn show_home_fallback_not_when_dialog_open() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(db, data_dir.path()).unwrap();
+        app.focus = Focus::NewAgentDialog;
+        assert!(!show_home_fallback(&app));
+    }
+
+    #[test]
+    fn draw_log_panel_zero_area_no_panic() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(db, data_dir.path()).unwrap();
+        let backend = TestBackend::new(20, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::classic();
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, 0, 0);
+                draw_log_panel(frame, area, &mut app, &theme);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn draw_split_panel_zero_area_no_panic() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(db, data_dir.path()).unwrap();
+        let backend = TestBackend::new(20, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::classic();
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, 0, 0);
+                draw_split_panel(frame, area, &mut app, "test-session", true, &theme);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn draw_corrupt_agent_panel_renders() {
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let corrupt = crate::domain::models::CorruptAgent {
+            id: "bad-agent".to_string(),
+            enabled: false,
+            error: "failed to parse JSON".to_string(),
+        };
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_corrupt_agent_panel(frame, area, &corrupt);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(text.contains("bad-agent"), "Should show agent id: {text}");
+        assert!(
+            text.contains("corrupt config"),
+            "Should show corrupt config: {text}"
+        );
+    }
+
+    #[test]
+    fn draw_home_panel_renders() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let app = App::new(db, data_dir.path()).unwrap();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_home_panel(frame, area, &app);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn rag_file_icon_and_color_indexed() {
+        let theme = Theme::classic();
+        let (icon, color) = rag_file_icon_and_color("indexed", &theme);
+        assert_eq!(icon, "✓");
+        assert_eq!(color, Color::Green);
+    }
+
+    #[test]
+    fn rag_file_icon_and_color_deleted() {
+        let theme = Theme::classic();
+        let (icon, color) = rag_file_icon_and_color("deleted", &theme);
+        assert_eq!(icon, "○");
+        assert_eq!(color, theme.dim_text);
+    }
+
+    #[test]
+    fn rag_file_icon_and_color_error() {
+        let theme = Theme::classic();
+        let (icon, color) = rag_file_icon_and_color("error", &theme);
+        assert_eq!(icon, "✗");
+        assert_eq!(color, Color::Red);
+    }
+
+    #[test]
+    fn rag_file_detail_error_with_message() {
+        use crate::db::project::RagPerFileStatus;
+        let file = RagPerFileStatus {
+            file_path: "test.rs".to_string(),
+            last_event_type: "error".to_string(),
+            last_detail: Some("parse failed".to_string()),
+            times_indexed: 0,
+            last_at: 0,
+        };
+        let detail = rag_file_detail(&file, 50);
+        assert!(detail.starts_with("error:"));
+    }
+
+    #[test]
+    fn rag_file_detail_error_no_message() {
+        use crate::db::project::RagPerFileStatus;
+        let file = RagPerFileStatus {
+            file_path: "test.rs".to_string(),
+            last_event_type: "error".to_string(),
+            last_detail: None,
+            times_indexed: 0,
+            last_at: 0,
+        };
+        let detail = rag_file_detail(&file, 50);
+        assert_eq!(detail, "error");
+    }
+
+    #[test]
+    fn rag_file_detail_deleted() {
+        use crate::db::project::RagPerFileStatus;
+        let file = RagPerFileStatus {
+            file_path: "test.rs".to_string(),
+            last_event_type: "deleted".to_string(),
+            last_detail: None,
+            times_indexed: 0,
+            last_at: 0,
+        };
+        let detail = rag_file_detail(&file, 50);
+        assert_eq!(detail, "deleted");
+    }
+
+    #[test]
+    fn rag_file_detail_indexed() {
+        use crate::db::project::RagPerFileStatus;
+        let file = RagPerFileStatus {
+            file_path: "test.rs".to_string(),
+            last_event_type: "indexed".to_string(),
+            last_detail: None,
+            times_indexed: 3,
+            last_at: 0,
+        };
+        let detail = rag_file_detail(&file, 50);
+        assert_eq!(detail, "indexed ×3");
+    }
+
+    #[test]
+    fn visible_playground_window_basic() {
+        let area = Rect::new(0, 0, 80, 20);
+        let (max_visible, scroll_start) = visible_playground_window(area, 0);
+        assert!(max_visible > 0);
+        assert_eq!(scroll_start, 0);
+    }
+
+    #[test]
+    fn visible_playground_window_scrolled() {
+        let area = Rect::new(0, 0, 80, 20);
+        let (max_visible, scroll_start) = visible_playground_window(area, 10);
+        assert!(scroll_start > 0 || max_visible >= 10);
+    }
+
+    #[test]
+    fn playground_scope_label_global() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let app = App::new(db, data_dir.path()).unwrap();
+        assert_eq!(playground_scope_label(&app), "Global");
+    }
+
+    #[test]
+    fn detail_progress_line_all_visible() {
+        let theme = Theme::classic();
+        let result = detail_progress_line(5, 10, 0, &theme);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn detail_progress_line_partial() {
+        let theme = Theme::classic();
+        let result = detail_progress_line(100, 10, 50, &theme);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn rag_status_lines_empty_queue() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(db, data_dir.path()).unwrap();
+        app.rag_info.queued_items = 0;
+        let theme = Theme::classic();
+        let lines = rag_summary_lines(&app, "● ready", theme.header_color, String::new(), &theme);
+        assert!(!lines.is_empty());
+    }
+
+    #[test]
+    fn rag_status_lines_with_queue() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let app = App::new(db, data_dir.path()).unwrap();
+        let theme = Theme::classic();
+        let lines = rag_summary_lines(
+            &app,
+            "● ready",
+            theme.header_color,
+            "3 queued".to_string(),
+            &theme,
+        );
+        assert!(!lines.is_empty());
     }
 }

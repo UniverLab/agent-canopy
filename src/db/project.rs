@@ -17,6 +17,27 @@ pub struct RagQueueItem {
     pub queued_at: i64,
 }
 
+/// One row in a project's persisted History tab: a finished loop or a past
+/// (no longer live) interactive/terminal session, scoped to the project's
+/// workdir and ordered newest-first. Unlike the live agent/loop providers
+/// (which only know about what's running in *this* TUI process), this reads
+/// straight from SQLite so history survives a restart.
+#[derive(Debug, Clone)]
+pub struct ProjectHistoryEntry {
+    pub kind: ProjectHistoryKind,
+    pub name: String,
+    pub status: String,
+    /// Unix timestamp used for sorting and relative-time display.
+    pub at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectHistoryKind {
+    Loop,
+    InteractiveSession,
+    TerminalSession,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RagInfoSummary {
     pub total_chunks: i64,
@@ -347,7 +368,8 @@ fn row_to_rag_queue_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<RagQueueIt
 pub struct RagFileEvent {
     pub id: i64,
     pub file_path: String,
-    /// `"indexed"` | `"deleted"` | `"error"`
+    /// `"indexed"` | `"deleted"` | `"error"` | `"failed"` (permanent give-up)
+    /// | `"skipped_oversize"` (exceeds `FILE_MAX_BYTES`, `detail` holds size in bytes)
     pub event_type: String,
     pub detail: Option<String>,
     pub occurred_at: i64,
@@ -384,7 +406,7 @@ impl Database {
             "SELECT id, file_path, event_type, detail, occurred_at
                FROM rag_file_events
               WHERE file_path = ?1
-              ORDER BY occurred_at DESC",
+              ORDER BY occurred_at DESC, id DESC",
         )?;
         let rows = stmt.query_map(rusqlite::params![file_path], row_to_rag_file_event)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -400,7 +422,7 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT id, file_path, event_type, detail, occurred_at
                FROM rag_file_events
-              ORDER BY occurred_at DESC
+              ORDER BY occurred_at DESC, id DESC
               LIMIT ?1",
         )?;
         let rows = stmt.query_map(rusqlite::params![limit as i64], row_to_rag_file_event)?;
@@ -463,6 +485,51 @@ impl Database {
             map.insert(path, ts);
         }
         Ok(map)
+    }
+
+    /// Count of `"error"` events recorded for a given file path.
+    pub fn rag_error_count(&self, file_path: &str) -> Result<i64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM rag_file_events WHERE file_path = ?1 AND event_type = 'error'",
+            rusqlite::params![file_path],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Return the set of file paths that have been permanently given up on:
+    /// at least one `"failed"` event with no later `"indexed"` event. A
+    /// successful re-index (e.g. after a manual re-add) clears the file from
+    /// this set, mirroring how `indexed_files_timestamps` treats `"deleted"`.
+    pub fn permanently_failed_rag_files(&self) -> Result<std::collections::HashSet<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT file_path
+               FROM (
+                   SELECT
+                       file_path,
+                       MAX(CASE WHEN event_type = 'failed' THEN occurred_at END) AS last_failed_at,
+                       MAX(CASE WHEN event_type = 'indexed' THEN occurred_at END) AS last_indexed_at
+                   FROM rag_file_events
+                   GROUP BY file_path
+               ) s
+              WHERE s.last_failed_at IS NOT NULL
+                AND (s.last_indexed_at IS NULL OR s.last_failed_at > s.last_indexed_at)",
+        )?;
+        let mut set = std::collections::HashSet::new();
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            set.insert(path);
+        }
+        Ok(set)
     }
 }
 
@@ -533,5 +600,247 @@ impl Database {
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+}
+
+fn parse_rfc3339_timestamp(value: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|dt| dt.timestamp())
+        .unwrap_or(0)
+}
+
+impl Database {
+    /// Persisted history for a project's `Focus → History` tab: finished
+    /// loops plus past (exited/finished) interactive and terminal sessions,
+    /// all scoped to `workdir` and merged newest-first. Reads straight from
+    /// SQLite (via the `idx_loops_workdir_created`,
+    /// `idx_interactive_sessions_workdir`, and `idx_terminal_sessions_workdir`
+    /// indices) rather than the live agent/loop providers, which only know
+    /// about state observed since this TUI process started.
+    pub fn list_project_history(
+        &self,
+        workdir: &str,
+        limit: usize,
+    ) -> Result<Vec<ProjectHistoryEntry>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
+        let mut entries = Vec::new();
+
+        let mut loop_stmt = conn.prepare(
+            "SELECT name, status, COALESCE(completed_at, created_at)
+             FROM loops
+             WHERE workdir = ?1 AND status IN ('completed', 'failed')
+             ORDER BY COALESCE(completed_at, created_at) DESC
+             LIMIT ?2",
+        )?;
+        let loop_rows = loop_stmt.query_map(rusqlite::params![workdir, limit as i64], |row| {
+            Ok(ProjectHistoryEntry {
+                kind: ProjectHistoryKind::Loop,
+                name: row.get(0)?,
+                status: row.get(1)?,
+                at: row.get(2)?,
+            })
+        })?;
+        for row in loop_rows {
+            entries.push(row?);
+        }
+
+        let mut interactive_stmt = conn.prepare(
+            "SELECT name, status, COALESCE(exited_at, started_at)
+             FROM interactive_sessions
+             WHERE working_dir = ?1 AND status != 'active'
+             ORDER BY COALESCE(exited_at, started_at) DESC
+             LIMIT ?2",
+        )?;
+        let interactive_rows =
+            interactive_stmt.query_map(rusqlite::params![workdir, limit as i64], |row| {
+                let name: String = row.get(0)?;
+                let status: String = row.get(1)?;
+                let at: String = row.get(2)?;
+                Ok((name, status, at))
+            })?;
+        for row in interactive_rows {
+            let (name, status, at) = row?;
+            entries.push(ProjectHistoryEntry {
+                kind: ProjectHistoryKind::InteractiveSession,
+                name,
+                status,
+                at: parse_rfc3339_timestamp(&at),
+            });
+        }
+
+        let mut terminal_stmt = conn.prepare(
+            "SELECT name, status, COALESCE(last_active, created_at)
+             FROM terminal_sessions
+             WHERE working_dir = ?1 AND status != 'idle'
+             ORDER BY COALESCE(last_active, created_at) DESC
+             LIMIT ?2",
+        )?;
+        let terminal_rows =
+            terminal_stmt.query_map(rusqlite::params![workdir, limit as i64], |row| {
+                let name: String = row.get(0)?;
+                let status: String = row.get(1)?;
+                let at: String = row.get(2)?;
+                Ok((name, status, at))
+            })?;
+        for row in terminal_rows {
+            let (name, status, at) = row?;
+            entries.push(ProjectHistoryEntry {
+                kind: ProjectHistoryKind::TerminalSession,
+                name,
+                status,
+                at: parse_rfc3339_timestamp(&at),
+            });
+        }
+
+        entries.sort_by_key(|b| std::cmp::Reverse(b.at));
+        entries.truncate(limit);
+        Ok(entries)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_db() -> Database {
+        let dir = tempfile::tempdir().unwrap();
+        Database::new(&dir.path().join("test.db")).unwrap()
+    }
+
+    fn sample_project(hash: &str) -> Project {
+        Project {
+            hash: hash.to_string(),
+            path: format!("/tmp/{hash}"),
+            name: format!("Project {hash}"),
+            description: Some("Test project".to_string()),
+            tags: None,
+            indexed_at: None,
+            created_at: chrono::Utc::now().timestamp(),
+        }
+    }
+
+    #[test]
+    fn upsert_and_get_project() {
+        let db = test_db();
+        let project = sample_project("abc123");
+        db.upsert_project(&project).unwrap();
+
+        let retrieved = db.get_project("abc123").unwrap();
+        assert!(retrieved.is_some());
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.hash, "abc123");
+        assert_eq!(retrieved.name, "Project abc123");
+    }
+
+    #[test]
+    fn get_project_not_found() {
+        let db = test_db();
+        let result = db.get_project("nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn list_projects_empty() {
+        let db = test_db();
+        let projects = db.list_projects().unwrap();
+        assert!(projects.is_empty());
+    }
+
+    #[test]
+    fn list_projects_with_projects() {
+        let db = test_db();
+        let project1 = sample_project("proj1");
+        let project2 = sample_project("proj2");
+        db.upsert_project(&project1).unwrap();
+        db.upsert_project(&project2).unwrap();
+
+        let projects = db.list_projects().unwrap();
+        assert_eq!(projects.len(), 2);
+    }
+
+    #[test]
+    fn delete_project() {
+        let db = test_db();
+        let project = sample_project("test-proj");
+        db.upsert_project(&project).unwrap();
+
+        db.delete_project("test-proj").unwrap();
+        let retrieved = db.get_project("test-proj").unwrap();
+        assert!(retrieved.is_none());
+    }
+
+    #[test]
+    fn update_project_description() {
+        let db = test_db();
+        let project = sample_project("test-proj");
+        db.upsert_project(&project).unwrap();
+
+        db.update_project_meta("test-proj", Some("New description"), None)
+            .unwrap();
+        let retrieved = db.get_project("test-proj").unwrap().unwrap();
+        assert_eq!(retrieved.description, Some("New description".to_string()));
+    }
+
+    #[test]
+    fn search_projects_by_name() {
+        let db = test_db();
+        let project1 = Project {
+            hash: "proj1".to_string(),
+            path: "/tmp/proj1".to_string(),
+            name: "Rust Project".to_string(),
+            description: Some("A Rust project".to_string()),
+            tags: None,
+            indexed_at: None,
+            created_at: chrono::Utc::now().timestamp(),
+        };
+        let project2 = Project {
+            hash: "proj2".to_string(),
+            path: "/tmp/proj2".to_string(),
+            name: "Python Project".to_string(),
+            description: Some("A Python project".to_string()),
+            tags: None,
+            indexed_at: None,
+            created_at: chrono::Utc::now().timestamp(),
+        };
+        db.upsert_project(&project1).unwrap();
+        db.upsert_project(&project2).unwrap();
+
+        let results = db.search_projects("Rust").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].hash, "proj1");
+    }
+
+    #[test]
+    fn search_projects_by_description() {
+        let db = test_db();
+        let project = Project {
+            hash: "proj1".to_string(),
+            path: "/tmp/proj1".to_string(),
+            name: "My Project".to_string(),
+            description: Some("Contains Rust code".to_string()),
+            tags: None,
+            indexed_at: None,
+            created_at: chrono::Utc::now().timestamp(),
+        };
+        db.upsert_project(&project).unwrap();
+
+        let results = db.search_projects("Rust").unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn parse_rfc3339_timestamp_valid() {
+        let ts = parse_rfc3339_timestamp("2024-01-15T10:30:00Z");
+        assert!(ts > 0);
+    }
+
+    #[test]
+    fn parse_rfc3339_timestamp_invalid() {
+        let ts = parse_rfc3339_timestamp("invalid");
+        assert_eq!(ts, 0);
     }
 }

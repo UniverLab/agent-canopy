@@ -35,3 +35,50 @@ impl Database {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::db::Database;
+    use tempfile::tempdir;
+
+    fn test_db() -> Database {
+        let dir = tempdir().unwrap();
+        Database::new(&dir.path().join("test.db")).unwrap()
+    }
+
+    #[test]
+    fn insert_group_stores_group_in_database() {
+        let db = test_db();
+        let result = db.insert_group("group-1", "horizontal", "session-a", "session-b");
+        assert!(result.is_ok(), "insert_group should succeed");
+    }
+
+    #[test]
+    fn insert_group_replaces_existing_group_with_same_id() {
+        let db = test_db();
+        db.insert_group("group-1", "horizontal", "session-a", "session-b")
+            .unwrap();
+        // Insert again with same ID but different data
+        let result = db.insert_group("group-1", "vertical", "session-c", "session-d");
+        assert!(result.is_ok(), "insert_group should replace existing group");
+    }
+
+    #[test]
+    fn delete_group_removes_group_from_database() {
+        let db = test_db();
+        db.insert_group("group-1", "horizontal", "session-a", "session-b")
+            .unwrap();
+        let result = db.delete_group("group-1");
+        assert!(result.is_ok(), "delete_group should succeed");
+    }
+
+    #[test]
+    fn delete_group_succeeds_even_if_group_does_not_exist() {
+        let db = test_db();
+        let result = db.delete_group("nonexistent-group");
+        assert!(
+            result.is_ok(),
+            "delete_group should succeed even if group doesn't exist"
+        );
+    }
+}

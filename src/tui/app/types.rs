@@ -3,23 +3,31 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+use super::loop_live_state::LoopLiveState;
 use crate::application::notification_service::NotificationService;
 use crate::db::project::{RagInfoSummary, RagQueueItem};
 use crate::db::Database;
-use crate::domain::models::{Agent, RunLog};
+use crate::domain::loops::{Loop, LoopDetails, LoopNodeRun, LoopSpec};
+use crate::domain::models::{Agent, CorruptAgent, RunLog};
 use crate::domain::project::Project;
 use crate::domain::sync::{ActiveIntent, SyncMessage, WorkspaceStatus};
-use crate::domain::workflow::{Workflow, WorkflowDetails, WorkflowNodeRun};
 use crate::rag::vector_store::SearchResult;
 use crate::tui::agent::InteractiveAgent;
-use crate::tui::app::dialog::{LaunchpadDialog, NewAgentDialog, SimplePromptDialog};
+use crate::tui::app::dialog::{
+    LaunchpadDialog, LoopFormDialog, NewAgentDialog, SimplePromptDialog,
+};
 use crate::tui::app::terminal_search::TerminalSearch;
 /// Unified entry in the sidebar.
 #[allow(clippy::large_enum_variant)]
 pub enum AgentEntry {
     Agent(Agent),
+    /// An agent row that failed to decode (e.g. malformed `trigger_config`
+    /// written directly to SQLite by an external tool). Rendered as a
+    /// degraded card instead of crashing the whole sidebar.
+    Corrupt(CorruptAgent),
     Interactive(usize), // index into App::interactive_agents
     Terminal(usize),    // index into App::terminal_agents
+    Orphaned(usize),    // index into App::orphaned_sessions
     Group(usize),       // index into App::split_groups
 }
 
@@ -27,11 +35,13 @@ impl AgentEntry {
     pub fn id<'a>(&'a self, app: &'a App) -> &'a str {
         match self {
             Self::Agent(a) => &a.id,
+            Self::Corrupt(c) => &c.id,
             Self::Interactive(idx) => app
                 .interactive_agents
                 .get(*idx)
                 .map_or("?", |a| a.seed_name.as_deref().unwrap_or(&a.name)),
             Self::Terminal(idx) => app.terminal_agents.get(*idx).map_or("?", |a| &a.name),
+            Self::Orphaned(idx) => app.orphaned_sessions.get(*idx).map_or("?", |s| &s.name),
             Self::Group(idx) => app.split_groups.get(*idx).map_or("?", |g| &g.id),
         }
     }
@@ -49,22 +59,119 @@ pub enum Focus {
     ContextTransfer,
     RagTransfer,
     PromptTemplateDialog,
-    WorkflowEditorDialog,
+    LoopEditorDialog,
+    LoopFormDialog,
     ProjectRelationDialog,
 }
 
+/// Mouse text selection over the focused agent's PTY pane. Coordinates are
+/// pane-relative `(row, col)` cells matching the rendered `ScreenSnapshot`.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ProjectsPanelFocus {
-    Projects,
-    Workflows,
-    Knowledge,
-    RagInfo,
+pub(crate) struct TerminalSelection {
+    /// Selected agent this selection belongs to: (is_terminal, index).
+    pub agent: (bool, usize),
+    pub start: (u16, u16),
+    pub end: (u16, u16),
+    pub dragging: bool,
 }
 
+impl TerminalSelection {
+    /// Selection endpoints in linear (reading) order: start ≤ end.
+    pub fn normalized(&self) -> ((u16, u16), (u16, u16)) {
+        if self.end < self.start {
+            (self.end, self.start)
+        } else {
+            (self.start, self.end)
+        }
+    }
+}
+
+/// The sidebar's three thematic tabs, shown one at a time below the pinned
+/// RAG summary (top) and above the sysinfo dashboard (bottom).
+/// `App::sidebar_layer` tracks which one is currently active.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SidebarLayer {
+    /// Interactive agents + terminals — the things with a PTY right now.
+    Live,
+    /// Background agents + loops — live/recent runs, global across projects.
+    Automation,
+    /// The projects list.
+    Knowledge,
+}
+
+/// Which of Automation's two sub-lists (background agents, loops) arrow-key
+/// navigation is currently cycling through.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AutomationKind {
+    Agent,
+    Loop,
+}
+
+/// Tabs shown inside a project once it's entered (`Focus::Agent` while
+/// `SidebarLayer::Knowledge` is active) — everything project-scoped lives
+/// here instead of as top-level sidebar siblings.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProjectTab {
+    Overview,
+    Backlog,
+    Knowledge,
+    History,
+}
+
+impl ProjectTab {
+    pub const ALL: [ProjectTab; 4] = [
+        ProjectTab::Overview,
+        ProjectTab::Backlog,
+        ProjectTab::Knowledge,
+        ProjectTab::History,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ProjectTab::Overview => "Overview",
+            ProjectTab::Backlog => "Backlog",
+            ProjectTab::Knowledge => "Knowledge",
+            ProjectTab::History => "History",
+        }
+    }
+
+    pub fn hotkey(self) -> char {
+        match self {
+            ProjectTab::Overview => 'o',
+            ProjectTab::Backlog => 'b',
+            ProjectTab::Knowledge => 'k',
+            ProjectTab::History => 'h',
+        }
+    }
+}
+
+/// Cheap, cached summary shown on a project's Preview card (highlighted, not
+/// entered) — recomputed on the normal `App::refresh` cadence, never on a
+/// per-keystroke highlight move (functional requirement 3).
+#[derive(Clone, Default)]
+pub(crate) struct ProjectPreviewSummary {
+    pub pending_backlog: usize,
+    pub knowledge_entries: usize,
+    pub last_activity: Option<i64>,
+    pub loop_running: bool,
+}
+
+/// Per-loop rendering data for the sidebar's `Loops` section — spec progress
+/// and whether the loop is stuck on a reported blocker (a `Paused` loop whose
+/// latest run recorded a `blocker`, see `loop_report_blocker`). Computed once
+/// per refresh cycle (`App::refresh_loops`) rather than queried per frame.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct LoopSidebarMeta {
+    pub done: usize,
+    pub total: usize,
+    pub blocked: bool,
+}
+
+/// Border-focus sub-section within the `Live` layer (interactive/terminal
+/// agents render as three stacked sub-panels sharing one collapsible layer).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[expect(dead_code)]
 pub enum AgentSectionFocus {
-    Background,
     Interactive,
     Terminal,
     Groups,
@@ -72,31 +179,31 @@ pub enum AgentSectionFocus {
 }
 
 #[derive(Clone)]
-pub(crate) enum WorkflowEditorMode {
+pub(crate) enum LoopEditorMode {
     AgentPrompt,
     NodeConfig,
 }
 
 #[derive(Clone)]
-pub(crate) struct WorkflowEditorDialog {
+pub(crate) struct LoopEditorDialog {
     pub node_id: String,
     pub node_name: String,
     pub title: String,
     pub help: String,
     pub buffer: String,
     pub cursor: usize,
-    pub mode: WorkflowEditorMode,
+    pub mode: LoopEditorMode,
     pub parse_error: Option<String>,
 }
 
-impl WorkflowEditorDialog {
+impl LoopEditorDialog {
     pub fn new(
         node_id: String,
         node_name: String,
         title: String,
         help: String,
         buffer: String,
-        mode: WorkflowEditorMode,
+        mode: LoopEditorMode,
     ) -> Self {
         let cursor = buffer.chars().count();
         Self {
@@ -181,12 +288,6 @@ pub(crate) struct RagTransferModal {
     pub context_payload: String,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum SidebarMode {
-    Agents,
-    Projects,
-}
-
 // ── App struct ──────────────────────────────────────────────────
 
 /// Main application state.
@@ -201,6 +302,14 @@ pub struct App {
     pub(crate) interactive_agents: Vec<InteractiveAgent>,
     /// Raw terminal sessions (no AI CLI).
     pub(crate) terminal_agents: Vec<InteractiveAgent>,
+    /// Sessions orphaned during auto-resume (can be revived or dismissed).
+    pub(crate) orphaned_sessions: Vec<crate::db::session::InteractiveSession>,
+    /// Gate: pending scheduled sends are held (not delivered) until the
+    /// startup restore runs — auto-resume reassigns each schedule onto its
+    /// resumed session id and drops schedules whose session is gone. Without
+    /// this, the first refresh (before sessions resume) would see zero live
+    /// sessions and prematurely treat every due schedule as dead.
+    pub(crate) scheduled_sends_restored: bool,
 
     // Split group state
     pub(crate) split_groups: Vec<crate::domain::models::SplitGroup>,
@@ -223,7 +332,20 @@ pub struct App {
     // UI state
     pub(crate) selected: usize,
     pub(crate) focus: Focus,
-    pub(crate) sidebar_mode: SidebarMode,
+    /// Which sidebar tab (Live / Automation / Knowledge) is active.
+    pub(crate) sidebar_layer: SidebarLayer,
+    /// Which of Automation's two sub-lists is active for navigation.
+    pub(crate) automation_kind: AutomationKind,
+    /// `Some(tab)` while a project is entered (Focus tab bar showing);
+    /// `None` while only highlighted (Preview summary card showing).
+    pub(crate) project_focus: Option<ProjectTab>,
+    pub(crate) selected_project_history: usize,
+    /// Persisted per-project History tab data, keyed by project hash and
+    /// refreshed lazily on first show of the tab (functional requirement 4).
+    pub(crate) project_history_cache: HashMap<String, Vec<crate::db::project::ProjectHistoryEntry>>,
+    /// Cheap per-project Preview summary, keyed by project hash and
+    /// recomputed on the normal refresh cadence — never per keystroke.
+    pub(crate) project_preview_cache: HashMap<String, ProjectPreviewSummary>,
     pub(crate) log_content: String,
     pub(crate) log_scroll: u16,
     pub(crate) running: bool,
@@ -233,7 +355,7 @@ pub struct App {
     pub(crate) pending_launch_dialog: Option<NewAgentDialog>,
     pub(crate) quit_confirm: bool,
     pub(crate) delete_project_confirm: bool,
-    pub(crate) delete_workflow_confirm: bool,
+    pub(crate) delete_loop_confirm: bool,
 
     // Brian's Brain automaton (sidebar decoration)
     pub(crate) sidebar_brain: Option<crate::tui::brians_brain::BriansBrain>,
@@ -252,17 +374,60 @@ pub struct App {
 
     // Layout state
     pub(crate) sidebar_click_map: Vec<(usize, u16, u16)>,
+    /// Agent index under the mouse cursor in the sidebar (hover highlight).
+    pub(crate) hovered_row: Option<usize>,
+    /// Manual mouse-wheel scroll adjustment applied on top of the
+    /// selection-follow scroll in the agent sidebar sections.
+    pub(crate) sidebar_scroll_offset: usize,
+    /// Total visible agent rows across the rendered sidebar sections on the
+    /// last frame; used to clamp mouse-wheel scrolling.
+    pub(crate) sidebar_visible_capacity: usize,
     pub(crate) projects: Vec<Project>,
     pub(crate) selected_project: usize,
-    pub(crate) projects_panel_focus: ProjectsPanelFocus,
     pub(crate) agent_section_focus: AgentSectionFocus,
-    pub(crate) workflows: Vec<Workflow>,
-    pub(crate) selected_workflow_id: Option<String>,
-    pub(crate) workflow_details: Option<WorkflowDetails>,
-    pub(crate) workflow_runs: Vec<WorkflowNodeRun>,
-    pub(crate) workflow_selected_spec: usize,
-    pub(crate) workflow_selected_node: usize,
-    pub(crate) workflow_editor_dialog: Option<WorkflowEditorDialog>,
+    /// Mouse hit-test rows for the Automation layer's loop cards, populated
+    /// during draw: `(loop id, row_start, row_end)`.
+    pub(crate) automation_loop_click_map: Vec<(String, u16, u16)>,
+    /// Mouse hit-test rows for the Knowledge layer's project list,
+    /// populated during draw: `(project index, row_start, row_end)`.
+    pub(crate) project_click_map: Vec<(usize, u16, u16)>,
+    /// Mouse hit-test columns for a Focus tab bar, populated during draw:
+    /// `(tab, col_start, col_end)`.
+    pub(crate) project_tab_click_map: Vec<(ProjectTab, u16, u16)>,
+    /// Mouse hit-test rows for the active tab's list, populated during draw.
+    pub(crate) project_tab_row_click_map: Vec<(usize, u16, u16)>,
+    /// Mouse hit-test cells for the sidebar's tab strip, populated during
+    /// draw: `(tab, row, col_start, col_end)` — clicking switches the active
+    /// tab.
+    pub(crate) sidebar_tab_click_map: Vec<(SidebarLayer, u16, u16, u16)>,
+    pub(crate) loops: Vec<Loop>,
+    pub(crate) selected_loop_id: Option<String>,
+    pub(crate) loop_details: Option<LoopDetails>,
+    pub(crate) loop_runs: Vec<LoopNodeRun>,
+    pub(crate) loop_selected_spec: usize,
+    pub(crate) loop_selected_node: usize,
+    pub(crate) loop_editor_dialog: Option<LoopEditorDialog>,
+    pub(crate) loop_form_dialog: Option<LoopFormDialog>,
+    /// Per-loop spec progress ("done/total") and blocked status for the
+    /// sidebar's `Loops` section, keyed by loop id. Refreshed alongside
+    /// `loops` in `App::refresh_loops`.
+    pub(crate) loop_sidebar_meta: HashMap<String, LoopSidebarMeta>,
+    /// Live snapshot of the currently-selected loop's runtime state,
+    /// refreshed every tick. `None` when no loop is selected.
+    pub(crate) loop_live_state: Option<LoopLiveState>,
+    /// Whether the live loop view's graph highlight auto-follows the
+    /// engine's current node (`true`, the default) or sits on a node the
+    /// user manually navigated to (`false`, see `loop_graph_selected_node`).
+    /// Reset to `true` whenever the selected loop changes.
+    pub(crate) loop_graph_follow: bool,
+    /// The node id manually highlighted in the live loop view's graph.
+    /// Only meaningful while `loop_graph_follow` is `false`.
+    pub(crate) loop_graph_selected_node: Option<String>,
+    /// Standalone/backlog specs (no loop yet), filtered to the selected
+    /// project's workdir tag when a project is selected. Refreshed alongside
+    /// `projects` in `App::refresh_projects`.
+    pub(crate) backlog_specs: Vec<LoopSpec>,
+    pub(crate) selected_backlog: usize,
     pub(crate) global_rag_queue: Vec<RagQueueItem>,
     pub(crate) selected_rag_queue: usize,
     pub(crate) rag_info: RagInfoSummary,
@@ -283,7 +448,10 @@ pub struct App {
     pub(crate) copied_at: std::time::Instant,
     pub(crate) last_scroll_at: std::time::Instant,
     pub(crate) last_panel_inner: (u16, u16),
+    pub(crate) last_panel_x: u16,
     pub(crate) last_panel_y: u16,
+    /// Active mouse text selection over the focused agent's PTY pane.
+    pub(crate) terminal_selection: Option<TerminalSelection>,
     pub(crate) whimsg: crate::tui::whimsg::Whimsg,
     /// Hash of the last log chunk scanned for whimsg triggers — avoids re-firing
     /// on the same content every tick.
@@ -299,6 +467,12 @@ pub struct App {
     /// Persisted prompt-builder sessions per agent/session (cleared on send).
     pub(crate) prompt_builder_sessions:
         HashMap<String, crate::tui::app::dialog::PromptBuilderSession>,
+    /// Tab-bar origin `(x, y)` of the prompt builder from the last frame, used
+    /// for mouse hit-testing the clickable Normal/Raw tabs.
+    pub(crate) prompt_tab_origin: Option<(u16, u16)>,
+    /// Raw tab content region `Rect` from the last frame, used for mouse
+    /// wheel hit-testing the scrollable content area.
+    pub(crate) prompt_raw_content_rect: Option<ratatui::layout::Rect>,
     /// Whether to send OS-level desktop notifications (agent done/failed).
     pub(crate) notifications_enabled: bool,
     /// Notification service for sending cross-platform notifications.
@@ -309,6 +483,9 @@ pub struct App {
     pub(crate) animation_tick: u32,
     /// Preferred unit for sysinfo temperature labels.
     pub(crate) temperature_unit: crate::domain::canopy_config::TemperatureUnit,
+    /// Resolved TUI color theme (T6), read from config once at startup.
+    /// No live switching yet — changing it requires a restart.
+    pub(crate) theme: crate::tui::ui::theme::Theme,
     /// Terminal autocomplete suggestion picker (shown on Tab).
     pub(crate) suggestion_picker: Option<crate::tui::terminal_history::SuggestionPicker>,
     /// Per-session terminal histories (loaded on demand, cached in memory).
@@ -325,6 +502,9 @@ pub struct App {
 
     // RAG pause state (synced from daemon_state table)
     pub(crate) rag_paused: bool,
+    /// Whether the embedding model is currently loaded in the daemon's
+    /// memory (synced from daemon_state table — see `rag::status`).
+    pub(crate) rag_model_loaded: bool,
     /// Whether the RagInfo panel has focus in Agents sidebar mode.
     pub(crate) agents_rag_focused: bool,
 
@@ -335,6 +515,12 @@ pub struct App {
     pub(crate) playground_selected: usize,
     pub(crate) playground_last_search: std::time::Instant,
     pub(crate) playground_search_pending: bool,
+    /// In-flight background playground search (B23): receiving end of the
+    /// worker thread running embed+search off the UI thread, tagged with the
+    /// query it executed. `Some` while a search is executing — the TUI keeps
+    /// rendering and polling instead of blocking on the model load.
+    pub(crate) playground_search_rx:
+        Option<std::sync::mpsc::Receiver<(String, anyhow::Result<Vec<SearchResult>>)>>,
     pub(crate) playground_last_executed_query: String,
     /// Whether the playground is showing a single chunk in detail mode.
     pub(crate) playground_detail_mode: bool,
@@ -350,8 +536,12 @@ pub struct App {
     pub(crate) project_graph_edges: Vec<ProjectGraphEdge>,
     pub(crate) project_graph_trees: Vec<Vec<String>>,
 
-    // Nursery — temporary path for seed creation workflow
+    // Nursery — temporary path for seed creation loop
     pub(crate) nursery_path: Option<std::path::PathBuf>,
+
+    /// Whether the terminal supports and has enabled the Kitty keyboard
+    /// enhancement protocol (Shift+Enter disambiguation).
+    pub(crate) keyboard_enhancement_active: bool,
 
     // Atmosphere engine
     pub(crate) atmosphere: crate::tui::atmosphere::SceneManager,

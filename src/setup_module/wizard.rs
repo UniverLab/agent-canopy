@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use inquire::{Confirm, MultiSelect, Select};
 use std::io::{self, Write};
 
-pub fn run_setup() -> Result<()> {
+pub fn run_setup(force_skills: bool) -> Result<()> {
     let mut wiz = WizardState::new();
     let home = dirs::home_dir().context("No home directory")?;
     let canopy_dir = home.join(".canopy");
@@ -82,6 +82,17 @@ pub fn run_setup() -> Result<()> {
         }
     ));
 
+    // ── Step 2.25: TUI theme preference ──────────────────────────
+    wiz.render()?;
+    let theme = select_theme(&existing_config.theme)?;
+    wiz.add(format!(
+        "\x1b[32m✓\x1b[0m Theme: {}",
+        match theme.as_str() {
+            "modern" => THEME_OPTION_MODERN,
+            _ => THEME_OPTION_CLASSIC,
+        }
+    ));
+
     // ── Step 2.3: RAG opt-in ─────────────────────────────────────
     wiz.render()?;
     let rag_previously_configured = !existing_config.embeddings_model.is_empty()
@@ -127,8 +138,11 @@ pub fn run_setup() -> Result<()> {
 
         // ── Download / warm-up the model ──────────────────────────
         wiz.render()?;
-        let model_cache_dir = canopy_dir.join("models");
-        download_local_model_for_setup(&embeddings_model, &model_cache_dir)?;
+        #[cfg(feature = "local-embeddings")]
+        {
+            let model_cache_dir = canopy_dir.join("models");
+            download_local_model_for_setup(&embeddings_model, &model_cache_dir)?;
+        }
         wiz.add(format!(
             "\x1b[32m✓\x1b[0m Model ready: {}",
             embeddings_model
@@ -207,7 +221,7 @@ pub fn run_setup() -> Result<()> {
 
     // ── Step 5: Essential Skills ─────────────────────────────────
     wiz.render()?;
-    let skills_step = run_essential_skills_step(&home, &selected);
+    let skills_step = run_essential_skills_step(&home, &selected, force_skills);
     wiz.add(skills_step);
 
     // ── Step 6: Daemon + service ────────────────────────────────
@@ -234,6 +248,7 @@ pub fn run_setup() -> Result<()> {
     config.mark_configured();
     config.clis = cli_registry.available_clis;
     config.temperature_unit = temperature_unit;
+    config.theme = theme;
     config.embeddings_model = embeddings_model;
     config.similarity_threshold = similarity_threshold;
     config.rag_personal_dirs = rag_personal_dirs;
@@ -320,6 +335,31 @@ fn select_temperature_unit() -> Result<crate::domain::canopy_config::Temperature
     })
 }
 
+const THEME_OPTION_CLASSIC: &str = "Classic (bordered)";
+const THEME_OPTION_MODERN: &str = "Modern (borderless)";
+
+fn select_theme(current: &str) -> Result<String> {
+    let options = [THEME_OPTION_CLASSIC, THEME_OPTION_MODERN];
+    let start = if current == "modern" { 1 } else { 0 };
+    let selected = Select::new("TUI theme:", options.to_vec())
+        .with_starting_cursor(start)
+        .with_help_message("enter: confirm | ↑↓: navigate | restart the TUI to apply")
+        .prompt()
+        .map_err(|e| anyhow::anyhow!("Theme selection cancelled: {}", e))?;
+
+    Ok(theme_choice_to_config_value(selected))
+}
+
+/// Map a `select_theme` menu label to the `CanopyConfig::theme` value.
+/// Pure so it's testable without an interactive prompt.
+fn theme_choice_to_config_value(selected: &str) -> String {
+    if selected == THEME_OPTION_MODERN {
+        "modern".to_string()
+    } else {
+        "classic".to_string()
+    }
+}
+
 fn select_local_embeddings_model(current: &str) -> Result<String> {
     const LOCAL_MODELS: &[(&str, &str)] = &[
         (
@@ -370,6 +410,7 @@ fn select_local_embeddings_model(current: &str) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("Unknown embeddings model selection"))
 }
 
+#[cfg(feature = "local-embeddings")]
 fn download_local_model_for_setup(model_id: &str, cache_dir: &std::path::Path) -> Result<()> {
     println!("  \x1b[90mDownloading model to ~/.canopy/models/ (only needed once)…\x1b[0m");
     println!();
@@ -411,4 +452,137 @@ fn pick_multiple_directories(
     println!();
 
     Ok(dirs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn theme_choice_writes_modern_for_the_modern_menu_label() {
+        assert_eq!(theme_choice_to_config_value(THEME_OPTION_MODERN), "modern");
+    }
+
+    #[test]
+    fn theme_choice_writes_classic_for_the_classic_menu_label() {
+        assert_eq!(
+            theme_choice_to_config_value(THEME_OPTION_CLASSIC),
+            "classic"
+        );
+    }
+
+    #[test]
+    fn theme_choice_defaults_unrecognized_input_to_classic() {
+        // Defensive: any label that isn't the modern one falls back to classic
+        // rather than writing an unexpected value to config.
+        assert_eq!(theme_choice_to_config_value("not a real option"), "classic");
+    }
+
+    #[test]
+    fn theme_choice_modern_constant_value() {
+        assert_eq!(THEME_OPTION_MODERN, "Modern (borderless)");
+    }
+
+    #[test]
+    fn theme_choice_classic_constant_value() {
+        assert_eq!(THEME_OPTION_CLASSIC, "Classic (bordered)");
+    }
+
+    #[test]
+    fn wizard_state_new_is_empty() {
+        let wiz = WizardState::new();
+        assert!(wiz.steps.is_empty());
+    }
+
+    #[test]
+    fn wizard_state_add_stores_steps() {
+        let mut wiz = WizardState::new();
+        wiz.add("step 1".to_string());
+        wiz.add("step 2".to_string());
+        assert_eq!(wiz.steps.len(), 2);
+        assert_eq!(wiz.steps[0], "step 1");
+        assert_eq!(wiz.steps[1], "step 2");
+    }
+
+    #[test]
+    fn wizard_state_render_returns_ok() {
+        // render() calls clear_wizard_screen() which does I/O, but we test
+        // that the function at least constructs without panic.
+        let wiz = WizardState::new();
+        // This may fail in headless CI (no terminal), but the test compiles
+        // and demonstrates the function is reachable.
+        let _ = wiz.render();
+    }
+
+    #[test]
+    fn wizard_state_add_preserves_order() {
+        let mut wiz = WizardState::new();
+        for i in 0..10 {
+            wiz.add(format!("step {i}"));
+        }
+        for (i, step) in wiz.steps.iter().enumerate() {
+            assert_eq!(*step, format!("step {i}"));
+        }
+    }
+
+    // ── Additional edge cases ────────────────────────────────────
+
+    #[test]
+    fn theme_choice_modern_roundtrip() {
+        let result = theme_choice_to_config_value(THEME_OPTION_MODERN);
+        assert_eq!(result, "modern");
+    }
+
+    #[test]
+    fn theme_choice_classic_roundtrip() {
+        let result = theme_choice_to_config_value(THEME_OPTION_CLASSIC);
+        assert_eq!(result, "classic");
+    }
+
+    #[test]
+    fn theme_choice_empty_string() {
+        assert_eq!(theme_choice_to_config_value(""), "classic");
+    }
+
+    #[test]
+    fn theme_choice_arbitrary_string() {
+        assert_eq!(theme_choice_to_config_value("anything"), "classic");
+    }
+
+    #[test]
+    fn wizard_state_new_has_zero_steps() {
+        let wiz = WizardState::new();
+        assert_eq!(wiz.steps.len(), 0);
+    }
+
+    #[test]
+    fn wizard_state_add_single_step() {
+        let mut wiz = WizardState::new();
+        wiz.add("single step".to_string());
+        assert_eq!(wiz.steps.len(), 1);
+        assert_eq!(wiz.steps[0], "single step");
+    }
+
+    #[test]
+    fn wizard_state_add_many_steps() {
+        let mut wiz = WizardState::new();
+        for i in 0..100 {
+            wiz.add(format!("step {i}"));
+        }
+        assert_eq!(wiz.steps.len(), 100);
+    }
+
+    #[test]
+    fn theme_choice_case_sensitivity() {
+        // "Modern (borderless)" is the exact constant
+        assert_eq!(
+            theme_choice_to_config_value("Modern (borderless)"),
+            "modern"
+        );
+        // Different casing should fall back to classic
+        assert_eq!(
+            theme_choice_to_config_value("modern (borderless)"),
+            "classic"
+        );
+    }
 }

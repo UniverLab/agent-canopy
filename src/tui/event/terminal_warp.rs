@@ -15,7 +15,7 @@ fn paste_clipboard_to_terminal(app: &mut App, idx: usize) {
     };
     let agent = &mut app.terminal_agents[idx];
     if agent.should_bypass_warp_input() || agent.warp_passthrough {
-        let _ = agent.write_to_pty(text.as_bytes());
+        let _ = agent.paste_to_pty(&text);
     } else if agent.warp_mode {
         if let Ok(mut buf) = agent.input_buffer.lock() {
             let pos = agent.warp_cursor.min(buf.len());
@@ -124,7 +124,7 @@ pub fn handle_terminal_warp_key(
         KeyCode::Backspace => delete_before_cursor(&mut app.terminal_agents[idx]),
         KeyCode::Delete => delete_at_cursor(&mut app.terminal_agents[idx]),
         KeyCode::Left => move_cursor_left(&mut app.terminal_agents[idx]),
-        KeyCode::Right => move_cursor_right(&mut app.terminal_agents[idx]),
+        KeyCode::Right => handle_warp_right_key(app, idx),
         KeyCode::Home => app.terminal_agents[idx].warp_cursor = 0,
         KeyCode::End => move_cursor_to_end(&mut app.terminal_agents[idx]),
         KeyCode::Up => handle_warp_up_key(app, idx),
@@ -399,6 +399,34 @@ fn move_cursor_right(agent: &mut InteractiveAgent) {
     agent.warp_cursor = new_pos;
 }
 
+/// Right arrow: if the cursor sits at the end of the input and there is
+/// a ghost-suggestion (the first history entry starting with the current
+/// input), accept the full completion in one go. Otherwise behave like a
+/// normal cursor-right.
+fn handle_warp_right_key(app: &mut App, idx: usize) {
+    let agent = &mut app.terminal_agents[idx];
+    let input_len = buffer_len(agent);
+    if agent.warp_cursor == input_len {
+        let current = input_text(agent);
+        if let Some(ghost) = app
+            .terminal_histories
+            .get(&agent.name)
+            .and_then(|h| h.ghost_suggestion(&current))
+        {
+            if ghost.len() > current.len() {
+                let suffix = &ghost[current.len()..];
+                let _ = with_input_buffer(agent, |buf| {
+                    buf.push_str(suffix);
+                });
+                agent.warp_cursor = buffer_len(agent);
+                agent.history_index = None;
+                return;
+            }
+        }
+    }
+    move_cursor_right(agent);
+}
+
 fn move_cursor_to_end(agent: &mut InteractiveAgent) {
     agent.warp_cursor = buffer_len(agent);
 }
@@ -562,6 +590,297 @@ pub fn open_terminal_suggestion_picker(app: &mut App, idx: usize) -> Result<()> 
         &cwd,
     ));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+
+    #[test]
+    fn is_direct_submit_enter() {
+        assert!(is_direct_submit(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn is_direct_submit_ctrl_c() {
+        assert!(is_direct_submit(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn is_direct_submit_ctrl_d() {
+        assert!(is_direct_submit(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn is_direct_submit_regular_char() {
+        assert!(!is_direct_submit(KeyCode::Char('a'), KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn is_direct_submit_ctrl_a() {
+        assert!(!is_direct_submit(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn is_direct_submit_esc() {
+        assert!(!is_direct_submit(KeyCode::Esc, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn wait_ms_for_key_tab() {
+        assert_eq!(wait_ms_for_key(KeyCode::Tab), TAB_SYNC_WAIT_MS);
+    }
+
+    #[test]
+    fn wait_ms_for_key_enter() {
+        assert_eq!(wait_ms_for_key(KeyCode::Enter), DIRECT_SYNC_WAIT_MS);
+    }
+
+    #[test]
+    fn wait_ms_for_key_char() {
+        assert_eq!(wait_ms_for_key(KeyCode::Char('a')), DIRECT_SYNC_WAIT_MS);
+    }
+
+    #[test]
+    fn wait_ms_for_key_esc() {
+        assert_eq!(wait_ms_for_key(KeyCode::Esc), DIRECT_SYNC_WAIT_MS);
+    }
+
+    #[test]
+    fn is_cd_command_exact() {
+        assert!(is_cd_command("cd"));
+    }
+
+    #[test]
+    fn is_cd_command_with_space() {
+        assert!(is_cd_command("cd /tmp"));
+    }
+
+    #[test]
+    fn is_cd_command_with_tab() {
+        assert!(is_cd_command("cd\t"));
+    }
+
+    #[test]
+    fn is_cd_command_not_cd() {
+        assert!(!is_cd_command("ls"));
+    }
+
+    #[test]
+    fn is_cd_command_not_cd_prefix() {
+        assert!(!is_cd_command("cd2"));
+    }
+
+    #[test]
+    fn is_cd_command_empty() {
+        assert!(!is_cd_command(""));
+    }
+
+    #[test]
+    fn is_cd_picker_request_empty() {
+        assert!(is_cd_picker_request(""));
+    }
+
+    #[test]
+    fn is_cd_picker_request_cd() {
+        assert!(is_cd_picker_request("cd"));
+    }
+
+    #[test]
+    fn is_cd_picker_request_cd_with_path() {
+        assert!(is_cd_picker_request("cd /tmp"));
+    }
+
+    #[test]
+    fn is_cd_picker_request_not_cd() {
+        assert!(!is_cd_picker_request("ls"));
+    }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn constants_are_sensible() {
+        assert!(DIRECT_SYNC_WAIT_MS > 0);
+        assert!(TAB_SYNC_WAIT_MS > DIRECT_SYNC_WAIT_MS);
+        assert!(SCROLL_STEP > 0);
+        assert!(PAGE_SCROLL_STEP > SCROLL_STEP);
+    }
+}
+
+#[cfg(test)]
+mod buffer_helper_tests {
+    use super::*;
+    use crate::tui::agent::InteractiveAgent;
+
+    fn make_agent() -> InteractiveAgent {
+        InteractiveAgent::spawn_terminal(
+            "cat",
+            "/tmp",
+            80,
+            24,
+            Some("test-buffer"),
+            &[],
+            ratatui::style::Color::White,
+        )
+        .expect("spawn")
+    }
+
+    #[test]
+    fn input_text_empty_initially() {
+        let agent = make_agent();
+        assert_eq!(input_text(&agent), "");
+    }
+
+    #[test]
+    fn trimmed_input_text_empty_initially() {
+        let agent = make_agent();
+        assert_eq!(trimmed_input_text(&agent), "");
+    }
+
+    #[test]
+    fn input_is_blank_initially() {
+        let agent = make_agent();
+        assert!(input_is_blank(&agent));
+    }
+
+    #[test]
+    fn buffer_len_zero_initially() {
+        let agent = make_agent();
+        assert_eq!(buffer_len(&agent), 0);
+    }
+
+    #[test]
+    fn replace_input_buffer_sets_content() {
+        let agent = make_agent();
+        replace_input_buffer(&agent, "hello world");
+        assert_eq!(input_text(&agent), "hello world");
+        assert_eq!(buffer_len(&agent), 11);
+        assert!(!input_is_blank(&agent));
+    }
+
+    #[test]
+    fn clear_input_buffer_empties_content() {
+        let agent = make_agent();
+        replace_input_buffer(&agent, "hello");
+        clear_input_buffer(&agent);
+        assert_eq!(input_text(&agent), "");
+        assert!(input_is_blank(&agent));
+    }
+
+    #[test]
+    fn trimmed_input_text_trims_whitespace() {
+        let agent = make_agent();
+        replace_input_buffer(&agent, "  hello  ");
+        assert_eq!(trimmed_input_text(&agent), "hello");
+    }
+
+    #[test]
+    fn trimmed_input_text_blank_after_trim() {
+        let agent = make_agent();
+        replace_input_buffer(&agent, "   ");
+        assert!(input_is_blank(&agent));
+        assert_eq!(trimmed_input_text(&agent), "");
+    }
+
+    #[test]
+    fn input_text_with_newlines() {
+        let agent = make_agent();
+        replace_input_buffer(&agent, "line1\nline2\n");
+        assert_eq!(input_text(&agent), "line1\nline2\n");
+        assert!(!input_is_blank(&agent));
+    }
+}
+
+#[cfg(test)]
+mod cd_picker_edge_cases {
+    use super::*;
+
+    #[test]
+    fn is_cd_command_with_multiple_spaces() {
+        assert!(is_cd_command("cd   /tmp"));
+    }
+
+    #[test]
+    fn is_cd_command_cd_only() {
+        assert!(is_cd_command("cd"));
+    }
+
+    #[test]
+    fn is_cd_picker_request_matches_cd_command() {
+        assert!(is_cd_picker_request("cd /some/path"));
+    }
+
+    #[test]
+    fn is_cd_picker_request_matches_empty() {
+        assert!(is_cd_picker_request(""));
+    }
+
+    #[test]
+    fn is_cd_picker_request_rejects_non_cd() {
+        assert!(!is_cd_picker_request("ls -la"));
+        assert!(!is_cd_picker_request("pwd"));
+        assert!(!is_cd_picker_request("echo hello"));
+    }
+}
+
+#[cfg(test)]
+mod is_direct_submit_edge_cases {
+    use super::*;
+
+    #[test]
+    fn ctrl_d_is_direct_submit() {
+        assert!(is_direct_submit(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn enter_is_direct_submit() {
+        assert!(is_direct_submit(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn ctrl_c_is_direct_submit() {
+        assert!(is_direct_submit(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn regular_char_is_not() {
+        assert!(!is_direct_submit(KeyCode::Char('x'), KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn ctrl_a_is_not() {
+        assert!(!is_direct_submit(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn shift_enter_is_not() {
+        assert!(is_direct_submit(KeyCode::Enter, KeyModifiers::SHIFT));
+    }
+}
+
+#[cfg(test)]
+mod should_skip_warp_sync_tests {
+    use super::*;
+    use crate::tui::agent::InteractiveAgent;
+
+    fn make_agent() -> InteractiveAgent {
+        InteractiveAgent::spawn_terminal(
+            "cat",
+            "/tmp",
+            80,
+            24,
+            Some("test-skip"),
+            &[],
+            ratatui::style::Color::White,
+        )
+        .expect("spawn")
+    }
+
+    #[test]
+    fn agent_not_in_alternate_screen_does_not_skip() {
+        let agent = make_agent();
+        assert!(!should_skip_warp_sync(&agent));
+    }
 }
 
 // ── Dialog: new agent creation ──────────────────────────────────────

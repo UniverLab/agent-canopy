@@ -1,10 +1,11 @@
 use crate::domain::sync::summarize_sync_context;
 
-use super::types::{AgentEntry, App, SidebarMode, SyncPanelState};
+use super::types::{AgentEntry, App, SidebarLayer, SyncPanelState};
 
 pub(crate) const ACTIVITY_PANEL_WIDTH: u16 = 34;
-const MIN_PANEL_WIDTH: u16 = 90;
-const MIN_EXPLICIT_ACTIVITY_WIDTH: u16 = 24;
+const ACTIVITY_PANEL_MIN_WIDTH: u16 = 24;
+const ACTIVITY_PANEL_FORCED_MIN_WIDTH: u16 = 16;
+const ACTIVITY_PANEL_PERCENT: u16 = 30;
 const RECENT_MESSAGE_LIMIT: usize = 18;
 const MAX_RECENT_MESSAGE_LIMIT: usize = 200;
 const MESSAGE_WINDOW_LINES_PER_STEP: u16 = 6;
@@ -50,13 +51,24 @@ impl App {
         summarize_sync_context(&messages, &active_agent_ids, 0).active_intents
     }
 
+    /// True when the selected sidebar entry is a terminal session.
+    fn selected_session_is_terminal(&self) -> bool {
+        matches!(self.selected_agent(), Some(AgentEntry::Terminal(_)))
+    }
+
     pub(crate) fn activity_panel_state(&self) -> Option<SyncPanelState> {
         let state = self.selected_activity_state()?;
-        if self.sidebar_mode == SidebarMode::Projects {
-            Some(state)
-        } else {
-            (!self.hidden_activity_workdirs.contains(&state.workdir)).then_some(state)
+        if self.sidebar_layer == SidebarLayer::Knowledge {
+            return Some(state);
         }
+        // Terminal sessions hide the sync panel by default; an explicit toggle
+        // (F3 → forced) still brings it up.
+        if self.selected_session_is_terminal()
+            && !self.forced_activity_workdirs.contains(&state.workdir)
+        {
+            return None;
+        }
+        (!self.hidden_activity_workdirs.contains(&state.workdir)).then_some(state)
     }
 
     pub(crate) fn activity_panel_layout_width(&self, total_width: u16, enabled: bool) -> u16 {
@@ -64,27 +76,26 @@ impl App {
             return 0;
         }
 
+        let proportional_width = ((total_width as u32 * ACTIVITY_PANEL_PERCENT as u32 / 100)
+            as u16)
+            .min(ACTIVITY_PANEL_WIDTH);
+
         let force_shown = self
             .selected_activity_workdir()
             .is_some_and(|workdir| self.forced_activity_workdirs.contains(workdir));
-        if !force_shown && total_width < MIN_PANEL_WIDTH {
+
+        if proportional_width < ACTIVITY_PANEL_MIN_WIDTH {
+            if force_shown {
+                return ACTIVITY_PANEL_FORCED_MIN_WIDTH.min(total_width);
+            }
             return 0;
         }
-        if force_shown {
-            if total_width <= MIN_EXPLICIT_ACTIVITY_WIDTH {
-                return total_width;
-            }
 
-            return ACTIVITY_PANEL_WIDTH
-                .min(total_width.saturating_sub(MIN_EXPLICIT_ACTIVITY_WIDTH))
-                .max(MIN_EXPLICIT_ACTIVITY_WIDTH.min(total_width));
-        }
-
-        ACTIVITY_PANEL_WIDTH.min(total_width.saturating_sub(48))
+        proportional_width
     }
 
     pub(crate) fn selected_activity_workdir(&self) -> Option<&str> {
-        if self.sidebar_mode == SidebarMode::Projects {
+        if self.sidebar_layer == SidebarLayer::Knowledge {
             return self.selected_project().map(|project| project.path.as_str());
         }
         match self.selected_agent()? {
@@ -97,6 +108,11 @@ impl App {
                 .get(*idx)
                 .map(|agent| agent.working_dir.as_str()),
             AgentEntry::Agent(agent) => agent.working_dir.as_deref(),
+            AgentEntry::Corrupt(_) => None,
+            AgentEntry::Orphaned(idx) => self
+                .orphaned_sessions
+                .get(*idx)
+                .map(|s| s.working_dir.as_str()),
             AgentEntry::Group(_) => None,
         }
     }
@@ -120,7 +136,7 @@ impl App {
             .into_iter()
             .collect::<std::collections::HashSet<_>>();
         if recent_messages.is_empty() {
-            if self.sidebar_mode != SidebarMode::Projects {
+            if self.sidebar_layer != SidebarLayer::Knowledge {
                 return None;
             }
             return Some(SyncPanelState {
@@ -183,6 +199,7 @@ mod tests {
             model: None,
             working_dir: Some(workdir.to_string()),
             enabled: true,
+            enable_at: None,
             created_at: Utc::now(),
             log_path: "/tmp/test.log".to_string(),
             timeout_minutes: 15,
@@ -295,7 +312,7 @@ mod tests {
         let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
         let project = sample_project("/tmp/project");
         app.projects = vec![project];
-        app.sidebar_mode = SidebarMode::Projects;
+        app.sidebar_layer = SidebarLayer::Knowledge;
 
         assert_eq!(app.selected_activity_workdir(), Some("/tmp/project"));
     }
@@ -307,7 +324,7 @@ mod tests {
         let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
         let project = sample_project("/tmp/project");
         app.projects = vec![project];
-        app.sidebar_mode = SidebarMode::Projects;
+        app.sidebar_layer = SidebarLayer::Knowledge;
 
         let state = app
             .activity_panel_state()
@@ -325,7 +342,7 @@ mod tests {
         let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
         let project = sample_project("/tmp/project");
         app.projects = vec![project];
-        app.sidebar_mode = SidebarMode::Projects;
+        app.sidebar_layer = SidebarLayer::Knowledge;
 
         assert!(app.activity_panel_state().is_some());
         app.toggle_activity_panel();
@@ -392,5 +409,42 @@ mod tests {
             app.activity_panel_layout_width(app.term_width, app.activity_panel_state().is_some())
                 > 0
         );
+    }
+
+    #[test]
+    fn activity_panel_width_is_30_percent_clamped_between_24_and_34() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+
+        assert_eq!(app.activity_panel_layout_width(200, true), 34);
+        assert_eq!(app.activity_panel_layout_width(100, true), 30);
+        assert_eq!(app.activity_panel_layout_width(70, true), 0);
+    }
+
+    #[test]
+    fn activity_panel_width_uses_forced_minimum_when_narrow() {
+        let db = test_db();
+        db.insert_sync_message(
+            "/tmp/project",
+            "agent-a",
+            "copilot",
+            crate::domain::sync::MessageKind::Info,
+            "first activity",
+            None,
+        )
+        .unwrap();
+
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.agents = vec![AgentEntry::Agent(sample_agent("bg-1", "/tmp/project"))];
+        app.selected = 0;
+        app.hidden_activity_workdirs
+            .insert("/tmp/project".to_string());
+
+        app.toggle_activity_panel();
+        assert!(app.forced_activity_workdirs.contains("/tmp/project"));
+
+        assert_eq!(app.activity_panel_layout_width(70, true), 16);
     }
 }

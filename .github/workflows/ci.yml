@@ -4,11 +4,95 @@ on:
   pull_request:
   workflow_dispatch:
 
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  rust-ci:
+  check:
     name: Format, Lint & Test
-    uses: UniverLab/workflows/.github/workflows/rust-ci.yml@main
-    with:
-      system-packages: protobuf-compiler
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Run clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked
+
+  publish-check:
+    name: Publish Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Dry-run publish
+        run: cargo publish --locked --dry-run
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      # `src/tui/ui/**` is pure ratatui rendering: functions whose whole job is
+      # to draw onto a Frame, and whose correctness is visual rather than
+      # logical. Covering it means asserting on screen-buffer contents, which
+      # costs a lot of test for very little defect-catching, so it sits outside
+      # the gate. Event handlers (`tui/event/**`) and app state (`tui/app/**`)
+      # stay in — that is the logic worth holding to a threshold.
+      - name: Measure coverage
+        run: |
+          cargo llvm-cov --locked \
+            --ignore-filename-regex 'src/tui/ui/' \
+            --fail-under-lines 80 \
+            --summary-only

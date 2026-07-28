@@ -11,6 +11,7 @@ fn sample_agent(id: &str, trigger: Option<Trigger>) -> Agent {
         model: None,
         working_dir: Some("/tmp/project".to_string()),
         enabled: true,
+        enable_at: None,
         created_at: Utc::now(),
         log_path: "/tmp/test.log".to_string(),
         timeout_minutes: 15,
@@ -296,4 +297,209 @@ fn test_watcher_trigger_accessors() {
     );
     assert_eq!(agent.trigger_count, 0);
     assert!(agent.last_triggered_at.is_none());
+}
+
+#[test]
+fn test_corrupt_agent_struct() {
+    let corrupt = CorruptAgent {
+        id: "test-id".to_string(),
+        enabled: true,
+        error: "parse error".to_string(),
+    };
+    assert_eq!(corrupt.id, "test-id");
+    assert!(corrupt.enabled);
+    assert_eq!(corrupt.error, "parse error");
+}
+
+#[test]
+fn test_agent_is_cron_and_is_watch() {
+    let cron_agent = sample_agent(
+        "c1",
+        Some(Trigger::Cron {
+            schedule_expr: "0 9 * * *".to_string(),
+        }),
+    );
+    assert!(cron_agent.is_cron());
+    assert!(!cron_agent.is_watch());
+
+    let watch_agent = sample_agent(
+        "w1",
+        Some(Trigger::Watch {
+            path: "/tmp".to_string(),
+            events: vec![WatchEvent::Create],
+            debounce_seconds: 2,
+            recursive: false,
+        }),
+    );
+    assert!(!watch_agent.is_cron());
+    assert!(watch_agent.is_watch());
+
+    let manual_agent = sample_agent("m1", None);
+    assert!(!manual_agent.is_cron());
+    assert!(!manual_agent.is_watch());
+}
+
+#[test]
+fn test_agent_watch_events() {
+    let watch_agent = sample_agent(
+        "w1",
+        Some(Trigger::Watch {
+            path: "/tmp".to_string(),
+            events: vec![WatchEvent::Create, WatchEvent::Modify],
+            debounce_seconds: 2,
+            recursive: false,
+        }),
+    );
+    let events = watch_agent.watch_events().unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(events.contains(&WatchEvent::Create));
+    assert!(events.contains(&WatchEvent::Modify));
+
+    let cron_agent = sample_agent(
+        "c1",
+        Some(Trigger::Cron {
+            schedule_expr: "0 9 * * *".to_string(),
+        }),
+    );
+    assert!(cron_agent.watch_events().is_none());
+}
+
+#[test]
+fn test_split_orientation_as_str() {
+    assert_eq!(SplitOrientation::Horizontal.as_str(), "horizontal");
+    assert_eq!(SplitOrientation::Vertical.as_str(), "vertical");
+}
+
+#[test]
+fn test_split_orientation_from_str() {
+    assert!(matches!(
+        SplitOrientation::from_str("vertical"),
+        SplitOrientation::Vertical
+    ));
+    assert!(matches!(
+        SplitOrientation::from_str("horizontal"),
+        SplitOrientation::Horizontal
+    ));
+    assert!(matches!(
+        SplitOrientation::from_str("anything"),
+        SplitOrientation::Horizontal
+    ));
+    assert!(matches!(
+        SplitOrientation::from_str(""),
+        SplitOrientation::Horizontal
+    ));
+}
+
+#[test]
+fn test_split_group_creation() {
+    let group = SplitGroup {
+        id: "sg1".to_string(),
+        orientation: SplitOrientation::Horizontal,
+        session_a: "sess_a".to_string(),
+        session_b: "sess_b".to_string(),
+        created_at: Utc::now(),
+    };
+    assert_eq!(group.id, "sg1");
+    assert!(matches!(group.orientation, SplitOrientation::Horizontal));
+    assert_eq!(group.session_a, "sess_a");
+    assert_eq!(group.session_b, "sess_b");
+}
+
+#[test]
+fn test_trigger_type_display() {
+    assert_eq!(format!("{}", TriggerType::Scheduled), "scheduled");
+    assert_eq!(format!("{}", TriggerType::Manual), "manual");
+    assert_eq!(format!("{}", TriggerType::Watch), "watch");
+}
+
+#[test]
+fn test_run_status_all_variants_display() {
+    assert_eq!(format!("{}", RunStatus::Pending), "pending");
+    assert_eq!(format!("{}", RunStatus::InProgress), "in_progress");
+    assert_eq!(format!("{}", RunStatus::Success), "success");
+    assert_eq!(format!("{}", RunStatus::Error), "error");
+    assert_eq!(format!("{}", RunStatus::Timeout), "timeout");
+    assert_eq!(format!("{}", RunStatus::Missed), "missed");
+}
+
+#[test]
+fn test_cli_resolve_empty_string_returns_err() {
+    let result = Cli::resolve(Some(""));
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(err.contains("must not be empty"));
+}
+
+#[test]
+fn test_default_debounce_returns_2() {
+    assert_eq!(default_debounce(), 2);
+}
+
+#[test]
+fn test_start_run_already_active() {
+    let run_log = RunLog {
+        id: "run1".to_string(),
+        background_agent_id: "agent1".to_string(),
+        status: RunStatus::InProgress,
+        trigger_type: TriggerType::Scheduled,
+        summary: None,
+        started_at: Utc::now(),
+        finished_at: None,
+        exit_code: None,
+        timeout_at: None,
+    };
+    let outcome = StartRunOutcome::AlreadyActive(run_log);
+    assert!(matches!(outcome, StartRunOutcome::AlreadyActive(_)));
+}
+
+#[test]
+fn test_start_run_started() {
+    let outcome = StartRunOutcome::Started;
+    assert!(matches!(outcome, StartRunOutcome::Started));
+}
+
+#[test]
+fn test_run_log_creation() {
+    let log = RunLog {
+        id: "run-1".to_string(),
+        background_agent_id: "agent-1".to_string(),
+        status: RunStatus::Success,
+        trigger_type: TriggerType::Manual,
+        summary: Some("done".to_string()),
+        started_at: Utc::now(),
+        finished_at: Some(Utc::now()),
+        exit_code: Some(0),
+        timeout_at: None,
+    };
+    assert_eq!(log.id, "run-1");
+    assert_eq!(log.background_agent_id, "agent-1");
+    assert!(matches!(log.status, RunStatus::Success));
+    assert!(matches!(log.trigger_type, TriggerType::Manual));
+    assert_eq!(log.summary.as_deref(), Some("done"));
+    assert_eq!(log.exit_code, Some(0));
+}
+
+#[test]
+fn test_trigger_watch_all_fields() {
+    let trigger = Trigger::Watch {
+        path: "/src".to_string(),
+        events: vec![WatchEvent::Modify, WatchEvent::Delete],
+        debounce_seconds: 10,
+        recursive: true,
+    };
+    assert_eq!(trigger.type_str(), "watch");
+    if let Trigger::Watch {
+        path,
+        events,
+        debounce_seconds,
+        recursive,
+    } = trigger
+    {
+        assert_eq!(path, "/src");
+        assert_eq!(events.len(), 2);
+        assert_eq!(debounce_seconds, 10);
+        assert!(recursive);
+    } else {
+        panic!("expected Watch trigger");
+    }
 }

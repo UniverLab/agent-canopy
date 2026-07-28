@@ -74,54 +74,59 @@ impl VectorStore {
             .with_context(|| format!("Failed to open LanceDB at {}", path.display()))?;
         let schema = chunk_schema(embedding_dimensions);
 
-        let table = match connection.open_table(TABLE_NAME).execute().await {
-            Ok(existing_table) => {
-                // Check whether the stored schema matches the requested dimensions.
-                // If they differ (e.g. model was changed), drop and recreate the table.
-                let stored_dims = embedding_dims_from_table(&existing_table).await;
-                tracing::info!(
-                    "RAG VectorStore: existing table found — stored_dims={:?}, requested={}",
+        let known_tables = connection
+            .table_names()
+            .execute()
+            .await
+            .context("Failed to list LanceDB tables")?;
+
+        let table = if !known_tables.iter().any(|name| name == TABLE_NAME) {
+            tracing::info!(
+                "RAG VectorStore: no existing table found, creating fresh with {} dims",
+                embedding_dimensions
+            );
+            connection
+                .create_empty_table(TABLE_NAME, schema.clone())
+                .execute()
+                .await
+                .context("Failed to create LanceDB table")?
+        } else {
+            // The table is listed on disk, so it must not be silently replaced:
+            // an open failure here is a transient race (e.g. concurrent manifest
+            // rewrite) or genuine corruption, never "table does not exist".
+            let existing_table = open_existing_table_with_retry(&connection).await?;
+
+            // Check whether the stored schema matches the requested dimensions.
+            // If they differ (e.g. model was changed), drop and recreate the table.
+            let stored_dims = embedding_dims_from_table(&existing_table).await;
+            tracing::info!(
+                "RAG VectorStore: existing table found — stored_dims={:?}, requested={}",
+                stored_dims,
+                embedding_dimensions
+            );
+            if stored_dims != Some(embedding_dimensions) {
+                tracing::warn!(
+                    "RAG VectorStore: schema mismatch (stored={:?} vs requested={}) — dropping and recreating table",
                     stored_dims,
                     embedding_dimensions
                 );
-                if stored_dims != Some(embedding_dimensions) {
-                    tracing::warn!(
-                        "RAG VectorStore: schema mismatch (stored={:?} vs requested={}) — dropping and recreating table",
-                        stored_dims,
-                        embedding_dimensions
-                    );
-                    connection
-                        .drop_table(TABLE_NAME, &[])
-                        .await
-                        .context("Failed to drop outdated LanceDB table")?;
-                    let new_table = connection
-                        .create_empty_table(TABLE_NAME, schema.clone())
-                        .execute()
-                        .await
-                        .context("Failed to recreate LanceDB table after schema change")?;
-                    tracing::info!(
-                        "RAG VectorStore: recreated table with {} dimensions",
-                        embedding_dimensions
-                    );
-                    new_table
-                } else {
-                    tracing::info!("RAG VectorStore: schema OK, reusing existing table");
-                    existing_table
-                }
-            }
-            Err(open_error) => {
-                tracing::info!(
-                    "RAG VectorStore: table not found ({}), creating fresh with {} dims",
-                    open_error,
-                    embedding_dimensions
-                );
                 connection
+                    .drop_table(TABLE_NAME, &[])
+                    .await
+                    .context("Failed to drop outdated LanceDB table")?;
+                let new_table = connection
                     .create_empty_table(TABLE_NAME, schema.clone())
                     .execute()
                     .await
-                    .with_context(|| {
-                        format!("Failed to create LanceDB table {TABLE_NAME} after open error: {open_error}")
-                    })?
+                    .context("Failed to recreate LanceDB table after schema change")?;
+                tracing::info!(
+                    "RAG VectorStore: recreated table with {} dimensions",
+                    embedding_dimensions
+                );
+                new_table
+            } else {
+                tracing::info!("RAG VectorStore: schema OK, reusing existing table");
+                existing_table
             }
         };
 
@@ -205,54 +210,45 @@ impl VectorStore {
     /// Return every distinct `file_path` stored in the vector table.
     /// Used for orphan-chunk reconciliation at startup.
     pub async fn list_unique_paths(&self) -> Result<Vec<String>> {
-        let batches: Vec<RecordBatch> = self
-            .table
-            .query()
-            .select(Select::columns(&["file_path"]))
-            .execute()
-            .await
-            .context("Failed to query LanceDB for unique paths")?
-            .try_collect()
-            .await
-            .context("Failed to collect LanceDB path query results")?;
-
-        let mut paths = std::collections::HashSet::new();
-        for batch in &batches {
-            if let Some(col) = batch.column_by_name("file_path") {
-                if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-                    for i in 0..arr.len() {
-                        paths.insert(arr.value(i).to_string());
-                    }
-                }
-            }
-        }
+        let file_paths = self.query_file_paths().await?;
+        let paths: std::collections::HashSet<String> = file_paths.into_iter().collect();
         Ok(paths.into_iter().collect())
     }
 
     /// Return a map of `file_path → chunk_count` for every indexed file.
     pub async fn count_chunks_per_file(&self) -> Result<std::collections::HashMap<String, usize>> {
+        let file_paths = self.query_file_paths().await?;
+        let mut counts = std::collections::HashMap::new();
+        for path in file_paths {
+            *counts.entry(path).or_insert(0) += 1;
+        }
+        Ok(counts)
+    }
+
+    /// Query all `file_path` values from the vector table.
+    async fn query_file_paths(&self) -> Result<Vec<String>> {
         let batches: Vec<RecordBatch> = self
             .table
             .query()
             .select(Select::columns(&["file_path"]))
             .execute()
             .await
-            .context("Failed to query LanceDB for chunk counts")?
+            .context("Failed to query LanceDB for file paths")?
             .try_collect()
             .await
-            .context("Failed to collect LanceDB chunk-count results")?;
+            .context("Failed to collect LanceDB file path results")?;
 
-        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut paths = Vec::new();
         for batch in &batches {
             if let Some(col) = batch.column_by_name("file_path") {
                 if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
                     for i in 0..arr.len() {
-                        *counts.entry(arr.value(i).to_string()).or_insert(0) += 1;
+                        paths.push(arr.value(i).to_string());
                     }
                 }
             }
         }
-        Ok(counts)
+        Ok(paths)
     }
 
     pub fn path_for_tests(base_dir: &Path) -> PathBuf {
@@ -270,6 +266,42 @@ impl VectorStore {
             )
         }
     }
+}
+
+/// Number of attempts to open a table already listed by `table_names()` before
+/// giving up. LanceDB's manifest can be transiently rewritten by background
+/// cleanup, which makes a concurrent `open_table` fail with a spurious
+/// "not found" even though the table is present on disk.
+const OPEN_TABLE_MAX_ATTEMPTS: u32 = 3;
+
+/// Open a table that `table_names()` has already confirmed exists, retrying
+/// with backoff on failure. Never falls back to creating an empty table:
+/// callers must treat a persistent failure as fatal, not as "table missing".
+async fn open_existing_table_with_retry(connection: &Connection) -> Result<Table> {
+    let mut last_error = None;
+    for attempt in 1..=OPEN_TABLE_MAX_ATTEMPTS {
+        match connection.open_table(TABLE_NAME).execute().await {
+            Ok(table) => return Ok(table),
+            Err(error) => {
+                tracing::warn!(
+                    "RAG VectorStore: open_table attempt {}/{} failed: {}",
+                    attempt,
+                    OPEN_TABLE_MAX_ATTEMPTS,
+                    error
+                );
+                last_error = Some(error);
+                if attempt < OPEN_TABLE_MAX_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * u64::from(attempt)))
+                        .await;
+                }
+            }
+        }
+    }
+    Err(last_error.expect("loop runs at least once")).with_context(|| {
+        format!(
+            "Failed to open existing LanceDB table {TABLE_NAME} after {OPEN_TABLE_MAX_ATTEMPTS} attempts"
+        )
+    })
 }
 
 fn path_to_uri(path: &Path) -> Result<String> {
@@ -512,6 +544,145 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].content, first_content);
         assert_eq!(results[0].file_path, "/docs/guide.md");
+    }
+
+    /// Truncate all regular files under `dir` to 0 bytes (simulates corruption).
+    fn corrupt_all_files(dir: &std::path::Path) {
+        let entries = std::fs::read_dir(dir).unwrap();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                std::fs::write(&path, []).unwrap();
+            } else if path.is_dir() {
+                corrupt_all_files(&path);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupted_store_fails_to_open() {
+        let temp_dir = TempDir::new().unwrap();
+        let lancedb_path = VectorStore::path_for_tests(temp_dir.path());
+
+        // Create a valid store with data.
+        let store = VectorStore::open_at(&lancedb_path, 4).await.unwrap();
+        store
+            .insert_chunk(&chunk("a", "/test.md", "hello", vec![1.0, 0.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        drop(store);
+
+        // Corrupt the store by truncating all files to 0 bytes.
+        corrupt_all_files(&lancedb_path);
+
+        // Opening the corrupted store should fail.
+        let result = VectorStore::open_at(&lancedb_path, 4).await;
+        assert!(result.is_err(), "corrupted store should fail to open");
+    }
+
+    #[tokio::test]
+    async fn open_failure_on_known_existing_table_propagates_instead_of_recreating() {
+        let temp_dir = TempDir::new().unwrap();
+        let lancedb_path = VectorStore::path_for_tests(temp_dir.path());
+
+        // Create a valid store with data.
+        let store = VectorStore::open_at(&lancedb_path, 4).await.unwrap();
+        store
+            .insert_chunk(&chunk("a", "/test.md", "hello", vec![1.0, 0.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        drop(store);
+
+        // Corrupt the store by truncating all files to 0 bytes.
+        corrupt_all_files(&lancedb_path);
+
+        // The table is still listed on disk even though its manifest is
+        // corrupt — table_names() is a plain directory scan, independent of
+        // manifest integrity. This is exactly the condition that used to make
+        // VectorStore::new() treat the table as "does not exist" and silently
+        // overwrite it with an empty one.
+        let connection = connect(&path_to_uri(&lancedb_path).unwrap())
+            .execute()
+            .await
+            .unwrap();
+        let known_tables = connection.table_names().execute().await.unwrap();
+        assert!(known_tables.iter().any(|name| name == TABLE_NAME));
+        drop(connection);
+
+        // Opening must propagate the failure, not fall back to creating an
+        // empty table — that would silently discard the existing row.
+        let result = VectorStore::open_at(&lancedb_path, 4).await;
+        assert!(
+            result.is_err(),
+            "open failure on a known-existing table must propagate, not recreate it empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupted_store_recovers_after_purge() {
+        let temp_dir = TempDir::new().unwrap();
+        let lancedb_path = VectorStore::path_for_tests(temp_dir.path());
+
+        // Create a valid store with data.
+        let store = VectorStore::open_at(&lancedb_path, 4).await.unwrap();
+        store
+            .insert_chunk(&chunk("a", "/test.md", "hello", vec![1.0, 0.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        drop(store);
+
+        // Corrupt the store by truncating all files to 0 bytes.
+        corrupt_all_files(&lancedb_path);
+
+        // Opening the corrupted store should fail.
+        assert!(VectorStore::open_at(&lancedb_path, 4).await.is_err());
+
+        // Purge (delete) the corrupted directory — simulates wipe_lancedb_dir.
+        std::fs::remove_dir_all(&lancedb_path).unwrap();
+
+        // Opening after purge should succeed with a fresh (empty) table.
+        let store = VectorStore::open_at(&lancedb_path, 4).await.unwrap();
+        assert_eq!(store.count_chunks().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn schema_mismatch_drops_and_recreates_table() {
+        let temp_dir = TempDir::new().unwrap();
+        let lancedb_path = VectorStore::path_for_tests(temp_dir.path());
+
+        // Create a store with 4-dimensional embeddings and a row.
+        let store = VectorStore::open_at(&lancedb_path, 4).await.unwrap();
+        store
+            .insert_chunk(&chunk("a", "/test.md", "hello", vec![1.0, 0.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        assert_eq!(store.count_chunks().await.unwrap(), 1);
+        drop(store);
+
+        // Reopening with a different embedding dimension (e.g. model change)
+        // must drop and recreate the table, ending up empty with the new schema.
+        let store = VectorStore::open_at(&lancedb_path, 8).await.unwrap();
+        assert_eq!(store.count_chunks().await.unwrap(), 0);
+        store
+            .insert_chunk(&chunk(
+                "b",
+                "/test2.md",
+                "world",
+                vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(store.count_chunks().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_directory_creates_fresh_table() {
+        let temp_dir = TempDir::new().unwrap();
+        let lancedb_path = temp_dir.path().join("nonexistent").join("vectors.lancedb");
+
+        // open_at should create the directory and table from scratch.
+        let store = VectorStore::open_at(&lancedb_path, 4).await.unwrap();
+        assert_eq!(store.count_chunks().await.unwrap(), 0);
     }
 
     #[tokio::test]

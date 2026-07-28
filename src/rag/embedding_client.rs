@@ -22,12 +22,17 @@ pub fn client_from_config(config: &CanopyConfig) -> Result<Box<dyn EmbeddingClie
     match provider_for_model(model) {
         Some(EmbeddingProvider::OpenAi) => Ok(Box::new(OpenAIEmbeddingClient::from_env(model)?)),
         Some(EmbeddingProvider::Gemini) => Ok(Box::new(GeminiEmbeddingClient::from_env(model)?)),
+        #[cfg(feature = "local-embeddings")]
         Some(EmbeddingProvider::Local) => {
             let cache_dir = dirs::home_dir()
                 .ok_or_else(|| anyhow!("No home directory found"))?
                 .join(".canopy")
                 .join("models");
             Ok(Box::new(LocalEmbeddingClient::new(model, &cache_dir)?))
+        }
+        #[cfg(not(feature = "local-embeddings"))]
+        Some(EmbeddingProvider::Local) => {
+            bail!("Local embeddings require the 'local-embeddings' feature")
         }
         None => bail!("Unsupported embeddings model: {model}"),
     }
@@ -255,6 +260,7 @@ impl EmbeddingClient for GeminiEmbeddingClient {
 ///
 /// The model file is downloaded from HuggingFace on first use and cached in
 /// `~/.canopy/models/`. No API key is required.
+#[cfg(feature = "local-embeddings")]
 pub struct LocalEmbeddingClient {
     // fastembed::TextEmbedding is Send but not Sync; wrapping in Mutex makes
     // the struct Sync so it satisfies the EmbeddingClient bound.
@@ -262,6 +268,7 @@ pub struct LocalEmbeddingClient {
     dimensions: usize,
 }
 
+#[cfg(feature = "local-embeddings")]
 impl LocalEmbeddingClient {
     pub fn new(model_id: &str, cache_dir: &std::path::Path) -> Result<Self> {
         std::fs::create_dir_all(cache_dir)
@@ -288,6 +295,7 @@ impl LocalEmbeddingClient {
     }
 }
 
+#[cfg(feature = "local-embeddings")]
 impl EmbeddingClient for LocalEmbeddingClient {
     fn embed(&self, text: &str) -> Result<Vec<f32>> {
         let mut model = self
@@ -312,6 +320,7 @@ impl EmbeddingClient for LocalEmbeddingClient {
 
 /// Download (or verify) a local embedding model, showing download progress.
 /// Called during interactive setup so the model is ready before indexing begins.
+#[cfg(feature = "local-embeddings")]
 pub fn download_local_model(model_id: &str, cache_dir: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(cache_dir)
         .with_context(|| format!("Cannot create model cache dir: {}", cache_dir.display()))?;
@@ -325,6 +334,7 @@ pub fn download_local_model(model_id: &str, cache_dir: &std::path::Path) -> Resu
     Ok(())
 }
 
+#[cfg(feature = "local-embeddings")]
 fn model_id_to_fastembed(model_id: &str) -> Result<fastembed::EmbeddingModel> {
     match model_id.trim().to_ascii_lowercase().as_str() {
         "baai/bge-small-en-v1.5" => Ok(fastembed::EmbeddingModel::BGESmallENV15),
@@ -612,5 +622,297 @@ mod tests {
                 std::env::remove_var(self.key);
             }
         }
+    }
+
+    // ── parse_dimension_suffix ─────────────────────────────────────────
+
+    #[test]
+    fn parse_dimension_suffix_extracts_numeric_suffix() {
+        assert_eq!(parse_dimension_suffix("model-768d"), Some(768));
+        assert_eq!(parse_dimension_suffix("custom-1536d"), Some(1536));
+        assert_eq!(parse_dimension_suffix("x-1d"), Some(1));
+    }
+
+    #[test]
+    fn parse_dimension_suffix_ignores_non_numeric_suffix() {
+        assert_eq!(parse_dimension_suffix("model-large"), None);
+        assert_eq!(parse_dimension_suffix("model-base"), None);
+        assert_eq!(parse_dimension_suffix("text-embedding-3-small"), None);
+    }
+
+    #[test]
+    fn parse_dimension_suffix_rejects_zero_dimensions() {
+        assert_eq!(parse_dimension_suffix("model-0d"), None);
+    }
+
+    #[test]
+    fn parse_dimension_suffix_handles_whitespace() {
+        assert_eq!(parse_dimension_suffix("  model-256d  "), Some(256));
+    }
+
+    #[test]
+    fn parse_dimension_suffix_no_dash_means_none() {
+        assert_eq!(parse_dimension_suffix("nodash"), None);
+        assert_eq!(parse_dimension_suffix(""), None);
+    }
+
+    #[test]
+    fn parse_dimension_suffix_suffix_without_d_is_none() {
+        assert_eq!(parse_dimension_suffix("model-512"), None);
+    }
+
+    // ── model_id_for_dimensions ────────────────────────────────────────
+
+    #[test]
+    fn model_id_for_dimensions_returns_known_labels() {
+        assert_eq!(model_id_for_dimensions(384), "local-384d");
+        assert_eq!(model_id_for_dimensions(768), "local-768d");
+        assert_eq!(model_id_for_dimensions(1024), "local-1024d");
+    }
+
+    #[test]
+    fn model_id_for_dimensions_returns_fallback_for_unknown() {
+        assert_eq!(model_id_for_dimensions(0), "local");
+        assert_eq!(model_id_for_dimensions(999), "local");
+        assert_eq!(model_id_for_dimensions(2048), "local");
+    }
+
+    // ── normalize_embedding ────────────────────────────────────────────
+
+    #[test]
+    fn normalize_embedding_produces_unit_vector() {
+        let v = normalize_embedding(vec![3.0, 4.0]);
+        let mag = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((mag - 1.0).abs() < 1e-5);
+        assert!((v[0] - 0.6).abs() < 1e-5);
+        assert!((v[1] - 0.8).abs() < 1e-5);
+    }
+
+    #[test]
+    fn normalize_embedding_preserves_zero_vector() {
+        let v = normalize_embedding(vec![0.0, 0.0, 0.0]);
+        assert_eq!(v, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn normalize_embedding_handles_single_element() {
+        let v = normalize_embedding(vec![5.0]);
+        assert!((v[0] - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn normalize_embedding_handles_negative_values() {
+        let v = normalize_embedding(vec![-3.0, 4.0]);
+        let mag = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((mag - 1.0).abs() < 1e-5);
+        assert!(v[0] < 0.0);
+        assert!(v[1] > 0.0);
+    }
+
+    // ── validate_embedding_dimensions ──────────────────────────────────
+
+    #[test]
+    fn validate_embedding_dimensions_ok_when_matching() {
+        let result = validate_embedding_dimensions("model", 3, &[1.0, 2.0, 3.0]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_embedding_dimensions_err_on_mismatch() {
+        let result = validate_embedding_dimensions("model", 4, &[1.0, 2.0, 3.0]);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("expected 4"));
+        assert!(msg.contains("got 3"));
+    }
+
+    #[test]
+    fn validate_embedding_dimensions_err_includes_model_name() {
+        let result = validate_embedding_dimensions("my-model", 2, &[1.0]);
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("my-model"));
+    }
+
+    // ── model_dimensions edge cases ────────────────────────────────────
+
+    #[test]
+    fn model_dimensions_returns_error_for_unknown_model() {
+        let result = model_dimensions("completely-unknown-model");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Unsupported"));
+    }
+
+    #[test]
+    fn model_dimensions_case_insensitive_for_known_models() {
+        assert_eq!(model_dimensions("Text-Embedding-3-Small").unwrap(), 1536);
+        assert_eq!(model_dimensions("TEXT-EMBEDDING-3-LARGE").unwrap(), 3072);
+    }
+
+    #[test]
+    fn model_dimensions_all_local_models() {
+        assert_eq!(model_dimensions("baai/bge-small-en-v1.5").unwrap(), 384);
+        assert_eq!(model_dimensions("baai/bge-base-en-v1.5").unwrap(), 768);
+        assert_eq!(model_dimensions("baai/bge-large-en-v1.5").unwrap(), 1024);
+        assert_eq!(
+            model_dimensions("intfloat/multilingual-e5-small").unwrap(),
+            384
+        );
+        assert_eq!(
+            model_dimensions("intfloat/multilingual-e5-base").unwrap(),
+            768
+        );
+        assert_eq!(
+            model_dimensions("intfloat/multilingual-e5-large").unwrap(),
+            1024
+        );
+    }
+
+    // ── provider_for_model edge cases ──────────────────────────────────
+
+    #[test]
+    fn provider_for_model_empty_string_returns_none() {
+        assert_eq!(provider_for_model(""), None);
+    }
+
+    #[test]
+    fn provider_for_model_whitespace_only_returns_none() {
+        assert_eq!(provider_for_model("   "), None);
+    }
+
+    #[test]
+    fn provider_for_model_gemini_embedding_001() {
+        assert_eq!(
+            provider_for_model("embedding-001"),
+            Some(EmbeddingProvider::Gemini)
+        );
+    }
+
+    #[test]
+    fn provider_for_model_local_models_detected() {
+        assert_eq!(
+            provider_for_model("baai/bge-small-en-v1.5"),
+            Some(EmbeddingProvider::Local)
+        );
+        assert_eq!(
+            provider_for_model("intfloat/multilingual-e5-large"),
+            Some(EmbeddingProvider::Local)
+        );
+    }
+
+    #[test]
+    fn provider_for_model_case_insensitive() {
+        assert_eq!(
+            provider_for_model("TEXT-EMBEDDING-3-SMALL"),
+            Some(EmbeddingProvider::OpenAi)
+        );
+        assert_eq!(
+            provider_for_model("Gemini-Embedding-001"),
+            Some(EmbeddingProvider::Gemini)
+        );
+    }
+
+    #[test]
+    fn provider_for_model_with_whitespace() {
+        assert_eq!(
+            provider_for_model("  text-embedding-3-small  "),
+            Some(EmbeddingProvider::OpenAi)
+        );
+    }
+
+    #[test]
+    fn provider_for_model_openai_keyword() {
+        assert_eq!(
+            provider_for_model("my-openai-model"),
+            Some(EmbeddingProvider::OpenAi)
+        );
+    }
+
+    // ── LOCAL_MODEL_IDS ────────────────────────────────────────────────
+
+    #[test]
+    fn local_model_ids_count() {
+        assert_eq!(LOCAL_MODEL_IDS.len(), 6);
+    }
+
+    #[test]
+    fn local_model_ids_are_unique() {
+        let mut ids = LOCAL_MODEL_IDS.to_vec();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), LOCAL_MODEL_IDS.len());
+    }
+
+    // ── MockEmbeddingClient ────────────────────────────────────────────
+
+    #[test]
+    fn mock_embedding_client_zero_dimensions_errors() {
+        let client = MockEmbeddingClient::new(0);
+        assert!(client.embed("hello").is_err());
+    }
+
+    #[test]
+    fn mock_embedding_client_single_token() {
+        let client = MockEmbeddingClient::new(3);
+        let embedding = client.embed("hello").unwrap();
+        assert_eq!(embedding.len(), 3);
+        let mag = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((mag - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn mock_embedding_client_empty_text() {
+        let client = MockEmbeddingClient::new(3);
+        let embedding = client.embed("").unwrap();
+        assert_eq!(embedding.len(), 3);
+        // Empty text: embedding[0] gets set to 1.0 then normalized
+        assert!((embedding[0] - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn mock_embedding_client_dimensions_match() {
+        let client = MockEmbeddingClient::new(16);
+        let embedding = client.embed("test").unwrap();
+        assert_eq!(embedding.len(), 16);
+    }
+
+    // ── EmbeddingProvider equality ─────────────────────────────────────
+
+    #[test]
+    fn embedding_provider_eq_and_debug() {
+        assert_eq!(EmbeddingProvider::OpenAi, EmbeddingProvider::OpenAi);
+        assert_ne!(EmbeddingProvider::OpenAi, EmbeddingProvider::Gemini);
+        assert_ne!(EmbeddingProvider::Gemini, EmbeddingProvider::Local);
+        assert_ne!(EmbeddingProvider::OpenAi, EmbeddingProvider::Local);
+        // Debug should not panic
+        let _ = format!("{:?}", EmbeddingProvider::OpenAi);
+    }
+
+    #[test]
+    fn embedding_provider_clone_and_copy() {
+        let p = EmbeddingProvider::Gemini;
+        let p2 = p;
+        assert_eq!(p, p2);
+    }
+
+    // ── client_from_config edge cases ──────────────────────────────────
+
+    #[test]
+    fn client_from_config_whitespace_model_is_rejected() {
+        let config = CanopyConfig {
+            embeddings_model: "   ".to_string(),
+            ..CanopyConfig::default()
+        };
+        let err = client_from_config(&config).err().unwrap();
+        assert!(err.to_string().contains("not configured"));
+    }
+
+    #[test]
+    fn client_from_config_unsupported_model_is_rejected() {
+        let config = CanopyConfig {
+            embeddings_model: "unknown-model".to_string(),
+            ..CanopyConfig::default()
+        };
+        let err = client_from_config(&config).err().unwrap();
+        assert!(err.to_string().contains("Unsupported"));
     }
 }

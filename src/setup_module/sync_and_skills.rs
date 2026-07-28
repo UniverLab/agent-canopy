@@ -35,17 +35,26 @@ pub(crate) fn run_sync_step(
 /// Download the UniverLab Essential Skills pack and create platform symlinks.
 ///
 /// Runs silently on failure so a network error never blocks setup completion.
-pub(crate) fn run_essential_skills_step(home: &Path, selected: &[&Platform]) -> String {
+///
+/// Local files that diverge from the incoming sync content are never
+/// overwritten (a WARN is logged and left as `.sync-new`) unless
+/// `force_skills` is set — see `skills_module::sync_policy`.
+pub(crate) fn run_essential_skills_step(
+    home: &Path,
+    selected: &[&Platform],
+    force_skills: bool,
+) -> String {
     // Ensure global skills directory exists
     if crate::skills_module::ensure_global_skills_dir().is_err() {
         return "\x1b[33m⚠\x1b[0m Skills: could not create ~/.agents/skills/".to_string();
     }
 
     // Download Essential Pack from GitHub (best-effort)
-    let downloaded = crate::skills_module::download_essential_pack().unwrap_or_else(|e| {
-        tracing::warn!("Essential skills download failed: {e}");
-        0
-    });
+    let downloaded =
+        crate::skills_module::download_essential_pack(force_skills).unwrap_or_else(|e| {
+            tracing::warn!("Essential skills download failed: {e}");
+            0
+        });
 
     // Create platform symlinks for all selected platforms that have skills_dir
     let symlinks =

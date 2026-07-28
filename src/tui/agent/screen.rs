@@ -1,5 +1,5 @@
 use crate::tui::agent::sanitize::{
-    is_ui_line, looks_like_shell_prompt, sanitize_line, strip_borders,
+    command_after_shell_prompt, is_ui_line, sanitize_line, strip_borders,
 };
 use crate::tui::agent::InteractiveAgent;
 
@@ -26,7 +26,7 @@ fn read_screen_line(screen: &vt100::Screen, row: u16, cols: u16) -> Option<Strin
 /// emitted exactly once even when the final clamped page overlaps with the
 /// previous one.
 fn read_abs_range(
-    vt: &mut vt100::Parser,
+    vt: &mut super::Vt,
     max_sb: usize,
     rows: usize,
     from_abs: usize,
@@ -106,10 +106,12 @@ impl InteractiveAgent {
             }
             vt.process(&replay);
         }
-
-        if let Ok(mut t) = self.last_output_at.lock() {
-            *t = chrono::Utc::now();
-        }
+        // Do NOT update last_output_at here. Replay is a history reconstruction
+        // (auto-resume, new-terminal scrollback), not fresh PTY output. Stamping
+        // now would make every replayed agent appear "actively working" for the
+        // next ACTIVITY_IDLE_THRESHOLD_MS, which is the root cause of the
+        // "all-green on navigation" bug — the activity timestamp must only move
+        // when the PTY background reader (mod.rs) actually receives bytes.
     }
 
     /// Get a snapshot of the virtual terminal screen for rendering.
@@ -135,6 +137,7 @@ impl InteractiveAgent {
                     bold: c.bold(),
                     underline: c.underline(),
                     inverse: c.inverse(),
+                    wide_continuation: c.is_wide_continuation(),
                 }));
             }
             cells.push(row_cells);
@@ -267,13 +270,16 @@ impl InteractiveAgent {
         Some(sanitize_line(&line).trim_end().to_string())
     }
 
-    /// Return concatenated text of the cursor line plus any wrapped continuation
-    /// lines above it that belong to the same prompt. This allows detecting
-    /// sensitive prompts even when the terminal is narrow and the keyword wraps
-    /// to a different row than the cursor.
+    /// Return the text of the *current command* — what the user is typing after
+    /// the active shell/program prompt — so sensitive-prompt detection only
+    /// looks at the line in progress, never at earlier output.
     ///
-    /// Walks at most 5 rows upward and stops at empty rows or shell prompt
-    /// boundaries to avoid false positives from unrelated screen history.
+    /// If the cursor line already carries a shell-prompt marker (e.g.
+    /// `user@host:~$ `), the command is just the text after it; a fresh empty
+    /// prompt yields an empty string and never matches. Otherwise the line is
+    /// program output (e.g. a `Vault passphrase:` prompt that wrapped on a
+    /// narrow terminal), so we walk up to 5 rows joining the continuation,
+    /// stopping at the shell prompt that launched it or at a blank row.
     pub(crate) fn prompt_context_text(&self) -> Option<String> {
         let vt = self.vt.try_lock().ok()?;
         let screen = vt.screen();
@@ -285,6 +291,13 @@ impl InteractiveAgent {
         let cursor = screen.cursor_position().0.min(rows.saturating_sub(1));
         let cursor_line = read_screen_line(screen, cursor, cols)?;
         let mut combined = sanitize_line(&cursor_line).trim_end().to_string();
+
+        // A marker on the cursor line bounds the current command: anything
+        // before it (including a stale `… wrong passphrase` error) is not part
+        // of what's being typed now, so return only the post-marker text.
+        if let Some(command) = command_after_shell_prompt(&combined) {
+            return Some(command);
+        }
 
         let mut row = cursor;
         let mut walked = 0u16;
@@ -298,7 +311,9 @@ impl InteractiveAgent {
             if trimmed.trim().is_empty() {
                 break;
             }
-            if looks_like_shell_prompt(&trimmed) {
+            // Reaching the shell prompt that launched this program means we've
+            // collected the whole wrapped prompt; earlier rows are history.
+            if command_after_shell_prompt(&trimmed).is_some() {
                 break;
             }
             combined = format!("{} {}", trimmed, combined);
@@ -471,6 +486,44 @@ pub struct ScreenSnapshot {
     pub scrolled: bool,
 }
 
+impl ScreenSnapshot {
+    /// Extract the text covered by a linear selection from `start` to `end`
+    /// (inclusive, `(row, col)` cells in reading order). Rows between the
+    /// endpoints are taken whole; trailing whitespace is trimmed per line.
+    pub fn selection_text(&self, start: (u16, u16), end: (u16, u16)) -> String {
+        let (start, end) = if end < start {
+            (end, start)
+        } else {
+            (start, end)
+        };
+        let mut lines = Vec::new();
+        for row in start.0..=end.0 {
+            let Some(cells) = self.cells.get(row as usize) else {
+                break;
+            };
+            let from = if row == start.0 { start.1 as usize } else { 0 };
+            let to = if row == end.0 {
+                (end.1 as usize + 1).min(cells.len())
+            } else {
+                cells.len()
+            };
+            let mut line = String::new();
+            for cell in cells.iter().take(to).skip(from) {
+                match cell {
+                    // The leading half of a wide char already contributed the
+                    // full grapheme; its continuation cell adds nothing.
+                    Some(c) if c.wide_continuation => {}
+                    Some(c) if c.ch.is_empty() => line.push(' '),
+                    Some(c) => line.push_str(&c.ch),
+                    None => line.push(' '),
+                }
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        lines.join("\n")
+    }
+}
+
 /// A single cell from the virtual terminal.
 pub struct VtCell {
     pub ch: String,
@@ -479,6 +532,8 @@ pub struct VtCell {
     pub bold: bool,
     pub underline: bool,
     pub inverse: bool,
+    /// Trailing half of a double-width character (contributes no text).
+    pub wide_continuation: bool,
 }
 /// Convert vt100 color to ratatui color.
 ///
@@ -490,5 +545,210 @@ fn from_vt100(color: vt100::Color) -> ratatui::style::Color {
         vt100::Color::Default => Color::Reset,
         vt100::Color::Idx(i) => Color::Indexed(i),
         vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cell(ch: &str) -> Option<VtCell> {
+        Some(VtCell {
+            ch: ch.to_string(),
+            fg: ratatui::style::Color::Reset,
+            bg: ratatui::style::Color::Reset,
+            bold: false,
+            underline: false,
+            inverse: false,
+            wide_continuation: false,
+        })
+    }
+
+    fn row_from(text: &str, width: usize) -> Vec<Option<VtCell>> {
+        let mut row: Vec<Option<VtCell>> = text.chars().map(|c| cell(&c.to_string())).collect();
+        row.resize_with(width, || cell(""));
+        row
+    }
+
+    fn snapshot(rows: &[&str], width: usize) -> ScreenSnapshot {
+        ScreenSnapshot {
+            cells: rows.iter().map(|r| row_from(r, width)).collect(),
+            cursor_row: 0,
+            cursor_col: 0,
+            scrolled: false,
+        }
+    }
+
+    #[test]
+    fn selection_text_single_row_segment() {
+        let snap = snapshot(&["hello world"], 20);
+        assert_eq!(snap.selection_text((0, 6), (0, 10)), "world");
+    }
+
+    #[test]
+    fn selection_text_multi_row_takes_full_middle_rows() {
+        let snap = snapshot(&["first line", "middle", "last line"], 20);
+        assert_eq!(snap.selection_text((0, 6), (2, 3)), "line\nmiddle\nlast");
+    }
+
+    #[test]
+    fn selection_text_reversed_endpoints_and_blank_cells() {
+        let snap = snapshot(&["a b", ""], 10);
+        // Reversed (end before start) selects the same range; untouched cells
+        // read as spaces and trailing whitespace is trimmed per line.
+        assert_eq!(snap.selection_text((1, 5), (0, 0)), "a b\n");
+    }
+
+    #[test]
+    fn selection_text_skips_wide_continuation_cells() {
+        // "日" occupies two cells: the glyph plus a continuation cell.
+        let mut row = vec![cell("日")];
+        row.push(Some(VtCell {
+            ch: String::new(),
+            fg: ratatui::style::Color::Reset,
+            bg: ratatui::style::Color::Reset,
+            bold: false,
+            underline: false,
+            inverse: false,
+            wide_continuation: true,
+        }));
+        row.push(cell("x"));
+        row.resize_with(6, || cell(""));
+        let snap = ScreenSnapshot {
+            cells: vec![row],
+            cursor_row: 0,
+            cursor_col: 0,
+            scrolled: false,
+        };
+        assert_eq!(snap.selection_text((0, 0), (0, 2)), "日x");
+    }
+
+    // ── from_vt100 color conversion ─────────────────────────────
+
+    #[test]
+    fn from_vt100_default_color() {
+        assert_eq!(
+            from_vt100(vt100::Color::Default),
+            ratatui::style::Color::Reset
+        );
+    }
+
+    #[test]
+    fn from_vt100_indexed_color() {
+        assert_eq!(
+            from_vt100(vt100::Color::Idx(42)),
+            ratatui::style::Color::Indexed(42)
+        );
+    }
+
+    #[test]
+    fn from_vt100_rgb_color() {
+        assert_eq!(
+            from_vt100(vt100::Color::Rgb(100, 200, 50)),
+            ratatui::style::Color::Rgb(100, 200, 50)
+        );
+    }
+
+    #[test]
+    fn from_vt100_indexed_zero() {
+        assert_eq!(
+            from_vt100(vt100::Color::Idx(0)),
+            ratatui::style::Color::Indexed(0)
+        );
+    }
+
+    #[test]
+    fn from_vt100_indexed_max() {
+        assert_eq!(
+            from_vt100(vt100::Color::Idx(255)),
+            ratatui::style::Color::Indexed(255)
+        );
+    }
+
+    // ── selection_text edge cases ────────────────────────────────
+
+    #[test]
+    fn selection_text_single_char() {
+        let snap = snapshot(&["abc"], 10);
+        assert_eq!(snap.selection_text((0, 1), (0, 1)), "b");
+    }
+
+    #[test]
+    fn selection_text_full_row() {
+        let snap = snapshot(&["hello"], 10);
+        assert_eq!(snap.selection_text((0, 0), (0, 4)), "hello");
+    }
+
+    #[test]
+    fn selection_text_empty_row() {
+        let snap = snapshot(&[""], 10);
+        let result = snap.selection_text((0, 0), (0, 0));
+        assert!(result.is_empty() || result == " ");
+    }
+
+    #[test]
+    fn selection_text_two_rows_no_overlap() {
+        let snap = snapshot(&["aaa", "bbb"], 10);
+        assert_eq!(snap.selection_text((0, 0), (1, 2)), "aaa\nbbb");
+    }
+
+    #[test]
+    fn selection_text_none_cells_are_spaces() {
+        let mut snap = snapshot(&["abc"], 5);
+        // Set one cell to None
+        snap.cells[0][1] = None;
+        assert_eq!(snap.selection_text((0, 0), (0, 2)), "a c");
+    }
+
+    #[test]
+    fn selection_text_reversed_endpoints() {
+        let snap = snapshot(&["hello"], 10);
+        // Reversed: start > end
+        assert_eq!(snap.selection_text((0, 4), (0, 0)), "hello");
+    }
+
+    #[test]
+    #[allow(clippy::vec_init_then_push)]
+    fn selection_text_wide_char_with_continuation() {
+        let mut row: Vec<Option<VtCell>> = Vec::new();
+        // "AB" as two normal chars
+        row.push(cell("A"));
+        row.push(cell("B"));
+        // "日" as wide char + continuation
+        row.push(cell("日"));
+        row.push(Some(VtCell {
+            ch: String::new(),
+            fg: ratatui::style::Color::Reset,
+            bg: ratatui::style::Color::Reset,
+            bold: false,
+            underline: false,
+            inverse: false,
+            wide_continuation: true,
+        }));
+        row.push(cell("C"));
+        row.resize_with(10, || cell(""));
+        let snap = ScreenSnapshot {
+            cells: vec![row],
+            cursor_row: 0,
+            cursor_col: 0,
+            scrolled: false,
+        };
+        assert_eq!(snap.selection_text((0, 0), (0, 4)), "AB日C");
+    }
+
+    #[test]
+    fn selection_text_empty_ch_cell() {
+        let mut snap = snapshot(&["abc"], 5);
+        // Set one cell to have empty ch
+        snap.cells[0][1] = Some(VtCell {
+            ch: String::new(),
+            fg: ratatui::style::Color::Reset,
+            bg: ratatui::style::Color::Reset,
+            bold: false,
+            underline: false,
+            inverse: false,
+            wide_continuation: false,
+        });
+        assert_eq!(snap.selection_text((0, 0), (0, 2)), "a c");
     }
 }

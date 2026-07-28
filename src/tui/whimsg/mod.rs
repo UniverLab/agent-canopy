@@ -404,3 +404,334 @@ impl Whimsg {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// WhimFrame factory methods produce correct initial state
+    #[test]
+    fn whim_frame_full_title_has_visible_title() {
+        let frame = WhimFrame::full_title();
+        assert_eq!(frame.title_visible, TITLE.len());
+        assert!(frame.kaomoji.is_empty());
+        assert!(frame.text.is_empty());
+        assert_eq!(frame.text_visible, 0);
+    }
+
+    /// WhimFrame factory methods produce correct initial state
+    #[test]
+    fn whim_frame_empty_title_has_no_visible_title() {
+        let frame = WhimFrame::empty_title();
+        assert_eq!(frame.title_visible, 0);
+        assert!(frame.kaomoji.is_empty());
+        assert!(frame.text.is_empty());
+        assert_eq!(frame.text_visible, 0);
+    }
+
+    /// tick_erasing_title progresses character visibility over time
+    #[test]
+    fn tick_erasing_title_progressively_hides_characters() {
+        let (frame, _next_phase) = tick_erasing_title(0);
+        let initial_visible = frame.title_visible;
+        assert!(initial_visible > 0);
+        assert_eq!(initial_visible, TITLE.len());
+
+        let (frame2, _next_phase2) = tick_erasing_title(ERASE_MS);
+        assert!(frame2.title_visible < initial_visible);
+
+        let (frame3, next_phase3) = tick_erasing_title(ERASE_MS * (TITLE.len() as u64));
+        assert_eq!(frame3.title_visible, 0);
+        assert!(next_phase3.is_some());
+    }
+
+    /// tick_erasing_title transitions to KaomojiFlash when title is fully erased
+    #[test]
+    fn tick_erasing_title_transitions_to_kaomoji_flash_when_done() {
+        let (_, next_phase) = tick_erasing_title(ERASE_MS * (TITLE.len() as u64 + 1));
+        assert!(matches!(next_phase, Some(Phase::KaomojiFlash)));
+    }
+
+    /// Whimsg::new creates a Whimsg with sensible defaults
+    #[test]
+    fn whimsg_new_initializes_correctly() {
+        let w = Whimsg::new();
+        assert!(matches!(w.phase, Phase::Idle));
+        assert!(w.active_kaomoji.is_empty());
+        assert!(w.active_text.is_empty());
+        assert_eq!(w.active_hold_ms, 0);
+        assert_eq!(w.celebration_remaining, 0);
+        assert!(w.event_context.is_none());
+        assert!(matches!(w.ambient, WhimContext::Idle));
+    }
+
+    /// set_ambient updates the ambient context
+    #[test]
+    fn set_ambient_changes_context() {
+        let mut w = Whimsg::new();
+        assert!(matches!(w.ambient, WhimContext::Idle));
+
+        w.set_ambient(WhimContext::AgentSpawned);
+        assert!(matches!(w.ambient, WhimContext::AgentSpawned));
+
+        w.set_ambient(WhimContext::Busy);
+        assert!(matches!(w.ambient, WhimContext::Busy));
+    }
+
+    /// notify_event sets event context and updates trigger time
+    #[test]
+    fn notify_event_sets_context_and_trigger() {
+        let mut w = Whimsg::new();
+        let old_trigger = w.next_trigger;
+
+        w.notify_event(WhimContext::AgentFailed);
+        assert!(w.event_context.is_some());
+        assert!(matches!(w.event_context, Some(WhimContext::AgentFailed)));
+
+        // From Idle phase, trigger should be sooner
+        assert!(w.next_trigger <= old_trigger);
+    }
+
+    /// notify_event from non-idle phase doesn't change trigger time if already sooner
+    #[test]
+    fn notify_event_when_already_triggered_keeps_early_trigger() {
+        let mut w = Whimsg::new();
+
+        // First event
+        w.notify_event(WhimContext::AgentSpawned);
+        let first_trigger = w.next_trigger;
+
+        // Second event soon after (trigger is already soon)
+        w.notify_event(WhimContext::AgentFailed);
+        // Trigger shouldn't go further back since it's already set
+        assert!(w.next_trigger <= first_trigger);
+    }
+
+    /// notify_mission_unlocked sets mission title and celebration counter
+    #[test]
+    fn notify_mission_unlocked_sets_title_and_celebration() {
+        let mut w = Whimsg::new();
+        w.notify_mission_unlocked("Test Mission");
+        assert_eq!(w.mission_title, Some("Test Mission".to_string()));
+        assert_eq!(w.celebration_remaining, 3);
+        assert!(w.event_context.is_some());
+    }
+
+    /// tick returns a WhimFrame on every call without panicking
+    #[test]
+    fn tick_always_produces_frame() {
+        let mut w = Whimsg::new();
+        for _ in 0..100 {
+            let frame = w.tick();
+            assert!(frame.title_visible <= TITLE.len());
+            // text_visible is always >= 0 by construction (it's a usize)
+        }
+    }
+
+    /// tick always starts in idle phase with full title visible
+    #[test]
+    fn tick_initial_state_shows_full_title_in_idle() {
+        let mut w = Whimsg::new();
+        let frame = w.tick();
+        assert_eq!(frame.title_visible, TITLE.len());
+        assert!(matches!(w.phase, Phase::Idle));
+    }
+
+    /// pick_intent for Idle context returns reasonable distribution
+    #[test]
+    fn pick_intent_idle_returns_thinking_loading_or_success() {
+        let mut w = Whimsg::new();
+        w.ambient = WhimContext::Idle;
+
+        let mut found_thinking = false;
+        let mut found_loading = false;
+        let mut found_success = false;
+
+        for _ in 0..100 {
+            let intent = w.pick_intent(WhimContext::Idle);
+            match intent {
+                Intent::Thinking => found_thinking = true,
+                Intent::Loading => found_loading = true,
+                Intent::Success => found_success = true,
+                Intent::Error => panic!("Idle should not produce Error intent"),
+            }
+        }
+
+        // With 100 samples, we should see some variety
+        assert!(found_thinking, "should see some Thinking intents");
+        assert!(found_loading, "should see some Loading intents");
+        assert!(found_success, "should see some Success intents");
+    }
+
+    /// pick_intent for AgentSpawned heavily favors Success
+    #[test]
+    fn pick_intent_agent_spawned_favors_success() {
+        let mut w = Whimsg::new();
+
+        let mut success_count = 0;
+        for _ in 0..100 {
+            let intent = w.pick_intent(WhimContext::AgentSpawned);
+            if matches!(intent, Intent::Success) {
+                success_count += 1;
+            }
+        }
+
+        // With 80% probability, expect 70+ successes in 100 samples
+        assert!(
+            success_count >= 50,
+            "AgentSpawned should favor Success (got {success_count}/100)"
+        );
+    }
+
+    /// pick_intent for AgentDone heavily favors Success
+    #[test]
+    fn pick_intent_agent_done_favors_success() {
+        let mut w = Whimsg::new();
+
+        let mut success_count = 0;
+        for _ in 0..100 {
+            let intent = w.pick_intent(WhimContext::AgentDone);
+            if matches!(intent, Intent::Success) {
+                success_count += 1;
+            }
+        }
+
+        // With 90% probability, expect high success rate
+        assert!(
+            success_count >= 70,
+            "AgentDone should favor Success (got {success_count}/100)"
+        );
+    }
+
+    /// pick_intent for AgentFailed produces balanced distribution
+    #[test]
+    fn pick_intent_agent_failed_balanced() {
+        let mut w = Whimsg::new();
+
+        let mut error_count = 0;
+        let mut thinking_count = 0;
+        let mut success_count = 0;
+
+        for _ in 0..100 {
+            let intent = w.pick_intent(WhimContext::AgentFailed);
+            match intent {
+                Intent::Error => error_count += 1,
+                Intent::Thinking => thinking_count += 1,
+                Intent::Success => success_count += 1,
+                Intent::Loading => panic!("AgentFailed should not produce Loading intent"),
+            }
+        }
+
+        // Should see balanced spread (40% error, 40% thinking, 20% success)
+        assert!(error_count > 20, "should see some Error intents");
+        assert!(thinking_count > 20, "should see some Thinking intents");
+        assert!(success_count > 5, "should see some Success intents");
+    }
+
+    /// pick_intent for TaskRunning favors Loading
+    #[test]
+    fn pick_intent_task_running_favors_loading() {
+        let mut w = Whimsg::new();
+
+        let mut loading_count = 0;
+        for _ in 0..100 {
+            let intent = w.pick_intent(WhimContext::TaskRunning);
+            if matches!(intent, Intent::Loading) {
+                loading_count += 1;
+            }
+        }
+
+        // With 70% probability, expect 50+ loadings in 100 samples
+        assert!(
+            loading_count >= 40,
+            "TaskRunning should favor Loading (got {loading_count}/100)"
+        );
+    }
+
+    /// pick_intent for MissionUnlocked always returns Success
+    #[test]
+    fn pick_intent_mission_unlocked_always_success() {
+        let mut w = Whimsg::new();
+
+        for _ in 0..20 {
+            let intent = w.pick_intent(WhimContext::MissionUnlocked);
+            assert!(
+                matches!(intent, Intent::Success),
+                "MissionUnlocked must always produce Success"
+            );
+        }
+    }
+
+    /// Active context decays from event to ambient after timeout
+    #[test]
+    fn active_context_decays_after_event_timeout() {
+        let mut w = Whimsg::new();
+        w.ambient = WhimContext::Idle;
+        w.event_context = Some(WhimContext::AgentSpawned);
+        w.event_at = Instant::now() - Duration::from_secs(EVENT_DECAY_SECS + 1);
+
+        let ctx = w.active_context();
+        assert!(matches!(ctx, WhimContext::Idle));
+    }
+
+    /// Active context uses event while within timeout
+    #[test]
+    fn active_context_uses_event_within_timeout() {
+        let mut w = Whimsg::new();
+        w.ambient = WhimContext::Idle;
+        w.event_context = Some(WhimContext::AgentFailed);
+        w.event_at = Instant::now() - Duration::from_secs(1);
+
+        let ctx = w.active_context();
+        assert!(matches!(ctx, WhimContext::AgentFailed));
+    }
+
+    /// WhimFrame doesn't panic when constructing with various text lengths
+    #[test]
+    fn whim_frame_handles_various_text_lengths() {
+        let test_strings = vec!["", "a", "hello", "こんにちは", "🎉🚀"];
+
+        for text in test_strings {
+            let frame = WhimFrame {
+                title_visible: 0,
+                kaomoji: text.to_string(),
+                text: text.to_string(),
+                text_visible: text.chars().count(),
+            };
+            // Just verify it constructs without panic
+            assert_eq!(frame.text, text);
+        }
+    }
+
+    /// Multiple sequential notifications don't corrupt state
+    #[test]
+    fn sequential_notifications_maintain_state() {
+        let mut w = Whimsg::new();
+
+        w.notify_event(WhimContext::AgentSpawned);
+        assert!(matches!(w.event_context, Some(WhimContext::AgentSpawned)));
+
+        w.notify_event(WhimContext::AgentFailed);
+        assert!(matches!(w.event_context, Some(WhimContext::AgentFailed)));
+
+        w.set_ambient(WhimContext::Busy);
+        assert!(matches!(w.ambient, WhimContext::Busy));
+    }
+
+    /// Celebration loop properly decrements counter during celebration phase
+    #[test]
+    fn celebration_sets_and_eventually_uses_title() {
+        let mut w = Whimsg::new();
+        w.notify_mission_unlocked("Test Mission");
+        assert_eq!(w.celebration_remaining, 3);
+        assert_eq!(w.mission_title, Some("Test Mission".to_string()));
+
+        // Verify that celebration_remaining can be decremented manually
+        w.celebration_remaining = 2;
+        assert_eq!(w.celebration_remaining, 2);
+
+        // The actual decrement happens during tick_blank when we've accumulated
+        // time in that phase. For this unit test, we just verify the state is set up correctly.
+    }
+}

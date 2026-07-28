@@ -6,7 +6,7 @@ use clap::Subcommand;
 use crate::application::ports::StateRepository;
 use crate::db::Database;
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 pub(crate) enum RagAction {
     /// Start or stop automatic file indexing.
     AutoIndex {
@@ -15,9 +15,15 @@ pub(crate) enum RagAction {
     },
     /// Show a detailed per-file RAG indexing report.
     Report,
+    /// Delete the entire vector store and reset all RAG state.
+    Purge {
+        /// Skip the interactive confirmation prompt.
+        #[arg(long, short)]
+        yes: bool,
+    },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 pub(crate) enum AutoIndexAction {
     /// Resume automatic indexing (default state).
     Start,
@@ -44,6 +50,41 @@ pub(crate) async fn handle_rag_action(action: RagAction) -> Result<()> {
             println!("     Run \x1b[1mcanopy rag auto-index start\x1b[0m to resume.");
         }
         RagAction::Report => handle_rag_report(&data_dir, &db).await?,
+        RagAction::Purge { yes } => {
+            if !yes {
+                eprintln!(
+                    "\x1b[33m⚠\x1b[0m  This will \x1b[1mdelete the entire RAG vector store\x1b[0m \
+                     and reset all indexing state."
+                );
+                eprint!("Are you sure? [y/N] ");
+                use std::io::Write;
+                std::io::stderr().flush()?;
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                if !input.trim().eq_ignore_ascii_case("y") {
+                    println!("Aborted.");
+                    return Ok(());
+                }
+            }
+            let lancedb_path = dirs::home_dir()
+                .ok_or_else(|| anyhow::anyhow!("Cannot determine home dir"))?
+                .join(".canopy/rag/vectors.lancedb");
+            let existed = lancedb_path.exists();
+            crate::rag::ingestion::wipe_lancedb(&db, "manual purge").await?;
+            if existed {
+                println!("\x1b[32m✓\x1b[0m  RAG vector store purged and state reset.");
+            } else {
+                println!("\x1b[32m✓\x1b[0m  RAG state reset (no vector store was present).");
+            }
+            if crate::daemon::process::read_pid(&data_dir)
+                .is_some_and(crate::daemon::process::is_process_running)
+            {
+                eprintln!(
+                    "     Note: the daemon is running and may still hold the old store open. \
+                     It will recreate the store on next use."
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -101,6 +142,25 @@ async fn handle_rag_report(data_dir: &std::path::Path, db: &Database) -> Result<
 
     let is_paused = db.get_state("rag_paused")?.as_deref() == Some("1");
     let total_chunks: usize = chunk_counts.values().sum();
+    let processing_items = queue_items
+        .iter()
+        .filter(|q| q.status == "processing")
+        .count();
+    let model_status = crate::rag::status::compute_rag_model_status(
+        is_paused,
+        crate::rag::status::is_model_loaded(db),
+        processing_items as i64,
+    );
+
+    // A file's *current* oversize status is whatever its latest event says —
+    // if it later shrank and got indexed, the newer "indexed" event wins.
+    let is_oversize = |file: &str| -> bool {
+        events_by_file
+            .get(file)
+            .and_then(|events| events.first())
+            .is_some_and(|e| e.event_type == "skipped_oversize")
+    };
+    let oversize_count = all_files.iter().filter(|f| is_oversize(f)).count();
 
     println!("\n\x1b[1m── Canopy RAG Report ──────────────────────────────────────────\x1b[0m");
     println!(
@@ -113,24 +173,33 @@ async fn handle_rag_report(data_dir: &std::path::Path, db: &Database) -> Result<
     );
     println!(
         " Status: {}",
-        if is_paused {
-            "\x1b[33m⏸ paused\x1b[0m"
-        } else {
-            "\x1b[32m● running\x1b[0m"
+        match model_status {
+            crate::rag::status::RagModelStatus::Paused => "\x1b[33m⏸ paused\x1b[0m".to_string(),
+            crate::rag::status::RagModelStatus::Ready =>
+                "\x1b[32m● ready (model loaded)\x1b[0m".to_string(),
+            crate::rag::status::RagModelStatus::Sleeping =>
+                "\x1b[90m○ sleeping (lazy — loads on demand)\x1b[0m".to_string(),
         }
     );
+    if model_status == crate::rag::status::RagModelStatus::Ready {
+        if let Some(since) = crate::rag::status::model_loaded_since(db) {
+            println!("         since: {}", format_ts(since));
+        }
+    }
     println!(
         " Total:  {} indexed file(s), {} chunk(s)",
         chunk_counts.len(),
         total_chunks
     );
     if !queue_items.is_empty() {
-        let processing = queue_items
-            .iter()
-            .filter(|q| q.status == "processing")
-            .count();
         let queued = queue_items.iter().filter(|q| q.status == "queued").count();
-        println!(" Queue:  {} queued, {} indexing", queued, processing);
+        println!(" Queue:  {} queued, {} indexing", queued, processing_items);
+    }
+    if oversize_count > 0 {
+        let cap_mb = crate::rag::ingestion::FILE_MAX_BYTES as f64 / (1024.0 * 1024.0);
+        println!(
+            " \x1b[33m⚠\x1b[0m Oversize: {oversize_count} file(s) skipped — exceed the {cap_mb:.0} MB indexing limit (FILE_MAX_BYTES)"
+        );
     }
 
     println!("\n\x1b[1m── Files ──────────────────────────────────────────────────────\x1b[0m");
@@ -146,9 +215,12 @@ async fn handle_rag_report(data_dir: &std::path::Path, db: &Database) -> Result<
         let indexed_count = events.iter().filter(|e| e.event_type == "indexed").count();
         let deleted_count = events.iter().filter(|e| e.event_type == "deleted").count();
         let last_error = events.iter().find(|e| e.event_type == "error");
+        let file_is_oversize = is_oversize(file);
 
         // Status icon
-        let status = if last_error.is_some() && chunks == 0 {
+        let status = if file_is_oversize {
+            "\x1b[35m⊘\x1b[0m"
+        } else if last_error.is_some() && chunks == 0 {
             "\x1b[31m✗\x1b[0m"
         } else if in_queue {
             "\x1b[33m⏳\x1b[0m"
@@ -160,6 +232,18 @@ async fn handle_rag_report(data_dir: &std::path::Path, db: &Database) -> Result<
 
         let short = short_path(file);
         println!("\n  {} {}", status, short);
+        if file_is_oversize {
+            if let Some(size_bytes) = events.first().and_then(|e| e.detail.as_deref()) {
+                if let Ok(bytes) = size_bytes.parse::<u64>() {
+                    let cap_mb = crate::rag::ingestion::FILE_MAX_BYTES as f64 / (1024.0 * 1024.0);
+                    println!(
+                        "     \x1b[35moversize\x1b[0m: {:.1} MB (exceeds {:.0} MB limit — skipped)",
+                        bytes as f64 / (1024.0 * 1024.0),
+                        cap_mb
+                    );
+                }
+            }
+        }
         if chunks > 0 {
             println!("     chunks: {}", chunks);
         }
@@ -208,4 +292,165 @@ fn format_ts(ts: i64) -> String {
     let d = UNIX_EPOCH + Duration::from_secs(ts as u64);
     let dt: chrono::DateTime<chrono::Local> = d.into();
     dt.format("%Y-%m-%d %H:%M").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::{CommandFactory, Parser};
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        action: RagAction,
+    }
+
+    #[test]
+    fn purge_yes_flag_parsed() {
+        let cli =
+            TestCli::try_parse_from(["test", "purge", "--yes"]).expect("purge --yes should parse");
+        match cli.action {
+            RagAction::Purge { yes } => assert!(yes),
+            other => panic!("expected Purge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn purge_without_yes_defaults_false() {
+        let cli =
+            TestCli::try_parse_from(["test", "purge"]).expect("purge should parse without --yes");
+        match cli.action {
+            RagAction::Purge { yes } => assert!(!yes),
+            other => panic!("expected Purge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn purge_appears_in_help_with_description() {
+        let mut cmd = <TestCli as CommandFactory>::command();
+        let help = cmd.render_help().to_string();
+        assert!(help.contains("purge"), "help should mention purge:\n{help}");
+        assert!(
+            help.contains("Delete the entire vector store"),
+            "purge should have description:\n{help}"
+        );
+    }
+
+    /// Integration-style check of the exact mapping `handle_rag_report` performs:
+    /// live daemon state read from the DB (the CLI's only transport to the
+    /// daemon today) must flow through `compute_rag_model_status` to the
+    /// truthful three-valued status, including the paused-wins and
+    /// active-processing-implies-ready rules.
+    #[test]
+    fn rag_report_status_mapping_reads_live_daemon_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+
+        // Fresh daemon, nothing loaded yet: sleeping.
+        assert_eq!(
+            crate::rag::status::compute_rag_model_status(
+                false,
+                crate::rag::status::is_model_loaded(&db),
+                0,
+            ),
+            crate::rag::status::RagModelStatus::Sleeping
+        );
+
+        // Daemon loads the model (as `IngestionManager::get_or_load_client` persists).
+        db.set_state(crate::rag::status::RAG_MODEL_LOADED_KEY, "1")
+            .unwrap();
+        assert_eq!(
+            crate::rag::status::compute_rag_model_status(
+                false,
+                crate::rag::status::is_model_loaded(&db),
+                0,
+            ),
+            crate::rag::status::RagModelStatus::Ready
+        );
+
+        // Paused wins even while the model is still loaded.
+        db.set_state("rag_paused", "1").unwrap();
+        let is_paused = db.get_state("rag_paused").unwrap().as_deref() == Some("1");
+        assert_eq!(
+            crate::rag::status::compute_rag_model_status(
+                is_paused,
+                crate::rag::status::is_model_loaded(&db),
+                0,
+            ),
+            crate::rag::status::RagModelStatus::Paused
+        );
+
+        // Unpaused, model unloaded, but a queue item is actively "processing":
+        // must never read as sleeping while chunks are being embedded.
+        db.set_state("rag_paused", "0").unwrap();
+        db.set_state(crate::rag::status::RAG_MODEL_LOADED_KEY, "0")
+            .unwrap();
+        let is_paused = db.get_state("rag_paused").unwrap().as_deref() == Some("1");
+        assert_eq!(
+            crate::rag::status::compute_rag_model_status(
+                is_paused,
+                crate::rag::status::is_model_loaded(&db),
+                1,
+            ),
+            crate::rag::status::RagModelStatus::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn wipe_lancedb_resets_db_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        db.set_state("rag_total_chunks", "42").unwrap();
+        db.set_state("rag_indexed_files", "5").unwrap();
+        // Point at a scratch LanceDB directory instead of the real
+        // home-directory-rooted store: the real path may be owned by an
+        // actual running canopy daemon, so touching it here would be both
+        // unsafe and racy.
+        let scratch_lancedb = dir.path().join("vectors.lancedb");
+        let _ = crate::rag::ingestion::wipe_lancedb_at(&scratch_lancedb, &db, "test").await;
+        assert_eq!(db.get_state("rag_total_chunks").unwrap(), Some("0".into()));
+        assert_eq!(db.get_state("rag_indexed_files").unwrap(), Some("0".into()));
+    }
+
+    #[test]
+    fn short_path_home_dir() {
+        if let Some(home) = dirs::home_dir() {
+            let home_str = home.to_string_lossy();
+            let full = format!("{home_str}/Documents/file.txt");
+            assert_eq!(short_path(&full), "~/Documents/file.txt");
+        }
+    }
+
+    #[test]
+    fn short_path_not_home() {
+        assert_eq!(short_path("/tmp/something"), "/tmp/something");
+    }
+
+    #[test]
+    fn short_path_exact_home() {
+        if let Some(home) = dirs::home_dir() {
+            let home_str = home.to_string_lossy();
+            assert_eq!(short_path(&home_str), "~");
+        }
+    }
+
+    #[test]
+    fn format_ts_epoch_zero() {
+        let result = format_ts(0);
+        // UTC epoch zero, depends on local timezone
+        assert!(!result.is_empty());
+        assert!(result.contains(":"));
+    }
+
+    #[test]
+    fn format_ts_recent() {
+        let result = format_ts(1700000000);
+        assert!(result.contains("2023"));
+    }
+
+    #[test]
+    fn format_ts_has_time() {
+        let result = format_ts(1700000000);
+        assert!(result.contains(":"));
+    }
 }

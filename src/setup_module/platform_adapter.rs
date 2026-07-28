@@ -96,7 +96,7 @@ fn rename_mapped_fields(
 // ── Validation & resolution ─────────────────────────────────────────────────
 
 /// Transport kind inferred from the server config shape.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum ServerKind {
     /// Remote server reached over HTTP/SSE (`url` field present).
     Url,
@@ -209,8 +209,15 @@ fn enforce_canopy_bridge_transport(adapted: &mut JsonMap, platform: &Platform, s
         return;
     }
 
+    // The canopy server always runs as a local stdio sidecar (`canopy
+    // bridge`), which injects identity headers itself. HTTP-transport-only
+    // keys are therefore meaningless here and some CLIs actively reject
+    // them: Codex fails to load config.toml with "http_headers is not
+    // supported for stdio" when these tables are present on a stdio server.
     adapted.remove("url");
     adapted.remove("headers");
+    adapted.remove("http_headers");
+    adapted.remove("env_http_headers");
 
     if platform.command_format == "merged" {
         adapted.insert(
@@ -669,6 +676,34 @@ mod tests {
     }
 
     #[test]
+    fn adapt_config_strips_http_only_keys_from_canopy_stdio_bridge() {
+        // The canopy server is always migrated to the stdio bridge, so
+        // HTTP-transport-only keys must not survive — Codex rejects
+        // `http_headers`/`env_http_headers` on a stdio server.
+        let platform = test_platform();
+        let adapted = adapt_config(
+            &serde_json::json!({
+                "command": "canopy",
+                "args": ["bridge"],
+                "url": "http://localhost:7755/mcp",
+                "headers": {"x-canopy-client-name": "codex"},
+                "http_headers": {"x-canopy-client-name": "codex"},
+                "env_http_headers": {"x-canopy-agent-id": "CANOPY_AGENT_ID"},
+            }),
+            &platform,
+            "canopy",
+        );
+        for key in ["url", "headers", "http_headers", "env_http_headers"] {
+            assert!(
+                adapted.get(key).is_none(),
+                "canopy stdio bridge must not carry '{key}'"
+            );
+        }
+        assert_eq!(adapted.get("command"), Some(&serde_json::json!("canopy")));
+        assert_eq!(adapted.get("args"), Some(&serde_json::json!(["bridge"])));
+    }
+
+    #[test]
     fn adapt_config_repairs_wrong_existing_type() {
         // A previously mis-written entry (`type: "http"` with `command`)
         // must be corrected on the next sync/setup pass.
@@ -761,5 +796,276 @@ mod tests {
                 "type": "stdio"
             })
         );
+    }
+
+    // ── New tests for pure helper functions ─────────────────────────────
+
+    use super::{
+        clone_object_entries, clone_object_entries_except, format_matrix_header, infer_server_kind,
+        initial_platform_config, matrix_separator_width, pick_allowed_value,
+        platform_servers_root_key, rename_mapped_fields, resolve_required_field_value,
+        substitute_placeholders, substitute_string_placeholders, ServerKind,
+    };
+
+    #[test]
+    fn substitute_string_placeholders_replaces_both() {
+        let content = "{home}/.canopy/{filesystem_dir}";
+        let out = substitute_string_placeholders(content, "/home/user", "/data");
+        assert_eq!(out, "/home/user/.canopy//data");
+    }
+
+    #[test]
+    fn substitute_string_placeholders_no_placeholders() {
+        let content = "no placeholders here";
+        let out = substitute_string_placeholders(content, "/home/user", "/data");
+        assert_eq!(out, content);
+    }
+
+    #[test]
+    fn substitute_placeholders_string_value() {
+        let mut val = serde_json::json!("{home}/projects");
+        substitute_placeholders(&mut val, "/home/user", "/data");
+        assert_eq!(val, serde_json::json!("/home/user/projects"));
+    }
+
+    #[test]
+    fn substitute_placeholders_object_value() {
+        let mut val = serde_json::json!({"key": "{filesystem_dir}/x"});
+        substitute_placeholders(&mut val, "/home/user", "/mnt");
+        assert_eq!(val["key"], "/mnt/x");
+    }
+
+    #[test]
+    fn substitute_placeholders_array_value() {
+        let mut val = serde_json::json!(["{home}/a", "{filesystem_dir}/b"]);
+        substitute_placeholders(&mut val, "/home", "/data");
+        assert_eq!(val[0], "/home/a");
+        assert_eq!(val[1], "/data/b");
+    }
+
+    #[test]
+    fn substitute_placeholders_non_string_unchanged() {
+        let mut val = serde_json::json!({"n": 42});
+        substitute_placeholders(&mut val, "/home", "/data");
+        assert_eq!(val["n"], 42);
+    }
+
+    #[test]
+    fn clone_object_entries_copies_all() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("a".to_string(), serde_json::json!(1));
+        obj.insert("b".to_string(), serde_json::json!("x"));
+        let cloned = clone_object_entries(&obj);
+        assert_eq!(cloned.len(), 2);
+        assert_eq!(cloned["a"], 1);
+        assert_eq!(cloned["b"], "x");
+    }
+
+    #[test]
+    fn clone_object_entries_except_excludes_keys() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("a".to_string(), serde_json::json!(1));
+        obj.insert("b".to_string(), serde_json::json!(2));
+        obj.insert("c".to_string(), serde_json::json!(3));
+        let cloned = clone_object_entries_except(&obj, &["b"]);
+        assert_eq!(cloned.len(), 2);
+        assert!(cloned.contains_key("a"));
+        assert!(!cloned.contains_key("b"));
+        assert!(cloned.contains_key("c"));
+    }
+
+    #[test]
+    fn clone_object_entries_except_empty_exclusion() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("a".to_string(), serde_json::json!(1));
+        let cloned = clone_object_entries_except(&obj, &[]);
+        assert_eq!(cloned.len(), 1);
+    }
+
+    #[test]
+    fn apply_command_format_separate_returns_clone() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("command".to_string(), serde_json::json!("uvx"));
+        obj.insert("args".to_string(), serde_json::json!(["pkg"]));
+        let result = apply_command_format(&obj, "separate");
+        assert_eq!(result["command"], "uvx");
+        assert_eq!(result["args"], serde_json::json!(["pkg"]));
+    }
+
+    #[test]
+    fn apply_command_format_merged_without_command_returns_clone() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("url".to_string(), serde_json::json!("http://x"));
+        let result = apply_command_format(&obj, "merged");
+        assert_eq!(result["url"], "http://x");
+    }
+
+    #[test]
+    fn apply_command_format_merged_without_args_returns_clone() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("command".to_string(), serde_json::json!("uvx"));
+        let result = apply_command_format(&obj, "merged");
+        assert_eq!(result["command"], "uvx");
+    }
+
+    #[test]
+    fn rename_mapped_fields_applies_mapping() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("env".to_string(), serde_json::json!({"A": "1"}));
+        obj.insert("keep".to_string(), serde_json::json!("v"));
+        let mut mapping = std::collections::HashMap::new();
+        mapping.insert("env".to_string(), "environment".to_string());
+        let result = rename_mapped_fields(obj, &mapping);
+        assert!(result.contains_key("environment"));
+        assert!(!result.contains_key("env"));
+        assert_eq!(result["keep"], "v");
+    }
+
+    #[test]
+    fn rename_mapped_fields_unmapped_key_stays() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("x".to_string(), serde_json::json!(1));
+        let mapping = std::collections::HashMap::new();
+        let result = rename_mapped_fields(obj, &mapping);
+        assert_eq!(result["x"], 1);
+    }
+
+    #[test]
+    fn infer_server_kind_url() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("url".to_string(), serde_json::json!("http://x"));
+        assert_eq!(infer_server_kind(&obj), ServerKind::Url);
+    }
+
+    #[test]
+    fn infer_server_kind_command() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("command".to_string(), serde_json::json!("uvx"));
+        assert_eq!(infer_server_kind(&obj), ServerKind::Command);
+    }
+
+    #[test]
+    fn infer_server_kind_unknown() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("name".to_string(), serde_json::json!("fetch"));
+        assert_eq!(infer_server_kind(&obj), ServerKind::Unknown);
+    }
+
+    #[test]
+    fn infer_server_kind_url_takes_priority() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("url".to_string(), serde_json::json!("http://x"));
+        obj.insert("command".to_string(), serde_json::json!("uvx"));
+        assert_eq!(infer_server_kind(&obj), ServerKind::Url);
+    }
+
+    #[test]
+    fn pick_allowed_value_finds_match() {
+        let allowed = vec!["stdio".to_string(), "http".to_string()];
+        let candidates = &["http", "sse"];
+        assert_eq!(pick_allowed_value(&allowed, candidates), Some("http"));
+    }
+
+    #[test]
+    fn pick_allowed_value_no_match() {
+        let allowed = vec!["sse".to_string()];
+        let candidates = &["http", "stdio"];
+        assert_eq!(pick_allowed_value(&allowed, candidates), None);
+    }
+
+    #[test]
+    fn resolve_required_field_value_url_server() {
+        let allowed = vec!["http".to_string(), "sse".to_string()];
+        assert_eq!(
+            resolve_required_field_value(&allowed, ServerKind::Url, false),
+            Some("http")
+        );
+    }
+
+    #[test]
+    fn resolve_required_field_value_command_server_prefers_local() {
+        let allowed = vec!["local".to_string(), "stdio".to_string()];
+        assert_eq!(
+            resolve_required_field_value(&allowed, ServerKind::Command, false),
+            Some("local")
+        );
+    }
+
+    #[test]
+    fn resolve_required_field_value_command_server_falls_back_stdio() {
+        let allowed = vec!["stdio".to_string(), "http".to_string()];
+        assert_eq!(
+            resolve_required_field_value(&allowed, ServerKind::Command, false),
+            Some("stdio")
+        );
+    }
+
+    #[test]
+    fn resolve_required_field_value_unknown_does_not_overwrite() {
+        let allowed = vec!["http".to_string()];
+        assert_eq!(
+            resolve_required_field_value(&allowed, ServerKind::Unknown, true),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_required_field_value_unknown_falls_back_to_first() {
+        let allowed = vec!["http".to_string(), "sse".to_string()];
+        assert_eq!(
+            resolve_required_field_value(&allowed, ServerKind::Unknown, false),
+            Some("http")
+        );
+    }
+
+    #[test]
+    fn platform_servers_root_key_first_entry() {
+        let mut platform = test_platform();
+        platform.mcp_servers_key = vec!["servers".to_string()];
+        assert_eq!(platform_servers_root_key(&platform), "servers");
+    }
+
+    #[test]
+    fn platform_servers_root_key_default() {
+        let platform = test_platform();
+        assert_eq!(platform_servers_root_key(&platform), "mcpServers");
+    }
+
+    #[test]
+    fn format_matrix_header_one_platform() {
+        let header = format_matrix_header(1);
+        assert!(header.contains("Server"));
+        assert!(header.contains(" 1"));
+    }
+
+    #[test]
+    fn format_matrix_header_multiple_platforms() {
+        let header = format_matrix_header(3);
+        assert!(header.contains(" 1"));
+        assert!(header.contains(" 2"));
+        assert!(header.contains(" 3"));
+    }
+
+    #[test]
+    fn matrix_separator_width_scales() {
+        let w1 = matrix_separator_width(1);
+        let w2 = matrix_separator_width(3);
+        assert!(w2 > w1);
+    }
+
+    #[test]
+    fn initial_platform_config_json() {
+        let mut platform = test_platform();
+        platform.config_format = Some("json".to_string());
+        let out = initial_platform_config(&platform);
+        assert!(out.contains("mcpServers"));
+    }
+
+    #[test]
+    fn initial_platform_config_toml() {
+        let mut platform = test_platform();
+        platform.config_format = Some("toml".to_string());
+        let out = initial_platform_config(&platform);
+        assert!(out.is_empty());
     }
 }

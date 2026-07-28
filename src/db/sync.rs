@@ -229,3 +229,74 @@ impl Database {
         Ok(rows.filter_map(|row| row.ok()).collect())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::sync::MessageKind;
+
+    fn test_db() -> Database {
+        let dir = tempfile::tempdir().unwrap();
+        Database::new(&dir.path().join("test.db")).unwrap()
+    }
+
+    #[test]
+    fn insert_and_list_sync_messages() {
+        let db = test_db();
+        let workdir = "/tmp/test";
+
+        db.insert_sync_message(
+            workdir,
+            "agent1",
+            "Agent 1",
+            MessageKind::Info,
+            "Test message 1",
+            None,
+        )
+        .unwrap();
+        db.insert_sync_message(
+            workdir,
+            "agent2",
+            "Agent 2",
+            MessageKind::Query,
+            "Test message 2",
+            None,
+        )
+        .unwrap();
+
+        let messages = db.list_sync_messages(workdir, 10).unwrap();
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn list_sync_messages_empty() {
+        let db = test_db();
+        let messages = db.list_sync_messages("/tmp/nonexistent", 10).unwrap();
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn list_recent_sync_messages_empty() {
+        let db = test_db();
+        let messages = db.list_recent_sync_messages(10).unwrap();
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn list_recent_sync_messages_with_messages() {
+        let db = test_db();
+
+        db.insert_sync_message(
+            "/tmp/test",
+            "agent1",
+            "Agent 1",
+            MessageKind::Info,
+            "Test message",
+            None,
+        )
+        .unwrap();
+
+        let messages = db.list_recent_sync_messages(10).unwrap();
+        assert_eq!(messages.len(), 1);
+    }
+}

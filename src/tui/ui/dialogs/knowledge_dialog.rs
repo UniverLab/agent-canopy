@@ -1,15 +1,16 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::tui::app::types::App;
+use crate::tui::ui::theme::Theme;
 
 const ACCENT: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
 
-pub fn draw_knowledge_dialog(frame: &mut Frame, app: &App) {
+pub fn draw_knowledge_dialog(frame: &mut Frame, app: &App, theme: &Theme) {
     let Some(dialog) = app.knowledge_dialog.as_ref() else {
         return;
     };
@@ -22,7 +23,7 @@ pub fn draw_knowledge_dialog(frame: &mut Frame, app: &App) {
         } else {
             " New Knowledge "
         })
-        .borders(Borders::ALL)
+        .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(ACCENT));
 
     let inner = block.inner(dialog_area);
@@ -37,7 +38,14 @@ pub fn draw_knowledge_dialog(frame: &mut Frame, app: &App) {
     ])
     .split(inner);
 
-    draw_field(frame, chunks[0], "Title", &dialog.title, dialog.field == 0);
+    draw_field(
+        frame,
+        chunks[0],
+        "Title",
+        &dialog.title,
+        dialog.field == 0,
+        theme,
+    );
 
     draw_field(
         frame,
@@ -45,9 +53,17 @@ pub fn draw_knowledge_dialog(frame: &mut Frame, app: &App) {
         "Kind",
         dialog.kind_str(),
         dialog.field == 2,
+        theme,
     );
 
-    draw_multiline_field(frame, chunks[2], "Body", &dialog.body, dialog.field == 1);
+    draw_multiline_field(
+        frame,
+        chunks[2],
+        "Body",
+        &dialog.body,
+        dialog.field == 1,
+        theme,
+    );
 
     let help = Line::from(vec![
         Span::styled(
@@ -82,11 +98,23 @@ pub fn draw_knowledge_dialog(frame: &mut Frame, app: &App) {
     frame.render_widget(Paragraph::new(help), chunks[4]);
 }
 
-fn draw_field(frame: &mut Frame, area: Rect, label: &str, value: &str, focused: bool) {
-    let border_color = if focused { ACCENT } else { DIM };
+fn draw_field(
+    frame: &mut Frame,
+    area: Rect,
+    label: &str,
+    value: &str,
+    focused: bool,
+    theme: &Theme,
+) {
+    let border_color = if focused { ACCENT } else { theme.border_color };
+    let title_style = if focused {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
     let block = Block::default()
-        .title(format!(" {} ", label))
-        .borders(Borders::ALL)
+        .title(Span::styled(format!(" {} ", label), title_style))
+        .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(border_color));
 
     let inner = block.inner(area);
@@ -101,11 +129,23 @@ fn draw_field(frame: &mut Frame, area: Rect, label: &str, value: &str, focused: 
     frame.render_widget(text, inner);
 }
 
-fn draw_multiline_field(frame: &mut Frame, area: Rect, label: &str, value: &str, focused: bool) {
-    let border_color = if focused { ACCENT } else { DIM };
+fn draw_multiline_field(
+    frame: &mut Frame,
+    area: Rect,
+    label: &str,
+    value: &str,
+    focused: bool,
+    theme: &Theme,
+) {
+    let border_color = if focused { ACCENT } else { theme.border_color };
+    let title_style = if focused {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
     let block = Block::default()
-        .title(format!(" {} ", label))
-        .borders(Borders::ALL)
+        .title(Span::styled(format!(" {} ", label), title_style))
+        .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(border_color));
 
     let inner = block.inner(area);

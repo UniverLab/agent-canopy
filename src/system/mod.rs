@@ -9,6 +9,8 @@ mod platform;
 mod power;
 mod windows;
 
+use std::path::Path;
+
 use sysinfo::{Components, System};
 
 use gpu::{get_linux_gpu_info, get_macos_gpu_info, try_get_nvidia_gpu_info};
@@ -36,6 +38,16 @@ pub struct SystemInfo {
     pub gpu_info: Option<GpuInfo>,
     pub power_watts: Option<f32>,
     pub power_limit_watts: Option<f32>,
+    pub power_source: Option<PowerSource>,
+}
+
+/// Where `SystemInfo::power_watts` was sourced from. The GPU dashboard row
+/// folds power in only when it's the GPU's own draw; battery discharge is
+/// system-wide and gets its own `pwr:` row instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerSource {
+    Battery,
+    Gpu,
 }
 
 /// GPU information.
@@ -156,11 +168,13 @@ impl SystemInfo {
             Some(watts) => {
                 self.power_watts = Some(watts);
                 self.power_limit_watts = None;
+                self.power_source = Some(PowerSource::Battery);
             }
             None => {
                 let gpu = self.gpu_info.as_ref();
                 self.power_watts = gpu.and_then(|g| g.power_watts);
                 self.power_limit_watts = gpu.and_then(|g| g.power_limit_watts);
+                self.power_source = self.power_watts.map(|_| PowerSource::Gpu);
             }
         }
     }
@@ -216,6 +230,24 @@ fn get_load_average() -> Option<f64> {
     }
 }
 
+/// Current machine boot id, stable for the lifetime of the running boot and
+/// different after every reboot (including a WSL restart). Used to tell
+/// whether a PID persisted in an earlier run could plausibly still refer to
+/// the process that recorded it — after a reboot the OS recycles PIDs from
+/// scratch, so a stored PID matching a live process is a coincidence, not
+/// evidence the original process survived.
+///
+/// `None` if the id can't be read (non-Linux host, sandboxed environment, ...).
+pub fn boot_id() -> Option<String> {
+    read_boot_id_from(Path::new("/proc/sys/kernel/random/boot_id"))
+}
+
+fn read_boot_id_from(path: &Path) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let trimmed = contents.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,5 +272,203 @@ mod tests {
         if let Some(pct) = info.gpu_vram_usage_percent() {
             assert!((0.0..=100.0).contains(&pct));
         }
+    }
+
+    #[test]
+    fn read_boot_id_from_trims_trailing_newline() {
+        let tmp = tempfile::NamedTempFile::new().expect("create temp file");
+        std::fs::write(tmp.path(), "abcd-1234\n").expect("write boot id");
+        assert_eq!(read_boot_id_from(tmp.path()), Some("abcd-1234".to_string()));
+    }
+
+    #[test]
+    fn read_boot_id_from_missing_file_returns_none() {
+        assert_eq!(
+            read_boot_id_from(Path::new("/nonexistent/boot_id_path")),
+            None
+        );
+    }
+
+    #[test]
+    fn boot_id_is_available_on_linux() {
+        if cfg!(target_os = "linux") {
+            assert!(boot_id().is_some());
+        }
+    }
+
+    #[test]
+    fn system_info_default_has_zeroed_values() {
+        let info = SystemInfo::default();
+        assert_eq!(info.cpu_usage, 0.0);
+        assert_eq!(info.cpu_cores, 0);
+        assert!(info.cpu_temperature.is_none());
+        assert_eq!(info.memory_used, 0);
+        assert_eq!(info.memory_total, 0);
+        assert!(info.gpu_info.is_none());
+        assert!(info.power_watts.is_none());
+        assert!(info.power_limit_watts.is_none());
+        assert!(info.power_source.is_none());
+    }
+
+    #[test]
+    fn cpu_usage_percent_returns_inner() {
+        let info = SystemInfo {
+            cpu_usage: 42.5,
+            ..SystemInfo::default()
+        };
+        assert_eq!(info.cpu_usage_percent(), 42.5);
+    }
+
+    #[test]
+    fn cpu_temperature_celsius_returns_inner() {
+        let info = SystemInfo::default();
+        assert!(info.cpu_temperature_celsius().is_none());
+        let info = SystemInfo {
+            cpu_temperature: Some(65.0),
+            ..SystemInfo::default()
+        };
+        assert_eq!(info.cpu_temperature_celsius(), Some(65.0));
+    }
+
+    #[test]
+    fn gpu_vram_used_mb_returns_none_when_no_gpu() {
+        let info = SystemInfo::default();
+        assert!(info.gpu_vram_used_mb().is_none());
+    }
+
+    #[test]
+    fn gpu_vram_used_mb_returns_vram_used() {
+        let info = SystemInfo {
+            gpu_info: Some(GpuInfo {
+                vram_used: Some(4096),
+                ..GpuInfo::default()
+            }),
+            ..SystemInfo::default()
+        };
+        assert_eq!(info.gpu_vram_used_mb(), Some(4096));
+    }
+
+    #[test]
+    fn gpu_vram_total_mb_returns_none_when_no_gpu() {
+        let info = SystemInfo::default();
+        assert!(info.gpu_vram_total_mb().is_none());
+    }
+
+    #[test]
+    fn gpu_vram_total_mb_returns_vram_total() {
+        let info = SystemInfo {
+            gpu_info: Some(GpuInfo {
+                vram_total: Some(8192),
+                ..GpuInfo::default()
+            }),
+            ..SystemInfo::default()
+        };
+        assert_eq!(info.gpu_vram_total_mb(), Some(8192));
+    }
+
+    #[test]
+    fn gpu_vram_usage_percent_none_when_no_gpu() {
+        let info = SystemInfo::default();
+        assert!(info.gpu_vram_usage_percent().is_none());
+    }
+
+    #[test]
+    fn gpu_vram_usage_percent_none_when_no_used() {
+        let info = SystemInfo {
+            gpu_info: Some(GpuInfo {
+                vram_used: None,
+                vram_total: Some(8192),
+                ..GpuInfo::default()
+            }),
+            ..SystemInfo::default()
+        };
+        assert!(info.gpu_vram_usage_percent().is_none());
+    }
+
+    #[test]
+    fn gpu_vram_usage_percent_none_when_no_total() {
+        let info = SystemInfo {
+            gpu_info: Some(GpuInfo {
+                vram_used: Some(4096),
+                vram_total: None,
+                ..GpuInfo::default()
+            }),
+            ..SystemInfo::default()
+        };
+        assert!(info.gpu_vram_usage_percent().is_none());
+    }
+
+    #[test]
+    fn gpu_vram_usage_percent_none_when_total_zero() {
+        let info = SystemInfo {
+            gpu_info: Some(GpuInfo {
+                vram_used: Some(100),
+                vram_total: Some(0),
+                ..GpuInfo::default()
+            }),
+            ..SystemInfo::default()
+        };
+        assert!(info.gpu_vram_usage_percent().is_none());
+    }
+
+    #[test]
+    fn gpu_vram_usage_percent_calculates_correctly() {
+        let info = SystemInfo {
+            gpu_info: Some(GpuInfo {
+                vram_used: Some(3072),
+                vram_total: Some(8192),
+                ..GpuInfo::default()
+            }),
+            ..SystemInfo::default()
+        };
+        let pct = info.gpu_vram_usage_percent().unwrap();
+        let expected = (3072.0 / 8192.0) * 100.0;
+        assert!((pct - expected).abs() < 0.01);
+    }
+
+    #[test]
+    fn gpu_vram_usage_percent_zero_used() {
+        let info = SystemInfo {
+            gpu_info: Some(GpuInfo {
+                vram_used: Some(0),
+                vram_total: Some(8192),
+                ..GpuInfo::default()
+            }),
+            ..SystemInfo::default()
+        };
+        assert_eq!(info.gpu_vram_usage_percent(), Some(0.0));
+    }
+
+    #[test]
+    fn gpu_vram_usage_percent_full_used() {
+        let info = SystemInfo {
+            gpu_info: Some(GpuInfo {
+                vram_used: Some(8192),
+                vram_total: Some(8192),
+                ..GpuInfo::default()
+            }),
+            ..SystemInfo::default()
+        };
+        assert_eq!(info.gpu_vram_usage_percent(), Some(100.0));
+    }
+
+    #[test]
+    fn power_source_equality() {
+        assert_eq!(PowerSource::Battery, PowerSource::Battery);
+        assert_eq!(PowerSource::Gpu, PowerSource::Gpu);
+        assert_ne!(PowerSource::Battery, PowerSource::Gpu);
+    }
+
+    #[test]
+    fn gpu_info_default() {
+        let gpu = GpuInfo::default();
+        assert!(gpu.name.is_empty());
+        assert!(gpu.vendor.is_empty());
+        assert!(gpu.usage.is_none());
+        assert!(gpu.temperature.is_none());
+        assert!(gpu.vram_used.is_none());
+        assert!(gpu.vram_total.is_none());
+        assert!(gpu.power_watts.is_none());
+        assert!(gpu.power_limit_watts.is_none());
     }
 }

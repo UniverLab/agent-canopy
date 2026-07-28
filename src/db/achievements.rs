@@ -90,4 +90,137 @@ mod tests {
         assert!(reloaded.is_unlocked(MissionId::FireflyCatcher));
         assert_eq!(reloaded.unlocked_count(), 1);
     }
+
+    #[test]
+    fn load_empty_store_has_zero_unlocked() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = Arc::new(Database::new(&db_path).unwrap());
+        let store = AchievementStore::load(db).unwrap();
+        assert_eq!(store.unlocked_count(), 0);
+        assert!(!store.is_unlocked(MissionId::FireflyCatcher));
+    }
+
+    #[test]
+    fn unlock_multiple_missions() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = Arc::new(Database::new(&db_path).unwrap());
+        let mut store = AchievementStore::load(Arc::clone(&db)).unwrap();
+
+        let first = store.unlock(MissionId::FireflyCatcher).unwrap();
+        assert!(first);
+
+        // Try all mission variants
+        for mission in MISSIONS {
+            store.unlock(mission.id).unwrap();
+        }
+        assert_eq!(store.unlocked_count(), MISSIONS.len());
+        // Second time: all are already unlocked
+        for mission in MISSIONS {
+            assert!(!store.unlock(mission.id).unwrap());
+        }
+    }
+
+    #[test]
+    fn unlock_timestamp_is_recorded() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = Arc::new(Database::new(&db_path).unwrap());
+        let mut store = AchievementStore::load(Arc::clone(&db)).unwrap();
+
+        let before = chrono::Utc::now().timestamp();
+        store.unlock(MissionId::FireflyCatcher).unwrap();
+        let after = chrono::Utc::now().timestamp();
+
+        let ts = store.unlock_timestamp(MissionId::FireflyCatcher).unwrap();
+        assert!(ts >= before && ts <= after);
+    }
+
+    #[test]
+    fn unlock_timestamp_persists_and_reloads() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = Arc::new(Database::new(&db_path).unwrap());
+        let mut store = AchievementStore::load(Arc::clone(&db)).unwrap();
+
+        store.unlock(MissionId::FireflyCatcher).unwrap();
+
+        let reloaded = AchievementStore::load(db).unwrap();
+        assert!(reloaded
+            .unlock_timestamp(MissionId::FireflyCatcher)
+            .is_some());
+    }
+
+    #[test]
+    fn unlock_timestamp_none_for_locked_mission() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = Arc::new(Database::new(&db_path).unwrap());
+        let store = AchievementStore::load(db).unwrap();
+        assert!(store.unlock_timestamp(MissionId::FireflyCatcher).is_none());
+    }
+
+    #[test]
+    fn achievement_key_format() {
+        let key = achievement_key(MissionId::FireflyCatcher);
+        assert!(key.starts_with("achievement:"));
+        assert!(key.contains(MissionId::FireflyCatcher.as_str()));
+    }
+
+    #[test]
+    fn is_unlocked_returns_false_for_nonexistent() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = Arc::new(Database::new(&db_path).unwrap());
+        let store = AchievementStore::load(db).unwrap();
+        // A mission that doesn't exist should still return false
+        assert!(!store.is_unlocked(MissionId::FireflyCatcher));
+    }
+
+    #[test]
+    fn unlocked_count_starts_at_zero() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = Arc::new(Database::new(&db_path).unwrap());
+        let store = AchievementStore::load(db).unwrap();
+        assert_eq!(store.unlocked_count(), 0);
+    }
+
+    #[test]
+    fn unlocked_count_increments_on_unlock() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = Arc::new(Database::new(&db_path).unwrap());
+        let mut store = AchievementStore::load(db).unwrap();
+
+        store.unlock(MissionId::FireflyCatcher).unwrap();
+        assert_eq!(store.unlocked_count(), 1);
+
+        store.unlock(MissionId::HarnessMaster).unwrap();
+        assert_eq!(store.unlocked_count(), 2);
+    }
+
+    #[test]
+    fn unlock_returns_true_for_new_unlock() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = Arc::new(Database::new(&db_path).unwrap());
+        let mut store = AchievementStore::load(db).unwrap();
+
+        let unlocked = store.unlock(MissionId::FireflyCatcher).unwrap();
+        assert!(unlocked);
+    }
+
+    #[test]
+    fn unlock_returns_false_for_already_unlocked() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = Arc::new(Database::new(&db_path).unwrap());
+        let mut store = AchievementStore::load(db).unwrap();
+
+        store.unlock(MissionId::FireflyCatcher).unwrap();
+        let unlocked_again = store.unlock(MissionId::FireflyCatcher).unwrap();
+        assert!(!unlocked_again);
+    }
 }

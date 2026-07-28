@@ -1,6 +1,6 @@
 [package]
 name = "harness-canopy"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 rust-version = "1.91"
 description = "A self-contained MCP server for AI agent task scheduling and file watching"
@@ -51,6 +51,7 @@ cron = "0.16"
 
 # Date/time
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 
 # CLI binary discovery
 which = "8.0"
@@ -99,6 +100,8 @@ rand = "0.10"
 
 # Clipboard for text copy from TUI
 arboard = "3.6"
+# Decode OSC 52 clipboard payloads emitted by PTY programs
+base64 = "0.22"
 toml = "1.1.2"
 
 # Path manipulation for relative paths
@@ -118,7 +121,7 @@ futures = "0.3"
 pdf-extract = "0.10.0"
 
 # Local embedding models via ONNX Runtime (no API key required)
-fastembed = "5"
+fastembed = { version = "5", optional = true }
 
 # Unix process management (kill, setsid)
 [target.'cfg(unix)'.dependencies]
@@ -130,6 +133,7 @@ tempfile = "3.8"
 
 [features]
 default = []
+local-embeddings = ["dep:fastembed"]
 
 [lints.clippy]
 # Production quality lints
@@ -141,6 +145,12 @@ manual_let_else = "warn"
 semicolon_if_nothing_returned = "warn"
 inconsistent_struct_constructor = "warn"
 doc_markdown = "warn"
+
+[profile.dev]
+# Reduce debug info from level 2 to 1 (keeps line tables, drops full type info)
+debug = 1
+# More codegen units for faster parallel compilation
+codegen-units = 16
 
 [profile.release]
 opt-level = 3

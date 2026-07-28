@@ -1,5 +1,7 @@
 //! Domain validation rules for identifiers, prompts, and paths.
 
+use crate::domain::loops::{EnsembleDetails, LoopEdge, LoopEdgeCondition, LoopNode};
+
 pub const MAX_ID_LENGTH: usize = 64;
 pub const MAX_PROMPT_LENGTH: usize = 50_000;
 pub const MAX_PATH_LENGTH: usize = 4096;
@@ -54,89 +56,112 @@ pub fn validate_watch_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate every ensemble (F1) found within one graph (a loop's top-level
+/// graph, or a single spec's own graph — never both mixed together, since an
+/// ensemble belongs to exactly one) as a unit: entry reachable, every member
+/// wired to the join, and both exits wired to nodes that actually exist in
+/// this same graph. Called at `loop_run` so a structurally broken ensemble
+/// fails fast with an actionable message instead of surfacing as a runtime
+/// "ambiguous outgoing edges" or "node not found" deep into a run.
+///
+/// In practice every one of these invariants is guaranteed by construction —
+/// `loop_add_ensemble`/`loop_update_ensemble` are the only writers of
+/// ensemble-owned nodes/edges — so this exists as defense in depth against a
+/// future bug or direct DB edit, not because callers are expected to trip it
+/// today.
+pub fn validate_ensembles_in_graph(
+    ensembles: &[EnsembleDetails],
+    nodes: &[LoopNode],
+    edges: &[LoopEdge],
+) -> Result<(), String> {
+    let node_exists = |id: &str| nodes.iter().any(|node| node.id == id);
+    let has_edge = |from: &str, to: &str, condition: LoopEdgeCondition| {
+        edges
+            .iter()
+            .any(|edge| edge.from_node == from && edge.to_node == to && edge.condition == condition)
+    };
+
+    for details in ensembles {
+        let ensemble = &details.ensemble;
+        let label = format!("Ensemble '{}' ('{}')", ensemble.id, ensemble.name);
+
+        if details.members.len() < 2 {
+            return Err(format!("{label} has fewer than 2 members."));
+        }
+        if ensemble.min_pass < 1 || ensemble.min_pass > details.members.len() as i64 {
+            return Err(format!(
+                "{label} has an invalid min_pass ({}) for {} members.",
+                ensemble.min_pass,
+                details.members.len()
+            ));
+        }
+        if !node_exists(&ensemble.entry_from_node) {
+            return Err(format!(
+                "{label}'s entry node '{}' is not reachable in this graph.",
+                ensemble.entry_from_node
+            ));
+        }
+        if !node_exists(&ensemble.join_node_id) {
+            return Err(format!(
+                "{label}'s quorum node '{}' is missing from this graph.",
+                ensemble.join_node_id
+            ));
+        }
+        if !node_exists(&ensemble.on_pass_to) {
+            return Err(format!(
+                "{label}'s on_pass_to target '{}' is not wired into this graph.",
+                ensemble.on_pass_to
+            ));
+        }
+        if let Some(on_fail_to) = &ensemble.on_fail_to {
+            if !node_exists(on_fail_to) {
+                return Err(format!(
+                    "{label}'s on_fail_to target '{on_fail_to}' is not wired into this graph."
+                ));
+            }
+        }
+        if !has_edge(
+            &ensemble.join_node_id,
+            &ensemble.on_pass_to,
+            LoopEdgeCondition::Pass,
+        ) {
+            return Err(format!(
+                "{label}'s quorum has no pass edge to its on_pass_to target."
+            ));
+        }
+        for member in &details.members {
+            if !node_exists(&member.node_id) {
+                return Err(format!(
+                    "{label}'s member node '{}' is missing from this graph.",
+                    member.node_id
+                ));
+            }
+            if !has_edge(
+                &ensemble.entry_from_node,
+                &member.node_id,
+                ensemble.entry_condition,
+            ) {
+                return Err(format!(
+                    "{label}'s member '{}' has no entry edge from '{}'.",
+                    member.node_id, ensemble.entry_from_node
+                ));
+            }
+            if !has_edge(
+                &member.node_id,
+                &ensemble.join_node_id,
+                LoopEdgeCondition::Always,
+            ) {
+                return Err(format!(
+                    "{label}'s member '{}' is not wired to the quorum — every member must route to the quorum.",
+                    member.node_id
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "validation_tests.rs"]
-mod tests {
-    use super::*;
-
-    // ── validate_id ───────────────────────────────────────────────
-
-    #[test]
-    fn test_validate_id_valid() {
-        assert!(validate_id("my-background_agent").is_ok());
-        assert!(validate_id("task_123").is_ok());
-        assert!(validate_id("a").is_ok());
-        assert!(validate_id("ABC-def_456").is_ok());
-    }
-
-    #[test]
-    fn test_validate_id_empty() {
-        assert!(validate_id("").is_err());
-    }
-
-    #[test]
-    fn test_validate_id_too_long() {
-        let long_id = "a".repeat(MAX_ID_LENGTH + 1);
-        assert!(validate_id(&long_id).is_err());
-        let exact_id = "a".repeat(MAX_ID_LENGTH);
-        assert!(validate_id(&exact_id).is_ok());
-    }
-
-    #[test]
-    fn test_validate_id_invalid_chars() {
-        assert!(validate_id("has space").is_err());
-        assert!(validate_id("has.dot").is_err());
-        assert!(validate_id("has/slash").is_err());
-        assert!(validate_id("has@at").is_err());
-        assert!(validate_id("has\nnewline").is_err());
-    }
-
-    // ── validate_prompt ───────────────────────────────────────────
-
-    #[test]
-    fn test_validate_prompt_valid() {
-        assert!(validate_prompt("Run the tests").is_ok());
-        assert!(validate_prompt("a").is_ok());
-    }
-
-    #[test]
-    fn test_validate_prompt_empty() {
-        assert!(validate_prompt("").is_err());
-        assert!(validate_prompt("   ").is_err());
-        assert!(validate_prompt("\t\n").is_err());
-    }
-
-    #[test]
-    fn test_validate_prompt_too_long() {
-        let long = "x".repeat(MAX_PROMPT_LENGTH + 1);
-        assert!(validate_prompt(&long).is_err());
-        let exact = "x".repeat(MAX_PROMPT_LENGTH);
-        assert!(validate_prompt(&exact).is_ok());
-    }
-
-    // ── validate_watch_path ───────────────────────────────────────
-
-    #[test]
-    fn test_validate_watch_path_valid() {
-        assert!(validate_watch_path("/tmp/project").is_ok());
-        assert!(validate_watch_path("/home/user/src").is_ok());
-    }
-
-    #[test]
-    fn test_validate_watch_path_empty() {
-        assert!(validate_watch_path("").is_err());
-        assert!(validate_watch_path("   ").is_err());
-    }
-
-    #[test]
-    fn test_validate_watch_path_relative() {
-        assert!(validate_watch_path("relative/path").is_err());
-        assert!(validate_watch_path("./here").is_err());
-    }
-
-    #[test]
-    fn test_validate_watch_path_too_long() {
-        let long = format!("/{}", "a".repeat(MAX_PATH_LENGTH));
-        assert!(validate_watch_path(&long).is_err());
-    }
-}
+mod tests;

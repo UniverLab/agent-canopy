@@ -254,3 +254,259 @@ fn extract_servers_from_array(array: &serde_json::Value) -> Vec<McpServerEntry> 
 pub fn get_mcp_servers_key_for_platform(platform: &crate::setup_module::Platform) -> &[String] {
     &platform.mcp_servers_key
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_registry() -> McpConfigRegistry {
+        let mut reg = McpConfigRegistry::new();
+        reg.platforms.push(PlatformMcpConfig {
+            platform: "kiro".to_string(),
+            config_path: "/home/user/.kiro/settings.json".to_string(),
+            servers: vec![
+                McpServerEntry {
+                    name: "canopy".to_string(),
+                    config: serde_json::json!({"url": "http://localhost:7755/mcp"}),
+                    enabled: true,
+                },
+                McpServerEntry {
+                    name: "github".to_string(),
+                    config: serde_json::json!({"token": "abc"}),
+                    enabled: true,
+                },
+            ],
+        });
+        reg.platforms.push(PlatformMcpConfig {
+            platform: "opencode".to_string(),
+            config_path: "/home/user/.opencode/config.json".to_string(),
+            servers: vec![McpServerEntry {
+                name: "canopy".to_string(),
+                config: serde_json::json!({"url": "http://localhost:7755/mcp"}),
+                enabled: false,
+            }],
+        });
+        reg
+    }
+
+    #[test]
+    fn new_registry_is_empty() {
+        let reg = McpConfigRegistry::new();
+        assert_eq!(reg.version, 1);
+        assert!(reg.platforms.is_empty());
+    }
+
+    #[test]
+    fn default_registry_is_empty() {
+        let reg = McpConfigRegistry::default();
+        assert_eq!(reg.version, 1);
+        assert!(reg.platforms.is_empty());
+    }
+
+    #[test]
+    fn unique_server_names_deduped_and_sorted() {
+        let reg = make_registry();
+        let names = reg.unique_server_names();
+        assert_eq!(names, vec!["canopy", "github"]);
+    }
+
+    #[test]
+    fn unique_server_names_empty_registry() {
+        let reg = McpConfigRegistry::new();
+        assert!(reg.unique_server_names().is_empty());
+    }
+
+    #[test]
+    fn server_diff_finds_unique_servers() {
+        let reg = make_registry();
+        let diff = reg.server_diff("kiro", "opencode");
+        assert_eq!(diff.len(), 1);
+        assert_eq!(diff[0].name, "github");
+    }
+
+    #[test]
+    fn server_diff_no_difference() {
+        let reg = make_registry();
+        let diff = reg.server_diff("opencode", "kiro");
+        assert!(diff.is_empty());
+    }
+
+    #[test]
+    fn server_diff_missing_platform() {
+        let reg = make_registry();
+        let diff = reg.server_diff("nonexistent", "kiro");
+        assert!(diff.is_empty());
+    }
+
+    #[test]
+    fn extract_servers_from_object_basic() {
+        let obj = serde_json::json!({
+            "server1": {"url": "http://localhost"},
+            "server2": {"disabled": true}
+        });
+        let servers = extract_servers_from_object(&obj);
+        assert_eq!(servers.len(), 2);
+        assert!(servers.iter().any(|s| s.name == "server1" && s.enabled));
+        assert!(servers.iter().any(|s| s.name == "server2" && !s.enabled));
+    }
+
+    #[test]
+    fn extract_servers_from_object_empty() {
+        let obj = serde_json::json!({});
+        let servers = extract_servers_from_object(&obj);
+        assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn extract_servers_from_object_not_object() {
+        let val = serde_json::json!("not an object");
+        let servers = extract_servers_from_object(&val);
+        assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn extract_servers_from_array_basic() {
+        let arr = serde_json::json!([
+            {"name": "server1", "url": "http://localhost"},
+            {"name": "server2", "disabled": true}
+        ]);
+        let servers = extract_servers_from_array(&arr);
+        assert_eq!(servers.len(), 2);
+        assert!(servers.iter().any(|s| s.name == "server1" && s.enabled));
+        assert!(servers.iter().any(|s| s.name == "server2" && !s.enabled));
+    }
+
+    #[test]
+    fn extract_servers_from_array_empty() {
+        let arr = serde_json::json!([]);
+        let servers = extract_servers_from_array(&arr);
+        assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn extract_servers_from_array_not_array() {
+        let val = serde_json::json!("not an array");
+        let servers = extract_servers_from_array(&val);
+        assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn extract_servers_from_array_skips_entries_without_name() {
+        let arr = serde_json::json!([
+            {"url": "http://localhost"},
+            {"name": "valid"}
+        ]);
+        let servers = extract_servers_from_array(&arr);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "valid");
+    }
+
+    #[test]
+    fn extract_servers_from_array_removes_name_from_config() {
+        let arr = serde_json::json!([
+            {"name": "server1", "url": "http://localhost"}
+        ]);
+        let servers = extract_servers_from_array(&arr);
+        assert!(!servers[0].config.as_object().unwrap().contains_key("name"));
+    }
+
+    #[test]
+    fn extract_servers_enabled_field() {
+        let obj = serde_json::json!({
+            "a": {"enabled": true},
+            "b": {"enabled": false},
+            "c": {},
+            "d": {"disabled": true}
+        });
+        let servers = extract_servers_from_object(&obj);
+        let find = |name: &str| servers.iter().find(|s| s.name == name).unwrap().enabled;
+        assert!(find("a"));
+        assert!(!find("b"));
+        assert!(find("c"));
+        assert!(!find("d"));
+    }
+
+    #[test]
+    fn extract_from_platform_missing_file() {
+        let result = McpConfigRegistry::extract_from_platform(
+            "test",
+            std::path::Path::new("/nonexistent/path.json"),
+            &["mcpServers".to_string()],
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[test]
+    fn extract_from_platform_json_with_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        std::fs::write(
+            &config_path,
+            r#"{"mcpServers": {"server1": {"url": "http://localhost:8080"}}}"#,
+        )
+        .unwrap();
+
+        let result = McpConfigRegistry::extract_from_platform(
+            "test-platform",
+            &config_path,
+            &["mcpServers".to_string()],
+        );
+        assert!(result.is_ok());
+        let config = result.unwrap();
+        assert_eq!(config.platform, "test-platform");
+        assert_eq!(config.servers.len(), 1);
+        assert_eq!(config.servers[0].name, "server1");
+    }
+
+    #[test]
+    fn extract_from_platform_missing_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        std::fs::write(&config_path, r#"{"other": "data"}"#).unwrap();
+
+        let result = McpConfigRegistry::extract_from_platform(
+            "test",
+            &config_path,
+            &["mcpServers".to_string()],
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[test]
+    fn sync_servers_syncs_matching_servers() {
+        let reg = make_registry();
+        let result = reg.sync_servers(&["canopy"], &["kiro"]);
+        assert!(result.is_ok());
+        let synced = result.unwrap();
+        assert_eq!(synced, vec!["kiro.canopy"]);
+    }
+
+    #[test]
+    fn sync_servers_missing_platform() {
+        let reg = make_registry();
+        let result = reg.sync_servers(&["canopy"], &["nonexistent"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sync_servers_missing_server() {
+        let reg = make_registry();
+        let result = reg.sync_servers(&["nonexistent-server"], &["kiro"]);
+        assert!(result.is_ok());
+        let synced = result.unwrap();
+        assert!(synced.is_empty());
+    }
+
+    #[test]
+    fn sync_servers_multiple_platforms() {
+        let reg = make_registry();
+        let result = reg.sync_servers(&["canopy"], &["kiro", "opencode"]);
+        assert!(result.is_ok());
+        let synced = result.unwrap();
+        assert_eq!(synced.len(), 2);
+        assert!(synced.contains(&"kiro.canopy".to_string()));
+        assert!(synced.contains(&"opencode.canopy".to_string()));
+    }
+}

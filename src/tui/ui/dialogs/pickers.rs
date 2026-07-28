@@ -1,13 +1,14 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph};
 use ratatui::Frame;
 
-use super::{centered_rect, ACCENT, DIM};
+use super::centered_rect;
 use crate::tui::app::types::App;
+use crate::tui::ui::theme::Theme;
 
-pub fn draw_split_picker(frame: &mut Frame, app: &App) {
+pub fn draw_split_picker(frame: &mut Frame, app: &App, theme: &Theme) {
     if !app.split_picker_open {
         return;
     }
@@ -30,7 +31,7 @@ pub fn draw_split_picker(frame: &mut Frame, app: &App) {
 
     let block = Block::default()
         .title(" Split con... ")
-        .borders(Borders::ALL)
+        .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(Color::Green))
         .style(Style::default().bg(Color::Rgb(15, 25, 15)));
     let inner = block.inner(area);
@@ -39,7 +40,7 @@ pub fn draw_split_picker(frame: &mut Frame, app: &App) {
     let mut lines = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Current: ", Style::default().fg(DIM)),
+            Span::styled("  Current: ", Style::default().fg(theme.dim_text)),
             Span::styled(
                 &current_name,
                 Style::default()
@@ -48,7 +49,10 @@ pub fn draw_split_picker(frame: &mut Frame, app: &App) {
             ),
         ]),
         Line::from(""),
-        Line::from(Span::styled("  Selecciona:", Style::default().fg(DIM))),
+        Line::from(Span::styled(
+            "  Selecciona:",
+            Style::default().fg(theme.dim_text),
+        )),
     ];
 
     for (i, (name, type_label)) in sessions.iter().enumerate() {
@@ -67,7 +71,10 @@ pub fn draw_split_picker(frame: &mut Frame, app: &App) {
         let prefix = if selected { "  > " } else { "    " };
         lines.push(Line::from(vec![
             Span::styled(format!("{}{}", prefix, name), style),
-            Span::styled(format!("  [{}]", type_label), Style::default().fg(DIM)),
+            Span::styled(
+                format!("  [{}]", type_label),
+                Style::default().fg(theme.dim_text),
+            ),
         ]));
     }
 
@@ -78,22 +85,27 @@ pub fn draw_split_picker(frame: &mut Frame, app: &App) {
         crate::domain::models::SplitOrientation::Vertical => "○ Horizontal  ● Vertical",
     };
     lines.push(Line::from(vec![
-        Span::styled("  Orientación:  ", Style::default().fg(DIM)),
+        Span::styled("  Orientación:  ", Style::default().fg(theme.dim_text)),
         Span::styled(orient_label, Style::default().fg(Color::White)),
     ]));
     lines.push(Line::from(Span::styled(
         "                Tab para alternar",
-        Style::default().fg(DIM),
+        Style::default().fg(theme.dim_text),
     )));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  Esc cancelar               Enter crear",
-        Style::default().fg(DIM),
+        Style::default().fg(theme.dim_text),
     )));
 
     frame.render_widget(Paragraph::new(lines), inner);
 }
-pub fn draw_suggestion_picker(frame: &mut Frame, app: &App, panel_area: ratatui::layout::Rect) {
+pub fn draw_suggestion_picker(
+    frame: &mut Frame,
+    app: &App,
+    panel_area: ratatui::layout::Rect,
+    theme: &Theme,
+) {
     let Some(picker) = &app.suggestion_picker else {
         return;
     };
@@ -143,12 +155,12 @@ pub fn draw_suggestion_picker(frame: &mut Frame, app: &App, panel_area: ratatui:
         );
         frame.render_widget(Clear, area);
         let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(DIM))
+            .borders(crate::tui::ui::borders_for(theme))
+            .border_style(Style::default().fg(theme.border_color))
             .style(Style::default().bg(Color::Rgb(15, 15, 25)));
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let msg = Paragraph::new("  No matches").style(Style::default().fg(DIM));
+        let msg = Paragraph::new("  No matches").style(Style::default().fg(theme.dim_text));
         frame.render_widget(msg, inner);
         return;
     }
@@ -192,8 +204,8 @@ pub fn draw_suggestion_picker(frame: &mut Frame, app: &App, panel_area: ratatui:
 
     let block = Block::default()
         .title(title)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .borders(crate::tui::ui::borders_for(theme))
+        .border_style(Style::default().fg(theme.header_color))
         .style(Style::default().bg(Color::Rgb(15, 25, 15)));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -209,7 +221,7 @@ pub fn draw_suggestion_picker(frame: &mut Frame, app: &App, panel_area: ratatui:
             let style = if selected {
                 Style::default()
                     .fg(Color::Black)
-                    .bg(ACCENT)
+                    .bg(theme.header_color)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)

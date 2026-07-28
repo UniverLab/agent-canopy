@@ -124,3 +124,75 @@ impl Default for SkillsRegistry {
 pub fn extract_skills_from_platform(_platform: &str, _skills_dir: &Path) -> Result<Vec<String>> {
     Ok(Vec::new())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_creates_empty_registry() {
+        let registry = SkillsRegistry::new();
+        assert_eq!(registry.version, 1);
+        assert!(registry.skills.is_empty());
+    }
+
+    #[test]
+    fn fetch_from_registry_returns_ok() {
+        let result = SkillsRegistry::fetch_from_registry();
+        assert!(result.is_ok());
+        let registry = result.unwrap();
+        assert_eq!(registry.version, 1);
+        assert!(registry.skills.is_empty());
+    }
+
+    #[test]
+    fn default_creates_empty_registry() {
+        let registry = SkillsRegistry::default();
+        assert_eq!(registry.version, 1);
+        assert!(registry.skills.is_empty());
+    }
+
+    #[test]
+    fn extract_skills_from_platform_returns_empty_vec() {
+        let result = extract_skills_from_platform("test", Path::new("/tmp"));
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn skill_struct_can_be_created() {
+        let skill = Skill {
+            id: "test-skill".to_string(),
+            name: "Test Skill".to_string(),
+            description: "A test skill".to_string(),
+            version: "1.0.0".to_string(),
+            author: "Test Author".to_string(),
+            tags: vec!["test".to_string()],
+            install_paths: vec![],
+        };
+        assert_eq!(skill.id, "test-skill");
+        assert_eq!(skill.name, "Test Skill");
+    }
+
+    #[test]
+    fn skill_install_path_struct_can_be_created() {
+        let path = SkillInstallPath {
+            platform: "linux".to_string(),
+            target_path: "/usr/local/bin/test".to_string(),
+            content: "#!/bin/bash\necho test".to_string(),
+        };
+        assert_eq!(path.platform, "linux");
+        assert_eq!(path.target_path, "/usr/local/bin/test");
+    }
+
+    #[test]
+    fn installed_skill_struct_can_be_created() {
+        let skill = InstalledSkill {
+            id: "test-skill".to_string(),
+            platforms: vec!["linux".to_string()],
+            installed_at: chrono::Utc::now(),
+        };
+        assert_eq!(skill.id, "test-skill");
+        assert_eq!(skill.platforms.len(), 1);
+    }
+}

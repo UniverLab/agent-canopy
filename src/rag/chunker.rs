@@ -537,3 +537,587 @@ mod tests {
         assert!(chunks[0].contains("first substantial chunk"));
     }
 }
+
+#[cfg(test)]
+mod additional_tests {
+    use super::*;
+
+    // ── detect_lang ────────────────────────────────────────────────────
+
+    #[test]
+    fn detect_lang_with_path_prefix() {
+        assert_eq!(detect_lang("/home/user/docs/file.md"), Some("markdown"));
+    }
+
+    #[test]
+    fn detect_lang_with_dot_prefix() {
+        assert_eq!(detect_lang(".hidden.pdf"), Some("text"));
+    }
+
+    #[test]
+    fn detect_lang_case_sensitive_extension() {
+        assert_eq!(detect_lang("file.MD"), None);
+        assert_eq!(detect_lang("file.PDF"), None);
+    }
+
+    #[test]
+    fn detect_lang_no_extension() {
+        assert_eq!(detect_lang("Makefile"), None);
+        assert_eq!(detect_lang("README"), None);
+    }
+
+    #[test]
+    fn detect_lang_empty_path() {
+        assert_eq!(detect_lang(""), None);
+    }
+
+    #[test]
+    fn detect_lang_dot_only() {
+        assert_eq!(detect_lang("."), None);
+    }
+
+    // ── term_frequencies ───────────────────────────────────────────────
+
+    #[test]
+    fn term_frequencies_empty_string() {
+        let freq = term_frequencies("");
+        assert!(freq.is_empty());
+    }
+
+    #[test]
+    fn term_frequencies_single_word() {
+        let freq = term_frequencies("hello");
+        assert_eq!(freq.len(), 1);
+        assert_eq!(freq["hello"], 1.0);
+    }
+
+    #[test]
+    fn term_frequencies_repeated_tokens() {
+        let freq = term_frequencies("cat cat cat");
+        assert_eq!(freq.len(), 1);
+        assert_eq!(freq["cat"], 3.0);
+    }
+
+    #[test]
+    fn term_frequencies_lowercases_tokens() {
+        let freq = term_frequencies("Foo foo FOO");
+        assert_eq!(freq.len(), 1);
+        assert_eq!(freq["foo"], 3.0);
+    }
+
+    #[test]
+    fn term_frequencies_splits_on_non_alphanumeric() {
+        let freq = term_frequencies("hello,world! it's-a test");
+        assert!(freq.contains_key("hello"));
+        assert!(freq.contains_key("world"));
+        assert!(freq.contains_key("it"));
+        assert!(freq.contains_key("s"));
+        assert!(freq.contains_key("a"));
+        assert!(freq.contains_key("test"));
+    }
+
+    #[test]
+    fn term_frequencies_numeric_tokens() {
+        let freq = term_frequencies("version 2.0 build 123");
+        assert!(freq.contains_key("version"));
+        assert!(freq.contains_key("2"));
+        assert!(freq.contains_key("0"));
+        assert!(freq.contains_key("build"));
+        assert!(freq.contains_key("123"));
+    }
+
+    // ── cosine_similarity ──────────────────────────────────────────────
+
+    #[test]
+    fn cosine_similarity_empty_both() {
+        assert_eq!(cosine_similarity("", ""), 0.0);
+    }
+
+    #[test]
+    fn cosine_similarity_empty_left() {
+        assert_eq!(cosine_similarity("", "hello world"), 0.0);
+    }
+
+    #[test]
+    fn cosine_similarity_empty_right() {
+        assert_eq!(cosine_similarity("hello world", ""), 0.0);
+    }
+
+    #[test]
+    fn cosine_similarity_partial_overlap() {
+        let sim = cosine_similarity("a b c d", "c d e f");
+        assert!(sim > 0.0 && sim < 1.0);
+    }
+
+    #[test]
+    fn cosine_similarity_symmetric() {
+        let a = "alpha beta gamma";
+        let b = "beta gamma delta";
+        let sim_ab = cosine_similarity(a, b);
+        let sim_ba = cosine_similarity(b, a);
+        assert!((sim_ab - sim_ba).abs() < f32::EPSILON);
+    }
+
+    // ── annotate_similarity ────────────────────────────────────────────
+
+    #[test]
+    fn annotate_similarity_single_chunk() {
+        let result = annotate_similarity(vec!["only one".to_string()]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].index, 0);
+        assert_eq!(result[0].similarity_to_prev, None);
+    }
+
+    #[test]
+    fn annotate_similarity_empty_input() {
+        let result = annotate_similarity(Vec::new());
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn annotate_similarity_two_identical_chunks() {
+        let result = annotate_similarity(vec!["same text".into(), "same text".into()]);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].similarity_to_prev, None);
+        assert!((result[1].similarity_to_prev.unwrap() - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn annotate_similarity_indices_are_sequential() {
+        let chunks: Vec<String> = (0..5).map(|i| format!("chunk {i} text")).collect();
+        let result = annotate_similarity(chunks);
+        let indices: Vec<usize> = result.iter().map(|c| c.index).collect();
+        assert_eq!(indices, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn annotate_similarity_preserves_content() {
+        let chunks = vec!["first".into(), "second".into(), "third".into()];
+        let result = annotate_similarity(chunks);
+        assert_eq!(result[0].content, "first");
+        assert_eq!(result[1].content, "second");
+        assert_eq!(result[2].content, "third");
+    }
+
+    // ── coalesce_small_chunks ──────────────────────────────────────────
+
+    #[test]
+    fn coalesce_small_chunks_empty_input() {
+        assert!(coalesce_small_chunks(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn coalesce_small_chunks_all_large() {
+        let chunks = vec![
+            "This is a substantial chunk of text with many words".into(),
+            "Another substantial chunk of text with many words".into(),
+        ];
+        let result = coalesce_small_chunks(chunks);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn coalesce_small_chunks_all_small() {
+        let chunks = vec!["tiny".into(), "small".into(), "little".into()];
+        let result = coalesce_small_chunks(chunks);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn coalesce_small_chunks_leading_small() {
+        let chunks = vec!["a".into(), "b".into(), "This is a long enough chunk".into()];
+        let result = coalesce_small_chunks(chunks);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].contains("a"));
+        assert!(result[0].contains("b"));
+        assert!(result[0].contains("long enough"));
+    }
+
+    #[test]
+    fn coalesce_small_chunks_trailing_small() {
+        let chunks = vec!["This is a long enough chunk".into(), "x".into(), "y".into()];
+        let result = coalesce_small_chunks(chunks);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].contains("long enough"));
+        assert!(result[0].contains("x"));
+        assert!(result[0].contains("y"));
+    }
+
+    #[test]
+    fn coalesce_small_chunks_interleaved_small() {
+        let chunks = vec![
+            "Long first chunk with many words here".into(),
+            "x".into(),
+            "Long second chunk with many words here".into(),
+            "y".into(),
+            "Long third chunk with many words here".into(),
+        ];
+        let result = coalesce_small_chunks(chunks);
+        assert_eq!(result.len(), 3);
+        assert!(result[0].contains("x"));
+        assert!(result[1].contains("y"));
+    }
+
+    #[test]
+    fn coalesce_small_chunks_empty_strings_skipped() {
+        let chunks = vec!["".into(), "This is a long enough chunk".into(), "".into()];
+        let result = coalesce_small_chunks(chunks);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn coalesce_small_chunks_whitespace_only_skipped() {
+        let chunks = vec!["   \n  ".into(), "This is a long enough chunk".into()];
+        let result = coalesce_small_chunks(chunks);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn coalesce_small_chunks_pending_only() {
+        let chunks = vec!["aa".into(), "bb".into()];
+        let result = coalesce_small_chunks(chunks);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].contains("aa"));
+        assert!(result[0].contains("bb"));
+    }
+
+    // ── split_paragraph ────────────────────────────────────────────────
+
+    #[test]
+    fn split_paragraph_short_text_unchanged() {
+        let text = "Short text that fits in one chunk.";
+        let result = split_paragraph(text);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], text);
+    }
+
+    #[test]
+    fn split_paragraph_exact_window_boundary() {
+        let text = "x".repeat(MAX_CHUNK_TOKENS * CHARS_PER_TOKEN);
+        let result = split_paragraph(&text);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn split_paragraph_one_over_window() {
+        let text = "x".repeat(MAX_CHUNK_TOKENS * CHARS_PER_TOKEN + 1);
+        let result = split_paragraph(&text);
+        assert!(result.len() >= 2);
+    }
+
+    #[test]
+    fn split_paragraph_preserves_all_content() {
+        // The overlap mechanism means content is not exactly preserved on
+        // join (some duplication at boundaries), but all chunks together
+        // must cover every original character at least once.
+        let text = "alpha beta gamma delta epsilon ".repeat(100);
+        let result = split_paragraph(&text);
+        assert!(result.len() >= 2, "must split into multiple chunks");
+        let joined: String = result.join("");
+        assert!(
+            joined.len() >= text.len(),
+            "joined chunks must cover original text"
+        );
+    }
+
+    #[test]
+    fn split_paragraph_chunks_are_within_window() {
+        let text = "word ".repeat(600);
+        let result = split_paragraph(&text);
+        let window = MAX_CHUNK_TOKENS * CHARS_PER_TOKEN;
+        for chunk in &result {
+            assert!(
+                chunk.len() <= window + CHARS_PER_TOKEN,
+                "chunk len {} exceeds window {window}",
+                chunk.len()
+            );
+        }
+    }
+
+    // ── chunk_paragraph_texts ──────────────────────────────────────────
+
+    #[test]
+    fn chunk_paragraph_texts_empty_input() {
+        let result = chunk_paragraph_texts("");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn chunk_paragraph_texts_single_short_paragraph() {
+        let result = chunk_paragraph_texts("Just one paragraph of text.");
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn chunk_paragraph_texts_multiple_short_paragraphs_fit_one_chunk() {
+        let result = chunk_paragraph_texts("First paragraph.\n\nSecond paragraph.");
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn chunk_paragraph_texts_very_long_paragraph_splits() {
+        let para = "word ".repeat(600);
+        let result = chunk_paragraph_texts(&para);
+        assert!(result.len() >= 2, "long paragraph must split");
+    }
+
+    #[test]
+    fn chunk_paragraph_texts_blank_lines_filtered() {
+        let content = "Paragraph one.\n\n\n\nParagraph two.";
+        let result = chunk_paragraph_texts(content);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn chunk_paragraph_texts_many_short_paragraphs_merge() {
+        let paragraphs: Vec<String> = (0..10).map(|i| format!("word{i} extra")).collect();
+        let content = paragraphs.join("\n\n");
+        let result = chunk_paragraph_texts(&content);
+        assert_eq!(result.len(), 1);
+    }
+
+    // ── chunk_paragraphs ───────────────────────────────────────────────
+
+    #[test]
+    fn chunk_paragraphs_empty_input() {
+        let result = chunk_paragraphs("");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn chunk_paragraphs_single_paragraph() {
+        let result = chunk_paragraphs("Just one paragraph.");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].index, 0);
+        assert_eq!(result[0].similarity_to_prev, None);
+    }
+
+    #[test]
+    fn chunk_paragraphs_filters_blank_paragraphs() {
+        let result = chunk_paragraphs("alpha beta gamma\n\n\n\nalpha beta gamma");
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn chunk_paragraphs_long_paragraph_splits() {
+        let big = "word ".repeat(600);
+        let result = chunk_paragraphs(&big);
+        assert!(result.len() >= 2);
+    }
+
+    // ── chunk (public API) ─────────────────────────────────────────────
+
+    #[test]
+    fn chunk_empty_markdown() {
+        let result = chunk("", "markdown");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn chunk_empty_text() {
+        let result = chunk("", "text");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn chunk_single_word_markdown() {
+        let result = chunk("hello", "markdown");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, 0);
+    }
+
+    #[test]
+    fn chunk_single_word_text() {
+        let result = chunk("hello", "text");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, 0);
+    }
+
+    #[test]
+    fn chunk_long_text_splits() {
+        let text = "word ".repeat(600);
+        let result = chunk(&text, "text");
+        assert!(result.len() >= 2);
+    }
+
+    #[test]
+    fn chunk_markdown_with_nested_headings() {
+        let md = "# Top\n\n## Sub1\n\nText A here with enough words to avoid coalesce\n\n## Sub2\n\nText B here with enough words to avoid coalesce\n\n# Top2\n\nText C here with enough words to avoid coalesce";
+        let result = chunk(md, "markdown");
+        assert!(result.len() >= 2);
+    }
+
+    #[test]
+    fn chunk_markdown_no_headings_falls_back_to_paragraphs() {
+        let md = "No headings here.\n\nJust plain text paragraphs.";
+        let result = chunk(md, "markdown");
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn chunk_text_indices_start_at_zero() {
+        // "hello" and "world" are short (< MIN_CHUNK_CHARS), so coalesce
+        // merges them into one chunk at index 0.
+        let result = chunk("hello\n\nworld", "text");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, 0);
+    }
+
+    // ── merge_similar_chunks ───────────────────────────────────────────
+
+    #[test]
+    fn merge_similar_chunks_empty_input() {
+        let result = merge_similar_chunks(Vec::new(), 0.5);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn merge_similar_chunks_single_chunk() {
+        let chunks = vec![SemanticChunk {
+            index: 0,
+            content: "only one".into(),
+            similarity_to_prev: None,
+        }];
+        let result = merge_similar_chunks(chunks, 0.5);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].similarity_to_prev, None);
+    }
+
+    #[test]
+    fn merge_similar_chunks_threshold_zero_always_merges() {
+        let chunks = annotate_similarity(vec![
+            "alpha beta gamma delta".into(),
+            "alpha beta gamma delta".into(),
+        ]);
+        let result = merge_similar_chunks(chunks, 0.0);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn merge_similar_chunks_threshold_one_identical_still_merges() {
+        let chunks =
+            annotate_similarity(vec!["alpha beta gamma".into(), "alpha beta gamma".into()]);
+        let result = merge_similar_chunks(chunks, 1.0);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn merge_similar_chunks_threshold_one_no_merge_for_partial_overlap() {
+        let chunks = annotate_similarity(vec![
+            "alpha beta gamma delta".into(),
+            "alpha beta epsilon zeta".into(),
+        ]);
+        let result = merge_similar_chunks(chunks, 1.0);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn merge_similar_chunks_clamps_threshold() {
+        let chunks = annotate_similarity(vec![
+            "alpha beta gamma delta".into(),
+            "alpha beta gamma delta".into(),
+        ]);
+        let result = merge_similar_chunks(chunks, 5.0);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn merge_similar_chunks_negative_threshold_clamps_to_zero() {
+        let chunks =
+            annotate_similarity(vec!["alpha beta gamma".into(), "delta epsilon zeta".into()]);
+        let result = merge_similar_chunks(chunks, -1.0);
+        assert_eq!(result.len(), 1);
+    }
+
+    // ── chunk_markdown_texts ───────────────────────────────────────────
+
+    #[test]
+    fn chunk_markdown_texts_empty() {
+        let result = chunk_markdown_texts("");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn chunk_markdown_texts_single_heading() {
+        let result = chunk_markdown_texts("# Title");
+        assert_eq!(result.len(), 1);
+        assert!(result[0].contains("Title"));
+    }
+
+    #[test]
+    fn chunk_markdown_texts_heading_with_no_content() {
+        // Both chunks are short (< MIN_CHUNK_CHARS), so coalesce merges them.
+        let result = chunk_markdown_texts("# Heading\n\n## Next");
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn chunk_markdown_texts_no_headings_uses_paragraphs() {
+        let result = chunk_markdown_texts("Plain text without headings.\n\nAnother paragraph.");
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn chunk_markdown_texts_only_hash_line_not_heading() {
+        let result = chunk_markdown_texts("#nospacenewline\nmore text");
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn chunk_markdown_texts_multiple_h1_sections() {
+        let md =
+            "# Section 1\n\nText one.\n\n# Section 2\n\nText two.\n\n# Section 3\n\nText three.";
+        let result = chunk_markdown_texts(md);
+        assert!(result.len() >= 3);
+    }
+
+    #[test]
+    fn chunk_markdown_texts_code_block_not_split() {
+        let md = "# Title\n\n```\ncode here\n```\n\nMore text.";
+        let result = chunk_markdown_texts(md);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn chunk_markdown_texts_blank_only_input() {
+        let result = chunk_markdown_texts("\n\n\n");
+        assert!(result.is_empty());
+    }
+
+    // ── chunk_semantic (additional) ────────────────────────────────────
+
+    #[test]
+    fn chunk_semantic_empty_text() {
+        let result = chunk_semantic("", "text", 0.5);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn chunk_semantic_empty_markdown() {
+        let result = chunk_semantic("", "markdown", 0.5);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn chunk_semantic_single_paragraph() {
+        let result = chunk_semantic("Just one paragraph of text.", "text", 0.5);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].similarity_to_prev, None);
+    }
+
+    #[test]
+    fn chunk_semantic_text_merge_all_threshold_zero() {
+        let content = "alpha beta gamma\n\ndelta epsilon zeta";
+        let result = chunk_semantic(content, "text", 0.0);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn chunk_semantic_text_keep_separate_high_threshold() {
+        // Paragraphs must be long enough to survive coalesce_small_chunks.
+        // Fully disjoint vocabulary ensures similarity is 0.0, below 0.5.
+        let content = "alpha beta gamma delta epsilon zeta eta theta iota kappa\n\nomega pi rho sigma tau upsilon phi chi psi omega";
+        let result = chunk_semantic(content, "text", 0.5);
+        assert_eq!(result.len(), 2);
+    }
+}

@@ -5,7 +5,33 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-pub fn render_vt_screen(frame: &mut Frame, area: Rect, snap: &ScreenSnapshot) {
+/// Background for mouse-selected cells in a PTY pane.
+const SELECTION_BG: Color = Color::Rgb(70, 90, 130);
+
+/// Normalized linear selection endpoints: ((row, col) start, (row, col) end).
+pub(super) type PaneSelection = ((u16, u16), (u16, u16));
+
+fn cell_selected(selection: PaneSelection, row: u16, col: u16) -> bool {
+    let ((r0, c0), (r1, c1)) = selection;
+    if row < r0 || row > r1 {
+        return false;
+    }
+    if r0 == r1 {
+        return col >= c0 && col <= c1;
+    }
+    match row {
+        r if r == r0 => col >= c0,
+        r if r == r1 => col <= c1,
+        _ => true,
+    }
+}
+
+pub fn render_vt_screen(
+    frame: &mut Frame,
+    area: Rect,
+    snap: &ScreenSnapshot,
+    selection: Option<PaneSelection>,
+) {
     let buf = frame.buffer_mut();
     for (row_idx, row) in snap.cells.iter().enumerate() {
         if row_idx as u16 >= area.height {
@@ -18,8 +44,15 @@ pub fn render_vt_screen(frame: &mut Frame, area: Rect, snap: &ScreenSnapshot) {
                 break;
             }
             let x = area.x + col_idx as u16;
+            let selected =
+                selection.is_some_and(|sel| cell_selected(sel, row_idx as u16, col_idx as u16));
 
             let Some(c) = cell else {
+                if selected {
+                    let buf_cell = &mut buf[(x, y)];
+                    buf_cell.set_symbol(" ");
+                    buf_cell.set_style(Style::default().bg(SELECTION_BG));
+                }
                 continue;
             };
 
@@ -36,6 +69,9 @@ pub fn render_vt_screen(frame: &mut Frame, area: Rect, snap: &ScreenSnapshot) {
             }
             if c.underline {
                 style = style.add_modifier(Modifier::UNDERLINED);
+            }
+            if selected {
+                style = style.bg(SELECTION_BG);
             }
 
             let buf_cell = &mut buf[(x, y)];

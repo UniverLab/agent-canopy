@@ -1,12 +1,13 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
-use super::{centered_rect, truncate_str, ACCENT, DIM};
+use super::{centered_rect, draw_dialog_left_wave, truncate_str};
 use crate::tui::app::types::App;
+use crate::tui::ui::theme::Theme;
 
-pub fn draw_rag_transfer_modal(frame: &mut Frame, app: &App) {
+pub fn draw_rag_transfer_modal(frame: &mut Frame, app: &App, theme: &Theme) {
     let Some(modal) = &app.rag_transfer_modal else {
         return;
     };
@@ -26,15 +27,16 @@ pub fn draw_rag_transfer_modal(frame: &mut Frame, app: &App) {
 
     let block = Block::default()
         .title(" Transfer RAG Result ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .borders(crate::tui::ui::borders_for(theme))
+        .border_style(Style::default().fg(theme.header_color))
         .style(Style::default().bg(Color::Rgb(15, 25, 15)));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    draw_dialog_left_wave(frame, area, app.animation_tick.into());
 
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("  Query: ", Style::default().fg(DIM)),
+            Span::styled("  Query: ", Style::default().fg(theme.dim_text)),
             Span::styled(
                 truncate_str(&modal.query, inner.width.saturating_sub(10) as usize),
                 Style::default()
@@ -45,7 +47,7 @@ pub fn draw_rag_transfer_modal(frame: &mut Frame, app: &App) {
         Line::from(""),
         Line::from(Span::styled(
             "  Selected chunk preview:",
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         )),
     ];
 
@@ -61,10 +63,15 @@ pub fn draw_rag_transfer_modal(frame: &mut Frame, app: &App) {
 
     lines.push(Line::from(""));
 
+    // Full-width trailing filler so a selected row reads as a card spanning the
+    // whole dialog (like the sidebar), not just the background behind the text.
+    let row_fill =
+        |bg: Color| Span::styled(" ".repeat(inner.width as usize), Style::default().bg(bg));
+
     if agents.is_empty() {
         lines.push(Line::from(Span::styled(
             "  No interactive agents running.",
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim_text),
         )));
     } else {
         for (i, agent) in agents.iter().enumerate() {
@@ -73,12 +80,14 @@ pub fn draw_rag_transfer_modal(frame: &mut Frame, app: &App) {
             }
             let is_sel = i == modal.picker_selected;
             let accent = agent.accent_color;
+            // Subtle selection (matches the sidebar): dark-gray background with
+            // the agent name in its accent color, instead of a full accent fill.
             let bg = if is_sel {
-                accent
+                theme.selected_bg
             } else {
                 Color::Rgb(15, 25, 15)
             };
-            let fg = if is_sel { Color::Black } else { Color::White };
+            let fg = if is_sel { accent } else { Color::White };
             let cursor = if is_sel { "›" } else { " " };
             lines.push(Line::from(vec![
                 Span::styled(format!("  {} ", cursor), Style::default().fg(accent).bg(bg)),
@@ -86,13 +95,15 @@ pub fn draw_rag_transfer_modal(frame: &mut Frame, app: &App) {
                     &agent.name,
                     Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
                 ),
+                row_fill(bg),
             ]));
             lines.push(Line::from(vec![
                 Span::styled("    ", Style::default().bg(bg)),
                 Span::styled(
                     format!("pty · {}", agent.cli.as_str()),
-                    Style::default().fg(DIM).bg(bg),
+                    Style::default().fg(theme.dim_text).bg(bg),
                 ),
+                row_fill(bg),
             ]));
             lines.push(Line::from(vec![
                 Span::styled("    ", Style::default().bg(bg)),
@@ -100,6 +111,7 @@ pub fn draw_rag_transfer_modal(frame: &mut Frame, app: &App) {
                     truncate_path(&agent.working_dir, inner.width.saturating_sub(6) as usize),
                     Style::default().fg(Color::Cyan).bg(bg),
                 ),
+                row_fill(bg),
             ]));
         }
     }
@@ -107,7 +119,7 @@ pub fn draw_rag_transfer_modal(frame: &mut Frame, app: &App) {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  ↑↓ navigate · Enter open prompt builder · Esc cancel",
-        Style::default().fg(DIM),
+        Style::default().fg(theme.dim_text),
     )));
 
     frame.render_widget(Paragraph::new(lines), inner);

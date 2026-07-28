@@ -37,6 +37,9 @@ const UNIVERSAL_REPEL_FORCE: f32 = 30.0;
 /// Max seconds before a firefly is guaranteed to glow (probability ramps linearly).
 const GLOW_RAMP_SECS: f32 = 20.0;
 
+/// How much faster fireflies fade once the scene is outside its time window.
+const WINDDOWN_FADE: f32 = 4.0;
+
 #[derive(Clone, Copy, PartialEq)]
 enum GlowState {
     /// Off — time_in_state tracks seconds dark (used to ramp ignition probability)
@@ -107,18 +110,28 @@ impl Scene for FireflyScene {
         if area.width < 5 || area.height < 2 {
             return;
         }
-        if !self.initialized {
-            for _ in 0..2 {
+        // Only seed new fireflies inside the time window. When winding down
+        // (`!ctx.spawning`) the existing swarm keeps flying and fades out.
+        if ctx.spawning {
+            if !self.initialized {
+                for _ in 0..2 {
+                    self.spawn(area);
+                }
+                self.initialized = true;
+            }
+
+            self.spawn_timer += delta_secs;
+            if self.spawn_timer >= SPAWN_INTERVAL_SECS {
+                self.spawn_timer = 0.0;
                 self.spawn(area);
             }
-            self.initialized = true;
         }
 
-        self.spawn_timer += delta_secs;
-        if self.spawn_timer >= SPAWN_INTERVAL_SECS {
-            self.spawn_timer = 0.0;
-            self.spawn(area);
-        }
+        let fade = if ctx.spawning {
+            delta_secs
+        } else {
+            delta_secs * WINDDOWN_FADE
+        };
 
         let x_min = area.x as f32 + 1.0;
         let x_max = (area.x + area.width) as f32 - 2.0;
@@ -140,7 +153,7 @@ impl Scene for FireflyScene {
         }
 
         self.fireflies.retain_mut(|fly| {
-            fly.life -= delta_secs;
+            fly.life -= fade;
             if fly.life <= 0.0 {
                 return false;
             }
@@ -267,7 +280,10 @@ mod tests {
     fn test_firefly_emits_3_particles_per_fly() {
         let mut scene = FireflyScene::new();
         let area = Rect::new(0, 0, 80, 24);
-        let mut ctx = AtmosphereCtx::default();
+        let mut ctx = AtmosphereCtx {
+            spawning: true,
+            ..Default::default()
+        };
         scene.tick(0.1, area, &mut ctx);
         assert_eq!(scene.particles().len(), scene.fireflies.len() * 3);
     }

@@ -509,3 +509,844 @@ pub(crate) fn browse_directories_multiselect_with_preselected(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::crossterm::event::KeyCode;
+    use std::path::PathBuf;
+
+    #[test]
+    fn adjust_cursor_bounds_clamps_to_last() {
+        let mut cursor = 10;
+        adjust_cursor_bounds(&mut cursor, 5);
+        assert_eq!(cursor, 4);
+    }
+
+    #[test]
+    fn adjust_cursor_bounds_no_change_when_within_range() {
+        let mut cursor = 2;
+        adjust_cursor_bounds(&mut cursor, 5);
+        assert_eq!(cursor, 2);
+    }
+
+    #[test]
+    fn adjust_cursor_bounds_zero_length() {
+        let mut cursor = 3;
+        adjust_cursor_bounds(&mut cursor, 0);
+        assert_eq!(cursor, 3);
+    }
+
+    #[test]
+    fn adjust_cursor_bounds_at_boundary() {
+        let mut cursor = 4;
+        adjust_cursor_bounds(&mut cursor, 5);
+        assert_eq!(cursor, 4);
+    }
+
+    #[test]
+    fn adjust_cursor_bounds_cursor_exactly_at_len() {
+        let mut cursor = 5;
+        adjust_cursor_bounds(&mut cursor, 5);
+        assert_eq!(cursor, 4);
+    }
+
+    #[test]
+    fn calculate_scroll_returns_zero_when_cursor_below_visible() {
+        assert_eq!(calculate_scroll(3, 10), 0);
+    }
+
+    #[test]
+    fn calculate_scroll_offsets_when_cursor_exceeds_visible() {
+        assert_eq!(calculate_scroll(10, 5), 6);
+    }
+
+    #[test]
+    fn calculate_scroll_at_boundary() {
+        assert_eq!(calculate_scroll(5, 5), 1);
+    }
+
+    #[test]
+    fn calculate_scroll_zero_cursor() {
+        assert_eq!(calculate_scroll(0, 10), 0);
+    }
+
+    #[test]
+    fn calculate_scroll_cursor_just_below_visible() {
+        assert_eq!(calculate_scroll(4, 5), 0);
+    }
+
+    #[test]
+    fn handle_browse_key_enter_returns_confirm() {
+        let subdirs = vec!["a".to_string(), "b".to_string()];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = String::new();
+        assert!(matches!(
+            handle_browse_key(
+                KeyCode::Enter,
+                &subdirs,
+                &mut cursor,
+                &mut current,
+                &mut filter
+            ),
+            BrowseAction::Confirm
+        ));
+    }
+
+    #[test]
+    fn handle_browse_key_esc_returns_cancel() {
+        let subdirs = vec![];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = String::new();
+        assert!(matches!(
+            handle_browse_key(
+                KeyCode::Esc,
+                &subdirs,
+                &mut cursor,
+                &mut current,
+                &mut filter
+            ),
+            BrowseAction::Cancel
+        ));
+    }
+
+    #[test]
+    fn handle_browse_key_up_decrements_cursor() {
+        let subdirs = vec!["a".to_string(), "b".to_string()];
+        let mut cursor = 1;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = String::new();
+        let _ = handle_browse_key(
+            KeyCode::Up,
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+        );
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn handle_browse_key_up_saturates_at_zero() {
+        let subdirs = vec!["a".to_string()];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = String::new();
+        let _ = handle_browse_key(
+            KeyCode::Up,
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+        );
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn handle_browse_key_down_increments_cursor() {
+        let subdirs = vec!["a".to_string(), "b".to_string()];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = String::new();
+        let _ = handle_browse_key(
+            KeyCode::Down,
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+        );
+        assert_eq!(cursor, 1);
+    }
+
+    #[test]
+    fn handle_browse_key_down_no_move_at_end() {
+        let subdirs = vec!["a".to_string()];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = String::new();
+        let _ = handle_browse_key(
+            KeyCode::Down,
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+        );
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn handle_browse_key_right_navigates_into_subdir() {
+        let subdirs = vec!["child".to_string()];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = String::new();
+        let _ = handle_browse_key(
+            KeyCode::Right,
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+        );
+        assert_eq!(current, PathBuf::from("/tmp/child"));
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn handle_browse_key_left_navigates_to_parent() {
+        let subdirs = vec![];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp/child");
+        let mut filter = String::new();
+        let _ = handle_browse_key(
+            KeyCode::Left,
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+        );
+        assert_eq!(current, PathBuf::from("/tmp"));
+    }
+
+    #[test]
+    fn handle_browse_key_char_appends_to_filter() {
+        let subdirs = vec![];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = String::new();
+        let _ = handle_browse_key(
+            KeyCode::Char('x'),
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+        );
+        assert_eq!(filter, "x");
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn handle_browse_key_backspace_removes_from_filter() {
+        let subdirs = vec![];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = "abc".to_string();
+        let _ = handle_browse_key(
+            KeyCode::Backspace,
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+        );
+        assert_eq!(filter, "ab");
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn handle_browse_key_right_with_filter_navigates_and_clears() {
+        let subdirs = vec!["child".to_string()];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = "ch".to_string();
+        let _ = handle_browse_key(
+            KeyCode::Right,
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+        );
+        assert_eq!(current, PathBuf::from("/tmp/child"));
+        assert!(filter.is_empty());
+    }
+
+    #[test]
+    fn handle_browse_key_l_navigates_like_right() {
+        let subdirs = vec!["child".to_string()];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = String::new();
+        let _ = handle_browse_key(
+            KeyCode::Char('l'),
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+        );
+        assert_eq!(current, PathBuf::from("/tmp/child"));
+    }
+
+    #[test]
+    fn handle_browse_key_h_navigates_like_left() {
+        let subdirs = vec![];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp/child");
+        let mut filter = String::new();
+        let _ = handle_browse_key(
+            KeyCode::Char('h'),
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+        );
+        assert_eq!(current, PathBuf::from("/tmp"));
+    }
+
+    #[test]
+    fn handle_multiselect_key_space_toggles_selection() {
+        let subdirs = vec!["a".to_string()];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = String::new();
+        let mut selected = std::collections::HashSet::new();
+        let _ = handle_multiselect_key(
+            KeyCode::Char(' '),
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+            &mut selected,
+        );
+        assert!(selected.contains("/tmp/a"));
+    }
+
+    #[test]
+    fn handle_multiselect_key_space_deselects() {
+        let subdirs = vec!["a".to_string()];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = String::new();
+        let mut selected: std::collections::HashSet<String> =
+            ["/tmp/a".to_string()].into_iter().collect();
+        let _ = handle_multiselect_key(
+            KeyCode::Char(' '),
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+            &mut selected,
+        );
+        assert!(!selected.contains("/tmp/a"));
+    }
+
+    #[test]
+    fn handle_multiselect_key_space_ignored_with_filter() {
+        let subdirs = vec!["a".to_string()];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = "x".to_string();
+        let mut selected = std::collections::HashSet::new();
+        let _ = handle_multiselect_key(
+            KeyCode::Char(' '),
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+            &mut selected,
+        );
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn handle_multiselect_key_enter_returns_confirm() {
+        let subdirs = vec![];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = String::new();
+        let mut selected = std::collections::HashSet::new();
+        assert!(matches!(
+            handle_multiselect_key(
+                KeyCode::Enter,
+                &subdirs,
+                &mut cursor,
+                &mut current,
+                &mut filter,
+                &mut selected,
+            ),
+            MultiSelectAction::Confirm
+        ));
+    }
+
+    #[test]
+    fn handle_multiselect_key_esc_returns_cancel() {
+        let subdirs = vec![];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = String::new();
+        let mut selected = std::collections::HashSet::new();
+        assert!(matches!(
+            handle_multiselect_key(
+                KeyCode::Esc,
+                &subdirs,
+                &mut cursor,
+                &mut current,
+                &mut filter,
+                &mut selected,
+            ),
+            MultiSelectAction::Cancel
+        ));
+    }
+
+    #[test]
+    fn handle_multiselect_key_char_appends_to_filter() {
+        let subdirs = vec![];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = String::new();
+        let mut selected = std::collections::HashSet::new();
+        let _ = handle_multiselect_key(
+            KeyCode::Char('a'),
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+            &mut selected,
+        );
+        assert_eq!(filter, "a");
+    }
+
+    #[test]
+    fn handle_multiselect_key_control_char_ignored() {
+        let subdirs = vec![];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = String::new();
+        let mut selected = std::collections::HashSet::new();
+        let _ = handle_multiselect_key(
+            KeyCode::Char('\x01'),
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+            &mut selected,
+        );
+        assert!(filter.is_empty());
+    }
+
+    #[test]
+    fn handle_multiselect_key_right_navigates_into_subdir() {
+        let subdirs = vec!["child".to_string()];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = String::new();
+        let mut selected = std::collections::HashSet::new();
+        let _ = handle_multiselect_key(
+            KeyCode::Right,
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+            &mut selected,
+        );
+        assert_eq!(current, PathBuf::from("/tmp/child"));
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn handle_multiselect_key_left_navigates_to_parent() {
+        let subdirs = vec![];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp/child");
+        let mut filter = String::new();
+        let mut selected = std::collections::HashSet::new();
+        let _ = handle_multiselect_key(
+            KeyCode::Left,
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+            &mut selected,
+        );
+        assert_eq!(current, PathBuf::from("/tmp"));
+    }
+
+    #[test]
+    fn handle_multiselect_key_down_increments_cursor() {
+        let subdirs = vec!["a".to_string(), "b".to_string()];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = String::new();
+        let mut selected = std::collections::HashSet::new();
+        let _ = handle_multiselect_key(
+            KeyCode::Down,
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+            &mut selected,
+        );
+        assert_eq!(cursor, 1);
+    }
+
+    #[test]
+    fn handle_multiselect_key_up_decrements_cursor() {
+        let subdirs = vec!["a".to_string(), "b".to_string()];
+        let mut cursor = 1;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = String::new();
+        let mut selected = std::collections::HashSet::new();
+        let _ = handle_multiselect_key(
+            KeyCode::Up,
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+            &mut selected,
+        );
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn filter_subdirs_empty_filter_returns_all() {
+        let subdirs = ["a".to_string(), "b".to_string(), "c".to_string()];
+        // We can't test filter_subdirs_from directly (calls list_subdirs which does I/O),
+        // but we test the filtering logic inline.
+        let filter = "";
+        let f = filter.to_lowercase();
+        let result: Vec<&String> = subdirs
+            .iter()
+            .filter(|name| f.is_empty() || name.to_lowercase().contains(&f))
+            .collect();
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn filter_subdirs_case_insensitive() {
+        let subdirs = ["Foo".to_string(), "bar".to_string(), "Baz".to_string()];
+        let filter = "foo";
+        let f = filter.to_lowercase();
+        let result: Vec<&String> = subdirs
+            .iter()
+            .filter(|name| name.to_lowercase().contains(&f))
+            .collect();
+        assert_eq!(result, vec![&"Foo".to_string()]);
+    }
+
+    #[test]
+    fn filter_subdirs_no_matches() {
+        let subdirs = ["a".to_string(), "b".to_string()];
+        let filter = "zzz";
+        let f = filter.to_lowercase();
+        let result: Vec<&String> = subdirs
+            .iter()
+            .filter(|name| name.to_lowercase().contains(&f))
+            .collect();
+        assert!(result.is_empty());
+    }
+
+    // ── Additional edge cases ────────────────────────────────────
+
+    #[test]
+    fn handle_browse_key_down_at_end_of_list() {
+        let subdirs = vec!["a".to_string(), "b".to_string()];
+        let mut cursor = 1; // at last item
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = String::new();
+        let _ = handle_browse_key(
+            KeyCode::Down,
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+        );
+        assert_eq!(cursor, 1); // no move
+    }
+
+    #[test]
+    fn handle_browse_key_right_no_subdirs() {
+        let subdirs: Vec<String> = vec![];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = String::new();
+        let _ = handle_browse_key(
+            KeyCode::Right,
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+        );
+        assert_eq!(current, PathBuf::from("/tmp")); // no change
+    }
+
+    #[test]
+    fn handle_browse_key_left_at_root() {
+        let subdirs: Vec<String> = vec![];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/");
+        let mut filter = String::new();
+        let _ = handle_browse_key(
+            KeyCode::Left,
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+        );
+        assert_eq!(current, PathBuf::from("/")); // parent is same
+    }
+
+    #[test]
+    fn handle_browse_key_char_multiple() {
+        let subdirs: Vec<String> = vec![];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = String::new();
+        let _ = handle_browse_key(
+            KeyCode::Char('a'),
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+        );
+        let _ = handle_browse_key(
+            KeyCode::Char('b'),
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+        );
+        assert_eq!(filter, "ab");
+    }
+
+    #[test]
+    fn handle_browse_key_backspace_empty_filter() {
+        let subdirs: Vec<String> = vec![];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = String::new();
+        let _ = handle_browse_key(
+            KeyCode::Backspace,
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+        );
+        assert!(filter.is_empty());
+    }
+
+    #[test]
+    fn handle_browse_key_l_with_filter() {
+        let subdirs = vec!["child".to_string()];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = "x".to_string();
+        let _ = handle_browse_key(
+            KeyCode::Char('l'),
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+        );
+        // 'l' is not handled when filter is non-empty
+        assert_eq!(current, PathBuf::from("/tmp"));
+        assert_eq!(filter, "xl");
+    }
+
+    #[test]
+    fn handle_browse_key_h_with_filter() {
+        let subdirs: Vec<String> = vec![];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp/child");
+        let mut filter = "x".to_string();
+        let _ = handle_browse_key(
+            KeyCode::Char('h'),
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+        );
+        // 'h' is not handled when filter is non-empty
+        assert_eq!(current, PathBuf::from("/tmp/child"));
+    }
+
+    #[test]
+    fn handle_multiselect_key_enter_on_empty() {
+        let subdirs: Vec<String> = vec![];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = String::new();
+        let mut selected = std::collections::HashSet::new();
+        let action = handle_multiselect_key(
+            KeyCode::Enter,
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+            &mut selected,
+        );
+        assert!(matches!(action, MultiSelectAction::Confirm));
+    }
+
+    #[test]
+    fn handle_multiselect_key_space_on_empty_list() {
+        let subdirs: Vec<String> = vec![];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = String::new();
+        let mut selected = std::collections::HashSet::new();
+        let _ = handle_multiselect_key(
+            KeyCode::Char(' '),
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+            &mut selected,
+        );
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn handle_multiselect_key_backspace_empty() {
+        let subdirs: Vec<String> = vec![];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = String::new();
+        let mut selected = std::collections::HashSet::new();
+        let _ = handle_multiselect_key(
+            KeyCode::Backspace,
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+            &mut selected,
+        );
+        assert!(filter.is_empty());
+    }
+
+    #[test]
+    fn handle_multiselect_key_char_long_filter() {
+        let subdirs: Vec<String> = vec![];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = "a".repeat(50);
+        let mut selected = std::collections::HashSet::new();
+        let _ = handle_multiselect_key(
+            KeyCode::Char('z'),
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+            &mut selected,
+        );
+        // Filter length is 50 (at limit), so new char is rejected
+        assert_eq!(filter.len(), 50);
+    }
+
+    #[test]
+    fn handle_multiselect_key_right_no_subdirs() {
+        let subdirs: Vec<String> = vec![];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = String::new();
+        let mut selected = std::collections::HashSet::new();
+        let _ = handle_multiselect_key(
+            KeyCode::Right,
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+            &mut selected,
+        );
+        assert_eq!(current, PathBuf::from("/tmp"));
+    }
+
+    #[test]
+    fn handle_multiselect_key_left_at_root() {
+        let subdirs: Vec<String> = vec![];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/");
+        let mut filter = String::new();
+        let mut selected = std::collections::HashSet::new();
+        let _ = handle_multiselect_key(
+            KeyCode::Left,
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+            &mut selected,
+        );
+        assert_eq!(current, PathBuf::from("/"));
+    }
+
+    #[test]
+    fn handle_multiselect_key_down_at_end() {
+        let subdirs = vec!["a".to_string()];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = String::new();
+        let mut selected = std::collections::HashSet::new();
+        let _ = handle_multiselect_key(
+            KeyCode::Down,
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+            &mut selected,
+        );
+        assert_eq!(cursor, 0); // at end, no move
+    }
+
+    #[test]
+    fn handle_multiselect_key_right_with_filter() {
+        let subdirs = vec!["child".to_string()];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = "ch".to_string();
+        let mut selected = std::collections::HashSet::new();
+        let _ = handle_multiselect_key(
+            KeyCode::Right,
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+            &mut selected,
+        );
+        assert_eq!(current, PathBuf::from("/tmp/child"));
+        assert!(filter.is_empty());
+    }
+
+    #[test]
+    fn calculate_scroll_zero_visible() {
+        assert_eq!(calculate_scroll(5, 0), 6);
+    }
+
+    #[test]
+    fn adjust_cursor_bounds_large_cursor() {
+        let mut cursor = 100;
+        adjust_cursor_bounds(&mut cursor, 3);
+        assert_eq!(cursor, 2);
+    }
+
+    #[test]
+    fn handle_browse_key_unknown_key() {
+        let subdirs: Vec<String> = vec![];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = String::new();
+        let action = handle_browse_key(
+            KeyCode::F(1),
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+        );
+        assert!(matches!(action, BrowseAction::Continue));
+    }
+
+    #[test]
+    fn handle_multiselect_key_unknown_key() {
+        let subdirs: Vec<String> = vec![];
+        let mut cursor = 0;
+        let mut current = PathBuf::from("/tmp");
+        let mut filter = String::new();
+        let mut selected = std::collections::HashSet::new();
+        let action = handle_multiselect_key(
+            KeyCode::F(1),
+            &subdirs,
+            &mut cursor,
+            &mut current,
+            &mut filter,
+            &mut selected,
+        );
+        assert!(matches!(action, MultiSelectAction::Continue));
+    }
+}

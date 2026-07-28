@@ -14,7 +14,9 @@ mod config;
 mod daemon;
 mod db;
 mod domain;
+mod dynamic_skills;
 mod executor;
+mod loop_engine;
 mod mcp_wizard_module;
 mod rag;
 mod scheduler;
@@ -25,15 +27,18 @@ mod sync_manager;
 mod system;
 mod tui;
 mod watchers;
-mod workflow_engine;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use daemon::bridge::run_bridge;
+use daemon::clean_cli::handle_clean_action;
 use daemon::cli::{handle_daemon_action, DaemonAction};
 use daemon::doctor::run_doctor;
+use daemon::loop_cli::{handle_loop_action, LoopAction};
+use daemon::prompts_cli::{handle_prompts_action, PromptsAction};
 use daemon::rag_cli::{handle_rag_action, RagAction};
 use daemon::server::{run_http_server, run_stdio_server};
+use daemon::spec_cli::{handle_spec_action, SpecAction};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -48,23 +53,68 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Start, stop, or manage the background daemon.
     Daemon {
         #[command(subcommand)]
         action: DaemonAction,
     },
+    /// Run a health check diagnosing common issues.
     Doctor,
+    /// Run the MCP server over stdio transport.
     Stdio,
+    /// First-run setup wizard to configure agents and directories.
     Setup {
         /// Use a local registry directory instead of fetching from GitHub.
         /// Useful for development and testing registry changes before publishing.
         #[arg(long = "local-registry", value_name = "PATH")]
         local_registry: Option<PathBuf>,
+        /// Overwrite local skill files that diverge from the sync source,
+        /// even if they were modified locally. Default: diverging files are
+        /// skipped with a WARN and left untouched.
+        #[arg(long = "force-skills")]
+        force_skills: bool,
     },
+    /// Interactive wizard to configure MCP in your AI client.
     Mcp,
     /// RAG indexing management.
     Rag {
         #[command(subcommand)]
         action: RagAction,
+    },
+    /// Inspect loop state (read-only).
+    Loop {
+        #[command(subcommand)]
+        action: LoopAction,
+    },
+    /// Manage standalone specs.
+    Spec {
+        #[command(subcommand)]
+        action: SpecAction,
+    },
+    /// Remove safely-removable stale data (soft cleanup, default mode).
+    Clean {
+        /// Preview what would be removed without deleting or modifying anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Override the configured retention window, in days.
+        #[arg(long = "older-than", value_name = "DAYS")]
+        older_than: Option<u64>,
+        /// Also delete orphaned projects (workdir missing) and their
+        /// dependent rows. Requires interactive confirmation, unless
+        /// `--yes` is set; `--dry-run` skips the prompt and deletes
+        /// nothing. Soft cleanup runs first either way.
+        #[arg(long)]
+        hard: bool,
+        /// Skip the interactive yes/no prompt that `--hard` would
+        /// otherwise require. Intended for scripting; a typo here can
+        /// delete a real cascade.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Discover file-backed prompt presets (~/.canopy/prompts/).
+    Prompts {
+        #[command(subcommand)]
+        action: PromptsAction,
     },
     /// Run a stdio sidecar proxy that injects canopy identity headers.
     Bridge {
@@ -78,10 +128,10 @@ enum Commands {
         #[arg(long)]
         workdir: Option<PathBuf>,
     },
+    /// Extract text content from a PDF file (internal use).
     #[command(hide = true)]
-    InternalPdfExtract {
-        path: PathBuf,
-    },
+    InternalPdfExtract { path: PathBuf },
+    /// Start the HTTP API server (used by the daemon).
     #[command(hide = true)]
     Serve,
 }
@@ -95,11 +145,14 @@ async fn main() -> Result<()> {
         Some(Commands::Doctor) => run_doctor().await,
         Some(Commands::Stdio) => run_stdio_server().await,
         Some(Commands::Serve) => run_http_server(cli.port).await,
-        Some(Commands::Setup { local_registry }) => {
+        Some(Commands::Setup {
+            local_registry,
+            force_skills,
+        }) => {
             if let Some(path) = local_registry {
                 setup_module::registry_fetch::set_local_registry(path);
             }
-            tokio::task::block_in_place(setup_module::run_setup)?;
+            tokio::task::block_in_place(|| setup_module::run_setup(force_skills))?;
             Ok(())
         }
         Some(Commands::Mcp) => {
@@ -107,6 +160,15 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(Commands::Rag { action }) => handle_rag_action(action).await,
+        Some(Commands::Loop { action }) => handle_loop_action(action).await,
+        Some(Commands::Spec { action }) => handle_spec_action(action).await,
+        Some(Commands::Clean {
+            dry_run,
+            older_than,
+            hard,
+            yes,
+        }) => handle_clean_action(dry_run, older_than, hard, yes).await,
+        Some(Commands::Prompts { action }) => handle_prompts_action(action).await,
         Some(Commands::Bridge {
             agent_id,
             port,
@@ -118,7 +180,7 @@ async fn main() -> Result<()> {
         None => {
             tokio::task::block_in_place(|| {
                 if setup_module::needs_setup() {
-                    setup_module::run_setup()?;
+                    setup_module::run_setup(false)?;
                 }
                 setup_module::maybe_refresh_registry();
                 let _ = autoupdate::check_and_update_if_needed();
@@ -146,4 +208,33 @@ pub(crate) fn ensure_data_dir() -> Result<std::path::PathBuf> {
     std::fs::create_dir_all(&data_dir)?;
     std::fs::create_dir_all(data_dir.join("logs"))?;
     Ok(data_dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn assert_all_subcommands_have_about(cmd: &clap::Command, prefix: &str) {
+        for sub in cmd.get_subcommands() {
+            let name = sub.get_name();
+            let full = if prefix.is_empty() {
+                name.to_string()
+            } else {
+                format!("{prefix} {name}")
+            };
+            assert!(
+                sub.get_about()
+                    .is_some_and(|a| !a.to_string().trim().is_empty()),
+                "Subcommand '{full}' has no doc comment (about is empty). Add a `///` doc comment."
+            );
+            assert_all_subcommands_have_about(sub, &full);
+        }
+    }
+
+    #[test]
+    fn all_subcommands_have_help_text() {
+        let cmd = <Cli as CommandFactory>::command();
+        assert_all_subcommands_have_about(&cmd, "");
+    }
 }

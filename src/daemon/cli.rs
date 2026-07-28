@@ -16,12 +16,19 @@ use crate::db::Database;
 
 #[derive(Subcommand)]
 pub(crate) enum DaemonAction {
+    /// Start the daemon in the background.
     Start,
+    /// Stop the running daemon.
     Stop,
+    /// Show daemon process status and agent counts.
     Status,
+    /// Restart the daemon (stop then start).
     Restart,
+    /// Print the last 50 lines of daemon logs.
     Logs,
+    /// Install the daemon as a system service.
     InstallService,
+    /// Remove the daemon system service.
     UninstallService,
 }
 

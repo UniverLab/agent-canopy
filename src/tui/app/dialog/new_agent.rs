@@ -6,6 +6,7 @@ use crate::domain::models::Cli;
 use crate::domain::models_db::{self, ModelCatalog, ModelEntry};
 
 use crate::tui::app::types::Focus;
+use crate::tui::ui::theme::Theme;
 
 /// Seed identity option for the agent creation dialog.
 #[derive(Clone, Debug)]
@@ -14,7 +15,7 @@ pub enum SeedOption {
     None,
     /// Bind to an existing seed identity.
     Seed { id: String, name: String },
-    /// Create a new seed via the Nursery workflow.
+    /// Create a new seed via the Nursery loop.
     PlantNewSeed,
 }
 
@@ -55,6 +56,10 @@ pub struct NewAgentDialog {
     pub working_dir: String,
     pub model: String,
     pub prompt: String,
+    /// Cursor position (char index) inside `prompt`.
+    pub prompt_cursor: usize,
+    /// First visible visual line of the multi-line prompt input.
+    pub prompt_scroll: usize,
     pub cron_expr: String,
     pub watch_path: String,
     pub watch_events: Vec<String>,
@@ -123,6 +128,8 @@ impl NewAgentDialog {
             working_dir: cwd.clone(),
             model: String::new(),
             prompt: String::new(),
+            prompt_cursor: 0,
+            prompt_scroll: 0,
             cron_expr: "0 9 * * *".to_string(),
             watch_path: cwd.clone(),
             watch_events: vec!["create".to_string(), "modify".to_string()],
@@ -183,25 +190,36 @@ impl NewAgentDialog {
             .map(|h| crate::domain::usage_stats::CliUsage::load(&h.join(".canopy")))
             .unwrap_or_default();
 
-        if let Some(home) = dirs::home_dir() {
-            let canopy_dir = home.join(".canopy");
-            let config = crate::domain::canopy_config::CanopyConfig::load(&canopy_dir);
-            if !config.clis.is_empty() {
-                let mut pairs = Vec::new();
-                for c in &config.clis {
-                    if let Ok(cli) = Cli::resolve(Some(&c.name)) {
-                        pairs.push((cli, Some(c.clone())));
-                    }
-                }
-                if !pairs.is_empty() {
-                    return Self::sort_clis_by_usage(pairs, &usage);
-                }
-            }
+        // Try configured CLIs first; fall back to auto-detected ones.
+        let pairs = Self::configured_cli_pairs().unwrap_or_else(|| {
+            Cli::detect_available()
+                .into_iter()
+                .map(|cli| (cli, None))
+                .collect()
+        });
+        Self::sort_clis_by_usage(pairs, &usage)
+    }
+
+    fn configured_cli_pairs() -> Option<Vec<(Cli, Option<crate::domain::cli_config::CliConfig>)>> {
+        let home = dirs::home_dir()?;
+        let config = crate::domain::canopy_config::CanopyConfig::load(&home.join(".canopy"));
+        if config.clis.is_empty() {
+            return None;
         }
-        let detected = Cli::detect_available();
-        let pairs: Vec<_> = detected.into_iter().map(|cli| (cli, None)).collect();
-        let (clis, configs) = Self::sort_clis_by_usage(pairs, &usage);
-        (clis, configs)
+        let pairs: Vec<_> = config
+            .clis
+            .iter()
+            .filter_map(|c| {
+                Cli::resolve(Some(&c.name))
+                    .ok()
+                    .map(|cli| (cli, Some(c.clone())))
+            })
+            .collect();
+        if pairs.is_empty() {
+            None
+        } else {
+            Some(pairs)
+        }
     }
 
     /// Sort CLI-config pairs by usage count descending (most-used first).
@@ -233,27 +251,34 @@ impl NewAgentDialog {
             .filter(|s| !s.trim().is_empty())
             .map(|s| s.to_string());
 
-        match self.task_mode {
-            NewTaskMode::Resume => {
-                // If the user picked a specific session via the canopy session picker,
-                // use interactive_args + session_resume_cmd + id.
-                if let Some((ref id, _)) = self.selected_session {
-                    if let Some(ref cmd) = config.session_resume_cmd {
-                        return Some(match inter {
-                            Some(ref i) => format!("{i} {cmd} {id}"),
-                            None => format!("{cmd} {id}"),
-                        });
-                    }
-                }
-                // Build: interactive_args + resume_args (each optional).
-                match (inter, config.resume_args.clone()) {
-                    (Some(i), Some(r)) => Some(format!("{i} {r}")),
-                    (Some(i), None) => Some(i),
-                    (None, Some(r)) => Some(r),
-                    (None, None) => None,
-                }
+        self.build_resume_args(config, inter)
+    }
+
+    fn build_resume_args(
+        &self,
+        config: &crate::domain::cli_config::CliConfig,
+        inter: Option<String>,
+    ) -> Option<String> {
+        if !matches!(self.task_mode, NewTaskMode::Resume) {
+            return inter;
+        }
+
+        // Session-specific resume: interactive_args + session_resume_cmd + id.
+        if let Some((ref id, _)) = self.selected_session {
+            if let Some(ref cmd) = config.session_resume_cmd {
+                return Some(match inter {
+                    Some(ref i) => format!("{i} {cmd} {id}"),
+                    None => format!("{cmd} {id}"),
+                });
             }
-            NewTaskMode::Interactive => inter,
+        }
+
+        // Generic resume: interactive_args + resume_args (each optional).
+        match (inter, config.resume_args.clone()) {
+            (Some(i), Some(r)) => Some(format!("{i} {r}")),
+            (Some(i), None) => Some(i),
+            (None, Some(r)) => Some(r),
+            (None, None) => None,
         }
     }
 
@@ -279,7 +304,12 @@ impl NewAgentDialog {
                 .cli_configs
                 .get(self.cli_index)
                 .and_then(|c| c.as_ref())
-                .map(|c| c.session_list_cmd.is_some())
+                .map(|c| {
+                    c.session_list_cmd
+                        .as_ref()
+                        .map(|cmd| !cmd.trim().is_empty())
+                        .unwrap_or(false)
+                })
                 .unwrap_or(false)
     }
 
@@ -295,6 +325,11 @@ impl NewAgentDialog {
         let Some(ref list_cmd) = config.session_list_cmd.clone() else {
             return;
         };
+        // Defense in depth: an empty/whitespace command must never spawn the
+        // CLI binary with zero args (it would block on a REPL prompt forever).
+        if list_cmd.trim().is_empty() {
+            return;
+        }
         let binary = config.binary.clone();
 
         let args: Vec<&str> = list_cmd.split_whitespace().collect();
@@ -347,9 +382,9 @@ impl NewAgentDialog {
             .and_then(|c| c.yolo_flag.clone())
     }
 
-    pub fn selected_accent_color(&self) -> Color {
+    pub fn selected_accent_color(&self, theme: &Theme) -> Color {
         if self.task_type == NewTaskType::Terminal {
-            return crate::tui::ui::ACCENT;
+            return theme.header_color;
         }
 
         self.cli_configs
@@ -689,16 +724,18 @@ fn collect_file_names(entries: &[std::fs::DirEntry], prefix: &str) -> Vec<String
 
 fn load_seed_options() -> Vec<SeedOption> {
     let mut options = vec![SeedOption::None];
-    if let Ok(seed_ids) = crate::domain::seeds::list_seeds() {
-        for seed_id in seed_ids {
-            if let Ok(identity) = crate::domain::seeds::load_seed(&seed_id) {
-                options.push(SeedOption::Seed {
-                    id: seed_id,
+    let seeds = crate::domain::seeds::list_seeds()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|id| {
+            crate::domain::seeds::load_seed(&id)
+                .ok()
+                .map(|identity| SeedOption::Seed {
+                    id,
                     name: identity.name,
-                });
-            }
-        }
-    }
+                })
+        });
+    options.extend(seeds);
     options.push(SeedOption::PlantNewSeed);
     options
 }
@@ -706,6 +743,7 @@ fn load_seed_options() -> Vec<SeedOption> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn test_new_session_selection_logic() {
@@ -765,7 +803,10 @@ mod tests {
         let mut dialog = NewAgentDialog::new(None);
         dialog.task_type = NewTaskType::Terminal;
 
-        assert_eq!(dialog.selected_accent_color(), crate::tui::ui::ACCENT);
+        assert_eq!(
+            dialog.selected_accent_color(&Theme::classic()),
+            Theme::classic().header_color
+        );
     }
 
     #[test]
@@ -877,6 +918,92 @@ mod tests {
         assert_eq!(result.len(), 2);
     }
 
+    fn cli_config_with_session_list(cmd: Option<&str>) -> crate::domain::cli_config::CliConfig {
+        crate::domain::cli_config::CliConfig {
+            name: "antigravity".into(),
+            binary: "agy".into(),
+            headless_mode: String::new(),
+            model_flag: None,
+            supports_working_dir: false,
+            working_dir_flag: None,
+            env_vars: std::collections::HashMap::new(),
+            interactive_args: None,
+            fallback_interactive_args: None,
+            resume_args: Some("--continue".into()),
+            session_list_cmd: cmd.map(|s| s.to_string()),
+            session_resume_cmd: Some("--conversation".into()),
+            session_id_set_flag: None,
+            session_list_format_args: None,
+            session_id_pattern: None,
+            models_list_cmd: None,
+            accent_color: None,
+            yolo_flag: None,
+            instruction_file: None,
+            prompt_via_stdin: false,
+            paste_submit_delay_ms: None,
+            paste_submit_key: None,
+            paste_submit_presses: 1,
+        }
+    }
+
+    #[test]
+    fn has_session_picker_false_for_empty_session_list_cmd() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.task_mode = NewTaskMode::Resume;
+        dialog.available_clis = vec![Cli::new("antigravity")];
+        dialog.cli_configs = vec![Some(cli_config_with_session_list(Some("")))];
+        dialog.cli_index = 0;
+
+        assert!(!dialog.has_session_picker());
+    }
+
+    #[test]
+    fn has_session_picker_false_for_whitespace_session_list_cmd() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.task_mode = NewTaskMode::Resume;
+        dialog.available_clis = vec![Cli::new("antigravity")];
+        dialog.cli_configs = vec![Some(cli_config_with_session_list(Some("   ")))];
+        dialog.cli_index = 0;
+
+        assert!(!dialog.has_session_picker());
+    }
+
+    #[test]
+    fn has_session_picker_true_for_real_session_list_cmd() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.task_mode = NewTaskMode::Resume;
+        dialog.available_clis = vec![Cli::new("antigravity")];
+        dialog.cli_configs = vec![Some(cli_config_with_session_list(Some("session list")))];
+        dialog.cli_index = 0;
+
+        assert!(dialog.has_session_picker());
+    }
+
+    #[test]
+    fn has_session_picker_false_for_none_session_list_cmd() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.task_mode = NewTaskMode::Resume;
+        dialog.available_clis = vec![Cli::new("antigravity")];
+        dialog.cli_configs = vec![Some(cli_config_with_session_list(None))];
+        dialog.cli_index = 0;
+
+        assert!(!dialog.has_session_picker());
+    }
+
+    #[test]
+    fn load_sessions_does_not_spawn_for_empty_session_list_cmd() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.task_mode = NewTaskMode::Resume;
+        dialog.available_clis = vec![Cli::new("antigravity")];
+        dialog.cli_configs = vec![Some(cli_config_with_session_list(Some("")))];
+        dialog.cli_index = 0;
+
+        // Must return immediately without attempting to spawn `agy` with no
+        // args (which would otherwise block on a REPL prompt).
+        dialog.load_sessions();
+        assert!(dialog.session_entries.is_empty());
+    }
+
     #[test]
     fn seed_option_display_order() {
         let options = load_seed_options();
@@ -888,5 +1015,916 @@ mod tests {
         for opt in options.iter().skip(1).take(options.len().saturating_sub(2)) {
             assert!(matches!(opt, SeedOption::Seed { .. }));
         }
+    }
+
+    // ── selected_cli ─────────────────────────────────────────────
+
+    #[test]
+    fn selected_cli_returns_correct_index() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.available_clis = vec![Cli::new("opencode"), Cli::new("claude")];
+        dialog.cli_index = 1;
+        assert_eq!(dialog.selected_cli().as_str(), "claude");
+    }
+
+    // ── selected_args ────────────────────────────────────────────
+
+    #[test]
+    fn selected_args_no_config_returns_none() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.cli_configs = vec![None];
+        dialog.cli_index = 0;
+        assert!(dialog.selected_args().is_none());
+    }
+
+    #[test]
+    fn selected_args_with_interactive_args() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.cli_configs = vec![Some(crate::domain::cli_config::CliConfig {
+            name: "test".into(),
+            binary: "test".into(),
+            headless_mode: String::new(),
+            model_flag: None,
+            supports_working_dir: false,
+            working_dir_flag: None,
+            env_vars: std::collections::HashMap::new(),
+            interactive_args: Some("--tui".to_string()),
+            fallback_interactive_args: None,
+            resume_args: None,
+            session_list_cmd: None,
+            session_resume_cmd: None,
+            session_id_set_flag: None,
+            session_list_format_args: None,
+            session_id_pattern: None,
+            models_list_cmd: None,
+            accent_color: None,
+            yolo_flag: None,
+            instruction_file: None,
+            prompt_via_stdin: false,
+            paste_submit_delay_ms: None,
+            paste_submit_key: None,
+            paste_submit_presses: 1,
+        })];
+        dialog.cli_index = 0;
+        dialog.task_mode = NewTaskMode::Interactive;
+        let args = dialog.selected_args();
+        assert_eq!(args.as_deref(), Some("--tui"));
+    }
+
+    // ── selected_fallback_args ───────────────────────────────────
+
+    #[test]
+    fn selected_fallback_args_none() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.cli_configs = vec![None];
+        dialog.cli_index = 0;
+        assert!(dialog.selected_fallback_args().is_none());
+    }
+
+    #[test]
+    fn selected_fallback_args_some() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.cli_configs = vec![Some(crate::domain::cli_config::CliConfig {
+            name: "test".into(),
+            binary: "test".into(),
+            headless_mode: String::new(),
+            model_flag: None,
+            supports_working_dir: false,
+            working_dir_flag: None,
+            env_vars: std::collections::HashMap::new(),
+            interactive_args: None,
+            fallback_interactive_args: Some("--fallback".to_string()),
+            resume_args: None,
+            session_list_cmd: None,
+            session_resume_cmd: None,
+            session_id_set_flag: None,
+            session_list_format_args: None,
+            session_id_pattern: None,
+            models_list_cmd: None,
+            accent_color: None,
+            yolo_flag: None,
+            instruction_file: None,
+            prompt_via_stdin: false,
+            paste_submit_delay_ms: None,
+            paste_submit_key: None,
+            paste_submit_presses: 1,
+        })];
+        dialog.cli_index = 0;
+        assert_eq!(
+            dialog.selected_fallback_args().as_deref(),
+            Some("--fallback")
+        );
+    }
+
+    // ── selected_yolo_flag ───────────────────────────────────────
+
+    #[test]
+    fn selected_yolo_flag_none() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.cli_configs = vec![None];
+        dialog.cli_index = 0;
+        assert!(dialog.selected_yolo_flag().is_none());
+    }
+
+    #[test]
+    fn selected_yolo_flag_some() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.cli_configs = vec![Some(crate::domain::cli_config::CliConfig {
+            name: "test".into(),
+            binary: "test".into(),
+            headless_mode: String::new(),
+            model_flag: None,
+            supports_working_dir: false,
+            working_dir_flag: None,
+            env_vars: std::collections::HashMap::new(),
+            interactive_args: None,
+            fallback_interactive_args: None,
+            resume_args: None,
+            session_list_cmd: None,
+            session_resume_cmd: None,
+            session_id_set_flag: None,
+            session_list_format_args: None,
+            session_id_pattern: None,
+            models_list_cmd: None,
+            accent_color: None,
+            yolo_flag: Some("--yolo".to_string()),
+            instruction_file: None,
+            prompt_via_stdin: false,
+            paste_submit_delay_ms: None,
+            paste_submit_key: None,
+            paste_submit_presses: 1,
+        })];
+        dialog.cli_index = 0;
+        assert_eq!(dialog.selected_yolo_flag().as_deref(), Some("--yolo"));
+    }
+
+    // ── is_edit_mode / resume_unconfigured ───────────────────────
+
+    #[test]
+    fn is_edit_mode_false_for_new() {
+        let dialog = NewAgentDialog::new(None);
+        assert!(!dialog.is_edit_mode());
+    }
+
+    #[test]
+    fn is_edit_mode_true_when_edit_id_set() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.edit_id = Some("existing-id".to_string());
+        assert!(dialog.is_edit_mode());
+    }
+
+    #[test]
+    fn resume_unconfigured_false_for_interactive_mode() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.task_mode = NewTaskMode::Interactive;
+        assert!(!dialog.resume_unconfigured());
+    }
+
+    #[test]
+    fn resume_unconfigured_true_for_resume_no_config() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.task_mode = NewTaskMode::Resume;
+        dialog.cli_configs = vec![None];
+        dialog.cli_index = 0;
+        assert!(dialog.resume_unconfigured());
+    }
+
+    #[test]
+    fn resume_unconfigured_false_for_resume_with_config() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.task_mode = NewTaskMode::Resume;
+        dialog.cli_configs = vec![Some(crate::domain::cli_config::CliConfig {
+            name: "test".into(),
+            binary: "test".into(),
+            headless_mode: String::new(),
+            model_flag: None,
+            supports_working_dir: false,
+            working_dir_flag: None,
+            env_vars: std::collections::HashMap::new(),
+            interactive_args: None,
+            fallback_interactive_args: None,
+            resume_args: Some("--continue".to_string()),
+            session_list_cmd: None,
+            session_resume_cmd: None,
+            session_id_set_flag: None,
+            session_list_format_args: None,
+            session_id_pattern: None,
+            models_list_cmd: None,
+            accent_color: None,
+            yolo_flag: None,
+            instruction_file: None,
+            prompt_via_stdin: false,
+            paste_submit_delay_ms: None,
+            paste_submit_key: None,
+            paste_submit_presses: 1,
+        })];
+        dialog.cli_index = 0;
+        assert!(!dialog.resume_unconfigured());
+    }
+
+    // ── set_cli_index ────────────────────────────────────────────
+
+    #[test]
+    fn set_cli_index_out_of_bounds_ignored() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.available_clis = vec![Cli::new("a"), Cli::new("b")];
+        let old = dialog.cli_index;
+        dialog.set_cli_index(99);
+        assert_eq!(dialog.cli_index, old);
+    }
+
+    #[test]
+    fn set_cli_index_resets_yolo_when_no_flag() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.available_clis = vec![Cli::new("a"), Cli::new("b")];
+        dialog.cli_configs = vec![None, None];
+        dialog.yolo_mode = true;
+        dialog.set_cli_index(1);
+        assert!(!dialog.yolo_mode);
+    }
+
+    // ── filtered_dir_entries ─────────────────────────────────────
+
+    #[test]
+    fn filtered_dir_entries_empty_filter() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.dir_entries = vec!["a".to_string(), "b".to_string()];
+        dialog.dir_filter.clear();
+        assert_eq!(dialog.filtered_dir_entries().len(), 2);
+    }
+
+    #[test]
+    fn filtered_dir_entries_with_filter() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.dir_entries = vec![
+            "apple".to_string(),
+            "banana".to_string(),
+            "avocado".to_string(),
+        ];
+        dialog.dir_filter = "ap".to_string();
+        let filtered = dialog.filtered_dir_entries();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0], "apple");
+    }
+
+    // ── navigate_to_selected ─────────────────────────────────────
+
+    #[test]
+    fn navigate_to_selected_out_of_bounds() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.dir_selected = 999;
+        let old_path = dialog.current_path.clone();
+        dialog.navigate_to_selected();
+        assert_eq!(dialog.current_path, old_path);
+    }
+
+    // ── go_up from root ──────────────────────────────────────────
+
+    #[test]
+    fn go_up_from_root_noop() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.current_path = "/".to_string();
+        dialog.go_up();
+        assert_eq!(dialog.current_path, "/");
+    }
+
+    // ── open/close cli picker ────────────────────────────────────
+
+    #[test]
+    fn open_close_cli_picker() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.open_cli_picker();
+        assert!(dialog.cli_picker_open);
+        dialog.close_cli_picker();
+        assert!(!dialog.cli_picker_open);
+    }
+
+    // ── move_cli_picker_next/prev ────────────────────────────────
+
+    #[test]
+    fn move_cli_picker_next_wraps() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.available_clis = vec![Cli::new("a"), Cli::new("b")];
+        dialog.cli_configs = vec![None, None];
+        dialog.open_cli_picker();
+        dialog.cli_picker_idx = 1;
+        dialog.move_cli_picker_next();
+        assert_eq!(dialog.cli_picker_idx, 0);
+    }
+
+    #[test]
+    fn move_cli_picker_prev_wraps() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.available_clis = vec![Cli::new("a"), Cli::new("b")];
+        dialog.cli_configs = vec![None, None];
+        dialog.open_cli_picker();
+        dialog.cli_picker_idx = 0;
+        dialog.move_cli_picker_prev();
+        assert_eq!(dialog.cli_picker_idx, 1);
+    }
+
+    #[test]
+    fn move_cli_picker_next_empty() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.available_clis.clear();
+        dialog.cli_configs.clear();
+        dialog.open_cli_picker();
+        dialog.move_cli_picker_next();
+        // Should not panic
+    }
+
+    // ── cli picker filter ────────────────────────────────────────
+
+    #[test]
+    fn push_pop_cli_picker_filter() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.available_clis = vec![Cli::new("opencode"), Cli::new("claude")];
+        dialog.cli_configs = vec![None, None];
+        dialog.open_cli_picker();
+        dialog.push_cli_picker_filter('o');
+        assert_eq!(dialog.cli_picker_filter, "o");
+        dialog.pop_cli_picker_filter();
+        assert!(dialog.cli_picker_filter.is_empty());
+    }
+
+    // ── session picker ───────────────────────────────────────────
+
+    #[test]
+    fn confirm_session_pick() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.session_entries = vec![
+            ("id1".to_string(), "Session 1".to_string()),
+            ("id2".to_string(), "Session 2".to_string()),
+        ];
+        dialog.session_picker_idx = 1;
+        dialog.confirm_session_pick();
+        assert_eq!(dialog.selected_session.as_ref().unwrap().0, "id2");
+        assert!(!dialog.session_picker_open);
+    }
+
+    #[test]
+    fn confirm_session_pick_out_of_bounds() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.session_entries = vec![("id1".to_string(), "Session 1".to_string())];
+        dialog.session_picker_idx = 99;
+        dialog.confirm_session_pick();
+        assert!(dialog.selected_session.is_none());
+    }
+
+    #[test]
+    fn clear_selected_session() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.selected_session = Some(("id1".to_string(), "Session 1".to_string()));
+        dialog.clear_selected_session();
+        assert!(dialog.selected_session.is_none());
+    }
+
+    // ── open_session_picker ──────────────────────────────────────
+
+    #[test]
+    fn open_session_picker_empty_entries_stays_closed() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.session_entries.clear();
+        dialog.cli_configs = vec![None];
+        dialog.cli_index = 0;
+        // open_session_picker calls load_sessions which checks config first.
+        // With no config, it stays closed.
+        dialog.open_session_picker();
+        assert!(!dialog.session_picker_open);
+    }
+
+    // ── build_resume_args ────────────────────────────────────────
+
+    #[test]
+    fn build_resume_args_interactive_mode() {
+        let dialog = NewAgentDialog::new(None);
+        let config = crate::domain::cli_config::CliConfig {
+            name: "test".into(),
+            binary: "test".into(),
+            headless_mode: String::new(),
+            model_flag: None,
+            supports_working_dir: false,
+            working_dir_flag: None,
+            env_vars: std::collections::HashMap::new(),
+            interactive_args: Some("--tui".to_string()),
+            fallback_interactive_args: None,
+            resume_args: Some("--resume".to_string()),
+            session_list_cmd: None,
+            session_resume_cmd: None,
+            session_id_set_flag: None,
+            session_list_format_args: None,
+            session_id_pattern: None,
+            models_list_cmd: None,
+            accent_color: None,
+            yolo_flag: None,
+            instruction_file: None,
+            prompt_via_stdin: false,
+            paste_submit_delay_ms: None,
+            paste_submit_key: None,
+            paste_submit_presses: 1,
+        };
+        let result = dialog.build_resume_args(&config, Some("--tui".to_string()));
+        assert_eq!(result.as_deref(), Some("--tui"));
+    }
+
+    #[test]
+    fn build_resume_args_resume_mode_generic() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.task_mode = NewTaskMode::Resume;
+        let config = crate::domain::cli_config::CliConfig {
+            name: "test".into(),
+            binary: "test".into(),
+            headless_mode: String::new(),
+            model_flag: None,
+            supports_working_dir: false,
+            working_dir_flag: None,
+            env_vars: std::collections::HashMap::new(),
+            interactive_args: Some("--tui".to_string()),
+            fallback_interactive_args: None,
+            resume_args: Some("--resume".to_string()),
+            session_list_cmd: None,
+            session_resume_cmd: None,
+            session_id_set_flag: None,
+            session_list_format_args: None,
+            session_id_pattern: None,
+            models_list_cmd: None,
+            accent_color: None,
+            yolo_flag: None,
+            instruction_file: None,
+            prompt_via_stdin: false,
+            paste_submit_delay_ms: None,
+            paste_submit_key: None,
+            paste_submit_presses: 1,
+        };
+        let result = dialog.build_resume_args(&config, Some("--tui".to_string()));
+        assert_eq!(result.as_deref(), Some("--tui --resume"));
+    }
+
+    #[test]
+    fn build_resume_args_resume_mode_interactive_only() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.task_mode = NewTaskMode::Resume;
+        let config = crate::domain::cli_config::CliConfig {
+            name: "test".into(),
+            binary: "test".into(),
+            headless_mode: String::new(),
+            model_flag: None,
+            supports_working_dir: false,
+            working_dir_flag: None,
+            env_vars: std::collections::HashMap::new(),
+            interactive_args: Some("--tui".to_string()),
+            fallback_interactive_args: None,
+            resume_args: None,
+            session_list_cmd: None,
+            session_resume_cmd: None,
+            session_id_set_flag: None,
+            session_list_format_args: None,
+            session_id_pattern: None,
+            models_list_cmd: None,
+            accent_color: None,
+            yolo_flag: None,
+            instruction_file: None,
+            prompt_via_stdin: false,
+            paste_submit_delay_ms: None,
+            paste_submit_key: None,
+            paste_submit_presses: 1,
+        };
+        let result = dialog.build_resume_args(&config, Some("--tui".to_string()));
+        assert_eq!(result.as_deref(), Some("--tui"));
+    }
+
+    #[test]
+    fn build_resume_args_resume_mode_resume_only() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.task_mode = NewTaskMode::Resume;
+        let config = crate::domain::cli_config::CliConfig {
+            name: "test".into(),
+            binary: "test".into(),
+            headless_mode: String::new(),
+            model_flag: None,
+            supports_working_dir: false,
+            working_dir_flag: None,
+            env_vars: std::collections::HashMap::new(),
+            interactive_args: None,
+            fallback_interactive_args: None,
+            resume_args: Some("--resume".to_string()),
+            session_list_cmd: None,
+            session_resume_cmd: None,
+            session_id_set_flag: None,
+            session_list_format_args: None,
+            session_id_pattern: None,
+            models_list_cmd: None,
+            accent_color: None,
+            yolo_flag: None,
+            instruction_file: None,
+            prompt_via_stdin: false,
+            paste_submit_delay_ms: None,
+            paste_submit_key: None,
+            paste_submit_presses: 1,
+        };
+        let result = dialog.build_resume_args(&config, None);
+        assert_eq!(result.as_deref(), Some("--resume"));
+    }
+
+    #[test]
+    fn build_resume_args_resume_mode_neither() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.task_mode = NewTaskMode::Resume;
+        let config = crate::domain::cli_config::CliConfig {
+            name: "test".into(),
+            binary: "test".into(),
+            headless_mode: String::new(),
+            model_flag: None,
+            supports_working_dir: false,
+            working_dir_flag: None,
+            env_vars: std::collections::HashMap::new(),
+            interactive_args: None,
+            fallback_interactive_args: None,
+            resume_args: None,
+            session_list_cmd: None,
+            session_resume_cmd: None,
+            session_id_set_flag: None,
+            session_list_format_args: None,
+            session_id_pattern: None,
+            models_list_cmd: None,
+            accent_color: None,
+            yolo_flag: None,
+            instruction_file: None,
+            prompt_via_stdin: false,
+            paste_submit_delay_ms: None,
+            paste_submit_key: None,
+            paste_submit_presses: 1,
+        };
+        let result = dialog.build_resume_args(&config, None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn build_resume_args_session_specific() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.task_mode = NewTaskMode::Resume;
+        dialog.selected_session = Some(("ses_abc123".to_string(), "My Session".to_string()));
+        let config = crate::domain::cli_config::CliConfig {
+            name: "test".into(),
+            binary: "test".into(),
+            headless_mode: String::new(),
+            model_flag: None,
+            supports_working_dir: false,
+            working_dir_flag: None,
+            env_vars: std::collections::HashMap::new(),
+            interactive_args: Some("--tui".to_string()),
+            fallback_interactive_args: None,
+            resume_args: None,
+            session_list_cmd: None,
+            session_resume_cmd: Some("--conversation".to_string()),
+            session_id_set_flag: None,
+            session_list_format_args: None,
+            session_id_pattern: None,
+            models_list_cmd: None,
+            accent_color: None,
+            yolo_flag: None,
+            instruction_file: None,
+            prompt_via_stdin: false,
+            paste_submit_delay_ms: None,
+            paste_submit_key: None,
+            paste_submit_presses: 1,
+        };
+        let result = dialog.build_resume_args(&config, Some("--tui".to_string()));
+        assert_eq!(result.as_deref(), Some("--tui --conversation ses_abc123"));
+    }
+
+    // ── update_dir_preview ───────────────────────────────────────
+
+    #[test]
+    fn update_dir_preview_out_of_bounds_uses_current_path() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.current_path = "/tmp/test".to_string();
+        dialog.dir_selected = 999;
+        dialog.update_dir_preview();
+        assert_eq!(dialog.working_dir, "/tmp/test");
+    }
+
+    // ── selected_accent_color ────────────────────────────────────
+
+    #[test]
+    fn selected_accent_color_terminal_uses_theme() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.task_type = NewTaskType::Terminal;
+        let theme = Theme::classic();
+        assert_eq!(dialog.selected_accent_color(&theme), theme.header_color);
+    }
+
+    #[test]
+    fn selected_accent_color_no_config_uses_default() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.task_type = NewTaskType::Interactive;
+        dialog.cli_configs = vec![None];
+        dialog.cli_index = 0;
+        let theme = Theme::classic();
+        assert_eq!(
+            dialog.selected_accent_color(&theme),
+            Color::Rgb(102, 187, 106)
+        );
+    }
+
+    #[test]
+    fn selected_accent_color_with_config() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.task_type = NewTaskType::Interactive;
+        dialog.cli_configs = vec![Some(crate::domain::cli_config::CliConfig {
+            name: "test".into(),
+            binary: "test".into(),
+            headless_mode: String::new(),
+            model_flag: None,
+            supports_working_dir: false,
+            working_dir_flag: None,
+            env_vars: std::collections::HashMap::new(),
+            interactive_args: None,
+            fallback_interactive_args: None,
+            resume_args: None,
+            session_list_cmd: None,
+            session_resume_cmd: None,
+            session_id_set_flag: None,
+            session_list_format_args: None,
+            session_id_pattern: None,
+            models_list_cmd: None,
+            accent_color: Some([255, 0, 0]),
+            yolo_flag: None,
+            instruction_file: None,
+            prompt_via_stdin: false,
+            paste_submit_delay_ms: None,
+            paste_submit_key: None,
+            paste_submit_presses: 1,
+        })];
+        dialog.cli_index = 0;
+        let theme = Theme::classic();
+        assert_eq!(dialog.selected_accent_color(&theme), Color::Rgb(255, 0, 0));
+    }
+
+    // ── build_resume_args with session + no resume_cmd ──────────
+
+    #[test]
+    fn build_resume_args_resume_mode_session_no_resume_cmd() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.task_mode = NewTaskMode::Resume;
+        dialog.selected_session = Some(("ses_abc123".to_string(), "My Session".to_string()));
+        let config = crate::domain::cli_config::CliConfig {
+            name: "test".into(),
+            binary: "test".into(),
+            headless_mode: String::new(),
+            model_flag: None,
+            supports_working_dir: false,
+            working_dir_flag: None,
+            env_vars: std::collections::HashMap::new(),
+            interactive_args: Some("--tui".to_string()),
+            fallback_interactive_args: None,
+            resume_args: None,
+            session_list_cmd: None,
+            session_resume_cmd: None, // No resume cmd
+            session_id_set_flag: None,
+            session_list_format_args: None,
+            session_id_pattern: None,
+            models_list_cmd: None,
+            accent_color: None,
+            yolo_flag: None,
+            instruction_file: None,
+            prompt_via_stdin: false,
+            paste_submit_delay_ms: None,
+            paste_submit_key: None,
+            paste_submit_presses: 1,
+        };
+        // With session but no resume_cmd, falls back to generic resume
+        let result = dialog.build_resume_args(&config, Some("--tui".to_string()));
+        assert_eq!(result.as_deref(), Some("--tui"));
+    }
+
+    // ── move_cli_picker_prev empty ──────────────────────────────
+
+    #[test]
+    fn move_cli_picker_prev_empty() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.available_clis.clear();
+        dialog.cli_configs.clear();
+        dialog.open_cli_picker();
+        dialog.move_cli_picker_prev();
+        // Should not panic
+    }
+
+    // ── apply_cli_picker_filter ─────────────────────────────────
+
+    #[test]
+    fn apply_cli_picker_filter_no_match_resets_to_first() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.available_clis = vec![Cli::new("opencode"), Cli::new("claude")];
+        dialog.cli_configs = vec![None, None];
+        dialog.cli_index = 1;
+        dialog.cli_picker_filter = "zzz".to_string();
+        dialog.apply_cli_picker_filter();
+        // No match → filtered is empty → idx stays 0 (but cli_index unchanged)
+        assert_eq!(dialog.cli_picker_idx, 0);
+    }
+
+    #[test]
+    fn apply_cli_picker_filter_match_keeps_current_if_present() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.available_clis = vec![Cli::new("opencode"), Cli::new("claude")];
+        dialog.cli_configs = vec![None, None];
+        dialog.cli_index = 1;
+        dialog.cli_picker_filter = "cl".to_string();
+        dialog.apply_cli_picker_filter();
+        // "claude" matches "cl" and was already selected → stays at position 0 in filtered list
+        assert_eq!(dialog.cli_picker_idx, 0);
+        assert_eq!(dialog.cli_index, 1);
+    }
+
+    // ── filtered_cli_indices with query ──────────────────────────
+
+    #[test]
+    fn filtered_cli_indices_case_insensitive() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.available_clis = vec![Cli::new("OpenCode"), Cli::new("CLAUDE")];
+        dialog.cli_configs = vec![None, None];
+        dialog.cli_picker_filter = "open".to_string();
+        let filtered = dialog.filtered_cli_indices();
+        assert_eq!(filtered, vec![0]);
+    }
+
+    #[test]
+    fn filtered_cli_indices_empty_filter_returns_all() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.available_clis = vec![Cli::new("a"), Cli::new("b"), Cli::new("c")];
+        dialog.cli_configs = vec![None, None, None];
+        dialog.cli_picker_filter.clear();
+        let filtered = dialog.filtered_cli_indices();
+        assert_eq!(filtered, vec![0, 1, 2]);
+    }
+
+    // ── update_dir_preview with valid selection ──────────────────
+
+    #[test]
+    fn update_dir_preview_valid_selection() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.current_path = "/tmp".to_string();
+        dialog.dir_entries = vec!["📁 sub".to_string(), "  file.txt".to_string()];
+        dialog.dir_selected = 0;
+        dialog.update_dir_preview();
+        assert_eq!(dialog.working_dir, "/tmp/sub");
+    }
+
+    // ── navigate_to_selected into directory ──────────────────────
+
+    #[test]
+    fn navigate_to_selected_into_existing_dir() {
+        let tmp = tempdir().unwrap();
+        let subdir = tmp.path().join("child");
+        std::fs::create_dir(&subdir).unwrap();
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.current_path = tmp.path().to_string_lossy().to_string();
+        dialog.refresh_dir_entries();
+        if let Some(idx) = dialog.dir_entries.iter().position(|e| e.contains("child")) {
+            dialog.dir_selected = idx;
+            dialog.navigate_to_selected();
+            assert!(dialog.current_path.contains("child"));
+        }
+    }
+
+    // ── go_up from nested dir ───────────────────────────────────
+
+    #[test]
+    fn go_up_from_nested_dir() {
+        let tmp = tempdir().unwrap();
+        let nested = tmp.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.current_path = nested.to_string_lossy().to_string();
+        dialog.go_up();
+        assert!(dialog.current_path.ends_with("a"));
+    }
+
+    // ── confirm_session_pick with no entries ─────────────────────
+
+    #[test]
+    fn confirm_session_pick_no_entries() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.session_entries.clear();
+        dialog.session_picker_idx = 0;
+        dialog.confirm_session_pick();
+        assert!(dialog.selected_session.is_none());
+        assert!(!dialog.session_picker_open);
+    }
+
+    // ── clear_selected_session when none ─────────────────────────
+
+    #[test]
+    fn clear_selected_session_when_none() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.selected_session = None;
+        dialog.clear_selected_session();
+        assert!(dialog.selected_session.is_none());
+    }
+
+    // ── open_session_picker with entries ─────────────────────────
+
+    #[test]
+    fn open_session_picker_with_entries_opens() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.session_entries = vec![
+            ("id1".to_string(), "Session 1".to_string()),
+            ("id2".to_string(), "Session 2".to_string()),
+        ];
+        dialog.open_session_picker();
+        assert!(dialog.session_picker_open);
+    }
+
+    // ── cli_picker sync ─────────────────────────────────────────
+
+    #[test]
+    fn sync_cli_picker_to_current_matches() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.available_clis = vec![Cli::new("a"), Cli::new("b"), Cli::new("c")];
+        dialog.cli_configs = vec![None, None, None];
+        dialog.cli_index = 2;
+        dialog.sync_cli_picker_to_current();
+        assert_eq!(dialog.cli_picker_idx, 2);
+    }
+
+    #[test]
+    fn sync_cli_picker_to_current_no_match() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.available_clis = vec![Cli::new("a"), Cli::new("b")];
+        dialog.cli_configs = vec![None, None];
+        dialog.cli_index = 99; // Not in list
+        dialog.sync_cli_picker_to_current();
+        assert_eq!(dialog.cli_picker_idx, 0);
+    }
+
+    // ── set_cli_index valid index ───────────────────────────────
+
+    #[test]
+    fn set_cli_index_valid_index() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.available_clis = vec![Cli::new("a"), Cli::new("b")];
+        dialog.cli_configs = vec![None, None];
+        dialog.set_cli_index(1);
+        assert_eq!(dialog.cli_index, 1);
+    }
+
+    // ── detect_available_shells ──────────────────────────────────
+
+    #[test]
+    fn detect_available_shells_returns_at_least_bash() {
+        let shells = detect_available_shells();
+        assert!(!shells.is_empty());
+        // bash should be present (it's a fallback)
+        assert!(shells.iter().any(|s| s == "bash"));
+    }
+
+    // ── load_seed_options: count >= 2 ───────────────────────────
+
+    #[test]
+    fn load_seed_options_at_least_two() {
+        let options = load_seed_options();
+        assert!(options.len() >= 2);
+    }
+
+    // ── SeedOption Clone and Debug ──────────────────────────────
+
+    #[test]
+    fn seed_option_clone() {
+        let opt = SeedOption::Seed {
+            id: "id".to_string(),
+            name: "name".to_string(),
+        };
+        let other = opt.clone();
+        match other {
+            SeedOption::Seed { id, name } => {
+                assert_eq!(id, "id");
+                assert_eq!(name, "name");
+            }
+            _ => panic!("expected Seed variant"),
+        }
+        // Verify original still usable
+        assert!(matches!(opt, SeedOption::Seed { .. }));
+    }
+
+    // ── NewTaskType / BackgroundTrigger / NewTaskMode ────────────
+
+    #[test]
+    fn new_task_type_eq() {
+        assert!(NewTaskType::Interactive == NewTaskType::Interactive);
+        assert!(NewTaskType::Interactive != NewTaskType::Terminal);
+        assert!(NewTaskType::Background != NewTaskType::Interactive);
+    }
+
+    #[test]
+    fn background_trigger_eq() {
+        assert!(BackgroundTrigger::Cron == BackgroundTrigger::Cron);
+        assert!(BackgroundTrigger::Cron != BackgroundTrigger::Watch);
+    }
+
+    #[test]
+    fn new_task_mode_eq() {
+        assert!(NewTaskMode::Interactive == NewTaskMode::Interactive);
+        assert!(NewTaskMode::Interactive != NewTaskMode::Resume);
     }
 }

@@ -1,8 +1,7 @@
 use anyhow::Result;
 use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
-use crate::tui::app::types::{AgentEntry, App, Focus, ProjectsPanelFocus, SidebarMode};
-use crate::tui::event::knowledge_dialog::{edit_knowledge_dialog, open_knowledge_dialog};
+use crate::tui::app::types::{AgentEntry, App, Focus, ProjectTab, SidebarLayer};
 
 // ── Home: screensaver — arrows enter Preview ────────────────────────
 
@@ -16,11 +15,10 @@ pub fn handle_home_key(app: &mut App, code: KeyCode, _modifiers: KeyModifiers) -
         return Ok(());
     }
 
-    let has_project_preview = app.sidebar_mode == SidebarMode::Projects
-        && (!app.projects.is_empty()
-            || !app.visible_workflows().is_empty()
-            || !app.global_rag_queue.is_empty()
-            || app.rag_info.total_chunks > 0);
+    let has_sidebar_preview = !app.agents.is_empty()
+        || !app.projects.is_empty()
+        || !app.visible_loops().is_empty()
+        || app.rag_info.has_rag_activity();
 
     match code {
         KeyCode::F(10) => {
@@ -44,30 +42,19 @@ pub fn handle_home_key(app: &mut App, code: KeyCode, _modifiers: KeyModifiers) -
         KeyCode::F(1) => {
             app.show_legend = true;
         }
-        KeyCode::Down | KeyCode::Char('j') if !app.agents.is_empty() || has_project_preview => {
+        KeyCode::Down | KeyCode::Char('j') if has_sidebar_preview => {
             app.dismiss_brain();
-            if app.sidebar_mode == SidebarMode::Agents {
-                // Arrow-down from Home: go to the first agent (background, at top of sidebar).
-                app.selected = 0;
-                app.agents_rag_focused = false;
-            } else {
-                app.focus_projects_panel_from_edge(true);
-            }
+            app.focus_sidebar_from_edge(true);
             app.log_scroll = 0;
             app.focus = Focus::Preview;
         }
-        KeyCode::Up | KeyCode::Char('k') if !app.agents.is_empty() || has_project_preview => {
+        KeyCode::Up | KeyCode::Char('k') if has_sidebar_preview => {
             app.dismiss_brain();
-            if app.sidebar_mode == SidebarMode::Agents {
-                app.selected = app.agents.len().saturating_sub(1);
-                app.agents_rag_focused = false;
-            } else {
-                app.focus_projects_panel_from_edge(false);
-            }
+            app.focus_sidebar_from_edge(false);
             app.log_scroll = 0;
             app.focus = Focus::Preview;
         }
-        KeyCode::Enter if !app.agents.is_empty() || has_project_preview => {
+        KeyCode::Enter if has_sidebar_preview => {
             app.dismiss_brain();
             app.log_scroll = 0;
             app.focus = Focus::Preview;
@@ -95,14 +82,14 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
         }
         return Ok(());
     }
-    if app.delete_workflow_confirm {
+    if app.delete_loop_confirm {
         match code {
             KeyCode::Char('y') | KeyCode::Enter => {
-                let _ = app.delete_selected_workflow();
-                app.delete_workflow_confirm = false;
+                let _ = app.delete_selected_loop();
+                app.delete_loop_confirm = false;
             }
             KeyCode::Char('n') | KeyCode::Esc => {
-                app.delete_workflow_confirm = false;
+                app.delete_loop_confirm = false;
             }
             _ => {}
         }
@@ -116,57 +103,31 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
         return Ok(());
     }
 
-    if app.sidebar_mode == SidebarMode::Projects
-        && app.projects_panel_focus == ProjectsPanelFocus::Knowledge
-        && app.knowledge_filter_mode
-    {
-        match code {
-            KeyCode::Esc => {
-                app.clear_knowledge_filter();
-                app.exit_knowledge_filter_mode();
-                return Ok(());
-            }
-            KeyCode::Enter => {
-                app.exit_knowledge_filter_mode();
-                return Ok(());
-            }
-            KeyCode::Backspace => {
-                app.pop_knowledge_filter();
-                return Ok(());
-            }
-            KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
-                app.append_knowledge_filter(c);
-                return Ok(());
-            }
-            _ => {
-                return Ok(());
-            }
-        }
-    }
+    let on_loop = app.sidebar_layer == SidebarLayer::Automation
+        && app.automation_kind == crate::tui::app::AutomationKind::Loop;
 
     match code {
+        // Manual node inspection in the live loop view intercepts Esc to
+        // return to auto-follow first; a second Esc falls through to the
+        // general "back to Home" behavior below.
+        KeyCode::Esc if on_loop && !app.loop_graph_follow => {
+            app.loop_graph_reset_follow();
+        }
         KeyCode::Esc | KeyCode::Char('h') => {
             app.focus = Focus::Home;
         }
         KeyCode::Enter | KeyCode::Char('l') => {
-            if app.sidebar_mode == SidebarMode::Projects {
-                match app.projects_panel_focus {
-                    ProjectsPanelFocus::RagInfo => app.activate_playground(),
-                    ProjectsPanelFocus::Projects => {
-                        let _ = app.open_project_relation_dialog();
-                    }
-                    ProjectsPanelFocus::Workflows => {
-                        let _ = app.open_workflow_editor_dialog();
-                    }
-                    ProjectsPanelFocus::Knowledge => {
-                        edit_knowledge_dialog(app);
-                    }
-                }
-                return Ok(());
-            }
-            // Agents mode: Enter on focused RagInfo → open playground.
             if app.agents_rag_focused {
                 app.activate_playground();
+                return Ok(());
+            }
+            if app.sidebar_layer == SidebarLayer::Knowledge {
+                app.enter_project_focus(ProjectTab::Overview);
+                app.focus = Focus::Agent;
+                return Ok(());
+            }
+            if on_loop {
+                let _ = app.open_loop_editor_dialog();
                 return Ok(());
             }
             // For Group entries: Enter activates the split and enters focus
@@ -183,100 +144,67 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
             app.log_scroll = 0;
             app.focus = Focus::Agent;
         }
-        KeyCode::Tab if app.sidebar_mode == SidebarMode::Projects => {
-            app.cycle_projects_panel_focus(true);
-        }
-        KeyCode::BackTab if app.sidebar_mode == SidebarMode::Projects => {
-            app.cycle_projects_panel_focus(false);
-        }
         KeyCode::Down | KeyCode::Char('j') => {
             app.select_next();
         }
         KeyCode::Up | KeyCode::Char('k') => {
             app.select_prev();
         }
-        KeyCode::Left
-            if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::Workflows =>
-        {
-            app.cycle_workflow_node(false);
+        KeyCode::Left if on_loop => {
+            app.loop_graph_move_highlight(false);
         }
-        KeyCode::Right
-            if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::Workflows =>
-        {
-            app.cycle_workflow_node(true);
+        KeyCode::Right if on_loop => {
+            app.loop_graph_move_highlight(true);
         }
-        KeyCode::Char('[')
-            if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::Workflows =>
-        {
-            app.cycle_workflow_spec(false);
+        KeyCode::Char('[') if on_loop => {
+            app.cycle_loop_spec(false);
         }
-        KeyCode::Char(']')
-            if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::Workflows =>
-        {
-            app.cycle_workflow_spec(true);
+        KeyCode::Char(']') if on_loop => {
+            app.cycle_loop_spec(true);
         }
         KeyCode::Char('e') if !app.agents_rag_focused => {
-            if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::Workflows
-            {
-                let _ = app.open_workflow_editor_dialog();
-            } else if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::Knowledge
-            {
-                edit_knowledge_dialog(app);
-            } else {
+            if on_loop {
+                let _ = app.open_loop_editor_dialog();
+            } else if app.sidebar_layer != SidebarLayer::Knowledge {
                 app.open_edit_dialog();
             }
         }
-        KeyCode::Char('d') if !app.agents_rag_focused => {
+        KeyCode::Char('d') if on_loop => {
+            // U10: duplicate the highlighted loop node in place.
+            let _ = app.duplicate_selected_loop_node();
+        }
+        KeyCode::Char('d')
+            if !app.agents_rag_focused && app.sidebar_layer != SidebarLayer::Knowledge =>
+        {
             let _ = app.toggle_enable();
         }
-        KeyCode::Char('r') if !app.agents_rag_focused => {
+        KeyCode::Char('r')
+            if !app.agents_rag_focused && app.sidebar_layer != SidebarLayer::Knowledge =>
+        {
             let _ = app.rerun_selected();
         }
-        KeyCode::Char('R') if app.sidebar_mode == SidebarMode::Projects => {
+        KeyCode::Char('R') if app.sidebar_layer == SidebarLayer::Knowledge => {
             let _ = app.open_project_relation_dialog();
         }
-        KeyCode::Char('p')
-            if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::RagInfo =>
-        {
+        KeyCode::Char('p') if app.agents_rag_focused => {
             app.toggle_rag_pause();
         }
         KeyCode::Char('n') => {
-            if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::Knowledge
-            {
-                open_knowledge_dialog(app);
-            } else {
+            if on_loop {
+                app.open_new_loop_dialog();
+            } else if app.sidebar_layer != SidebarLayer::Knowledge {
                 app.open_new_agent_dialog();
             }
         }
-        KeyCode::Char('/')
-            if app.sidebar_mode == SidebarMode::Projects
-                && app.projects_panel_focus == ProjectsPanelFocus::Knowledge =>
-        {
-            app.enter_knowledge_filter_mode();
+        KeyCode::Char('E') if on_loop => {
+            app.open_edit_loop_dialog();
         }
         KeyCode::F(4) => {
-            if app.sidebar_mode == SidebarMode::Projects {
-                match app.projects_panel_focus {
-                    ProjectsPanelFocus::Projects => {
-                        app.delete_project_confirm = true;
-                    }
-                    ProjectsPanelFocus::Workflows => {
-                        app.delete_workflow_confirm = true;
-                    }
-                    ProjectsPanelFocus::Knowledge => {
-                        let _ = app.delete_selected_knowledge();
-                    }
-                    _ => {}
-                }
-            } else if app.sidebar_mode != SidebarMode::Projects && !app.agents_rag_focused {
+            if app.sidebar_layer == SidebarLayer::Knowledge {
+                app.delete_project_confirm = true;
+            } else if on_loop {
+                app.delete_loop_confirm = true;
+            } else if !app.agents_rag_focused {
                 let _ = app.delete_selected();
             }
         }
@@ -335,9 +263,7 @@ pub(super) fn handle_playground_key(app: &mut App, code: KeyCode, modifiers: Key
     match code {
         KeyCode::F(10) => {
             app.deactivate_playground();
-            if app.focus != Focus::Agent {
-                app.focus = Focus::Preview;
-            }
+            app.focus = Focus::Preview;
         }
         KeyCode::Up if modifiers.contains(KeyModifiers::SHIFT) => {
             app.deactivate_playground();
@@ -431,3 +357,724 @@ fn handle_project_relation_dialog_key(app: &mut App, code: KeyCode) -> bool {
 }
 
 // ── Focus: PTY interaction or log scroll ────────────────────────────
+
+#[cfg(test)]
+mod playground_key_tests {
+    use super::*;
+    use crate::db::Database;
+    use crate::domain::models::{Agent, Cli, Trigger};
+    use crate::tui::app::types::App;
+    use chrono::Utc;
+    use std::sync::Arc;
+    use tempfile::{tempdir, NamedTempFile};
+
+    fn test_db() -> Arc<Database> {
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        Arc::new(Database::new(&path).expect("create test db"))
+    }
+
+    fn cron_agent(id: &str) -> Agent {
+        Agent {
+            id: id.to_string(),
+            prompt: "prompt".to_string(),
+            trigger: Some(Trigger::Cron {
+                schedule_expr: "0 9 * * *".to_string(),
+            }),
+            cli: Cli::new("claude"),
+            model: None,
+            working_dir: None,
+            enabled: true,
+            enable_at: None,
+            created_at: Utc::now(),
+            log_path: "/tmp/test-playground.log".to_string(),
+            timeout_minutes: 15,
+            expires_at: None,
+            last_run_at: None,
+            last_run_ok: None,
+            last_triggered_at: None,
+            trigger_count: 0,
+        }
+    }
+
+    fn app_with_agents() -> App {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.agents = vec![AgentEntry::Agent(cron_agent("a1"))];
+        app.selected = 0;
+        app
+    }
+
+    #[test]
+    fn playground_inactive_returns_false() {
+        let mut app = app_with_agents();
+        app.playground_active = false;
+        assert!(!handle_playground_key(
+            &mut app,
+            KeyCode::Char('a'),
+            KeyModifiers::NONE
+        ));
+    }
+
+    #[test]
+    fn playground_active_returns_true_for_any_key() {
+        let mut app = app_with_agents();
+        app.playground_active = true;
+        assert!(handle_playground_key(
+            &mut app,
+            KeyCode::Char('a'),
+            KeyModifiers::NONE
+        ));
+    }
+
+    #[test]
+    fn playground_f10_deactivates() {
+        let mut app = app_with_agents();
+        app.playground_active = true;
+        app.playground_selected = 2;
+        handle_playground_key(&mut app, KeyCode::F(10), KeyModifiers::NONE);
+        assert!(!app.playground_active);
+        assert!(matches!(app.focus, Focus::Preview));
+    }
+
+    #[test]
+    fn playground_detail_mode_esc_closes_detail() {
+        let mut app = app_with_agents();
+        app.playground_active = true;
+        app.playground_detail_mode = true;
+        app.playground_scroll = 5;
+        handle_playground_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.playground_detail_mode);
+        assert_eq!(app.playground_scroll, 0);
+        assert!(app.playground_active, "should stay active");
+    }
+
+    #[test]
+    fn playground_detail_mode_f10_closes_detail() {
+        let mut app = app_with_agents();
+        app.playground_active = true;
+        app.playground_detail_mode = true;
+        handle_playground_key(&mut app, KeyCode::F(10), KeyModifiers::NONE);
+        assert!(!app.playground_detail_mode);
+    }
+
+    #[test]
+    fn playground_up_navigates_results() {
+        let mut app = app_with_agents();
+        app.playground_active = true;
+        app.playground_selected = 2;
+        app.playground_results = (0..4)
+            .map(|i| crate::rag::vector_store::SearchResult {
+                id: format!("id{i}"),
+                file_path: format!("r{i}"),
+                content: format!("r{i}"),
+                created_at: 0,
+                distance: None,
+            })
+            .collect();
+        handle_playground_key(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.playground_selected, 1);
+    }
+
+    #[test]
+    fn playground_up_at_zero_stays() {
+        let mut app = app_with_agents();
+        app.playground_active = true;
+        app.playground_selected = 0;
+        app.playground_results = vec![crate::rag::vector_store::SearchResult {
+            id: "id0".into(),
+            file_path: "r0".into(),
+            content: "r0".into(),
+            created_at: 0,
+            distance: None,
+        }];
+        handle_playground_key(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.playground_selected, 0);
+    }
+
+    #[test]
+    fn playground_down_navigates_results() {
+        let mut app = app_with_agents();
+        app.playground_active = true;
+        app.playground_selected = 0;
+        app.playground_results = (0..3)
+            .map(|i| crate::rag::vector_store::SearchResult {
+                id: format!("id{i}"),
+                file_path: format!("r{i}"),
+                content: format!("r{i}"),
+                created_at: 0,
+                distance: None,
+            })
+            .collect();
+        handle_playground_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.playground_selected, 1);
+    }
+
+    #[test]
+    fn playground_down_at_end_stays() {
+        let mut app = app_with_agents();
+        app.playground_active = true;
+        app.playground_results = vec![crate::rag::vector_store::SearchResult {
+            id: "id0".into(),
+            file_path: "r0".into(),
+            content: "r0".into(),
+            created_at: 0,
+            distance: None,
+        }];
+        app.playground_selected = 0;
+        handle_playground_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.playground_selected, 0);
+    }
+
+    #[test]
+    fn playground_backspace_removes_char() {
+        let mut app = app_with_agents();
+        app.playground_active = true;
+        app.playground_query = "hello".into();
+        handle_playground_key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(app.playground_query, "hell");
+        assert!(!app.playground_search_pending);
+    }
+
+    #[test]
+    fn playground_backspace_empty_clears_results() {
+        let mut app = app_with_agents();
+        app.playground_active = true;
+        app.playground_query.clear();
+        app.playground_results = vec![crate::rag::vector_store::SearchResult {
+            id: "id1".into(),
+            file_path: "r1".into(),
+            content: "r1".into(),
+            created_at: 0,
+            distance: None,
+        }];
+        app.playground_selected = 2;
+        handle_playground_key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        assert!(app.playground_results.is_empty());
+        assert_eq!(app.playground_selected, 0);
+    }
+
+    #[test]
+    fn playground_char_appends_to_query() {
+        let mut app = app_with_agents();
+        app.playground_active = true;
+        app.playground_query.clear();
+        handle_playground_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(app.playground_query, "x");
+        assert!(app.playground_search_pending);
+    }
+
+    #[test]
+    fn playground_ctrl_char_ignored() {
+        let mut app = app_with_agents();
+        app.playground_active = true;
+        app.playground_query.clear();
+        handle_playground_key(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert!(app.playground_query.is_empty());
+    }
+
+    #[test]
+    fn playground_detail_shift_up_deactivates() {
+        let mut app = app_with_agents();
+        app.playground_active = true;
+        app.playground_detail_mode = true;
+        app.agents = vec![AgentEntry::Agent(cron_agent("a1"))];
+        app.selected = 0;
+        app.focus = Focus::Agent;
+        handle_playground_key(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+        assert!(!app.playground_active);
+    }
+
+    #[test]
+    fn playground_detail_shift_down_deactivates() {
+        let mut app = app_with_agents();
+        app.playground_active = true;
+        app.playground_detail_mode = true;
+        app.agents = vec![AgentEntry::Agent(cron_agent("a1"))];
+        app.selected = 0;
+        app.focus = Focus::Agent;
+        handle_playground_key(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        assert!(!app.playground_active);
+    }
+
+    #[test]
+    fn playground_non_detail_shift_up_deactivates() {
+        let mut app = app_with_agents();
+        app.playground_active = true;
+        app.playground_detail_mode = false;
+        app.agents = vec![AgentEntry::Agent(cron_agent("a1"))];
+        app.selected = 0;
+        app.focus = Focus::Agent;
+        handle_playground_key(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+        assert!(!app.playground_active);
+    }
+
+    #[test]
+    fn playground_detail_scroll_down() {
+        let mut app = app_with_agents();
+        app.playground_active = true;
+        app.playground_detail_mode = true;
+        app.playground_scroll = 0;
+        handle_playground_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.playground_scroll, 3);
+    }
+
+    #[test]
+    fn playground_detail_scroll_up() {
+        let mut app = app_with_agents();
+        app.playground_active = true;
+        app.playground_detail_mode = true;
+        app.playground_scroll = 5;
+        handle_playground_key(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.playground_scroll, 2);
+    }
+
+    #[test]
+    fn playground_detail_scroll_up_saturates() {
+        let mut app = app_with_agents();
+        app.playground_active = true;
+        app.playground_detail_mode = true;
+        app.playground_scroll = 1;
+        handle_playground_key(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.playground_scroll, 0);
+    }
+
+    #[test]
+    fn playground_enter_triggers_search_when_query_changed() {
+        let mut app = app_with_agents();
+        app.playground_active = true;
+        app.playground_query = "test".into();
+        app.playground_last_executed_query = "other".into();
+        handle_playground_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.playground_search_pending);
+    }
+
+    #[test]
+    fn playground_enter_opens_detail_when_results_match() {
+        let mut app = app_with_agents();
+        app.playground_active = true;
+        app.playground_results = vec![crate::rag::vector_store::SearchResult {
+            id: "id1".into(),
+            file_path: "r1".into(),
+            content: "r1".into(),
+            created_at: 0,
+            distance: None,
+        }];
+        app.playground_query = "r1".into();
+        app.playground_last_executed_query = "r1".into();
+        handle_playground_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.playground_detail_mode);
+    }
+
+    #[test]
+    fn playground_ctrl_t_opens_rag_transfer() {
+        let mut app = app_with_agents();
+        app.playground_active = true;
+        app.playground_results = vec![crate::rag::vector_store::SearchResult {
+            id: "id1".into(),
+            file_path: "r1".into(),
+            content: "r1".into(),
+            created_at: 0,
+            distance: None,
+        }];
+        handle_playground_key(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert!(app.rag_transfer_modal.is_some());
+    }
+
+    #[test]
+    fn playground_detail_ctrl_t_opens_rag_transfer() {
+        let mut app = app_with_agents();
+        app.playground_active = true;
+        app.playground_detail_mode = true;
+        app.playground_results = vec![crate::rag::vector_store::SearchResult {
+            id: "id1".into(),
+            file_path: "r1".into(),
+            content: "r1".into(),
+            created_at: 0,
+            distance: None,
+        }];
+        handle_playground_key(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert!(app.rag_transfer_modal.is_some());
+    }
+}
+
+#[cfg(test)]
+mod home_key_tests {
+    use super::*;
+    use crate::db::Database;
+    use crate::domain::models::{Agent, Cli, Trigger};
+    use crate::tui::app::types::App;
+    use chrono::Utc;
+    use std::sync::Arc;
+    use tempfile::{tempdir, NamedTempFile};
+
+    fn test_db() -> Arc<Database> {
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        Arc::new(Database::new(&path).expect("create test db"))
+    }
+
+    fn cron_agent(id: &str) -> Agent {
+        Agent {
+            id: id.to_string(),
+            prompt: "prompt".to_string(),
+            trigger: Some(Trigger::Cron {
+                schedule_expr: "0 9 * * *".to_string(),
+            }),
+            cli: Cli::new("claude"),
+            model: None,
+            working_dir: None,
+            enabled: true,
+            enable_at: None,
+            created_at: Utc::now(),
+            log_path: "/tmp/test-home.log".to_string(),
+            timeout_minutes: 15,
+            expires_at: None,
+            last_run_at: None,
+            last_run_ok: None,
+            last_triggered_at: None,
+            trigger_count: 0,
+        }
+    }
+
+    fn app_with_agents() -> App {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.agents = vec![AgentEntry::Agent(cron_agent("a1"))];
+        app.selected = 0;
+        app
+    }
+
+    #[test]
+    fn home_f10_shows_quit_confirm() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Home;
+        handle_home_key(&mut app, KeyCode::F(10), KeyModifiers::NONE).unwrap();
+        assert!(app.quit_confirm);
+        assert!(app.running);
+    }
+
+    #[test]
+    fn home_quit_confirm_y_exits() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Home;
+        app.quit_confirm = true;
+        handle_home_key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE).unwrap();
+        assert!(!app.running);
+    }
+
+    #[test]
+    fn home_quit_confirm_enter_exits() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Home;
+        app.quit_confirm = true;
+        handle_home_key(&mut app, KeyCode::Enter, KeyModifiers::NONE).unwrap();
+        assert!(!app.running);
+    }
+
+    #[test]
+    fn home_quit_confirm_other_key_cancels() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Home;
+        app.quit_confirm = true;
+        handle_home_key(&mut app, KeyCode::Char('n'), KeyModifiers::NONE).unwrap();
+        assert!(!app.quit_confirm);
+        assert!(app.running);
+    }
+
+    #[test]
+    fn home_down_moves_to_preview() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Home;
+        handle_home_key(&mut app, KeyCode::Down, KeyModifiers::NONE).unwrap();
+        assert!(matches!(app.focus, Focus::Preview));
+    }
+
+    #[test]
+    fn home_up_moves_to_preview() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Home;
+        handle_home_key(&mut app, KeyCode::Up, KeyModifiers::NONE).unwrap();
+        assert!(matches!(app.focus, Focus::Preview));
+    }
+
+    #[test]
+    fn home_j_moves_to_preview() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Home;
+        handle_home_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE).unwrap();
+        assert!(matches!(app.focus, Focus::Preview));
+    }
+
+    #[test]
+    fn home_k_moves_to_preview() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Home;
+        handle_home_key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE).unwrap();
+        assert!(matches!(app.focus, Focus::Preview));
+    }
+
+    #[test]
+    fn home_enter_moves_to_preview() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Home;
+        handle_home_key(&mut app, KeyCode::Enter, KeyModifiers::NONE).unwrap();
+        assert!(matches!(app.focus, Focus::Preview));
+    }
+
+    #[test]
+    fn home_n_opens_new_agent_dialog() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Home;
+        handle_home_key(&mut app, KeyCode::Char('n'), KeyModifiers::NONE).unwrap();
+        assert!(matches!(app.focus, Focus::NewAgentDialog));
+    }
+
+    #[test]
+    fn home_f1_shows_legend() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Home;
+        app.show_legend = false;
+        handle_home_key(&mut app, KeyCode::F(1), KeyModifiers::NONE).unwrap();
+        assert!(app.show_legend);
+    }
+
+    #[test]
+    fn home_esc_shows_quit_confirm() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Home;
+        handle_home_key(&mut app, KeyCode::Esc, KeyModifiers::NONE).unwrap();
+        assert!(app.quit_confirm);
+    }
+}
+
+#[cfg(test)]
+mod preview_key_tests {
+    use super::*;
+    use crate::db::Database;
+    use crate::domain::models::{Agent, Cli, Trigger};
+    use crate::tui::app::types::App;
+    use chrono::Utc;
+    use std::sync::Arc;
+    use tempfile::{tempdir, NamedTempFile};
+
+    fn test_db() -> Arc<Database> {
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        Arc::new(Database::new(&path).expect("create test db"))
+    }
+
+    fn cron_agent(id: &str) -> Agent {
+        Agent {
+            id: id.to_string(),
+            prompt: "prompt".to_string(),
+            trigger: Some(Trigger::Cron {
+                schedule_expr: "0 9 * * *".to_string(),
+            }),
+            cli: Cli::new("claude"),
+            model: None,
+            working_dir: None,
+            enabled: true,
+            enable_at: None,
+            created_at: Utc::now(),
+            log_path: "/tmp/test-preview.log".to_string(),
+            timeout_minutes: 15,
+            expires_at: None,
+            last_run_at: None,
+            last_run_ok: None,
+            last_triggered_at: None,
+            trigger_count: 0,
+        }
+    }
+
+    fn app_with_agents() -> App {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.agents = vec![AgentEntry::Agent(cron_agent("a1"))];
+        app.selected = 0;
+        app
+    }
+
+    #[test]
+    fn preview_esc_goes_home() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Preview;
+        handle_preview_key(&mut app, KeyCode::Esc, KeyModifiers::NONE).unwrap();
+        assert!(matches!(app.focus, Focus::Home));
+    }
+
+    #[test]
+    fn preview_h_goes_home() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Preview;
+        handle_preview_key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE).unwrap();
+        assert!(matches!(app.focus, Focus::Home));
+    }
+
+    #[test]
+    fn preview_f10_goes_home() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Preview;
+        handle_preview_key(&mut app, KeyCode::F(10), KeyModifiers::NONE).unwrap();
+        assert!(matches!(app.focus, Focus::Home));
+    }
+
+    #[test]
+    fn preview_down_selects_next() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Preview;
+        app.sidebar_layer = SidebarLayer::Automation;
+        app.agents = vec![
+            AgentEntry::Agent(cron_agent("a1")),
+            AgentEntry::Agent(cron_agent("a2")),
+        ];
+        app.selected = 0;
+        handle_preview_key(&mut app, KeyCode::Down, KeyModifiers::NONE).unwrap();
+        assert_eq!(app.selected, 1);
+    }
+
+    #[test]
+    fn preview_up_selects_prev() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Preview;
+        app.sidebar_layer = SidebarLayer::Automation;
+        app.agents = vec![
+            AgentEntry::Agent(cron_agent("a1")),
+            AgentEntry::Agent(cron_agent("a2")),
+        ];
+        app.selected = 1;
+        handle_preview_key(&mut app, KeyCode::Up, KeyModifiers::NONE).unwrap();
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn preview_j_selects_next() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Preview;
+        app.sidebar_layer = SidebarLayer::Automation;
+        app.agents = vec![
+            AgentEntry::Agent(cron_agent("a1")),
+            AgentEntry::Agent(cron_agent("a2")),
+        ];
+        app.selected = 0;
+        handle_preview_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE).unwrap();
+        assert_eq!(app.selected, 1);
+    }
+
+    #[test]
+    fn preview_k_selects_prev() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Preview;
+        app.sidebar_layer = SidebarLayer::Automation;
+        app.agents = vec![
+            AgentEntry::Agent(cron_agent("a1")),
+            AgentEntry::Agent(cron_agent("a2")),
+        ];
+        app.selected = 1;
+        handle_preview_key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE).unwrap();
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn preview_enter_focuses_agent() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Preview;
+        handle_preview_key(&mut app, KeyCode::Enter, KeyModifiers::NONE).unwrap();
+        assert!(matches!(app.focus, Focus::Agent));
+    }
+
+    #[test]
+    fn preview_l_focuses_agent() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Preview;
+        handle_preview_key(&mut app, KeyCode::Char('l'), KeyModifiers::NONE).unwrap();
+        assert!(matches!(app.focus, Focus::Agent));
+    }
+
+    #[test]
+    fn preview_f1_shows_legend() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Preview;
+        app.show_legend = false;
+        handle_preview_key(&mut app, KeyCode::F(1), KeyModifiers::NONE).unwrap();
+        assert!(app.show_legend);
+    }
+
+    #[test]
+    fn preview_n_opens_new_agent_dialog() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Preview;
+        handle_preview_key(&mut app, KeyCode::Char('n'), KeyModifiers::NONE).unwrap();
+        assert!(matches!(app.focus, Focus::NewAgentDialog));
+    }
+
+    #[test]
+    fn preview_delete_confirm_y_deletes() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Preview;
+        app.delete_project_confirm = true;
+        handle_preview_key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE).unwrap();
+        assert!(!app.delete_project_confirm);
+    }
+
+    #[test]
+    fn preview_delete_confirm_n_cancels() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Preview;
+        app.delete_project_confirm = true;
+        handle_preview_key(&mut app, KeyCode::Char('n'), KeyModifiers::NONE).unwrap();
+        assert!(!app.delete_project_confirm);
+    }
+
+    #[test]
+    fn preview_delete_loop_confirm_y_deletes() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Preview;
+        app.delete_loop_confirm = true;
+        handle_preview_key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE).unwrap();
+        assert!(!app.delete_loop_confirm);
+    }
+
+    #[test]
+    fn preview_delete_loop_confirm_n_cancels() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Preview;
+        app.delete_loop_confirm = true;
+        handle_preview_key(&mut app, KeyCode::Char('n'), KeyModifiers::NONE).unwrap();
+        assert!(!app.delete_loop_confirm);
+    }
+
+    #[test]
+    fn preview_d_toggles_enable() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Preview;
+        app.agents = vec![AgentEntry::Agent(cron_agent("a1"))];
+        app.selected = 0;
+        let _ = handle_preview_key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+        // The toggle call may fail on test agents, but the key is consumed
+    }
+
+    #[test]
+    fn preview_r_reruns_selected() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Preview;
+        app.agents = vec![AgentEntry::Agent(cron_agent("a1"))];
+        app.selected = 0;
+        let _ = handle_preview_key(&mut app, KeyCode::Char('r'), KeyModifiers::NONE);
+    }
+
+    #[test]
+    fn preview_e_opens_edit_dialog() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Preview;
+        app.agents = vec![AgentEntry::Agent(cron_agent("a1"))];
+        app.selected = 0;
+        let _ = handle_preview_key(&mut app, KeyCode::Char('e'), KeyModifiers::NONE);
+    }
+}

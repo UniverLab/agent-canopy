@@ -17,9 +17,35 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-2E8B57?style=for-the-badge" alt="License"/></a>
 </p>
 
-harness-canopy is a modern, self-contained MCP (Model Context Protocol) server and TUI for orchestrating AI agent sessions, background tasks, and file event triggers. Designed for reliability, modularity, and performance — it enables advanced scheduling, persistent knowledge graphs, multi-agent coordination, workflow automation, and interactive terminal management with zero runtime dependencies.
+harness-canopy is a modern, self-contained MCP (Model Context Protocol) server and TUI for orchestrating AI agent sessions, background tasks, and file event triggers. Designed for reliability, modularity, and performance — it enables advanced scheduling, persistent knowledge graphs, multi-agent coordination, loop automation, and interactive terminal management with zero runtime dependencies.
 
 ---
+
+### Demo
+
+![Demo](demo/dist/demo.gif)
+
+---
+
+## Installation
+
+**Linux / macOS:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/UniverLab/harness-canopy/main/scripts/install.sh | sh
+```
+
+Or via cargo: `cargo install harness-canopy` (the binary is `canopy`).
+See [`docs/installation.md`](docs/installation.md) for all methods and first-time setup.
+
+## Documentation
+
+Full documentation lives in [`docs/`](docs/): installation, quick start, the
+TUI, agents and seed identities, intelligence & sync, loops, the RAG
+pipeline, all 64 MCP tools, and the complete CLI reference.
+
+---
+
 
 ## Features
 
@@ -27,7 +53,7 @@ harness-canopy is a modern, self-contained MCP (Model Context Protocol) server a
 
 - **🚀 High-Performance Scheduler** — Event-driven cron scheduler using Tokio with zero polling overhead. Computes precise wake-up times and sleeps until needed; CPU usage drops to near-zero when idle.
 - **📊 Real-time File Watcher** — Instantly reacts to file system events (create, modify, delete, move) using the `notify` crate with configurable debouncing, recursive directory monitoring, and macOS FSEvents compatibility.
-- **💾 Persistent State** — All tasks, watchers, execution logs, agent state, sync messages, intelligence nodes, workflows, and projects are stored in an embedded SQLite database with WAL mode and automatic schema migration.
+- **💾 Persistent State** — All tasks, watchers, execution logs, agent state, sync messages, intelligence nodes, loops, and projects are stored in an embedded SQLite database with WAL mode and automatic schema migration.
 - **🔄 Auto-Update** — Checks GitHub releases daily for new stable versions, downloads the platform-specific binary (linux-musl, macos-darwin; x86_64/aarch64), and atomically replaces the running executable.
 - **🔔 Cross-Platform Notifications** — Native desktop notifications for task completions, failures, and watcher triggers. Auto-detects platform: WSL (PowerShell toasts with AUMID), macOS (`osascript`), Linux (`notify-send`).
 
@@ -37,6 +63,7 @@ harness-canopy is a modern, self-contained MCP (Model Context Protocol) server a
 - **Terminal Sessions** — Raw shell sessions with per-session command history (TOML-backed), cross-session autocomplete search, and Warp-like input mode for efficient command entry.
 - **Background Agents** — Cron-scheduled and file-watcher-triggered agents with configurable timeouts, automatic retries, execution logging (5 MB rotation), and per-run status tracking.
 - **Seed Identity System** — Persistent, evolvable agent identities stored as structured TOML at `~/.canopy/seeds/<id>/identity.toml`. Each seed has a unique name, family, behavioral directives, and personality traits. Binded sessions receive the seed's prompt injection automatically. The `evolve_identity` MCP tool lets agents refine themselves over time. 4 KB size cap, case-insensitive name uniqueness, and mandatory field validation.
+- **Seed Nursery** — Collaborative workspace for creating new seed identities. Creates a temporary directory with a draft `identity.toml` and CLI-specific instruction files (e.g. `CLAUDE.md`, `AGENTS.md`) that guide the agent to interview the user and define the seed's personality. Validates and registers the seed on completion.
 - **Context Transfer** — Seamlessly transfer conversation context, prompts, and output between agents while preserving session state and scrollback history.
 - **Prompt Builder** — Structured prompt templates with configurable sections (instruction, context, resources, examples), section picker, and @-mention agent references.
 - **Launchpad** — Start new interactive sessions with previous mission recovery, mission input, and auto-injected context.
@@ -56,13 +83,18 @@ harness-canopy is a modern, self-contained MCP (Model Context Protocol) server a
 - **Broadcast Messaging** — Info, query, and answer messages between agents in the same workdir.
 - **Active Context** — `sync_get_context` returns active missions, recent chatter, and a computed workspace "vibe" (worst status among active intents).
 
-### 🔀 Workflow DAG Engine
+### 🔀 Loop DAG Engine
 
-- **Ordered Specs** — Workflows contain sequenced `Spec`s, each with `Node`s connected by `Edge`s with routing conditions (`pass`/`fail`/`always`).
-- **Node Kinds** — `agent` nodes invoke CLI tools with prompt templates; `check` nodes execute shell commands; `gate` nodes validate previous output (e.g., `output_contains`).
-- **Full Lifecycle** — Create, update, run, pause, continue (retry or skip), complete nodes, and report blockers for human intervention.
-- **Template Variables** — Workflow prompts support `{{workflow_name}}`, `{{spec_content}}`, `{{node_id}}`, `{{previous_feedback}}`, and more.
-- **15 MCP Tools** — Complete CRUD + runtime management: `workflow_create`, `workflow_update`, `workflow_add_spec`, `workflow_add_node`, `workflow_add_edge`, `workflow_run`, `workflow_pause`, `workflow_continue`, `workflow_complete_node`, `workflow_report_blocker`, `workflow_get`, `workflow_list`, `workflow_update_spec`, `workflow_update_node`, `workflow_update_edge`.
+- **Ordered Specs** — Loops contain sequenced `Spec`s, each with `Node`s connected by `Edge`s with routing conditions (`pass`/`fail`/`always`).
+- **Standalone Spec Backlog** — Specs exist independently from loops; tag them to a workdir for filtering. Managed via `spec_create`, `spec_list`, `spec_update`, `spec_delete`.
+- **Spec Queues** — Ordered queues of existing specs that a loop drains one by one. Append and reorder while a loop is running via `queue_create`, `queue_add_spec`, `queue_list`, `queue_remove_spec`, `queue_reorder`. (The old `pool_*` names remain as deprecated back-compat aliases.)
+- **Node Kinds** — `agent` nodes invoke CLI tools with prompt templates; `check` nodes execute shell commands; `gate` nodes validate previous output (e.g., `output_contains`); `quorum` is the engine-managed node that closes an ensemble.
+- **Ensembles** — `loop_add_ensemble` creates a parallel group of 2-8 agent-node members sharing one prompt, plus a wait-all quorum that consolidates their outputs and routes onward, in a single MCP call. `loop_update_ensemble` edits the shared prompt, member list, and quorum/exit config as one unit. See [docs/loops.md](docs/loops.md#ensembles).
+- **Node Blueprints** — Reusable `{name, kind, config}` templates referenced by name in `loop_add_node`. Five builtins seeded at startup; custom blueprints via `blueprint_create`/`blueprint_delete`/`blueprint_list`.
+- **Full Lifecycle** — Create, update, run, pause, continue (retry or skip), reset, complete nodes, and report blockers for human intervention. `loop_schedule_autorun` resumes failed/completed loops at a future time.
+- **`on_completed` Hook** — Post-completion agent execution (e.g. documentation maintenance) that fires once per completion.
+- **Template Variables** — Loop prompts support `{{loop_name}}`, `{{workdir}}`, `{{spec_id}}`, `{{spec_name}}`, `{{spec_content}}`, `{{node_id}}`, `{{previous_feedback}}`, and `{{spec_start_head}}` (git HEAD at spec start, for check nodes).
+- **24 MCP Tools** — Complete authoring, inspection, runtime, spec, queue, and blueprint management.
 
 ### 📚 Personal RAG Pipeline
 
@@ -76,13 +108,18 @@ harness-canopy is a modern, self-contained MCP (Model Context Protocol) server a
 ### 🖥️ Interactive TUI (Canopy Hub)
 
 - **NewAgentDialog** — Three modes (Interactive, Background Cron/Watch, Terminal) with CLI picker, model picker, seed identity selector (`◀ None / SeedName ▶`), directory browser, and yolo mode toggle.
+- **Scheduled Delivery** — `Shift+Enter` (Kitty keyboard protocol) sends prompts at a chosen time instead of immediately.
 - **Split Groups** — Side-by-side horizontal/vertical views for monitoring multiple agents simultaneously.
 - **System Dashboard** — CPU, memory, disk, GPU (NVIDIA/Linux/macOS), temperatures with amber/red alert thresholds. WSL queries Windows host metrics via PowerShell.
-- **Workflow Editor** — Inline node config JSON editing with validation.
+- **Live Loop View** — Real-time graph rendering with auto-follow on the running node, manual node inspection, and per-node run info (status, elapsed, output tail).
+- **Agent Status Colors** — Green for working (recent output), blue for idle, red for failed, gray for exited.
+- **Projects Sidebar** — Sections for active loops, backlog specs, and loop history, filterable by project workdir.
+- **Loop Editor** — Inline node config JSON editing with validation.
 - **RAG Transfer Modal** — Send semantic search results to other agents as injected context.
 - **Context Transfer** — Two-step modal (preview → agent picker) to inject conversation context between sessions.
 - **Brian's Brain** — 3-state cellular automaton with auto-noise for idle state visualization.
 - **Whimsg** — Animated kaomoji status messages with typing effects.
+- **Gamification** — 28 achievement-style missions across 6 categories (Environment, Intelligence, Projects, Loop, Seeds, SysInfo) tracked automatically during normal TUI operation.
 
 ### 🔧 Additional Features
 
@@ -91,21 +128,24 @@ harness-canopy is a modern, self-contained MCP (Model Context Protocol) server a
 - **Action Protocol Advisor** — `get_tools` MCP tool returns scope-sensitive action protocols (`session_start`, `file_write`, `test_run`, `close_session`, `multi_agent`) with risk levels and recommended tool sets.
 - **Setup Wizard** — Interactive `canopy setup` detects installed AI CLIs from a GitHub-hosted registry, configures binary paths, model flags, headless modes, environment variables, and temperature units. Generates `~/.canopy/config.toml`.
 - **MCP Wizard** — `canopy mcp` subcommand for syncing, adding, and removing MCP server entries across all detected platforms with automatic format conversion (JSON ↔ TOML).
-- **Skills Manager** — List, validate symlink integrity, and remove installed skills across platforms.
+- **Skills Manager** — Global skill directory at `~/.agents/skills/` with cross-platform symlinks. List, validate symlink integrity, and remove installed skills across platforms.
 - **Doctor Diagnostics** — `canopy doctor` checks data directory, database, config, harnesses, RAG status, file watchers, daemon process, registry connectivity, and auto-update health.
-- **Desktop Notifications** — Cross-platform alerts for task completions, failures, watcher triggers, and RAG indexing events.
+- **Desktop Notifications** — Cross-platform alerts for task completions, failures, watcher triggers, RAG indexing events, and loop lifecycle (started, spec completed, finished with outcome, blocker, hook failure).
 
 ---
 
-## MCP Tools (46)
+## MCP Tools (64)
 
 | Category | Tools |
 |----------|-------|
-| **Agent Management** (12) | `agent_add`, `agent_watch`, `agent_list`, `agent_remove`, `agent_enable`, `agent_disable`, `agent_run`, `agent_status`, `agent_models`, `agent_logs`, `agent_update`, `agent_report` |
+| **Agent Management** (13) | `agent_add`, `agent_watch`, `agent_list`, `agent_remove`, `agent_enable`, `agent_disable`, `agent_schedule_enable`, `agent_run`, `agent_status`, `agent_models`, `agent_logs`, `agent_update`, `agent_report` |
 | **Multi-Agent Sync** (4) | `sync_declare_intent`, `sync_report_status`, `sync_broadcast`, `sync_get_context` |
 | **Intelligence V2** (6) | `intelligence_get_context`, `intelligence_upsert`, `intelligence_search`, `intelligence_graph_walk`, `intelligence_list_projects`, `intelligence_link_projects` |
 | **Seed Identity** (5) | `get_identity`, `evolve_identity`, `create_seed`, `list_seeds`, `remove_seed` |
-| **Workflow Engine** (15) | `workflow_create`, `workflow_update`, `workflow_add_spec`, `workflow_update_spec`, `workflow_add_node`, `workflow_update_node`, `workflow_add_edge`, `workflow_update_edge`, `workflow_get`, `workflow_list`, `workflow_run`, `workflow_pause`, `workflow_continue`, `workflow_complete_node`, `workflow_report_blocker` |
+| **Loop Engine** (19) | `loop_create`, `loop_update`, `loop_add_spec`, `loop_update_spec`, `loop_add_node`, `loop_update_node`, `loop_add_edge`, `loop_update_edge`, `loop_add_ensemble`, `loop_update_ensemble`, `loop_get`, `loop_list`, `loop_run`, `loop_reset`, `loop_schedule_autorun`, `loop_pause`, `loop_continue`, `loop_complete_node`, `loop_report_blocker` |
+| **Spec Backlog** (5) | `spec_create`, `spec_list`, `spec_update`, `spec_delete`, `spec_set_status` |
+| **Spec Queues** (5) | `queue_create`, `queue_add_spec`, `queue_list`, `queue_remove_spec`, `queue_reorder` (deprecated `pool_*` aliases still resolve) |
+| **Node Blueprints** (3) | `blueprint_list`, `blueprint_create`, `blueprint_delete` |
 | **Project** (2) | `project_search`, `project_update` |
 | **RAG** (1) | `rag_search` |
 | **Protocol** (1) | `get_tools` |
@@ -114,15 +154,17 @@ harness-canopy is a modern, self-contained MCP (Model Context Protocol) server a
 
 ## Architecture Overview
 
-- **Daemon** — Owns the MCP server (Streamable HTTP on port 7755 + stdio), scheduler, watcher engine, and database. Exposes all 46 MCP tools.
+- **Daemon** — Owns the MCP server (Streamable HTTP on port 7755 + stdio), scheduler, watcher engine, and database. Exposes all 64 MCP tools.
 - **Scheduler** — Computes next fire times for all active tasks, sleeping until needed. Wakes instantly on changes.
 - **Watcher Engine** — Reacts to file system events, triggering tasks as defined.
 - **Executor** — Runs tasks and agents, manages locking, logs, and status.
 - **Intelligence V2** — Project-scoped knowledge graph with node/edge CRUD, graph walk, project relationships.
 - **Sync Manager** — Per-workdir in-memory broadcast channels (64 capacity), DB persistence, and intelligence node auto-upsert.
-- **Workflow Engine** — DAG execution engine: check/gate/agent node runners, iteration limits, pause/continue, blocker reporting.
+- **Loop Engine** — DAG execution engine: check/gate/agent node runners, iteration limits, pause/continue, blocker reporting, spec queues, node blueprints, scheduled autorun.
 - **RAG Pipeline** — Background ingestion, language-aware chunking, embedding client, vector store, and rate-limited search.
-- **TUI** — Full-screen ratatui terminal UI for managing agents, viewing output, workflows, and system metrics in real time.
+- **TUI** — Full-screen ratatui terminal UI for managing agents, viewing output, loops, and system metrics in real time.
+- **Gamification** — Mission tracker with 28 achievements across 6 categories, persisted in the database.
+- **Skills Manager** — Global skills directory with cross-platform symlinks and integrity validation.
 
 ---
 
@@ -131,15 +173,15 @@ harness-canopy is a modern, self-contained MCP (Model Context Protocol) server a
 - `application/` — Application ports and abstractions
 - `autoupdate/` — Self-update system (GitHub releases)
 - `daemon/` — MCP server, handler, params, RAG CLI, doctor
-- `db/` — SQLite persistence and migrations (agents, runs, sessions, sync, intelligence, workflows, projects, seeds, groups, state)
-- `domain/` — Core models: Agent, Trigger, WatchEvent, Project, SeedIdentity, Workflow, SyncMessage, IntelligenceNode
+- `db/` — SQLite persistence and migrations (agents, runs, sessions, sync, intelligence, loops, projects, seeds, groups, state)
+- `domain/` — Core models: Agent, Trigger, WatchEvent, Project, SeedIdentity, Loop, LoopSpec, LoopPool, LoopNodeBlueprint, SyncMessage, IntelligenceNode
 - `executor/` — Task and agent execution logic
 - `rag/` — RAG pipeline (ingestion, chunking, embedding, vector store, rate limiting)
 - `scheduler/` — Internal cron scheduler with template variables
 - `sync_manager/` — Multi-agent coordination broadcast
 - `tui/` — Terminal UI: agent management, dialogs, sidebar, system dashboard, context transfer
 - `watchers/` — File system watcher engine
-- `workflow_engine/` — DAG workflow execution engine
+- `loop_engine/` — DAG loop execution engine
 
 ---
 
@@ -210,4 +252,5 @@ MIT — see [LICENSE](LICENSE) for details.
 
 ---
 
-Made with ❤️ by [JheisonMB](https://github.com/JheisonMB) and [UniverLab](https://github.com/UniverLab)
+An experiment of [UniverLab](https://github.com/UniverLab) — an open computational laboratory.
+Made with ❤️ by [JheisonMB](https://github.com/JheisonMB)

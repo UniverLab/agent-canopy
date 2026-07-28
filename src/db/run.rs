@@ -5,7 +5,7 @@ use rusqlite::{params, OptionalExtension};
 use crate::application::ports::AgentRepository;
 use crate::application::ports::RunRepository;
 use crate::db::Database;
-use crate::domain::models::{RunLog, RunStatus, TriggerType};
+use crate::domain::models::{RunLog, RunStatus, StartRunOutcome, TriggerType};
 
 impl RunRepository for Database {
     fn insert_run(&self, run: &RunLog) -> Result<()> {
@@ -13,24 +13,53 @@ impl RunRepository for Database {
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-        conn.execute(
-            "INSERT INTO runs (id, background_agent_id, status, trigger_type, summary, started_at, finished_at, exit_code, timeout_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                &run.id,
-                &run.background_agent_id,
-                run.status.as_str(),
-                run.trigger_type.as_str(),
-                &run.summary,
-                run.started_at.to_rfc3339(),
-                run.finished_at.map(|t| t.to_rfc3339()),
-                run.exit_code,
-                run.timeout_at.map(|t| t.to_rfc3339()),
-            ],
-        )?;
+        insert_run_row(&conn, run)?;
         drop(conn);
         self.upsert_run_intelligence_node(run)?;
         Ok(())
+    }
+
+    fn try_start_run(&self, run: &RunLog) -> Result<StartRunOutcome> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
+        // Check-then-insert under the *same* lock acquisition: two
+        // concurrent callers (e.g. a scheduled tick and a manual
+        // `agent_run`, or two evaluations of the same cron tick) serialize
+        // on `self.conn`'s mutex, so whichever loses the race sees the
+        // winner's row already inserted here instead of both seeing "no
+        // active run" and both starting an execution.
+        let active = {
+            let mut stmt = conn.prepare(
+                "SELECT id, background_agent_id, status, trigger_type, summary, started_at, finished_at, exit_code, timeout_at
+                 FROM runs WHERE background_agent_id = ?1 AND status IN ('pending', 'in_progress') LIMIT 1",
+            )?;
+            stmt.query_row(params![&run.background_agent_id], |row| {
+                Ok(RunRow {
+                    id: row.get(0)?,
+                    background_agent_id: row.get(1)?,
+                    status_str: row.get(2)?,
+                    trigger_str: row.get(3)?,
+                    summary: row.get(4)?,
+                    started_at_str: row.get(5)?,
+                    finished_at_str: row.get(6)?,
+                    exit_code: row.get(7)?,
+                    timeout_at_str: row.get(8)?,
+                })
+            })
+            .optional()?
+        };
+
+        if let Some(row) = active {
+            return Ok(StartRunOutcome::AlreadyActive(row.into_run_log()?));
+        }
+
+        insert_run_row(&conn, run)?;
+        drop(conn);
+        self.upsert_run_intelligence_node(run)?;
+        Ok(StartRunOutcome::Started)
     }
 
     fn list_runs(&self, background_agent_id: &str, limit: usize) -> Result<Vec<RunLog>> {
@@ -254,6 +283,27 @@ impl Database {
     }
 }
 
+/// Insert a run row on an already-locked connection. Shared by `insert_run`
+/// and `try_start_run` so the INSERT itself stays single-sourced.
+fn insert_run_row(conn: &rusqlite::Connection, run: &RunLog) -> Result<()> {
+    conn.execute(
+        "INSERT INTO runs (id, background_agent_id, status, trigger_type, summary, started_at, finished_at, exit_code, timeout_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            &run.id,
+            &run.background_agent_id,
+            run.status.as_str(),
+            run.trigger_type.as_str(),
+            &run.summary,
+            run.started_at.to_rfc3339(),
+            run.finished_at.map(|t| t.to_rfc3339()),
+            run.exit_code,
+            run.timeout_at.map(|t| t.to_rfc3339()),
+        ],
+    )?;
+    Ok(())
+}
+
 struct RunRow {
     id: String,
     background_agent_id: String,
@@ -292,5 +342,94 @@ impl RunRow {
             exit_code: self.exit_code,
             timeout_at,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::application::ports::RunRepository;
+    use crate::db::Database;
+    use crate::domain::models::{RunLog, RunStatus, StartRunOutcome, TriggerType};
+    use chrono::Utc;
+    use tempfile::tempdir;
+
+    fn test_db() -> Database {
+        let dir = tempdir().unwrap();
+        Database::new(&dir.path().join("test.db")).unwrap()
+    }
+
+    fn make_run(agent_id: &str, status: RunStatus) -> RunLog {
+        RunLog {
+            id: format!("run-{}", agent_id),
+            background_agent_id: agent_id.to_string(),
+            status,
+            trigger_type: TriggerType::Manual,
+            summary: Some("test run".to_string()),
+            started_at: Utc::now(),
+            finished_at: None,
+            exit_code: None,
+            timeout_at: None,
+        }
+    }
+
+    #[test]
+    fn insert_run_stores_run_in_database() {
+        let db = test_db();
+        let run = make_run("agent-1", RunStatus::Pending);
+        let result = db.insert_run(&run);
+        assert!(result.is_ok(), "insert_run should succeed");
+
+        let runs = db.list_runs("agent-1", 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, "run-agent-1");
+    }
+
+    #[test]
+    fn list_runs_returns_runs_for_agent() {
+        let db = test_db();
+        let mut run1 = make_run("agent-1", RunStatus::Pending);
+        run1.id = "run-1".to_string();
+        let mut run2 = make_run("agent-1", RunStatus::InProgress);
+        run2.id = "run-2".to_string();
+        let mut run3 = make_run("agent-2", RunStatus::Pending);
+        run3.id = "run-3".to_string();
+
+        db.insert_run(&run1).unwrap();
+        db.insert_run(&run2).unwrap();
+        db.insert_run(&run3).unwrap();
+
+        let runs = db.list_runs("agent-1", 10).unwrap();
+        assert_eq!(runs.len(), 2);
+    }
+
+    #[test]
+    fn list_runs_respects_limit() {
+        let db = test_db();
+        for i in 0..5 {
+            let run = make_run(&format!("agent-{}", i), RunStatus::Pending);
+            db.insert_run(&run).unwrap();
+        }
+
+        let runs = db.list_runs("agent-0", 3).unwrap();
+        assert_eq!(runs.len(), 1); // Only one run for agent-0
+    }
+
+    #[test]
+    fn try_start_run_returns_started_when_no_active_run() {
+        let db = test_db();
+        let run = make_run("agent-1", RunStatus::Pending);
+        let outcome = db.try_start_run(&run).unwrap();
+        assert!(matches!(outcome, StartRunOutcome::Started));
+    }
+
+    #[test]
+    fn try_start_run_returns_already_active_when_run_exists() {
+        let db = test_db();
+        let run1 = make_run("agent-1", RunStatus::Pending);
+        db.insert_run(&run1).unwrap();
+
+        let run2 = make_run("agent-1", RunStatus::Pending);
+        let outcome = db.try_start_run(&run2).unwrap();
+        assert!(matches!(outcome, StartRunOutcome::AlreadyActive(_)));
     }
 }

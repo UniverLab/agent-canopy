@@ -1,32 +1,19 @@
 use super::types::{AgentEntry, App, Focus};
 use crate::tui::agent::{AgentStatus, InteractiveAgent};
 use crate::tui::terminal_history::save_history;
+use regex::Regex;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 const SHADOW_SUMMARY_LINGER_SECS: u64 = 7;
 const SHADOW_SUMMARY_INSTRUCTION: &str = "Session terminated by user. Before exit, call intelligence_upsert with kind='session' and persist a concise summary including: mission outcome, key decisions, pending follow-ups, and any reusable facts/patterns.";
 
+static ANSI_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\x1b\[[0-9;]*[A-Za-z]").expect("invalid ANSI regex"));
+
 /// Strip ANSI escape sequences from a string for plain-text display.
 fn strip_ansi_codes(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            // Skip CSI sequences: ESC [ ... final_byte
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                while let Some(&next) = chars.peek() {
-                    chars.next();
-                    if next.is_ascii_alphabetic() || next == 'm' {
-                        break;
-                    }
-                }
-            }
-        } else {
-            result.push(c);
-        }
-    }
-    result
+    ANSI_RE.replace_all(s, "").into_owned()
 }
 
 fn recent_output_snippet(agent: &InteractiveAgent, n: usize) -> String {
@@ -54,6 +41,25 @@ fn reverse_sorted_indices(mut indices: Vec<usize>) -> Vec<usize> {
     indices.sort_unstable();
     indices.reverse();
     indices
+}
+
+/// Selection index after a session-list mutation: keep the previously-selected
+/// entry by identity when it survived the mutation, otherwise clamp into range.
+/// Pure so the "navigate Down over a reaped session" fix is unit-testable.
+fn selection_after_mutation(
+    entry_ids: &[&str],
+    anchor: Option<&str>,
+    prev_selected: usize,
+) -> usize {
+    if entry_ids.is_empty() {
+        return 0;
+    }
+    if let Some(anchor) = anchor {
+        if let Some(pos) = entry_ids.iter().position(|id| *id == anchor) {
+            return pos;
+        }
+    }
+    prev_selected.min(entry_ids.len() - 1)
 }
 
 fn poll_agents(agents: &mut [InteractiveAgent]) {
@@ -175,6 +181,11 @@ impl App {
         }
     }
 
+    /// Indices of all agent entries the user can navigate to from focus mode:
+    /// interactive + terminal sessions, groups, and background agents. The
+    /// RAG-info panel is reached by walking past either end of this list, not
+    /// by a dedicated index. Order matches `app.agents`, which itself is
+    /// `[background..., interactive..., terminal..., groups...]`.
     fn focusable_agent_indices(&self) -> Vec<usize> {
         self.agents
             .iter()
@@ -182,7 +193,10 @@ impl App {
             .filter(|(_, entry)| {
                 matches!(
                     entry,
-                    AgentEntry::Interactive(_) | AgentEntry::Terminal(_) | AgentEntry::Group(_)
+                    AgentEntry::Interactive(_)
+                        | AgentEntry::Terminal(_)
+                        | AgentEntry::Group(_)
+                        | AgentEntry::Agent(_)
                 )
             })
             .map(|(idx, _)| idx)
@@ -479,10 +493,20 @@ impl App {
     }
 
     fn successful_interactive_exit_indices(&self) -> Vec<usize> {
+        // Keep a successfully-finished session on screen while it is the one the
+        // user is currently viewing — its final output often carries useful
+        // end-of-run stats. It is reaped on a later poll, once the user moves
+        // the selection to another session.
+        let viewing = match self.selected_session_target() {
+            Some(SessionTarget::Interactive(idx)) => Some(idx),
+            _ => None,
+        };
         self.interactive_agents
             .iter()
             .enumerate()
-            .filter(|(_, agent)| matches!(agent.status, AgentStatus::Exited(0)))
+            .filter(|(idx, agent)| {
+                matches!(agent.status, AgentStatus::Exited(0)) && Some(*idx) != viewing
+            })
             .map(|(idx, _)| idx)
             .collect()
     }
@@ -645,8 +669,9 @@ impl App {
             return;
         }
 
+        let anchor = self.selected_entry_identity();
         self.remove_interactive_sessions(removed_indices);
-        self.finish_session_mutation();
+        self.finish_session_mutation_preserving(anchor.as_deref());
     }
 
     pub fn rerun_selected(&self) -> anyhow::Result<()> {
@@ -686,6 +711,12 @@ impl App {
                 use crate::application::ports::AgentRepository;
                 self.db.delete_agent(&agent.id)?;
             }
+            AgentEntry::Corrupt(corrupt) => {
+                // Deletes by id without parsing the stored row — a corrupt
+                // row must always be removable.
+                use crate::application::ports::AgentRepository;
+                self.db.delete_agent(&corrupt.id)?;
+            }
             AgentEntry::Group(idx) => {
                 if !self.delete_group_at(*idx) {
                     return Ok(());
@@ -700,6 +731,11 @@ impl App {
                 if !self.close_session_target(SessionTarget::Terminal(*idx), 0) {
                     return Ok(());
                 }
+            }
+            AgentEntry::Orphaned(idx) => {
+                // Orphaned sessions are DB-only; just drop the entry.
+                self.orphaned_sessions.remove(*idx);
+                self.finish_session_mutation();
             }
         }
 
@@ -764,6 +800,24 @@ impl App {
         self.reset_focus_after_session_mutation();
     }
 
+    fn selected_entry_identity(&self) -> Option<String> {
+        self.agents
+            .get(self.selected)
+            .map(|entry| entry.id(self).to_string())
+    }
+
+    fn finish_session_mutation_preserving(&mut self, anchor: Option<&str>) {
+        let _ = self.refresh_agents();
+        let ids: Vec<String> = self
+            .agents
+            .iter()
+            .map(|entry| entry.id(self).to_string())
+            .collect();
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        self.selected = selection_after_mutation(&id_refs, anchor, self.selected);
+        self.reset_focus_after_session_mutation();
+    }
+
     fn close_interactive_session_at(&mut self, idx: usize, exit_code: i32) -> bool {
         let Some(agent_id) = self
             .interactive_agents
@@ -821,6 +875,69 @@ impl App {
         self.dissolve_groups_for_session(&agent_name);
         true
     }
+
+    pub(crate) fn selected_session_is_exited(&self) -> bool {
+        match self.selected_session_target() {
+            Some(SessionTarget::Interactive(idx)) => self
+                .interactive_agents
+                .get(idx)
+                .is_some_and(|agent| matches!(agent.status, AgentStatus::Exited(_))),
+            Some(SessionTarget::Terminal(idx)) => self
+                .terminal_agents
+                .get(idx)
+                .is_some_and(|agent| matches!(agent.status, AgentStatus::Exited(_))),
+            None => false,
+        }
+    }
+
+    pub(crate) fn dismiss_selected_exited_session(&mut self) {
+        // The session already exited (DB was finalized in handle_*_exit); just drop
+        // it from the list and let the selection clamp to a neighbour.
+        let Some(target) = self.selected_session_target() else {
+            return;
+        };
+        if self.remove_session_target(target) {
+            self.finish_session_mutation();
+        }
+    }
+
+    /// Revive a selected orphaned session by re-launching its CLI with stored
+    /// args in its stored workdir.
+    pub(crate) fn revive_selected_orphaned_session(&mut self) {
+        let Some(AgentEntry::Orphaned(idx)) = self.selected_agent() else {
+            return;
+        };
+        let idx = *idx;
+        let Some(session) = self.orphaned_sessions.get(idx).cloned() else {
+            return;
+        };
+
+        let home = dirs::home_dir().unwrap_or_default();
+        let canopy_config = crate::domain::canopy_config::CanopyConfig::load(&home.join(".canopy"));
+        let (cols, rows) = Self::session_panel_size();
+        let current_boot_id = crate::system::boot_id();
+
+        // Remove from orphaned list first.
+        self.orphaned_sessions.remove(idx);
+        self.resume_interactive_session(
+            &session,
+            &canopy_config,
+            cols,
+            rows,
+            current_boot_id.as_deref(),
+        );
+        self.finish_session_mutation();
+    }
+
+    /// Dismiss (remove) a selected orphaned session without reviving it.
+    pub(crate) fn dismiss_selected_orphaned_session(&mut self) {
+        let Some(AgentEntry::Orphaned(idx)) = self.selected_agent() else {
+            return;
+        };
+        let idx = *idx;
+        self.orphaned_sessions.remove(idx);
+        self.finish_session_mutation();
+    }
 }
 
 // ── Brain helpers ─────────────────────────────────────────────────
@@ -852,4 +969,249 @@ fn effective_brain_dims(panel: (u16, u16)) -> (usize, usize) {
     let cols = (tw / 2).saturating_sub(2) as usize;
     let rows = th.saturating_sub(3) as usize;
     (cols, rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selection_after_mutation_follows_anchor_shifted_up() {
+        // "Down jump" scenario: B was reaped while cursor had moved to C (old
+        // index 2); C is now at index 1 and must remain selected.
+        assert_eq!(selection_after_mutation(&["A", "C", "D"], Some("C"), 2), 1);
+    }
+
+    #[test]
+    fn selection_after_mutation_up_navigation_unaffected() {
+        assert_eq!(selection_after_mutation(&["A", "C", "D"], Some("A"), 0), 0);
+    }
+
+    #[test]
+    fn selection_after_mutation_clamps_when_anchor_missing() {
+        assert_eq!(selection_after_mutation(&["A", "C", "D"], Some("B"), 2), 2);
+    }
+
+    #[test]
+    fn selection_after_mutation_clamps_to_last_when_prev_out_of_range() {
+        assert_eq!(selection_after_mutation(&["A", "C"], Some("Z"), 5), 1);
+    }
+
+    #[test]
+    fn selection_after_mutation_empty_list_is_zero() {
+        assert_eq!(selection_after_mutation(&[], Some("A"), 3), 0);
+    }
+
+    #[test]
+    fn strip_ansi_codes_plain_text() {
+        assert_eq!(strip_ansi_codes("hello"), "hello");
+    }
+
+    #[test]
+    fn strip_ansi_codes_with_escapes() {
+        assert_eq!(strip_ansi_codes("\x1b[31mred\x1b[0m"), "red");
+    }
+
+    #[test]
+    fn strip_ansi_codes_multiple_escapes() {
+        assert_eq!(
+            strip_ansi_codes("\x1b[1m\x1b[32mbold green\x1b[0m"),
+            "bold green"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_codes_empty() {
+        assert_eq!(strip_ansi_codes(""), "");
+    }
+
+    #[test]
+    fn strip_ansi_codes_no_escapes() {
+        assert_eq!(strip_ansi_codes("no escapes here"), "no escapes here");
+    }
+
+    #[test]
+    fn strip_ansi_codes_complex_sequence() {
+        assert_eq!(strip_ansi_codes("\x1b[38;5;196mred256\x1b[0m"), "red256");
+    }
+
+    #[test]
+    fn reverse_sorted_indices_basic() {
+        assert_eq!(reverse_sorted_indices(vec![1, 3, 2]), vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn reverse_sorted_indices_empty() {
+        assert_eq!(reverse_sorted_indices(vec![]), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn reverse_sorted_indices_single() {
+        assert_eq!(reverse_sorted_indices(vec![5]), vec![5]);
+    }
+
+    #[test]
+    fn reverse_sorted_indices_already_sorted() {
+        assert_eq!(reverse_sorted_indices(vec![1, 2, 3]), vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn reverse_sorted_indices_duplicates() {
+        assert_eq!(reverse_sorted_indices(vec![2, 2, 1, 3]), vec![3, 2, 2, 1]);
+    }
+
+    #[test]
+    fn selection_after_mutation_no_anchor() {
+        assert_eq!(selection_after_mutation(&["A", "B", "C"], None, 1), 1);
+    }
+
+    #[test]
+    fn selection_after_mutation_no_anchor_clamps() {
+        assert_eq!(selection_after_mutation(&["A", "B"], None, 5), 1);
+    }
+
+    #[test]
+    fn selection_after_mutation_single_element() {
+        assert_eq!(selection_after_mutation(&["A"], Some("A"), 0), 0);
+    }
+
+    #[test]
+    fn selection_after_mutation_anchor_first() {
+        assert_eq!(selection_after_mutation(&["X", "Y", "Z"], Some("X"), 2), 0);
+    }
+
+    #[test]
+    fn selection_after_mutation_anchor_last() {
+        assert_eq!(selection_after_mutation(&["X", "Y", "Z"], Some("Z"), 0), 2);
+    }
+
+    #[test]
+    fn selection_after_mutation_no_anchor_empty() {
+        assert_eq!(selection_after_mutation(&[], None, 0), 0);
+    }
+
+    #[test]
+    fn brain_needs_reinit_none() {
+        assert!(brain_needs_reinit(&None, 10, 10));
+    }
+
+    #[test]
+    fn brain_needs_reinit_matching_dims() {
+        let brain = make_brain(10, 10, 3);
+        assert!(!brain_needs_reinit(&Some(brain), 10, 10));
+    }
+
+    #[test]
+    fn brain_needs_reinit_different_dims() {
+        let brain = make_brain(10, 10, 3);
+        assert!(brain_needs_reinit(&Some(brain), 20, 20));
+    }
+
+    #[test]
+    fn brain_needs_reinit_different_rows() {
+        let brain = make_brain(10, 10, 3);
+        assert!(brain_needs_reinit(&Some(brain), 20, 10));
+    }
+
+    #[test]
+    fn brain_needs_reinit_different_cols() {
+        let brain = make_brain(10, 10, 3);
+        assert!(brain_needs_reinit(&Some(brain), 10, 20));
+    }
+
+    #[test]
+    fn effective_brain_dims_small() {
+        let (cols, rows) = effective_brain_dims((100, 200));
+        assert!(rows > 0);
+        assert!(cols > 0);
+        assert!(rows <= 200);
+        assert!(cols <= 100);
+    }
+
+    #[test]
+    fn effective_brain_dims_zero_area() {
+        let (cols, rows) = effective_brain_dims((0, 0));
+        assert!(cols > 0);
+        assert!(rows > 0);
+    }
+
+    #[test]
+    fn effective_brain_dims_exactly_minimum() {
+        let (cols, rows) = effective_brain_dims((6, 3));
+        assert_eq!(cols, 6);
+        assert_eq!(rows, 3);
+    }
+
+    #[test]
+    fn effective_brain_dims_below_minimum() {
+        let (cols, rows) = effective_brain_dims((5, 2));
+        assert!(rows > 0);
+        assert!(cols > 0);
+    }
+
+    #[test]
+    fn effective_brain_dims_large() {
+        let (cols, rows) = effective_brain_dims((500, 1000));
+        assert_eq!(cols, 500);
+        assert_eq!(rows, 1000);
+    }
+
+    #[test]
+    fn selection_after_mutation_anchor_present_at_same_position() {
+        assert_eq!(selection_after_mutation(&["A", "B", "C"], Some("A"), 0), 0);
+    }
+
+    #[test]
+    fn selection_after_mutation_anchor_at_end() {
+        assert_eq!(selection_after_mutation(&["A", "B", "C"], Some("C"), 0), 2);
+    }
+
+    #[test]
+    fn selection_after_mutation_single_element_no_anchor() {
+        assert_eq!(selection_after_mutation(&["X"], None, 0), 0);
+    }
+
+    #[test]
+    fn strip_ansi_codes_nested_sequences() {
+        assert_eq!(
+            strip_ansi_codes("\x1b[1m\x1b[31mbold red\x1b[0m\x1b[0m"),
+            "bold red"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_codes_color256() {
+        assert_eq!(strip_ansi_codes("\x1b[38;5;42mhello\x1b[0m"), "hello");
+    }
+
+    #[test]
+    fn strip_ansi_codes_rgb_color() {
+        assert_eq!(
+            strip_ansi_codes("\x1b[38;2;255;128;0mcolored\x1b[0m"),
+            "colored"
+        );
+    }
+
+    #[test]
+    fn brain_needs_reinit_none_vs_none() {
+        assert!(brain_needs_reinit(&None, 5, 5));
+    }
+
+    #[test]
+    fn brain_needs_reinit_exact_match_no_reinit() {
+        let brain = make_brain(15, 25, 10);
+        assert!(!brain_needs_reinit(&Some(brain), 15, 25));
+    }
+
+    #[test]
+    fn effective_brain_dims_width_exactly_minimum() {
+        let (cols, _rows) = effective_brain_dims((6, 100));
+        assert_eq!(cols, 6);
+    }
+
+    #[test]
+    fn effective_brain_dims_height_exactly_minimum() {
+        let (_cols, rows) = effective_brain_dims((100, 3));
+        assert_eq!(rows, 3);
+    }
 }
