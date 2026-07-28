@@ -239,4 +239,34 @@ mod tests {
         let last = db.get_last_prompt_for_workdir("/proj").unwrap().unwrap();
         assert_eq!(last.created_at.timestamp(), ts.timestamp());
     }
+
+    #[test]
+    fn insert_last_prompt_with_builder_state() {
+        let db = test_db();
+        let builder_state = Some(r#"{"key": "value"}"#);
+        db.insert_last_prompt("lp-bs", "/proj", "text", builder_state, Utc::now())
+            .unwrap();
+
+        let last = db.get_last_prompt_for_workdir("/proj").unwrap().unwrap();
+        assert!(last.builder_state.is_some());
+    }
+
+    #[test]
+    fn get_last_prompt_for_workdir_returns_latest() {
+        let db = test_db();
+        let t1 = Utc::now() - chrono::Duration::hours(2);
+        let t2 = Utc::now() - chrono::Duration::hours(1);
+        let t3 = Utc::now();
+
+        db.insert_last_prompt("lp-1", "/proj", "first", None, t1)
+            .unwrap();
+        db.insert_last_prompt("lp-2", "/proj", "second", None, t2)
+            .unwrap();
+        db.insert_last_prompt("lp-3", "/proj", "third", None, t3)
+            .unwrap();
+
+        let last = db.get_last_prompt_for_workdir("/proj").unwrap().unwrap();
+        assert_eq!(last.id, "lp-3");
+        assert_eq!(last.prompt_text, "third");
+    }
 }
