@@ -298,3 +298,68 @@ fn test_watcher_trigger_accessors() {
     assert_eq!(agent.trigger_count, 0);
     assert!(agent.last_triggered_at.is_none());
 }
+
+#[test]
+fn test_corrupt_agent_struct() {
+    let corrupt = CorruptAgent {
+        id: "test-id".to_string(),
+        enabled: true,
+        error: "parse error".to_string(),
+    };
+    assert_eq!(corrupt.id, "test-id");
+    assert!(corrupt.enabled);
+    assert_eq!(corrupt.error, "parse error");
+}
+
+#[test]
+fn test_agent_is_cron_and_is_watch() {
+    let cron_agent = sample_agent(
+        "c1",
+        Some(Trigger::Cron {
+            schedule_expr: "0 9 * * *".to_string(),
+        }),
+    );
+    assert!(cron_agent.is_cron());
+    assert!(!cron_agent.is_watch());
+
+    let watch_agent = sample_agent(
+        "w1",
+        Some(Trigger::Watch {
+            path: "/tmp".to_string(),
+            events: vec![WatchEvent::Create],
+            debounce_seconds: 2,
+            recursive: false,
+        }),
+    );
+    assert!(!watch_agent.is_cron());
+    assert!(watch_agent.is_watch());
+
+    let manual_agent = sample_agent("m1", None);
+    assert!(!manual_agent.is_cron());
+    assert!(!manual_agent.is_watch());
+}
+
+#[test]
+fn test_agent_watch_events() {
+    let watch_agent = sample_agent(
+        "w1",
+        Some(Trigger::Watch {
+            path: "/tmp".to_string(),
+            events: vec![WatchEvent::Create, WatchEvent::Modify],
+            debounce_seconds: 2,
+            recursive: false,
+        }),
+    );
+    let events = watch_agent.watch_events().unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(events.contains(&WatchEvent::Create));
+    assert!(events.contains(&WatchEvent::Modify));
+
+    let cron_agent = sample_agent(
+        "c1",
+        Some(Trigger::Cron {
+            schedule_expr: "0 9 * * *".to_string(),
+        }),
+    );
+    assert!(cron_agent.watch_events().is_none());
+}
