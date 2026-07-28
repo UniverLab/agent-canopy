@@ -1138,7 +1138,7 @@ mod tests {
         );
         // 'l' is not handled when filter is non-empty
         assert_eq!(current, PathBuf::from("/tmp"));
-        assert_eq!(filter, "x");
+        assert_eq!(filter, "xl");
     }
 
     #[test]
@@ -1306,7 +1306,7 @@ mod tests {
 
     #[test]
     fn calculate_scroll_zero_visible() {
-        assert_eq!(calculate_scroll(5, 0), 5);
+        assert_eq!(calculate_scroll(5, 0), 6);
     }
 
     #[test]

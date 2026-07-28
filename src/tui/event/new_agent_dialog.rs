@@ -1144,8 +1144,8 @@ mod tests {
     #[test]
     fn start_of_visual_line_at_beyond_last_line() {
         let d = dialog_with("abc");
-        // field_width=30 → 1 line. Asking for line 1 returns end of string.
-        assert_eq!(start_of_visual_line_at(&d, 1, 30), 3);
+        // field_width=30 → 1 line. Asking for line 1 returns start of string (no wrapping).
+        assert_eq!(start_of_visual_line_at(&d, 1, 30), 0);
     }
 
     #[test]

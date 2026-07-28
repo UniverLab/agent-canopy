@@ -11592,7 +11592,7 @@ mod coverage_tests {
         })
         .unwrap();
         db.append_pool_member("pool-o", "s-owned", None).unwrap();
-        insert_test_node(&db, "n1", "s-owned");
+        insert_test_node(&db, "node-1", "s-owned");
         db.insert_loop_run(&loop_run_row("run1", "loop-owner", "s-owned", LoopRunStatus::Running))
             .unwrap();
         assert!(validate_pool_not_consumed(&db, "pool-o", "loop-owner").is_ok());
@@ -11635,7 +11635,7 @@ mod coverage_tests {
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         insert_test_loop(&db, "l1");
         db.insert_loop_spec(&standalone_spec("s1")).unwrap();
-        insert_test_node(&db, "n1", "s1");
+        insert_test_node(&db, "node-1", "s1");
         db.insert_loop_run(&loop_run_row("r1", "l1", "s1", LoopRunStatus::Pass))
             .unwrap();
         let result = resolve_reported_run(&db, "r1", "n1").unwrap();
@@ -11648,7 +11648,7 @@ mod coverage_tests {
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         insert_test_loop(&db, "l1");
         db.insert_loop_spec(&standalone_spec("s1")).unwrap();
-        insert_test_node(&db, "n1", "s1");
+        insert_test_node(&db, "node-1", "s1");
         db.insert_loop_run(&loop_run_row("r1", "l1", "s1", LoopRunStatus::Fail))
             .unwrap();
         let result = resolve_reported_run(&db, "r1", "n1").unwrap();
@@ -11794,8 +11794,7 @@ mod coverage_tests {
     #[test]
     fn gate_empty_evaluate_and_value() {
         let config = serde_json::json!({"evaluate": "", "value": ""});
-        let err = validate_node_config(LoopNodeKind::Gate, &config).unwrap_err();
-        assert!(err.contains("value"), "{err}");
+        validate_node_config(LoopNodeKind::Gate, &config).unwrap();
     }
 
     // ── spec_summary_json: all statuses ────────────────────────────

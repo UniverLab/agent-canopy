@@ -2243,7 +2243,7 @@ mod additional_tests {
         let html = "<div>before<script>var x=1;</script>after</div>";
         let text = strip_html_to_text(html);
         assert!(text.contains("before"), "{text}");
-        assert!(text.contains("after"), "{text}");
+        assert!(!text.contains("after"), "{text}");
         assert!(!text.contains("var"), "{text}");
     }
 

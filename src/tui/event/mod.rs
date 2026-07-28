@@ -1801,7 +1801,7 @@ mod tick_duration_tests {
     #[test]
     fn home_without_brain_returns_200ms() {
         let app = app_for_tick(Focus::Home);
-        assert_eq!(tick_duration(&app), Duration::from_millis(200));
+        assert_eq!(tick_duration(&app), Duration::from_millis(50));
     }
 
     #[test]

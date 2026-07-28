@@ -1182,6 +1182,8 @@ mod tests {
         db.insert_loop(&lp).unwrap();
         db.insert_loop_spec(&make_spec("s1", "lp1", LoopSpecStatus::Running, 1))
             .unwrap();
+        db.insert_loop_node(&make_node("n1", "s1", LoopNodeKind::Check, 1))
+            .unwrap();
 
         db.insert_loop_run(&make_run(
             "lp1",
@@ -1204,6 +1206,8 @@ mod tests {
         let lp = make_loop("lp1", LoopStatus::Running);
         db.insert_loop(&lp).unwrap();
         db.insert_loop_spec(&make_spec("s1", "lp1", LoopSpecStatus::Running, 1))
+            .unwrap();
+        db.insert_loop_node(&make_node("n1", "s1", LoopNodeKind::Check, 1))
             .unwrap();
 
         db.insert_loop_run(&make_run(

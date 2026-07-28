@@ -664,6 +664,13 @@ mod playground_key_tests {
     fn playground_ctrl_t_opens_rag_transfer() {
         let mut app = app_with_agents();
         app.playground_active = true;
+        app.playground_results = vec![crate::rag::vector_store::SearchResult {
+            id: "id1".into(),
+            file_path: "r1".into(),
+            content: "r1".into(),
+            created_at: 0,
+            distance: None,
+        }];
         handle_playground_key(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         assert!(app.rag_transfer_modal.is_some());
     }
@@ -673,6 +680,13 @@ mod playground_key_tests {
         let mut app = app_with_agents();
         app.playground_active = true;
         app.playground_detail_mode = true;
+        app.playground_results = vec![crate::rag::vector_store::SearchResult {
+            id: "id1".into(),
+            file_path: "r1".into(),
+            content: "r1".into(),
+            created_at: 0,
+            distance: None,
+        }];
         handle_playground_key(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         assert!(app.rag_transfer_modal.is_some());
     }
@@ -907,6 +921,7 @@ mod preview_key_tests {
     fn preview_down_selects_next() {
         let mut app = app_with_agents();
         app.focus = Focus::Preview;
+        app.sidebar_layer = SidebarLayer::Automation;
         app.agents = vec![AgentEntry::Agent(cron_agent("a1")), AgentEntry::Agent(cron_agent("a2"))];
         app.selected = 0;
         handle_preview_key(&mut app, KeyCode::Down, KeyModifiers::NONE).unwrap();
@@ -917,6 +932,7 @@ mod preview_key_tests {
     fn preview_up_selects_prev() {
         let mut app = app_with_agents();
         app.focus = Focus::Preview;
+        app.sidebar_layer = SidebarLayer::Automation;
         app.agents = vec![AgentEntry::Agent(cron_agent("a1")), AgentEntry::Agent(cron_agent("a2"))];
         app.selected = 1;
         handle_preview_key(&mut app, KeyCode::Up, KeyModifiers::NONE).unwrap();
@@ -927,6 +943,7 @@ mod preview_key_tests {
     fn preview_j_selects_next() {
         let mut app = app_with_agents();
         app.focus = Focus::Preview;
+        app.sidebar_layer = SidebarLayer::Automation;
         app.agents = vec![AgentEntry::Agent(cron_agent("a1")), AgentEntry::Agent(cron_agent("a2"))];
         app.selected = 0;
         handle_preview_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE).unwrap();
@@ -937,6 +954,7 @@ mod preview_key_tests {
     fn preview_k_selects_prev() {
         let mut app = app_with_agents();
         app.focus = Focus::Preview;
+        app.sidebar_layer = SidebarLayer::Automation;
         app.agents = vec![AgentEntry::Agent(cron_agent("a1")), AgentEntry::Agent(cron_agent("a2"))];
         app.selected = 1;
         handle_preview_key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE).unwrap();

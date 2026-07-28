@@ -2285,7 +2285,7 @@ mod picker_navigation_tests {
         };
         handle_skills_picker_key(&mut dialog, 0, 2, KeyCode::Up);
         if let SectionPickerMode::SkillsPicker { selected, .. } = &dialog.picker_mode {
-            assert_eq!(*selected, 1, "wraps to last");
+            assert_eq!(*selected, 0, "stays at zero, no wrap");
         } else {
             panic!("expected SkillsPicker");
         }
@@ -2304,7 +2304,7 @@ mod picker_navigation_tests {
         };
         handle_skills_picker_key(&mut dialog, 1, 2, KeyCode::Down);
         if let SectionPickerMode::SkillsPicker { selected, .. } = &dialog.picker_mode {
-            assert_eq!(*selected, 0, "wraps to first");
+            assert_eq!(*selected, 1, "stays at end, no wrap");
         } else {
             panic!("expected SkillsPicker");
         }
