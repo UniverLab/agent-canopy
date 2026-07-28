@@ -12098,6 +12098,25 @@ mod endpoint_tests {
         result.is_error == Some(true)
     }
 
+    /// The raw (unescaped) text of a result's first content block — unlike
+    /// [`text`] (which Debug-formats the whole `Vec<Content>`, escaping
+    /// embedded quotes), this is safe to `serde_json::from_str` or otherwise
+    /// parse structurally.
+    fn raw_text(result: &CallToolResult) -> String {
+        result.content[0].as_text().unwrap().text.clone()
+    }
+
+    /// Parse a `build_id_result`-shaped response (`{"<key>": "<id>"}`) and
+    /// return the id.
+    fn extract_id(result: &CallToolResult, key: &str) -> String {
+        let value: serde_json::Value = serde_json::from_str(&raw_text(result))
+            .unwrap_or_else(|e| panic!("expected JSON body, got {:?}: {e}", raw_text(result)));
+        value[key]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected string field '{key}' in {value}"))
+            .to_string()
+    }
+
     // ── task_add / agent_add ─────────────────────────────────────
 
     #[tokio::test]
@@ -12836,5 +12855,876 @@ mod endpoint_tests {
             }))
             .await;
         assert!(result.is_err());
+    }
+
+    // ── loop_create / loop_update / loop graph tool handlers ─────
+
+    fn valid_spec_description() -> String {
+        "Functional Requirements: does the thing.\n\
+         Non-Functional Requirements: is fast.\n\
+         Objective: ship the feature.\n\
+         Constraints: none extra.\n\
+         Guidelines: follow house style.\n\
+         In Scope: this change.\n\
+         Out of Scope: everything else."
+            .to_string()
+    }
+
+    fn agent_node_config(platform: &str) -> serde_json::Map<String, serde_json::Value> {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "platform".to_string(),
+            serde_json::Value::String(platform.to_string()),
+        );
+        map
+    }
+
+    #[tokio::test]
+    async fn loop_create_and_update_round_trip() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let workdir = dir.path().to_string_lossy().to_string();
+
+        let created = handler
+            .loop_create(Parameters(LoopCreateParams {
+                name: "My Loop".to_string(),
+                description: None,
+                workdir: workdir.clone(),
+                trigger: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&created), "{}", text(&created));
+        let loop_id = extract_id(&created, "loop_id");
+        assert!(db.get_loop(&loop_id).unwrap().is_some());
+
+        let updated = handler
+            .loop_update(Parameters(LoopUpdateParams {
+                loop_id: loop_id.clone(),
+                name: Some("Renamed Loop".to_string()),
+                description: None,
+                workdir: None,
+                trigger: None,
+                on_completed: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&updated), "{}", text(&updated));
+        assert_eq!(db.get_loop(&loop_id).unwrap().unwrap().name, "Renamed Loop");
+    }
+
+    #[tokio::test]
+    async fn loop_create_rejects_empty_name_and_relative_workdir() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+
+        let empty_name = handler
+            .loop_create(Parameters(LoopCreateParams {
+                name: "  ".to_string(),
+                description: None,
+                workdir: "/tmp".to_string(),
+                trigger: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&empty_name));
+
+        let bad_workdir = handler
+            .loop_create(Parameters(LoopCreateParams {
+                name: "Loop".to_string(),
+                description: None,
+                workdir: "relative/dir".to_string(),
+                trigger: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&bad_workdir));
+        assert!(text(&bad_workdir).contains("absolute") || text(&bad_workdir).contains("exist"));
+    }
+
+    #[tokio::test]
+    async fn loop_update_rejects_unknown_loop_and_requires_a_field() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let missing = handler
+            .loop_update(Parameters(LoopUpdateParams {
+                loop_id: "ghost".to_string(),
+                name: Some("x".to_string()),
+                description: None,
+                workdir: None,
+                trigger: None,
+                on_completed: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&missing));
+
+        let lp = insert_test_loop(&db, dir.path());
+        let no_fields = handler
+            .loop_update(Parameters(LoopUpdateParams {
+                loop_id: lp.id.clone(),
+                name: None,
+                description: None,
+                workdir: None,
+                trigger: None,
+                on_completed: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&no_fields));
+        assert!(text(&no_fields).contains("at least one field"));
+    }
+
+    fn insert_test_loop(db: &Database, workdir: &std::path::Path) -> Loop {
+        let lp = Loop {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "Test Loop".to_string(),
+            description: None,
+            workdir: workdir.to_string_lossy().to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_pool_id: None,
+            on_completed: None,
+        };
+        db.insert_loop(&lp).unwrap();
+        lp
+    }
+
+    fn insert_test_spec(db: &Database, loop_id: &str, position: i64) -> LoopSpec {
+        let spec = LoopSpec {
+            id: uuid::Uuid::new_v4().to_string(),
+            loop_id: Some(loop_id.to_string()),
+            name: "Test Spec".to_string(),
+            description: Some(valid_spec_description()),
+            position,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        db.insert_loop_spec(&spec).unwrap();
+        spec
+    }
+
+    // ── loop_add_spec / loop_update_spec ─────────────────────────
+
+    #[tokio::test]
+    async fn loop_add_spec_happy_path_and_position_conflict() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+
+        let added = handler
+            .loop_add_spec(Parameters(LoopAddSpecParams {
+                loop_id: lp.id.clone(),
+                name: "First Spec".to_string(),
+                description: Some(valid_spec_description()),
+                position: 1,
+                parallelizable: false,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&added), "{}", text(&added));
+
+        let conflict = handler
+            .loop_add_spec(Parameters(LoopAddSpecParams {
+                loop_id: lp.id.clone(),
+                name: "Second Spec".to_string(),
+                description: Some(valid_spec_description()),
+                position: 1,
+                parallelizable: false,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&conflict));
+        assert!(text(&conflict).contains("already has a spec at position"));
+
+        let missing_desc = handler
+            .loop_add_spec(Parameters(LoopAddSpecParams {
+                loop_id: lp.id.clone(),
+                name: "Third Spec".to_string(),
+                description: None,
+                position: 2,
+                parallelizable: false,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&missing_desc));
+
+        let bad_template = handler
+            .loop_add_spec(Parameters(LoopAddSpecParams {
+                loop_id: lp.id,
+                name: "Fourth Spec".to_string(),
+                description: Some("just a sentence".to_string()),
+                position: 3,
+                parallelizable: false,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&bad_template));
+        assert!(text(&bad_template).contains("missing required sections"));
+    }
+
+    #[tokio::test]
+    async fn loop_update_spec_renames_and_rejects_no_op() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+
+        let updated = handler
+            .loop_update_spec(Parameters(LoopUpdateSpecParams {
+                spec_id: spec.id.clone(),
+                name: Some("New Name".to_string()),
+                description: None,
+                position: None,
+                parallelizable: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&updated), "{}", text(&updated));
+        assert_eq!(
+            db.get_loop_spec(&spec.id).unwrap().unwrap().name,
+            "New Name"
+        );
+
+        let no_op = handler
+            .loop_update_spec(Parameters(LoopUpdateSpecParams {
+                spec_id: spec.id.clone(),
+                name: None,
+                description: None,
+                position: None,
+                parallelizable: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&no_op));
+
+        let missing = handler
+            .loop_update_spec(Parameters(LoopUpdateSpecParams {
+                spec_id: "ghost".to_string(),
+                name: Some("x".to_string()),
+                description: None,
+                position: None,
+                parallelizable: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&missing));
+    }
+
+    // ── spec_create / spec_list / spec_update / spec_set_status / spec_delete
+
+    #[tokio::test]
+    async fn spec_create_and_list_and_update() {
+        let (_dir, db, handler) = endpoint_test_handler();
+
+        let created = handler
+            .spec_create(Parameters(SpecCreateParams {
+                name: "Backlog item".to_string(),
+                description: valid_spec_description(),
+                workdir: Some("/tmp".to_string()),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&created), "{}", text(&created));
+
+        let bad = handler
+            .spec_create(Parameters(SpecCreateParams {
+                name: "Backlog item 2".to_string(),
+                description: "too short".to_string(),
+                workdir: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&bad));
+
+        let listed = handler
+            .spec_list(Parameters(SpecListParams {
+                workdir: None,
+                status: None,
+                unassigned_only: Some(true),
+            }))
+            .await
+            .unwrap();
+        assert!(text(&listed).contains("Backlog item"));
+
+        let bad_status = handler
+            .spec_list(Parameters(SpecListParams {
+                workdir: None,
+                status: Some("sideways".to_string()),
+                unassigned_only: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&bad_status));
+
+        let all_specs = db.list_specs(None, None, false).unwrap();
+        let spec_id = all_specs
+            .iter()
+            .find(|s| s.name == "Backlog item")
+            .unwrap()
+            .id
+            .clone();
+
+        let updated = handler
+            .spec_update(Parameters(SpecUpdateParams {
+                spec_id: spec_id.clone(),
+                name: Some("Renamed backlog item".to_string()),
+                description: None,
+                workdir: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&updated), "{}", text(&updated));
+        assert_eq!(
+            db.get_loop_spec(&spec_id).unwrap().unwrap().name,
+            "Renamed backlog item"
+        );
+    }
+
+    #[tokio::test]
+    async fn spec_set_status_transitions_and_rejects_bound_spec() {
+        let (dir, db, handler) = endpoint_test_handler();
+
+        let standalone = handler
+            .spec_create(Parameters(SpecCreateParams {
+                name: "Standalone".to_string(),
+                description: valid_spec_description(),
+                workdir: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&standalone));
+        let spec_id = db
+            .list_specs(None, None, false)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "Standalone")
+            .unwrap()
+            .id;
+
+        let completed = handler
+            .spec_set_status(Parameters(SpecSetStatusParams {
+                spec_id: spec_id.clone(),
+                status: "completed".to_string(),
+                reason: "manually closed".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&completed), "{}", text(&completed));
+        assert_eq!(
+            db.get_loop_spec(&spec_id).unwrap().unwrap().status,
+            LoopSpecStatus::Completed
+        );
+
+        let empty_reason = handler
+            .spec_set_status(Parameters(SpecSetStatusParams {
+                spec_id: spec_id.clone(),
+                status: "pending".to_string(),
+                reason: "  ".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&empty_reason));
+
+        // A loop-bound spec must be rejected as "not standalone".
+        let lp = insert_test_loop(&db, dir.path());
+        let bound_spec = insert_test_spec(&db, &lp.id, 1);
+        let not_standalone = handler
+            .spec_set_status(Parameters(SpecSetStatusParams {
+                spec_id: bound_spec.id.clone(),
+                status: "completed".to_string(),
+                reason: "trying anyway".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&not_standalone));
+        assert!(text(&not_standalone).contains("bound to loop"));
+
+        let unknown_status = handler
+            .spec_set_status(Parameters(SpecSetStatusParams {
+                spec_id: spec_id.clone(),
+                status: "sideways".to_string(),
+                reason: "x".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&unknown_status));
+    }
+
+    #[tokio::test]
+    async fn spec_delete_removes_standalone_but_refuses_bound_spec() {
+        let (dir, db, handler) = endpoint_test_handler();
+        handler
+            .spec_create(Parameters(SpecCreateParams {
+                name: "Deletable".to_string(),
+                description: valid_spec_description(),
+                workdir: None,
+            }))
+            .await
+            .unwrap();
+        let spec_id = db
+            .list_specs(None, None, false)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "Deletable")
+            .unwrap()
+            .id;
+
+        let deleted = handler
+            .spec_delete(Parameters(SpecDeleteParams {
+                spec_id: spec_id.clone(),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&deleted), "{}", text(&deleted));
+        assert!(db.get_loop_spec(&spec_id).unwrap().is_none());
+
+        let missing = handler
+            .spec_delete(Parameters(SpecDeleteParams {
+                spec_id: "ghost".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&missing));
+
+        let lp = insert_test_loop(&db, dir.path());
+        let bound_spec = insert_test_spec(&db, &lp.id, 1);
+        let refused = handler
+            .spec_delete(Parameters(SpecDeleteParams {
+                spec_id: bound_spec.id,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&refused));
+    }
+
+    // ── blueprint_list / blueprint_create / blueprint_delete ─────
+
+    #[tokio::test]
+    async fn blueprint_create_list_delete_round_trip() {
+        let (_dir, db, handler) = endpoint_test_handler();
+
+        let created = handler
+            .blueprint_create(Parameters(BlueprintCreateParams {
+                name: "my-agent-bp".to_string(),
+                kind: "agent".to_string(),
+                config: agent_node_config("claude"),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&created), "{}", text(&created));
+
+        let duplicate = handler
+            .blueprint_create(Parameters(BlueprintCreateParams {
+                name: "my-agent-bp".to_string(),
+                kind: "agent".to_string(),
+                config: agent_node_config("claude"),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&duplicate));
+        assert!(text(&duplicate).contains("already exists"));
+
+        let bad_kind = handler
+            .blueprint_create(Parameters(BlueprintCreateParams {
+                name: "other-bp".to_string(),
+                kind: "not-a-kind".to_string(),
+                config: agent_node_config("claude"),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&bad_kind));
+
+        let bad_config = handler
+            .blueprint_create(Parameters(BlueprintCreateParams {
+                name: "no-platform-bp".to_string(),
+                kind: "agent".to_string(),
+                config: serde_json::Map::new(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&bad_config));
+
+        let listed = handler.blueprint_list().await.unwrap();
+        assert!(text(&listed).contains("my-agent-bp"));
+        assert!(db
+            .list_blueprints()
+            .unwrap()
+            .iter()
+            .any(|bp| bp.name == "my-agent-bp"));
+
+        let deleted = handler
+            .blueprint_delete(Parameters(BlueprintDeleteParams {
+                name: "my-agent-bp".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&deleted), "{}", text(&deleted));
+        assert!(db.get_blueprint_by_name("my-agent-bp").unwrap().is_none());
+
+        let missing = handler
+            .blueprint_delete(Parameters(BlueprintDeleteParams {
+                name: "ghost-bp".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&missing));
+    }
+
+    // ── loop_add_node / loop_update_node ──────────────────────────
+
+    #[tokio::test]
+    async fn loop_add_node_happy_path_and_invalid_config() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+
+        let added = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Kickoff".to_string(),
+                kind: Some("agent".to_string()),
+                config: Some(agent_node_config("claude")),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&added), "{}", text(&added));
+        assert_eq!(db.list_loop_nodes(&spec.id).unwrap().len(), 1);
+
+        let missing_both_targets = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: None,
+                loop_id: None,
+                name: "Orphan".to_string(),
+                kind: Some("agent".to_string()),
+                config: Some(agent_node_config("claude")),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&missing_both_targets));
+
+        let bad_config = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "No Platform".to_string(),
+                kind: Some("agent".to_string()),
+                config: Some(serde_json::Map::new()),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&bad_config));
+
+        let join_rejected = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: Some(spec.id),
+                loop_id: None,
+                name: "Quorum".to_string(),
+                kind: Some("join".to_string()),
+                config: Some(serde_json::Map::new()),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&join_rejected));
+        assert!(text(&join_rejected).contains("engine-managed"));
+    }
+
+    #[tokio::test]
+    async fn loop_update_node_renames_and_validates() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let node_id = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Node A".to_string(),
+                kind: Some("agent".to_string()),
+                config: Some(agent_node_config("claude")),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        let node_id = extract_id(&node_id, "node_id");
+
+        let renamed = handler
+            .loop_update_node(Parameters(LoopUpdateNodeParams {
+                node_id: node_id.clone(),
+                name: Some("Node A Renamed".to_string()),
+                kind: None,
+                config: None,
+                position: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&renamed), "{}", text(&renamed));
+        assert_eq!(
+            db.get_loop_node(&node_id).unwrap().unwrap().name,
+            "Node A Renamed"
+        );
+
+        let no_op = handler
+            .loop_update_node(Parameters(LoopUpdateNodeParams {
+                node_id: node_id.clone(),
+                name: None,
+                kind: None,
+                config: None,
+                position: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&no_op));
+
+        let missing = handler
+            .loop_update_node(Parameters(LoopUpdateNodeParams {
+                node_id: "ghost".to_string(),
+                name: Some("x".to_string()),
+                kind: None,
+                config: None,
+                position: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&missing));
+    }
+
+    // ── loop_add_edge / loop_update_edge ──────────────────────────
+
+    async fn add_agent_node(handler: &TaskTriggerHandler, spec_id: &str, name: &str) -> String {
+        let result = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: Some(spec_id.to_string()),
+                loop_id: None,
+                name: name.to_string(),
+                kind: Some("agent".to_string()),
+                config: Some(agent_node_config("claude")),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        extract_id(&result, "node_id")
+    }
+
+    #[tokio::test]
+    async fn loop_add_edge_wires_nodes_and_rejects_foreign_node() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let a = add_agent_node(&handler, &spec.id, "A").await;
+        let b = add_agent_node(&handler, &spec.id, "B").await;
+
+        let edge = handler
+            .loop_add_edge(Parameters(LoopAddEdgeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                from_node: a.clone(),
+                to_node: b.clone(),
+                condition: "always".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&edge), "{}", text(&edge));
+        assert_eq!(db.list_loop_edges(&spec.id).unwrap().len(), 1);
+
+        let foreign = handler
+            .loop_add_edge(Parameters(LoopAddEdgeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                from_node: a.clone(),
+                to_node: "not-a-real-node".to_string(),
+                condition: "always".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&foreign));
+
+        let bad_condition = handler
+            .loop_add_edge(Parameters(LoopAddEdgeParams {
+                spec_id: Some(spec.id),
+                loop_id: None,
+                from_node: a,
+                to_node: b,
+                condition: "sideways".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&bad_condition));
+
+        let edges = db
+            .list_loop_edges(&db.list_loop_specs(&lp.id).unwrap()[0].id)
+            .unwrap();
+        let edge_id = edges[0].id.clone();
+        let updated = handler
+            .loop_update_edge(Parameters(LoopUpdateEdgeParams {
+                edge_id: edge_id.clone(),
+                condition: "fail".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&updated), "{}", text(&updated));
+
+        let same_condition = handler
+            .loop_update_edge(Parameters(LoopUpdateEdgeParams {
+                edge_id: edge_id.clone(),
+                condition: "fail".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&same_condition));
+        assert!(text(&same_condition).contains("already uses condition"));
+
+        let missing_edge = handler
+            .loop_update_edge(Parameters(LoopUpdateEdgeParams {
+                edge_id: "ghost-edge".to_string(),
+                condition: "pass".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&missing_edge));
+    }
+
+    // ── loop_add_ensemble ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn loop_add_ensemble_happy_path_and_validation_errors() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let entry = add_agent_node(&handler, &spec.id, "Entry").await;
+        let arbiter = add_agent_node(&handler, &spec.id, "Arbiter").await;
+
+        let members = vec![
+            crate::daemon::params::EnsembleMemberParams {
+                platform: "claude".to_string(),
+                model: None,
+            },
+            crate::daemon::params::EnsembleMemberParams {
+                platform: "opencode".to_string(),
+                model: None,
+            },
+        ];
+
+        let created = handler
+            .loop_add_ensemble(Parameters(LoopAddEnsembleParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Review Ensemble".to_string(),
+                prompt_template: Some("Review {{spec_name}}".to_string()),
+                members: Some(members.clone()),
+                blueprint: None,
+                from_node: entry.clone(),
+                condition: "always".to_string(),
+                min_pass: Some(2),
+                straggler_timeout_minutes: None,
+                timeout_minutes: None,
+                on_pass_to: arbiter.clone(),
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&created), "{}", text(&created));
+        assert_eq!(db.list_ensembles_for_spec(&spec.id).unwrap().len(), 1);
+
+        let missing_prompt = handler
+            .loop_add_ensemble(Parameters(LoopAddEnsembleParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "No Prompt".to_string(),
+                prompt_template: None,
+                members: Some(members.clone()),
+                blueprint: None,
+                from_node: entry.clone(),
+                condition: "always".to_string(),
+                min_pass: None,
+                straggler_timeout_minutes: None,
+                timeout_minutes: None,
+                on_pass_to: arbiter.clone(),
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&missing_prompt));
+        assert!(text(&missing_prompt).contains("prompt_template"));
+
+        let bad_min_pass = handler
+            .loop_add_ensemble(Parameters(LoopAddEnsembleParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Bad Min Pass".to_string(),
+                prompt_template: Some("Review".to_string()),
+                members: Some(members.clone()),
+                blueprint: None,
+                from_node: entry.clone(),
+                condition: "always".to_string(),
+                min_pass: Some(99),
+                straggler_timeout_minutes: None,
+                timeout_minutes: None,
+                on_pass_to: arbiter.clone(),
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&bad_min_pass));
+        assert!(text(&bad_min_pass).contains("min_pass must be between"));
+
+        let unknown_entry = handler
+            .loop_add_ensemble(Parameters(LoopAddEnsembleParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Bad Entry".to_string(),
+                prompt_template: Some("Review".to_string()),
+                members: Some(members.clone()),
+                blueprint: None,
+                from_node: "not-a-node".to_string(),
+                condition: "always".to_string(),
+                min_pass: None,
+                straggler_timeout_minutes: None,
+                timeout_minutes: None,
+                on_pass_to: arbiter.clone(),
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&unknown_entry));
+        assert!(text(&unknown_entry).contains("not found in the target graph"));
+
+        let too_few_members = handler
+            .loop_add_ensemble(Parameters(LoopAddEnsembleParams {
+                spec_id: Some(spec.id),
+                loop_id: None,
+                name: "Too Few".to_string(),
+                prompt_template: Some("Review".to_string()),
+                members: Some(vec![members[0].clone()]),
+                blueprint: None,
+                from_node: entry,
+                condition: "always".to_string(),
+                min_pass: None,
+                straggler_timeout_minutes: None,
+                timeout_minutes: None,
+                on_pass_to: arbiter,
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&too_few_members));
     }
 }
