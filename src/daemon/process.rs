@@ -259,4 +259,58 @@ mod tests {
             second.err()
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_process_running_returns_true_for_current_process() {
+        let current_pid = std::process::id();
+        assert!(
+            is_process_running(current_pid),
+            "current process should be running"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_process_running_returns_false_for_invalid_pid() {
+        // Very large PID that's unlikely to exist
+        assert!(
+            !is_process_running(999999999),
+            "nonexistent PID should not be reported as running"
+        );
+        // Negative PIDs are invalid (but the function takes u32, so we can't test negative)
+        // Instead test a PID that's definitely not running
+        assert!(
+            !is_process_running(4294967294),
+            "nonexistent high PID should not be reported as running"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_pids_from_ss_extracts_pids_from_ss_output() {
+        let ss_output = r#"State   Recv-Q  Send-Q  Local Address:Port  Peer Address:Port  Process
+LISTEN  0       128     0.0.0.0:8080        0.0.0.0:*            users:(("nginx",pid=1234,fd=6))
+LISTEN  0       128     0.0.0.0:9090        0.0.0.0:*            users:(("node",pid=5678,fd=12))
+"#;
+        let pids = parse_pids_from_ss(ss_output);
+        assert_eq!(pids, vec![1234, 5678]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_pids_from_ss_handles_empty_output() {
+        let pids = parse_pids_from_ss("");
+        assert!(pids.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_pids_from_ss_handles_no_pid_field() {
+        let ss_output = r#"State   Recv-Q  Send-Q  Local Address:Port  Peer Address:Port
+LISTEN  0       128     0.0.0.0:8080        0.0.0.0:*
+"#;
+        let pids = parse_pids_from_ss(ss_output);
+        assert!(pids.is_empty());
+    }
 }
