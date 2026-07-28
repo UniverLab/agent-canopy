@@ -2324,17 +2324,19 @@ mod tests {
         use ratatui::Terminal;
         let backend = TestBackend::new(20, 1);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| {
-            let area = Rect::new(0, 0, 20, 1);
-            render_sidebar_card_line(
-                frame,
-                area,
-                0,
-                Color::Reset,
-                STATUS_OK,
-                vec![Span::raw("test")],
-            );
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, 20, 1);
+                render_sidebar_card_line(
+                    frame,
+                    area,
+                    0,
+                    Color::Reset,
+                    STATUS_OK,
+                    vec![Span::raw("test")],
+                );
+            })
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let mut text = String::new();
         for x in 0..buffer.area.width {
@@ -2349,18 +2351,20 @@ mod tests {
         use ratatui::Terminal;
         let backend = TestBackend::new(20, 2);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| {
-            let area = Rect::new(0, 0, 20, 2);
-            // line_offset=2 is beyond height, should not panic
-            render_sidebar_card_line(
-                frame,
-                area,
-                2,
-                Color::Reset,
-                STATUS_OK,
-                vec![Span::raw("test")],
-            );
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, 20, 2);
+                // line_offset=2 is beyond height, should not panic
+                render_sidebar_card_line(
+                    frame,
+                    area,
+                    2,
+                    Color::Reset,
+                    STATUS_OK,
+                    vec![Span::raw("test")],
+                );
+            })
+            .unwrap();
     }
 
     #[test]
@@ -2523,9 +2527,11 @@ mod tests {
         let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
         let backend = TestBackend::new(33, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| {
-            draw_sidebar(frame, frame.area(), &mut app, &Theme::classic());
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_sidebar(frame, frame.area(), &mut app, &Theme::classic());
+            })
+            .unwrap();
     }
 
     #[test]
@@ -2541,8 +2547,10 @@ mod tests {
         let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
         let backend = TestBackend::new(33, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| {
-            draw_sidebar(frame, frame.area(), &mut app, &Theme::modern());
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_sidebar(frame, frame.area(), &mut app, &Theme::modern());
+            })
+            .unwrap();
     }
 }

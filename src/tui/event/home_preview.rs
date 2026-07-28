@@ -411,14 +411,22 @@ mod playground_key_tests {
     fn playground_inactive_returns_false() {
         let mut app = app_with_agents();
         app.playground_active = false;
-        assert!(!handle_playground_key(&mut app, KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(!handle_playground_key(
+            &mut app,
+            KeyCode::Char('a'),
+            KeyModifiers::NONE
+        ));
     }
 
     #[test]
     fn playground_active_returns_true_for_any_key() {
         let mut app = app_with_agents();
         app.playground_active = true;
-        assert!(handle_playground_key(&mut app, KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(handle_playground_key(
+            &mut app,
+            KeyCode::Char('a'),
+            KeyModifiers::NONE
+        ));
     }
 
     #[test]
@@ -922,7 +930,10 @@ mod preview_key_tests {
         let mut app = app_with_agents();
         app.focus = Focus::Preview;
         app.sidebar_layer = SidebarLayer::Automation;
-        app.agents = vec![AgentEntry::Agent(cron_agent("a1")), AgentEntry::Agent(cron_agent("a2"))];
+        app.agents = vec![
+            AgentEntry::Agent(cron_agent("a1")),
+            AgentEntry::Agent(cron_agent("a2")),
+        ];
         app.selected = 0;
         handle_preview_key(&mut app, KeyCode::Down, KeyModifiers::NONE).unwrap();
         assert_eq!(app.selected, 1);
@@ -933,7 +944,10 @@ mod preview_key_tests {
         let mut app = app_with_agents();
         app.focus = Focus::Preview;
         app.sidebar_layer = SidebarLayer::Automation;
-        app.agents = vec![AgentEntry::Agent(cron_agent("a1")), AgentEntry::Agent(cron_agent("a2"))];
+        app.agents = vec![
+            AgentEntry::Agent(cron_agent("a1")),
+            AgentEntry::Agent(cron_agent("a2")),
+        ];
         app.selected = 1;
         handle_preview_key(&mut app, KeyCode::Up, KeyModifiers::NONE).unwrap();
         assert_eq!(app.selected, 0);
@@ -944,7 +958,10 @@ mod preview_key_tests {
         let mut app = app_with_agents();
         app.focus = Focus::Preview;
         app.sidebar_layer = SidebarLayer::Automation;
-        app.agents = vec![AgentEntry::Agent(cron_agent("a1")), AgentEntry::Agent(cron_agent("a2"))];
+        app.agents = vec![
+            AgentEntry::Agent(cron_agent("a1")),
+            AgentEntry::Agent(cron_agent("a2")),
+        ];
         app.selected = 0;
         handle_preview_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE).unwrap();
         assert_eq!(app.selected, 1);
@@ -955,7 +972,10 @@ mod preview_key_tests {
         let mut app = app_with_agents();
         app.focus = Focus::Preview;
         app.sidebar_layer = SidebarLayer::Automation;
-        app.agents = vec![AgentEntry::Agent(cron_agent("a1")), AgentEntry::Agent(cron_agent("a2"))];
+        app.agents = vec![
+            AgentEntry::Agent(cron_agent("a1")),
+            AgentEntry::Agent(cron_agent("a2")),
+        ];
         app.selected = 1;
         handle_preview_key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE).unwrap();
         assert_eq!(app.selected, 0);

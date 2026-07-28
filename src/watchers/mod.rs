@@ -707,5 +707,4 @@ mod tests {
         ));
         assert_eq!(map_event_kind(&kind, "test"), Some(WatchEvent::Move));
     }
-
 }

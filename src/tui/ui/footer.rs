@@ -330,13 +330,19 @@ mod tests {
         App::new(db, data_dir.path()).unwrap()
     }
 
-    fn render_footer_to_text(width: u16, height: u16, draw: impl FnOnce(&mut ratatui::Frame, Rect)) -> String {
+    fn render_footer_to_text(
+        width: u16,
+        height: u16,
+        draw: impl FnOnce(&mut ratatui::Frame, Rect),
+    ) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| {
-            let area = frame.area();
-            draw(frame, area);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw(frame, area);
+            })
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let mut text = String::new();
         for y in 0..buffer.area.height {
@@ -356,8 +362,14 @@ mod tests {
         let text = render_footer_to_text(80, 1, |frame, area| {
             draw_footer(frame, area, &app, &theme);
         });
-        assert!(text.contains("select"), "Home footer should show 'select': {text}");
-        assert!(text.contains("new"), "Home footer should show 'new': {text}");
+        assert!(
+            text.contains("select"),
+            "Home footer should show 'select': {text}"
+        );
+        assert!(
+            text.contains("new"),
+            "Home footer should show 'new': {text}"
+        );
     }
 
     #[test]
@@ -368,7 +380,10 @@ mod tests {
         let text = render_footer_to_text(80, 1, |frame, area| {
             draw_footer(frame, area, &app, &theme);
         });
-        assert!(text.contains("nav"), "Preview footer should show 'nav': {text}");
+        assert!(
+            text.contains("nav"),
+            "Preview footer should show 'nav': {text}"
+        );
     }
 
     #[test]
@@ -379,8 +394,14 @@ mod tests {
         let text = render_footer_to_text(80, 1, |frame, area| {
             draw_footer(frame, area, &app, &theme);
         });
-        assert!(text.contains("fields"), "NewAgentDialog footer should show 'fields': {text}");
-        assert!(text.contains("cancel"), "NewAgentDialog footer should show 'cancel': {text}");
+        assert!(
+            text.contains("fields"),
+            "NewAgentDialog footer should show 'fields': {text}"
+        );
+        assert!(
+            text.contains("cancel"),
+            "NewAgentDialog footer should show 'cancel': {text}"
+        );
     }
 
     #[test]
@@ -391,7 +412,10 @@ mod tests {
         let text = render_footer_to_text(80, 1, |frame, area| {
             draw_footer(frame, area, &app, &theme);
         });
-        assert!(text.contains("mission"), "LaunchpadDialog footer should show 'mission': {text}");
+        assert!(
+            text.contains("mission"),
+            "LaunchpadDialog footer should show 'mission': {text}"
+        );
     }
 
     #[test]
@@ -402,7 +426,10 @@ mod tests {
         let text = render_footer_to_text(80, 1, |frame, area| {
             draw_footer(frame, area, &app, &theme);
         });
-        assert!(text.contains("select"), "ContextTransfer footer should show 'select': {text}");
+        assert!(
+            text.contains("select"),
+            "ContextTransfer footer should show 'select': {text}"
+        );
     }
 
     #[test]
@@ -413,7 +440,10 @@ mod tests {
         let text = render_footer_to_text(80, 1, |frame, area| {
             draw_footer(frame, area, &app, &theme);
         });
-        assert!(text.contains("transfer"), "RagTransfer footer should show 'transfer': {text}");
+        assert!(
+            text.contains("transfer"),
+            "RagTransfer footer should show 'transfer': {text}"
+        );
     }
 
     #[test]
@@ -424,7 +454,10 @@ mod tests {
         let text = render_footer_to_text(80, 1, |frame, area| {
             draw_footer(frame, area, &app, &theme);
         });
-        assert!(text.contains("send"), "PromptTemplateDialog footer should show 'send': {text}");
+        assert!(
+            text.contains("send"),
+            "PromptTemplateDialog footer should show 'send': {text}"
+        );
     }
 
     #[test]
@@ -435,7 +468,10 @@ mod tests {
         let text = render_footer_to_text(80, 1, |frame, area| {
             draw_footer(frame, area, &app, &theme);
         });
-        assert!(text.contains("save"), "LoopEditorDialog footer should show 'save': {text}");
+        assert!(
+            text.contains("save"),
+            "LoopEditorDialog footer should show 'save': {text}"
+        );
     }
 
     #[test]
@@ -446,7 +482,10 @@ mod tests {
         let text = render_footer_to_text(80, 1, |frame, area| {
             draw_footer(frame, area, &app, &theme);
         });
-        assert!(text.contains("field"), "LoopFormDialog footer should show 'field': {text}");
+        assert!(
+            text.contains("field"),
+            "LoopFormDialog footer should show 'field': {text}"
+        );
     }
 
     #[test]
@@ -457,7 +496,10 @@ mod tests {
         let text = render_footer_to_text(80, 1, |frame, area| {
             draw_footer(frame, area, &app, &theme);
         });
-        assert!(text.contains("relation"), "ProjectRelationDialog footer should show 'relation': {text}");
+        assert!(
+            text.contains("relation"),
+            "ProjectRelationDialog footer should show 'relation': {text}"
+        );
     }
 
     #[test]
@@ -468,7 +510,10 @@ mod tests {
         let text = render_footer_to_text(80, 1, |frame, area| {
             draw_footer(frame, area, &app, &theme);
         });
-        assert!(text.contains("toggle"), "KnowledgeDialog footer should show 'toggle': {text}");
+        assert!(
+            text.contains("toggle"),
+            "KnowledgeDialog footer should show 'toggle': {text}"
+        );
     }
 
     #[test]
@@ -479,7 +524,10 @@ mod tests {
         let text = render_footer_to_text(80, 1, |frame, area| {
             draw_footer(frame, area, &app, &theme);
         });
-        assert!(text.contains("preview"), "Agent footer should show 'preview': {text}");
+        assert!(
+            text.contains("preview"),
+            "Agent footer should show 'preview': {text}"
+        );
     }
 
     #[test]
@@ -491,8 +539,14 @@ mod tests {
         let text = render_footer_to_text(80, 1, |frame, area| {
             draw_footer(frame, area, &app, &theme);
         });
-        assert!(text.contains("tab"), "Knowledge Agent footer should show 'tab': {text}");
-        assert!(text.contains("back"), "Knowledge Agent footer should show 'back': {text}");
+        assert!(
+            text.contains("tab"),
+            "Knowledge Agent footer should show 'tab': {text}"
+        );
+        assert!(
+            text.contains("back"),
+            "Knowledge Agent footer should show 'back': {text}"
+        );
     }
 
     #[test]
@@ -504,7 +558,10 @@ mod tests {
         let text = render_footer_to_text(80, 1, |frame, area| {
             draw_footer(frame, area, &app, &theme);
         });
-        assert!(text.contains("v1.0.0"), "Footer should show version: {text}");
+        assert!(
+            text.contains("v1.0.0"),
+            "Footer should show version: {text}"
+        );
     }
 
     #[test]
@@ -517,7 +574,10 @@ mod tests {
             draw_footer(frame, area, &app, &theme);
         });
         // Should still render hints even without version
-        assert!(text.contains("select"), "Footer should still show hints: {text}");
+        assert!(
+            text.contains("select"),
+            "Footer should still show hints: {text}"
+        );
     }
 
     #[test]
@@ -548,8 +608,14 @@ mod tests {
         let text = render_footer_to_text(80, 1, |frame, area| {
             draw_footer(frame, area, &app, &theme);
         });
-        assert!(text.contains("session-a"), "Split footer should show session-a: {text}");
-        assert!(text.contains("session-b"), "Split footer should show session-b: {text}");
+        assert!(
+            text.contains("session-a"),
+            "Split footer should show session-a: {text}"
+        );
+        assert!(
+            text.contains("session-b"),
+            "Split footer should show session-b: {text}"
+        );
     }
 
     #[test]
@@ -561,7 +627,10 @@ mod tests {
         let text = render_footer_to_text(80, 1, |frame, area| {
             draw_footer(frame, area, &app, &theme);
         });
-        assert!(text.contains("search"), "Playground footer should show 'search': {text}");
+        assert!(
+            text.contains("search"),
+            "Playground footer should show 'search': {text}"
+        );
     }
 
     #[test]
@@ -573,7 +642,10 @@ mod tests {
         let text = render_footer_to_text(80, 1, |frame, area| {
             draw_footer(frame, area, &app, &theme);
         });
-        assert!(text.contains("highlight"), "Knowledge preview should show 'highlight': {text}");
+        assert!(
+            text.contains("highlight"),
+            "Knowledge preview should show 'highlight': {text}"
+        );
     }
 
     #[test]
@@ -585,6 +657,9 @@ mod tests {
         let text = render_footer_to_text(80, 1, |frame, area| {
             draw_footer(frame, area, &app, &theme);
         });
-        assert!(text.contains("search"), "Agent playground footer should show 'search': {text}");
+        assert!(
+            text.contains("search"),
+            "Agent playground footer should show 'search': {text}"
+        );
     }
 }

@@ -2123,25 +2123,22 @@ mod should_expand_tests {
     #[test]
     fn char_keys_expand() {
         assert!(should_expand_on_key(KeyCode::Char('a'), KeyModifiers::NONE));
-        assert!(should_expand_on_key(KeyCode::Char('z'), KeyModifiers::SHIFT));
+        assert!(should_expand_on_key(
+            KeyCode::Char('z'),
+            KeyModifiers::SHIFT
+        ));
         assert!(should_expand_on_key(KeyCode::Char(' '), KeyModifiers::NONE));
     }
 
     #[test]
     fn backspace_and_delete_expand() {
-        assert!(should_expand_on_key(
-            KeyCode::Backspace,
-            KeyModifiers::NONE
-        ));
+        assert!(should_expand_on_key(KeyCode::Backspace, KeyModifiers::NONE));
         assert!(should_expand_on_key(KeyCode::Delete, KeyModifiers::NONE));
     }
 
     #[test]
     fn enter_with_modifier_expands() {
-        assert!(should_expand_on_key(
-            KeyCode::Enter,
-            KeyModifiers::CONTROL
-        ));
+        assert!(should_expand_on_key(KeyCode::Enter, KeyModifiers::CONTROL));
     }
 
     #[test]
@@ -2156,23 +2153,14 @@ mod should_expand_tests {
         assert!(!should_expand_on_key(KeyCode::Left, KeyModifiers::NONE));
         assert!(!should_expand_on_key(KeyCode::Right, KeyModifiers::NONE));
         assert!(!should_expand_on_key(KeyCode::Tab, KeyModifiers::NONE));
-        assert!(!should_expand_on_key(
-            KeyCode::BackTab,
-            KeyModifiers::SHIFT
-        ));
+        assert!(!should_expand_on_key(KeyCode::BackTab, KeyModifiers::SHIFT));
     }
 
     #[test]
     fn other_keys_do_not_expand() {
         assert!(!should_expand_on_key(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(!should_expand_on_key(
-            KeyCode::PageUp,
-            KeyModifiers::NONE
-        ));
-        assert!(!should_expand_on_key(
-            KeyCode::PageDown,
-            KeyModifiers::NONE
-        ));
+        assert!(!should_expand_on_key(KeyCode::PageUp, KeyModifiers::NONE));
+        assert!(!should_expand_on_key(KeyCode::PageDown, KeyModifiers::NONE));
         assert!(!should_expand_on_key(KeyCode::Home, KeyModifiers::NONE));
         assert!(!should_expand_on_key(KeyCode::End, KeyModifiers::NONE));
     }
@@ -2207,7 +2195,10 @@ mod focused_section_name_tests {
         dialog.focused_section = 5;
         let name = focused_section_name(&mut dialog);
         assert!(name.is_some());
-        assert_eq!(dialog.focused_section, 1, "should be clamped to valid index");
+        assert_eq!(
+            dialog.focused_section, 1,
+            "should be clamped to valid index"
+        );
     }
 
     #[test]
@@ -2393,11 +2384,7 @@ mod picker_navigation_tests {
         dialog.picker_mode = SectionPickerMode::AddCustom {
             input: "abc".into(),
         };
-        handle_add_custom_section_key(
-            &mut dialog,
-            "abc".into(),
-            KeyCode::Backspace,
-        );
+        handle_add_custom_section_key(&mut dialog, "abc".into(), KeyCode::Backspace);
         if let SectionPickerMode::AddCustom { input } = &dialog.picker_mode {
             assert_eq!(input, "ab");
         } else {
@@ -2452,14 +2439,7 @@ mod picker_navigation_tests {
         dialog.picker_mode = SectionPickerMode::AddSection { selected: 0 };
         let db = test_db();
         let workdir = Path::new("/tmp");
-        handle_add_section_picker_key(
-            &mut dialog,
-            0,
-            &db,
-            workdir,
-            KeyCode::Char('c'),
-        )
-        .unwrap();
+        handle_add_section_picker_key(&mut dialog, 0, &db, workdir, KeyCode::Char('c')).unwrap();
         assert!(matches!(
             dialog.picker_mode,
             SectionPickerMode::AddCustom { .. }

@@ -854,10 +854,7 @@ mod is_direct_submit_edge_cases {
 
     #[test]
     fn shift_enter_is_not() {
-        assert!(is_direct_submit(
-            KeyCode::Enter,
-            KeyModifiers::SHIFT
-        ));
+        assert!(is_direct_submit(KeyCode::Enter, KeyModifiers::SHIFT));
     }
 }
 

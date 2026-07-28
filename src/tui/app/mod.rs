@@ -3089,7 +3089,9 @@ mod tests {
     };
     use crate::db::session::InteractiveSession;
     use crate::db::Database;
-    use crate::tui::app::types::{AgentEntry, App, AutomationKind, Focus, ProjectTab, SidebarLayer};
+    use crate::tui::app::types::{
+        AgentEntry, App, AutomationKind, Focus, ProjectTab, SidebarLayer,
+    };
     use std::sync::Arc;
     use tempfile::{tempdir, NamedTempFile};
 
@@ -4127,19 +4129,17 @@ mod tests {
         let db = test_db();
         let data_dir = tempdir().expect("create data dir");
         let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
-        app.project_knowledge = vec![
-            crate::db::intelligence::IntelligenceNodeRecord {
-                id: "n1".into(),
-                kind: "fact".into(),
-                title: "Title".into(),
-                body: "contains the word pattern".into(),
-                metadata: None,
-                project_hash: None,
-                session_id: None,
-                created_at: chrono::Utc::now().timestamp(),
-                updated_at: chrono::Utc::now().timestamp(),
-            },
-        ];
+        app.project_knowledge = vec![crate::db::intelligence::IntelligenceNodeRecord {
+            id: "n1".into(),
+            kind: "fact".into(),
+            title: "Title".into(),
+            body: "contains the word pattern".into(),
+            metadata: None,
+            project_hash: None,
+            session_id: None,
+            created_at: chrono::Utc::now().timestamp(),
+            updated_at: chrono::Utc::now().timestamp(),
+        }];
         app.knowledge_filter = "pattern".to_string();
         let indices = app.filtered_knowledge_indices();
         assert_eq!(indices, vec![0]);

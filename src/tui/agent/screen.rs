@@ -627,7 +627,10 @@ mod tests {
 
     #[test]
     fn from_vt100_default_color() {
-        assert_eq!(from_vt100(vt100::Color::Default), ratatui::style::Color::Reset);
+        assert_eq!(
+            from_vt100(vt100::Color::Default),
+            ratatui::style::Color::Reset
+        );
     }
 
     #[test]

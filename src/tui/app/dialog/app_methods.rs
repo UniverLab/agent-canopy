@@ -1367,7 +1367,8 @@ mod tests {
         dialog.prompt = String::new();
         dialog.task_type = NewTaskType::Background;
         dialog.background_trigger = BackgroundTrigger::Cron;
-        app.launch_scheduled(&dialog, None).expect("should not error");
+        app.launch_scheduled(&dialog, None)
+            .expect("should not error");
         // No agent should have been created
         let agents = db.list_agents().unwrap();
         assert!(agents.is_empty());

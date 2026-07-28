@@ -1181,10 +1181,7 @@ mod tests {
 
     #[test]
     fn strip_ansi_codes_color256() {
-        assert_eq!(
-            strip_ansi_codes("\x1b[38;5;42mhello\x1b[0m"),
-            "hello"
-        );
+        assert_eq!(strip_ansi_codes("\x1b[38;5;42mhello\x1b[0m"), "hello");
     }
 
     #[test]

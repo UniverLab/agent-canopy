@@ -2901,8 +2901,14 @@ mod tests {
 
     #[test]
     fn section_type_instruction() {
-        assert_eq!(SimplePromptDialog::section_type("instruction_1"), "instruction");
-        assert_eq!(SimplePromptDialog::section_type("instruction"), "instruction");
+        assert_eq!(
+            SimplePromptDialog::section_type("instruction_1"),
+            "instruction"
+        );
+        assert_eq!(
+            SimplePromptDialog::section_type("instruction"),
+            "instruction"
+        );
     }
 
     #[test]
@@ -2912,24 +2918,36 @@ mod tests {
 
     #[test]
     fn section_type_unknown() {
-        assert_eq!(SimplePromptDialog::section_type("custom_thing"), "custom_thing");
+        assert_eq!(
+            SimplePromptDialog::section_type("custom_thing"),
+            "custom_thing"
+        );
     }
 
     // ── section_matches_prefix ───────────────────────────────────
 
     #[test]
     fn section_matches_prefix_exact() {
-        assert!(SimplePromptDialog::section_matches_prefix("instruction", "instruction"));
+        assert!(SimplePromptDialog::section_matches_prefix(
+            "instruction",
+            "instruction"
+        ));
     }
 
     #[test]
     fn section_matches_prefix_with_suffix() {
-        assert!(SimplePromptDialog::section_matches_prefix("instruction_1", "instruction"));
+        assert!(SimplePromptDialog::section_matches_prefix(
+            "instruction_1",
+            "instruction"
+        ));
     }
 
     #[test]
     fn section_matches_prefix_no_match() {
-        assert!(!SimplePromptDialog::section_matches_prefix("context_1", "instruction"));
+        assert!(!SimplePromptDialog::section_matches_prefix(
+            "context_1",
+            "instruction"
+        ));
     }
 
     // ── is_tools_section ─────────────────────────────────────────
@@ -2981,8 +2999,7 @@ mod tests {
 
     #[test]
     fn resolve_rag_scope_project_prefix() {
-        let (scope, query) =
-            SimplePromptDialog::resolve_rag_scope("project:abc123:my query", None);
+        let (scope, query) = SimplePromptDialog::resolve_rag_scope("project:abc123:my query", None);
         assert!(matches!(scope, RagScope::Project("abc123")));
         assert_eq!(query, "my query");
     }
@@ -3173,7 +3190,10 @@ mod tests {
         dialog.send_edit.as_mut().unwrap().field = 2; // day
         dialog.send_edit_adjust(1);
         let edit = dialog.send_edit.unwrap();
-        assert_eq!(edit.value.day(), chrono::Local::now().naive_local().day() + 1);
+        assert_eq!(
+            edit.value.day(),
+            chrono::Local::now().naive_local().day() + 1
+        );
     }
 
     #[test]
@@ -3309,7 +3329,10 @@ mod tests {
     #[test]
     fn collect_tool_lines_with_content() {
         let mut dialog = SimplePromptDialog::new();
-        dialog.add_section_with_content("tools", "skill:code-engineering\nskill:rust-idiomatic".to_string());
+        dialog.add_section_with_content(
+            "tools",
+            "skill:code-engineering\nskill:rust-idiomatic".to_string(),
+        );
         let lines = dialog.collect_tool_lines();
         assert_eq!(lines.len(), 2);
     }
@@ -3469,10 +3492,9 @@ mod tests {
     fn expand_collapsed_paste_restores_content() {
         let mut dialog = SimplePromptDialog::new();
         dialog.set_section_content("instruction_1", "[Pasted ~2 lines]".to_string());
-        dialog.collapsed_pastes.insert(
-            "instruction_1".to_string(),
-            "real\ncontent".to_string(),
-        );
+        dialog
+            .collapsed_pastes
+            .insert("instruction_1".to_string(), "real\ncontent".to_string());
         dialog.expand_collapsed_paste("instruction_1");
         assert_eq!(dialog.get_section_content("instruction_1"), "real\ncontent");
         assert!(!dialog.has_collapsed_paste("instruction_1"));
@@ -3556,11 +3578,7 @@ mod tests {
             .iter()
             .any(|id| id.starts_with("resources")));
         assert_eq!(
-            dialog.get_section_content(
-                &dialog
-                    .resources_section_id()
-                    .unwrap()
-            ),
+            dialog.get_section_content(&dialog.resources_section_id().unwrap()),
             "/path/to/file"
         );
     }
@@ -3810,14 +3828,18 @@ mod tests {
     #[test]
     fn cursor_returns_stored_value() {
         let mut dialog = SimplePromptDialog::new();
-        dialog.section_cursors.insert("instruction_1".to_string(), 5);
+        dialog
+            .section_cursors
+            .insert("instruction_1".to_string(), 5);
         assert_eq!(dialog.cursor("instruction_1"), 5);
     }
 
     #[test]
     fn scroll_returns_stored_value() {
         let mut dialog = SimplePromptDialog::new();
-        dialog.section_scrolls.insert("instruction_1".to_string(), 3);
+        dialog
+            .section_scrolls
+            .insert("instruction_1".to_string(), 3);
         assert_eq!(dialog.scroll("instruction_1"), 3);
     }
 
@@ -4141,8 +4163,7 @@ mod tests {
     #[test]
     fn get_file_reference_with_styling_no_refs() {
         let dialog = SimplePromptDialog::new();
-        let result =
-            dialog.get_file_reference_with_styling("hello world", Color::Blue);
+        let result = dialog.get_file_reference_with_styling("hello world", Color::Blue);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, "hello world");
         assert!(result[0].1.is_none());
@@ -4151,8 +4172,7 @@ mod tests {
     #[test]
     fn get_file_reference_with_styling_with_ref() {
         let dialog = SimplePromptDialog::new();
-        let result =
-            dialog.get_file_reference_with_styling("look @src/lib.rs here", Color::Blue);
+        let result = dialog.get_file_reference_with_styling("look @src/lib.rs here", Color::Blue);
         // "look " + "@src/lib.rs" + " here"
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].0, "look ");
@@ -4166,8 +4186,7 @@ mod tests {
     #[test]
     fn get_file_reference_with_styling_invalid_ref() {
         let dialog = SimplePromptDialog::new();
-        let result =
-            dialog.get_file_reference_with_styling("@ invalid", Color::Blue);
+        let result = dialog.get_file_reference_with_styling("@ invalid", Color::Blue);
         // "@" is a valid ref start but "invalid" is part of " @ invalid"
         // Actually: next_file_reference finds @ at position 0, ref = "@", which has
         // len 1 and starts with @, so is_file_reference returns false.
@@ -4234,10 +4253,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let db_path = temp.path().join("canopy.db");
         let db = Database::new(&db_path).unwrap();
-        let result = SimplePromptDialog::resolve_resource_entry(
-            &db,
-            "https://example.com/doc",
-        );
+        let result = SimplePromptDialog::resolve_resource_entry(&db, "https://example.com/doc");
         assert!(result.contains("https://example.com/doc"));
         assert!(result.contains("kind: url"));
     }

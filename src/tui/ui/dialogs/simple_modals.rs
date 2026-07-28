@@ -196,8 +196,8 @@ mod tests {
 
     #[test]
     fn draw_quit_confirm_renders_without_panic() {
-        use crate::tui::app::types::App;
         use crate::db::Database;
+        use crate::tui::app::types::App;
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         use std::sync::Arc;
@@ -212,15 +212,17 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let theme = Theme::classic();
-        terminal.draw(|frame| {
-            draw_quit_confirm(frame, &theme);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_quit_confirm(frame, &theme);
+            })
+            .unwrap();
     }
 
     #[test]
     fn draw_delete_project_confirm_renders_without_panic() {
-        use crate::tui::app::types::App;
         use crate::db::Database;
+        use crate::tui::app::types::App;
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         use std::sync::Arc;
@@ -235,15 +237,17 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let theme = Theme::classic();
-        terminal.draw(|frame| {
-            draw_delete_project_confirm(frame, &theme);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_delete_project_confirm(frame, &theme);
+            })
+            .unwrap();
     }
 
     #[test]
     fn draw_delete_loop_confirm_renders_without_panic() {
-        use crate::tui::app::types::App;
         use crate::db::Database;
+        use crate::tui::app::types::App;
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         use std::sync::Arc;
@@ -258,9 +262,11 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let theme = Theme::classic();
-        terminal.draw(|frame| {
-            draw_delete_loop_confirm(frame, &theme);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_delete_loop_confirm(frame, &theme);
+            })
+            .unwrap();
     }
 
     #[test]
@@ -271,9 +277,11 @@ mod tests {
         let backend = TestBackend::new(30, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         let theme = Theme::classic();
-        terminal.draw(|frame| {
-            draw_modal_confirm(frame, " Title ", "Short text", &theme);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_modal_confirm(frame, " Title ", "Short text", &theme);
+            })
+            .unwrap();
     }
 
     #[test]
@@ -284,9 +292,11 @@ mod tests {
         let backend = TestBackend::new(10, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         let theme = Theme::classic();
-        terminal.draw(|frame| {
-            draw_modal_confirm(frame, " Title ", "Text", &theme);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_modal_confirm(frame, " Title ", "Text", &theme);
+            })
+            .unwrap();
     }
 
     #[test]
@@ -297,10 +307,13 @@ mod tests {
         let backend = TestBackend::new(40, 15);
         let mut terminal = Terminal::new(backend).unwrap();
         let theme = Theme::classic();
-        let long_text = "This is a very long text that should wrap across multiple lines in the dialog box";
-        terminal.draw(|frame| {
-            draw_modal_confirm(frame, " Title ", long_text, &theme);
-        }).unwrap();
+        let long_text =
+            "This is a very long text that should wrap across multiple lines in the dialog box";
+        terminal
+            .draw(|frame| {
+                draw_modal_confirm(frame, " Title ", long_text, &theme);
+            })
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let mut text = String::new();
         for y in 0..buffer.area.height {
@@ -320,9 +333,11 @@ mod tests {
         let backend = TestBackend::new(40, 15);
         let mut terminal = Terminal::new(backend).unwrap();
         let theme = Theme::classic();
-        terminal.draw(|frame| {
-            draw_modal_confirm(frame, " Title ", "Line 1\nLine 2\nLine 3", &theme);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_modal_confirm(frame, " Title ", "Line 1\nLine 2\nLine 3", &theme);
+            })
+            .unwrap();
     }
 
     #[test]
@@ -355,8 +370,8 @@ mod tests {
 
     #[test]
     fn draw_legend_renders_without_panic() {
-        use crate::tui::app::types::App;
         use crate::db::Database;
+        use crate::tui::app::types::App;
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         use std::sync::Arc;
@@ -371,15 +386,17 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let theme = Theme::classic();
-        terminal.draw(|frame| {
-            draw_legend(frame, &mut app, &theme);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_legend(frame, &mut app, &theme);
+            })
+            .unwrap();
     }
 
     #[test]
     fn draw_legend_with_zero_missions() {
-        use crate::tui::app::types::App;
         use crate::db::Database;
+        use crate::tui::app::types::App;
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         use std::sync::Arc;
@@ -395,9 +412,11 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let theme = Theme::classic();
-        terminal.draw(|frame| {
-            draw_legend(frame, &mut app, &theme);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_legend(frame, &mut app, &theme);
+            })
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let mut text = String::new();
         for y in 0..buffer.area.height {
@@ -406,7 +425,10 @@ mod tests {
             }
             text.push('\n');
         }
-        assert!(text.contains("Missions"), "Should show Missions title: {text}");
+        assert!(
+            text.contains("Missions"),
+            "Should show Missions title: {text}"
+        );
     }
 
     #[test]
@@ -417,9 +439,11 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let theme = Theme::classic();
-        terminal.draw(|frame| {
-            draw_quit_confirm(frame, &theme);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_quit_confirm(frame, &theme);
+            })
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let mut text = String::new();
         for y in 0..buffer.area.height {

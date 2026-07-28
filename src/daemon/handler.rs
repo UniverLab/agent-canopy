@@ -9434,7 +9434,9 @@ mod tests {
 #[cfg(test)]
 mod additional_tests {
     use super::*;
-    use crate::daemon::params::{EnsembleMemberParams, LoopCompletionHookParams, LoopTriggerParams};
+    use crate::daemon::params::{
+        EnsembleMemberParams, LoopCompletionHookParams, LoopTriggerParams,
+    };
     use crate::db::Database;
     use crate::domain::loops::{
         Loop, LoopNode, LoopNodeKind, LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus,
@@ -10266,10 +10268,7 @@ mod additional_tests {
 
     #[test]
     fn json_value_kind_name_array() {
-        assert_eq!(
-            json_value_kind_name(&serde_json::json!([1, 2])),
-            "an array"
-        );
+        assert_eq!(json_value_kind_name(&serde_json::json!([1, 2])), "an array");
     }
 
     #[test]
@@ -10789,9 +10788,9 @@ mod coverage_tests {
     use crate::daemon::params::EnsembleMemberParams;
     use crate::db::Database;
     use crate::domain::loops::{
-        Ensemble, EnsembleDetails, EnsembleMember, Loop, LoopCompletionHook,
-        LoopCompletionHookRun, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind, LoopNodeRun,
-        LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus,
+        Ensemble, EnsembleDetails, EnsembleMember, Loop, LoopCompletionHook, LoopCompletionHookRun,
+        LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind, LoopNodeRun, LoopRunStatus, LoopSpec,
+        LoopSpecStatus, LoopStatus,
     };
     use crate::domain::models::{Agent, Cli};
     use crate::domain::pools::Pool;
@@ -10862,12 +10861,7 @@ mod coverage_tests {
         }
     }
 
-    fn loop_run_row(
-        id: &str,
-        loop_id: &str,
-        spec_id: &str,
-        status: LoopRunStatus,
-    ) -> LoopNodeRun {
+    fn loop_run_row(id: &str, loop_id: &str, spec_id: &str, status: LoopRunStatus) -> LoopNodeRun {
         LoopNodeRun {
             id: id.to_string(),
             loop_id: loop_id.to_string(),
@@ -11373,7 +11367,11 @@ mod coverage_tests {
     #[test]
     fn footer_live_source() {
         use crate::domain::models_db::CatalogSource;
-        let f = super::model_result_footer("Models:", CatalogSource::Live, std::time::SystemTime::now());
+        let f = super::model_result_footer(
+            "Models:",
+            CatalogSource::Live,
+            std::time::SystemTime::now(),
+        );
         assert!(f.contains("Source: live"));
         assert!(!f.contains("out of date"));
     }
@@ -11381,7 +11379,11 @@ mod coverage_tests {
     #[test]
     fn footer_stale_source() {
         use crate::domain::models_db::CatalogSource;
-        let f = super::model_result_footer("Models:", CatalogSource::Stale, std::time::SystemTime::now());
+        let f = super::model_result_footer(
+            "Models:",
+            CatalogSource::Stale,
+            std::time::SystemTime::now(),
+        );
         assert!(f.contains("Source: stale"));
         assert!(f.contains("out of date"));
     }
@@ -11408,7 +11410,9 @@ mod coverage_tests {
         });
         assert_eq!(built.ensemble.on_fail_to.as_deref(), Some("cleanup"));
         assert_eq!(built.ensemble.straggler_timeout_minutes, Some(10));
-        let fail_edges: Vec<_> = built.edges.iter()
+        let fail_edges: Vec<_> = built
+            .edges
+            .iter()
             .filter(|e| e.condition == LoopEdgeCondition::Fail)
             .collect();
         assert_eq!(fail_edges.len(), 1);
@@ -11433,7 +11437,9 @@ mod coverage_tests {
             start_position: 5,
         });
         assert!(built.ensemble.on_fail_to.is_none());
-        let fail_edges: Vec<_> = built.edges.iter()
+        let fail_edges: Vec<_> = built
+            .edges
+            .iter()
             .filter(|e| e.condition == LoopEdgeCondition::Fail)
             .collect();
         assert!(fail_edges.is_empty());
@@ -11441,7 +11447,11 @@ mod coverage_tests {
 
     #[test]
     fn ensemble_unit_positions_sequential() {
-        let members = vec![("p1".into(), None), ("p2".into(), None), ("p3".into(), None)];
+        let members = vec![
+            ("p1".into(), None),
+            ("p2".into(), None),
+            ("p3".into(), None),
+        ];
         let built = build_ensemble_unit(&EnsembleUnitSpec {
             spec_id: None,
             loop_id: Some("l1".into()),
@@ -11584,7 +11594,8 @@ mod coverage_tests {
         let dir = tempdir().unwrap();
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         db.insert_loop_spec(&running_spec("s-owned")).unwrap();
-        db.insert_loop(&make_loop("loop-owner", LoopStatus::Running)).unwrap();
+        db.insert_loop(&make_loop("loop-owner", LoopStatus::Running))
+            .unwrap();
         db.insert_pool(&Pool {
             id: "pool-o".into(),
             name: "pool-o".into(),
@@ -11593,8 +11604,13 @@ mod coverage_tests {
         .unwrap();
         db.append_pool_member("pool-o", "s-owned", None).unwrap();
         insert_test_node(&db, "node-1", "s-owned");
-        db.insert_loop_run(&loop_run_row("run1", "loop-owner", "s-owned", LoopRunStatus::Running))
-            .unwrap();
+        db.insert_loop_run(&loop_run_row(
+            "run1",
+            "loop-owner",
+            "s-owned",
+            LoopRunStatus::Running,
+        ))
+        .unwrap();
         assert!(validate_pool_not_consumed(&db, "pool-o", "loop-owner").is_ok());
     }
 
@@ -11639,7 +11655,10 @@ mod coverage_tests {
         db.insert_loop_run(&loop_run_row("r1", "l1", "s1", LoopRunStatus::Pass))
             .unwrap();
         let result = resolve_reported_run(&db, "r1", "n1").unwrap();
-        assert!(result.expect_err("pass run must be stale").is_error.unwrap_or(false));
+        assert!(result
+            .expect_err("pass run must be stale")
+            .is_error
+            .unwrap_or(false));
     }
 
     #[test]
@@ -11652,7 +11671,10 @@ mod coverage_tests {
         db.insert_loop_run(&loop_run_row("r1", "l1", "s1", LoopRunStatus::Fail))
             .unwrap();
         let result = resolve_reported_run(&db, "r1", "n1").unwrap();
-        assert!(result.expect_err("fail run must be stale").is_error.unwrap_or(false));
+        assert!(result
+            .expect_err("fail run must be stale")
+            .is_error
+            .unwrap_or(false));
     }
 
     // ── validate_pool_reorder_locking edge cases ───────────────────
@@ -11664,8 +11686,15 @@ mod coverage_tests {
         db.insert_loop_spec(&standalone_spec("a")).unwrap();
         db.insert_loop_spec(&standalone_spec("b")).unwrap();
         db.insert_loop_spec(&standalone_spec("c")).unwrap();
-        db.insert_pool(&Pool { id: "p1".into(), name: "p1".into(), created_at: chrono::Utc::now() }).unwrap();
-        for id in ["a", "b", "c"] { db.append_pool_member("p1", id, None).unwrap(); }
+        db.insert_pool(&Pool {
+            id: "p1".into(),
+            name: "p1".into(),
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        for id in ["a", "b", "c"] {
+            db.append_pool_member("p1", id, None).unwrap();
+        }
         let current = db.list_pool_member_spec_ids("p1").unwrap();
         let order = vec!["c".into(), "a".into(), "b".into()];
         assert!(validate_pool_reorder_locking(&db, &current, &order).is_ok());
@@ -11679,7 +11708,12 @@ mod coverage_tests {
         f.status = LoopSpecStatus::Failed;
         db.insert_loop_spec(&f).unwrap();
         db.insert_loop_spec(&standalone_spec("p")).unwrap();
-        db.insert_pool(&Pool { id: "p1".into(), name: "p1".into(), created_at: chrono::Utc::now() }).unwrap();
+        db.insert_pool(&Pool {
+            id: "p1".into(),
+            name: "p1".into(),
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
         db.append_pool_member("p1", "f", None).unwrap();
         db.append_pool_member("p1", "p", None).unwrap();
         let current = db.list_pool_member_spec_ids("p1").unwrap();
@@ -11696,7 +11730,12 @@ mod coverage_tests {
         s.status = LoopSpecStatus::Skipped;
         db.insert_loop_spec(&s).unwrap();
         db.insert_loop_spec(&standalone_spec("p")).unwrap();
-        db.insert_pool(&Pool { id: "p1".into(), name: "p1".into(), created_at: chrono::Utc::now() }).unwrap();
+        db.insert_pool(&Pool {
+            id: "p1".into(),
+            name: "p1".into(),
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
         db.append_pool_member("p1", "s", None).unwrap();
         db.append_pool_member("p1", "p", None).unwrap();
         let current = db.list_pool_member_spec_ids("p1").unwrap();
@@ -11712,7 +11751,12 @@ mod coverage_tests {
         db.insert_loop_spec(&running_spec("r")).unwrap();
         db.insert_loop_spec(&standalone_spec("p1")).unwrap();
         db.insert_loop_spec(&standalone_spec("p2")).unwrap();
-        db.insert_pool(&Pool { id: "p1".into(), name: "p1".into(), created_at: chrono::Utc::now() }).unwrap();
+        db.insert_pool(&Pool {
+            id: "p1".into(),
+            name: "p1".into(),
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
         db.append_pool_member("p1", "r", None).unwrap();
         db.append_pool_member("p1", "p1", None).unwrap();
         db.append_pool_member("p1", "p2", None).unwrap();
@@ -11757,7 +11801,10 @@ mod coverage_tests {
     #[test]
     fn ensemble_exactly_min() {
         let m: Vec<EnsembleMemberParams> = (0..2)
-            .map(|i| EnsembleMemberParams { platform: format!("p{i}"), model: None })
+            .map(|i| EnsembleMemberParams {
+                platform: format!("p{i}"),
+                model: None,
+            })
             .collect();
         assert!(validate_ensemble_members(&m).is_ok());
     }
@@ -11765,7 +11812,10 @@ mod coverage_tests {
     #[test]
     fn ensemble_exactly_max() {
         let m: Vec<EnsembleMemberParams> = (0..8)
-            .map(|i| EnsembleMemberParams { platform: format!("p{i}"), model: None })
+            .map(|i| EnsembleMemberParams {
+                platform: format!("p{i}"),
+                model: None,
+            })
             .collect();
         assert!(validate_ensemble_members(&m).is_ok());
     }
@@ -11773,7 +11823,10 @@ mod coverage_tests {
     #[test]
     fn ensemble_above_max() {
         let m: Vec<EnsembleMemberParams> = (0..9)
-            .map(|i| EnsembleMemberParams { platform: format!("p{i}"), model: None })
+            .map(|i| EnsembleMemberParams {
+                platform: format!("p{i}"),
+                model: None,
+            })
             .collect();
         assert!(validate_ensemble_members(&m).unwrap_err().contains("2-8"));
     }
@@ -11781,8 +11834,14 @@ mod coverage_tests {
     #[test]
     fn ensemble_empty_model_becomes_none() {
         let m = vec![
-            EnsembleMemberParams { platform: "claude".into(), model: Some("".into()) },
-            EnsembleMemberParams { platform: "mimo".into(), model: None },
+            EnsembleMemberParams {
+                platform: "claude".into(),
+                model: Some("".into()),
+            },
+            EnsembleMemberParams {
+                platform: "mimo".into(),
+                model: None,
+            },
         ];
         let result = validate_ensemble_members(&m).unwrap();
         assert_eq!(result[0].1, None);

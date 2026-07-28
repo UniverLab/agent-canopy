@@ -1823,18 +1823,12 @@ mod scroll_direction_tests {
 
     #[test]
     fn scroll_up_returns_positive() {
-        assert_eq!(
-            scroll_direction(MouseEventKind::ScrollUp),
-            Some(1)
-        );
+        assert_eq!(scroll_direction(MouseEventKind::ScrollUp), Some(1));
     }
 
     #[test]
     fn scroll_down_returns_negative() {
-        assert_eq!(
-            scroll_direction(MouseEventKind::ScrollDown),
-            Some(-1)
-        );
+        assert_eq!(scroll_direction(MouseEventKind::ScrollDown), Some(-1));
     }
 
     #[test]
@@ -1888,7 +1882,11 @@ mod clamp_sidebar_scroll_tests {
     fn scroll_down_clamps_at_max() {
         // total=20, max_visible=8 → max_offset=12
         assert_eq!(clamp_sidebar_scroll(12, 20, 8, -1), 12);
-        assert_eq!(clamp_sidebar_scroll(13, 20, 8, -1), 12, "should not exceed max");
+        assert_eq!(
+            clamp_sidebar_scroll(13, 20, 8, -1),
+            12,
+            "should not exceed max"
+        );
     }
 
     #[test]
@@ -1931,14 +1929,8 @@ mod sidebar_tab_at_tests {
         ];
 
         assert_eq!(sidebar_tab_at(&app, 0, 5), Some(SidebarLayer::Live));
-        assert_eq!(
-            sidebar_tab_at(&app, 0, 15),
-            Some(SidebarLayer::Automation)
-        );
-        assert_eq!(
-            sidebar_tab_at(&app, 0, 25),
-            Some(SidebarLayer::Knowledge)
-        );
+        assert_eq!(sidebar_tab_at(&app, 0, 15), Some(SidebarLayer::Automation));
+        assert_eq!(sidebar_tab_at(&app, 0, 25), Some(SidebarLayer::Knowledge));
     }
 
     #[test]
@@ -1962,11 +1954,7 @@ mod sidebar_agent_at_tests {
         let db = Arc::new(crate::db::Database::new(&path).unwrap());
         let dir = tempfile::tempdir().unwrap();
         let mut app = App::new(db, dir.path()).unwrap();
-        app.sidebar_click_map = vec![
-            (0, 0, 3),
-            (1, 4, 7),
-            (2, 8, 11),
-        ];
+        app.sidebar_click_map = vec![(0, 0, 3), (1, 4, 7), (2, 8, 11)];
 
         assert_eq!(sidebar_agent_at(&app, 1), Some(0));
         assert_eq!(sidebar_agent_at(&app, 5), Some(1));
@@ -2020,10 +2008,7 @@ mod mouse_pty_position_tests {
         app.last_panel_y = 5;
         app.last_panel_inner = (40, 20);
 
-        assert_eq!(
-            mouse_pty_position(&app, &mouse_at(15, 8)),
-            Some((5, 3))
-        );
+        assert_eq!(mouse_pty_position(&app, &mouse_at(15, 8)), Some((5, 3)));
     }
 
     #[test]

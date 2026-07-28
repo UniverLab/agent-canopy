@@ -1927,10 +1927,12 @@ mod tests {
     fn render_wrapped_paragraph_zero_area() {
         let backend = TestBackend::new(10, 10);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| {
-            let area = Rect::new(0, 0, 0, 0);
-            render_wrapped_paragraph(frame, area, vec![]);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, 0, 0);
+                render_wrapped_paragraph(frame, area, vec![]);
+            })
+            .unwrap();
     }
 
     #[test]
@@ -1938,13 +1940,15 @@ mod tests {
         let backend = TestBackend::new(30, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         let theme = Theme::classic();
-        terminal.draw(|frame| {
-            let area = frame.area();
-            let title = Span::styled(" Test ", Style::default().fg(Color::White));
-            let inner = render_panel_block(frame, area, Color::Cyan, Some(title), &theme);
-            assert!(inner.width > 0);
-            assert!(inner.height > 0);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let title = Span::styled(" Test ", Style::default().fg(Color::White));
+                let inner = render_panel_block(frame, area, Color::Cyan, Some(title), &theme);
+                assert!(inner.width > 0);
+                assert!(inner.height > 0);
+            })
+            .unwrap();
     }
 
     #[test]
@@ -1952,12 +1956,14 @@ mod tests {
         let backend = TestBackend::new(30, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         let theme = Theme::classic();
-        terminal.draw(|frame| {
-            let area = frame.area();
-            let inner = render_panel_block(frame, area, Color::Cyan, None, &theme);
-            assert!(inner.width > 0);
-            assert!(inner.height > 0);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let inner = render_panel_block(frame, area, Color::Cyan, None, &theme);
+                assert!(inner.width > 0);
+                assert!(inner.height > 0);
+            })
+            .unwrap();
     }
 
     #[test]
@@ -1965,12 +1971,14 @@ mod tests {
         let backend = TestBackend::new(30, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         let theme = Theme::modern();
-        terminal.draw(|frame| {
-            let area = frame.area();
-            let inner = render_panel_block(frame, area, Color::Cyan, None, &theme);
-            // Modern theme: no borders, so inner == area
-            assert_eq!(inner, area);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let inner = render_panel_block(frame, area, Color::Cyan, None, &theme);
+                // Modern theme: no borders, so inner == area
+                assert_eq!(inner, area);
+            })
+            .unwrap();
     }
 
     #[test]
@@ -1983,10 +1991,12 @@ mod tests {
             cursor_col: 5,
             scrolled: true,
         };
-        terminal.draw(|frame| {
-            let area = Rect::new(0, 0, 20, 10);
-            set_cursor_from_snapshot(frame, area, &snap);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, 20, 10);
+                set_cursor_from_snapshot(frame, area, &snap);
+            })
+            .unwrap();
         // Scrolled: no cursor set
     }
 
@@ -2000,10 +2010,12 @@ mod tests {
             cursor_col: 0,
             scrolled: false,
         };
-        terminal.draw(|frame| {
-            let area = Rect::new(0, 0, 0, 0);
-            set_cursor_from_snapshot(frame, area, &snap);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, 0, 0);
+                set_cursor_from_snapshot(frame, area, &snap);
+            })
+            .unwrap();
     }
 
     #[test]
@@ -2100,10 +2112,12 @@ mod tests {
         let backend = TestBackend::new(20, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         let theme = Theme::classic();
-        terminal.draw(|frame| {
-            let area = Rect::new(0, 0, 0, 0);
-            draw_log_panel(frame, area, &mut app, &theme);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, 0, 0);
+                draw_log_panel(frame, area, &mut app, &theme);
+            })
+            .unwrap();
     }
 
     #[test]
@@ -2117,10 +2131,12 @@ mod tests {
         let backend = TestBackend::new(20, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         let theme = Theme::classic();
-        terminal.draw(|frame| {
-            let area = Rect::new(0, 0, 0, 0);
-            draw_split_panel(frame, area, &mut app, "test-session", true, &theme);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, 0, 0);
+                draw_split_panel(frame, area, &mut app, "test-session", true, &theme);
+            })
+            .unwrap();
     }
 
     #[test]
@@ -2132,10 +2148,12 @@ mod tests {
             enabled: false,
             error: "failed to parse JSON".to_string(),
         };
-        terminal.draw(|frame| {
-            let area = frame.area();
-            draw_corrupt_agent_panel(frame, area, &corrupt);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_corrupt_agent_panel(frame, area, &corrupt);
+            })
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let mut text = String::new();
         for y in 0..buffer.area.height {
@@ -2145,7 +2163,10 @@ mod tests {
             text.push('\n');
         }
         assert!(text.contains("bad-agent"), "Should show agent id: {text}");
-        assert!(text.contains("corrupt config"), "Should show corrupt config: {text}");
+        assert!(
+            text.contains("corrupt config"),
+            "Should show corrupt config: {text}"
+        );
     }
 
     #[test]
@@ -2158,10 +2179,12 @@ mod tests {
         let app = App::new(db, data_dir.path()).unwrap();
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| {
-            let area = frame.area();
-            draw_home_panel(frame, area, &app);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_home_panel(frame, area, &app);
+            })
+            .unwrap();
     }
 
     #[test]
@@ -2307,7 +2330,13 @@ mod tests {
         let data_dir = tempfile::tempdir().unwrap();
         let app = App::new(db, data_dir.path()).unwrap();
         let theme = Theme::classic();
-        let lines = rag_summary_lines(&app, "● ready", theme.header_color, "3 queued".to_string(), &theme);
+        let lines = rag_summary_lines(
+            &app,
+            "● ready",
+            theme.header_color,
+            "3 queued".to_string(),
+            &theme,
+        );
         assert!(!lines.is_empty());
     }
 }

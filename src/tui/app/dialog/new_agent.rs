@@ -1110,7 +1110,10 @@ mod tests {
             paste_submit_presses: 1,
         })];
         dialog.cli_index = 0;
-        assert_eq!(dialog.selected_fallback_args().as_deref(), Some("--fallback"));
+        assert_eq!(
+            dialog.selected_fallback_args().as_deref(),
+            Some("--fallback")
+        );
     }
 
     // ── selected_yolo_flag ───────────────────────────────────────
@@ -1253,7 +1256,11 @@ mod tests {
     #[test]
     fn filtered_dir_entries_with_filter() {
         let mut dialog = NewAgentDialog::new(None);
-        dialog.dir_entries = vec!["apple".to_string(), "banana".to_string(), "avocado".to_string()];
+        dialog.dir_entries = vec![
+            "apple".to_string(),
+            "banana".to_string(),
+            "avocado".to_string(),
+        ];
         dialog.dir_filter = "ap".to_string();
         let filtered = dialog.filtered_dir_entries();
         assert_eq!(filtered.len(), 1);
@@ -1774,11 +1781,7 @@ mod tests {
         let mut dialog = NewAgentDialog::new(None);
         dialog.current_path = tmp.path().to_string_lossy().to_string();
         dialog.refresh_dir_entries();
-        if let Some(idx) = dialog
-            .dir_entries
-            .iter()
-            .position(|e| e.contains("child"))
-        {
+        if let Some(idx) = dialog.dir_entries.iter().position(|e| e.contains("child")) {
             dialog.dir_selected = idx;
             dialog.navigate_to_selected();
             assert!(dialog.current_path.contains("child"));

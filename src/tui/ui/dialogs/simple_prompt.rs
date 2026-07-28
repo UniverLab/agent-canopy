@@ -1527,10 +1527,7 @@ mod tests {
 
     #[test]
     fn wrap_content_empty_segments() {
-        let styled = vec![
-            (String::new(), None),
-            ("hello".to_string(), None),
-        ];
+        let styled = vec![(String::new(), None), ("hello".to_string(), None)];
         let lines = wrap_styled_content(styled, None, 40, Color::Black);
         assert_eq!(line_text(&lines[0]), "hello");
     }

@@ -1115,10 +1115,7 @@ mod tests {
         assert!(!is_focus_cycle_key(KeyCode::Up, KeyModifiers::NONE));
         assert!(!is_focus_cycle_key(KeyCode::Down, KeyModifiers::NONE));
         // Control alone is not enough
-        assert!(!is_focus_cycle_key(
-            KeyCode::Up,
-            KeyModifiers::CONTROL
-        ));
+        assert!(!is_focus_cycle_key(KeyCode::Up, KeyModifiers::CONTROL));
     }
 
     #[test]
