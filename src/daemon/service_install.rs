@@ -387,4 +387,29 @@ mod tests {
         assert!(result.contains("/usr/bin"));
         assert!(result.contains("/bin"));
     }
+
+    #[test]
+    fn render_unit_content_includes_exe_and_port() {
+        let content = render_unit_content("/usr/bin/canopy", 7755, "/usr/bin:/bin");
+        assert!(content.contains("/usr/bin/canopy"));
+        assert!(content.contains("7755"));
+        assert!(content.contains("[Unit]"));
+        assert!(content.contains("[Service]"));
+        assert!(content.contains("[Install]"));
+        assert!(content.contains("ExecStart="));
+        assert!(content.contains("Environment=PATH="));
+    }
+
+    #[test]
+    fn render_unit_content_uses_custom_port() {
+        let content = render_unit_content("/usr/bin/canopy", 9999, "/usr/bin");
+        assert!(content.contains("9999"));
+        assert!(!content.contains("7755"));
+    }
+
+    #[test]
+    fn render_unit_content_uses_custom_path() {
+        let content = render_unit_content("/usr/bin/canopy", 7755, "/custom/path:/another/path");
+        assert!(content.contains("/custom/path:/another/path"));
+    }
 }
