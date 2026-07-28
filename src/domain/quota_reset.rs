@@ -281,4 +281,84 @@ mod tests {
             chrono::Utc.with_ymd_and_hms(2026, 7, 24, 17, 2, 0).unwrap()
         );
     }
+
+    #[test]
+    fn rejects_hour_zero_out_of_range() {
+        let now = Utc::now();
+        let err = parse_quota_reset_instant("resets 0am (America/Bogota)", now).unwrap_err();
+        assert!(err.0.contains("out of 12-hour range"), "{err}");
+    }
+
+    #[test]
+    fn rejects_hour_thirteen_out_of_range() {
+        let now = Utc::now();
+        let err = parse_quota_reset_instant("resets 13pm (America/Bogota)", now).unwrap_err();
+        assert!(err.0.contains("out of 12-hour range"), "{err}");
+    }
+
+    #[test]
+    fn quota_reset_error_display() {
+        let err = QuotaResetError("test error".to_string());
+        assert_eq!(format!("{err}"), "test error");
+    }
+
+    #[test]
+    fn quota_reset_error_is_std_error() {
+        let err = QuotaResetError("test".to_string());
+        let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn resets_5am_bogota_before_dawn() {
+        let now = bogota_now(1, 0);
+        let at = parse_quota_reset_instant("resets 5am (America/Bogota)", now).unwrap();
+        // 5am local = 10:00 UTC, + 2min margin = 10:02 UTC
+        assert_eq!(
+            at,
+            chrono::Utc.with_ymd_and_hms(2026, 7, 24, 10, 2, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn resets_11_59pm_bogota_just_before_midnight() {
+        let now = bogota_now(10, 0);
+        let at = parse_quota_reset_instant("resets 11:59pm (America/Bogota)", now).unwrap();
+        // 23:59 local = 04:59 UTC next day, + 2min margin = 05:01 UTC
+        assert_eq!(
+            at,
+            chrono::Utc.with_ymd_and_hms(2026, 7, 25, 5, 1, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn resets_12_01pm_bogota() {
+        let now = bogota_now(0, 0);
+        let at = parse_quota_reset_instant("resets 12:01pm (America/Bogota)", now).unwrap();
+        // 12:01pm local = 17:01 UTC, + 2min margin = 17:03 UTC
+        assert_eq!(
+            at,
+            chrono::Utc.with_ymd_and_hms(2026, 7, 24, 17, 3, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn message_with_extra_text_before_resets() {
+        let now = bogota_now(9, 0);
+        let at = parse_quota_reset_instant(
+            "Error: You've hit your session limit · resets 1pm (America/Bogota)",
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            at,
+            chrono::Utc.with_ymd_and_hms(2026, 7, 24, 18, 2, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn rejects_message_with_only_resets_word() {
+        let now = Utc::now();
+        let err = parse_quota_reset_instant("resets", now).unwrap_err();
+        assert!(err.0.contains("no 'resets"), "{err}");
+    }
 }

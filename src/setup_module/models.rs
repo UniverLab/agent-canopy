@@ -161,3 +161,324 @@ pub fn is_configured() -> bool {
         })
         .unwrap_or(false)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_command_format_returns_separate() {
+        assert_eq!(default_command_format(), "separate");
+    }
+
+    #[test]
+    fn resolve_config_path_returns_primary_when_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("config.json");
+        std::fs::write(&primary, "{}").unwrap();
+        let result = resolve_config_path(dir.path(), "config.json");
+        assert_eq!(result, primary);
+    }
+
+    #[test]
+    fn resolve_config_path_falls_back_to_jsonc_when_jsonc_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let alt = dir.path().join("config.jsonc");
+        std::fs::write(&alt, "{}").unwrap();
+        let result = resolve_config_path(dir.path(), "config.json");
+        assert_eq!(result, alt);
+    }
+
+    #[test]
+    fn resolve_config_path_falls_back_to_json_when_jsonc_requested() {
+        let dir = tempfile::tempdir().unwrap();
+        let alt = dir.path().join("config.json");
+        std::fs::write(&alt, "{}").unwrap();
+        let result = resolve_config_path(dir.path(), "config.jsonc");
+        assert_eq!(result, alt);
+    }
+
+    #[test]
+    fn resolve_config_path_returns_primary_when_no_alternate_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("config.json");
+        let result = resolve_config_path(dir.path(), "config.json");
+        assert_eq!(result, primary);
+        assert!(!result.exists());
+    }
+
+    #[test]
+    fn resolve_config_path_non_json_extension_returns_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("config.toml");
+        let result = resolve_config_path(dir.path(), "config.toml");
+        assert_eq!(result, primary);
+    }
+
+    #[test]
+    fn resolve_config_path_no_extension_returns_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("config");
+        let result = resolve_config_path(dir.path(), "config");
+        assert_eq!(result, primary);
+    }
+
+    #[test]
+    fn platform_to_platform_with_cli_parses_valid_json() {
+        let platform = Platform {
+            name: "test-platform".to_string(),
+            config_path: ".config/test/config.json".to_string(),
+            config_format: None,
+            toml_array_format: false,
+            command_format: "separate".to_string(),
+            mcp_servers_key: vec!["mcpServers".to_string()],
+            deprecated_keys: vec![],
+            unsupported_keys: vec![],
+            fields_mapping: std::collections::HashMap::new(),
+            required_fields: std::collections::HashMap::new(),
+            server_extras: std::collections::HashMap::new(),
+            skills_dir: None,
+            instruction_file: Some(".instructions/test.md".to_string()),
+            cli: Some(serde_json::json!({
+                "binary": "test-cli",
+                "install": {"type": "none"}
+            })),
+        };
+
+        let result = platform.to_platform_with_cli();
+        assert_eq!(result.name, "test-platform");
+        assert_eq!(result.config_path, ".config/test/config.json");
+        assert!(result.cli.is_some());
+        let cli = result.cli.unwrap();
+        assert_eq!(cli.name, "test-platform");
+        assert_eq!(
+            cli.instruction_file,
+            Some(".instructions/test.md".to_string())
+        );
+    }
+
+    #[test]
+    fn platform_to_platform_with_cli_no_cli_returns_none() {
+        let platform = Platform {
+            name: "no-cli".to_string(),
+            config_path: ".config/no-cli/config.json".to_string(),
+            config_format: None,
+            toml_array_format: false,
+            command_format: "separate".to_string(),
+            mcp_servers_key: vec![],
+            deprecated_keys: vec![],
+            unsupported_keys: vec![],
+            fields_mapping: std::collections::HashMap::new(),
+            required_fields: std::collections::HashMap::new(),
+            server_extras: std::collections::HashMap::new(),
+            skills_dir: None,
+            instruction_file: None,
+            cli: None,
+        };
+
+        let result = platform.to_platform_with_cli();
+        assert_eq!(result.name, "no-cli");
+        assert!(result.cli.is_none());
+    }
+
+    #[test]
+    fn platform_to_platform_with_cli_invalid_json_returns_none() {
+        let platform = Platform {
+            name: "bad-cli".to_string(),
+            config_path: ".config/bad/config.json".to_string(),
+            config_format: None,
+            toml_array_format: false,
+            command_format: "separate".to_string(),
+            mcp_servers_key: vec![],
+            deprecated_keys: vec![],
+            unsupported_keys: vec![],
+            fields_mapping: std::collections::HashMap::new(),
+            required_fields: std::collections::HashMap::new(),
+            server_extras: std::collections::HashMap::new(),
+            skills_dir: None,
+            instruction_file: None,
+            cli: Some(serde_json::json!("not an object")),
+        };
+
+        let result = platform.to_platform_with_cli();
+        assert_eq!(result.name, "bad-cli");
+        assert!(result.cli.is_none());
+    }
+
+    #[test]
+    fn is_platform_available_true_for_ls() {
+        let platform = Platform {
+            name: "test".to_string(),
+            config_path: "test.json".to_string(),
+            config_format: None,
+            toml_array_format: false,
+            command_format: "separate".to_string(),
+            mcp_servers_key: vec![],
+            deprecated_keys: vec![],
+            unsupported_keys: vec![],
+            fields_mapping: std::collections::HashMap::new(),
+            required_fields: std::collections::HashMap::new(),
+            server_extras: std::collections::HashMap::new(),
+            skills_dir: None,
+            instruction_file: None,
+            cli: Some(serde_json::json!({"binary": "ls"})),
+        };
+        assert!(is_platform_available(&platform));
+    }
+
+    #[test]
+    fn is_platform_available_false_for_nonexistent_binary() {
+        let platform = Platform {
+            name: "test".to_string(),
+            config_path: "test.json".to_string(),
+            config_format: None,
+            toml_array_format: false,
+            command_format: "separate".to_string(),
+            mcp_servers_key: vec![],
+            deprecated_keys: vec![],
+            unsupported_keys: vec![],
+            fields_mapping: std::collections::HashMap::new(),
+            required_fields: std::collections::HashMap::new(),
+            server_extras: std::collections::HashMap::new(),
+            skills_dir: None,
+            instruction_file: None,
+            cli: Some(serde_json::json!({"binary": "definitely_not_a_real_binary_xyz123"})),
+        };
+        assert!(!is_platform_available(&platform));
+    }
+
+    #[test]
+    fn is_platform_available_false_when_no_cli() {
+        let platform = Platform {
+            name: "test".to_string(),
+            config_path: "test.json".to_string(),
+            config_format: None,
+            toml_array_format: false,
+            command_format: "separate".to_string(),
+            mcp_servers_key: vec![],
+            deprecated_keys: vec![],
+            unsupported_keys: vec![],
+            fields_mapping: std::collections::HashMap::new(),
+            required_fields: std::collections::HashMap::new(),
+            server_extras: std::collections::HashMap::new(),
+            skills_dir: None,
+            instruction_file: None,
+            cli: None,
+        };
+        assert!(!is_platform_available(&platform));
+    }
+
+    #[test]
+    fn is_binary_available_true_for_ls() {
+        assert!(is_binary_available("ls"));
+    }
+
+    #[test]
+    fn is_binary_available_false_for_nonexistent() {
+        assert!(!is_binary_available("definitely_not_a_real_binary_xyz123"));
+    }
+
+    #[test]
+    fn canonical_servers_default_is_empty() {
+        let servers = CanonicalServers::default();
+        assert!(servers.servers.is_empty());
+    }
+
+    #[test]
+    fn canonical_servers_deserializes() {
+        let json = r#"{"servers": {"my-server": {"command": "echo"}}}"#;
+        let servers: CanonicalServers = serde_json::from_str(json).unwrap();
+        assert_eq!(servers.servers.len(), 1);
+        assert!(servers.servers.contains_key("my-server"));
+    }
+
+    #[test]
+    fn platform_deserializes_with_defaults() {
+        let json = r#"{
+            "name": "test",
+            "config_path": ".config/test/config.json",
+            "mcp_servers_key": ["mcpServers"]
+        }"#;
+        let platform: Platform = serde_json::from_str(json).unwrap();
+        assert_eq!(platform.name, "test");
+        assert!(!platform.toml_array_format);
+        assert_eq!(platform.command_format, "separate");
+        assert!(platform.deprecated_keys.is_empty());
+        assert!(platform.unsupported_keys.is_empty());
+        assert!(platform.fields_mapping.is_empty());
+        assert!(platform.required_fields.is_empty());
+        assert!(platform.server_extras.is_empty());
+        assert!(platform.skills_dir.is_none());
+        assert!(platform.instruction_file.is_none());
+        assert!(platform.cli.is_none());
+    }
+
+    #[test]
+    fn platform_deserializes_with_all_fields() {
+        let json = r#"{
+            "name": "full",
+            "config_path": ".config/full/config.toml",
+            "config_format": "toml",
+            "toml_array_format": true,
+            "command_format": "merged",
+            "mcp_servers_key": ["mcpServers", "servers"],
+            "deprecated_keys": ["old_key"],
+            "unsupported_keys": ["unsupported"],
+            "fields_mapping": {"env": "environment"},
+            "required_fields": {"type": ["stdio", "http"]},
+            "server_extras": {"canopy": {"tools": ["*"]}},
+            "skills_dir": ".full/skills",
+            "instruction_file": ".full/instructions.md",
+            "cli": {"binary": "full-cli"}
+        }"#;
+        let platform: Platform = serde_json::from_str(json).unwrap();
+        assert_eq!(platform.name, "full");
+        assert_eq!(platform.config_format, Some("toml".to_string()));
+        assert!(platform.toml_array_format);
+        assert_eq!(platform.command_format, "merged");
+        assert_eq!(platform.mcp_servers_key, vec!["mcpServers", "servers"]);
+        assert_eq!(platform.deprecated_keys, vec!["old_key"]);
+        assert_eq!(platform.unsupported_keys, vec!["unsupported"]);
+        assert_eq!(
+            platform.fields_mapping.get("env"),
+            Some(&"environment".to_string())
+        );
+        assert_eq!(
+            platform.required_fields.get("type"),
+            Some(&vec!["stdio".to_string(), "http".to_string()])
+        );
+        assert!(platform.server_extras.contains_key("canopy"));
+        assert_eq!(platform.skills_dir, Some(".full/skills".to_string()));
+        assert_eq!(
+            platform.instruction_file,
+            Some(".full/instructions.md".to_string())
+        );
+        assert!(platform.cli.is_some());
+    }
+
+    #[test]
+    fn registry_raw_stores_platforms() {
+        let platform = Platform {
+            name: "p1".to_string(),
+            config_path: "c1".to_string(),
+            config_format: None,
+            toml_array_format: false,
+            command_format: "separate".to_string(),
+            mcp_servers_key: vec![],
+            deprecated_keys: vec![],
+            unsupported_keys: vec![],
+            fields_mapping: std::collections::HashMap::new(),
+            required_fields: std::collections::HashMap::new(),
+            server_extras: std::collections::HashMap::new(),
+            skills_dir: None,
+            instruction_file: None,
+            cli: None,
+        };
+        let registry = RegistryRaw {
+            platforms: vec![platform],
+            canonical_servers: CanonicalServers::default(),
+        };
+        assert_eq!(registry.platforms.len(), 1);
+        assert_eq!(registry.platforms[0].name, "p1");
+    }
+}
