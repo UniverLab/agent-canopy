@@ -1,18 +1,18 @@
 [package]
-name = "task-trigger-mcp"
-version = "1.4.0"
+name = "harness-canopy"
+version = "2.1.0"
 edition = "2021"
-rust-version = "1.75"
-description = "DEPRECATED: use agent-canopy instead — https://crates.io/crates/agent-canopy"
+rust-version = "1.91"
+description = "A self-contained MCP server for AI agent task scheduling and file watching"
 license = "MIT"
-repository = "https://github.com/JheisonMB/task-trigger-mcp"
-homepage = "https://github.com/JheisonMB/task-trigger-mcp"
+repository = "https://github.com/UniverLab/harness-canopy"
+homepage = "https://github.com/UniverLab/harness-canopy"
 keywords = ["mcp", "scheduler", "cron", "file-watcher", "ai-agent"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "README.md"
 
 [[bin]]
-name = "task-trigger-mcp"
+name = "canopy"
 path = "src/main.rs"
 
 [dependencies]
@@ -38,22 +38,23 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Schema generation for MCP tools
-schemars = { version = "0.8", features = ["derive"] }
+schemars = { version = "1.2.1", features = ["derive"] }
 
 # SQLite persistence
 rusqlite = { version = "0.39", features = ["bundled"] }
 
 # File watching
-notify = "6.1"
+notify = "8.2"
 
 # Cron expression parsing (internal scheduler)
 cron = "0.16"
 
 # Date/time
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 
 # CLI binary discovery
-which = "7.0"
+which = "8.0"
 
 # CLI argument parsing
 clap = { version = "4.6", features = ["derive"] }
@@ -64,8 +65,63 @@ dirs = "6.0"
 # UUID generation for execution runs
 uuid = { version = "1", features = ["v4"] }
 
+# SHA-256 for workdir_hash
+sha2 = "0.11.0"
+
+# Directory traversal for RAG ingestion
+walkdir = "2"
+
+# Regex matching for ragignore patterns
+regex = "1"
+
 # Graceful shutdown coordination
 tokio-util = { version = "0.7", features = ["rt"] }
+
+# TUI
+ratatui = "0.30"
+
+# PTY for interactive agents
+portable-pty = "0.9"
+
+# Virtual terminal emulator for embedding agent output
+vt100 = "0.16"
+
+# HTTP client for registry fetch
+reqwest = { version = "0.13", features = ["blocking", "json"] }
+
+# Interactive prompts for setup wizard
+inquire = "0.9"
+
+# Shell argument parsing
+shell-words = "1.1"
+
+# Random number generation for automata noise injection
+rand = "0.10"
+
+# Clipboard for text copy from TUI
+arboard = "3.6"
+# Decode OSC 52 clipboard payloads emitted by PTY programs
+base64 = "0.22"
+toml = "1.1.2"
+
+# Path manipulation for relative paths
+pathdiff = "0.2"
+
+# Auto-update dependencies
+flate2 = "1.0"
+tar = "0.4"
+tempfile = "3.8"
+sysinfo = "0.38"
+lancedb = "0.27.2"
+arrow-array = "57.3.1"
+arrow-schema = "57.3.1"
+futures = "0.3"
+
+# PDF text extraction
+pdf-extract = "0.10.0"
+
+# Local embedding models via ONNX Runtime (no API key required)
+fastembed = { version = "5", optional = true }
 
 # Unix process management (kill, setsid)
 [target.'cfg(unix)'.dependencies]
@@ -77,6 +133,7 @@ tempfile = "3.8"
 
 [features]
 default = []
+local-embeddings = ["dep:fastembed"]
 
 [lints.clippy]
 # Production quality lints
@@ -88,6 +145,12 @@ manual_let_else = "warn"
 semicolon_if_nothing_returned = "warn"
 inconsistent_struct_constructor = "warn"
 doc_markdown = "warn"
+
+[profile.dev]
+# Reduce debug info from level 2 to 1 (keeps line tables, drops full type info)
+debug = 1
+# More codegen units for faster parallel compilation
+codegen-units = 16
 
 [profile.release]
 opt-level = 3

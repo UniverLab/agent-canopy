@@ -1,39 +1,35 @@
-//! `SQLite` database layer for persistent storage.
-//!
-//! Handles all CRUD operations for tasks, watchers, execution logs,
-//! and daemon state using a single persistent connection.
-
 use anyhow::Result;
-use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::Connection;
 use std::path::PathBuf;
-use std::sync::Mutex;
-
-use crate::application::ports::{
-    RunRepository, StateRepository, TaskFieldsUpdate, TaskRepository, WatcherFieldsUpdate,
-    WatcherRepository,
-};
-use crate::domain::models::{Cli, RunLog, RunStatus, Task, TriggerType, WatchEvent, Watcher};
+use std::sync::{Arc, Mutex};
 
 /// Thread-safe `SQLite` database wrapper.
 ///
-/// Uses a `Mutex<Connection>` instead of opening a new connection per operation,
-/// which is more efficient for `SQLite`'s single-writer model.
+/// Uses an `Arc<Mutex<Connection>>` so the handle can be cheaply cloned and
+/// shared across threads (e.g. for background file-scanning tasks) while still
+/// serialising all SQLite writes through a single connection.
+#[derive(Clone)]
 pub struct Database {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl Database {
-    /// Create and initialize a new database at the given path.
-    ///
-    /// Creates all required tables if they don't exist.
     pub fn new(db_path: &PathBuf) -> Result<Self> {
         let conn = Connection::open(db_path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         let db = Database {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
         };
         db.init()?;
+        if let Err(e) = db.backfill_project_nodes() {
+            tracing::warn!("Could not backfill project intelligence nodes: {e}");
+        }
+        if let Err(e) = db.seed_builtin_blueprints() {
+            tracing::warn!("Could not seed builtin blueprints: {e}");
+        }
+        if let Err(e) = db.seed_builtin_ensemble_blueprints() {
+            tracing::warn!("Could not seed builtin ensemble blueprints: {e}");
+        }
         Ok(db)
     }
 
@@ -44,41 +40,30 @@ impl Database {
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
 
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS tasks (
+            "CREATE TABLE IF NOT EXISTS agents (
                 id TEXT PRIMARY KEY,
                 prompt TEXT NOT NULL,
-                schedule_expr TEXT NOT NULL,
+                trigger_type TEXT,
+                trigger_config TEXT,
                 cli TEXT NOT NULL,
                 model TEXT,
                 working_dir TEXT,
                 enabled BOOLEAN NOT NULL DEFAULT 1,
+                enable_at TEXT,
                 created_at TEXT NOT NULL,
+                log_path TEXT NOT NULL,
+                timeout_minutes INTEGER NOT NULL DEFAULT 15,
                 expires_at TEXT,
                 last_run_at TEXT,
                 last_run_ok BOOLEAN,
-                log_path TEXT NOT NULL,
-                timeout_minutes INTEGER NOT NULL DEFAULT 15
-            );
-
-            CREATE TABLE IF NOT EXISTS watchers (
-                id TEXT PRIMARY KEY,
-                path TEXT NOT NULL,
-                events TEXT NOT NULL,
-                prompt TEXT NOT NULL,
-                cli TEXT NOT NULL,
-                model TEXT,
-                debounce_seconds INTEGER NOT NULL DEFAULT 2,
-                recursive BOOLEAN NOT NULL DEFAULT 0,
-                enabled BOOLEAN NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL,
                 last_triggered_at TEXT,
                 trigger_count INTEGER NOT NULL DEFAULT 0,
-                timeout_minutes INTEGER NOT NULL DEFAULT 15
+                notify_on_success BOOLEAN NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS runs (
                 id TEXT PRIMARY KEY,
-                task_id TEXT NOT NULL,
+                background_agent_id TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
                 trigger_type TEXT NOT NULL,
                 summary TEXT,
@@ -91,1303 +76,848 @@ impl Database {
             CREATE TABLE IF NOT EXISTS daemon_state (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
-            );",
+            );
+
+            CREATE TABLE IF NOT EXISTS interactive_sessions (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                cli TEXT NOT NULL,
+                working_dir TEXT NOT NULL,
+                args TEXT,
+                started_at TEXT NOT NULL,
+                exited_at TEXT,
+                exit_code INTEGER,
+                status TEXT NOT NULL DEFAULT 'active',
+                session_type TEXT NOT NULL DEFAULT 'interactive',
+                pid INTEGER,
+                boot_id TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS terminal_sessions (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                shell TEXT NOT NULL,
+                working_dir TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_active TEXT,
+                status TEXT NOT NULL DEFAULT 'idle'
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_interactive_sessions_workdir
+                ON interactive_sessions(working_dir, started_at DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_terminal_sessions_workdir
+                ON terminal_sessions(working_dir, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS groups (
+                id TEXT PRIMARY KEY,
+                orientation TEXT NOT NULL DEFAULT 'horizontal',
+                session_a TEXT NOT NULL,
+                session_b TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS sync_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workdir TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                agent_name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                message TEXT NOT NULL,
+                payload TEXT,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS sync_locks (
+                id TEXT PRIMARY KEY,
+                workdir TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                lock_type TEXT NOT NULL,
+                resource TEXT NOT NULL,
+                acquired_at INTEGER NOT NULL,
+                expires_at INTEGER,
+                released_at INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS projects (
+                hash TEXT PRIMARY KEY,
+                path TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT,
+                tags TEXT,
+                indexed_at INTEGER,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS rag_queue (
+                source_path TEXT NOT NULL PRIMARY KEY,
+                status TEXT NOT NULL,
+                queued_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS rag_file_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_path TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                detail TEXT,
+                occurred_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_rag_file_events_path
+                ON rag_file_events(file_path);
+
+            CREATE TABLE IF NOT EXISTS intelligence_nodes (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                metadata TEXT,
+                project_hash TEXT,
+                session_id TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_intelligence_nodes_kind_updated
+                ON intelligence_nodes(kind, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_intelligence_nodes_project_hash
+                ON intelligence_nodes(project_hash);
+            CREATE INDEX IF NOT EXISTS idx_intelligence_nodes_session_id
+                ON intelligence_nodes(session_id);
+
+            CREATE TABLE IF NOT EXISTS intelligence_edges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_node_id TEXT NOT NULL,
+                to_node_id TEXT NOT NULL,
+                relation TEXT NOT NULL,
+                weight REAL NOT NULL DEFAULT 1.0,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY(from_node_id) REFERENCES intelligence_nodes(id) ON DELETE CASCADE,
+                FOREIGN KEY(to_node_id) REFERENCES intelligence_nodes(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_intelligence_edges_from
+                ON intelligence_edges(from_node_id);
+            CREATE INDEX IF NOT EXISTS idx_intelligence_edges_to
+                ON intelligence_edges(to_node_id);
+
+            CREATE TABLE IF NOT EXISTS loops (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                workdir TEXT NOT NULL,
+                status TEXT NOT NULL,
+                trigger_type TEXT,
+                trigger_config TEXT,
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER,
+                autorun_at INTEGER,
+                spec_pool TEXT,
+                active_run_pool_id TEXT,
+                on_completed TEXT,
+                auto_continue_at INTEGER,
+                auto_continue_action TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_loops_workdir_created
+                ON loops(workdir, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS loop_specs (
+                id TEXT PRIMARY KEY,
+                loop_id TEXT REFERENCES loops(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                description TEXT,
+                position INTEGER NOT NULL,
+                parallelizable INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER,
+                spec_start_head TEXT,
+                workdir TEXT,
+                completed_via TEXT,
+                completed_via_reason TEXT,
+                completed_via_at INTEGER
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_loop_specs_position
+                ON loop_specs(loop_id, position);
+
+            CREATE TABLE IF NOT EXISTS loop_nodes (
+                id TEXT PRIMARY KEY,
+                spec_id TEXT REFERENCES loop_specs(id) ON DELETE CASCADE,
+                loop_id TEXT REFERENCES loops(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                config TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                CHECK ((spec_id IS NULL) <> (loop_id IS NULL))
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_loop_nodes_position
+                ON loop_nodes(spec_id, position);
+
+            CREATE TABLE IF NOT EXISTS loop_edges (
+                id TEXT PRIMARY KEY,
+                spec_id TEXT REFERENCES loop_specs(id) ON DELETE CASCADE,
+                loop_id TEXT REFERENCES loops(id) ON DELETE CASCADE,
+                from_node TEXT NOT NULL REFERENCES loop_nodes(id) ON DELETE CASCADE,
+                to_node TEXT NOT NULL REFERENCES loop_nodes(id) ON DELETE CASCADE,
+                condition TEXT NOT NULL,
+                CHECK ((spec_id IS NULL) <> (loop_id IS NULL))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_loop_edges_spec_from
+                ON loop_edges(spec_id, from_node);
+
+            CREATE TABLE IF NOT EXISTS loop_runs (
+                id TEXT PRIMARY KEY,
+                loop_id TEXT NOT NULL REFERENCES loops(id) ON DELETE CASCADE,
+                spec_id TEXT NOT NULL REFERENCES loop_specs(id) ON DELETE CASCADE,
+                node_id TEXT NOT NULL REFERENCES loop_nodes(id) ON DELETE CASCADE,
+                status TEXT NOT NULL,
+                input TEXT,
+                output TEXT,
+                started_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                iteration INTEGER NOT NULL DEFAULT 1,
+                pid INTEGER,
+                boot_id TEXT,
+                session_id TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_loop_runs_spec_started
+                ON loop_runs(spec_id, started_at ASC);
+
+            CREATE INDEX IF NOT EXISTS idx_loop_runs_node_iteration
+                ON loop_runs(node_id, iteration DESC);
+
+            -- N2: firings of a loop's `on_completed` hook. Deliberately not
+            -- `loop_runs` — that table's spec_id/node_id are NOT NULL FKs into
+            -- a spec's graph, which a completion hook (no spec, no graph node)
+            -- can never satisfy.
+            CREATE TABLE IF NOT EXISTS loop_completion_hook_runs (
+                id TEXT PRIMARY KEY,
+                loop_id TEXT NOT NULL REFERENCES loops(id) ON DELETE CASCADE,
+                status TEXT NOT NULL,
+                output TEXT,
+                summary TEXT,
+                started_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                pid INTEGER,
+                boot_id TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_loop_completion_hook_runs_loop_started
+                ON loop_completion_hook_runs(loop_id, started_at ASC);
+
+            -- F1: an ensemble unit -- the members and join are ordinary
+            -- loop_nodes/loop_edges rows (the engine's graph-walking code is
+            -- reused as-is); this row is what lets loop_get/loop_update_ensemble
+            -- address the whole ensemble as one thing instead of N+1 nodes.
+            CREATE TABLE IF NOT EXISTS ensembles (
+                id TEXT PRIMARY KEY,
+                spec_id TEXT REFERENCES loop_specs(id) ON DELETE CASCADE,
+                loop_id TEXT REFERENCES loops(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                prompt_template TEXT NOT NULL,
+                join_node_id TEXT NOT NULL REFERENCES loop_nodes(id) ON DELETE CASCADE,
+                entry_from_node TEXT NOT NULL REFERENCES loop_nodes(id) ON DELETE CASCADE,
+                entry_condition TEXT NOT NULL,
+                min_pass INTEGER NOT NULL,
+                straggler_timeout_minutes INTEGER,
+                timeout_minutes INTEGER NOT NULL,
+                on_pass_to TEXT NOT NULL REFERENCES loop_nodes(id) ON DELETE CASCADE,
+                on_fail_to TEXT REFERENCES loop_nodes(id) ON DELETE SET NULL,
+                created_at INTEGER NOT NULL,
+                CHECK ((spec_id IS NULL) <> (loop_id IS NULL))
+            );
+
+            CREATE TABLE IF NOT EXISTS ensemble_members (
+                ensemble_id TEXT NOT NULL REFERENCES ensembles(id) ON DELETE CASCADE,
+                node_id TEXT NOT NULL REFERENCES loop_nodes(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                platform TEXT NOT NULL,
+                model TEXT,
+                PRIMARY KEY (ensemble_id, node_id)
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_ensemble_members_position
+                ON ensemble_members(ensemble_id, position);
+
+            CREATE INDEX IF NOT EXISTS idx_ensemble_members_node
+                ON ensemble_members(node_id);
+
+            CREATE INDEX IF NOT EXISTS idx_ensembles_join_node
+                ON ensembles(join_node_id);
+
+            -- F1: ensemble blueprints -- a whole ensemble's shared prompt +
+            -- member list (unlike `blueprints`, which templates a single
+            -- node), seeded with the builtin ensemble-proposers pattern.
+            CREATE TABLE IF NOT EXISTS ensemble_blueprints (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                prompt_template TEXT NOT NULL,
+                members TEXT NOT NULL,
+                min_pass INTEGER,
+                builtin INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS pools (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS pool_members (
+                pool_id TEXT NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
+                spec_id TEXT NOT NULL REFERENCES loop_specs(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                group_name TEXT,
+                PRIMARY KEY (pool_id, spec_id)
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_pool_members_position
+                ON pool_members(pool_id, position);
+
+            CREATE TABLE IF NOT EXISTS seed_sessions (
+                session_id TEXT PRIMARY KEY,
+                seed_id TEXT NOT NULL,
+                bound_at TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES interactive_sessions(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_seed_sessions_seed
+                ON seed_sessions(seed_id);
+
+            CREATE TABLE IF NOT EXISTS blueprints (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                kind TEXT NOT NULL,
+                config TEXT NOT NULL,
+                builtin INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS scheduled_sends (
+                id TEXT PRIMARY KEY,
+                prompt TEXT NOT NULL,
+                target_session_id TEXT NOT NULL,
+                fire_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS failed_scheduled_sends (
+                id TEXT PRIMARY KEY,
+                prompt TEXT NOT NULL,
+                target_session_id TEXT NOT NULL,
+                workdir TEXT,
+                failed_at INTEGER NOT NULL
+            );
+
+            -- U8: the prompt builder's last-sent prompt per project, recalled
+            -- with Ctrl+L. Insert-only with a timestamp (rather than one row
+            -- per workdir) so this can grow into a browsable history later —
+            -- today's reads take the most recent row per workdir (LIMIT 1).
+            CREATE TABLE IF NOT EXISTS last_prompts (
+                id TEXT PRIMARY KEY,
+                workdir TEXT NOT NULL,
+                prompt_text TEXT NOT NULL,
+                builder_state TEXT,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_last_prompts_workdir_created
+                ON last_prompts(workdir, created_at DESC);",
         )?;
 
-        // Migrate old schema if needed
-        self.migrate(&conn)?;
-
-        Ok(())
-    }
-
-    /// Run schema migrations for existing databases.
-    fn migrate(&self, conn: &Connection) -> Result<()> {
-        // Add timeout_minutes to tasks if missing
-        let has_timeout = conn
-            .prepare("SELECT timeout_minutes FROM tasks LIMIT 0")
-            .is_ok();
-        if !has_timeout {
-            conn.execute_batch(
-                "ALTER TABLE tasks ADD COLUMN timeout_minutes INTEGER NOT NULL DEFAULT 15;",
-            )?;
-        }
-
-        // Add timeout_minutes to watchers if missing
-        let has_watcher_timeout = conn
-            .prepare("SELECT timeout_minutes FROM watchers LIMIT 0")
-            .is_ok();
-        if !has_watcher_timeout {
-            conn.execute_batch(
-                "ALTER TABLE watchers ADD COLUMN timeout_minutes INTEGER NOT NULL DEFAULT 15;",
-            )?;
-        }
-
-        // Migrate runs table from INTEGER id to TEXT id with new columns
-        let has_status = conn.prepare("SELECT status FROM runs LIMIT 0").is_ok();
-        if !has_status {
-            conn.execute_batch(
-                "ALTER TABLE runs RENAME TO runs_old;
-                 CREATE TABLE runs (
-                     id TEXT PRIMARY KEY,
-                     task_id TEXT NOT NULL,
-                     status TEXT NOT NULL DEFAULT 'pending',
-                     trigger_type TEXT NOT NULL,
-                     summary TEXT,
-                     started_at TEXT NOT NULL,
-                     finished_at TEXT,
-                     exit_code INTEGER,
-                     timeout_at TEXT
-                 );
-                 INSERT INTO runs (id, task_id, status, trigger_type, started_at, finished_at, exit_code)
-                     SELECT CAST(id AS TEXT), task_id, 'success', trigger_type, started_at, finished_at, exit_code
-                     FROM runs_old;
-                 DROP TABLE runs_old;",
-            )?;
-        }
-
-        // Remove FK constraint from runs table so watchers can have runs too
-        let has_fk: bool = conn
+        // `workdir` records which project a scheduled send targeted so a
+        // dead-target failure can be preserved per-project for U8's recall.
+        let has_scheduled_send_workdir: bool = conn
             .query_row(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name='runs'",
+                "SELECT COUNT(*) FROM pragma_table_info('scheduled_sends') WHERE name = 'workdir'",
                 [],
-                |row| row.get::<_, String>(0),
+                |row| Ok(row.get::<_, i32>(0)? > 0),
             )
-            .map(|sql| sql.contains("FOREIGN KEY"))
             .unwrap_or(false);
-        if has_fk {
+        if !has_scheduled_send_workdir {
+            conn.execute("ALTER TABLE scheduled_sends ADD COLUMN workdir TEXT", [])
+                .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        let has_session_type: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('interactive_sessions') WHERE name = 'session_type'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_session_type {
+            conn.execute(
+                "ALTER TABLE interactive_sessions ADD COLUMN session_type TEXT NOT NULL DEFAULT 'interactive'",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        let has_pid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('interactive_sessions') WHERE name = 'pid'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_pid {
+            conn.execute(
+                "ALTER TABLE interactive_sessions ADD COLUMN pid INTEGER",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // Boot-id aware auto-resume (see should_resume_session in
+        // tui::app::mod): a stored pid alone can't tell a resumed session
+        // from an unrelated process that got the same pid after a reboot
+        // recycled the pid space. NULL for rows written before this column
+        // existed — treated as "unknown boot" (always safe to resume).
+        let has_boot_id: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('interactive_sessions') WHERE name = 'boot_id'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_boot_id {
+            conn.execute(
+                "ALTER TABLE interactive_sessions ADD COLUMN boot_id TEXT",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // Older builds registered `canopy bridge` sidecars with
+        // session_type = 'interactive' (a bug — see daemon::bridge), which made
+        // auto_resume_sessions try to relaunch them as chat CLIs on every TUI
+        // startup. Reclassify any such rows so they're excluded from
+        // get_active_sessions() going forward. Idempotent: once reclassified,
+        // the WHERE clause no longer matches them.
+        conn.execute(
+            "UPDATE interactive_sessions SET session_type = 'bridge'
+             WHERE cli = 'bridge' AND session_type != 'bridge'",
+            [],
+        )
+        .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+
+        let has_enable_at: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('agents') WHERE name = 'enable_at'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_enable_at {
+            conn.execute("ALTER TABLE agents ADD COLUMN enable_at TEXT", [])
+                .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // Per-agent opt-in to success notifications (B27). Failures always
+        // notify; scheduled/watch successes stay silent unless this is set,
+        // so a frequent cron agent can't spam the Action Center. Older
+        // databases predate the column; default 0 keeps every existing agent
+        // on the quiet-on-success policy.
+        let has_notify_on_success: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('agents') WHERE name = 'notify_on_success'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_notify_on_success {
+            conn.execute(
+                "ALTER TABLE agents ADD COLUMN notify_on_success BOOLEAN NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // Loops gained optional cron/watch triggers; older databases predate the
+        // columns. Add them if missing (both nullable, so existing rows stay
+        // manual-only).
+        for column in ["trigger_type", "trigger_config"] {
+            let has_column: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('loops') WHERE name = ?1",
+                    [column],
+                    |row| Ok(row.get::<_, i32>(0)? > 0),
+                )
+                .unwrap_or(false);
+            if !has_column {
+                conn.execute(&format!("ALTER TABLE loops ADD COLUMN {column} TEXT"), [])
+                    .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+            }
+        }
+
+        // One-shot resume schedule for loops (mirrors agents' `enable_at`);
+        // older databases predate the column.
+        let has_autorun_at: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loops') WHERE name = 'autorun_at'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_autorun_at {
+            conn.execute("ALTER TABLE loops ADD COLUMN autorun_at INTEGER", [])
+                .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // One-shot deferred-resume-while-paused schedule (distinct from
+        // `autorun_at`'s reset-and-relaunch — see
+        // [`crate::domain::loops::Loop::auto_continue_at`]); older databases
+        // predate the columns.
+        for (column, sql_type) in [
+            ("auto_continue_at", "INTEGER"),
+            ("auto_continue_action", "TEXT"),
+        ] {
+            let has_column: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('loops') WHERE name = ?1",
+                    [column],
+                    |row| Ok(row.get::<_, i32>(0)? > 0),
+                )
+                .unwrap_or(false);
+            if !has_column {
+                conn.execute(
+                    &format!("ALTER TABLE loops ADD COLUMN {column} {sql_type}"),
+                    [],
+                )
+                .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+            }
+        }
+
+        // `spec_pool` (7f2efdf) was an unused template model, retired in favor
+        // of the `pools`/`pool_members` tables below. Kept only so pre-R4
+        // databases that already have the column don't need a destructive
+        // migration; current code never reads or writes it.
+        let has_spec_pool: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loops') WHERE name = 'spec_pool'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_spec_pool {
+            conn.execute("ALTER TABLE loops ADD COLUMN spec_pool TEXT", [])
+                .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // `spec_start_head` records the workdir's git HEAD when a spec starts
+        // running, so `check` nodes can verify a spec actually committed
+        // without relying on a file marker outside the spec row. Older
+        // databases predate the column.
+        let has_spec_start_head: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loop_specs') WHERE name = 'spec_start_head'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_spec_start_head {
+            conn.execute("ALTER TABLE loop_specs ADD COLUMN spec_start_head TEXT", [])
+                .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // Standalone specs (R3): a spec no longer must belong to a loop — it
+        // can exist as a backlog item (optionally tagged to a workdir)
+        // before being assigned. Older databases have `loop_id NOT NULL`,
+        // which `ALTER TABLE ... ADD COLUMN` cannot relax, so rebuild the
+        // table via SQLite's documented copy-and-rename procedure. Every
+        // existing row keeps its `loop_id`; only new rows may leave it NULL.
+        let loop_specs_loop_id_nullable: bool = conn
+            .query_row(
+                "SELECT \"notnull\" FROM pragma_table_info('loop_specs') WHERE name = 'loop_id'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|notnull| notnull == 0)
+            .unwrap_or(false);
+        if !loop_specs_loop_id_nullable {
             conn.execute_batch(
-                "ALTER TABLE runs RENAME TO runs_old;
-                 CREATE TABLE runs (
+                "PRAGMA foreign_keys=OFF;
+                 BEGIN TRANSACTION;
+
+                 CREATE TABLE loop_specs_new (
                      id TEXT PRIMARY KEY,
-                     task_id TEXT NOT NULL,
-                     status TEXT NOT NULL DEFAULT 'pending',
-                     trigger_type TEXT NOT NULL,
-                     summary TEXT,
-                     started_at TEXT NOT NULL,
-                     finished_at TEXT,
-                     exit_code INTEGER,
-                     timeout_at TEXT
+                     loop_id TEXT REFERENCES loops(id) ON DELETE CASCADE,
+                     name TEXT NOT NULL,
+                     description TEXT,
+                     position INTEGER NOT NULL,
+                     parallelizable INTEGER NOT NULL DEFAULT 0,
+                     status TEXT NOT NULL,
+                     started_at INTEGER,
+                     completed_at INTEGER,
+                     spec_start_head TEXT
                  );
-                 INSERT INTO runs SELECT * FROM runs_old;
-                 DROP TABLE runs_old;",
-            )?;
+                 INSERT INTO loop_specs_new (id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head)
+                     SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head FROM loop_specs;
+                 DROP TABLE loop_specs;
+                 ALTER TABLE loop_specs_new RENAME TO loop_specs;
+
+                 CREATE UNIQUE INDEX IF NOT EXISTS idx_loop_specs_position
+                     ON loop_specs(loop_id, position);
+
+                 COMMIT;
+                 PRAGMA foreign_keys=ON;",
+            )
+            .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // Optional workdir tag on specs (R3), for backlog filtering only —
+        // it never drives execution. Nullable, so existing (loop-bound)
+        // specs are unaffected; older databases predate the column.
+        let has_spec_workdir: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loop_specs') WHERE name = 'workdir'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_spec_workdir {
+            conn.execute("ALTER TABLE loop_specs ADD COLUMN workdir TEXT", [])
+                .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // Loop-level graphs (R1): a node/edge may now target a loop directly
+        // (`loop_id`) instead of a spec, so it can be defined once per loop
+        // instead of being repeated across every spec. Older databases have
+        // `spec_id NOT NULL` on both tables, which `ALTER TABLE ... ADD
+        // COLUMN` cannot relax, so rebuild the tables via SQLite's documented
+        // copy-and-rename procedure ("Making Other Kinds Of Table Schema
+        // Changes"). Every existing row keeps its `spec_id`; `loop_id` starts
+        // NULL for all of them, so nothing already saved changes meaning.
+        let has_loop_nodes_loop_id: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loop_nodes') WHERE name = 'loop_id'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_loop_nodes_loop_id {
+            conn.execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 BEGIN TRANSACTION;
+
+                 CREATE TABLE loop_nodes_new (
+                     id TEXT PRIMARY KEY,
+                     spec_id TEXT REFERENCES loop_specs(id) ON DELETE CASCADE,
+                     loop_id TEXT REFERENCES loops(id) ON DELETE CASCADE,
+                     name TEXT NOT NULL,
+                     kind TEXT NOT NULL,
+                     config TEXT NOT NULL,
+                     position INTEGER NOT NULL,
+                     created_at INTEGER NOT NULL,
+                     CHECK ((spec_id IS NULL) <> (loop_id IS NULL))
+                 );
+                 INSERT INTO loop_nodes_new (id, spec_id, loop_id, name, kind, config, position, created_at)
+                     SELECT id, spec_id, NULL, name, kind, config, position, created_at FROM loop_nodes;
+                 DROP TABLE loop_nodes;
+                 ALTER TABLE loop_nodes_new RENAME TO loop_nodes;
+
+                 CREATE UNIQUE INDEX IF NOT EXISTS idx_loop_nodes_position
+                     ON loop_nodes(spec_id, position);
+                 CREATE UNIQUE INDEX IF NOT EXISTS idx_loop_nodes_loop_position
+                     ON loop_nodes(loop_id, position);
+
+                 CREATE TABLE loop_edges_new (
+                     id TEXT PRIMARY KEY,
+                     spec_id TEXT REFERENCES loop_specs(id) ON DELETE CASCADE,
+                     loop_id TEXT REFERENCES loops(id) ON DELETE CASCADE,
+                     from_node TEXT NOT NULL REFERENCES loop_nodes(id) ON DELETE CASCADE,
+                     to_node TEXT NOT NULL REFERENCES loop_nodes(id) ON DELETE CASCADE,
+                     condition TEXT NOT NULL,
+                     CHECK ((spec_id IS NULL) <> (loop_id IS NULL))
+                 );
+                 INSERT INTO loop_edges_new (id, spec_id, loop_id, from_node, to_node, condition)
+                     SELECT id, spec_id, NULL, from_node, to_node, condition FROM loop_edges;
+                 DROP TABLE loop_edges;
+                 ALTER TABLE loop_edges_new RENAME TO loop_edges;
+
+                 CREATE INDEX IF NOT EXISTS idx_loop_edges_spec_from
+                     ON loop_edges(spec_id, from_node);
+                 CREATE INDEX IF NOT EXISTS idx_loop_edges_loop_from
+                     ON loop_edges(loop_id, from_node);
+
+                 COMMIT;
+                 PRAGMA foreign_keys=ON;",
+            )
+            .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // These reference `loop_id`, so they can only be created once the
+        // column is guaranteed to exist — either from the fresh CREATE TABLE
+        // above (new databases) or the rebuild just above (migrated ones).
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_loop_nodes_loop_position
+                 ON loop_nodes(loop_id, position);
+             CREATE INDEX IF NOT EXISTS idx_loop_edges_loop_from
+                 ON loop_edges(loop_id, from_node);",
+        )
+        .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+
+        // `active_run_pool_id` persists which pool (if any) a loop's current/
+        // last run drew from, so an interrupted run (quota failure, daemon
+        // crash) can be resumed against the same pool by every resume path
+        // (scheduled autorun, `loop_reset`) instead of falling back to the
+        // loop's own bound specs. Older databases predate the column.
+        let has_active_run_pool_id: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loops') WHERE name = 'active_run_pool_id'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_active_run_pool_id {
+            conn.execute("ALTER TABLE loops ADD COLUMN active_run_pool_id TEXT", [])
+                .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // `on_completed` (N2): the loop's optional post-completion hook
+        // config (agent-node-style JSON: platform/model/prompt/
+        // timeout_minutes), fired once when a run reaches `Completed`. `NULL`
+        // on older databases and on any loop that never configured one —
+        // exactly today's (pre-N2) behavior.
+        let has_on_completed: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loops') WHERE name = 'on_completed'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_on_completed {
+            conn.execute("ALTER TABLE loops ADD COLUMN on_completed TEXT", [])
+                .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // `pid`/`boot_id` (B12): the OS process-group leader spawned for a
+        // node run, and the boot it was spawned under. Lets the engine
+        // `killpg` an active run's process on every abnormal end (timeout,
+        // pause, reset, budget exhaustion, run failure, daemon shutdown),
+        // and lets startup reconciliation attempt a best-effort kill of
+        // survivors from the same boot. Older databases predate both
+        // columns; NULL on existing rows (nothing was tracked for them, so
+        // there's nothing to kill).
+        for column in ["pid", "boot_id"] {
+            let has_column: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('loop_runs') WHERE name = ?1",
+                    [column],
+                    |row| Ok(row.get::<_, i32>(0)? > 0),
+                )
+                .unwrap_or(false);
+            if !has_column {
+                let sql = if column == "pid" {
+                    "ALTER TABLE loop_runs ADD COLUMN pid INTEGER".to_string()
+                } else {
+                    "ALTER TABLE loop_runs ADD COLUMN boot_id TEXT".to_string()
+                };
+                conn.execute(&sql, [])
+                    .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+            }
+        }
+
+        // `session_id` (RS1): the harness session id that served a node run,
+        // captured per-platform (set-at-spawn for platforms that accept a
+        // caller-chosen id, list-after-run for those that can enumerate their
+        // sessions). Older databases predate the column; NULL on existing rows
+        // (no session identity was ever captured for them). Additive — the
+        // foundation for resume mode (RS2).
+        let has_session_id: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loop_runs') WHERE name = 'session_id'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_session_id {
+            conn.execute("ALTER TABLE loop_runs ADD COLUMN session_id TEXT", [])
+                .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // `completed_via`/`completed_via_reason`/`completed_via_at` (B25):
+        // administrative spec status transitions, recorded with provenance
+        // and reason. Older databases predate these columns; NULL on existing
+        // rows (all existing completions are engine-driven).
+        for column in ["completed_via", "completed_via_reason", "completed_via_at"] {
+            let has_column: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('loop_specs') WHERE name = ?1",
+                    [column],
+                    |row| Ok(row.get::<_, i32>(0)? > 0),
+                )
+                .unwrap_or(false);
+            if !has_column {
+                let sql = match column {
+                    "completed_via" => "ALTER TABLE loop_specs ADD COLUMN completed_via TEXT",
+                    "completed_via_reason" => {
+                        "ALTER TABLE loop_specs ADD COLUMN completed_via_reason TEXT"
+                    }
+                    "completed_via_at" => {
+                        "ALTER TABLE loop_specs ADD COLUMN completed_via_at INTEGER"
+                    }
+                    _ => "",
+                };
+                if !sql.is_empty() {
+                    conn.execute(sql, [])
+                        .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+                }
+            }
+        }
+
+        // `group_name` (RS3): the optional context group a queue member belongs
+        // to. Grouped members share a warm harness session — the first agent
+        // node of a grouped spec resumes the session captured by the previous
+        // successfully-completed grouped sibling instead of cold-starting.
+        // Older databases predate the column; NULL on existing rows (every
+        // legacy member is ungrouped and never cross-resumes). Additive.
+        let has_group_name: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('pool_members') WHERE name = 'group_name'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_group_name {
+            conn.execute("ALTER TABLE pool_members ADD COLUMN group_name TEXT", [])
+                .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
         }
 
         Ok(())
     }
 }
 
-// ── Task operations ──────────────────────────────────────────────
-
-impl TaskRepository for Database {
-    fn insert_or_update_task(&self, task: &Task) -> Result<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-        conn.execute(
-            "INSERT OR REPLACE INTO tasks
-            (id, prompt, schedule_expr, cli, model, working_dir, enabled, created_at, expires_at, log_path, timeout_minutes)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                &task.id,
-                &task.prompt,
-                &task.schedule_expr,
-                task.cli.as_str(),
-                &task.model,
-                &task.working_dir,
-                task.enabled,
-                task.created_at.to_rfc3339(),
-                task.expires_at.map(|t| t.to_rfc3339()),
-                &task.log_path,
-                task.timeout_minutes as i64,
-            ],
-        )?;
-        Ok(())
-    }
-
-    fn get_task(&self, id: &str) -> Result<Option<Task>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-        let mut stmt = conn.prepare(
-            "SELECT id, prompt, schedule_expr, cli, model, working_dir, enabled,
-                    created_at, expires_at, last_run_at, last_run_ok, log_path, timeout_minutes
-             FROM tasks WHERE id = ?1",
-        )?;
-
-        let task = stmt
-            .query_row(params![id], |row| {
-                Ok(TaskRow {
-                    id: row.get(0)?,
-                    prompt: row.get(1)?,
-                    schedule_expr: row.get(2)?,
-                    cli_str: row.get(3)?,
-                    model: row.get(4)?,
-                    working_dir: row.get(5)?,
-                    enabled: row.get(6)?,
-                    created_at_str: row.get(7)?,
-                    expires_at_str: row.get(8)?,
-                    last_run_at_str: row.get(9)?,
-                    last_run_ok: row.get(10)?,
-                    log_path: row.get(11)?,
-                    timeout_minutes: row.get(12)?,
-                })
-            })
-            .optional()?;
-
-        match task {
-            Some(row) => Ok(Some(row.into_task()?)),
-            None => Ok(None),
-        }
-    }
-
-    fn list_tasks(&self) -> Result<Vec<Task>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-        let mut stmt = conn.prepare(
-            "SELECT id, prompt, schedule_expr, cli, model, working_dir, enabled,
-                    created_at, expires_at, last_run_at, last_run_ok, log_path, timeout_minutes
-             FROM tasks ORDER BY created_at DESC",
-        )?;
-
-        let rows = stmt.query_map([], |row| {
-            Ok(TaskRow {
-                id: row.get(0)?,
-                prompt: row.get(1)?,
-                schedule_expr: row.get(2)?,
-                cli_str: row.get(3)?,
-                model: row.get(4)?,
-                working_dir: row.get(5)?,
-                enabled: row.get(6)?,
-                created_at_str: row.get(7)?,
-                expires_at_str: row.get(8)?,
-                last_run_at_str: row.get(9)?,
-                last_run_ok: row.get(10)?,
-                log_path: row.get(11)?,
-                timeout_minutes: row.get(12)?,
-            })
-        })?;
-
-        let mut tasks = Vec::new();
-        for row_result in rows {
-            tasks.push(row_result?.into_task()?);
-        }
-        Ok(tasks)
-    }
-
-    fn delete_task(&self, id: &str) -> Result<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-        // Delete associated runs first (FK constraint)
-        conn.execute("DELETE FROM runs WHERE task_id = ?1", params![id])?;
-        conn.execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
-        Ok(())
-    }
-
-    fn update_task_enabled(&self, id: &str, enabled: bool) -> Result<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-        conn.execute(
-            "UPDATE tasks SET enabled = ?1 WHERE id = ?2",
-            params![enabled, id],
-        )?;
-        Ok(())
-    }
-
-    fn update_task_fields(&self, id: &str, fields: &TaskFieldsUpdate<'_>) -> Result<bool> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-
-        let mut sets = Vec::new();
-        let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-        if let Some(v) = fields.prompt {
-            sets.push("prompt = ?");
-            values.push(Box::new(v.to_string()));
-        }
-        if let Some(v) = fields.schedule_expr {
-            sets.push("schedule_expr = ?");
-            values.push(Box::new(v.to_string()));
-        }
-        if let Some(v) = fields.cli {
-            sets.push("cli = ?");
-            values.push(Box::new(v.to_string()));
-        }
-        if let Some(v) = fields.model {
-            sets.push("model = ?");
-            values.push(Box::new(v.map(|s| s.to_string())));
-        }
-        if let Some(v) = fields.working_dir {
-            sets.push("working_dir = ?");
-            values.push(Box::new(v.map(|s| s.to_string())));
-        }
-        if let Some(v) = fields.expires_at {
-            sets.push("expires_at = ?");
-            values.push(Box::new(v.map(|s| s.to_string())));
-        }
-
-        if sets.is_empty() {
-            return Ok(false);
-        }
-
-        let placeholders: Vec<String> = sets
-            .iter()
-            .enumerate()
-            .map(|(i, s)| s.replace('?', &format!("?{}", i + 1)))
-            .collect();
-
-        let id_param = sets.len() + 1;
-        let sql = format!(
-            "UPDATE tasks SET {} WHERE id = ?{}",
-            placeholders.join(", "),
-            id_param
-        );
-        values.push(Box::new(id.to_string()));
-
-        let params: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
-        let rows = conn.execute(&sql, params.as_slice())?;
-        Ok(rows > 0)
-    }
-
-    fn update_task_last_run(&self, id: &str, success: bool) -> Result<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-        conn.execute(
-            "UPDATE tasks SET last_run_at = ?1, last_run_ok = ?2 WHERE id = ?3",
-            params![Utc::now().to_rfc3339(), success, id],
-        )?;
-        Ok(())
-    }
-}
-
-// ── Watcher operations ───────────────────────────────────────────
-
-impl WatcherRepository for Database {
-    fn insert_or_update_watcher(&self, watcher: &Watcher) -> Result<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-        let events_json = serde_json::to_string(&watcher.events)?;
-
-        conn.execute(
-            "INSERT OR REPLACE INTO watchers
-            (id, path, events, prompt, cli, model, debounce_seconds, recursive, enabled, created_at, timeout_minutes)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                &watcher.id,
-                &watcher.path,
-                &events_json,
-                &watcher.prompt,
-                watcher.cli.as_str(),
-                &watcher.model,
-                watcher.debounce_seconds as i64,
-                watcher.recursive,
-                watcher.enabled,
-                watcher.created_at.to_rfc3339(),
-                watcher.timeout_minutes as i64,
-            ],
-        )?;
-        Ok(())
-    }
-
-    fn get_watcher(&self, id: &str) -> Result<Option<Watcher>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-        let mut stmt = conn.prepare(
-            "SELECT id, path, events, prompt, cli, model, debounce_seconds, recursive,
-                    enabled, created_at, last_triggered_at, trigger_count, timeout_minutes
-             FROM watchers WHERE id = ?1",
-        )?;
-
-        let watcher = stmt
-            .query_row(params![id], |row| {
-                Ok(WatcherRow {
-                    id: row.get(0)?,
-                    path: row.get(1)?,
-                    events_json: row.get(2)?,
-                    prompt: row.get(3)?,
-                    cli_str: row.get(4)?,
-                    model: row.get(5)?,
-                    debounce_seconds: row.get(6)?,
-                    recursive: row.get(7)?,
-                    enabled: row.get(8)?,
-                    created_at_str: row.get(9)?,
-                    last_triggered_at_str: row.get(10)?,
-                    trigger_count: row.get(11)?,
-                    timeout_minutes: row.get(12)?,
-                })
-            })
-            .optional()?;
-
-        match watcher {
-            Some(row) => Ok(Some(row.into_watcher()?)),
-            None => Ok(None),
-        }
-    }
-
-    fn list_watchers(&self) -> Result<Vec<Watcher>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-        let mut stmt = conn.prepare(
-            "SELECT id, path, events, prompt, cli, model, debounce_seconds, recursive,
-                    enabled, created_at, last_triggered_at, trigger_count, timeout_minutes
-             FROM watchers ORDER BY created_at DESC",
-        )?;
-
-        let rows = stmt.query_map([], |row| {
-            Ok(WatcherRow {
-                id: row.get(0)?,
-                path: row.get(1)?,
-                events_json: row.get(2)?,
-                prompt: row.get(3)?,
-                cli_str: row.get(4)?,
-                model: row.get(5)?,
-                debounce_seconds: row.get(6)?,
-                recursive: row.get(7)?,
-                enabled: row.get(8)?,
-                created_at_str: row.get(9)?,
-                last_triggered_at_str: row.get(10)?,
-                trigger_count: row.get(11)?,
-                timeout_minutes: row.get(12)?,
-            })
-        })?;
-
-        let mut watchers = Vec::new();
-        for row_result in rows {
-            watchers.push(row_result?.into_watcher()?);
-        }
-        Ok(watchers)
-    }
-
-    fn list_enabled_watchers(&self) -> Result<Vec<Watcher>> {
-        let all = self.list_watchers()?;
-        Ok(all.into_iter().filter(|w| w.enabled).collect())
-    }
-
-    fn delete_watcher(&self, id: &str) -> Result<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-        conn.execute("DELETE FROM runs WHERE task_id = ?1", params![id])?;
-        conn.execute("DELETE FROM watchers WHERE id = ?1", params![id])?;
-        Ok(())
-    }
-
-    fn update_watcher_enabled(&self, id: &str, enabled: bool) -> Result<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-        conn.execute(
-            "UPDATE watchers SET enabled = ?1 WHERE id = ?2",
-            params![enabled, id],
-        )?;
-        Ok(())
-    }
-
-    fn update_watcher_fields(&self, id: &str, fields: &WatcherFieldsUpdate<'_>) -> Result<bool> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-
-        let mut sets = Vec::new();
-        let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-        if let Some(v) = fields.prompt {
-            sets.push("prompt = ?");
-            values.push(Box::new(v.to_string()));
-        }
-        if let Some(v) = fields.path {
-            sets.push("path = ?");
-            values.push(Box::new(v.to_string()));
-        }
-        if let Some(v) = fields.events {
-            sets.push("events = ?");
-            values.push(Box::new(v.to_string()));
-        }
-        if let Some(v) = fields.cli {
-            sets.push("cli = ?");
-            values.push(Box::new(v.to_string()));
-        }
-        if let Some(v) = fields.model {
-            sets.push("model = ?");
-            values.push(Box::new(v.map(|s| s.to_string())));
-        }
-        if let Some(v) = fields.debounce_seconds {
-            sets.push("debounce_seconds = ?");
-            values.push(Box::new(v as i64));
-        }
-        if let Some(v) = fields.recursive {
-            sets.push("recursive = ?");
-            values.push(Box::new(v));
-        }
-
-        if sets.is_empty() {
-            return Ok(false);
-        }
-
-        let placeholders: Vec<String> = sets
-            .iter()
-            .enumerate()
-            .map(|(i, s)| s.replace('?', &format!("?{}", i + 1)))
-            .collect();
-
-        let id_param = sets.len() + 1;
-        let sql = format!(
-            "UPDATE watchers SET {} WHERE id = ?{}",
-            placeholders.join(", "),
-            id_param
-        );
-        values.push(Box::new(id.to_string()));
-
-        let params: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
-        let rows = conn.execute(&sql, params.as_slice())?;
-        Ok(rows > 0)
-    }
-
-    fn update_watcher_triggered(&self, id: &str) -> Result<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-        conn.execute(
-            "UPDATE watchers SET last_triggered_at = ?1, trigger_count = trigger_count + 1 WHERE id = ?2",
-            params![Utc::now().to_rfc3339(), id],
-        )?;
-        Ok(())
-    }
-}
-
-// ── Run log operations ───────────────────────────────────────────
-
-impl RunRepository for Database {
-    fn insert_run(&self, run: &RunLog) -> Result<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-        conn.execute(
-            "INSERT INTO runs (id, task_id, status, trigger_type, summary, started_at, finished_at, exit_code, timeout_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                &run.id,
-                &run.task_id,
-                run.status.as_str(),
-                run.trigger_type.as_str(),
-                &run.summary,
-                run.started_at.to_rfc3339(),
-                run.finished_at.map(|t| t.to_rfc3339()),
-                run.exit_code,
-                run.timeout_at.map(|t| t.to_rfc3339()),
-            ],
-        )?;
-        Ok(())
-    }
-
-    fn list_runs(&self, task_id: &str, limit: usize) -> Result<Vec<RunLog>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-        let mut stmt = conn.prepare(
-            "SELECT id, task_id, status, trigger_type, summary, started_at, finished_at, exit_code, timeout_at
-             FROM runs WHERE task_id = ?1 ORDER BY started_at DESC LIMIT ?2",
-        )?;
-
-        let rows = stmt.query_map(params![task_id, limit as i64], |row| {
-            Ok(RunRow {
-                id: row.get(0)?,
-                task_id: row.get(1)?,
-                status_str: row.get(2)?,
-                trigger_str: row.get(3)?,
-                summary: row.get(4)?,
-                started_at_str: row.get(5)?,
-                finished_at_str: row.get(6)?,
-                exit_code: row.get(7)?,
-                timeout_at_str: row.get(8)?,
-            })
-        })?;
-
-        let mut runs = Vec::new();
-        for row_result in rows {
-            runs.push(row_result?.into_run_log()?);
-        }
-        Ok(runs)
-    }
-
-    fn get_active_run(&self, task_id: &str) -> Result<Option<RunLog>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-        let mut stmt = conn.prepare(
-            "SELECT id, task_id, status, trigger_type, summary, started_at, finished_at, exit_code, timeout_at
-             FROM runs WHERE task_id = ?1 AND status IN ('pending', 'in_progress') LIMIT 1",
-        )?;
-
-        let run = stmt
-            .query_row(params![task_id], |row| {
-                Ok(RunRow {
-                    id: row.get(0)?,
-                    task_id: row.get(1)?,
-                    status_str: row.get(2)?,
-                    trigger_str: row.get(3)?,
-                    summary: row.get(4)?,
-                    started_at_str: row.get(5)?,
-                    finished_at_str: row.get(6)?,
-                    exit_code: row.get(7)?,
-                    timeout_at_str: row.get(8)?,
-                })
-            })
-            .optional()?;
-
-        match run {
-            Some(row) => Ok(Some(row.into_run_log()?)),
-            None => Ok(None),
-        }
-    }
-
-    fn update_run_status(
-        &self,
-        run_id: &str,
-        status: RunStatus,
-        summary: Option<&str>,
-    ) -> Result<bool> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-        let finished_at = if status.is_active() {
-            None
-        } else {
-            Some(Utc::now().to_rfc3339())
-        };
-        let rows = conn.execute(
-            "UPDATE runs SET status = ?1, summary = COALESCE(?2, summary), finished_at = COALESCE(?3, finished_at)
-             WHERE id = ?4",
-            params![status.as_str(), summary, finished_at, run_id],
-        )?;
-        Ok(rows > 0)
-    }
-
-    fn update_run_exit_code(&self, run_id: &str, exit_code: i32) -> Result<bool> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-        let rows = conn.execute(
-            "UPDATE runs SET exit_code = ?1 WHERE id = ?2",
-            params![exit_code, run_id],
-        )?;
-        Ok(rows > 0)
-    }
-
-    fn get_run(&self, run_id: &str) -> Result<Option<RunLog>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-        let mut stmt = conn.prepare(
-            "SELECT id, task_id, status, trigger_type, summary, started_at, finished_at, exit_code, timeout_at
-             FROM runs WHERE id = ?1",
-        )?;
-
-        let run = stmt
-            .query_row(params![run_id], |row| {
-                Ok(RunRow {
-                    id: row.get(0)?,
-                    task_id: row.get(1)?,
-                    status_str: row.get(2)?,
-                    trigger_str: row.get(3)?,
-                    summary: row.get(4)?,
-                    started_at_str: row.get(5)?,
-                    finished_at_str: row.get(6)?,
-                    exit_code: row.get(7)?,
-                    timeout_at_str: row.get(8)?,
-                })
-            })
-            .optional()?;
-
-        match run {
-            Some(row) => Ok(Some(row.into_run_log()?)),
-            None => Ok(None),
-        }
-    }
-}
-
-// ── Daemon state operations ──────────────────────────────────────
-
-impl StateRepository for Database {
-    fn set_state(&self, key: &str, value: &str) -> Result<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-        conn.execute(
-            "INSERT OR REPLACE INTO daemon_state (key, value) VALUES (?1, ?2)",
-            params![key, value],
-        )?;
-        Ok(())
-    }
-
-    fn get_state(&self, key: &str) -> Result<Option<String>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-        let mut stmt = conn.prepare("SELECT value FROM daemon_state WHERE key = ?1")?;
-        let value = stmt.query_row(params![key], |row| row.get(0)).optional()?;
-        Ok(value)
-    }
-}
-
-// ── Internal row types for deserialization ───────────────────────────
-
-struct TaskRow {
-    id: String,
-    prompt: String,
-    schedule_expr: String,
-    cli_str: String,
-    model: Option<String>,
-    working_dir: Option<String>,
-    enabled: bool,
-    created_at_str: String,
-    expires_at_str: Option<String>,
-    last_run_at_str: Option<String>,
-    last_run_ok: Option<bool>,
-    log_path: String,
-    timeout_minutes: i64,
-}
-
-impl TaskRow {
-    fn into_task(self) -> Result<Task> {
-        let cli = Cli::from_str(&self.cli_str);
-        let created_at =
-            chrono::DateTime::parse_from_rfc3339(&self.created_at_str)?.with_timezone(&Utc);
-        let expires_at = self
-            .expires_at_str
-            .as_ref()
-            .map(|s| chrono::DateTime::parse_from_rfc3339(s).map(|dt| dt.with_timezone(&Utc)))
-            .transpose()?;
-        let last_run_at = self
-            .last_run_at_str
-            .as_ref()
-            .map(|s| chrono::DateTime::parse_from_rfc3339(s).map(|dt| dt.with_timezone(&Utc)))
-            .transpose()?;
-
-        Ok(Task {
-            id: self.id,
-            prompt: self.prompt,
-            schedule_expr: self.schedule_expr,
-            cli,
-            model: self.model,
-            working_dir: self.working_dir,
-            enabled: self.enabled,
-            created_at,
-            expires_at,
-            last_run_at,
-            last_run_ok: self.last_run_ok,
-            log_path: self.log_path,
-            timeout_minutes: self.timeout_minutes as u32,
-        })
-    }
-}
-
-struct WatcherRow {
-    id: String,
-    path: String,
-    events_json: String,
-    prompt: String,
-    cli_str: String,
-    model: Option<String>,
-    debounce_seconds: i64,
-    recursive: bool,
-    enabled: bool,
-    created_at_str: String,
-    last_triggered_at_str: Option<String>,
-    trigger_count: i64,
-    timeout_minutes: i64,
-}
-
-impl WatcherRow {
-    fn into_watcher(self) -> Result<Watcher> {
-        let cli = Cli::from_str(&self.cli_str);
-        let events: Vec<WatchEvent> = serde_json::from_str(&self.events_json)?;
-        let created_at =
-            chrono::DateTime::parse_from_rfc3339(&self.created_at_str)?.with_timezone(&Utc);
-        let last_triggered_at = self
-            .last_triggered_at_str
-            .as_ref()
-            .map(|s| chrono::DateTime::parse_from_rfc3339(s).map(|dt| dt.with_timezone(&Utc)))
-            .transpose()?;
-
-        Ok(Watcher {
-            id: self.id,
-            path: self.path,
-            events,
-            prompt: self.prompt,
-            cli,
-            model: self.model,
-            debounce_seconds: self.debounce_seconds as u64,
-            recursive: self.recursive,
-            enabled: self.enabled,
-            created_at,
-            last_triggered_at,
-            trigger_count: self.trigger_count as u64,
-            timeout_minutes: self.timeout_minutes as u32,
-        })
-    }
-}
-
-struct RunRow {
-    id: String,
-    task_id: String,
-    status_str: String,
-    trigger_str: String,
-    summary: Option<String>,
-    started_at_str: String,
-    finished_at_str: Option<String>,
-    exit_code: Option<i32>,
-    timeout_at_str: Option<String>,
-}
-
-impl RunRow {
-    fn into_run_log(self) -> Result<RunLog> {
-        let started_at =
-            chrono::DateTime::parse_from_rfc3339(&self.started_at_str)?.with_timezone(&Utc);
-        let finished_at = self
-            .finished_at_str
-            .as_ref()
-            .map(|s| chrono::DateTime::parse_from_rfc3339(s).map(|dt| dt.with_timezone(&Utc)))
-            .transpose()?;
-        let timeout_at = self
-            .timeout_at_str
-            .as_ref()
-            .map(|s| chrono::DateTime::parse_from_rfc3339(s).map(|dt| dt.with_timezone(&Utc)))
-            .transpose()?;
-
-        Ok(RunLog {
-            id: self.id,
-            task_id: self.task_id,
-            status: RunStatus::from_str(&self.status_str),
-            trigger_type: TriggerType::from_str(&self.trigger_str),
-            summary: self.summary,
-            started_at,
-            finished_at,
-            exit_code: self.exit_code,
-            timeout_at,
-        })
-    }
-}
+pub mod achievements;
+pub mod agent;
+pub mod blueprints;
+pub mod clean;
+pub mod ensembles;
+pub mod gamification;
+pub mod group;
+pub mod intelligence;
+pub mod last_prompts;
+pub mod loops;
+pub mod pools;
+pub mod project;
+pub mod run;
+pub mod scheduled_sends;
+pub mod seeds;
+pub mod session;
+pub mod state;
+pub mod sync;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::domain::models::{Cli, RunLog, RunStatus, Task, TriggerType, WatchEvent, Watcher};
-    use chrono::{Duration, Utc};
-    use tempfile::NamedTempFile;
+pub use crate::application::ports::{AgentRepository, RunRepository, StateRepository};
 
-    /// Create an in-memory-like DB backed by a temp file (`SQLite` needs a real file for WAL).
-    fn test_db() -> Database {
-        let tmp = NamedTempFile::new().expect("create temp file");
-        let path = tmp.path().to_path_buf();
-        // Keep the temp file alive by leaking it (tests are short-lived).
-        std::mem::forget(tmp);
-        Database::new(&path).expect("create test db")
-    }
-
-    fn sample_task(id: &str) -> Task {
-        Task {
-            id: id.to_string(),
-            prompt: "Run tests".to_string(),
-            schedule_expr: "0 9 * * *".to_string(),
-            cli: Cli::OpenCode,
-            model: None,
-            working_dir: Some("/tmp/project".to_string()),
-            enabled: true,
-            created_at: Utc::now(),
-            expires_at: None,
-            last_run_at: None,
-            last_run_ok: None,
-            log_path: "/tmp/test.log".to_string(),
-            timeout_minutes: 15,
-        }
-    }
-
-    fn sample_watcher(id: &str) -> Watcher {
-        Watcher {
-            id: id.to_string(),
-            path: "/tmp/watched".to_string(),
-            events: vec![WatchEvent::Create, WatchEvent::Modify],
-            prompt: "Handle file change".to_string(),
-            cli: Cli::Kiro,
-            model: Some("claude-4".to_string()),
-            debounce_seconds: 5,
-            recursive: true,
-            enabled: true,
-            created_at: Utc::now(),
-            last_triggered_at: None,
-            trigger_count: 0,
-            timeout_minutes: 15,
-        }
-    }
-
-    // ── Task CRUD ─────────────────────────────────────────────────
-
-    #[test]
-    fn test_insert_and_get_task() {
-        let db = test_db();
-        let task = sample_task("build-daily");
-        db.insert_or_update_task(&task).unwrap();
-
-        let retrieved = db.get_task("build-daily").unwrap().expect("task exists");
-        assert_eq!(retrieved.id, "build-daily");
-        assert_eq!(retrieved.prompt, "Run tests");
-        assert_eq!(retrieved.schedule_expr, "0 9 * * *");
-        assert!(matches!(retrieved.cli, Cli::OpenCode));
-        assert_eq!(retrieved.working_dir.as_deref(), Some("/tmp/project"));
-        assert!(retrieved.enabled);
-    }
-
-    #[test]
-    fn test_get_nonexistent_task() {
-        let db = test_db();
-        let result = db.get_task("does-not-exist").unwrap();
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_upsert_task_overwrites() {
-        let db = test_db();
-        let mut task = sample_task("my-task");
-        db.insert_or_update_task(&task).unwrap();
-
-        task.prompt = "Updated prompt".to_string();
-        task.schedule_expr = "*/10 * * * *".to_string();
-        db.insert_or_update_task(&task).unwrap();
-
-        let retrieved = db.get_task("my-task").unwrap().unwrap();
-        assert_eq!(retrieved.prompt, "Updated prompt");
-        assert_eq!(retrieved.schedule_expr, "*/10 * * * *");
-    }
-
-    #[test]
-    fn test_list_tasks_ordered_by_created_at_desc() {
-        let db = test_db();
-
-        let mut t1 = sample_task("first");
-        t1.created_at = Utc::now() - Duration::hours(2);
-        let mut t2 = sample_task("second");
-        t2.created_at = Utc::now() - Duration::hours(1);
-        let mut t3 = sample_task("third");
-        t3.created_at = Utc::now();
-
-        db.insert_or_update_task(&t1).unwrap();
-        db.insert_or_update_task(&t2).unwrap();
-        db.insert_or_update_task(&t3).unwrap();
-
-        let tasks = db.list_tasks().unwrap();
-        assert_eq!(tasks.len(), 3);
-        assert_eq!(tasks[0].id, "third");
-        assert_eq!(tasks[1].id, "second");
-        assert_eq!(tasks[2].id, "first");
-    }
-
-    #[test]
-    fn test_delete_task() {
-        let db = test_db();
-        db.insert_or_update_task(&sample_task("to-delete")).unwrap();
-        assert!(db.get_task("to-delete").unwrap().is_some());
-
-        db.delete_task("to-delete").unwrap();
-        assert!(db.get_task("to-delete").unwrap().is_none());
-    }
-
-    #[test]
-    fn test_update_task_enabled() {
-        let db = test_db();
-        db.insert_or_update_task(&sample_task("toggle-me")).unwrap();
-
-        db.update_task_enabled("toggle-me", false).unwrap();
-        let task = db.get_task("toggle-me").unwrap().unwrap();
-        assert!(!task.enabled);
-
-        db.update_task_enabled("toggle-me", true).unwrap();
-        let task = db.get_task("toggle-me").unwrap().unwrap();
-        assert!(task.enabled);
-    }
-
-    #[test]
-    fn test_update_task_last_run() {
-        let db = test_db();
-        db.insert_or_update_task(&sample_task("run-me")).unwrap();
-
-        db.update_task_last_run("run-me", true).unwrap();
-        let task = db.get_task("run-me").unwrap().unwrap();
-        assert!(task.last_run_at.is_some());
-        assert_eq!(task.last_run_ok, Some(true));
-
-        db.update_task_last_run("run-me", false).unwrap();
-        let task = db.get_task("run-me").unwrap().unwrap();
-        assert_eq!(task.last_run_ok, Some(false));
-    }
-
-    #[test]
-    fn test_task_with_expiration() {
-        let db = test_db();
-        let mut task = sample_task("expiring");
-        task.expires_at = Some(Utc::now() + Duration::hours(1));
-        db.insert_or_update_task(&task).unwrap();
-
-        let retrieved = db.get_task("expiring").unwrap().unwrap();
-        assert!(retrieved.expires_at.is_some());
-        assert!(!retrieved.is_expired());
-    }
-
-    // ── Watcher CRUD ──────────────────────────────────────────────
-
-    #[test]
-    fn test_insert_and_get_watcher() {
-        let db = test_db();
-        let watcher = sample_watcher("watch-src");
-        db.insert_or_update_watcher(&watcher).unwrap();
-
-        let retrieved = db
-            .get_watcher("watch-src")
-            .unwrap()
-            .expect("watcher exists");
-        assert_eq!(retrieved.id, "watch-src");
-        assert_eq!(retrieved.path, "/tmp/watched");
-        assert_eq!(retrieved.events.len(), 2);
-        assert!(retrieved.events.contains(&WatchEvent::Create));
-        assert!(retrieved.events.contains(&WatchEvent::Modify));
-        assert!(matches!(retrieved.cli, Cli::Kiro));
-        assert_eq!(retrieved.model.as_deref(), Some("claude-4"));
-        assert_eq!(retrieved.debounce_seconds, 5);
-        assert!(retrieved.recursive);
-    }
-
-    #[test]
-    fn test_get_nonexistent_watcher() {
-        let db = test_db();
-        assert!(db.get_watcher("nope").unwrap().is_none());
-    }
-
-    #[test]
-    fn test_list_and_delete_watchers() {
-        let db = test_db();
-        db.insert_or_update_watcher(&sample_watcher("w1")).unwrap();
-        db.insert_or_update_watcher(&sample_watcher("w2")).unwrap();
-
-        assert_eq!(db.list_watchers().unwrap().len(), 2);
-
-        db.delete_watcher("w1").unwrap();
-        assert_eq!(db.list_watchers().unwrap().len(), 1);
-        assert!(db.get_watcher("w1").unwrap().is_none());
-    }
-
-    #[test]
-    fn test_list_enabled_watchers() {
-        let db = test_db();
-        let mut w1 = sample_watcher("enabled-w");
-        w1.enabled = true;
-        let mut w2 = sample_watcher("disabled-w");
-        w2.enabled = false;
-
-        db.insert_or_update_watcher(&w1).unwrap();
-        db.insert_or_update_watcher(&w2).unwrap();
-
-        let enabled = db.list_enabled_watchers().unwrap();
-        assert_eq!(enabled.len(), 1);
-        assert_eq!(enabled[0].id, "enabled-w");
-    }
-
-    #[test]
-    fn test_update_watcher_enabled() {
-        let db = test_db();
-        db.insert_or_update_watcher(&sample_watcher("toggle-w"))
-            .unwrap();
-
-        db.update_watcher_enabled("toggle-w", false).unwrap();
-        let w = db.get_watcher("toggle-w").unwrap().unwrap();
-        assert!(!w.enabled);
-    }
-
-    #[test]
-    fn test_update_watcher_triggered() {
-        let db = test_db();
-        db.insert_or_update_watcher(&sample_watcher("trig-w"))
-            .unwrap();
-
-        db.update_watcher_triggered("trig-w").unwrap();
-        let w = db.get_watcher("trig-w").unwrap().unwrap();
-        assert!(w.last_triggered_at.is_some());
-        assert_eq!(w.trigger_count, 1);
-
-        db.update_watcher_triggered("trig-w").unwrap();
-        let w = db.get_watcher("trig-w").unwrap().unwrap();
-        assert_eq!(w.trigger_count, 2);
-    }
-
-    // ── Run log operations ────────────────────────────────────────
-
-    #[test]
-    fn test_insert_and_list_runs() {
-        let db = test_db();
-        // Need a task first for FK
-        db.insert_or_update_task(&sample_task("run-task")).unwrap();
-
-        let run = RunLog {
-            id: uuid::Uuid::new_v4().to_string(),
-            task_id: "run-task".to_string(),
-            status: RunStatus::Success,
-            trigger_type: TriggerType::Scheduled,
-            summary: None,
-            started_at: Utc::now() - Duration::minutes(5),
-            finished_at: Some(Utc::now()),
-            exit_code: Some(0),
-            timeout_at: None,
-        };
-        db.insert_run(&run).unwrap();
-
-        let runs = db.list_runs("run-task", 10).unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].task_id, "run-task");
-        assert_eq!(runs[0].exit_code, Some(0));
-        assert!(matches!(runs[0].trigger_type, TriggerType::Scheduled));
-    }
-
-    #[test]
-    fn test_list_runs_limit() {
-        let db = test_db();
-        db.insert_or_update_task(&sample_task("many-runs")).unwrap();
-
-        for i in 0..10 {
-            let run = RunLog {
-                id: uuid::Uuid::new_v4().to_string(),
-                task_id: "many-runs".to_string(),
-                status: RunStatus::Success,
-                trigger_type: TriggerType::Manual,
-                summary: None,
-                started_at: Utc::now() - Duration::minutes(i),
-                finished_at: Some(Utc::now()),
-                exit_code: Some(0),
-                timeout_at: None,
-            };
-            db.insert_run(&run).unwrap();
-        }
-
-        let runs = db.list_runs("many-runs", 3).unwrap();
-        assert_eq!(runs.len(), 3);
-    }
-
-    #[test]
-    fn test_delete_task_cascades_runs() {
-        let db = test_db();
-        db.insert_or_update_task(&sample_task("cascade-task"))
-            .unwrap();
-        let run = RunLog {
-            id: uuid::Uuid::new_v4().to_string(),
-            task_id: "cascade-task".to_string(),
-            status: RunStatus::Pending,
-            trigger_type: TriggerType::Watch,
-            summary: None,
-            started_at: Utc::now(),
-            finished_at: None,
-            exit_code: None,
-            timeout_at: None,
-        };
-        db.insert_run(&run).unwrap();
-        assert_eq!(db.list_runs("cascade-task", 10).unwrap().len(), 1);
-
-        db.delete_task("cascade-task").unwrap();
-        assert_eq!(db.list_runs("cascade-task", 10).unwrap().len(), 0);
-    }
-
-    // ── Task field updates ────────────────────────────────────────
-
-    #[test]
-    fn test_update_task_fields_prompt() {
-        let db = test_db();
-        db.insert_or_update_task(&sample_task("upd-task")).unwrap();
-
-        let fields = TaskFieldsUpdate {
-            prompt: Some("New prompt"),
-            ..Default::default()
-        };
-        assert!(db.update_task_fields("upd-task", &fields).unwrap());
-
-        let t = db.get_task("upd-task").unwrap().unwrap();
-        assert_eq!(t.prompt, "New prompt");
-        assert_eq!(t.schedule_expr, "0 9 * * *"); // unchanged
-    }
-
-    #[test]
-    fn test_update_task_fields_multiple() {
-        let db = test_db();
-        db.insert_or_update_task(&sample_task("upd-multi")).unwrap();
-
-        let fields = TaskFieldsUpdate {
-            prompt: Some("Updated prompt"),
-            schedule_expr: Some("*/10 * * * *"),
-            cli: Some("kiro"),
-            model: Some(Some("gpt-5")),
-            ..Default::default()
-        };
-        assert!(db.update_task_fields("upd-multi", &fields).unwrap());
-
-        let t = db.get_task("upd-multi").unwrap().unwrap();
-        assert_eq!(t.prompt, "Updated prompt");
-        assert_eq!(t.schedule_expr, "*/10 * * * *");
-        assert!(matches!(t.cli, Cli::Kiro));
-        assert_eq!(t.model.as_deref(), Some("gpt-5"));
-    }
-
-    #[test]
-    fn test_update_task_fields_clear_optional() {
-        let db = test_db();
-        let mut task = sample_task("upd-clear");
-        task.model = Some("claude-4".to_string());
-        db.insert_or_update_task(&task).unwrap();
-
-        let fields = TaskFieldsUpdate {
-            model: Some(None), // clear model
-            ..Default::default()
-        };
-        assert!(db.update_task_fields("upd-clear", &fields).unwrap());
-
-        let t = db.get_task("upd-clear").unwrap().unwrap();
-        assert!(t.model.is_none());
-    }
-
-    #[test]
-    fn test_update_task_fields_no_fields_returns_false() {
-        let db = test_db();
-        db.insert_or_update_task(&sample_task("upd-noop")).unwrap();
-
-        let fields = TaskFieldsUpdate::default();
-        assert!(!db.update_task_fields("upd-noop", &fields).unwrap());
-    }
-
-    #[test]
-    fn test_update_task_fields_nonexistent_returns_false() {
-        let db = test_db();
-
-        let fields = TaskFieldsUpdate {
-            prompt: Some("ghost"),
-            ..Default::default()
-        };
-        assert!(!db.update_task_fields("nonexistent", &fields).unwrap());
-    }
-
-    // ── Watcher field updates ─────────────────────────────────────
-
-    #[test]
-    fn test_update_watcher_fields_prompt() {
-        let db = test_db();
-        db.insert_or_update_watcher(&sample_watcher("upd-watch"))
-            .unwrap();
-
-        let fields = WatcherFieldsUpdate {
-            prompt: Some("New watcher prompt"),
-            ..Default::default()
-        };
-        assert!(db.update_watcher_fields("upd-watch", &fields).unwrap());
-
-        let w = db.get_watcher("upd-watch").unwrap().unwrap();
-        assert_eq!(w.prompt, "New watcher prompt");
-        assert_eq!(w.path, "/tmp/watched"); // unchanged
-    }
-
-    #[test]
-    fn test_update_watcher_fields_multiple() {
-        let db = test_db();
-        db.insert_or_update_watcher(&sample_watcher("upd-wmulti"))
-            .unwrap();
-
-        let events_json = serde_json::to_string(&vec![WatchEvent::Delete]).unwrap();
-        let fields = WatcherFieldsUpdate {
-            path: Some("/new/path"),
-            events: Some(&events_json),
-            debounce_seconds: Some(10),
-            recursive: Some(false),
-            ..Default::default()
-        };
-        assert!(db.update_watcher_fields("upd-wmulti", &fields).unwrap());
-
-        let w = db.get_watcher("upd-wmulti").unwrap().unwrap();
-        assert_eq!(w.path, "/new/path");
-        assert_eq!(w.events, vec![WatchEvent::Delete]);
-        assert_eq!(w.debounce_seconds, 10);
-        assert!(!w.recursive);
-    }
-
-    #[test]
-    fn test_update_watcher_fields_clear_model() {
-        let db = test_db();
-        db.insert_or_update_watcher(&sample_watcher("upd-wclr"))
-            .unwrap();
-        // sample_watcher has model = Some("claude-4")
-
-        let fields = WatcherFieldsUpdate {
-            model: Some(None),
-            ..Default::default()
-        };
-        assert!(db.update_watcher_fields("upd-wclr", &fields).unwrap());
-
-        let w = db.get_watcher("upd-wclr").unwrap().unwrap();
-        assert!(w.model.is_none());
-    }
-
-    #[test]
-    fn test_update_watcher_fields_no_fields_returns_false() {
-        let db = test_db();
-        db.insert_or_update_watcher(&sample_watcher("upd-wnoop"))
-            .unwrap();
-
-        let fields = WatcherFieldsUpdate::default();
-        assert!(!db.update_watcher_fields("upd-wnoop", &fields).unwrap());
-    }
-
-    // ── Daemon state ──────────────────────────────────────────────
-
-    #[test]
-    fn test_set_and_get_state() {
-        let db = test_db();
-        db.set_state("port", "7755").unwrap();
-        assert_eq!(db.get_state("port").unwrap(), Some("7755".to_string()));
-    }
-
-    #[test]
-    fn test_get_state_missing_key() {
-        let db = test_db();
-        assert!(db.get_state("missing").unwrap().is_none());
-    }
-
-    #[test]
-    fn test_set_state_overwrites() {
-        let db = test_db();
-        db.set_state("version", "0.1.0").unwrap();
-        db.set_state("version", "0.2.0").unwrap();
-        assert_eq!(db.get_state("version").unwrap(), Some("0.2.0".to_string()));
-    }
-}
+#[cfg(test)]
+mod tests;

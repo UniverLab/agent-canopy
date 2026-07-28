@@ -1,0 +1,678 @@
+[demo]
+name = "demo"
+output_dir = "./dist"
+prompt = '\[\e[1;32m\]canopy@univerlab\[\e[0m\]:\[\e[1;34m\]~\[\e[0m\]$ '
+
+[typing]
+base_ms = 80
+salt_ms = 15
+
+[layout]
+width = 1440
+height = 1080
+fps = 15
+line_height = 1.2000000476837158
+background = "#0b0f14"
+font_family = "IBM Plex Mono"
+
+[[layout.panes]]
+id = "main"
+type = "terminal"
+x = 0
+y = 0
+width = 1440
+height = 1080
+font_family = "monospace"
+font_size = 16
+
+[[timeline]]
+action = "focus"
+pane = "main"
+
+[[timeline]]
+action = "type"
+text = "canopy doctor"
+human_salt = true
+
+[[timeline]]
+action = "wait"
+duration_ms = 200
+
+[[timeline]]
+action = "keypress"
+key = "enter"
+
+[[timeline]]
+action = "wait_for_quiet"
+quiet_ms = 500
+
+[[timeline]]
+action = "type"
+text = "canopy mcp"
+human_salt = true
+
+[[timeline]]
+action = "wait"
+duration_ms = 200
+
+[[timeline]]
+action = "keypress"
+key = "enter"
+
+[[timeline]]
+action = "wait"
+duration_ms = 200
+
+[[timeline]]
+action = "keypress"
+key = "enter"
+
+[[timeline]]
+action = "wait_for_quiet"
+quiet_ms = 2500
+
+[[timeline]]
+action = "type"
+text = "canopy"
+human_salt = true
+
+[[timeline]]
+action = "wait"
+duration_ms = 200
+
+[[timeline]]
+action = "keypress"
+key = "enter"
+
+[[timeline]]
+action = "wait"
+duration_ms = 2500
+
+[[timeline]]
+action = "keypress"
+key = "f2"
+
+[[timeline]]
+action = "wait"
+duration_ms = 2500
+
+[[timeline]]
+action = "keypress"
+key = "down"
+
+[[timeline]]
+action = "wait"
+duration_ms = 330
+
+[[timeline]]
+action = "keypress"
+key = "down"
+
+[[timeline]]
+action = "wait"
+duration_ms = 364
+
+[[timeline]]
+action = "keypress"
+key = "down"
+
+[[timeline]]
+action = "wait"
+duration_ms = 324
+
+[[timeline]]
+action = "keypress"
+key = "down"
+
+[[timeline]]
+action = "wait"
+duration_ms = 376
+
+[[timeline]]
+action = "keypress"
+key = "tab"
+
+[[timeline]]
+action = "wait"
+duration_ms = 467
+
+[[timeline]]
+action = "keypress"
+key = "down"
+
+[[timeline]]
+action = "wait"
+duration_ms = 927
+
+[[timeline]]
+action = "keypress"
+key = "down"
+
+[[timeline]]
+action = "wait"
+duration_ms = 376
+
+[[timeline]]
+action = "keypress"
+key = "down"
+
+[[timeline]]
+action = "wait"
+duration_ms = 1448
+
+[[timeline]]
+action = "keypress"
+key = "f1"
+
+[[timeline]]
+action = "wait"
+duration_ms = 1559
+
+[[timeline]]
+action = "keypress"
+key = "down"
+
+[[timeline]]
+action = "wait"
+duration_ms = 278
+
+[[timeline]]
+action = "keypress"
+key = "down"
+
+[[timeline]]
+action = "wait"
+duration_ms = 214
+
+[[timeline]]
+action = "keypress"
+key = "down"
+
+[[timeline]]
+action = "wait"
+duration_ms = 259
+
+[[timeline]]
+action = "keypress"
+key = "down"
+
+[[timeline]]
+action = "wait"
+duration_ms = 290
+
+[[timeline]]
+action = "keypress"
+key = "down"
+
+[[timeline]]
+action = "wait"
+duration_ms = 306
+
+[[timeline]]
+action = "keypress"
+key = "down"
+
+[[timeline]]
+action = "wait"
+duration_ms = 293
+
+[[timeline]]
+action = "keypress"
+key = "down"
+
+[[timeline]]
+action = "wait"
+duration_ms = 931
+
+[[timeline]]
+action = "keypress"
+key = "f1"
+
+[[timeline]]
+action = "wait"
+duration_ms = 2500
+
+[[timeline]]
+action = "keypress"
+key = "f2"
+
+[[timeline]]
+action = "wait"
+duration_ms = 2500
+
+[[timeline]]
+action = "keypress"
+key = "ctrl+n"
+
+[[timeline]]
+action = "wait"
+duration_ms = 200
+
+[[timeline]]
+action = "keypress"
+key = "down"
+
+[[timeline]]
+action = "wait"
+duration_ms = 1337
+
+[[timeline]]
+action = "type"
+text = " "
+human_salt = true
+
+[[timeline]]
+action = "wait"
+duration_ms = 739
+
+[[timeline]]
+action = "keypress"
+key = "down"
+
+[[timeline]]
+action = "wait"
+duration_ms = 299
+
+[[timeline]]
+action = "keypress"
+key = "down"
+
+[[timeline]]
+action = "wait"
+duration_ms = 227
+
+[[timeline]]
+action = "keypress"
+key = "down"
+
+[[timeline]]
+action = "wait"
+duration_ms = 256
+
+[[timeline]]
+action = "keypress"
+key = "down"
+
+[[timeline]]
+action = "wait"
+duration_ms = 250
+
+[[timeline]]
+action = "keypress"
+key = "down"
+
+[[timeline]]
+action = "wait"
+duration_ms = 248
+
+[[timeline]]
+action = "keypress"
+key = "down"
+
+[[timeline]]
+action = "wait"
+duration_ms = 259
+
+[[timeline]]
+action = "keypress"
+key = "down"
+
+[[timeline]]
+action = "wait"
+duration_ms = 273
+
+[[timeline]]
+action = "keypress"
+key = "down"
+
+[[timeline]]
+action = "wait"
+duration_ms = 281
+
+[[timeline]]
+action = "keypress"
+key = "down"
+
+[[timeline]]
+action = "wait"
+duration_ms = 602
+
+[[timeline]]
+action = "type"
+text = "ope"
+human_salt = true
+
+[[timeline]]
+action = "wait"
+duration_ms = 200
+
+[[timeline]]
+action = "keypress"
+key = "enter"
+
+[[timeline]]
+action = "wait"
+duration_ms = 1295
+
+[[timeline]]
+action = "keypress"
+key = "down"
+
+[[timeline]]
+action = "wait"
+duration_ms = 263
+
+[[timeline]]
+action = "keypress"
+key = "down"
+
+[[timeline]]
+action = "wait"
+duration_ms = 279
+
+[[timeline]]
+action = "keypress"
+key = "down"
+
+[[timeline]]
+action = "wait"
+duration_ms = 798
+
+[[timeline]]
+action = "keypress"
+key = "left"
+
+[[timeline]]
+action = "wait"
+duration_ms = 338
+
+[[timeline]]
+action = "keypress"
+key = "left"
+
+[[timeline]]
+action = "wait"
+duration_ms = 290
+
+[[timeline]]
+action = "keypress"
+key = "left"
+
+[[timeline]]
+action = "wait"
+duration_ms = 276
+
+[[timeline]]
+action = "keypress"
+key = "left"
+
+[[timeline]]
+action = "wait"
+duration_ms = 295
+
+[[timeline]]
+action = "keypress"
+key = "left"
+
+[[timeline]]
+action = "wait"
+duration_ms = 823
+
+[[timeline]]
+action = "type"
+text = "hom"
+human_salt = true
+
+[[timeline]]
+action = "wait"
+duration_ms = 818
+
+[[timeline]]
+action = "keypress"
+key = "right"
+
+[[timeline]]
+action = "wait"
+duration_ms = 1195
+
+[[timeline]]
+action = "keypress"
+key = "right"
+
+[[timeline]]
+action = "wait"
+duration_ms = 2418
+
+[[timeline]]
+action = "type"
+text = "pro"
+human_salt = true
+
+[[timeline]]
+action = "wait"
+duration_ms = 544
+
+[[timeline]]
+action = "keypress"
+key = "right"
+
+[[timeline]]
+action = "wait"
+duration_ms = 1451
+
+[[timeline]]
+action = "type"
+text = "uni"
+human_salt = true
+
+[[timeline]]
+action = "wait"
+duration_ms = 887
+
+[[timeline]]
+action = "keypress"
+key = "right"
+
+[[timeline]]
+action = "wait"
+duration_ms = 200
+
+[[timeline]]
+action = "keypress"
+key = "enter"
+
+[[timeline]]
+action = "wait"
+duration_ms = 884
+
+[[timeline]]
+action = "type"
+text = "demo"
+human_salt = true
+
+[[timeline]]
+action = "wait"
+duration_ms = 200
+
+[[timeline]]
+action = "keypress"
+key = "enter"
+
+[[timeline]]
+action = "wait"
+duration_ms = 200
+
+[[timeline]]
+action = "keypress"
+key = "enter"
+
+[[timeline]]
+action = "wait"
+duration_ms = 2500
+
+[[timeline]]
+action = "keypress"
+key = "esc"
+
+[[timeline]]
+action = "wait"
+duration_ms = 2500
+
+[[timeline]]
+action = "type"
+text = "/model"
+human_salt = true
+
+[[timeline]]
+action = "wait"
+duration_ms = 200
+
+[[timeline]]
+action = "keypress"
+key = "enter"
+
+[[timeline]]
+action = "wait"
+duration_ms = 1501
+
+[[timeline]]
+action = "type"
+text = "free"
+human_salt = true
+
+[[timeline]]
+action = "wait"
+duration_ms = 1536
+
+[[timeline]]
+action = "keypress"
+key = "down"
+
+[[timeline]]
+action = "wait"
+duration_ms = 200
+
+[[timeline]]
+action = "keypress"
+key = "enter"
+
+[[timeline]]
+action = "wait"
+duration_ms = 500
+
+[[timeline]]
+action = "keypress"
+key = "ctrl+b"
+
+[[timeline]]
+action = "wait"
+duration_ms = 200
+
+[[timeline]]
+action = "type"
+text = "Using only Canopy's intelligence, tell me everything you know about this project, without reading any files."
+human_salt = true
+
+[[timeline]]
+action = "wait"
+duration_ms = 200
+
+[[timeline]]
+action = "keypress"
+key = "ctrl+s"
+
+[[timeline]]
+action = "wait"
+duration_ms = 2500
+
+[[timeline]]
+action = "keypress"
+key = "f3"
+
+[[timeline]]
+action = "wait"
+duration_ms = 1368
+
+[[timeline]]
+action = "keypress"
+key = "f3"
+
+[[timeline]]
+action = "wait"
+duration_ms = 1030
+
+[[timeline]]
+action = "keypress"
+key = "f3"
+
+[[timeline]]
+action = "wait"
+duration_ms = 2500
+
+[[timeline]]
+action = "keypress"
+key = "f3"
+
+[[timeline]]
+action = "wait"
+duration_ms = 2500
+
+[[timeline]]
+action = "keypress"
+key = "f3"
+
+[[timeline]]
+action = "wait"
+duration_ms = 5000
+
+[[timeline]]
+action = "type"
+text = "/exit"
+human_salt = true
+
+[[timeline]]
+action = "wait"
+duration_ms = 200
+
+[[timeline]]
+action = "keypress"
+key = "enter"
+
+[[timeline]]
+action = "wait"
+duration_ms = 2500
+
+[[timeline]]
+action = "keypress"
+key = "f10"
+
+[[timeline]]
+action = "wait"
+duration_ms = 1067
+
+[[timeline]]
+action = "keypress"
+key = "f10"
+
+[[timeline]]
+action = "wait"
+duration_ms = 608
+
+[[timeline]]
+action = "keypress"
+key = "f10"
+
+[[timeline]]
+action = "wait"
+duration_ms = 200
+
+[[timeline]]
+action = "keypress"
+key = "enter"
+
+[[timeline]]
+action = "wait"
+duration_ms = 1500
+
+[[timeline]]
+action = "terminate"

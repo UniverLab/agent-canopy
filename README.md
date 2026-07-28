@@ -1,362 +1,256 @@
-# task-trigger-mcp
+```                                                         
+  ██████   ██████   ████████    ██████  ████████  █████ ████
+ ███░░███ ░░░░░███ ░░███░░███  ███░░███░░███░░███░░███ ░███ 
+░███ ░░░   ███████  ░███ ░███ ░███ ░███ ░███ ░███ ░███ ░███ 
+░███  ███ ███░░███  ░███ ░███ ░███ ░███ ░███ ░███ ░███ ░███ 
+░░██████ ░░████████ ████ █████░░██████  ░███████  ░░███████ 
+ ░░░░░░   ░░░░░░░░ ░░░░ ░░░░░  ░░░░░░   ░███░░░    ░░░░░███ 
+                                        ░███       ███ ░███ 
+                                        █████     ░░██████  
+                                       ░░░░░       ░░░░░░   
+```
 
-[![CI](https://github.com/JheisonMB/task-trigger-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/JheisonMB/task-trigger-mcp/actions/workflows/ci.yml)
-[![Release](https://github.com/JheisonMB/task-trigger-mcp/actions/workflows/release.yml/badge.svg)](https://github.com/JheisonMB/task-trigger-mcp/actions/workflows/release.yml)
-[![Crates.io](https://img.shields.io/crates/v/task-trigger-mcp)](https://crates.io/crates/task-trigger-mcp)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+<p align="center">
+  <a href="https://github.com/UniverLab/harness-canopy/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/UniverLab/harness-canopy/ci.yml?branch=main&style=for-the-badge&label=CI" alt="CI"/></a>
+  <a href="https://crates.io/crates/harness-canopy"><img src="https://img.shields.io/crates/v/harness-canopy?style=for-the-badge&logo=rust&logoColor=white" alt="Crates.io"/></a>
+  <img src="https://img.shields.io/badge/Status-Active-27AE60?style=for-the-badge" alt="Status"/>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-2E8B57?style=for-the-badge" alt="License"/></a>
+</p>
 
-A self-contained MCP server that lets AI agents register, manage, and execute **scheduled** and **event-driven** tasks. Single static binary. No runtime dependencies. Cross-platform (Linux/WSL, macOS).
-
-Your agent says *"run tests every day at 9am"* — the model converts that to a cron expression, and the binary handles scheduling, file watching, CLI invocation, log rotation, and everything else internally. The agent never writes bash scripts or touches crontab.
+harness-canopy is a modern, self-contained MCP (Model Context Protocol) server and TUI for orchestrating AI agent sessions, background tasks, and file event triggers. Designed for reliability, modularity, and performance — it enables advanced scheduling, persistent knowledge graphs, multi-agent coordination, loop automation, and interactive terminal management with zero runtime dependencies.
 
 ---
 
-## How It Works
+### Demo
 
-```mermaid
-graph TB
-    subgraph daemon["task-trigger-mcp daemon"]
-        MCP["MCP Server<br/>Streamable HTTP :7755"]
-        SCHED["Cron Scheduler<br/>(internal, tokio)"]
-        WE["Watcher Engine<br/>(notify crate)"]
-        DB[(SQLite<br/>tasks.db)]
-        MCP <--> DB
-        SCHED <--> DB
-        WE <--> DB
-        SCHED -- "on schedule" --> EXEC
-        WE -- "on file event" --> EXEC
-        EXEC["Executor"]
-    end
-
-    Agent["MCP Client<br/>(OpenCode, Kiro, Copilot,<br/>Claude Desktop)"] -- "Streamable HTTP / stdio" --> MCP
-    EXEC --> CLI["Headless CLI<br/>(opencode run / kiro-cli / copilot)"]
-
-    style daemon fill:#1a1a2e,stroke:#16213e,color:#eee
-    style Agent fill:#0f3460,stroke:#16213e,color:#eee
-    style CLI fill:#e94560,stroke:#16213e,color:#eee
-```
-
-**Key property**: the agent connects and disconnects freely. Watchers keep running. Scheduled tasks keep firing. The daemon is the source of truth.
+![Demo](demo/dist/demo.gif)
 
 ---
 
 ## Installation
 
-### Quick install (recommended)
+**Linux / macOS:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/JheisonMB/task-trigger-mcp/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/UniverLab/harness-canopy/main/scripts/install.sh | sh
 ```
 
-This downloads the latest prebuilt binary for your platform and installs it to `~/.local/bin`. No Rust toolchain needed.
+Or via cargo: `cargo install harness-canopy` (the binary is `canopy`).
+See [`docs/installation.md`](docs/installation.md) for all methods and first-time setup.
 
-You can customize the install:
+## Documentation
 
-```bash
-# Pin a specific version
-VERSION=1.0.0 curl -fsSL https://raw.githubusercontent.com/JheisonMB/task-trigger-mcp/main/install.sh | sh
-
-# Install to a custom directory
-INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/JheisonMB/task-trigger-mcp/main/install.sh | sh
-```
-
-### Via cargo
-
-```bash
-cargo install task-trigger-mcp
-```
-
-Available on [crates.io](https://crates.io/crates/task-trigger-mcp).
-
-### From source
-
-```bash
-git clone https://github.com/JheisonMB/task-trigger-mcp.git
-cd task-trigger-mcp
-cargo build --release
-# Binary at target/release/task-trigger-mcp
-```
-
-### GitHub Releases
-
-Check the [Releases](https://github.com/JheisonMB/task-trigger-mcp/releases) page for precompiled binaries (Linux x86_64, macOS x86_64/ARM64, Windows x86_64).
+Full documentation lives in [`docs/`](docs/): installation, quick start, the
+TUI, agents and seed identities, intelligence & sync, loops, the RAG
+pipeline, all 64 MCP tools, and the complete CLI reference.
 
 ---
 
-## MCP Client Configuration
 
-Add this to your OpenCode config file (`~/.opencode/config.json`):
+## Features
 
-```json
-{
-  "mcp": {
-    "task-trigger": {
-      "type": "local",
-      "command": ["task-trigger-mcp"],
-      "args": ["stdio"],
-      "enabled": true
-    }
-  }
-}
-```
+### 🎯 Core Platform
 
-**Note:** This runs task-trigger-mcp in stdio mode. Scheduled tasks will pause when OpenCode disconnects. For persistent task execution, run the daemon separately:
+- **🚀 High-Performance Scheduler** — Event-driven cron scheduler using Tokio with zero polling overhead. Computes precise wake-up times and sleeps until needed; CPU usage drops to near-zero when idle.
+- **📊 Real-time File Watcher** — Instantly reacts to file system events (create, modify, delete, move) using the `notify` crate with configurable debouncing, recursive directory monitoring, and macOS FSEvents compatibility.
+- **💾 Persistent State** — All tasks, watchers, execution logs, agent state, sync messages, intelligence nodes, loops, and projects are stored in an embedded SQLite database with WAL mode and automatic schema migration.
+- **🔄 Auto-Update** — Checks GitHub releases daily for new stable versions, downloads the platform-specific binary (linux-musl, macos-darwin; x86_64/aarch64), and atomically replaces the running executable.
+- **🔔 Cross-Platform Notifications** — Native desktop notifications for task completions, failures, and watcher triggers. Auto-detects platform: WSL (PowerShell toasts with AUMID), macOS (`osascript`), Linux (`notify-send`).
 
-```bash
-task-trigger-mcp daemon start
-```
+### 🤖 Agent Management
 
-And reconfigure to use remote MCP:
+- **Interactive PTY Agents** — Each agent runs in a dedicated pseudo-terminal with full vt100 emulation, 24-bit color support, cursor positioning, and interactive applications.
+- **Terminal Sessions** — Raw shell sessions with per-session command history (TOML-backed), cross-session autocomplete search, and Warp-like input mode for efficient command entry.
+- **Background Agents** — Cron-scheduled and file-watcher-triggered agents with configurable timeouts, automatic retries, execution logging (5 MB rotation), and per-run status tracking.
+- **Seed Identity System** — Persistent, evolvable agent identities stored as structured TOML at `~/.canopy/seeds/<id>/identity.toml`. Each seed has a unique name, family, behavioral directives, and personality traits. Binded sessions receive the seed's prompt injection automatically. The `evolve_identity` MCP tool lets agents refine themselves over time. 4 KB size cap, case-insensitive name uniqueness, and mandatory field validation.
+- **Seed Nursery** — Collaborative workspace for creating new seed identities. Creates a temporary directory with a draft `identity.toml` and CLI-specific instruction files (e.g. `CLAUDE.md`, `AGENTS.md`) that guide the agent to interview the user and define the seed's personality. Validates and registers the seed on completion.
+- **Context Transfer** — Seamlessly transfer conversation context, prompts, and output between agents while preserving session state and scrollback history.
+- **Prompt Builder** — Structured prompt templates with configurable sections (instruction, context, resources, examples), section picker, and @-mention agent references.
+- **Launchpad** — Start new interactive sessions with previous mission recovery, mission input, and auto-injected context.
 
-```json
-{
-  "mcp": {
-    "task-trigger": {
-      "type": "remote",
-      "url": "http://localhost:7755/mcp",
-      "enabled": true
-    }
-  }
-}
-```
+### 🧠 Intelligence V2 — Knowledge Graph
 
----
+- **Project-Scoped Knowledge** — Store facts, patterns, and session summaries scoped to individual projects via `project_hash` (SHA-256 of canonical workdir path, truncated to 8 hex). Auto-detected from the session workdir — agents never need to set it manually.
+- **Full-Text Search** — Search intelligence nodes by query and optional kind filter across all projects.
+- **Graph Walk** — Traverse the knowledge graph from any node up to a configurable depth, returning connected facts, patterns, and cross-references.
+- **Project Relationships** — Link projects with typed relations (`depends_on`, `complements`, `relates_to`, `independent`) and query related projects for context enrichment.
+- **Context Retrieval** — `intelligence_get_context` auto-detects the project, returns a curated mix of session knowledge, project facts, and related-project summaries.
 
-## Quick Start
+### 🔄 Multi-Agent Sync
 
-```bash
-# 1. Start the daemon
-task-trigger-mcp daemon start
+- **Mission Declaration** — Agents declare high-level missions with impact levels (`low`/`high`/`breaking`) so peers can see what's happening.
+- **Workspace Status** — Report workspace stability (`stable`/`unstable`/`testing`) to coordinate safe concurrent work.
+- **Broadcast Messaging** — Info, query, and answer messages between agents in the same workdir.
+- **Active Context** — `sync_get_context` returns active missions, recent chatter, and a computed workspace "vibe" (worst status among active intents).
 
-# 2. Check it's running
-task-trigger-mcp daemon status
+### 🔀 Loop DAG Engine
 
-# 3. Your agent now has access to 12 task management tools
-```
+- **Ordered Specs** — Loops contain sequenced `Spec`s, each with `Node`s connected by `Edge`s with routing conditions (`pass`/`fail`/`always`).
+- **Standalone Spec Backlog** — Specs exist independently from loops; tag them to a workdir for filtering. Managed via `spec_create`, `spec_list`, `spec_update`, `spec_delete`.
+- **Spec Queues** — Ordered queues of existing specs that a loop drains one by one. Append and reorder while a loop is running via `queue_create`, `queue_add_spec`, `queue_list`, `queue_remove_spec`, `queue_reorder`. (The old `pool_*` names remain as deprecated back-compat aliases.)
+- **Node Kinds** — `agent` nodes invoke CLI tools with prompt templates; `check` nodes execute shell commands; `gate` nodes validate previous output (e.g., `output_contains`); `quorum` is the engine-managed node that closes an ensemble.
+- **Ensembles** — `loop_add_ensemble` creates a parallel group of 2-8 agent-node members sharing one prompt, plus a wait-all quorum that consolidates their outputs and routes onward, in a single MCP call. `loop_update_ensemble` edits the shared prompt, member list, and quorum/exit config as one unit. See [docs/loops.md](docs/loops.md#ensembles).
+- **Node Blueprints** — Reusable `{name, kind, config}` templates referenced by name in `loop_add_node`. Five builtins seeded at startup; custom blueprints via `blueprint_create`/`blueprint_delete`/`blueprint_list`.
+- **Full Lifecycle** — Create, update, run, pause, continue (retry or skip), reset, complete nodes, and report blockers for human intervention. `loop_schedule_autorun` resumes failed/completed loops at a future time.
+- **`on_completed` Hook** — Post-completion agent execution (e.g. documentation maintenance) that fires once per completion.
+- **Template Variables** — Loop prompts support `{{loop_name}}`, `{{workdir}}`, `{{spec_id}}`, `{{spec_name}}`, `{{spec_content}}`, `{{node_id}}`, `{{previous_feedback}}`, and `{{spec_start_head}}` (git HEAD at spec start, for check nodes).
+- **24 MCP Tools** — Complete authoring, inspection, runtime, spec, queue, and blueprint management.
 
-The daemon is a single long-running process that owns:
+### 📚 Personal RAG Pipeline
 
-1. **MCP Server** (Streamable HTTP on port 7755) — so agents can connect and call tools
-2. **Internal Cron Scheduler** (tokio) — event-driven, sleeps until the next task is due and executes it
-3. **File Watcher Engine** (notify crate) — monitors files/directories for changes and triggers executions
-4. **SQLite Database** — persists all task/watcher definitions, run history, and logs
+- **Semantic Search** — Embed and query personal documents (Markdown, MDX, PDF) with local ONNX models (fastembed/BGE, multilingual-e5) or remote APIs (OpenAI, Gemini).
+- **Language-Aware Chunking** — Markdown split by headings with paragraph fallback, similarity-aware merging, and overlap for context preservation.
+- **PDF Extraction** — Isolated subprocess prevents parser crashes from taking down the daemon, with HTML detection and raw-text salvage fallback.
+- **Auto-Ingestion** — Background watcher monitors configured RAG roots with 3-second debounce, enqueues changes, and reconciles orphan chunks on startup.
+- **Per-Agent Rate Limiting** — 10 calls/minute sliding window per agent.
+- **`.canopy/ragignore`** — Regex-based exclusion patterns for files and directories.
 
-There is no dependency on `crontab`, `launchd`, or any OS scheduler. Everything runs inside the daemon.
+### 🖥️ Interactive TUI (Canopy Hub)
 
-### What happens when the daemon stops?
+- **NewAgentDialog** — Three modes (Interactive, Background Cron/Watch, Terminal) with CLI picker, model picker, seed identity selector (`◀ None / SeedName ▶`), directory browser, and yolo mode toggle.
+- **Scheduled Delivery** — `Shift+Enter` (Kitty keyboard protocol) sends prompts at a chosen time instead of immediately.
+- **Split Groups** — Side-by-side horizontal/vertical views for monitoring multiple agents simultaneously.
+- **System Dashboard** — CPU, memory, disk, GPU (NVIDIA/Linux/macOS), temperatures with amber/red alert thresholds. WSL queries Windows host metrics via PowerShell.
+- **Live Loop View** — Real-time graph rendering with auto-follow on the running node, manual node inspection, and per-node run info (status, elapsed, output tail).
+- **Agent Status Colors** — Green for working (recent output), blue for idle, red for failed, gray for exited.
+- **Projects Sidebar** — Sections for active loops, backlog specs, and loop history, filterable by project workdir.
+- **Loop Editor** — Inline node config JSON editing with validation.
+- **RAG Transfer Modal** — Send semantic search results to other agents as injected context.
+- **Context Transfer** — Two-step modal (preview → agent picker) to inject conversation context between sessions.
+- **Brian's Brain** — 3-state cellular automaton with auto-noise for idle state visualization.
+- **Whimsg** — Animated kaomoji status messages with typing effects.
+- **Gamification** — 28 achievement-style missions across 6 categories (Environment, Intelligence, Projects, Loop, Seeds, SysInfo) tracked automatically during normal TUI operation.
 
-| Component | Behavior |
-|---|---|
-| **Scheduled tasks** | Stop executing. They resume when the daemon restarts. |
-| **File watchers** | Stop monitoring. They are reloaded from SQLite on restart. |
-| **Task definitions** | Persist in SQLite. Nothing is lost. |
+### 🔧 Additional Features
 
-### How to make it survive reboots
-
-```bash
-task-trigger-mcp daemon install-service
-```
-
-This installs the daemon as a system service that starts automatically on boot:
-
-- **Linux/WSL**: creates a systemd user unit and enables lingering (runs without active login)
-- **macOS**: creates a launchd agent that starts on login
-
-To remove the service:
-
-```bash
-task-trigger-mcp daemon uninstall-service
-```
-
-Alternatively, add `task-trigger-mcp daemon start` to your shell startup file (`.bashrc`, `.zshrc`).
-
----
-
-## MCP Tools
-
-The server exposes 12 tools to the agent:
-
-| Tool | Description |
-|---|---|
-| `task_add` | Register a scheduled task with a 5-field cron expression (`*/5 * * * *`, `0 9 * * 1-5`). Supports `timeout_minutes` for execution locking. |
-| `task_watch` | Watch a file/directory for create, modify, delete, or move events. Supports `timeout_minutes` for execution locking. |
-| `task_report` | Report execution status from a running task. Called by the agent with `run_id`, `status` (`in_progress`, `success`, `error`), and `summary`. |
-| `task_update` | Modify an existing task or watcher (schedule, prompt, events, etc.) without deleting and recreating it |
-| `task_list` | List all scheduled tasks with status, last run, and expiry info |
-| `task_watchers` | List all file watchers with status and trigger counts |
-| `task_remove` | Remove a task or watcher completely |
-| `task_unwatch` | Pause a file watcher without deleting it |
-| `task_enable` | Re-enable a disabled task or watcher |
-| `task_disable` | Disable a task or watcher without removing it |
-| `task_run` | Execute a task immediately, outside its schedule |
-| `task_logs` | Get log output for a task or watcher with optional line/time filters |
-| `task_status` | Daemon health: uptime, transport, scheduler status, active counts |
-
-### Schedule format (cron)
-
-The `schedule` field in `task_add` expects a standard 5-field cron expression:
-
-```
-┌───────── minute (0-59)
-│ ┌─────── hour (0-23)
-│ │ ┌───── day of month (1-31)
-│ │ │ ┌─── month (1-12)
-│ │ │ │ ┌─ day of week (0-6, 0=Sun)
-│ │ │ │ │
-* * * * *
-```
-
-Common patterns:
-- `*/5 * * * *` — every 5 minutes
-- `0 9 * * *` — daily at 9am
-- `0 9 * * 1-5` — weekdays at 9am
-- `0 */2 * * *` — every 2 hours
-- `30 14 1,15 * *` — 1st and 15th at 2:30pm
-
-The model is responsible for converting natural language (e.g. "every day at 9am") into cron expressions. The tool description includes common patterns to guide the model.
-
-### Execution runs & locking
-
-Every task execution generates a unique run (UUID) with a lifecycle:
-
-```
-pending → in_progress → success / error
-                      → timeout (if agent doesn't report back)
-```
-
-**How it works:**
-
-1. When the daemon launches a task, it creates a run with status `pending` and locks the task
-2. The prompt sent to the agent includes instructions to call `task_report` with the `run_id`
-3. The agent calls `task_report(run_id, "in_progress")` immediately, then does its work
-4. When finished, the agent calls `task_report(run_id, "success", summary)` or `task_report(run_id, "error", summary)`
-5. If a new trigger arrives while the task is locked, it's recorded as `missed` and skipped
-
-**Timeout:** Each task has a configurable `timeout_minutes` (default: 15). If the agent doesn't report back within this window, the run is marked as `timeout` and the task is unlocked on the next trigger. This prevents tasks from being permanently locked.
-
-**Anti-recursion for watchers:** The locking mechanism naturally prevents recursive loops — if a watcher triggers a CLI that modifies the watched file, the second trigger is skipped because the task is still locked.
+- **Prompt Template Engine** — Background agent prompts support `{{TIMESTAMP}}`, `{{TASK_ID}}`, `{{LOG_PATH}}`, `{{FILE_PATH}}`, `{{EVENT_TYPE}}` placeholders.
+- **Project Registry** — Automatic project index keyed by workdir hash. README descriptions extracted from project roots (min 20 words, before first `##` heading). Search and update via `project_search` and `project_update` MCP tools.
+- **Action Protocol Advisor** — `get_tools` MCP tool returns scope-sensitive action protocols (`session_start`, `file_write`, `test_run`, `close_session`, `multi_agent`) with risk levels and recommended tool sets.
+- **Setup Wizard** — Interactive `canopy setup` detects installed AI CLIs from a GitHub-hosted registry, configures binary paths, model flags, headless modes, environment variables, and temperature units. Generates `~/.canopy/config.toml`.
+- **MCP Wizard** — `canopy mcp` subcommand for syncing, adding, and removing MCP server entries across all detected platforms with automatic format conversion (JSON ↔ TOML).
+- **Skills Manager** — Global skill directory at `~/.agents/skills/` with cross-platform symlinks. List, validate symlink integrity, and remove installed skills across platforms.
+- **Doctor Diagnostics** — `canopy doctor` checks data directory, database, config, harnesses, RAG status, file watchers, daemon process, registry connectivity, and auto-update health.
+- **Desktop Notifications** — Cross-platform alerts for task completions, failures, watcher triggers, RAG indexing events, and loop lifecycle (started, spec completed, finished with outcome, blocker, hook failure).
 
 ---
 
-## Usage Examples
+## MCP Tools (64)
 
-### Schedule a daily test run
-
-> Agent: "Run the test suite every day at 9am"
-
-The model calls `task_add`:
-```json
-{
-  "id": "daily-tests",
-  "prompt": "Run cargo test in the project and report any failures",
-  "schedule": "0 9 * * *",
-  "cli": "opencode",
-  "working_dir": "/home/user/my-project",
-  "timeout_minutes": 30
-}
-```
-
-### Watch for source changes
-
-> Agent: "Watch src/ for changes and run the linter"
-
-The model calls `task_watch`:
-```json
-{
-  "id": "lint-on-change",
-  "path": "/home/user/my-project/src",
-  "events": ["create", "modify"],
-  "prompt": "Run cargo clippy and fix any warnings",
-  "cli": "opencode",
-  "recursive": true,
-  "debounce_seconds": 5
-}
-```
-
-### Temporary task with auto-expiry
-
-> Agent: "Check deployment status every minute for the next hour"
-
-```json
-{
-  "id": "monitor-deploy",
-  "prompt": "Check deployment status and report",
-  "schedule": "*/1 * * * *",
-  "cli": "opencode",
-  "duration_minutes": 60
-}
-```
-
-This task auto-disables after 60 minutes.
-
-### Prompt variables
-
-Prompts support variable substitution at execution time:
-
-- `{{TIMESTAMP}}` — current ISO 8601 timestamp
-- `{{TASK_ID}}` — the task's ID
-- `{{LOG_PATH}}` — path to the task's log file
-- `{{FILE_PATH}}` — the watched file path (watchers only)
-- `{{EVENT_TYPE}}` — the event that fired (watchers only)
+| Category | Tools |
+|----------|-------|
+| **Agent Management** (13) | `agent_add`, `agent_watch`, `agent_list`, `agent_remove`, `agent_enable`, `agent_disable`, `agent_schedule_enable`, `agent_run`, `agent_status`, `agent_models`, `agent_logs`, `agent_update`, `agent_report` |
+| **Multi-Agent Sync** (4) | `sync_declare_intent`, `sync_report_status`, `sync_broadcast`, `sync_get_context` |
+| **Intelligence V2** (6) | `intelligence_get_context`, `intelligence_upsert`, `intelligence_search`, `intelligence_graph_walk`, `intelligence_list_projects`, `intelligence_link_projects` |
+| **Seed Identity** (5) | `get_identity`, `evolve_identity`, `create_seed`, `list_seeds`, `remove_seed` |
+| **Loop Engine** (19) | `loop_create`, `loop_update`, `loop_add_spec`, `loop_update_spec`, `loop_add_node`, `loop_update_node`, `loop_add_edge`, `loop_update_edge`, `loop_add_ensemble`, `loop_update_ensemble`, `loop_get`, `loop_list`, `loop_run`, `loop_reset`, `loop_schedule_autorun`, `loop_pause`, `loop_continue`, `loop_complete_node`, `loop_report_blocker` |
+| **Spec Backlog** (5) | `spec_create`, `spec_list`, `spec_update`, `spec_delete`, `spec_set_status` |
+| **Spec Queues** (5) | `queue_create`, `queue_add_spec`, `queue_list`, `queue_remove_spec`, `queue_reorder` (deprecated `pool_*` aliases still resolve) |
+| **Node Blueprints** (3) | `blueprint_list`, `blueprint_create`, `blueprint_delete` |
+| **Project** (2) | `project_search`, `project_update` |
+| **RAG** (1) | `rag_search` |
+| **Protocol** (1) | `get_tools` |
 
 ---
 
-## Daemon Management
+## Architecture Overview
 
-```bash
-task-trigger-mcp daemon start              # start in background
-task-trigger-mcp daemon stop               # stop daemon
-task-trigger-mcp daemon status             # check if running
-task-trigger-mcp daemon restart            # restart
-task-trigger-mcp daemon logs               # tail daemon logs
-task-trigger-mcp daemon install-service    # install as systemd/launchd service
-task-trigger-mcp daemon uninstall-service  # remove the system service
-```
-
----
-
-## Runtime Directory
-
-```
-~/.task-trigger/
-  tasks.db              # SQLite database
-  daemon.pid            # PID file for daemon management
-  daemon.log            # daemon-level logs
-  logs/
-    <task-id>.log       # per-task/watcher logs (5MB rotation)
-```
+- **Daemon** — Owns the MCP server (Streamable HTTP on port 7755 + stdio), scheduler, watcher engine, and database. Exposes all 64 MCP tools.
+- **Scheduler** — Computes next fire times for all active tasks, sleeping until needed. Wakes instantly on changes.
+- **Watcher Engine** — Reacts to file system events, triggering tasks as defined.
+- **Executor** — Runs tasks and agents, manages locking, logs, and status.
+- **Intelligence V2** — Project-scoped knowledge graph with node/edge CRUD, graph walk, project relationships.
+- **Sync Manager** — Per-workdir in-memory broadcast channels (64 capacity), DB persistence, and intelligence node auto-upsert.
+- **Loop Engine** — DAG execution engine: check/gate/agent node runners, iteration limits, pause/continue, blocker reporting, spec queues, node blueprints, scheduled autorun.
+- **RAG Pipeline** — Background ingestion, language-aware chunking, embedding client, vector store, and rate-limited search.
+- **TUI** — Full-screen ratatui terminal UI for managing agents, viewing output, loops, and system metrics in real time.
+- **Gamification** — Mission tracker with 28 achievements across 6 categories, persisted in the database.
+- **Skills Manager** — Global skills directory with cross-platform symlinks and integrity validation.
 
 ---
 
-## Platform Support
+## Main Modules
 
-| Feature | Linux / WSL | macOS |
-|---|---|---|
-| Daemon transport | Streamable HTTP localhost | Streamable HTTP localhost |
-| Cron scheduling | Internal (tokio) | Internal (tokio) |
-| File watching | inotify | FSEvents |
-| Service install | systemd user unit | launchd agent |
-| Binary format | ELF static (musl) | Mach-O |
+- `application/` — Application ports and abstractions
+- `autoupdate/` — Self-update system (GitHub releases)
+- `daemon/` — MCP server, handler, params, RAG CLI, doctor
+- `db/` — SQLite persistence and migrations (agents, runs, sessions, sync, intelligence, loops, projects, seeds, groups, state)
+- `domain/` — Core models: Agent, Trigger, WatchEvent, Project, SeedIdentity, Loop, LoopSpec, LoopPool, LoopNodeBlueprint, SyncMessage, IntelligenceNode
+- `executor/` — Task and agent execution logic
+- `rag/` — RAG pipeline (ingestion, chunking, embedding, vector store, rate limiting)
+- `scheduler/` — Internal cron scheduler with template variables
+- `sync_manager/` — Multi-agent coordination broadcast
+- `tui/` — Terminal UI: agent management, dialogs, sidebar, system dashboard, context transfer
+- `watchers/` — File system watcher engine
+- `loop_engine/` — DAG loop execution engine
+
+---
+
+## Data Storage
+
+| Data | Location | Format |
+|------|----------|--------|
+| Structured data | `~/.canopy/background_agents.db` | SQLite (WAL mode) |
+| Vector embeddings | `~/.canopy/rag/vectors.lancedb` | LanceDB |
+| Seed identities | `~/.canopy/seeds/<id>/identity.toml` | TOML |
+| Terminal history | `~/.canopy/terminals/<name>/history.toml` | TOML |
+| Configuration | `~/.canopy/config.toml` | TOML |
+| Agent logs | `~/.canopy/logs/<id>.log` | Text (5 MB rotation) |
+| Daemon log | `~/.canopy/daemon.log` | Text |
+| RAG indexed files | `~/.canopy/rag/` | Markdown, PDF |
+
+---
+
+## Usage
+
+1. **Start the daemon:**
+   ```bash
+   canopy daemon start
+   ```
+
+2. **Configure (first time):**
+   ```bash
+   canopy setup
+   ```
+   Choose AI CLI platforms, model flags, temperature units, and RAG settings. Generates `~/.canopy/config.toml`.
+
+3. **Launch the TUI:**
+   ```bash
+   canopy
+   ```
+   Opens the full-screen Canopy Hub. Press `Ctrl+N` or `n` to create a new agent (Interactive, Background, or Terminal). Select a seed identity to give the agent a persistent personality.
+
+4. **Check health:**
+   ```bash
+   canopy doctor
+   ```
+
+5. **Manage MCP servers across platforms:**
+   ```bash
+   canopy mcp
+   ```
+
+6. **RAG indexing:**
+   ```bash
+   canopy rag auto-index start   # Start background watcher
+   canopy rag auto-index stop    # Stop
+   canopy rag report             # Per-file indexing report
+   ```
+
+All state persists in `~/.canopy/`. The daemon auto-updates to stable releases every 24 hours.
 
 ---
 
 ## Tech Stack
 
-| Concern | Crate |
-|---|---|
-| MCP SDK | `rmcp` + `rmcp-macros` |
-| Async runtime | `tokio` |
-| HTTP transport | `axum` |
-| Cron parsing | `cron` |
-| File watching | `notify` |
-| State | `rusqlite` (bundled) |
-| Serialization | `serde` + `serde_json` |
-| CLI detection | `which` |
-| UUID generation | `uuid` |
-| Logging | `tracing` |
+|Rust 2021| Tokio | Axum | rusqlite | LanceDB | notify | vt100 | ratatui | clap | serde | tracing | fastembed |
 
 ---
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE) for details.
+
+---
+
+An experiment of [UniverLab](https://github.com/UniverLab) — an open computational laboratory.
+Made with ❤️ by [JheisonMB](https://github.com/JheisonMB)

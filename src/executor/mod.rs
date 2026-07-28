@@ -1,4 +1,4 @@
-//! Task executor — spawns CLI subprocesses headlessly.
+//! Agent executor — spawns CLI subprocesses headlessly.
 //!
 //! Resolves the CLI binary path via `which`, spawns the process with
 //! the appropriate flags, captures output to log files, and records
@@ -10,16 +10,19 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::process::Command;
 
-use crate::application::ports::{RunRepository, TaskRepository, WatcherRepository};
+use crate::application::notification_service::NotificationService;
+use crate::application::ports::{AgentRepository, RunRepository};
 use crate::db::Database;
-use crate::domain::models::{Cli, RunLog, RunStatus, Task, TriggerType, Watcher};
+use crate::domain::models::{Agent, Cli, RunLog, RunStatus, StartRunOutcome, Trigger, TriggerType};
 use crate::scheduler::substitute_variables;
+
+#[cfg(test)]
+mod tests;
 
 /// Maximum log file size before rotation (5 MB).
 const MAX_LOG_SIZE: u64 = 5 * 1024 * 1024;
 
-/// Inputs for a single CLI execution. Used by `run_cli_process` to
-/// decouple the common spawn-capture-log logic from caller-specific setup.
+/// Inputs for a single CLI execution.
 struct CliRunParams<'a> {
     id: &'a str,
     cli: &'a Cli,
@@ -36,116 +39,116 @@ struct CliRunResult {
     success: bool,
 }
 
-/// Task execution engine.
+/// Context for a single agent execution (file path + event for watch triggers).
+struct ExecutionContext<'a> {
+    file_path: Option<&'a str>,
+    event_type: Option<&'a str>,
+    trigger_type: TriggerType,
+    /// True when this execution was triggered by a file-watch event.
+    is_watch: bool,
+    /// True when a human invoked this run directly (a forced `agent_run`),
+    /// as opposed to the scheduler or a watch event firing it. Drives the
+    /// success-notification policy (B27): manual runs always report success.
+    is_manual: bool,
+}
+
+/// Agent execution engine.
 pub struct Executor {
     db: Arc<Database>,
+    notification_service: Arc<dyn NotificationService>,
 }
 
 impl Executor {
-    pub fn new(db: Arc<Database>) -> Self {
-        Self { db }
+    pub fn new(db: Arc<Database>, notification_service: Arc<dyn NotificationService>) -> Self {
+        Self {
+            db,
+            notification_service,
+        }
     }
 
     /// Resolve a timed-out active run by marking it as timeout.
-    /// Called lazily before checking the lock.
-    fn resolve_timeout(&self, task_id: &str) {
-        if let Ok(Some(run)) = self.db.get_active_run(task_id) {
-            if let Some(timeout_at) = run.timeout_at {
-                if Utc::now() > timeout_at {
-                    tracing::info!("Run '{}' for '{}' timed out, unlocking", run.id, task_id);
-                    let _ = self.db.update_run_status(
-                        &run.id,
-                        RunStatus::Timeout,
-                        Some("Execution timed out"),
-                    );
-                    let _ = self.db.update_task_last_run(task_id, false);
-                }
-            }
+    fn resolve_timeout(&self, agent_id: &str) {
+        let Ok(Some(run)) = self.db.get_active_run(agent_id) else {
+            return;
+        };
+        let Some(timeout_at) = run.timeout_at else {
+            return;
+        };
+        if Utc::now() <= timeout_at {
+            return;
         }
+        tracing::info!("Run '{}' for '{}' timed out, unlocking", run.id, agent_id);
+        let _ = self
+            .db
+            .update_run_status(&run.id, RunStatus::Timeout, Some("Execution timed out"));
+        let _ = self.db.update_agent_last_run(agent_id, false);
     }
 
-    /// Execute a scheduled task.
+    /// Atomically claim the right to run `agent`.
     ///
-    /// When `force` is true (manual runs), expiry and enabled checks are skipped.
-    /// Returns the `run_id` if execution started, or None if skipped.
-    pub async fn execute_task(
-        &self,
-        task: &Task,
-        trigger: TriggerType,
-        force: bool,
-    ) -> Result<i32> {
-        if !force {
-            if task.is_expired() {
-                tracing::info!("Task '{}' has expired, disabling", task.id);
-                self.db.update_task_enabled(&task.id, false)?;
-                return Ok(-1);
-            }
-
-            if !task.enabled {
-                tracing::info!("Task '{}' is disabled, skipping", task.id);
-                return Ok(-1);
-            }
-        }
-
-        // Check lock: if there's an active run, record as missed
-        self.resolve_timeout(&task.id);
-        if let Ok(Some(active)) = self.db.get_active_run(&task.id) {
-            tracing::info!(
-                "Task '{}' is locked (run {}), recording as missed",
-                task.id,
-                active.id
-            );
-            let missed = RunLog {
-                id: uuid::Uuid::new_v4().to_string(),
-                task_id: task.id.clone(),
-                status: RunStatus::Missed,
-                trigger_type: trigger,
-                summary: Some(format!("Skipped: task locked by run {}", active.id)),
-                started_at: Utc::now(),
-                finished_at: Some(Utc::now()),
-                exit_code: None,
-                timeout_at: None,
-            };
-            let _ = self.db.insert_run(&missed);
-            return Ok(-1);
-        }
-
-        // Create run and lock the task
+    /// This is the single choke point every firing path routes through —
+    /// the scheduler's cron tick, a file-watch trigger, and a manual
+    /// `agent_run` all end up here via [`Self::run_agent`] — so no two of
+    /// them can ever spawn overlapping executions of the same agent, no
+    /// matter which combination races. The check-then-insert itself is
+    /// atomic (see [`crate::application::ports::RunRepository::try_start_run`]),
+    /// closing the gap a bare "check active, then insert" would leave
+    /// between the check and the write.
+    ///
+    /// Returns the new run's id if this call won the race, or `None` if
+    /// another run was already active — in which case a `Missed` run is
+    /// recorded (visible via `agent_logs`/recent executions, distinct from
+    /// an agent that has never fired) and an INFO line is logged.
+    fn start_run(&self, agent: &Agent, trigger_type: TriggerType) -> Result<Option<String>> {
         let run_id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now();
-        let timeout_at = now + chrono::Duration::minutes(i64::from(task.timeout_minutes));
-
+        let timeout_at = now + chrono::Duration::minutes(i64::from(agent.timeout_minutes));
         let run = RunLog {
             id: run_id.clone(),
-            task_id: task.id.clone(),
+            background_agent_id: agent.id.clone(),
             status: RunStatus::Pending,
-            trigger_type: trigger,
+            trigger_type,
             summary: None,
             started_at: now,
             finished_at: None,
             exit_code: None,
             timeout_at: Some(timeout_at),
         };
-        self.db.insert_run(&run)?;
 
-        let user_prompt = substitute_variables(&task.prompt, &task.id, &task.log_path, None, None);
-        let wrapped = wrap_prompt(&user_prompt, &task.id, &run_id);
+        match self.db.try_start_run(&run)? {
+            StartRunOutcome::Started => Ok(Some(run_id)),
+            StartRunOutcome::AlreadyActive(active) => {
+                tracing::info!(
+                    "Agent '{}' is already running (run '{}'); skipping this fire",
+                    agent.id,
+                    active.id
+                );
+                let missed = RunLog {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    background_agent_id: agent.id.clone(),
+                    status: RunStatus::Missed,
+                    trigger_type,
+                    summary: Some(format!("Skipped: already running (run '{}')", active.id)),
+                    started_at: now,
+                    finished_at: Some(now),
+                    exit_code: None,
+                    timeout_at: None,
+                };
+                let _ = self.db.insert_run(&missed);
+                Ok(None)
+            }
+        }
+    }
 
-        let params = CliRunParams {
-            id: &task.id,
-            cli: &task.cli,
-            prompt: wrapped,
-            model: task.model.as_deref(),
-            working_dir: task.working_dir.as_deref(),
-            log_path: task.log_path.clone(),
-            trigger,
-        };
-
-        let result = self.run_cli_process(&params).await?;
-
-        // If the agent didn't report via task_report, auto-close the run
-        // based on the process exit code.
-        if let Ok(Some(run)) = self.db.get_run(&run_id) {
+    /// Finalize a run: update status, exit code, trigger count, and last_run.
+    fn finalize_run(
+        &self,
+        agent: &Agent,
+        run_id: &str,
+        result: &CliRunResult,
+        update_trigger_count: bool,
+    ) {
+        if let Ok(Some(run)) = self.db.get_run(run_id) {
             if run.status.is_active() {
                 let status = if result.success {
                     RunStatus::Success
@@ -153,7 +156,7 @@ impl Executor {
                     RunStatus::Error
                 };
                 let _ = self.db.update_run_status(
-                    &run_id,
+                    run_id,
                     status,
                     Some(&format!(
                         "Auto-closed: process exited with code {}",
@@ -162,137 +165,208 @@ impl Executor {
                 );
             }
         }
-        let _ = self.db.update_run_exit_code(&run_id, result.exit_code);
+        let _ = self.db.update_run_exit_code(run_id, result.exit_code);
 
-        if let Err(e) = self.db.update_task_last_run(&task.id, result.success) {
-            tracing::error!("Failed to update last_run for task '{}': {}", task.id, e);
+        if let Err(e) = self.db.update_agent_last_run(&agent.id, result.success) {
+            tracing::error!("Failed to update last_run for agent '{}': {}", agent.id, e);
         }
+
+        if update_trigger_count {
+            if let Err(e) = self.db.update_agent_triggered(&agent.id) {
+                tracing::error!(
+                    "Failed to update trigger count for agent '{}': {}",
+                    agent.id,
+                    e
+                );
+            }
+        }
+    }
+
+    /// Send success/failure notification if the agent still exists.
+    ///
+    /// Failure-first policy (B27): a failed run always notifies. A *successful*
+    /// run notifies only when a human ran it directly (`is_manual`) or the
+    /// agent opted in via `notify_on_success` — otherwise a frequent cron/watch
+    /// agent (e.g. a */15min schedule) would bury the Action Center under ~96
+    /// success toasts a day.
+    fn notify_result(&self, agent: &Agent, result: &CliRunResult, is_watch: bool, is_manual: bool) {
+        let agent_still_exists = self.db.get_agent(&agent.id).ok().flatten().is_some();
+        if !agent_still_exists {
+            return;
+        }
+        if result.success {
+            let opted_in = self.db.agent_notify_on_success(&agent.id).unwrap_or(false);
+            if is_manual || opted_in {
+                self.notification_service.notify_task_completed(
+                    &agent.id,
+                    true,
+                    Some(result.exit_code),
+                );
+            }
+        } else if is_watch {
+            self.notification_service.notify_agent_failed(
+                &agent.id,
+                agent.cli.as_str(),
+                result.exit_code,
+                &format!("Watcher agent failed with exit code {}", result.exit_code),
+            );
+        } else {
+            self.notification_service.notify_task_failed(
+                &agent.id,
+                result.exit_code,
+                &format!("Agent failed with exit code {}", result.exit_code),
+            );
+        }
+    }
+
+    /// Core execution logic shared by all trigger types.
+    async fn run_agent(&self, agent: &Agent, ctx: ExecutionContext<'_>) -> Result<i32> {
+        self.resolve_timeout(&agent.id);
+
+        let Some(run_id) = self.start_run(agent, ctx.trigger_type)? else {
+            return Ok(-1);
+        };
+
+        let user_prompt = substitute_variables(
+            &agent.prompt,
+            &agent.id,
+            &agent.log_path,
+            ctx.file_path,
+            ctx.event_type,
+        );
+        let wrapped = wrap_prompt(&user_prompt, &agent.id, &run_id);
+
+        let params = CliRunParams {
+            id: &agent.id,
+            cli: &agent.cli,
+            prompt: wrapped,
+            model: agent.model.as_deref(),
+            working_dir: agent.working_dir.as_deref(),
+            log_path: agent.log_path.clone(),
+            trigger: ctx.trigger_type,
+        };
+
+        let result = self.run_cli_process(&params).await?;
+
+        let is_watch = ctx.is_watch || agent.is_watch();
+        self.finalize_run(agent, &run_id, &result, is_watch);
+        self.notify_result(agent, &result, ctx.is_watch, ctx.is_manual);
 
         Ok(result.exit_code)
     }
 
-    /// Execute a watcher-triggered task.
-    pub async fn execute_watcher_task(
+    /// Execute a unified agent.
+    ///
+    /// When `force` is true (manual runs), expiry and enabled checks are skipped.
+    /// Returns the exit code if execution started, or -1 if skipped.
+    pub async fn execute_agent(&self, agent: &Agent, force: bool) -> Result<i32> {
+        let trigger_type = match &agent.trigger {
+            Some(Trigger::Cron { .. }) => TriggerType::Scheduled,
+            Some(Trigger::Watch { .. }) => TriggerType::Watch,
+            None => TriggerType::Manual,
+        };
+
+        if !force {
+            if agent.is_expired() {
+                tracing::info!("Agent '{}' has expired, disabling", agent.id);
+                self.db.update_agent_enabled(&agent.id, false)?;
+                return Ok(-1);
+            }
+            if !agent.enabled {
+                tracing::info!("Agent '{}' is disabled, skipping", agent.id);
+                return Ok(-1);
+            }
+        }
+
+        let ctx = ExecutionContext {
+            file_path: if agent.is_watch() {
+                Some("manual")
+            } else {
+                None
+            },
+            event_type: if agent.is_watch() {
+                Some("manual")
+            } else {
+                None
+            },
+            trigger_type,
+            is_watch: false,
+            // A forced execution is a human running the agent on demand
+            // (`agent_run`); the scheduler's cron tick passes `force = false`.
+            is_manual: force,
+        };
+
+        self.run_agent(agent, ctx).await
+    }
+
+    /// Execute a watcher-triggered agent with specific file path and event info.
+    pub async fn execute_agent_with_context(
         &self,
-        watcher: &Watcher,
+        agent: &Agent,
         file_path: &str,
         event_type: &str,
     ) -> Result<i32> {
-        if !watcher.enabled {
+        if !agent.enabled {
             return Ok(-1);
         }
 
-        // Check lock
-        self.resolve_timeout(&watcher.id);
-        if let Ok(Some(active)) = self.db.get_active_run(&watcher.id) {
-            tracing::info!(
-                "Watcher '{}' is locked (run {}), recording as missed",
-                watcher.id,
-                active.id
-            );
-            let missed = RunLog {
-                id: uuid::Uuid::new_v4().to_string(),
-                task_id: watcher.id.clone(),
-                status: RunStatus::Missed,
-                trigger_type: TriggerType::Watch,
-                summary: Some(format!("Skipped: locked by run {}", active.id)),
-                started_at: Utc::now(),
-                finished_at: Some(Utc::now()),
-                exit_code: None,
-                timeout_at: None,
-            };
-            let _ = self.db.insert_run(&missed);
-            return Ok(-1);
-        }
-
-        let log_dir = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("No home directory"))?
-            .join(".task-trigger/logs");
-        let log_path = log_dir
-            .join(&watcher.id)
-            .with_extension("log")
-            .to_string_lossy()
-            .to_string();
-
-        // Create run and lock
-        let run_id = uuid::Uuid::new_v4().to_string();
-        let now = Utc::now();
-        let timeout_at = now + chrono::Duration::minutes(i64::from(watcher.timeout_minutes));
-
-        let run = RunLog {
-            id: run_id.clone(),
-            task_id: watcher.id.clone(),
-            status: RunStatus::Pending,
+        let ctx = ExecutionContext {
+            file_path: Some(file_path),
+            event_type: Some(event_type),
             trigger_type: TriggerType::Watch,
-            summary: None,
-            started_at: now,
-            finished_at: None,
-            exit_code: None,
-            timeout_at: Some(timeout_at),
-        };
-        self.db.insert_run(&run)?;
-
-        let user_prompt = substitute_variables(
-            &watcher.prompt,
-            &watcher.id,
-            &log_path,
-            Some(file_path),
-            Some(event_type),
-        );
-        let wrapped = wrap_prompt(&user_prompt, &watcher.id, &run_id);
-
-        let params = CliRunParams {
-            id: &watcher.id,
-            cli: &watcher.cli,
-            prompt: wrapped,
-            model: watcher.model.as_deref(),
-            working_dir: None,
-            log_path,
-            trigger: TriggerType::Watch,
+            is_watch: true,
+            is_manual: false,
         };
 
-        let result = self.run_cli_process(&params).await?;
-
-        if let Ok(Some(run)) = self.db.get_run(&run_id) {
-            if run.status.is_active() {
-                let status = if result.success {
-                    RunStatus::Success
-                } else {
-                    RunStatus::Error
-                };
-                let _ = self.db.update_run_status(
-                    &run_id,
-                    status,
-                    Some(&format!(
-                        "Auto-closed: process exited with code {}",
-                        result.exit_code
-                    )),
-                );
-            }
-        }
-        let _ = self.db.update_run_exit_code(&run_id, result.exit_code);
-
-        if let Err(e) = self.db.update_watcher_triggered(&watcher.id) {
-            tracing::error!(
-                "Failed to update trigger count for watcher '{}': {}",
-                watcher.id,
-                e
-            );
-        }
-
-        Ok(result.exit_code)
+        self.run_agent(agent, ctx).await
     }
 
     /// Core CLI execution: resolve binary, build command, spawn, capture output, write log.
     async fn run_cli_process(&self, params: &CliRunParams<'_>) -> Result<CliRunResult> {
-        let cli_path = resolve_cli_binary(params.cli)?;
-        let mut cmd = build_cli_command(
+        let cli_path = match resolve_cli_binary(params.cli) {
+            Ok(path) => path,
+            Err(e) => {
+                tracing::error!("Failed to resolve CLI binary for '{}': {}", params.id, e);
+                append_to_log(
+                    &params.log_path,
+                    params.id,
+                    &params.trigger,
+                    &Utc::now(),
+                    -1,
+                    &[],
+                    e.to_string().as_bytes(),
+                )?;
+                return Ok(CliRunResult {
+                    exit_code: -1,
+                    success: false,
+                });
+            }
+        };
+        let mut cmd = match build_cli_command(
             &cli_path,
             params.cli,
             &params.prompt,
             params.model,
             params.working_dir,
-        );
+        ) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                tracing::error!("Failed to build command for '{}': {}", params.id, e);
+                append_to_log(
+                    &params.log_path,
+                    params.id,
+                    &params.trigger,
+                    &Utc::now(),
+                    -1,
+                    &[],
+                    e.to_string().as_bytes(),
+                )?;
+                return Ok(CliRunResult {
+                    exit_code: -1,
+                    success: false,
+                });
+            }
+        };
 
         tracing::info!(
             "Executing '{}' with {} (trigger: {})",
@@ -339,32 +413,28 @@ impl Executor {
 }
 
 /// Resolve the full path to a CLI binary.
+///
+/// Delegates to `cli_strategy::resolve_binary`, which resolves absolute
+/// paths as-is and bare names via PATH lookup.
 fn resolve_cli_binary(cli: &Cli) -> Result<PathBuf> {
     let cmd_name = cli.command_name();
-    which::which(cmd_name).map_err(|e| {
-        anyhow::anyhow!(
-            "CLI binary '{}' not found in PATH: {}. Make sure it is installed.",
-            cmd_name,
-            e
-        )
-    })
+    crate::domain::cli_strategy::resolve_binary(&cmd_name)
 }
 
 /// Build the CLI command with appropriate flags.
 fn build_cli_command(
-    cli_path: &Path,
+    _cli_path: &Path,
     cli: &Cli,
     prompt: &str,
     model: Option<&str>,
     working_dir: Option<&str>,
-) -> Command {
-    let mut cmd = Command::new(cli_path);
-
-    // Use the strategy pattern to build CLI-specific arguments
+) -> Result<Command> {
     let strategy = cli.strategy();
-    strategy.build_command(&mut cmd, prompt, model, working_dir);
+    let mut cmd = strategy.build_command(prompt, model, working_dir)?;
 
-    cmd.stdin(std::process::Stdio::null());
+    // Stdin is already set by `build_command` (null for argv-mode CLIs, or
+    // an open temp-file handle carrying the prompt for stdin-mode CLIs) —
+    // don't clobber it here.
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
 
@@ -372,13 +442,13 @@ fn build_cli_command(
         cmd.current_dir(dir);
     }
 
-    cmd
+    Ok(cmd)
 }
 
-/// Append execution output to a task's log file with rotation.
+/// Append execution output to an agent's log file with rotation.
 fn append_to_log(
     log_path: &str,
-    task_id: &str,
+    agent_id: &str,
     trigger: &TriggerType,
     started_at: &chrono::DateTime<Utc>,
     exit_code: i32,
@@ -400,7 +470,7 @@ fn append_to_log(
         .append(true)
         .open(path)?;
 
-    writeln!(file, "--- [{trigger}] {task_id} at {started_at} ---")?;
+    writeln!(file, "--- [{trigger}] {agent_id} at {started_at} ---")?;
     writeln!(file, "exit_code: {exit_code}")?;
 
     if !stdout.is_empty() {
@@ -436,17 +506,17 @@ fn rotate_log_if_needed(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Wrap the user's prompt with structured `task_report` instructions.
-fn wrap_prompt(user_prompt: &str, task_id: &str, run_id: &str) -> String {
+/// Wrap the user's prompt with structured `agent_report` instructions.
+fn wrap_prompt(user_prompt: &str, agent_id: &str, run_id: &str) -> String {
     format!(
         "[SYSTEM INSTRUCTIONS]\n\
-         You are executing a managed task. You MUST follow these steps:\n\
-         1. IMMEDIATELY call the task_report tool: task_report(run_id=\"{run_id}\", status=\"in_progress\")\n\
+         You are executing a managed agent. You MUST follow these steps:\n\
+         1. IMMEDIATELY call the agent_report tool: agent_report(run_id=\"{run_id}\", status=\"in_progress\")\n\
          2. Execute the user's task below\n\
-         3. When finished, call: task_report(run_id=\"{run_id}\", status=\"success\", summary=\"<brief summary of what happened>\")\n\
-            If the task failed: task_report(run_id=\"{run_id}\", status=\"error\", summary=\"<what went wrong>\")\n\
+         3. When finished, call: agent_report(run_id=\"{run_id}\", status=\"success\", summary=\"<brief summary of what happened>\")\n\
+            If the task failed: agent_report(run_id=\"{run_id}\", status=\"error\", summary=\"<what went wrong>\")\n\
          \n\
-         Task ID: {task_id}\n\
+         Agent ID: {agent_id}\n\
          Run ID: {run_id}\n\
          [/SYSTEM INSTRUCTIONS]\n\
          \n\
