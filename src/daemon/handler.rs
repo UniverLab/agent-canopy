@@ -11993,3 +11993,848 @@ mod coverage_tests {
         assert!(n.contains("Unwired") && n.contains("loop_add_edge"));
     }
 }
+
+// ── Direct #[tool] handler-method coverage ───────────────────────────
+//
+// The three test modules above almost exclusively exercise *pure* helper
+// functions (validate_*, build_*, format_*). The `#[tool]` methods on
+// `TaskTriggerHandler` itself — `task_add`, `task_watch`, `sync_*`,
+// `intelligence_*`, `loop_*`, `spec_*`, `blueprint_*`, etc. — are called
+// directly here instead: construct `Parameters<...>`, call the method on a
+// real handler wired to a real (tempdir) SQLite database, assert on the
+// `CallToolResult` and on the resulting DB state. This is the surface a
+// live MCP client actually calls, and where most of this file's uncovered
+// lines live (error branches inside each handler in particular).
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+    use crate::application::notification_service::{
+        DefaultNotificationService, NotificationService,
+    };
+    use crate::db::Database;
+    use crate::domain::models::{Agent, Cli, RunLog, RunStatus, TriggerType};
+    use crate::executor::Executor;
+    use crate::loop_engine::LoopEngine;
+    use crate::rag::ingestion::IngestionManager;
+    use crate::sync_manager::SyncManager;
+    use crate::watchers::WatcherEngine;
+    use rmcp::handler::server::wrapper::Parameters;
+    use tempfile::tempdir;
+    use tokio::sync::Notify;
+
+    /// RAII guard: sets the real `$HOME` env var to `path` for the test
+    /// body, restoring the previous value on drop. `make_log_path` /
+    /// `data_dir()` read `dirs::home_dir()` directly (real `$HOME`, not the
+    /// `CANOPY_HOME_OVERRIDE` some other subsystems honor), so any handler
+    /// path that writes a log file needs this to avoid touching the real
+    /// developer's `~/.canopy`. Safe under `cargo nextest` (one process per
+    /// test) but would race under plain `cargo test`.
+    struct HomeVar {
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl HomeVar {
+        fn set(path: &std::path::Path) -> Self {
+            let prev = std::env::var_os("HOME");
+            unsafe { std::env::set_var("HOME", path) };
+            HomeVar { prev }
+        }
+    }
+
+    impl Drop for HomeVar {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => unsafe { std::env::set_var("HOME", v) },
+                None => unsafe { std::env::remove_var("HOME") },
+            }
+        }
+    }
+
+    fn endpoint_test_handler() -> (
+        tempfile::TempDir,
+        std::sync::Arc<Database>,
+        TaskTriggerHandler,
+    ) {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
+        let notif: Arc<dyn NotificationService> = Arc::new(DefaultNotificationService);
+        let executor = Arc::new(Executor::new(Arc::clone(&db), Arc::clone(&notif)));
+        let sync_manager = Arc::new(SyncManager::new(Arc::clone(&db)));
+        let loop_engine = Arc::new(LoopEngine::new(Arc::clone(&db), Arc::clone(&notif)));
+        let watcher_engine = Arc::new(WatcherEngine::new(
+            Arc::clone(&db),
+            Arc::clone(&executor),
+            Arc::clone(&loop_engine),
+        ));
+        let ingestion = Arc::new(IngestionManager::new(
+            Arc::clone(&db),
+            dir.path().to_path_buf(),
+        ));
+        let dynamic_skills = Arc::new(crate::dynamic_skills::SkillStore::new(
+            dir.path().join("skills"),
+            Vec::new(),
+            15,
+        ));
+        let handler = TaskTriggerHandler::new(
+            Arc::clone(&db),
+            executor,
+            watcher_engine,
+            Arc::new(Notify::new()),
+            loop_engine,
+            notif,
+            sync_manager,
+            ingestion,
+            dynamic_skills,
+            0,
+        );
+        (dir, db, handler)
+    }
+
+    fn text(result: &CallToolResult) -> String {
+        format!("{:?}", result.content)
+    }
+
+    fn is_err(result: &CallToolResult) -> bool {
+        result.is_error == Some(true)
+    }
+
+    // ── task_add / agent_add ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn task_add_registers_a_cron_agent() {
+        let home = tempdir().unwrap();
+        let _home_guard = HomeVar::set(home.path());
+        let (_dir, db, handler) = endpoint_test_handler();
+
+        let result = handler
+            .task_add(Parameters(TaskAddParams {
+                id: "agt-1".to_string(),
+                prompt: "run the tests".to_string(),
+                schedule: "*/5 * * * *".to_string(),
+                cli: Some("opencode".to_string()),
+                model: None,
+                duration_minutes: None,
+                working_dir: None,
+                timeout_minutes: None,
+            }))
+            .await
+            .unwrap();
+
+        assert!(!is_err(&result), "{}", text(&result));
+        assert!(text(&result).contains("registered with schedule"));
+        let stored = db.get_agent("agt-1").unwrap().unwrap();
+        assert!(matches!(stored.trigger, Some(Trigger::Cron { .. })));
+    }
+
+    #[tokio::test]
+    async fn task_add_rejects_invalid_cron_expression() {
+        let home = tempdir().unwrap();
+        let _home_guard = HomeVar::set(home.path());
+        let (_dir, db, handler) = endpoint_test_handler();
+
+        let result = handler
+            .task_add(Parameters(TaskAddParams {
+                id: "agt-bad-cron".to_string(),
+                prompt: "run the tests".to_string(),
+                schedule: "not a cron expr!".to_string(),
+                cli: Some("opencode".to_string()),
+                model: None,
+                duration_minutes: None,
+                working_dir: None,
+                timeout_minutes: None,
+            }))
+            .await
+            .unwrap();
+
+        assert!(is_err(&result));
+        assert!(text(&result).contains("Invalid cron expression"));
+        assert!(db.get_agent("agt-bad-cron").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn task_add_rejects_invalid_id() {
+        let home = tempdir().unwrap();
+        let _home_guard = HomeVar::set(home.path());
+        let (_dir, _db, handler) = endpoint_test_handler();
+
+        let result = handler
+            .task_add(Parameters(TaskAddParams {
+                id: "bad id with spaces!".to_string(),
+                prompt: "run the tests".to_string(),
+                schedule: "*/5 * * * *".to_string(),
+                cli: Some("opencode".to_string()),
+                model: None,
+                duration_minutes: None,
+                working_dir: None,
+                timeout_minutes: None,
+            }))
+            .await
+            .unwrap();
+
+        assert!(is_err(&result));
+        assert!(text(&result).contains("alphanumeric"));
+    }
+
+    // ── task_watch / agent_watch ─────────────────────────────────
+
+    #[tokio::test]
+    async fn task_watch_registers_a_watcher() {
+        let home = tempdir().unwrap();
+        let _home_guard = HomeVar::set(home.path());
+        let (dir, db, handler) = endpoint_test_handler();
+
+        let result = handler
+            .task_watch(Parameters(TaskWatchParams {
+                id: "watch-1".to_string(),
+                path: dir.path().to_string_lossy().to_string(),
+                events: vec!["modify".to_string(), "create".to_string()],
+                prompt: "react to changes".to_string(),
+                cli: Some("opencode".to_string()),
+                model: None,
+                debounce_seconds: None,
+                recursive: Some(true),
+                timeout_minutes: None,
+            }))
+            .await
+            .unwrap();
+
+        assert!(!is_err(&result), "{}", text(&result));
+        let stored = db.get_agent("watch-1").unwrap().unwrap();
+        assert!(matches!(stored.trigger, Some(Trigger::Watch { .. })));
+    }
+
+    #[tokio::test]
+    async fn task_watch_rejects_relative_path() {
+        let home = tempdir().unwrap();
+        let _home_guard = HomeVar::set(home.path());
+        let (_dir, db, handler) = endpoint_test_handler();
+
+        let result = handler
+            .task_watch(Parameters(TaskWatchParams {
+                id: "watch-bad-path".to_string(),
+                path: "relative/path".to_string(),
+                events: vec!["modify".to_string()],
+                prompt: "react to changes".to_string(),
+                cli: Some("opencode".to_string()),
+                model: None,
+                debounce_seconds: None,
+                recursive: None,
+                timeout_minutes: None,
+            }))
+            .await
+            .unwrap();
+
+        assert!(is_err(&result));
+        assert!(text(&result).contains("must be absolute"));
+        assert!(db.get_agent("watch-bad-path").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn task_watch_rejects_unknown_event_name() {
+        let home = tempdir().unwrap();
+        let _home_guard = HomeVar::set(home.path());
+        let (dir, _db, handler) = endpoint_test_handler();
+
+        let result = handler
+            .task_watch(Parameters(TaskWatchParams {
+                id: "watch-bad-event".to_string(),
+                path: dir.path().to_string_lossy().to_string(),
+                events: vec!["explode".to_string()],
+                prompt: "react to changes".to_string(),
+                cli: Some("opencode".to_string()),
+                model: None,
+                debounce_seconds: None,
+                recursive: None,
+                timeout_minutes: None,
+            }))
+            .await
+            .unwrap();
+
+        assert!(is_err(&result));
+    }
+
+    // ── task_list / agent_list ───────────────────────────────────
+
+    fn sample_agent(id: &str, trigger: Option<Trigger>) -> Agent {
+        Agent {
+            id: id.to_string(),
+            prompt: "do things".to_string(),
+            trigger,
+            cli: Cli::new("opencode"),
+            model: None,
+            working_dir: None,
+            enabled: true,
+            enable_at: None,
+            created_at: chrono::Utc::now(),
+            log_path: format!("/tmp/{id}.log"),
+            timeout_minutes: 15,
+            expires_at: None,
+            last_run_at: None,
+            last_run_ok: None,
+            last_triggered_at: None,
+            trigger_count: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn task_list_reports_agents_and_corrupt_rows() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        db.upsert_agent(&sample_agent("healthy-1", None)).unwrap();
+        db.insert_corrupt_agent_for_test("corrupt-1", true).unwrap();
+
+        let result = handler.task_list().await.unwrap();
+        let out = text(&result);
+        assert!(out.contains("healthy-1"));
+        assert!(out.contains("corrupt"));
+        assert!(out.contains("corrupt-1"));
+    }
+
+    #[tokio::test]
+    async fn task_list_reports_empty_state() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let result = handler.task_list().await.unwrap();
+        assert!(text(&result).contains("No agents registered"));
+    }
+
+    // ── task_remove / agent_remove ───────────────────────────────
+
+    #[tokio::test]
+    async fn task_remove_deletes_existing_agent() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        db.upsert_agent(&sample_agent("to-remove", None)).unwrap();
+
+        let result = handler
+            .task_remove(Parameters(IdParam {
+                id: "to-remove".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        assert!(!is_err(&result));
+        assert!(text(&result).contains("removed"));
+        assert!(db.get_agent("to-remove").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn task_remove_reports_missing_agent() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let result = handler
+            .task_remove(Parameters(IdParam {
+                id: "does-not-exist".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        assert!(is_err(&result));
+        assert!(text(&result).contains("No agent found"));
+    }
+
+    // ── task_enable / agent_enable ───────────────────────────────
+
+    #[tokio::test]
+    async fn task_enable_clears_expiry_on_expired_agent() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        let mut agent = sample_agent("expired-1", None);
+        agent.enabled = false;
+        agent.expires_at = Some(chrono::Utc::now() - chrono::Duration::minutes(5));
+        db.upsert_agent(&agent).unwrap();
+
+        let result = handler
+            .task_enable(Parameters(IdParam {
+                id: "expired-1".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        assert!(!is_err(&result));
+        let stored = db.get_agent("expired-1").unwrap().unwrap();
+        assert!(stored.enabled);
+        assert!(stored.expires_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn task_enable_reports_missing_agent() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let result = handler
+            .task_enable(Parameters(IdParam {
+                id: "ghost".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&result));
+    }
+
+    // ── task_schedule_enable / agent_schedule_enable ─────────────
+
+    #[tokio::test]
+    async fn task_schedule_enable_sets_future_enable_time() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        let mut agent = sample_agent("sched-1", None);
+        agent.enabled = false;
+        db.upsert_agent(&agent).unwrap();
+
+        let at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let result = handler
+            .task_schedule_enable(Parameters(AgentScheduleEnableParams {
+                id: "sched-1".to_string(),
+                at: at.clone(),
+            }))
+            .await
+            .unwrap();
+
+        assert!(!is_err(&result));
+        assert!(text(&result).contains("scheduled to enable"));
+    }
+
+    #[tokio::test]
+    async fn task_schedule_enable_rejects_bad_timestamp() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        db.upsert_agent(&sample_agent("sched-2", None)).unwrap();
+
+        let result = handler
+            .task_schedule_enable(Parameters(AgentScheduleEnableParams {
+                id: "sched-2".to_string(),
+                at: "not-a-timestamp".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        assert!(is_err(&result));
+        assert!(text(&result).contains("Invalid ISO 8601"));
+    }
+
+    #[tokio::test]
+    async fn task_schedule_enable_reports_missing_agent() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let result = handler
+            .task_schedule_enable(Parameters(AgentScheduleEnableParams {
+                id: "ghost".to_string(),
+                at,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&result));
+    }
+
+    // ── task_disable / agent_disable ─────────────────────────────
+
+    #[tokio::test]
+    async fn task_disable_stops_a_watch_agent() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        db.upsert_agent(&sample_agent(
+            "watch-disable",
+            Some(Trigger::Watch {
+                path: "/tmp".to_string(),
+                events: vec![crate::domain::models::WatchEvent::Modify],
+                debounce_seconds: 2,
+                recursive: false,
+            }),
+        ))
+        .unwrap();
+
+        let result = handler
+            .task_disable(Parameters(IdParam {
+                id: "watch-disable".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        assert!(!is_err(&result));
+        let stored = db.get_agent("watch-disable").unwrap().unwrap();
+        assert!(!stored.enabled);
+    }
+
+    #[tokio::test]
+    async fn task_disable_reports_missing_agent() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let result = handler
+            .task_disable(Parameters(IdParam {
+                id: "ghost".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&result));
+    }
+
+    // ── agent_run ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn agent_run_launches_existing_agent_in_background() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        db.upsert_agent(&sample_agent("runnable", None)).unwrap();
+
+        let result = handler
+            .agent_run(Parameters(IdParam {
+                id: "runnable".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        assert!(!is_err(&result));
+        assert!(text(&result).contains("launched in background"));
+    }
+
+    #[tokio::test]
+    async fn agent_run_reports_missing_agent() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let result = handler
+            .agent_run(Parameters(IdParam {
+                id: "ghost".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&result));
+        assert!(text(&result).contains("No agent found"));
+    }
+
+    // ── task_status / agent_status ───────────────────────────────
+
+    #[tokio::test]
+    async fn task_status_reports_agent_counts() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        db.upsert_agent(&sample_agent(
+            "cron-a",
+            Some(Trigger::Cron {
+                schedule_expr: "* * * * *".to_string(),
+            }),
+        ))
+        .unwrap();
+        db.upsert_agent(&sample_agent("manual-a", None)).unwrap();
+
+        let result = handler.task_status().await.unwrap();
+        let out = text(&result);
+        assert!(out.contains("canopy v"));
+        assert!(out.contains("cron: 1"));
+        assert!(out.contains("manual: 1"));
+    }
+
+    // ── task_models / agent_models ───────────────────────────────
+
+    #[tokio::test]
+    async fn task_models_rejects_unconfigured_platform() {
+        let home = tempdir().unwrap();
+        let canopy_dir = home.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        let config = crate::domain::canopy_config::CanopyConfig {
+            clis: vec![crate::domain::cli_config::CliConfig {
+                name: "echo-cli".to_string(),
+                binary: "/bin/echo".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        config.save(&canopy_dir).unwrap();
+        let _home_guard = HomeVar::set(home.path());
+
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let result = handler
+            .task_models(Parameters(TaskModelsParams {
+                platform: Some("not-configured-platform".to_string()),
+                refresh: None,
+            }))
+            .await
+            .unwrap();
+
+        assert!(is_err(&result));
+        assert!(text(&result).contains("is not configured in canopy"));
+    }
+
+    #[tokio::test]
+    async fn task_models_enumerates_native_platform_models() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempdir().unwrap();
+        let canopy_dir = home.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        let script = home.path().join("list-models.sh");
+        std::fs::write(&script, "#!/bin/sh\necho model-a\necho model-b\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config = crate::domain::canopy_config::CanopyConfig {
+            clis: vec![crate::domain::cli_config::CliConfig {
+                name: "native-cli".to_string(),
+                binary: script.to_string_lossy().to_string(),
+                models_list_cmd: Some("--list".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        config.save(&canopy_dir).unwrap();
+        let _home_guard = HomeVar::set(home.path());
+
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let result = handler
+            .task_models(Parameters(TaskModelsParams {
+                platform: Some("native-cli".to_string()),
+                refresh: Some(true),
+            }))
+            .await
+            .unwrap();
+
+        assert!(!is_err(&result), "{}", text(&result));
+        let out = text(&result);
+        assert!(out.contains("model-a"));
+        assert!(out.contains("model-b"));
+        assert!(out.contains("Source:"));
+    }
+
+    // ── task_logs / agent_logs ───────────────────────────────────
+
+    #[tokio::test]
+    async fn task_logs_reports_no_logs_for_unexecuted_agent() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let mut agent = sample_agent("no-logs-yet", None);
+        agent.log_path = dir
+            .path()
+            .join("no-logs-yet.log")
+            .to_string_lossy()
+            .to_string();
+        db.upsert_agent(&agent).unwrap();
+
+        let result = handler
+            .task_logs(Parameters(TaskLogsParams {
+                id: "no-logs-yet".to_string(),
+                lines: None,
+                since: None,
+            }))
+            .await
+            .unwrap();
+
+        assert!(!is_err(&result));
+        assert!(text(&result).contains("No logs found"));
+    }
+
+    #[tokio::test]
+    async fn task_logs_returns_recent_lines() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let log_path = dir.path().join("has-logs.log");
+        std::fs::write(&log_path, "line one\nline two\nline three\n").unwrap();
+        let mut agent = sample_agent("has-logs", None);
+        agent.log_path = log_path.to_string_lossy().to_string();
+        db.upsert_agent(&agent).unwrap();
+
+        let result = handler
+            .task_logs(Parameters(TaskLogsParams {
+                id: "has-logs".to_string(),
+                lines: Some(2),
+                since: None,
+            }))
+            .await
+            .unwrap();
+
+        let out = text(&result);
+        assert!(out.contains("line two"));
+        assert!(out.contains("line three"));
+        assert!(!out.contains("line one"));
+    }
+
+    // ── task_update / agent_update ───────────────────────────────
+
+    #[tokio::test]
+    async fn task_update_renames_and_updates_prompt() {
+        let home = tempdir().unwrap();
+        let _home_guard = HomeVar::set(home.path());
+        let (_dir, db, handler) = endpoint_test_handler();
+        db.upsert_agent(&sample_agent(
+            "old-id",
+            Some(Trigger::Cron {
+                schedule_expr: "* * * * *".to_string(),
+            }),
+        ))
+        .unwrap();
+
+        let result = handler
+            .task_update(Parameters(TaskUpdateParams {
+                id: "old-id".to_string(),
+                new_id: Some("new-id".to_string()),
+                prompt: Some("updated prompt".to_string()),
+                cli: None,
+                model: None,
+                schedule: None,
+                working_dir: None,
+                duration_minutes: None,
+                path: None,
+                events: None,
+                debounce_seconds: None,
+                recursive: None,
+                enabled: None,
+                notify_on_success: None,
+            }))
+            .await
+            .unwrap();
+
+        assert!(!is_err(&result), "{}", text(&result));
+        assert!(db.get_agent("old-id").unwrap().is_none());
+        let renamed = db.get_agent("new-id").unwrap().unwrap();
+        assert_eq!(renamed.prompt, "updated prompt");
+    }
+
+    #[tokio::test]
+    async fn task_update_reports_missing_agent() {
+        let home = tempdir().unwrap();
+        let _home_guard = HomeVar::set(home.path());
+        let (_dir, _db, handler) = endpoint_test_handler();
+
+        let result = handler
+            .task_update(Parameters(TaskUpdateParams {
+                id: "ghost".to_string(),
+                new_id: None,
+                prompt: None,
+                cli: None,
+                model: None,
+                schedule: None,
+                working_dir: None,
+                duration_minutes: None,
+                path: None,
+                events: None,
+                debounce_seconds: None,
+                recursive: None,
+                enabled: None,
+                notify_on_success: None,
+            }))
+            .await
+            .unwrap();
+
+        assert!(is_err(&result));
+        assert!(text(&result).contains("No agent found"));
+    }
+
+    #[tokio::test]
+    async fn task_update_rejects_invalid_new_id() {
+        let home = tempdir().unwrap();
+        let _home_guard = HomeVar::set(home.path());
+        let (_dir, db, handler) = endpoint_test_handler();
+        db.upsert_agent(&sample_agent("keep-id", None)).unwrap();
+
+        let result = handler
+            .task_update(Parameters(TaskUpdateParams {
+                id: "keep-id".to_string(),
+                new_id: Some("bad id!".to_string()),
+                prompt: None,
+                cli: None,
+                model: None,
+                schedule: None,
+                working_dir: None,
+                duration_minutes: None,
+                path: None,
+                events: None,
+                debounce_seconds: None,
+                recursive: None,
+                enabled: None,
+                notify_on_success: None,
+            }))
+            .await
+            .unwrap();
+
+        assert!(is_err(&result));
+        assert!(db.get_agent("keep-id").unwrap().is_some());
+    }
+
+    // ── task_report / agent_report ───────────────────────────────
+
+    fn sample_run(id: &str, agent_id: &str, status: RunStatus) -> RunLog {
+        RunLog {
+            id: id.to_string(),
+            background_agent_id: agent_id.to_string(),
+            status,
+            trigger_type: TriggerType::Manual,
+            summary: None,
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+            exit_code: None,
+            timeout_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn task_report_transitions_in_progress_to_success() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        db.upsert_agent(&sample_agent("reporter", None)).unwrap();
+        db.insert_run(&sample_run("run-1", "reporter", RunStatus::InProgress))
+            .unwrap();
+
+        let result = handler
+            .task_report(Parameters(TaskReportParams {
+                run_id: "run-1".to_string(),
+                status: "success".to_string(),
+                summary: Some("all good".to_string()),
+            }))
+            .await
+            .unwrap();
+
+        assert!(!is_err(&result), "{}", text(&result));
+        let run = db.get_run("run-1").unwrap().unwrap();
+        assert!(matches!(run.status, RunStatus::Success));
+        let agent = db.get_agent("reporter").unwrap().unwrap();
+        assert_eq!(agent.last_run_ok, Some(true));
+    }
+
+    #[tokio::test]
+    async fn task_report_rejects_invalid_status() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let result = handler
+            .task_report(Parameters(TaskReportParams {
+                run_id: "run-x".to_string(),
+                status: "sideways".to_string(),
+                summary: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&result));
+        assert!(text(&result).contains("Invalid status"));
+    }
+
+    #[tokio::test]
+    async fn task_report_requires_summary_on_success() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        db.upsert_agent(&sample_agent("reporter-2", None)).unwrap();
+        db.insert_run(&sample_run("run-2", "reporter-2", RunStatus::InProgress))
+            .unwrap();
+
+        let result = handler
+            .task_report(Parameters(TaskReportParams {
+                run_id: "run-2".to_string(),
+                status: "success".to_string(),
+                summary: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&result));
+        assert!(text(&result).contains("summary is required"));
+    }
+
+    #[tokio::test]
+    async fn task_report_rejects_invalid_transition() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        db.upsert_agent(&sample_agent("reporter-3", None)).unwrap();
+        // Already terminal (Success) — Success -> Success is not a valid
+        // transition per validate_run_transition.
+        db.insert_run(&sample_run("run-3", "reporter-3", RunStatus::Success))
+            .unwrap();
+
+        let result = handler
+            .task_report(Parameters(TaskReportParams {
+                run_id: "run-3".to_string(),
+                status: "success".to_string(),
+                summary: Some("again".to_string()),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&result));
+        assert!(text(&result).contains("Invalid transition"));
+    }
+
+    #[tokio::test]
+    async fn task_report_errors_on_unknown_run_id() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let result = handler
+            .task_report(Parameters(TaskReportParams {
+                run_id: "no-such-run".to_string(),
+                status: "success".to_string(),
+                summary: Some("done".to_string()),
+            }))
+            .await;
+        assert!(result.is_err());
+    }
+}
