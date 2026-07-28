@@ -56,3 +56,70 @@ impl Database {
         Ok(rows)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn test_db() -> Database {
+        let dir = tempdir().unwrap();
+        Database::new(&dir.path().join("test.db")).unwrap()
+    }
+
+    fn insert_test_session(db: &Database, session_id: &str) {
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO interactive_sessions (id, name, cli, working_dir, started_at, status)
+             VALUES (?1, 'test', 'bash', '/tmp', datetime('now'), 'active')",
+            params![session_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn bind_and_resolve_session_seed() {
+        let db = test_db();
+        insert_test_session(&db, "session1");
+        db.bind_session_to_seed("session1", "seed1").unwrap();
+
+        let resolved = db.resolve_session_seed("session1").unwrap();
+        assert_eq!(resolved, Some("seed1".to_string()));
+    }
+
+    #[test]
+    fn resolve_session_seed_not_found() {
+        let db = test_db();
+        let resolved = db.resolve_session_seed("nonexistent").unwrap();
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn unbind_session_seed() {
+        let db = test_db();
+        insert_test_session(&db, "session1");
+        db.bind_session_to_seed("session1", "seed1").unwrap();
+
+        db.unbind_session_seed("session1").unwrap();
+        let resolved = db.resolve_session_seed("session1").unwrap();
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn get_sessions_for_seed_empty() {
+        let db = test_db();
+        let sessions = db.get_sessions_for_seed("nonexistent").unwrap();
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn bind_session_to_seed_overwrites() {
+        let db = test_db();
+        insert_test_session(&db, "session1");
+        db.bind_session_to_seed("session1", "seed1").unwrap();
+        db.bind_session_to_seed("session1", "seed2").unwrap();
+
+        let resolved = db.resolve_session_seed("session1").unwrap();
+        assert_eq!(resolved, Some("seed2".to_string()));
+    }
+}
