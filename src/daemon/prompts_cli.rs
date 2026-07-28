@@ -136,4 +136,43 @@ mod tests {
         let missing = dir.path().join("does-not-exist");
         assert_eq!(list_preset_names(&missing).unwrap(), Vec::<String>::new());
     }
+
+    #[test]
+    fn first_non_empty_line_returns_first_line() {
+        assert_eq!(first_non_empty_line("hello\nworld"), Some("hello"));
+        assert_eq!(first_non_empty_line("single"), Some("single"));
+    }
+
+    #[test]
+    fn first_non_empty_line_trims_whitespace() {
+        assert_eq!(first_non_empty_line("  hello  \nworld"), Some("hello"));
+        assert_eq!(first_non_empty_line("\t\tindented\n"), Some("indented"));
+    }
+
+    #[test]
+    fn first_non_empty_line_handles_only_whitespace() {
+        assert_eq!(first_non_empty_line("   \n\t\n  "), None);
+        assert_eq!(first_non_empty_line(""), None);
+    }
+
+    #[test]
+    fn list_preset_names_sorts_alphabetically() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("zebra.md"), "content").unwrap();
+        std::fs::write(dir.path().join("alpha.md"), "content").unwrap();
+        std::fs::write(dir.path().join("middle.md"), "content").unwrap();
+
+        let names = list_preset_names(dir.path()).unwrap();
+        assert_eq!(names, vec!["alpha", "middle", "zebra"]);
+    }
+
+    #[test]
+    fn list_preset_names_ignores_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.md"), "content").unwrap();
+        std::fs::create_dir(dir.path().join("directory.md")).unwrap();
+
+        let names = list_preset_names(dir.path()).unwrap();
+        assert_eq!(names, vec!["file"]);
+    }
 }
