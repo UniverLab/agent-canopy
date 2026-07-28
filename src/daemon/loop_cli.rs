@@ -893,4 +893,146 @@ mod tests {
         let at = DateTime::<Utc>::from_timestamp(5 * 3600, 0).unwrap(); // 05:00:00 UTC
         assert_eq!(format_autorun_compact(at), "⏲ 05:00Z");
     }
+
+    #[test]
+    fn short_id_truncates_to_eight_chars() {
+        assert_eq!(short_id("abcdef1234567890"), "abcdef12");
+        assert_eq!(short_id("short"), "short");
+        assert_eq!(short_id(""), "");
+    }
+
+    #[test]
+    fn spec_status_icons_are_distinct_per_status() {
+        let statuses = [
+            LoopSpecStatus::Running,
+            LoopSpecStatus::Completed,
+            LoopSpecStatus::Failed,
+            LoopSpecStatus::Skipped,
+            LoopSpecStatus::Pending,
+        ];
+        let icons: std::collections::HashSet<&str> =
+            statuses.iter().map(|s| spec_status_icon(*s)).collect();
+        assert_eq!(icons.len(), statuses.len());
+    }
+
+    #[test]
+    fn run_status_icon_shows_flag_for_interrupted_runs() {
+        let output = Some(serde_json::json!({"interrupted": true}));
+        assert!(run_status_icon(LoopRunStatus::Fail, output.as_ref()).contains("⚑"));
+        assert!(run_status_icon(LoopRunStatus::Pass, output.as_ref()).contains("⚑"));
+        assert!(run_status_icon(LoopRunStatus::Running, output.as_ref()).contains("⚑"));
+    }
+
+    #[test]
+    fn run_status_icon_shows_normal_icons_when_not_interrupted() {
+        let output = Some(serde_json::json!({"interrupted": false}));
+        assert!(run_status_icon(LoopRunStatus::Pass, output.as_ref()).contains("✓"));
+        assert!(run_status_icon(LoopRunStatus::Fail, output.as_ref()).contains("✗"));
+        assert!(run_status_icon(LoopRunStatus::Running, output.as_ref()).contains("▶"));
+    }
+
+    #[test]
+    fn run_status_icon_handles_none_output() {
+        assert!(run_status_icon(LoopRunStatus::Pass, None).contains("✓"));
+        assert!(run_status_icon(LoopRunStatus::Fail, None).contains("✗"));
+        assert!(run_status_icon(LoopRunStatus::Running, None).contains("▶"));
+    }
+
+    #[test]
+    fn is_interrupted_detects_flag() {
+        assert!(is_interrupted(Some(
+            &serde_json::json!({"interrupted": true})
+        )));
+        assert!(!is_interrupted(Some(
+            &serde_json::json!({"interrupted": false})
+        )));
+        assert!(!is_interrupted(Some(
+            &serde_json::json!({"other": "field"})
+        )));
+        assert!(!is_interrupted(None));
+    }
+
+    #[test]
+    fn commit_rights_note_renders_violation() {
+        let output = Some(serde_json::json!({
+            "commit_rights_violation": {"head_after": "abcdef1234567890"}
+        }));
+        let note = commit_rights_note(output.as_ref());
+        assert!(note.contains("no commit rights"));
+        assert!(note.contains("abcdef12"));
+    }
+
+    #[test]
+    fn commit_rights_note_empty_when_no_violation() {
+        assert!(commit_rights_note(None).is_empty());
+        assert!(commit_rights_note(Some(&serde_json::json!({"other": "field"}))).is_empty());
+    }
+
+    #[test]
+    fn interrupted_note_renders_with_quarantine() {
+        let output = Some(serde_json::json!({
+            "interrupted": true,
+            "quarantine": {"stashed": true}
+        }));
+        let note = interrupted_note(output.as_ref());
+        assert!(note.contains("interrupted"));
+        assert!(note.contains("quarantined"));
+        assert!(note.contains("git stash pop"));
+    }
+
+    #[test]
+    fn interrupted_note_renders_without_quarantine() {
+        let output = Some(serde_json::json!({"interrupted": true}));
+        let note = interrupted_note(output.as_ref());
+        assert!(note.contains("interrupted"));
+        assert!(!note.contains("quarantined"));
+    }
+
+    #[test]
+    fn interrupted_note_empty_when_not_interrupted() {
+        assert!(interrupted_note(None).is_empty());
+        assert!(interrupted_note(Some(&serde_json::json!({"interrupted": false}))).is_empty());
+    }
+
+    #[test]
+    fn format_dt_renders_local_time() {
+        let dt = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+        let formatted = format_dt(dt);
+        // The function converts to local time, so we just check it's non-empty and has a colon
+        assert!(!formatted.is_empty());
+        assert!(formatted.contains(":"));
+    }
+
+    #[test]
+    fn candidate_list_renders_loop_names() {
+        let loops = [
+            make_loop("abc123", "loop-one", LoopStatus::Draft),
+            make_loop("def456", "loop-two", LoopStatus::Running),
+        ];
+        let list = candidate_list(loops.iter());
+        assert!(list.contains("loop-one"));
+        assert!(list.contains("loop-two"));
+        assert!(list.contains("abc123"));
+        assert!(list.contains("def456"));
+    }
+
+    #[test]
+    fn not_found_error_mentions_query() {
+        let loops = [make_loop("abc123", "one", LoopStatus::Draft)];
+        let err = not_found_error("missing", &loops);
+        assert!(err.to_string().contains("missing"));
+    }
+
+    #[test]
+    fn ambiguous_error_mentions_all_candidates() {
+        let loops = [
+            make_loop("abc123", "dup", LoopStatus::Draft),
+            make_loop("def456", "dup", LoopStatus::Draft),
+        ];
+        let matches: Vec<&Loop> = loops.iter().collect();
+        let err = ambiguous_error("dup", &matches);
+        let msg = err.to_string();
+        assert!(msg.contains("abc123"));
+        assert!(msg.contains("def456"));
+    }
 }
