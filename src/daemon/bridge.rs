@@ -694,4 +694,98 @@ mod tests {
         );
         assert_eq!(identity.agent_id, "my-id");
     }
+
+    // ── non_empty_env tests ─────────────────────────────────────
+
+    #[test]
+    fn non_empty_env_returns_none_for_missing_var() {
+        std::env::remove_var("CANOPY_TEST_MISSING_VAR");
+        assert!(non_empty_env("CANOPY_TEST_MISSING_VAR").is_none());
+    }
+
+    #[test]
+    fn non_empty_env_returns_none_for_empty_var() {
+        std::env::set_var("CANOPY_TEST_EMPTY_VAR", "");
+        assert!(non_empty_env("CANOPY_TEST_EMPTY_VAR").is_none());
+        std::env::remove_var("CANOPY_TEST_EMPTY_VAR");
+    }
+
+    #[test]
+    fn non_empty_env_returns_none_for_whitespace_var() {
+        std::env::set_var("CANOPY_TEST_WS_VAR", "   ");
+        assert!(non_empty_env("CANOPY_TEST_WS_VAR").is_none());
+        std::env::remove_var("CANOPY_TEST_WS_VAR");
+    }
+
+    #[test]
+    fn non_empty_env_returns_trimmed_value() {
+        std::env::set_var("CANOPY_TEST_VALUE_VAR", "  hello  ");
+        let result = non_empty_env("CANOPY_TEST_VALUE_VAR");
+        assert_eq!(result, Some("hello".to_string()));
+        std::env::remove_var("CANOPY_TEST_VALUE_VAR");
+    }
+
+    // ── resolve_workdir tests ───────────────────────────────────
+
+    #[test]
+    fn resolve_workdir_uses_explicit_arg() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = resolve_workdir(Some(dir.path().to_path_buf())).unwrap();
+        assert!(result.contains(dir.path().file_name().unwrap().to_str().unwrap()));
+    }
+
+    #[test]
+    fn resolve_workdir_falls_back_to_current_dir() {
+        let result = resolve_workdir(None).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let canonical = std::fs::canonicalize(&cwd).unwrap();
+        assert_eq!(result, canonical.to_string_lossy().to_string());
+    }
+
+    // ── resolve_bridge_port tests ───────────────────────────────
+
+    #[test]
+    fn resolve_bridge_port_prefers_explicit_arg() {
+        assert_eq!(resolve_bridge_port(Some(9999)), 9999);
+    }
+
+    #[test]
+    fn resolve_bridge_port_defaults_to_7755() {
+        // Remove env var to ensure default
+        std::env::remove_var("CANOPY_PORT");
+        // Without a data dir or state, should default to 7755
+        assert_eq!(resolve_bridge_port(None), 7755);
+    }
+
+    // ── read_port_from_state tests ──────────────────────────────
+
+    #[test]
+    fn read_port_from_state_returns_none_for_missing_db() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_port_from_state(dir.path()).is_none());
+    }
+
+    #[test]
+    fn read_port_from_state_returns_none_for_missing_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let _db = Database::new(&dir.path().join("background_agents.db")).unwrap();
+        // No port set in state
+        assert!(read_port_from_state(dir.path()).is_none());
+    }
+
+    #[test]
+    fn read_port_from_state_returns_port_when_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(&dir.path().join("background_agents.db")).unwrap();
+        db.set_state("port", "8080").unwrap();
+        assert_eq!(read_port_from_state(dir.path()), Some(8080));
+    }
+
+    #[test]
+    fn read_port_from_state_returns_none_for_invalid_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(&dir.path().join("background_agents.db")).unwrap();
+        db.set_state("port", "not-a-number").unwrap();
+        assert!(read_port_from_state(dir.path()).is_none());
+    }
 }
