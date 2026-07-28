@@ -425,4 +425,88 @@ mod tests {
         assert!(find("c"));
         assert!(!find("d"));
     }
+
+    #[test]
+    fn extract_from_platform_missing_file() {
+        let result = McpConfigRegistry::extract_from_platform(
+            "test",
+            std::path::Path::new("/nonexistent/path.json"),
+            &["mcpServers".to_string()],
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[test]
+    fn extract_from_platform_json_with_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        std::fs::write(
+            &config_path,
+            r#"{"mcpServers": {"server1": {"url": "http://localhost:8080"}}}"#,
+        )
+        .unwrap();
+
+        let result = McpConfigRegistry::extract_from_platform(
+            "test-platform",
+            &config_path,
+            &["mcpServers".to_string()],
+        );
+        assert!(result.is_ok());
+        let config = result.unwrap();
+        assert_eq!(config.platform, "test-platform");
+        assert_eq!(config.servers.len(), 1);
+        assert_eq!(config.servers[0].name, "server1");
+    }
+
+    #[test]
+    fn extract_from_platform_missing_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        std::fs::write(&config_path, r#"{"other": "data"}"#).unwrap();
+
+        let result = McpConfigRegistry::extract_from_platform(
+            "test",
+            &config_path,
+            &["mcpServers".to_string()],
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[test]
+    fn sync_servers_syncs_matching_servers() {
+        let reg = make_registry();
+        let result = reg.sync_servers(&["canopy"], &["kiro"]);
+        assert!(result.is_ok());
+        let synced = result.unwrap();
+        assert_eq!(synced, vec!["kiro.canopy"]);
+    }
+
+    #[test]
+    fn sync_servers_missing_platform() {
+        let reg = make_registry();
+        let result = reg.sync_servers(&["canopy"], &["nonexistent"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sync_servers_missing_server() {
+        let reg = make_registry();
+        let result = reg.sync_servers(&["nonexistent-server"], &["kiro"]);
+        assert!(result.is_ok());
+        let synced = result.unwrap();
+        assert!(synced.is_empty());
+    }
+
+    #[test]
+    fn sync_servers_multiple_platforms() {
+        let reg = make_registry();
+        let result = reg.sync_servers(&["canopy"], &["kiro", "opencode"]);
+        assert!(result.is_ok());
+        let synced = result.unwrap();
+        assert_eq!(synced.len(), 2);
+        assert!(synced.contains(&"kiro.canopy".to_string()));
+        assert!(synced.contains(&"opencode.canopy".to_string()));
+    }
 }
