@@ -438,3 +438,84 @@ fn from_timestamp(value: i64) -> rusqlite::Result<DateTime<Utc>> {
         )
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::pools::Pool;
+    use chrono::Utc;
+    use tempfile::tempdir;
+
+    fn test_db() -> Database {
+        let dir = tempdir().unwrap();
+        Database::new(&dir.path().join("test.db")).unwrap()
+    }
+
+    fn sample_pool(id: &str) -> Pool {
+        Pool {
+            id: id.to_string(),
+            name: format!("Pool {id}"),
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn insert_and_get_pool() {
+        let db = test_db();
+        let pool = sample_pool("pool1");
+        db.insert_pool(&pool).unwrap();
+
+        let retrieved = db.get_pool("pool1").unwrap();
+        assert!(retrieved.is_some());
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.id, "pool1");
+        assert_eq!(retrieved.name, "Pool pool1");
+    }
+
+    #[test]
+    fn get_pool_not_found() {
+        let db = test_db();
+        let result = db.get_pool("nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn list_pools_empty() {
+        let db = test_db();
+        let pools = db.list_pools().unwrap();
+        assert!(pools.is_empty());
+    }
+
+    #[test]
+    fn list_pools_with_pools() {
+        let db = test_db();
+        let pool1 = sample_pool("pool1");
+        let pool2 = sample_pool("pool2");
+        db.insert_pool(&pool1).unwrap();
+        db.insert_pool(&pool2).unwrap();
+
+        let pools = db.list_pools().unwrap();
+        assert_eq!(pools.len(), 2);
+    }
+
+    #[test]
+    fn list_pool_member_spec_ids_empty() {
+        let db = test_db();
+        let members = db.list_pool_member_spec_ids("nonexistent").unwrap();
+        assert!(members.is_empty());
+    }
+
+    #[test]
+    fn pool_has_member_false() {
+        let db = test_db();
+        let has = db.pool_has_member("nonexistent", "spec1").unwrap();
+        assert!(!has);
+    }
+
+    #[test]
+    fn pool_member_group_none() {
+        let db = test_db();
+        let group = db.pool_member_group("nonexistent", "spec1").unwrap();
+        assert!(group.is_none());
+    }
+}
