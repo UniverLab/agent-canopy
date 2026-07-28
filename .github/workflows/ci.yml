@@ -84,8 +84,15 @@ jobs:
 
       - uses: taiki-e/install-action@cargo-llvm-cov
 
+      # `src/tui/ui/**` is pure ratatui rendering: functions whose whole job is
+      # to draw onto a Frame, and whose correctness is visual rather than
+      # logical. Covering it means asserting on screen-buffer contents, which
+      # costs a lot of test for very little defect-catching, so it sits outside
+      # the gate. Event handlers (`tui/event/**`) and app state (`tui/app/**`)
+      # stay in — that is the logic worth holding to a threshold.
       - name: Measure coverage
         run: |
           cargo llvm-cov --locked \
+            --ignore-filename-regex 'src/tui/ui/' \
             --fail-under-lines 80 \
             --summary-only
