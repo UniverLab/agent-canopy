@@ -71,3 +71,36 @@ fn stable_version_rejects_empty() {
     assert!(!super::is_stable_version(""));
     assert!(!super::is_stable_version("v"));
 }
+
+#[test]
+fn current_version_returns_non_empty() {
+    let version = super::current_version();
+    assert!(!version.is_empty(), "version should not be empty");
+}
+
+#[test]
+fn detect_platform_returns_valid_tuple() {
+    let result = super::detect_platform();
+    // On supported platforms, this should succeed
+    if (cfg!(target_os = "linux") || cfg!(target_os = "macos"))
+        && (cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64"))
+    {
+        assert!(
+            result.is_ok(),
+            "should detect platform on supported systems"
+        );
+        let (os, arch) = result.unwrap();
+        assert!(!os.is_empty(), "OS should not be empty");
+        assert!(!arch.is_empty(), "arch should not be empty");
+    }
+}
+
+#[test]
+fn now_secs_returns_reasonable_timestamp() {
+    let result = super::now_secs();
+    assert!(result.is_ok(), "now_secs should succeed");
+    let secs = result.unwrap();
+    // Should be after 2020-01-01 and before 2100-01-01
+    assert!(secs > 1577836800, "timestamp should be after 2020");
+    assert!(secs < 4102444800, "timestamp should be before 2100");
+}
