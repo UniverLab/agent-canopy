@@ -367,3 +367,156 @@ impl Database {
         Ok(count)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_db() -> Database {
+        let dir = tempfile::tempdir().unwrap();
+        Database::new(&dir.path().join("test.db")).unwrap()
+    }
+
+    #[test]
+    fn insert_and_get_interactive_session() {
+        let db = test_db();
+        let session_id = "test-session-123";
+        let name = "test-session";
+        let cli = "bash";
+        let workdir = "/tmp/test";
+        let args = Some("arg1 arg2");
+        let pid = Some(12345i64);
+        let session_type = "interactive";
+        let boot_id = Some("boot-123");
+
+        db.insert_interactive_session(
+            session_id,
+            name,
+            cli,
+            workdir,
+            args,
+            pid,
+            session_type,
+            boot_id,
+        )
+        .unwrap();
+
+        let retrieved_args = db.get_interactive_session_args(session_id).unwrap();
+        assert!(retrieved_args.is_some());
+        let retrieved_args = retrieved_args.unwrap();
+        assert!(retrieved_args.contains("arg1"));
+        assert!(retrieved_args.contains("arg2"));
+
+        let workdir = db.get_session_workdir(session_id).unwrap();
+        assert_eq!(workdir, Some("/tmp/test".to_string()));
+    }
+
+    #[test]
+    fn get_interactive_session_args_not_found() {
+        let db = test_db();
+        let result = db.get_interactive_session_args("nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn get_session_workdir_not_found() {
+        let db = test_db();
+        let result = db.get_session_workdir("nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn finish_interactive_session() {
+        let db = test_db();
+        let session_id = "test-session-456";
+        let name = "test-session";
+        let cli = "bash";
+        let workdir = "/tmp/test";
+        let args = Some("arg1");
+        let pid = Some(12345i64);
+        let session_type = "interactive";
+        let boot_id = Some("boot-123");
+
+        db.insert_interactive_session(
+            session_id,
+            name,
+            cli,
+            workdir,
+            args,
+            pid,
+            session_type,
+            boot_id,
+        )
+        .unwrap();
+
+        db.finish_interactive_session(session_id, 0).unwrap();
+
+        let status = db.get_interactive_session_status(session_id).unwrap();
+        assert_eq!(status, Some("completed".to_string()));
+    }
+
+    #[test]
+    fn get_active_sessions_empty() {
+        let db = test_db();
+        let sessions = db.get_active_sessions().unwrap();
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn get_active_sessions_with_sessions() {
+        let db = test_db();
+        db.insert_interactive_session(
+            "session1",
+            "name1",
+            "bash",
+            "/tmp",
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+        db.insert_interactive_session(
+            "session2",
+            "name2",
+            "bash",
+            "/tmp",
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+
+        let sessions = db.get_active_sessions().unwrap();
+        assert_eq!(sessions.len(), 2);
+    }
+
+    #[test]
+    fn get_orphaned_sessions_empty() {
+        let db = test_db();
+        let sessions = db.get_orphaned_sessions().unwrap();
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn count_terminal_sessions_empty() {
+        let db = test_db();
+        let count = db.count_terminal_sessions().unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn count_background_agents_empty() {
+        let db = test_db();
+        let count = db.count_background_agents().unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn count_runs_empty() {
+        let db = test_db();
+        let count = db.count_runs().unwrap();
+        assert_eq!(count, 0);
+    }
+}
