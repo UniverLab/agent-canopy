@@ -1890,3 +1890,177 @@ fn parse_json_value(raw: &str) -> rusqlite::Result<Value> {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::loops::{Loop, LoopStatus};
+    use chrono::Utc;
+    use tempfile::tempdir;
+
+    fn test_db() -> Database {
+        let dir = tempdir().unwrap();
+        Database::new(&dir.path().join("test.db")).unwrap()
+    }
+
+    fn sample_loop(id: &str) -> Loop {
+        Loop {
+            id: id.to_string(),
+            name: format!("Loop {id}"),
+            description: None,
+            workdir: "/tmp/test".to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_pool_id: None,
+            on_completed: None,
+        }
+    }
+
+    #[test]
+    fn insert_and_get_loop() {
+        let db = test_db();
+        let loop_obj = sample_loop("loop1");
+        db.insert_loop(&loop_obj).unwrap();
+
+        let retrieved = db.get_loop("loop1").unwrap();
+        assert!(retrieved.is_some());
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.id, "loop1");
+        assert_eq!(retrieved.name, "Loop loop1");
+    }
+
+    #[test]
+    fn get_loop_not_found() {
+        let db = test_db();
+        let result = db.get_loop("nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn delete_loop() {
+        let db = test_db();
+        let loop_obj = sample_loop("loop1");
+        db.insert_loop(&loop_obj).unwrap();
+
+        db.delete_loop("loop1").unwrap();
+        let retrieved = db.get_loop("loop1").unwrap();
+        assert!(retrieved.is_none());
+    }
+
+    #[test]
+    fn list_loops_empty() {
+        let db = test_db();
+        let loops = db.list_loops(None).unwrap();
+        assert!(loops.is_empty());
+    }
+
+    #[test]
+    fn list_loops_with_loops() {
+        let db = test_db();
+        let loop1 = sample_loop("loop1");
+        let loop2 = sample_loop("loop2");
+        db.insert_loop(&loop1).unwrap();
+        db.insert_loop(&loop2).unwrap();
+
+        let loops = db.list_loops(None).unwrap();
+        assert_eq!(loops.len(), 2);
+    }
+
+    #[test]
+    fn update_loop_status() {
+        let db = test_db();
+        let loop_obj = sample_loop("loop1");
+        db.insert_loop(&loop_obj).unwrap();
+
+        db.update_loop_status("loop1", LoopStatus::Running, None, None)
+            .unwrap();
+        let retrieved = db.get_loop("loop1").unwrap().unwrap();
+        assert_eq!(retrieved.status, LoopStatus::Running);
+    }
+
+    #[test]
+    fn schedule_and_clear_loop_autorun() {
+        let db = test_db();
+        let loop_obj = sample_loop("loop1");
+        db.insert_loop(&loop_obj).unwrap();
+
+        let scheduled_at = Utc::now() + chrono::Duration::hours(1);
+        db.schedule_loop_autorun("loop1", scheduled_at).unwrap();
+
+        let retrieved = db.get_loop("loop1").unwrap().unwrap();
+        assert!(retrieved.autorun_at.is_some());
+
+        db.clear_loop_autorun("loop1").unwrap();
+        let retrieved = db.get_loop("loop1").unwrap().unwrap();
+        assert!(retrieved.autorun_at.is_none());
+    }
+
+    #[test]
+    fn list_pending_autorun_loops_empty() {
+        let db = test_db();
+        let loops = db.list_pending_autorun_loops().unwrap();
+        assert!(loops.is_empty());
+    }
+
+    #[test]
+    fn list_pending_autorun_loops_with_scheduled() {
+        let db = test_db();
+        let loop_obj = sample_loop("loop1");
+        db.insert_loop(&loop_obj).unwrap();
+
+        let scheduled_at = Utc::now() - chrono::Duration::hours(1);
+        db.schedule_loop_autorun("loop1", scheduled_at).unwrap();
+
+        let loops = db.list_pending_autorun_loops().unwrap();
+        assert_eq!(loops.len(), 1);
+    }
+
+    #[test]
+    fn validate_single_target_both_none() {
+        let result = validate_single_target(None, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_single_target_both_some() {
+        let result = validate_single_target(Some("spec1"), Some("loop1"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_single_target_spec_only() {
+        let result = validate_single_target(Some("spec1"), None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_single_target_loop_only() {
+        let result = validate_single_target(None, Some("loop1"));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn encode_and_decode_loop_trigger_none() {
+        let (type_str, config) = encode_loop_trigger(None).unwrap();
+        assert!(type_str.is_none());
+        assert!(config.is_none());
+    }
+
+    #[test]
+    fn parse_json_value_valid() {
+        let result = parse_json_value(r#"{"key": "value"}"#);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn parse_json_value_invalid() {
+        let result = parse_json_value("invalid json");
+        assert!(result.is_err());
+    }
+}
