@@ -82,3 +82,80 @@ fn ensure_data_dir() -> Result<PathBuf> {
 
     Ok(base_dir.join("canopy.db"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spec_action_complete_variant() {
+        let action = SpecAction::Complete {
+            spec_id: "test-spec".to_string(),
+            reason: "test reason".to_string(),
+        };
+        match action {
+            SpecAction::Complete { spec_id, reason } => {
+                assert_eq!(spec_id, "test-spec");
+                assert_eq!(reason, "test reason");
+            }
+            _ => panic!("Expected Complete variant"),
+        }
+    }
+
+    #[test]
+    fn spec_action_skip_variant() {
+        let action = SpecAction::Skip {
+            spec_id: "test-spec".to_string(),
+            reason: "test reason".to_string(),
+        };
+        match action {
+            SpecAction::Skip { spec_id, reason } => {
+                assert_eq!(spec_id, "test-spec");
+                assert_eq!(reason, "test reason");
+            }
+            _ => panic!("Expected Skip variant"),
+        }
+    }
+
+    #[test]
+    fn spec_action_reopen_variant() {
+        let action = SpecAction::Reopen {
+            spec_id: "test-spec".to_string(),
+            reason: "test reason".to_string(),
+        };
+        match action {
+            SpecAction::Reopen { spec_id, reason } => {
+                assert_eq!(spec_id, "test-spec");
+                assert_eq!(reason, "test reason");
+            }
+            _ => panic!("Expected Reopen variant"),
+        }
+    }
+
+    #[test]
+    fn ensure_data_dir_creates_directory() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let test_dir = temp_dir.path().join("test_data");
+        std::env::set_var("CANOPY_DATA_DIR", test_dir.to_str().unwrap());
+
+        let result = ensure_data_dir();
+        assert!(result.is_ok());
+        let db_path = result.unwrap();
+        assert!(db_path.to_str().unwrap().ends_with("canopy.db"));
+
+        // Clean up
+        std::env::remove_var("CANOPY_DATA_DIR");
+    }
+
+    #[test]
+    fn ensure_data_dir_uses_existing_directory() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("CANOPY_DATA_DIR", temp_dir.path().to_str().unwrap());
+
+        let result = ensure_data_dir();
+        assert!(result.is_ok());
+
+        // Clean up
+        std::env::remove_var("CANOPY_DATA_DIR");
+    }
+}

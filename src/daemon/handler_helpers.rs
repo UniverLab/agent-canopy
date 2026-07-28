@@ -829,4 +829,52 @@ mod tests {
             other => panic!("expected Trigger::Cron, got {other:?}"),
         }
     }
+
+    #[test]
+    fn validate_cron_schedule_valid() {
+        let result = validate_cron_schedule("0 9 * * *", &crate::scheduler::validate_cron, |s| {
+            format!("Invalid: {}", s)
+        });
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_cron_schedule_invalid() {
+        let result = validate_cron_schedule("invalid", &crate::scheduler::validate_cron, |s| {
+            format!("Invalid: {}", s)
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_cron_schedule_empty() {
+        let result = validate_cron_schedule("", &crate::scheduler::validate_cron, |s| {
+            format!("Invalid: {}", s)
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_effective_project_hash_with_explicit_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let result = resolve_effective_project_hash(&db, Some("explicit-hash"), "test-agent");
+        assert_eq!(result, Some("explicit-hash".to_string()));
+    }
+
+    #[test]
+    fn resolve_effective_project_hash_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let result = resolve_effective_project_hash(&db, None, "test-agent");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_effective_project_hash_explicit_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let result = resolve_effective_project_hash(&db, Some("explicit"), "test-agent");
+        assert_eq!(result, Some("explicit".to_string()));
+    }
 }
