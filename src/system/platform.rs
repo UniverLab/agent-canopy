@@ -180,4 +180,101 @@ mod tests {
         assert_eq!(bytes_to_megabytes(10 * 1024 * 1024), 10);
         assert_eq!(bytes_to_megabytes(1024), 0); // Less than 1 MB rounds down
     }
+
+    #[test]
+    fn infer_gpu_vendor_nvidia_variants() {
+        assert_eq!(infer_gpu_vendor("NVIDIA GeForce RTX 3080"), "NVIDIA");
+        assert_eq!(infer_gpu_vendor("geforce gtx 1080"), "NVIDIA");
+        assert_eq!(infer_gpu_vendor("Quadro RTX 6000"), "NVIDIA");
+        assert_eq!(infer_gpu_vendor("NVIDIA"), "NVIDIA");
+    }
+
+    #[test]
+    fn infer_gpu_vendor_amd_variants() {
+        assert_eq!(infer_gpu_vendor("AMD Radeon RX 7900 XTX"), "AMD");
+        assert_eq!(infer_gpu_vendor("radeon vii"), "AMD");
+        assert_eq!(infer_gpu_vendor("ATI Radeon HD 5870"), "AMD");
+        assert_eq!(infer_gpu_vendor("AMD"), "AMD");
+    }
+
+    #[test]
+    fn infer_gpu_vendor_intel_variants() {
+        assert_eq!(infer_gpu_vendor("Intel Arc A770"), "Intel");
+        assert_eq!(infer_gpu_vendor("intel uhd 630"), "Intel");
+        assert_eq!(infer_gpu_vendor("Intel"), "Intel");
+    }
+
+    #[test]
+    fn infer_gpu_vendor_apple() {
+        assert_eq!(infer_gpu_vendor("Apple M2 Pro GPU"), "Apple");
+        assert_eq!(infer_gpu_vendor("apple m1"), "Apple");
+    }
+
+    #[test]
+    fn infer_gpu_vendor_unknown_falls_back_to_gpu() {
+        assert_eq!(infer_gpu_vendor("Some Unknown GPU"), "GPU");
+        assert_eq!(infer_gpu_vendor(""), "GPU");
+        assert_eq!(infer_gpu_vendor("12345"), "GPU");
+    }
+
+    #[test]
+    fn infer_gpu_vendor_case_insensitive() {
+        assert_eq!(infer_gpu_vendor("NVIDIA"), "NVIDIA");
+        assert_eq!(infer_gpu_vendor("nvidia"), "NVIDIA");
+        assert_eq!(infer_gpu_vendor("Nvidia"), "NVIDIA");
+        assert_eq!(infer_gpu_vendor("AMD"), "AMD");
+        assert_eq!(infer_gpu_vendor("amd"), "AMD");
+        assert_eq!(infer_gpu_vendor("Intel"), "Intel");
+        assert_eq!(infer_gpu_vendor("intel"), "Intel");
+    }
+
+    #[test]
+    fn parse_optional_f32_none() {
+        assert_eq!(parse_optional_f32(None), None);
+    }
+
+    #[test]
+    fn parse_optional_f32_empty_string() {
+        assert_eq!(parse_optional_f32(Some("")), None);
+    }
+
+    #[test]
+    fn parse_optional_f32_valid_float() {
+        assert_eq!(parse_optional_f32(Some("1.5")), Some(1.5));
+        assert_eq!(parse_optional_f32(Some("0.0")), Some(0.0));
+        assert_eq!(parse_optional_f32(Some("-1.5")), Some(-1.5));
+    }
+
+    #[test]
+    fn parse_optional_f32_invalid_string() {
+        assert_eq!(parse_optional_f32(Some("not_a_number")), None);
+        assert_eq!(parse_optional_f32(Some("abc")), None);
+    }
+
+    #[test]
+    fn parse_optional_u64_none() {
+        assert_eq!(parse_optional_u64(None), None);
+    }
+
+    #[test]
+    fn parse_optional_u64_empty_string() {
+        assert_eq!(parse_optional_u64(Some("")), None);
+    }
+
+    #[test]
+    fn parse_optional_u64_valid_number() {
+        assert_eq!(parse_optional_u64(Some("0")), Some(0));
+        assert_eq!(parse_optional_u64(Some("42")), Some(42));
+        assert_eq!(
+            parse_optional_u64(Some("18446744073709551615")),
+            Some(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn parse_optional_u64_invalid_string() {
+        assert_eq!(parse_optional_u64(Some("not_a_number")), None);
+        assert_eq!(parse_optional_u64(Some("-1")), None);
+        assert_eq!(parse_optional_u64(Some("3.14")), None);
+    }
 }

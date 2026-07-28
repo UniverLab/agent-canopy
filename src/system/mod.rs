@@ -295,4 +295,180 @@ mod tests {
             assert!(boot_id().is_some());
         }
     }
+
+    #[test]
+    fn system_info_default_has_zeroed_values() {
+        let info = SystemInfo::default();
+        assert_eq!(info.cpu_usage, 0.0);
+        assert_eq!(info.cpu_cores, 0);
+        assert!(info.cpu_temperature.is_none());
+        assert_eq!(info.memory_used, 0);
+        assert_eq!(info.memory_total, 0);
+        assert!(info.gpu_info.is_none());
+        assert!(info.power_watts.is_none());
+        assert!(info.power_limit_watts.is_none());
+        assert!(info.power_source.is_none());
+    }
+
+    #[test]
+    fn cpu_usage_percent_returns_inner() {
+        let info = SystemInfo {
+            cpu_usage: 42.5,
+            ..SystemInfo::default()
+        };
+        assert_eq!(info.cpu_usage_percent(), 42.5);
+    }
+
+    #[test]
+    fn cpu_temperature_celsius_returns_inner() {
+        let info = SystemInfo::default();
+        assert!(info.cpu_temperature_celsius().is_none());
+        let info = SystemInfo {
+            cpu_temperature: Some(65.0),
+            ..SystemInfo::default()
+        };
+        assert_eq!(info.cpu_temperature_celsius(), Some(65.0));
+    }
+
+    #[test]
+    fn gpu_vram_used_mb_returns_none_when_no_gpu() {
+        let info = SystemInfo::default();
+        assert!(info.gpu_vram_used_mb().is_none());
+    }
+
+    #[test]
+    fn gpu_vram_used_mb_returns_vram_used() {
+        let info = SystemInfo {
+            gpu_info: Some(GpuInfo {
+                vram_used: Some(4096),
+                ..GpuInfo::default()
+            }),
+            ..SystemInfo::default()
+        };
+        assert_eq!(info.gpu_vram_used_mb(), Some(4096));
+    }
+
+    #[test]
+    fn gpu_vram_total_mb_returns_none_when_no_gpu() {
+        let info = SystemInfo::default();
+        assert!(info.gpu_vram_total_mb().is_none());
+    }
+
+    #[test]
+    fn gpu_vram_total_mb_returns_vram_total() {
+        let info = SystemInfo {
+            gpu_info: Some(GpuInfo {
+                vram_total: Some(8192),
+                ..GpuInfo::default()
+            }),
+            ..SystemInfo::default()
+        };
+        assert_eq!(info.gpu_vram_total_mb(), Some(8192));
+    }
+
+    #[test]
+    fn gpu_vram_usage_percent_none_when_no_gpu() {
+        let info = SystemInfo::default();
+        assert!(info.gpu_vram_usage_percent().is_none());
+    }
+
+    #[test]
+    fn gpu_vram_usage_percent_none_when_no_used() {
+        let info = SystemInfo {
+            gpu_info: Some(GpuInfo {
+                vram_used: None,
+                vram_total: Some(8192),
+                ..GpuInfo::default()
+            }),
+            ..SystemInfo::default()
+        };
+        assert!(info.gpu_vram_usage_percent().is_none());
+    }
+
+    #[test]
+    fn gpu_vram_usage_percent_none_when_no_total() {
+        let info = SystemInfo {
+            gpu_info: Some(GpuInfo {
+                vram_used: Some(4096),
+                vram_total: None,
+                ..GpuInfo::default()
+            }),
+            ..SystemInfo::default()
+        };
+        assert!(info.gpu_vram_usage_percent().is_none());
+    }
+
+    #[test]
+    fn gpu_vram_usage_percent_none_when_total_zero() {
+        let info = SystemInfo {
+            gpu_info: Some(GpuInfo {
+                vram_used: Some(100),
+                vram_total: Some(0),
+                ..GpuInfo::default()
+            }),
+            ..SystemInfo::default()
+        };
+        assert!(info.gpu_vram_usage_percent().is_none());
+    }
+
+    #[test]
+    fn gpu_vram_usage_percent_calculates_correctly() {
+        let info = SystemInfo {
+            gpu_info: Some(GpuInfo {
+                vram_used: Some(3072),
+                vram_total: Some(8192),
+                ..GpuInfo::default()
+            }),
+            ..SystemInfo::default()
+        };
+        let pct = info.gpu_vram_usage_percent().unwrap();
+        let expected = (3072.0 / 8192.0) * 100.0;
+        assert!((pct - expected).abs() < 0.01);
+    }
+
+    #[test]
+    fn gpu_vram_usage_percent_zero_used() {
+        let info = SystemInfo {
+            gpu_info: Some(GpuInfo {
+                vram_used: Some(0),
+                vram_total: Some(8192),
+                ..GpuInfo::default()
+            }),
+            ..SystemInfo::default()
+        };
+        assert_eq!(info.gpu_vram_usage_percent(), Some(0.0));
+    }
+
+    #[test]
+    fn gpu_vram_usage_percent_full_used() {
+        let info = SystemInfo {
+            gpu_info: Some(GpuInfo {
+                vram_used: Some(8192),
+                vram_total: Some(8192),
+                ..GpuInfo::default()
+            }),
+            ..SystemInfo::default()
+        };
+        assert_eq!(info.gpu_vram_usage_percent(), Some(100.0));
+    }
+
+    #[test]
+    fn power_source_equality() {
+        assert_eq!(PowerSource::Battery, PowerSource::Battery);
+        assert_eq!(PowerSource::Gpu, PowerSource::Gpu);
+        assert_ne!(PowerSource::Battery, PowerSource::Gpu);
+    }
+
+    #[test]
+    fn gpu_info_default() {
+        let gpu = GpuInfo::default();
+        assert!(gpu.name.is_empty());
+        assert!(gpu.vendor.is_empty());
+        assert!(gpu.usage.is_none());
+        assert!(gpu.temperature.is_none());
+        assert!(gpu.vram_used.is_none());
+        assert!(gpu.vram_total.is_none());
+        assert!(gpu.power_watts.is_none());
+        assert!(gpu.power_limit_watts.is_none());
+    }
 }
