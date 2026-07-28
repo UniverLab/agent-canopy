@@ -572,7 +572,7 @@ fn from_timestamp(value: i64) -> rusqlite::Result<DateTime<Utc>> {
 mod tests {
     use super::*;
     use crate::domain::loops::{LoopNodeKind, LoopSpec, LoopSpecStatus};
-    use tempfile::NamedTempFile;
+    use tempfile::{tempdir, NamedTempFile};
 
     fn test_db() -> Database {
         let tmp = NamedTempFile::new().expect("create temp file");
@@ -1171,5 +1171,87 @@ mod tests {
         // The surviving member and the join itself are unaffected.
         assert!(db.get_loop_node("m1").unwrap().is_some());
         assert!(db.get_loop_node("join1").unwrap().is_some());
+    }
+
+    #[test]
+    fn get_ensemble_not_found() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let result = db.get_ensemble("nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn list_ensemble_members_empty() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let members = db.list_ensemble_members("nonexistent").unwrap();
+        assert!(members.is_empty());
+    }
+
+    #[test]
+    fn get_ensemble_details_not_found() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let result = db.get_ensemble_details("nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn list_ensembles_for_spec_empty() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let ensembles = db.list_ensembles_for_spec("nonexistent").unwrap();
+        assert!(ensembles.is_empty());
+    }
+
+    #[test]
+    fn list_ensembles_for_loop_empty() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let ensembles = db.list_ensembles_for_loop("nonexistent").unwrap();
+        assert!(ensembles.is_empty());
+    }
+
+    #[test]
+    fn get_ensemble_by_member_node_not_found() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let result = db.get_ensemble_by_member_node("nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn get_ensemble_by_join_node_not_found() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let result = db.get_ensemble_by_join_node("nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn update_ensemble_prompt_not_found() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let updated = db
+            .update_ensemble_prompt("nonexistent", "new prompt")
+            .unwrap();
+        assert!(!updated);
+    }
+
+    #[test]
+    fn remove_ensemble_member_not_found() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let removed = db.remove_ensemble_member("nonexistent").unwrap();
+        assert!(!removed);
+    }
+
+    #[test]
+    fn get_ensemble_blueprint_by_name_not_found() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let result = db.get_ensemble_blueprint_by_name("nonexistent").unwrap();
+        assert!(result.is_none());
     }
 }
