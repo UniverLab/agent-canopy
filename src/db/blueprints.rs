@@ -192,4 +192,43 @@ mod tests {
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         assert!(db.delete_blueprint_by_name("implementer-claude").unwrap());
     }
+
+    #[test]
+    fn get_blueprint_by_name_not_found() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let result = db.get_blueprint_by_name("nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn delete_blueprint_by_name_not_found() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let deleted = db.delete_blueprint_by_name("nonexistent").unwrap();
+        assert!(!deleted);
+    }
+
+    #[test]
+    fn insert_and_retrieve_blueprint() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+
+        let bp = Blueprint {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "test-blueprint-unique".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({ "key": "value" }),
+            builtin: false,
+            created_at: Utc::now(),
+        };
+        db.insert_blueprint(&bp).unwrap();
+
+        let fetched = db
+            .get_blueprint_by_name("test-blueprint-unique")
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.name, "test-blueprint-unique");
+        assert_eq!(fetched.kind, LoopNodeKind::Agent);
+    }
 }
