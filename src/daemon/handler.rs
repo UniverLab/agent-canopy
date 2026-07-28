@@ -13727,4 +13727,593 @@ mod endpoint_tests {
             .unwrap();
         assert!(is_err(&too_few_members));
     }
+
+    // ── loop_get / loop_list ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn loop_get_and_loop_list() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+
+        let got = handler
+            .loop_get(Parameters(LoopGetParams {
+                loop_id: lp.id.clone(),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&got), "{}", text(&got));
+        assert!(raw_text(&got).contains(&lp.id));
+
+        let missing = handler
+            .loop_get(Parameters(LoopGetParams {
+                loop_id: "ghost".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&missing));
+
+        let listed = handler
+            .loop_list(Parameters(LoopListParams { workdir: None }))
+            .await
+            .unwrap();
+        assert!(raw_text(&listed).contains(&lp.id));
+
+        let filtered_out = handler
+            .loop_list(Parameters(LoopListParams {
+                workdir: Some("/nowhere".to_string()),
+            }))
+            .await
+            .unwrap();
+        assert!(!raw_text(&filtered_out).contains(&lp.id));
+    }
+
+    // ── loop_pause / loop_continue ────────────────────────────────
+
+    #[tokio::test]
+    async fn loop_pause_rejects_non_running_loop() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let result = handler
+            .loop_pause(Parameters(LoopPauseParams {
+                loop_id: lp.id.clone(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&result));
+        assert!(text(&result).contains("not running"));
+    }
+
+    #[tokio::test]
+    async fn loop_continue_requires_a_paused_loop() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+
+        let not_paused = handler
+            .loop_continue(Parameters(LoopContinueParams {
+                loop_id: lp.id.clone(),
+                action: "retry_current_node".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&not_paused));
+        assert!(text(&not_paused).contains("not paused"));
+
+        let missing = handler
+            .loop_continue(Parameters(LoopContinueParams {
+                loop_id: "ghost".to_string(),
+                action: "retry_current_node".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&missing));
+
+        db.update_loop_status(&lp.id, LoopStatus::Paused, None, None)
+            .unwrap();
+        let bad_action = handler
+            .loop_continue(Parameters(LoopContinueParams {
+                loop_id: lp.id.clone(),
+                action: "sideways".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&bad_action));
+        assert!(text(&bad_action).contains("retry_current_node or skip_next_spec"));
+    }
+
+    // ── loop_complete_node / loop_report_blocker ──────────────────
+
+    /// Creates a spec + agent node under `loop_id` and a `Running` node-run
+    /// against it — the FK-satisfying fixture `loop_complete_node` /
+    /// `loop_report_blocker` need (`loop_runs.spec_id`/`node_id` are both
+    /// `NOT NULL REFERENCES`).
+    fn insert_running_node_run(db: &Database, loop_id: &str) -> LoopNodeRun {
+        let spec = insert_test_spec(db, loop_id, 1);
+        let node = LoopNode {
+            id: uuid::Uuid::new_v4().to_string(),
+            spec_id: Some(spec.id.clone()),
+            loop_id: None,
+            name: "Node".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "claude"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+        db.insert_loop_node(&node).unwrap();
+        let run = LoopNodeRun {
+            id: uuid::Uuid::new_v4().to_string(),
+            loop_id: loop_id.to_string(),
+            spec_id: spec.id,
+            node_id: node.id,
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        };
+        db.insert_loop_run(&run).unwrap();
+        run
+    }
+
+    #[tokio::test]
+    async fn loop_complete_node_records_result_and_rejects_stale_report() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let run = insert_running_node_run(&db, &lp.id);
+        let node_id = run.node_id.clone();
+
+        let bad_status = handler
+            .loop_complete_node(Parameters(LoopCompleteNodeParams {
+                run_id: run.id.clone(),
+                node_id: node_id.clone(),
+                status: "sideways".to_string(),
+                output: "out".to_string(),
+                summary: "sum".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&bad_status));
+
+        let ok = handler
+            .loop_complete_node(Parameters(LoopCompleteNodeParams {
+                run_id: run.id.clone(),
+                node_id: node_id.clone(),
+                status: "pass".to_string(),
+                output: "out".to_string(),
+                summary: "sum".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&ok), "{}", text(&ok));
+
+        // Reporting again against the now-finalized run must be rejected as
+        // stale, not silently accepted.
+        let stale = handler
+            .loop_complete_node(Parameters(LoopCompleteNodeParams {
+                run_id: run.id.clone(),
+                node_id: node_id.clone(),
+                status: "pass".to_string(),
+                output: "out2".to_string(),
+                summary: "sum2".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&stale));
+        assert!(text(&stale).contains("no longer active"));
+
+        let wrong_node = handler
+            .loop_complete_node(Parameters(LoopCompleteNodeParams {
+                run_id: run.id,
+                node_id: "not-the-right-node".to_string(),
+                status: "pass".to_string(),
+                output: "out".to_string(),
+                summary: "sum".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&wrong_node));
+
+        let unknown_run = handler
+            .loop_complete_node(Parameters(LoopCompleteNodeParams {
+                run_id: "ghost-run".to_string(),
+                node_id,
+                status: "pass".to_string(),
+                output: "out".to_string(),
+                summary: "sum".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&unknown_run));
+    }
+
+    #[tokio::test]
+    async fn loop_report_blocker_pauses_the_loop() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let run = insert_running_node_run(&db, &lp.id);
+        let node_id = run.node_id.clone();
+
+        let result = handler
+            .loop_report_blocker(Parameters(LoopReportBlockerParams {
+                run_id: run.id,
+                node_id,
+                description: "waiting on human input".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&result), "{}", text(&result));
+        assert_eq!(
+            db.get_loop(&lp.id).unwrap().unwrap().status,
+            LoopStatus::Paused
+        );
+    }
+
+    // ── loop_copy_node / loop_copy_ensemble ───────────────────────
+
+    #[tokio::test]
+    async fn loop_copy_node_unwired_and_wired() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let source = add_agent_node(&handler, &spec.id, "Source").await;
+        let entry = add_agent_node(&handler, &spec.id, "Entry").await;
+        let exit = add_agent_node(&handler, &spec.id, "Exit").await;
+
+        let unwired = handler
+            .loop_copy_node(Parameters(LoopCopyNodeParams {
+                source_node_id: source.clone(),
+                spec_id: None,
+                loop_id: None,
+                name: Some("Source Copy".to_string()),
+                config_overrides: None,
+                entry_from_node: None,
+                entry_condition: None,
+                on_pass_to: None,
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&unwired), "{}", text(&unwired));
+        let value: serde_json::Value = serde_json::from_str(&raw_text(&unwired)).unwrap();
+        assert_eq!(value["wired"], false);
+        assert_eq!(db.list_loop_nodes(&spec.id).unwrap().len(), 4);
+
+        let wired = handler
+            .loop_copy_node(Parameters(LoopCopyNodeParams {
+                source_node_id: source,
+                spec_id: None,
+                loop_id: None,
+                name: Some("Source Copy 2".to_string()),
+                config_overrides: None,
+                entry_from_node: Some(entry),
+                entry_condition: Some("always".to_string()),
+                on_pass_to: Some(exit),
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&wired), "{}", text(&wired));
+        let value: serde_json::Value = serde_json::from_str(&raw_text(&wired)).unwrap();
+        assert_eq!(value["wired"], true);
+
+        let missing_source = handler
+            .loop_copy_node(Parameters(LoopCopyNodeParams {
+                source_node_id: "ghost-node".to_string(),
+                spec_id: None,
+                loop_id: None,
+                name: None,
+                config_overrides: None,
+                entry_from_node: None,
+                entry_condition: None,
+                on_pass_to: None,
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&missing_source));
+    }
+
+    #[tokio::test]
+    async fn loop_copy_ensemble_duplicates_members_and_quorum() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let entry = add_agent_node(&handler, &spec.id, "Entry").await;
+        let arbiter = add_agent_node(&handler, &spec.id, "Arbiter").await;
+
+        let created = handler
+            .loop_add_ensemble(Parameters(LoopAddEnsembleParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Source Ensemble".to_string(),
+                prompt_template: Some("Review {{spec_name}}".to_string()),
+                members: Some(vec![
+                    crate::daemon::params::EnsembleMemberParams {
+                        platform: "claude".to_string(),
+                        model: None,
+                    },
+                    crate::daemon::params::EnsembleMemberParams {
+                        platform: "opencode".to_string(),
+                        model: None,
+                    },
+                ]),
+                blueprint: None,
+                from_node: entry,
+                condition: "always".to_string(),
+                min_pass: None,
+                straggler_timeout_minutes: None,
+                timeout_minutes: None,
+                on_pass_to: arbiter,
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        let source_ensemble_id = extract_id(&created, "ensemble_id");
+
+        let copied = handler
+            .loop_copy_ensemble(Parameters(LoopCopyEnsembleParams {
+                source_ensemble_id: source_ensemble_id.clone(),
+                spec_id: None,
+                loop_id: None,
+                name: Some("Copied Ensemble".to_string()),
+                prompt_template: None,
+                members: None,
+                min_pass: None,
+                timeout_minutes: None,
+                straggler_timeout_minutes: None,
+                from_node: None,
+                condition: None,
+                on_pass_to: None,
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&copied), "{}", text(&copied));
+        let copied_ensemble_id = extract_id(&copied, "ensemble_id");
+        assert_ne!(copied_ensemble_id, source_ensemble_id);
+        let copied_details = db
+            .get_ensemble_details(&copied_ensemble_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(copied_details.ensemble.name, "Copied Ensemble");
+        assert_eq!(copied_details.members.len(), 2);
+
+        let missing_source = handler
+            .loop_copy_ensemble(Parameters(LoopCopyEnsembleParams {
+                source_ensemble_id: "ghost-ensemble".to_string(),
+                spec_id: None,
+                loop_id: None,
+                name: None,
+                prompt_template: None,
+                members: None,
+                min_pass: None,
+                timeout_minutes: None,
+                straggler_timeout_minutes: None,
+                from_node: None,
+                condition: None,
+                on_pass_to: None,
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&missing_source));
+    }
+
+    // ── loop_update_ensemble ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn loop_update_ensemble_prompt_members_join_and_wiring() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let entry = add_agent_node(&handler, &spec.id, "Entry").await;
+        let arbiter = add_agent_node(&handler, &spec.id, "Arbiter").await;
+        let alt_exit = add_agent_node(&handler, &spec.id, "AltExit").await;
+
+        let created = handler
+            .loop_add_ensemble(Parameters(LoopAddEnsembleParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Ensemble".to_string(),
+                prompt_template: Some("Original prompt".to_string()),
+                members: Some(vec![
+                    crate::daemon::params::EnsembleMemberParams {
+                        platform: "claude".to_string(),
+                        model: None,
+                    },
+                    crate::daemon::params::EnsembleMemberParams {
+                        platform: "opencode".to_string(),
+                        model: None,
+                    },
+                ]),
+                blueprint: None,
+                from_node: entry,
+                condition: "always".to_string(),
+                min_pass: Some(2),
+                straggler_timeout_minutes: None,
+                timeout_minutes: None,
+                on_pass_to: arbiter,
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        let ensemble_id = extract_id(&created, "ensemble_id");
+
+        // No fields at all -> rejected.
+        let no_op = handler
+            .loop_update_ensemble(Parameters(LoopUpdateEnsembleParams {
+                ensemble_id: ensemble_id.clone(),
+                prompt_template: None,
+                members: None,
+                min_pass: None,
+                straggler_timeout_minutes: None,
+                timeout_minutes: None,
+                on_pass_to: None,
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&no_op));
+        assert!(text(&no_op).contains("at least one field"));
+
+        // Prompt-only update, propagated to existing members without a resize.
+        let prompt_updated = handler
+            .loop_update_ensemble(Parameters(LoopUpdateEnsembleParams {
+                ensemble_id: ensemble_id.clone(),
+                prompt_template: Some("New prompt".to_string()),
+                members: None,
+                min_pass: None,
+                straggler_timeout_minutes: None,
+                timeout_minutes: None,
+                on_pass_to: None,
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&prompt_updated), "{}", text(&prompt_updated));
+        let details = db.get_ensemble_details(&ensemble_id).unwrap().unwrap();
+        assert_eq!(details.ensemble.prompt_template, "New prompt");
+
+        // Grow membership 2 -> 3.
+        let grown = handler
+            .loop_update_ensemble(Parameters(LoopUpdateEnsembleParams {
+                ensemble_id: ensemble_id.clone(),
+                prompt_template: None,
+                members: Some(vec![
+                    crate::daemon::params::EnsembleMemberParams {
+                        platform: "claude".to_string(),
+                        model: None,
+                    },
+                    crate::daemon::params::EnsembleMemberParams {
+                        platform: "opencode".to_string(),
+                        model: None,
+                    },
+                    crate::daemon::params::EnsembleMemberParams {
+                        platform: "gemini".to_string(),
+                        model: None,
+                    },
+                ]),
+                min_pass: None,
+                straggler_timeout_minutes: None,
+                timeout_minutes: None,
+                on_pass_to: None,
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&grown), "{}", text(&grown));
+        let details = db.get_ensemble_details(&ensemble_id).unwrap().unwrap();
+        assert_eq!(details.members.len(), 3);
+
+        // Shrink membership 3 -> 2.
+        let shrunk = handler
+            .loop_update_ensemble(Parameters(LoopUpdateEnsembleParams {
+                ensemble_id: ensemble_id.clone(),
+                prompt_template: None,
+                members: Some(vec![
+                    crate::daemon::params::EnsembleMemberParams {
+                        platform: "claude".to_string(),
+                        model: None,
+                    },
+                    crate::daemon::params::EnsembleMemberParams {
+                        platform: "opencode".to_string(),
+                        model: None,
+                    },
+                ]),
+                min_pass: None,
+                straggler_timeout_minutes: None,
+                timeout_minutes: None,
+                on_pass_to: None,
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&shrunk), "{}", text(&shrunk));
+        let details = db.get_ensemble_details(&ensemble_id).unwrap().unwrap();
+        assert_eq!(details.members.len(), 2);
+
+        // min_pass out of bounds.
+        let bad_min_pass = handler
+            .loop_update_ensemble(Parameters(LoopUpdateEnsembleParams {
+                ensemble_id: ensemble_id.clone(),
+                prompt_template: None,
+                members: None,
+                min_pass: Some(99),
+                straggler_timeout_minutes: None,
+                timeout_minutes: None,
+                on_pass_to: None,
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&bad_min_pass));
+
+        // Negative straggler timeout.
+        let bad_straggler = handler
+            .loop_update_ensemble(Parameters(LoopUpdateEnsembleParams {
+                ensemble_id: ensemble_id.clone(),
+                prompt_template: None,
+                members: None,
+                min_pass: None,
+                straggler_timeout_minutes: Some(Some(-1)),
+                timeout_minutes: None,
+                on_pass_to: None,
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&bad_straggler));
+
+        // Re-wire on_pass_to to a new valid target.
+        let rewired = handler
+            .loop_update_ensemble(Parameters(LoopUpdateEnsembleParams {
+                ensemble_id: ensemble_id.clone(),
+                prompt_template: None,
+                members: None,
+                min_pass: Some(2),
+                straggler_timeout_minutes: None,
+                timeout_minutes: None,
+                on_pass_to: Some(alt_exit.clone()),
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&rewired), "{}", text(&rewired));
+        let details = db.get_ensemble_details(&ensemble_id).unwrap().unwrap();
+        assert_eq!(details.ensemble.on_pass_to, alt_exit);
+
+        // Unknown on_pass_to target.
+        let bad_target = handler
+            .loop_update_ensemble(Parameters(LoopUpdateEnsembleParams {
+                ensemble_id: ensemble_id.clone(),
+                prompt_template: None,
+                members: None,
+                min_pass: None,
+                straggler_timeout_minutes: None,
+                timeout_minutes: None,
+                on_pass_to: Some("not-a-node".to_string()),
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&bad_target));
+
+        let missing_ensemble = handler
+            .loop_update_ensemble(Parameters(LoopUpdateEnsembleParams {
+                ensemble_id: "ghost-ensemble".to_string(),
+                prompt_template: Some("x".to_string()),
+                members: None,
+                min_pass: None,
+                straggler_timeout_minutes: None,
+                timeout_minutes: None,
+                on_pass_to: None,
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&missing_ensemble));
+    }
 }
