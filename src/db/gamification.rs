@@ -84,3 +84,56 @@ impl Database {
         Ok(max)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn test_db() -> Database {
+        let dir = tempdir().unwrap();
+        Database::new(&dir.path().join("test.db")).unwrap()
+    }
+
+    #[test]
+    fn count_intelligence_nodes_empty() {
+        let db = test_db();
+        let count = db.count_intelligence_nodes().unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn count_cross_project_intelligence_links_empty() {
+        let db = test_db();
+        let count = db.count_cross_project_intelligence_links().unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn count_loop_node_runs_empty() {
+        let db = test_db();
+        let count = db.count_loop_node_runs().unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn count_completed_loops_empty() {
+        let db = test_db();
+        let count = db.count_completed_loops().unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn max_loop_nodes_in_any_loop_empty() {
+        let db = test_db();
+        let max = db.max_loop_nodes_in_any_loop().unwrap();
+        assert_eq!(max, 0);
+    }
+
+    #[test]
+    fn max_seed_session_bindings_empty() {
+        let db = test_db();
+        let max = db.max_seed_session_bindings().unwrap();
+        assert_eq!(max, 0);
+    }
+}
