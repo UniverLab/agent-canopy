@@ -313,4 +313,84 @@ LISTEN  0       128     0.0.0.0:8080        0.0.0.0:*
         let pids = parse_pids_from_ss(ss_output);
         assert!(pids.is_empty());
     }
+
+    #[test]
+    fn write_pid_file_creates_file_with_pid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_pid_file(dir.path()).expect("write_pid_file should succeed");
+        let pid_path = dir.path().join("daemon.pid");
+        assert!(pid_path.exists(), "PID file should be created");
+        let content = std::fs::read_to_string(&pid_path).expect("should read PID file");
+        let pid: u32 = content.trim().parse().expect("PID should be valid u32");
+        assert_eq!(pid, std::process::id());
+    }
+
+    #[test]
+    fn read_pid_returns_none_when_no_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(read_pid(dir.path()).is_none());
+    }
+
+    #[test]
+    fn read_pid_returns_pid_from_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_path = dir.path().join("daemon.pid");
+        std::fs::write(&pid_path, "12345\n").expect("should write PID file");
+        assert_eq!(read_pid(dir.path()), Some(12345));
+    }
+
+    #[test]
+    fn read_pid_returns_none_for_invalid_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_path = dir.path().join("daemon.pid");
+        std::fs::write(&pid_path, "not-a-number\n").expect("should write PID file");
+        assert!(read_pid(dir.path()).is_none());
+    }
+
+    #[test]
+    fn remove_pid_file_removes_existing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_path = dir.path().join("daemon.pid");
+        std::fs::write(&pid_path, "12345\n").expect("should write PID file");
+        assert!(pid_path.exists());
+        remove_pid_file(dir.path());
+        assert!(!pid_path.exists(), "PID file should be removed");
+    }
+
+    #[test]
+    fn remove_pid_file_succeeds_when_no_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        remove_pid_file(dir.path()); // Should not panic
+    }
+
+    #[test]
+    fn print_last_n_lines_handles_missing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nonexistent.log");
+        let result = print_last_n_lines(&path, 10);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn print_last_n_lines_reads_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.log");
+        std::fs::write(&path, "line1\nline2\nline3\nline4\nline5\n").expect("should write log");
+        let result = print_last_n_lines(&path, 3);
+        assert!(result.is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn is_systemd_available_returns_bool() {
+        // Just verify it doesn't panic and returns a bool
+        let _ = is_systemd_available();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn is_service_enabled_returns_bool() {
+        // Just verify it doesn't panic and returns a bool
+        let _ = is_service_enabled();
+    }
 }
