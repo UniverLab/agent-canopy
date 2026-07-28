@@ -344,3 +344,92 @@ impl RunRow {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::application::ports::RunRepository;
+    use crate::db::Database;
+    use crate::domain::models::{RunLog, RunStatus, StartRunOutcome, TriggerType};
+    use chrono::Utc;
+    use tempfile::tempdir;
+
+    fn test_db() -> Database {
+        let dir = tempdir().unwrap();
+        Database::new(&dir.path().join("test.db")).unwrap()
+    }
+
+    fn make_run(agent_id: &str, status: RunStatus) -> RunLog {
+        RunLog {
+            id: format!("run-{}", agent_id),
+            background_agent_id: agent_id.to_string(),
+            status,
+            trigger_type: TriggerType::Manual,
+            summary: Some("test run".to_string()),
+            started_at: Utc::now(),
+            finished_at: None,
+            exit_code: None,
+            timeout_at: None,
+        }
+    }
+
+    #[test]
+    fn insert_run_stores_run_in_database() {
+        let db = test_db();
+        let run = make_run("agent-1", RunStatus::Pending);
+        let result = db.insert_run(&run);
+        assert!(result.is_ok(), "insert_run should succeed");
+
+        let runs = db.list_runs("agent-1", 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, "run-agent-1");
+    }
+
+    #[test]
+    fn list_runs_returns_runs_for_agent() {
+        let db = test_db();
+        let mut run1 = make_run("agent-1", RunStatus::Pending);
+        run1.id = "run-1".to_string();
+        let mut run2 = make_run("agent-1", RunStatus::InProgress);
+        run2.id = "run-2".to_string();
+        let mut run3 = make_run("agent-2", RunStatus::Pending);
+        run3.id = "run-3".to_string();
+
+        db.insert_run(&run1).unwrap();
+        db.insert_run(&run2).unwrap();
+        db.insert_run(&run3).unwrap();
+
+        let runs = db.list_runs("agent-1", 10).unwrap();
+        assert_eq!(runs.len(), 2);
+    }
+
+    #[test]
+    fn list_runs_respects_limit() {
+        let db = test_db();
+        for i in 0..5 {
+            let run = make_run(&format!("agent-{}", i), RunStatus::Pending);
+            db.insert_run(&run).unwrap();
+        }
+
+        let runs = db.list_runs("agent-0", 3).unwrap();
+        assert_eq!(runs.len(), 1); // Only one run for agent-0
+    }
+
+    #[test]
+    fn try_start_run_returns_started_when_no_active_run() {
+        let db = test_db();
+        let run = make_run("agent-1", RunStatus::Pending);
+        let outcome = db.try_start_run(&run).unwrap();
+        assert!(matches!(outcome, StartRunOutcome::Started));
+    }
+
+    #[test]
+    fn try_start_run_returns_already_active_when_run_exists() {
+        let db = test_db();
+        let run1 = make_run("agent-1", RunStatus::Pending);
+        db.insert_run(&run1).unwrap();
+
+        let run2 = make_run("agent-1", RunStatus::Pending);
+        let outcome = db.try_start_run(&run2).unwrap();
+        assert!(matches!(outcome, StartRunOutcome::AlreadyActive(_)));
+    }
+}
