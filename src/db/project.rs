@@ -701,3 +701,146 @@ impl Database {
         Ok(entries)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_db() -> Database {
+        let dir = tempfile::tempdir().unwrap();
+        Database::new(&dir.path().join("test.db")).unwrap()
+    }
+
+    fn sample_project(hash: &str) -> Project {
+        Project {
+            hash: hash.to_string(),
+            path: format!("/tmp/{hash}"),
+            name: format!("Project {hash}"),
+            description: Some("Test project".to_string()),
+            tags: None,
+            indexed_at: None,
+            created_at: chrono::Utc::now().timestamp(),
+        }
+    }
+
+    #[test]
+    fn upsert_and_get_project() {
+        let db = test_db();
+        let project = sample_project("abc123");
+        db.upsert_project(&project).unwrap();
+
+        let retrieved = db.get_project("abc123").unwrap();
+        assert!(retrieved.is_some());
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.hash, "abc123");
+        assert_eq!(retrieved.name, "Project abc123");
+    }
+
+    #[test]
+    fn get_project_not_found() {
+        let db = test_db();
+        let result = db.get_project("nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn list_projects_empty() {
+        let db = test_db();
+        let projects = db.list_projects().unwrap();
+        assert!(projects.is_empty());
+    }
+
+    #[test]
+    fn list_projects_with_projects() {
+        let db = test_db();
+        let project1 = sample_project("proj1");
+        let project2 = sample_project("proj2");
+        db.upsert_project(&project1).unwrap();
+        db.upsert_project(&project2).unwrap();
+
+        let projects = db.list_projects().unwrap();
+        assert_eq!(projects.len(), 2);
+    }
+
+    #[test]
+    fn delete_project() {
+        let db = test_db();
+        let project = sample_project("test-proj");
+        db.upsert_project(&project).unwrap();
+
+        db.delete_project("test-proj").unwrap();
+        let retrieved = db.get_project("test-proj").unwrap();
+        assert!(retrieved.is_none());
+    }
+
+    #[test]
+    fn update_project_description() {
+        let db = test_db();
+        let project = sample_project("test-proj");
+        db.upsert_project(&project).unwrap();
+
+        db.update_project_meta("test-proj", Some("New description"), None)
+            .unwrap();
+        let retrieved = db.get_project("test-proj").unwrap().unwrap();
+        assert_eq!(retrieved.description, Some("New description".to_string()));
+    }
+
+    #[test]
+    fn search_projects_by_name() {
+        let db = test_db();
+        let project1 = Project {
+            hash: "proj1".to_string(),
+            path: "/tmp/proj1".to_string(),
+            name: "Rust Project".to_string(),
+            description: Some("A Rust project".to_string()),
+            tags: None,
+            indexed_at: None,
+            created_at: chrono::Utc::now().timestamp(),
+        };
+        let project2 = Project {
+            hash: "proj2".to_string(),
+            path: "/tmp/proj2".to_string(),
+            name: "Python Project".to_string(),
+            description: Some("A Python project".to_string()),
+            tags: None,
+            indexed_at: None,
+            created_at: chrono::Utc::now().timestamp(),
+        };
+        db.upsert_project(&project1).unwrap();
+        db.upsert_project(&project2).unwrap();
+
+        let results = db.search_projects("Rust").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].hash, "proj1");
+    }
+
+    #[test]
+    fn search_projects_by_description() {
+        let db = test_db();
+        let project = Project {
+            hash: "proj1".to_string(),
+            path: "/tmp/proj1".to_string(),
+            name: "My Project".to_string(),
+            description: Some("Contains Rust code".to_string()),
+            tags: None,
+            indexed_at: None,
+            created_at: chrono::Utc::now().timestamp(),
+        };
+        db.upsert_project(&project).unwrap();
+
+        let results = db.search_projects("Rust").unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn parse_rfc3339_timestamp_valid() {
+        let ts = parse_rfc3339_timestamp("2024-01-15T10:30:00Z");
+        assert!(ts > 0);
+    }
+
+    #[test]
+    fn parse_rfc3339_timestamp_invalid() {
+        let ts = parse_rfc3339_timestamp("invalid");
+        assert_eq!(ts, 0);
+    }
+}
