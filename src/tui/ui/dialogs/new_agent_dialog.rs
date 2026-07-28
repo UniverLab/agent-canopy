@@ -1582,4 +1582,91 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[1].spans.is_empty());
     }
+
+    /// task_type_label returns correct labels for all task types
+    #[test]
+    fn task_type_label_interactive() {
+        assert_eq!(task_type_label(NewTaskType::Interactive), "Interactive");
+    }
+
+    #[test]
+    fn task_type_label_terminal() {
+        assert_eq!(task_type_label(NewTaskType::Terminal), "Terminal");
+    }
+
+    #[test]
+    fn task_type_label_background() {
+        assert_eq!(task_type_label(NewTaskType::Background), "Background");
+    }
+
+    /// interactive_mode_label returns correct labels for modes
+    #[test]
+    fn interactive_mode_label_new() {
+        assert_eq!(interactive_mode_label(NewTaskMode::Interactive), "New");
+    }
+
+    #[test]
+    fn interactive_mode_label_resume() {
+        assert_eq!(interactive_mode_label(NewTaskMode::Resume), "Resume");
+    }
+
+    /// background_trigger_label returns correct labels for triggers
+    #[test]
+    fn background_trigger_label_cron() {
+        assert_eq!(background_trigger_label(BackgroundTrigger::Cron), "Cron");
+    }
+
+    #[test]
+    fn background_trigger_label_watch() {
+        assert_eq!(background_trigger_label(BackgroundTrigger::Watch), "Watch");
+    }
+
+    /// truncate_with_ellipsis doesn't truncate short strings
+    #[test]
+    fn truncate_with_ellipsis_short_string() {
+        let result = truncate_with_ellipsis("hello", 10);
+        assert_eq!(result, "hello");
+    }
+
+    /// truncate_with_ellipsis adds ellipsis when truncating
+    #[test]
+    fn truncate_with_ellipsis_long_string() {
+        let result = truncate_with_ellipsis("hello world test", 5);
+        assert_eq!(result, "hello…");
+    }
+
+    /// truncate_with_ellipsis exact length has no ellipsis
+    #[test]
+    fn truncate_with_ellipsis_exact_length() {
+        let result = truncate_with_ellipsis("hello", 5);
+        assert_eq!(result, "hello");
+    }
+
+    /// truncate_with_ellipsis handles empty string
+    #[test]
+    fn truncate_with_ellipsis_empty_string() {
+        let result = truncate_with_ellipsis("", 5);
+        assert_eq!(result, "");
+    }
+
+    /// truncate_with_ellipsis handles zero max_chars
+    #[test]
+    fn truncate_with_ellipsis_zero_max_chars() {
+        let result = truncate_with_ellipsis("hello", 0);
+        assert_eq!(result, "…");
+    }
+
+    /// truncate_with_ellipsis handles unicode characters correctly by char count
+    #[test]
+    fn truncate_with_ellipsis_unicode() {
+        // "こんにちは" is 5 chars; taking 3 gives "こんに" + ellipsis
+        let result = truncate_with_ellipsis("こんにちは世界", 3);
+        assert_eq!(result, "こんに…");
+    }
+
+    /// filter_display handles special characters
+    #[test]
+    fn filter_display_special_chars() {
+        assert_eq!(filter_display("test@#$%"), "test@#$%");
+    }
 }
