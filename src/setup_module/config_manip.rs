@@ -682,4 +682,351 @@ mod tests {
         // Should remove ALL [[mcp_servers]] sections
         assert!(!result.contains("[[mcp_servers]]"));
     }
+
+    // ── upsert_json_key ────────────────────────────────────────────
+
+    #[test]
+    fn upsert_json_key_creates_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let val = serde_json::json!("hello");
+        upsert_json_key(&path, &["key"], &val).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("\"hello\""));
+    }
+
+    #[test]
+    fn upsert_json_key_nested_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let val = serde_json::json!("world");
+        upsert_json_key(&path, &["a", "b", "c"], &val).unwrap();
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["a"]["b"]["c"], serde_json::json!("world"));
+    }
+
+    #[test]
+    fn upsert_json_key_overwrites_existing_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        upsert_json_key(&path, &["k"], &serde_json::json!("old")).unwrap();
+        upsert_json_key(&path, &["k"], &serde_json::json!("new")).unwrap();
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["k"], serde_json::json!("new"));
+    }
+
+    #[test]
+    fn upsert_json_key_preserves_other_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        upsert_json_key(&path, &["a"], &serde_json::json!(1)).unwrap();
+        upsert_json_key(&path, &["b"], &serde_json::json!(2)).unwrap();
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["a"], serde_json::json!(1));
+        assert_eq!(root["b"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn upsert_json_key_on_jsonc_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.jsonc");
+        std::fs::write(&path, r#"{"a": 1} // existing"#).unwrap();
+        upsert_json_key(&path, &["b"], &serde_json::json!(2)).unwrap();
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["a"], serde_json::json!(1));
+        assert_eq!(root["b"], serde_json::json!(2));
+    }
+
+    // ── remove_json_key ────────────────────────────────────────────
+
+    #[test]
+    fn remove_json_key_removes_existing_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        upsert_json_key(&path, &["parent", "child"], &serde_json::json!("val")).unwrap();
+        let removed = remove_json_key(&path, "parent", "child").unwrap();
+        assert!(removed);
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(root["parent"].get("child").is_none());
+    }
+
+    #[test]
+    fn remove_json_key_nonexistent_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.json");
+        let removed = remove_json_key(&path, "parent", "child").unwrap();
+        assert!(!removed);
+    }
+
+    #[test]
+    fn remove_json_key_missing_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"a": 1}"#).unwrap();
+        let removed = remove_json_key(&path, "no_such_parent", "child").unwrap();
+        assert!(!removed);
+    }
+
+    #[test]
+    fn remove_json_key_missing_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        upsert_json_key(&path, &["parent", "existing"], &serde_json::json!("val")).unwrap();
+        let removed = remove_json_key(&path, "parent", "nonexistent_child").unwrap();
+        assert!(!removed);
+    }
+
+    // ── upsert_toml_key ────────────────────────────────────────────
+
+    #[test]
+    fn upsert_toml_key_creates_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let val = serde_json::json!({"url": "http://localhost"});
+        upsert_toml_key(&path, "mcp_servers", "canopy", &val).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("[mcp_servers.canopy]"));
+        assert!(content.contains("url = \"http://localhost\""));
+    }
+
+    #[test]
+    fn upsert_toml_key_overwrites_existing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let val1 = serde_json::json!({"url": "http://old"});
+        upsert_toml_key(&path, "mcp_servers", "canopy", &val1).unwrap();
+        let val2 = serde_json::json!({"url": "http://new"});
+        upsert_toml_key(&path, "mcp_servers", "canopy", &val2).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("http://new"));
+        assert!(!content.contains("http://old"));
+    }
+
+    #[test]
+    fn upsert_toml_key_handles_bool_and_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let val = serde_json::json!({"enabled": true, "port": 7755});
+        upsert_toml_key(&path, "section", "entry", &val).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("enabled = true"));
+        assert!(content.contains("port = 7755"));
+    }
+
+    // ── upsert_toml_array ──────────────────────────────────────────
+
+    #[test]
+    fn upsert_toml_array_creates_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let val = serde_json::json!({"command": "uvx"});
+        upsert_toml_array(&path, "mcp_servers", "fetch", &val).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("[[mcp_servers]]"));
+        assert!(content.contains("name = \"fetch\""));
+        assert!(content.contains("command = \"uvx\""));
+    }
+
+    #[test]
+    fn upsert_toml_array_overwrites_existing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let val1 = serde_json::json!({"command": "old"});
+        upsert_toml_array(&path, "mcp_servers", "fetch", &val1).unwrap();
+        let val2 = serde_json::json!({"command": "new"});
+        upsert_toml_array(&path, "mcp_servers", "fetch", &val2).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("command = \"new\""));
+        assert!(!content.contains("command = \"old\""));
+    }
+
+    #[test]
+    fn upsert_toml_array_multiple_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        upsert_toml_array(
+            &path,
+            "mcp_servers",
+            "fetch",
+            &serde_json::json!({"command": "uvx"}),
+        )
+        .unwrap();
+        upsert_toml_array(
+            &path,
+            "mcp_servers",
+            "fs",
+            &serde_json::json!({"command": "node"}),
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("name = \"fetch\""));
+        assert!(content.contains("name = \"fs\""));
+        let count = content.matches("[[mcp_servers]]").count();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn upsert_toml_array_removes_conflicting_scalar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "mcp_servers = []\n").unwrap();
+        upsert_toml_array(
+            &path,
+            "mcp_servers",
+            "fetch",
+            &serde_json::json!({"command": "uvx"}),
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("mcp_servers = []"));
+    }
+
+    #[test]
+    fn upsert_toml_array_removes_conflicting_key_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[mcp_servers.canopy]\nurl = \"http://localhost\"\n").unwrap();
+        upsert_toml_array(
+            &path,
+            "mcp_servers",
+            "fetch",
+            &serde_json::json!({"command": "uvx"}),
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("[mcp_servers.canopy]"));
+    }
+
+    // ── remove_toml_array_entry_str edge cases ─────────────────────
+
+    #[test]
+    fn remove_toml_array_entry_str_entry_at_end() {
+        let input = "[[s]]\nname = \"a\"\nx = 1\n[[s]]\nname = \"b\"\ny = 2\n";
+        let out = remove_toml_array_entry_str(input, "[[s]]", "name = \"b\"");
+        assert!(!out.contains("name = \"b\""));
+        assert!(out.contains("name = \"a\""));
+        assert!(out.contains("x = 1"));
+    }
+
+    #[test]
+    fn remove_toml_array_entry_str_single_entry() {
+        let input = "[[s]]\nname = \"only\"\ndata = 42\n";
+        let out = remove_toml_array_entry_str(input, "[[s]]", "name = \"only\"");
+        assert!(!out.contains("name = \"only\""));
+        assert!(!out.contains("data = 42"));
+    }
+
+    #[test]
+    fn remove_toml_array_entry_str_no_array_header() {
+        let input = "[section]\nkey = 1\n";
+        let out = remove_toml_array_entry_str(input, "[[s]]", "name = \"a\"");
+        assert_eq!(out, input);
+    }
+
+    // ── strip_jsonc edge cases ─────────────────────────────────────
+
+    #[test]
+    fn strip_jsonc_string_with_escaped_quote_and_slash() {
+        let input = r#"{"path": "C:\\Users\\test"}"#;
+        let out = strip_jsonc_comments(input);
+        assert!(out.contains("C:\\\\Users\\\\test"));
+    }
+
+    #[test]
+    fn strip_jsonc_double_slash_not_in_string() {
+        let input = r#"{"url": "https://example.com"} // comment"#;
+        let out = strip_jsonc_comments(input);
+        assert!(out.contains("https://example.com"));
+        assert!(!out.contains("comment"));
+    }
+
+    #[test]
+    fn strip_jsonc_block_comment_at_start() {
+        let input = "/* header */ {\"a\": 1}";
+        let out = strip_jsonc_comments(input);
+        assert!(out.contains("\"a\""));
+        assert!(!out.contains("header"));
+    }
+
+    // ── remove_conflicting_toml_tables edge cases ──────────────────
+
+    #[test]
+    fn remove_conflicting_toml_tables_empty_content() {
+        let out = remove_conflicting_toml_tables("", "mcp_servers");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn remove_conflicting_toml_tables_no_conflicts() {
+        let input = "[other_section]\nkey = 1\n";
+        let out = remove_conflicting_toml_tables(input, "mcp_servers");
+        assert_eq!(out, input);
+    }
+
+    // ── remove_conflicting_toml_arrays edge cases ──────────────────
+
+    #[test]
+    fn remove_conflicting_toml_arrays_empty_content() {
+        let out = remove_conflicting_toml_arrays("", "mcp_servers");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn remove_conflicting_toml_arrays_no_conflicts() {
+        let input = "[[other]]\nname = \"a\"\n";
+        let out = remove_conflicting_toml_arrays(input, "mcp_servers");
+        assert_eq!(out, input);
+    }
+
+    // ── remove_stray_toml_array_headers edge cases ─────────────────
+
+    #[test]
+    fn remove_stray_toml_array_headers_all_stray() {
+        let input = "[[s]]\n\n[[s]]\n\n[[s]]\n";
+        let out = remove_stray_toml_array_headers(input, "[[s]]");
+        assert!(!out.contains("[[s]]"));
+    }
+
+    #[test]
+    fn remove_stray_toml_array_headers_mixed() {
+        let input = "[[s]]\nname = \"a\"\n[[s]]\n\n[[s]]\nname = \"b\"\n";
+        let out = remove_stray_toml_array_headers(input, "[[s]]");
+        let count = out.matches("[[s]]").count();
+        assert_eq!(count, 2);
+    }
+
+    // ── handle_string_char edge cases ──────────────────────────────
+
+    #[test]
+    fn handle_string_char_backslash_at_end() {
+        let mut chars = "".chars().peekable();
+        let mut out = String::new();
+        let result = handle_string_char('\\', &mut chars, &mut out);
+        assert!(result);
+        assert_eq!(out, "\\");
+    }
+
+    // ── handle_comment_or_slash edge cases ─────────────────────────
+
+    #[test]
+    fn handle_comment_or_slash_empty_after_slash() {
+        let mut chars = "".chars().peekable();
+        let mut out = String::new();
+        handle_comment_or_slash(&mut chars, &mut out);
+        assert_eq!(out, "/");
+    }
+
+    #[test]
+    fn handle_comment_or_slash_star_only() {
+        let mut chars = "*".chars().peekable();
+        let mut out = String::new();
+        handle_comment_or_slash(&mut chars, &mut out);
+        // Block comment with no closing */ — consumes to end
+        assert!(out.is_empty());
+    }
 }
