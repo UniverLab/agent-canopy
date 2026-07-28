@@ -17,5 +17,9 @@ jobs:
     with:
       binary-name: canopy
       system-packages: protobuf-compiler
+      # LanceDB's lance-encoding builds protobuf definitions, so protoc has to
+      # exist on every target — not just the Linux ones. Different name here
+      # because brew calls the package protobuf, not protobuf-compiler.
+      system-packages-brew: protobuf
       include-windows: false
     secrets: inherit
