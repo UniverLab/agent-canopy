@@ -736,10 +736,40 @@ mod tests {
 
     #[test]
     fn resolve_workdir_falls_back_to_current_dir() {
+        // The cwd is only the *third* source, behind the explicit argument and
+        // CANOPY_WORKDIR. That variable is set for every process the daemon
+        // spawns, so a suite run from inside a canopy session inherits it and
+        // would otherwise measure the env branch while claiming to test the
+        // fallback. Clear it for the duration, then put it back.
+        let saved = std::env::var(CANOPY_WORKDIR_ENV).ok();
+        std::env::remove_var(CANOPY_WORKDIR_ENV);
+
         let result = resolve_workdir(None).unwrap();
+
+        if let Some(value) = saved {
+            std::env::set_var(CANOPY_WORKDIR_ENV, value);
+        }
+
         let cwd = std::env::current_dir().unwrap();
         let canonical = std::fs::canonicalize(&cwd).unwrap();
         assert_eq!(result, canonical.to_string_lossy().to_string());
+    }
+
+    #[test]
+    fn resolve_workdir_prefers_the_env_var_over_the_current_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = std::env::var(CANOPY_WORKDIR_ENV).ok();
+        std::env::set_var(CANOPY_WORKDIR_ENV, dir.path());
+
+        let result = resolve_workdir(None).unwrap();
+
+        match saved {
+            Some(value) => std::env::set_var(CANOPY_WORKDIR_ENV, value),
+            None => std::env::remove_var(CANOPY_WORKDIR_ENV),
+        }
+
+        let expected = std::fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(result, expected.to_string_lossy().to_string());
     }
 
     // ── resolve_bridge_port tests ───────────────────────────────
