@@ -1035,4 +1035,69 @@ mod tests {
         assert!(msg.contains("abc123"));
         assert!(msg.contains("def456"));
     }
+
+    #[test]
+    fn current_spec_name_returns_none_for_empty_specs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let lp = make_loop("loop1", "test-loop", LoopStatus::Running);
+        let result = current_spec_name(&db, &lp, &[]).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn current_spec_name_returns_name_for_running_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let lp = make_loop("loop1", "test-loop", LoopStatus::Running);
+        let specs = vec![
+            make_spec("loop1", "spec-a", 0, LoopSpecStatus::Completed),
+            make_spec("loop1", "spec-b", 1, LoopSpecStatus::Running),
+        ];
+        let result = current_spec_name(&db, &lp, &specs).unwrap();
+        assert_eq!(result, Some("spec-b".to_string()));
+    }
+
+    #[test]
+    fn format_elapsed_zero_seconds() {
+        assert_eq!(format_elapsed(chrono::Duration::seconds(0)), "0s");
+    }
+
+    #[test]
+    fn format_elapsed_exactly_one_minute() {
+        assert_eq!(format_elapsed(chrono::Duration::seconds(60)), "1m0s");
+    }
+
+    #[test]
+    fn format_elapsed_exactly_one_hour() {
+        assert_eq!(format_elapsed(chrono::Duration::seconds(3600)), "1h0m");
+    }
+
+    #[test]
+    fn format_relative_duration_exactly_zero() {
+        assert_eq!(
+            format_relative_duration(chrono::Duration::seconds(0)),
+            "due now"
+        );
+    }
+
+    #[test]
+    fn format_relative_duration_large_future() {
+        let result = format_relative_duration(chrono::Duration::days(365));
+        assert!(result.contains("in"));
+    }
+
+    #[test]
+    fn format_autorun_compact_midnight() {
+        let at = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+        let result = format_autorun_compact(at);
+        assert!(result.contains("00:00Z"));
+    }
+
+    #[test]
+    fn format_autorun_compact_end_of_day() {
+        let at = DateTime::<Utc>::from_timestamp(23 * 3600 + 59 * 60, 0).unwrap();
+        let result = format_autorun_compact(at);
+        assert!(result.contains("23:59Z"));
+    }
 }
