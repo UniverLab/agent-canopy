@@ -788,4 +788,73 @@ mod tests {
         db.set_state("port", "not-a-number").unwrap();
         assert!(read_port_from_state(dir.path()).is_none());
     }
+
+    #[test]
+    fn flush_sse_event_clears_current_and_pushes_message() {
+        let mut current = vec!["line1", "line2"];
+        let mut messages = Vec::new();
+        flush_sse_event(&mut current, &mut messages);
+        assert!(current.is_empty());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0], "line1\nline2");
+    }
+
+    #[test]
+    fn flush_sse_event_does_nothing_when_current_is_empty() {
+        let mut current = Vec::new();
+        let mut messages = Vec::new();
+        flush_sse_event(&mut current, &mut messages);
+        assert!(current.is_empty());
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn flush_sse_event_trims_trailing_newlines() {
+        let mut current = vec!["line1\n", "line2\n"];
+        let mut messages = Vec::new();
+        flush_sse_event(&mut current, &mut messages);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0], "line1\n\nline2\n");
+    }
+
+    #[test]
+    fn build_jsonrpc_transport_error_with_empty_request() {
+        let error = build_jsonrpc_transport_error("", "test error");
+        let value: serde_json::Value = serde_json::from_str(&error).unwrap();
+        assert!(value["id"].is_null());
+        assert_eq!(value["error"]["message"], "canopy bridge transport error");
+        assert_eq!(value["error"]["data"], "test error");
+    }
+
+    #[test]
+    fn build_jsonrpc_transport_error_with_null_id() {
+        let error = build_jsonrpc_transport_error(r#"{"jsonrpc":"2.0","id":null}"#, "error");
+        let value: serde_json::Value = serde_json::from_str(&error).unwrap();
+        assert!(value["id"].is_null());
+    }
+
+    #[test]
+    fn resolve_workdir_with_env_var() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("CANOPY_WORKDIR", dir.path());
+        let result = resolve_workdir(None).unwrap();
+        assert!(result.contains(dir.path().file_name().unwrap().to_str().unwrap()));
+        std::env::remove_var("CANOPY_WORKDIR");
+    }
+
+    #[test]
+    fn resolve_bridge_port_with_env_var() {
+        std::env::set_var("CANOPY_PORT", "9999");
+        let result = resolve_bridge_port(None);
+        assert_eq!(result, 9999);
+        std::env::remove_var("CANOPY_PORT");
+    }
+
+    #[test]
+    fn resolve_bridge_port_with_invalid_env_var() {
+        std::env::set_var("CANOPY_PORT", "not-a-number");
+        let result = resolve_bridge_port(None);
+        assert_eq!(result, 7755); // Should fall back to default
+        std::env::remove_var("CANOPY_PORT");
+    }
 }
