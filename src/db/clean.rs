@@ -1158,4 +1158,58 @@ mod tests {
         // The pool membership that pointed at the doomed spec is gone.
         assert!(!db.pool_has_member(&pool.id, doomed_spec_id).unwrap());
     }
+
+    #[test]
+    fn list_cleanable_interactive_sessions_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let sessions = db.list_cleanable_interactive_sessions().unwrap();
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn delete_interactive_sessions_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let deleted = db.delete_interactive_sessions(&[]).unwrap();
+        assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn list_agent_ids_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let ids = db.list_agent_ids().unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn list_terminal_session_names_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let names = db.list_terminal_session_names().unwrap();
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn project_dependent_counts_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let counts = db.project_dependent_counts("/nonexistent").unwrap();
+        assert_eq!(counts.loops, 0);
+        assert_eq!(counts.interactive_sessions, 0);
+        assert_eq!(counts.terminal_sessions, 0);
+    }
+
+    #[test]
+    fn parse_rfc3339_ts_valid() {
+        let ts = parse_rfc3339_ts("2024-01-15T10:30:00Z");
+        assert!(ts > 0);
+    }
+
+    #[test]
+    fn parse_rfc3339_ts_invalid() {
+        let ts = parse_rfc3339_ts("invalid");
+        assert_eq!(ts, 0);
+    }
 }
