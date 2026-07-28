@@ -9101,6 +9101,13 @@ echo done
                     "platform": platform,
                     "prompt_template": "ignored by the member's test script",
                     "timeout_minutes": 5,
+                    // A member that exits non-zero inside `crash_max_seconds`
+                    // reads as an infra crash, so the engine retries it behind
+                    // the doubling backoff. At the 30s default that parked two
+                    // of these tests on a real 60s sleep each and set the floor
+                    // for the whole suite; zero keeps the retry path exercised
+                    // without the wait.
+                    "infra_backoff_seconds": 0,
                 }),
                 position: 2 + i as i64,
                 created_at: now,
