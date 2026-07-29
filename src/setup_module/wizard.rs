@@ -389,40 +389,46 @@ fn theme_choice_to_config_value(selected: &str) -> String {
     }
 }
 
+/// Human-readable label (name, dimensions, approximate download size) for a
+/// supported local model id. The set of ids offered is derived from
+/// `embedding_client::LOCAL_MODEL_IDS` — the same single source of truth
+/// `model_id_to_fastembed` maps from — instead of a second hand-maintained
+/// id list, so the wizard can no longer drift out of step with which models
+/// are actually supported. Only the descriptive text lives here; coverage
+/// against `LOCAL_MODEL_IDS` is asserted by
+/// `every_local_model_id_has_a_label` below.
+fn local_model_label(id: &str) -> &'static str {
+    match id {
+        "baai/bge-small-en-v1.5" => {
+            "BGE Small EN v1.5     (local · 384d · ~130 MB)  — fast, great for English"
+        }
+        "baai/bge-base-en-v1.5" => {
+            "BGE Base EN v1.5      (local · 768d · ~430 MB)  — balanced, English"
+        }
+        "baai/bge-large-en-v1.5" => {
+            "BGE Large EN v1.5     (local · 1024d · ~1.3 GB) — best quality, English"
+        }
+        "intfloat/multilingual-e5-small" => {
+            "Multilingual E5 Small (local · 384d · ~480 MB)  — fast, multilingual"
+        }
+        "intfloat/multilingual-e5-base" => {
+            "Multilingual E5 Base  (local · 768d · ~1.1 GB)  — balanced, multilingual"
+        }
+        "intfloat/multilingual-e5-large" => {
+            "Multilingual E5 Large (local · 1024d · ~2.2 GB) — best quality, multilingual"
+        }
+        // Unreached in practice — every id in LOCAL_MODEL_IDS is covered
+        // above, and every_local_model_id_has_a_label fails the build if a
+        // new one is added here without it.
+        _ => "(unlabeled model)",
+    }
+}
+
 fn select_local_embeddings_model(current: &str) -> Result<String> {
-    const LOCAL_MODELS: &[(&str, &str)] = &[
-        (
-            "baai/bge-small-en-v1.5",
-            "BGE Small EN v1.5     (local · 384d · ~130 MB)  — fast, great for English",
-        ),
-        (
-            "baai/bge-base-en-v1.5",
-            "BGE Base EN v1.5      (local · 768d · ~430 MB)  — balanced, English",
-        ),
-        (
-            "baai/bge-large-en-v1.5",
-            "BGE Large EN v1.5     (local · 1024d · ~1.3 GB) — best quality, English",
-        ),
-        (
-            "intfloat/multilingual-e5-small",
-            "Multilingual E5 Small (local · 384d · ~480 MB)  — fast, multilingual",
-        ),
-        (
-            "intfloat/multilingual-e5-base",
-            "Multilingual E5 Base  (local · 768d · ~1.1 GB)  — balanced, multilingual",
-        ),
-        (
-            "intfloat/multilingual-e5-large",
-            "Multilingual E5 Large (local · 1024d · ~2.2 GB) — best quality, multilingual",
-        ),
-    ];
+    let ids = crate::rag::embedding_client::LOCAL_MODEL_IDS;
+    let options: Vec<&str> = ids.iter().map(|id| local_model_label(id)).collect();
 
-    let options: Vec<&str> = LOCAL_MODELS.iter().map(|(_, label)| *label).collect();
-
-    let start = LOCAL_MODELS
-        .iter()
-        .position(|(id, _)| *id == current)
-        .unwrap_or(0);
+    let start = ids.iter().position(|id| *id == current).unwrap_or(0);
 
     let selected = Select::new("Embeddings model (local, no API key required):", options)
         .with_starting_cursor(start)
@@ -432,18 +438,22 @@ fn select_local_embeddings_model(current: &str) -> Result<String> {
         .prompt()
         .map_err(|e| anyhow::anyhow!("Embeddings model selection cancelled: {}", e))?;
 
-    LOCAL_MODELS
-        .iter()
-        .find(|(_, label)| *label == selected)
-        .map(|(id, _)| id.to_string())
+    ids.iter()
+        .find(|id| local_model_label(id) == selected)
+        .map(|id| id.to_string())
         .ok_or_else(|| anyhow::anyhow!("Unknown embeddings model selection"))
 }
 
 #[cfg(feature = "local-embeddings")]
 fn download_local_model_for_setup(model_id: &str, cache_dir: &std::path::Path) -> Result<()> {
-    println!("  \x1b[90mDownloading model to ~/.canopy/models/ (only needed once)…\x1b[0m");
-    println!();
-    crate::rag::embedding_client::download_local_model(model_id, cache_dir)?;
+    let already_cached = crate::rag::embedding_client::download_local_model(model_id, cache_dir)?;
+    if already_cached {
+        println!(
+            "  \x1b[90mModel already cached in ~/.canopy/models/ — nothing to download.\x1b[0m"
+        );
+    } else {
+        println!("  \x1b[90mDownloaded model to ~/.canopy/models/ (only needed once).\x1b[0m");
+    }
     println!();
     Ok(())
 }
@@ -486,6 +496,35 @@ fn pick_multiple_directories(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every id the wizard could offer (derived from `LOCAL_MODEL_IDS`) must
+    /// have a real label, not the id-echoing fallback arm in
+    /// `local_model_label` — that fallback exists only so a missing label
+    /// can't panic mid-setup; this test is what actually catches it.
+    #[test]
+    fn every_local_model_id_has_a_label() {
+        for id in crate::rag::embedding_client::LOCAL_MODEL_IDS {
+            assert_ne!(
+                local_model_label(id),
+                *id,
+                "missing a descriptive label for '{id}'"
+            );
+        }
+    }
+
+    #[test]
+    fn local_model_labels_are_unique() {
+        let ids = crate::rag::embedding_client::LOCAL_MODEL_IDS;
+        let mut labels: Vec<&str> = ids.iter().map(|id| local_model_label(id)).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(
+            labels.len(),
+            ids.len(),
+            "two ids resolved to the same label — select_local_embeddings_model \
+             maps the chosen label back to an id and needs them distinct"
+        );
+    }
 
     #[test]
     fn theme_choice_writes_modern_for_the_modern_menu_label() {

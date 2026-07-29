@@ -338,18 +338,67 @@ impl EmbeddingClient for LocalEmbeddingClient {
 
 /// Download (or verify) a local embedding model, showing download progress.
 /// Called during interactive setup so the model is ready before indexing begins.
+///
+/// Returns `true` if the model was already fully cached (nothing downloaded
+/// or loaded), `false` if a download and/or model load actually happened —
+/// so a caller can report which one occurred instead of always saying
+/// "downloading".
 #[cfg(feature = "local-embeddings")]
-pub fn download_local_model(model_id: &str, cache_dir: &std::path::Path) -> Result<()> {
+pub fn download_local_model(model_id: &str, cache_dir: &std::path::Path) -> Result<bool> {
     std::fs::create_dir_all(cache_dir)
         .with_context(|| format!("Cannot create model cache dir: {}", cache_dir.display()))?;
     let fastembed_model = model_id_to_fastembed(model_id)?;
+
+    if local_model_is_cached(&fastembed_model, cache_dir)? {
+        return Ok(true);
+    }
+
     fastembed::TextEmbedding::try_new(
         fastembed::InitOptions::new(fastembed_model)
             .with_cache_dir(cache_dir.to_path_buf())
             .with_show_download_progress(true),
     )
     .with_context(|| format!("Failed to download/load local embedding model '{model_id}'"))?;
-    Ok(())
+    Ok(false)
+}
+
+/// Cheap, on-disk check for whether every file `TextEmbedding::try_new`
+/// would need for `model` is already present in `cache_dir` — without
+/// constructing the model, which loads the ONNX graph and initialises the
+/// runtime (observed ~5.7s for multilingual-e5-base) even when nothing
+/// actually needs downloading.
+///
+/// This mirrors `fastembed::text_embedding::TextEmbedding::try_new` exactly:
+/// the model's own file(s) (`ModelInfo::model_file` +
+/// `ModelInfo::additional_files`) plus the four tokenizer files
+/// `load_tokenizer_hf_hub` reads. `hf_hub::Cache::get` is the same lookup
+/// fastembed's own `pull_from_hf` uses internally to resolve a cached path,
+/// so this check is exact, not a heuristic — there is no "can't tell
+/// cheaply" fallback here because none is needed. It also honors `HF_HOME`
+/// the same way `pull_from_hf` does, so the check stays accurate when that
+/// env var overrides the cache directory.
+#[cfg(feature = "local-embeddings")]
+fn local_model_is_cached(
+    model: &fastembed::EmbeddingModel,
+    cache_dir: &std::path::Path,
+) -> Result<bool> {
+    let info = fastembed::TextEmbedding::get_model_info(model)?;
+
+    let effective_cache_dir = std::env::var("HF_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| cache_dir.to_path_buf());
+    let repo = hf_hub::Cache::new(effective_cache_dir).model(info.model_code.clone());
+
+    let mut required_files: Vec<&str> = vec![info.model_file.as_str()];
+    required_files.extend(info.additional_files.iter().map(String::as_str));
+    required_files.extend([
+        "tokenizer.json",
+        "config.json",
+        "special_tokens_map.json",
+        "tokenizer_config.json",
+    ]);
+
+    Ok(required_files.iter().all(|file| repo.get(file).is_some()))
 }
 
 #[cfg(feature = "local-embeddings")]
@@ -891,6 +940,94 @@ mod tests {
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), LOCAL_MODEL_IDS.len());
+    }
+
+    /// The two halves of the local-model contract — our `LOCAL_MODEL_IDS` +
+    /// `model_id_to_fastembed` mapping on one side, fastembed's own model
+    /// catalog on the other — must agree. Without this, either list can
+    /// drift silently: a fastembed upgrade that changes a model's dimensions
+    /// (or drops a variant) would only surface as a runtime dimension
+    /// mismatch deep in indexing, not here where it's cheap to catch.
+    #[test]
+    #[cfg(feature = "local-embeddings")]
+    fn local_model_ids_agree_with_fastembed_catalog() {
+        for id in LOCAL_MODEL_IDS {
+            let fastembed_model = model_id_to_fastembed(id)
+                .unwrap_or_else(|e| panic!("no fastembed mapping for '{id}': {e}"));
+            let info =
+                fastembed::TextEmbedding::get_model_info(&fastembed_model).unwrap_or_else(|e| {
+                    panic!("fastembed has no info for the model mapped from '{id}': {e}")
+                });
+            let our_dims = model_dimensions(id).unwrap();
+            assert_eq!(
+                info.dim, our_dims,
+                "dimension drift for '{id}': fastembed reports {}, we report {}",
+                info.dim, our_dims
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "local-embeddings")]
+    fn local_model_is_cached_false_when_cache_dir_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            !local_model_is_cached(&fastembed::EmbeddingModel::BGESmallENV15, dir.path()).unwrap()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "local-embeddings")]
+    fn local_model_is_cached_false_when_only_partially_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = fastembed::EmbeddingModel::BGESmallENV15;
+        let info = fastembed::TextEmbedding::get_model_info(&model).unwrap();
+
+        let repo = hf_hub::Cache::new(dir.path().to_path_buf()).model(info.model_code.clone());
+        repo.create_ref("test-commit").unwrap();
+        let snapshot_dir = repo.pointer_path("test-commit");
+
+        // Only the model weight file, none of the tokenizer files.
+        write_cached_file(&snapshot_dir, &info.model_file);
+
+        assert!(!local_model_is_cached(&model, dir.path()).unwrap());
+    }
+
+    #[test]
+    #[cfg(feature = "local-embeddings")]
+    fn local_model_is_cached_true_once_every_required_file_is_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = fastembed::EmbeddingModel::BGESmallENV15;
+        let info = fastembed::TextEmbedding::get_model_info(&model).unwrap();
+
+        let repo = hf_hub::Cache::new(dir.path().to_path_buf()).model(info.model_code.clone());
+        repo.create_ref("test-commit").unwrap();
+        let snapshot_dir = repo.pointer_path("test-commit");
+
+        write_cached_file(&snapshot_dir, &info.model_file);
+        for extra in &info.additional_files {
+            write_cached_file(&snapshot_dir, extra);
+        }
+        for tokenizer_file in [
+            "tokenizer.json",
+            "config.json",
+            "special_tokens_map.json",
+            "tokenizer_config.json",
+        ] {
+            write_cached_file(&snapshot_dir, tokenizer_file);
+        }
+
+        assert!(local_model_is_cached(&model, dir.path()).unwrap());
+    }
+
+    /// Writes a placeholder file at `snapshot_dir/relative_path`, creating
+    /// any intermediate directories the path implies (some model files, e.g.
+    /// "onnx/model.onnx", live in a subdirectory of the snapshot).
+    #[cfg(feature = "local-embeddings")]
+    fn write_cached_file(snapshot_dir: &std::path::Path, relative_path: &str) {
+        let full_path = snapshot_dir.join(relative_path);
+        std::fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+        std::fs::write(full_path, b"fake").unwrap();
     }
 
     // ── MockEmbeddingClient ────────────────────────────────────────────

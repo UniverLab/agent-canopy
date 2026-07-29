@@ -2917,6 +2917,7 @@ dependencies = [
  "fastembed",
  "flate2",
  "futures",
+ "hf-hub",
  "inquire",
  "lancedb",
  "libc",

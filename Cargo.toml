@@ -127,6 +127,11 @@ pdf-extract = "0.10.0"
 
 # Local embedding models via ONNX Runtime (no API key required)
 fastembed = { version = "5", optional = true }
+# Already a transitive dependency of fastembed (its cache-path resolution
+# lives here) — depended on directly, network features disabled, so we can
+# check whether a model is already cached without pulling in a second HTTP
+# stack or downloading anything ourselves.
+hf-hub = { version = "0.5", optional = true, default-features = false }
 
 # Unix process management (kill, setsid)
 [target.'cfg(unix)'.dependencies]
@@ -150,7 +155,7 @@ default = []
 # tarballs. Instead, doctor/setup/rag-status all check capability
 # (`embedding_client::provider_available`) and refuse/warn explicitly when
 # this feature is off, so the absence is visible rather than silently green.
-local-embeddings = ["dep:fastembed"]
+local-embeddings = ["dep:fastembed", "dep:hf-hub"]
 
 [lints.clippy]
 # Production quality lints
