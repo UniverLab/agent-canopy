@@ -56,3 +56,9 @@ Cargo.lock
 # MSVC Windows builds of rustc generate these, which store debugging information
 
 # End of https://www.toptal.com/developers/gitignore/api/rust
+
+# Demo artifacts: the recorded cast and the rendered gif are generated from
+# demo.toml and weigh tens of megabytes. The published demo lives in the
+# landing repo under public/demos/.
+demo/dist/
+demo/*.rec
