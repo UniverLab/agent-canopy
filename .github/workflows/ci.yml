@@ -4,123 +4,26 @@ on:
   pull_request:
   workflow_dispatch:
 
-env:
-  CARGO_TERM_COLOR: always
-
 permissions:
   contents: read
 
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  check:
-    name: Format, Lint & Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Install system packages
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-
-      - name: Check formatting
-        run: cargo fmt -- --check
-
-      - name: Run clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
-
-      - name: Run tests
-        run: cargo test --locked
-
-  publish-check:
-    name: Publish Check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system packages
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-
-      - name: Dry-run publish
-        run: cargo publish --locked --dry-run
-
-      # The dry run never uploads, and the size ceiling only exists
-      # server-side — so a green dry run says nothing about whether the
-      # publish will fit. That is how a 41 MiB package reached the registry
-      # and came back as an HTTP/2 stream reset, which reads like a network
-      # fault. Measure what the dry run already produced.
-      - name: Check package size
-        run: |
-          crate=$(ls -1 target/package/*.crate 2>/dev/null | head -1)
-          if [ -z "$crate" ]; then
-            echo "No .crate produced by the dry run — nothing to measure."
-            exit 0
-          fi
-          size=$(stat -c%s "$crate")
-          limit=$(( 9 * 1024 * 1024 ))
-          echo "Package: $crate"
-          echo "Size:    $size bytes"
-          echo "Limit:   9 MiB (crates.io rejects over 10 MiB)"
-          if [ "$size" -gt "$limit" ]; then
-            echo "::error::Package exceeds 9 MiB."
-            echo "Largest files in the package:"
-            cargo package --locked --list --allow-dirty 2>/dev/null \
-              | while read -r f; do
-                  [ -f "$f" ] && printf '%10s  %s\n' "$(stat -c%s "$f")" "$f"
-                done | sort -rn | head -10
-            echo "Fix: extend the 'exclude' list in Cargo.toml."
-            exit 1
-          fi
-
-  coverage:
-    name: Coverage
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
-
-      - name: Install system packages
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-
-      - uses: taiki-e/install-action@cargo-llvm-cov
-
-      # `src/tui/ui/**` is pure ratatui rendering: functions whose whole job is
-      # to draw onto a Frame, and whose correctness is visual rather than
+  ci:
+    uses: UniverLab/workflows/.github/workflows/rust-ci.yml@main
+    with:
+      system-packages: protobuf-compiler
+      # Default features only. `--all-features` turns on local-embeddings,
+      # which pulls fastembed and needs an ONNX Runtime the runners do not
+      # carry — that mismatch is what pushed this repo off the shared
+      # workflow in the first place.
+      feature-flags: ""
+      # `src/tui/ui/**` is pure ratatui rendering: functions whose whole job
+      # is to draw onto a Frame, and whose correctness is visual rather than
       # logical. Covering it means asserting on screen-buffer contents, which
-      # costs a lot of test for very little defect-catching, so it sits outside
-      # the gate. Event handlers (`tui/event/**`) and app state (`tui/app/**`)
-      # stay in — that is the logic worth holding to a threshold.
-      - name: Measure coverage
-        run: |
-          cargo llvm-cov --locked \
-            --ignore-filename-regex 'src/tui/ui/' \
-            --fail-under-lines 80 \
-            --summary-only
+      # costs a lot of test for very little defect-catching. Event handlers
+      # and app state stay inside the gate — that is the logic worth holding
+      # to a threshold. Not anchored with ^ because llvm-cov matches full
+      # runner paths.
+      coverage-ignore-regex: "src/tui/ui/"
+      coverage-threshold: 80
+    secrets: inherit
