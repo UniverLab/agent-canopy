@@ -511,6 +511,11 @@ pub struct App {
     /// `rag::status::compute_rag_status`), instead of only failing at
     /// query time.
     pub(crate) rag_embeddings_model: String,
+    /// Current acquisition (download+prepare) state for the configured
+    /// local embedding model, read from daemon_state per-model keys.
+    /// `None` when the model is already fully available or was never
+    /// tracked — the normal ready/sleeping logic applies.
+    pub(crate) rag_acquisition_state: Option<crate::rag::status::AcquisitionState>,
     /// Whether the RagInfo panel has focus in Agents sidebar mode.
     pub(crate) agents_rag_focused: bool,
 

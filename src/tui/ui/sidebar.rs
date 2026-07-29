@@ -1040,10 +1040,23 @@ fn rag_status_line(app: &App, theme: &Theme) -> Line<'static> {
         app.rag_paused,
         app.rag_model_loaded,
         app.rag_info.processing_items,
+        app.rag_acquisition_state.clone(),
     ) {
         RagModelStatus::Unavailable(_) => Line::from(Span::styled(
             " ✗ unavailable ",
             Style::default().fg(Color::Red),
+        )),
+        RagModelStatus::DownloadFailed(_) => Line::from(Span::styled(
+            " ✗ download failed ",
+            Style::default().fg(Color::Red),
+        )),
+        RagModelStatus::Downloading { .. } => Line::from(Span::styled(
+            " ⬇ downloading ",
+            Style::default().fg(Color::Yellow),
+        )),
+        RagModelStatus::Preparing { .. } => Line::from(Span::styled(
+            " ⚙ preparing ",
+            Style::default().fg(Color::Yellow),
         )),
         RagModelStatus::Paused => Line::from(Span::styled(
             " ⏸ paused ",
@@ -2557,5 +2570,45 @@ mod tests {
                 draw_sidebar(frame, frame.area(), &mut app, &Theme::modern());
             })
             .unwrap();
+    }
+
+    #[test]
+    fn rag_status_line_shows_downloading_not_ready_even_when_loaded_flag_is_stale() {
+        use crate::db::Database;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
+        app.rag_embeddings_model = "text-embedding-3-small".to_string();
+        app.rag_model_loaded = true;
+        app.rag_acquisition_state =
+            Some(crate::rag::status::AcquisitionState::Downloading { started_at: 0 });
+
+        let theme = Theme::classic();
+        let line = rag_status_line(&app, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("downloading"), "got: {text:?}");
+    }
+
+    #[test]
+    fn rag_status_line_shows_download_failed() {
+        use crate::db::Database;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
+        app.rag_embeddings_model = "text-embedding-3-small".to_string();
+        app.rag_acquisition_state = Some(crate::rag::status::AcquisitionState::Failed {
+            reason: "boom".to_string(),
+        });
+
+        let theme = Theme::classic();
+        let line = rag_status_line(&app, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("download failed"), "got: {text:?}");
     }
 }

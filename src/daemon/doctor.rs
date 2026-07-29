@@ -164,7 +164,44 @@ pub(crate) async fn run_doctor() -> Result<()> {
                 if crate::rag::embedding_client::provider_available(
                     crate::rag::embedding_client::EmbeddingProvider::Local,
                 ) {
-                    println!(" \x1b[32m✓\x1b[0m Local model — no API key required");
+                    // Only open the DB if it already exists — doctor is a
+                    // passive diagnostic and must not create
+                    // background_agents.db as a side effect on a machine
+                    // that's never run setup.
+                    let acquisition = db_path
+                        .exists()
+                        .then(|| Database::new(&db_path).ok())
+                        .flatten()
+                        .and_then(|db| {
+                            crate::rag::status::read_acquisition_state(
+                                &db,
+                                &config.embeddings_model,
+                            )
+                        });
+                    match acquisition {
+                        Some(crate::rag::status::AcquisitionState::Downloading { started_at }) => {
+                            println!(
+                                " \x1b[33m⬇\x1b[0m Local model downloading ({}s so far)",
+                                crate::rag::status::elapsed_secs(started_at)
+                            );
+                        }
+                        Some(crate::rag::status::AcquisitionState::Preparing { started_at }) => {
+                            println!(
+                                " \x1b[33m⚙\x1b[0m Local model preparing ({}s so far)",
+                                crate::rag::status::elapsed_secs(started_at)
+                            );
+                        }
+                        Some(crate::rag::status::AcquisitionState::Failed { reason }) => {
+                            println!(" \x1b[31m✗\x1b[0m Local model download failed — {reason}");
+                            issues.push(format!(
+                                "Local embedding model download failed: {reason}. \
+                                 Run 'canopy rag model retry' to try again."
+                            ));
+                        }
+                        None => {
+                            println!(" \x1b[32m✓\x1b[0m Local model — no API key required");
+                        }
+                    }
                 } else {
                     println!(
                         " \x1b[31m✗\x1b[0m Local embeddings unavailable — {}",
@@ -827,5 +864,64 @@ mod tests {
         assert!(output.contains("Embeddings model: baai/bge-small-en-v1.5"));
         assert!(output.contains("Local model — no API key required"));
         assert!(!output.contains("Local embeddings unavailable"));
+    }
+
+    /// A local model still downloading must not read as "no API key
+    /// required" (green) or "unavailable" (capability gap) — it's a third,
+    /// distinct, honest state.
+    #[tokio::test]
+    #[ignore]
+    #[cfg(feature = "local-embeddings")]
+    async fn run_doctor_reports_downloading_state_for_local_model() {
+        let home = tempfile::tempdir().unwrap();
+        let canopy_dir = home.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+
+        let config = CanopyConfig {
+            embeddings_model: "baai/bge-small-en-v1.5".to_string(),
+            ..Default::default()
+        };
+        config.save(&canopy_dir).unwrap();
+
+        let db = Database::new(&canopy_dir.join("background_agents.db")).unwrap();
+        crate::rag::status::mark_downloading(&db, "baai/bge-small-en-v1.5");
+        drop(db);
+
+        let (result, output) = run_doctor_captured(home.path()).await;
+
+        assert!(result.is_ok());
+        assert!(output.contains("Local model downloading"));
+        assert!(
+            !output.contains("Local model — no API key required"),
+            "must not claim ready while still downloading:\n{output}"
+        );
+    }
+
+    /// A failed download must surface as red with the reason, plus an
+    /// actionable issue naming the retry command.
+    #[tokio::test]
+    #[ignore]
+    #[cfg(feature = "local-embeddings")]
+    async fn run_doctor_reports_failed_download_with_reason_and_retry_hint() {
+        let home = tempfile::tempdir().unwrap();
+        let canopy_dir = home.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+
+        let config = CanopyConfig {
+            embeddings_model: "baai/bge-small-en-v1.5".to_string(),
+            ..Default::default()
+        };
+        config.save(&canopy_dir).unwrap();
+
+        let db = Database::new(&canopy_dir.join("background_agents.db")).unwrap();
+        crate::rag::status::mark_failed(&db, "baai/bge-small-en-v1.5", "connection reset");
+        drop(db);
+
+        let (result, output) = run_doctor_captured(home.path()).await;
+
+        assert!(result.is_ok());
+        assert!(output.contains("Local model download failed"));
+        assert!(output.contains("connection reset"));
+        assert!(output.contains("canopy rag model retry"));
     }
 }

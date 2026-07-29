@@ -336,30 +336,17 @@ impl EmbeddingClient for LocalEmbeddingClient {
     }
 }
 
-/// Download (or verify) a local embedding model, showing download progress.
-/// Called during interactive setup so the model is ready before indexing begins.
-///
-/// Returns `true` if the model was already fully cached (nothing downloaded
-/// or loaded), `false` if a download and/or model load actually happened —
-/// so a caller can report which one occurred instead of always saying
-/// "downloading".
+/// Whether `model_id` is already fully cached on disk. A fast, disk-only
+/// check — no network access — so it's safe to call from an interactive
+/// process like the setup wizard without risking a blocking download; the
+/// wizard uses this to decide whether to say "ready now" or "downloading in
+/// the background" without ever downloading anything itself (the daemon's
+/// `IngestionManager` owns that, via
+/// `rag::model_acquisition::acquire_local_model`).
 #[cfg(feature = "local-embeddings")]
-pub fn download_local_model(model_id: &str, cache_dir: &std::path::Path) -> Result<bool> {
-    std::fs::create_dir_all(cache_dir)
-        .with_context(|| format!("Cannot create model cache dir: {}", cache_dir.display()))?;
+pub fn is_local_model_cached(model_id: &str, cache_dir: &std::path::Path) -> Result<bool> {
     let fastembed_model = model_id_to_fastembed(model_id)?;
-
-    if local_model_is_cached(&fastembed_model, cache_dir)? {
-        return Ok(true);
-    }
-
-    fastembed::TextEmbedding::try_new(
-        fastembed::InitOptions::new(fastembed_model)
-            .with_cache_dir(cache_dir.to_path_buf())
-            .with_show_download_progress(true),
-    )
-    .with_context(|| format!("Failed to download/load local embedding model '{model_id}'"))?;
-    Ok(false)
+    local_model_is_cached(&fastembed_model, cache_dir)
 }
 
 /// Cheap, on-disk check for whether every file `TextEmbedding::try_new`
@@ -378,7 +365,7 @@ pub fn download_local_model(model_id: &str, cache_dir: &std::path::Path) -> Resu
 /// the same way `pull_from_hf` does, so the check stays accurate when that
 /// env var overrides the cache directory.
 #[cfg(feature = "local-embeddings")]
-fn local_model_is_cached(
+pub(crate) fn local_model_is_cached(
     model: &fastembed::EmbeddingModel,
     cache_dir: &std::path::Path,
 ) -> Result<bool> {
@@ -402,7 +389,7 @@ fn local_model_is_cached(
 }
 
 #[cfg(feature = "local-embeddings")]
-fn model_id_to_fastembed(model_id: &str) -> Result<fastembed::EmbeddingModel> {
+pub(crate) fn model_id_to_fastembed(model_id: &str) -> Result<fastembed::EmbeddingModel> {
     match model_id.trim().to_ascii_lowercase().as_str() {
         "baai/bge-small-en-v1.5" => Ok(fastembed::EmbeddingModel::BGESmallENV15),
         "baai/bge-base-en-v1.5" => Ok(fastembed::EmbeddingModel::BGEBaseENV15),

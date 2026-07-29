@@ -21,6 +21,11 @@ pub(crate) enum RagAction {
         #[arg(long, short)]
         yes: bool,
     },
+    /// Manage the configured embedding model's download/prepare state.
+    Model {
+        #[command(subcommand)]
+        action: ModelAction,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -29,6 +34,14 @@ pub(crate) enum AutoIndexAction {
     Start,
     /// Pause automatic indexing without losing the queue.
     Stop,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum ModelAction {
+    /// Clear a failed local-model download/prepare attempt so the running
+    /// daemon's background acquisition loop retries it (within its normal
+    /// poll interval), without re-running the whole setup wizard.
+    Retry,
 }
 
 pub(crate) async fn handle_rag_action(action: RagAction) -> Result<()> {
@@ -84,6 +97,44 @@ pub(crate) async fn handle_rag_action(action: RagAction) -> Result<()> {
                      It will recreate the store on next use."
                 );
             }
+        }
+        RagAction::Model {
+            action: ModelAction::Retry,
+        } => handle_model_retry(&data_dir, &db)?,
+    }
+    Ok(())
+}
+
+fn handle_model_retry(data_dir: &std::path::Path, db: &Database) -> Result<()> {
+    let config = crate::domain::canopy_config::CanopyConfig::load(data_dir);
+    let model_id = config.embeddings_model.trim();
+
+    if model_id.is_empty() {
+        println!("\x1b[33m⚠\x1b[0m  No embeddings model configured — nothing to retry.");
+        return Ok(());
+    }
+
+    match crate::rag::status::read_acquisition_state(db, model_id) {
+        Some(crate::rag::status::AcquisitionState::Failed { reason }) => {
+            crate::rag::status::clear_acquisition(db, model_id);
+            println!("\x1b[32m✓\x1b[0m  Cleared failed download for '{model_id}' (was: {reason}).");
+            println!(
+                "     The running daemon will retry it automatically within ~15s. \
+                 Start the daemon first if it isn't running."
+            );
+        }
+        Some(crate::rag::status::AcquisitionState::Downloading { .. }) => {
+            println!(
+                "\x1b[33m⚠\x1b[0m  '{model_id}' is already downloading — nothing to retry yet."
+            );
+        }
+        Some(crate::rag::status::AcquisitionState::Preparing { .. }) => {
+            println!(
+                "\x1b[33m⚠\x1b[0m  '{model_id}' is already being prepared — nothing to retry yet."
+            );
+        }
+        None => {
+            println!("\x1b[32m✓\x1b[0m  '{model_id}' has no failed download to retry.");
         }
     }
     Ok(())
@@ -151,6 +202,7 @@ async fn handle_rag_report(data_dir: &std::path::Path, db: &Database) -> Result<
         is_paused,
         crate::rag::status::is_model_loaded(db),
         processing_items as i64,
+        crate::rag::status::read_acquisition_state(db, config.embeddings_model.trim()),
     );
 
     // A file's *current* oversize status is whatever its latest event says —
@@ -174,7 +226,7 @@ async fn handle_rag_report(data_dir: &std::path::Path, db: &Database) -> Result<
     );
     println!(
         " Status: {}",
-        match model_status {
+        match &model_status {
             crate::rag::status::RagModelStatus::Paused => "\x1b[33m⏸ paused\x1b[0m".to_string(),
             crate::rag::status::RagModelStatus::Ready =>
                 "\x1b[32m● ready (model loaded)\x1b[0m".to_string(),
@@ -182,6 +234,17 @@ async fn handle_rag_report(data_dir: &std::path::Path, db: &Database) -> Result<
                 "\x1b[90m○ sleeping (lazy — loads on demand)\x1b[0m".to_string(),
             crate::rag::status::RagModelStatus::Unavailable(reason) =>
                 format!("\x1b[31m✗ unavailable\x1b[0m — {reason}"),
+            crate::rag::status::RagModelStatus::Downloading { started_at } => format!(
+                "\x1b[33m⬇ downloading\x1b[0m ({}s so far)",
+                crate::rag::status::elapsed_secs(*started_at)
+            ),
+            crate::rag::status::RagModelStatus::Preparing { started_at } => format!(
+                "\x1b[33m⚙ preparing\x1b[0m ({}s so far)",
+                crate::rag::status::elapsed_secs(*started_at)
+            ),
+            crate::rag::status::RagModelStatus::DownloadFailed(reason) => format!(
+                "\x1b[31m✗ download failed\x1b[0m — {reason} (run 'canopy rag model retry')"
+            ),
         }
     );
     if model_status == crate::rag::status::RagModelStatus::Ready {
@@ -337,6 +400,77 @@ mod tests {
             help.contains("Delete the entire vector store"),
             "purge should have description:\n{help}"
         );
+    }
+
+    #[test]
+    fn model_retry_parses_as_canopy_rag_model_retry() {
+        let cli = TestCli::try_parse_from(["test", "model", "retry"])
+            .expect("'model retry' should parse");
+        assert!(matches!(
+            cli.action,
+            RagAction::Model {
+                action: ModelAction::Retry
+            }
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "local-embeddings")]
+    fn handle_model_retry_clears_a_failed_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let config = crate::domain::canopy_config::CanopyConfig {
+            embeddings_model: "baai/bge-small-en-v1.5".to_string(),
+            ..Default::default()
+        };
+        config.save(dir.path()).unwrap();
+        crate::rag::status::mark_downloading(&db, "baai/bge-small-en-v1.5");
+        crate::rag::status::mark_failed(&db, "baai/bge-small-en-v1.5", "connection reset");
+
+        handle_model_retry(dir.path(), &db).unwrap();
+
+        assert_eq!(
+            crate::rag::status::read_acquisition_state(&db, "baai/bge-small-en-v1.5"),
+            None
+        );
+    }
+
+    #[test]
+    fn handle_model_retry_is_a_no_op_when_nothing_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let config = crate::domain::canopy_config::CanopyConfig {
+            embeddings_model: "baai/bge-small-en-v1.5".to_string(),
+            ..Default::default()
+        };
+        config.save(dir.path()).unwrap();
+
+        // Must not error and must not fabricate a state where none exists.
+        handle_model_retry(dir.path(), &db).unwrap();
+        assert_eq!(
+            crate::rag::status::read_acquisition_state(&db, "baai/bge-small-en-v1.5"),
+            None
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "local-embeddings")]
+    fn handle_model_retry_leaves_an_in_progress_download_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let config = crate::domain::canopy_config::CanopyConfig {
+            embeddings_model: "baai/bge-small-en-v1.5".to_string(),
+            ..Default::default()
+        };
+        config.save(dir.path()).unwrap();
+        crate::rag::status::mark_downloading(&db, "baai/bge-small-en-v1.5");
+
+        handle_model_retry(dir.path(), &db).unwrap();
+
+        assert!(matches!(
+            crate::rag::status::read_acquisition_state(&db, "baai/bge-small-en-v1.5"),
+            Some(crate::rag::status::AcquisitionState::Downloading { .. })
+        ));
     }
 
     /// Integration-style check of the exact mapping `handle_rag_report` performs:

@@ -178,6 +178,7 @@ impl App {
             rag_paused: false,
             rag_model_loaded: false,
             rag_embeddings_model: canopy_config.embeddings_model.clone(),
+            rag_acquisition_state: None,
             agents_rag_focused: false,
             sync_scroll_offset: 0,
             last_sync_area: None,
@@ -1094,6 +1095,8 @@ impl App {
             .map(|v| v == "1")
             .unwrap_or(false);
         self.rag_model_loaded = crate::rag::status::is_model_loaded(&self.db);
+        self.rag_acquisition_state =
+            crate::rag::status::read_acquisition_state(&self.db, &self.rag_embeddings_model);
 
         let (queued, processing) = self
             .db

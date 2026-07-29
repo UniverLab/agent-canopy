@@ -168,17 +168,32 @@ pub fn run_setup(force_skills: bool) -> Result<()> {
             embeddings_model
         ));
 
-        // ── Download / warm-up the model ──────────────────────────
+        // ── Model acquisition ─────────────────────────────────────────
+        // Setup never downloads the model itself — it only checks whether
+        // one's already cached, so this returns immediately either way. If
+        // it isn't cached, the daemon's background acquisition loop (see
+        // `IngestionManager::ensure_configured_model_acquired`) picks it up
+        // once it (re)starts below, so a multi-hundred-MB download never
+        // blocks this wizard.
         wiz.render()?;
         #[cfg(feature = "local-embeddings")]
-        {
+        let model_already_cached = {
             let model_cache_dir = canopy_dir.join("models");
-            download_local_model_for_setup(&embeddings_model, &model_cache_dir)?;
+            crate::rag::embedding_client::is_local_model_cached(&embeddings_model, &model_cache_dir)
+                .unwrap_or(false)
+        };
+        #[cfg(not(feature = "local-embeddings"))]
+        let model_already_cached = false;
+        if model_already_cached {
+            wiz.add(format!(
+                "\x1b[32m✓\x1b[0m Model ready: {embeddings_model} (already cached)"
+            ));
+        } else {
+            wiz.add(
+                "\x1b[33m⬇\x1b[0m Model will download in the background — indexing begins once it's ready"
+                    .to_string(),
+            );
         }
-        wiz.add(format!(
-            "\x1b[32m✓\x1b[0m Model ready: {}",
-            embeddings_model
-        ));
 
         // Chunk-merge similarity threshold: internal tuning knob with no
         // user-observable effect in its valid range, so it is not prompted.
@@ -485,20 +500,6 @@ fn select_local_embeddings_model(current: &str) -> Result<String> {
         .find(|id| local_model_label(id) == selected)
         .map(|id| id.to_string())
         .ok_or_else(|| anyhow::anyhow!("Unknown embeddings model selection"))
-}
-
-#[cfg(feature = "local-embeddings")]
-fn download_local_model_for_setup(model_id: &str, cache_dir: &std::path::Path) -> Result<()> {
-    let already_cached = crate::rag::embedding_client::download_local_model(model_id, cache_dir)?;
-    if already_cached {
-        println!(
-            "  \x1b[90mModel already cached in ~/.canopy/models/ — nothing to download.\x1b[0m"
-        );
-    } else {
-        println!("  \x1b[90mDownloaded model to ~/.canopy/models/ (only needed once).\x1b[0m");
-    }
-    println!();
-    Ok(())
 }
 
 /// Interactively pick one or more directories for personal RAG indexing.
