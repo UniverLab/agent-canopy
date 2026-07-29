@@ -8,7 +8,7 @@ use crate::setup_module::registry_fetch::{fetch_registry, print_banner};
 use crate::setup_module::sync_and_skills::{run_essential_skills_step, run_sync_step};
 use crate::setup_module::PlatformWithCli;
 use anyhow::{Context, Result};
-use inquire::{Confirm, MultiSelect, Select};
+use inquire::{Confirm, CustomType, MultiSelect, Select};
 use std::io::{self, Write};
 
 pub fn run_setup(force_skills: bool) -> Result<()> {
@@ -109,7 +109,9 @@ pub fn run_setup(force_skills: bool) -> Result<()> {
         crate::rag::embedding_client::EmbeddingProvider::Local,
     );
 
-    let (embeddings_model, similarity_threshold, rag_personal_dirs) = if use_rag && !rag_capable {
+    let (embeddings_model, similarity_threshold, rag_personal_dirs, rag_max_file_mb) = if use_rag
+        && !rag_capable
+    {
         // This build has no way to serve any model the wizard can currently
         // offer — every option in `select_local_embeddings_model` is a local
         // (fastembed/ONNX) model. Refuse to offer them rather than saving a
@@ -133,6 +135,7 @@ pub fn run_setup(force_skills: bool) -> Result<()> {
             String::new(),
             existing_config.similarity_threshold,
             Vec::new(),
+            existing_config.rag_max_file_mb,
         )
     } else if use_rag {
         // ── Select local embedding model ──────────────────────────
@@ -216,13 +219,26 @@ pub fn run_setup(force_skills: bool) -> Result<()> {
             rag_personal_dirs.join(", ")
         ));
 
-        (embeddings_model, similarity_threshold, rag_personal_dirs)
+        // ── Per-file indexing size limit ─────────────────────────────
+        wiz.render()?;
+        let rag_max_file_mb = select_rag_max_file_mb(existing_config.rag_max_file_mb)?;
+        wiz.add(format!(
+            "\x1b[32m✓\x1b[0m Indexing size limit: {rag_max_file_mb} MB per file"
+        ));
+
+        (
+            embeddings_model,
+            similarity_threshold,
+            rag_personal_dirs,
+            rag_max_file_mb,
+        )
     } else {
         wiz.add("\x1b[90m–\x1b[0m RAG: disabled".to_string());
         (
             String::new(),
             existing_config.similarity_threshold,
             Vec::new(),
+            existing_config.rag_max_file_mb,
         )
     };
 
@@ -281,6 +297,7 @@ pub fn run_setup(force_skills: bool) -> Result<()> {
     config.embeddings_model = embeddings_model;
     config.similarity_threshold = similarity_threshold;
     config.rag_personal_dirs = rag_personal_dirs;
+    config.rag_max_file_mb = rag_max_file_mb;
     let config_step = match config.save(&canopy_dir) {
         Ok(_) => format!(
             "\x1b[32m✓\x1b[0m Config: {} CLI(s) saved to config.toml",
@@ -387,6 +404,32 @@ fn theme_choice_to_config_value(selected: &str) -> String {
     } else {
         "classic".to_string()
     }
+}
+
+/// Prompt for the per-file indexing size cap, in MB, with the currently
+/// configured value (or the 10 MB default on first run) preselected. Rejects
+/// out-of-range input inline via the same `validate_rag_max_file_mb` doctor
+/// and ingestion both defer to, so the wizard can't save a value neither of
+/// them would actually honor.
+fn select_rag_max_file_mb(current: u32) -> Result<u32> {
+    use inquire::validator::Validation;
+
+    CustomType::<u32>::new("Per-file indexing size limit (MB):")
+        .with_default(current)
+        .with_help_message(&format!(
+            "Files larger than this are skipped during indexing | ceiling: {} MB",
+            crate::domain::canopy_config::RAG_MAX_FILE_MB_CEILING
+        ))
+        .with_validator(|mb: &u32| {
+            Ok(
+                match crate::domain::canopy_config::validate_rag_max_file_mb(*mb) {
+                    Ok(()) => Validation::Valid,
+                    Err(reason) => Validation::Invalid(reason.into()),
+                },
+            )
+        })
+        .prompt()
+        .map_err(|e| anyhow::anyhow!("Indexing size limit selection cancelled: {}", e))
 }
 
 /// Human-readable label (name, dimensions, approximate download size) for a

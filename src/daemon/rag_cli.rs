@@ -194,14 +194,15 @@ async fn handle_rag_report(data_dir: &std::path::Path, db: &Database) -> Result<
         chunk_counts.len(),
         total_chunks
     );
+    let cap_mb = config.rag_max_file_bytes() as f64 / (1024.0 * 1024.0);
+    println!(" Limit:  {cap_mb:.0} MB per file (config.toml: rag_max_file_mb)");
     if !queue_items.is_empty() {
         let queued = queue_items.iter().filter(|q| q.status == "queued").count();
         println!(" Queue:  {} queued, {} indexing", queued, processing_items);
     }
     if oversize_count > 0 {
-        let cap_mb = crate::rag::ingestion::FILE_MAX_BYTES as f64 / (1024.0 * 1024.0);
         println!(
-            " \x1b[33m⚠\x1b[0m Oversize: {oversize_count} file(s) skipped — exceed the {cap_mb:.0} MB indexing limit (FILE_MAX_BYTES)"
+            " \x1b[33m⚠\x1b[0m Oversize: {oversize_count} file(s) skipped — exceed the {cap_mb:.0} MB indexing limit"
         );
     }
 
@@ -238,7 +239,6 @@ async fn handle_rag_report(data_dir: &std::path::Path, db: &Database) -> Result<
         if file_is_oversize {
             if let Some(size_bytes) = events.first().and_then(|e| e.detail.as_deref()) {
                 if let Ok(bytes) = size_bytes.parse::<u64>() {
-                    let cap_mb = crate::rag::ingestion::FILE_MAX_BYTES as f64 / (1024.0 * 1024.0);
                     println!(
                         "     \x1b[35moversize\x1b[0m: {:.1} MB (exceeds {:.0} MB limit — skipped)",
                         bytes as f64 / (1024.0 * 1024.0),

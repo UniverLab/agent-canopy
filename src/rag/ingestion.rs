@@ -25,9 +25,6 @@ const QUEUE_MAX: usize = 10_000;
 /// How often the background task checks whether the cached embedding client
 /// has been idle long enough to unload.
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
-/// Exposed so `doctor` and `rag report` can point at the same cap when
-/// explaining why a file was skipped.
-pub(crate) const FILE_MAX_BYTES: u64 = 5 * 1024 * 1024; // 5 MB
 /// Max number of recorded `"error"` events before a file is given up on
 /// permanently, even if the error message doesn't match a known-fatal pattern.
 const MAX_RAG_ATTEMPTS: i64 = 3;
@@ -687,13 +684,19 @@ impl IngestionManager {
             return Ok(());
         }
 
+        // Loaded fresh (not cached on `self`) so a `rag_max_file_mb` edit in
+        // config.toml takes effect on this file's very next indexing pass —
+        // no daemon restart needed.
+        let config = crate::domain::canopy_config::CanopyConfig::load(&self.data_dir);
+        let max_bytes = config.rag_max_file_bytes();
+
         let meta = std::fs::metadata(path)?;
-        if meta.len() > FILE_MAX_BYTES {
+        if meta.len() > max_bytes {
             let size_mb = meta.len() as f64 / (1024.0 * 1024.0);
-            let cap_mb = FILE_MAX_BYTES as f64 / (1024.0 * 1024.0);
+            let cap_mb = max_bytes as f64 / (1024.0 * 1024.0);
             tracing::info!(
                 "Personal RAG: skipping '{source_path}' — {size_mb:.1} MB exceeds the \
-                 {cap_mb:.0} MB indexing limit (FILE_MAX_BYTES)"
+                 {cap_mb:.0} MB indexing limit (config.toml: rag_max_file_mb)"
             );
             record_oversize_skip(&self.db, source_path, meta.len());
             return Ok(());
@@ -713,7 +716,6 @@ impl IngestionManager {
             content.len()
         );
         let now = chrono::Utc::now().timestamp();
-        let config = crate::domain::canopy_config::CanopyConfig::load(&self.data_dir);
 
         let threshold = config.similarity_threshold;
         let Some(semantic_chunks) =
@@ -924,9 +926,10 @@ async fn purge_vector_chunks(data_dir: &Path, source_path: &str, db: Option<&cra
     }
 }
 
-/// Record a `"skipped_oversize"` ledger event for a file that exceeds
-/// `FILE_MAX_BYTES`, unless the latest recorded event for that path is
-/// already a `"skipped_oversize"` for the same size — the file is rescanned
+/// Record a `"skipped_oversize"` ledger event for a file that exceeds the
+/// configured indexing limit (`CanopyConfig::rag_max_file_bytes`), unless the
+/// latest recorded event for that path is already a `"skipped_oversize"` for
+/// the same size — the file is rescanned
 /// on every startup and watcher pass, so without this check an unchanged
 /// oversize file would spam a duplicate row every time.
 fn record_oversize_skip(db: &Database, source_path: &str, size_bytes: u64) {
@@ -1656,8 +1659,9 @@ mod tests {
         assert_eq!(mgr.queue_len().await, 1);
     }
 
-    /// A file over `FILE_MAX_BYTES` records a `"skipped_oversize"` ledger
-    /// event carrying its size, instead of vanishing silently.
+    /// A file over the configured indexing limit records a
+    /// `"skipped_oversize"` ledger event carrying its size, instead of
+    /// vanishing silently.
     #[tokio::test]
     async fn record_oversize_skip_logs_event_with_size() {
         let (mgr, _dir) = test_manager();
@@ -1701,11 +1705,14 @@ mod tests {
 
     /// End-to-end: `index_file` on a file above the cap does not error, does
     /// not index anything, and leaves a `"skipped_oversize"` ledger trail.
+    /// Uses the default cap (10 MB — no config.toml in the test manager's
+    /// data dir) rather than a hardcoded constant.
     #[tokio::test]
     async fn index_file_skips_oversize_file_and_records_ledger_event() {
         let (mgr, dir) = test_manager();
+        let max_bytes = crate::domain::canopy_config::CanopyConfig::default().rag_max_file_bytes();
         let big_path = dir.path().join("huge.md");
-        std::fs::write(&big_path, vec![b'a'; (FILE_MAX_BYTES + 1) as usize]).unwrap();
+        std::fs::write(&big_path, vec![b'a'; (max_bytes + 1) as usize]).unwrap();
         let source_path = big_path.to_string_lossy().to_string();
 
         mgr.index_file(&source_path).await.unwrap();
@@ -1715,13 +1722,42 @@ mod tests {
         assert_eq!(events[0].event_type, "skipped_oversize");
         assert_eq!(
             events[0].detail.as_deref(),
-            Some((FILE_MAX_BYTES + 1).to_string().as_str())
+            Some((max_bytes + 1).to_string().as_str())
         );
 
         // Re-running against the unchanged file must not duplicate the event.
         mgr.index_file(&source_path).await.unwrap();
         let events = mgr.db().rag_events_for_file(&source_path).unwrap();
         assert_eq!(events.len(), 1);
+    }
+
+    /// A `rag_max_file_mb` written to config.toml is honored on the very
+    /// next `index_file` call against the *same, already-constructed*
+    /// manager — no daemon restart and no new `IngestionManager` needed.
+    /// This is the "read per ingestion pass" behavior the spec requires.
+    #[tokio::test]
+    async fn index_file_honors_a_lowered_configured_limit_without_restart() {
+        let (mgr, dir) = test_manager();
+
+        // 2 MB: comfortably under the 10 MB default, so before the config
+        // change below this file would sail past the size check.
+        let path = dir.path().join("medium.md");
+        std::fs::write(&path, vec![b'a'; 2 * 1024 * 1024]).unwrap();
+        let source_path = path.to_string_lossy().to_string();
+
+        // Lower the configured limit to 1 MB, below this file's size — set
+        // *after* the manager was constructed, and read fresh by `index_file`.
+        let config = crate::domain::canopy_config::CanopyConfig {
+            rag_max_file_mb: 1,
+            ..Default::default()
+        };
+        config.save(dir.path()).unwrap();
+
+        mgr.index_file(&source_path).await.unwrap();
+
+        let events = mgr.db().rag_events_for_file(&source_path).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "skipped_oversize");
     }
 }
 

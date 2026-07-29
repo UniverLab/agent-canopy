@@ -200,10 +200,36 @@ pub(crate) async fn run_doctor() -> Result<()> {
         }
     }
 
+    // Report the *configured* value's validity explicitly — rag_max_file_bytes()
+    // silently falls back to the default for an out-of-range config.toml value
+    // (indexing must never honor an unbounded/huge cap), but that fallback
+    // must not read as silently green here.
+    match crate::domain::canopy_config::validate_rag_max_file_mb(config.rag_max_file_mb) {
+        Ok(()) => {
+            println!(
+                " \x1b[32m✓\x1b[0m Indexing size limit: {} MB per file",
+                config.rag_max_file_mb
+            );
+        }
+        Err(reason) => {
+            let effective_mb = config.rag_max_file_bytes() / (1024 * 1024);
+            println!(
+                " \x1b[31m✗\x1b[0m Indexing size limit: {} MB is invalid ({reason}) — \
+                 falling back to {effective_mb} MB",
+                config.rag_max_file_mb
+            );
+            issues.push(format!(
+                "config.toml's rag_max_file_mb ({}) is invalid: {reason}. Run 'canopy setup' or fix config.toml.",
+                config.rag_max_file_mb
+            ));
+        }
+    }
+
     if config.rag_personal_dirs.is_empty() {
         println!(" \x1b[33m⚠\x1b[0m No personal RAG directories configured");
         issues.push("Add personal RAG directories via 'canopy setup'".to_string());
     } else {
+        let max_bytes = config.rag_max_file_bytes();
         let mut total_files: usize = 0;
         let mut oversize_files: usize = 0;
         for dir in &config.rag_personal_dirs {
@@ -222,10 +248,7 @@ pub(crate) async fn run_doctor() -> Result<()> {
                 let file_count = indexable_entries.len();
                 let dir_oversize = indexable_entries
                     .iter()
-                    .filter(|e| {
-                        e.metadata()
-                            .is_ok_and(|m| m.len() > crate::rag::ingestion::FILE_MAX_BYTES)
-                    })
+                    .filter(|e| e.metadata().is_ok_and(|m| m.len() > max_bytes))
                     .count();
                 println!(" \x1b[32m✓\x1b[0m RAG dir: {dir} ({file_count} indexable file(s))");
                 total_files += file_count;
@@ -241,15 +264,15 @@ pub(crate) async fn run_doctor() -> Result<()> {
             );
         }
         if oversize_files > 0 {
-            let cap_mb = crate::rag::ingestion::FILE_MAX_BYTES as f64 / (1024.0 * 1024.0);
+            let cap_mb = max_bytes as f64 / (1024.0 * 1024.0);
             println!(
                 " \x1b[33m⚠\x1b[0m {oversize_files} configured file(s) exceed the {cap_mb:.0} MB \
-                 indexing limit (FILE_MAX_BYTES) and are skipped"
+                 indexing limit (config.toml: rag_max_file_mb) and are skipped"
             );
-            issues.push(
-                "Some configured files exceed FILE_MAX_BYTES and are skipped — see 'canopy rag report'"
-                    .to_string(),
-            );
+            issues.push(format!(
+                "Some configured files exceed the {cap_mb:.0} MB indexing limit and are skipped — \
+                 see 'canopy rag report', or raise rag_max_file_mb in config.toml"
+            ));
         }
     }
 
@@ -652,8 +675,9 @@ mod tests {
     /// binary that can't be resolved, a stale daemon PID, an OpenAI
     /// embeddings model with no API key exported, a configured RAG
     /// directory that's missing on disk, and an oversize file that exceeds
-    /// `FILE_MAX_BYTES`. Exercises the error/warning branches the healthy
-    /// and fresh fixtures above don't reach.
+    /// the (default, since no config.toml is saved here) indexing limit.
+    /// Exercises the error/warning branches the healthy and fresh fixtures
+    /// above don't reach.
     #[tokio::test]
     #[ignore]
     async fn run_doctor_reports_degraded_state_details() {
@@ -668,10 +692,12 @@ mod tests {
         std::fs::write(canopy_dir.join("daemon.pid"), "999999999").unwrap();
 
         // A RAG dir that's configured but missing, plus one that exists
-        // and holds an oversize file (> FILE_MAX_BYTES).
+        // and holds a file over the (default, since no config.toml is
+        // saved here) indexing limit.
         let present_dir = home.path().join("present-docs");
         std::fs::create_dir_all(&present_dir).unwrap();
-        let big = vec![b'a'; (crate::rag::ingestion::FILE_MAX_BYTES as usize) + 1];
+        let max_bytes = crate::domain::canopy_config::CanopyConfig::default().rag_max_file_bytes();
+        let big = vec![b'a'; (max_bytes as usize) + 1];
         std::fs::write(present_dir.join("huge.md"), &big).unwrap();
 
         let config = CanopyConfig {
@@ -720,7 +746,7 @@ mod tests {
         assert!(output.contains("OPENAI_API_KEY is NOT set"));
         assert!(output.contains("RAG dir missing:"));
         assert!(output.contains("RAG dir:"));
-        assert!(output.contains("configured file(s) exceed the 5 MB"));
+        assert!(output.contains("configured file(s) exceed the 10 MB"));
         assert!(output.contains("Suggestions:"));
     }
 
