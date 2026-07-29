@@ -28,6 +28,11 @@ pub enum RagModelStatus {
     /// The daemon is healthy but the model has unloaded after sitting idle;
     /// it reloads transparently on the next query or indexing pass.
     Sleeping,
+    /// The configured provider is one this binary cannot serve (e.g. a local
+    /// model on a build without the `local-embeddings` feature). Takes
+    /// priority over every other signal — a capability gap, unlike pause or
+    /// idle-unload, never resolves itself on the next query.
+    Unavailable(&'static str),
 }
 
 /// Maps the raw signals the CLI/TUI already read — the auto-index pause
@@ -52,6 +57,30 @@ pub fn compute_rag_model_status(
     } else {
         RagModelStatus::Sleeping
     }
+}
+
+/// The truthful status a user should see, folding in whether this binary can
+/// even serve `model` — not just whether the daemon happens to have it
+/// loaded. Every surface that shows RAG status (`canopy rag report`, the TUI
+/// sidebar/panel) must go through this, not `compute_rag_model_status`
+/// directly, or a capability gap silently reads as "sleeping".
+pub fn compute_rag_status(
+    model: &str,
+    paused: bool,
+    model_loaded: bool,
+    processing_items: i64,
+) -> RagModelStatus {
+    use crate::rag::embedding_client::{provider_available, provider_for_model, EmbeddingProvider};
+
+    if provider_for_model(model) == Some(EmbeddingProvider::Local)
+        && !provider_available(EmbeddingProvider::Local)
+    {
+        return RagModelStatus::Unavailable(
+            crate::rag::embedding_client::LOCAL_EMBEDDINGS_UNAVAILABLE_REASON,
+        );
+    }
+
+    compute_rag_model_status(paused, model_loaded, processing_items)
 }
 
 /// Read the persisted "is the embedding model currently cached in the
@@ -98,6 +127,38 @@ mod tests {
         assert_eq!(
             compute_rag_model_status(false, false, 0),
             RagModelStatus::Sleeping
+        );
+    }
+
+    #[test]
+    fn cloud_model_status_ignores_capability_and_defers_to_daemon_state() {
+        assert_eq!(
+            compute_rag_status("text-embedding-3-small", false, true, 0),
+            RagModelStatus::Ready
+        );
+        assert_eq!(
+            compute_rag_status("text-embedding-3-small", false, false, 0),
+            RagModelStatus::Sleeping
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "local-embeddings"))]
+    fn local_model_status_is_unavailable_without_the_feature_regardless_of_daemon_state() {
+        // Even a "ready" daemon state (paused=false, loaded=true) must not
+        // hide a capability gap — that's the exact silent-green defect.
+        assert!(matches!(
+            compute_rag_status("baai/bge-small-en-v1.5", false, true, 3),
+            RagModelStatus::Unavailable(_)
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "local-embeddings")]
+    fn local_model_status_defers_to_daemon_state_with_the_feature() {
+        assert_eq!(
+            compute_rag_status("baai/bge-small-en-v1.5", false, true, 0),
+            RagModelStatus::Ready
         );
     }
 

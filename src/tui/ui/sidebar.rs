@@ -1033,13 +1033,18 @@ fn labeled_kv_line(label: &'static str, value: &str, theme: &Theme) -> Line<'sta
 }
 
 fn rag_status_line(app: &App, theme: &Theme) -> Line<'static> {
-    use crate::rag::status::{compute_rag_model_status, RagModelStatus};
+    use crate::rag::status::{compute_rag_status, RagModelStatus};
 
-    match compute_rag_model_status(
+    match compute_rag_status(
+        &app.rag_embeddings_model,
         app.rag_paused,
         app.rag_model_loaded,
         app.rag_info.processing_items,
     ) {
+        RagModelStatus::Unavailable(_) => Line::from(Span::styled(
+            " ✗ unavailable ",
+            Style::default().fg(Color::Red),
+        )),
         RagModelStatus::Paused => Line::from(Span::styled(
             " ⏸ paused ",
             Style::default().fg(Color::Yellow),

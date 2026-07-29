@@ -505,6 +505,12 @@ pub struct App {
     /// Whether the embedding model is currently loaded in the daemon's
     /// memory (synced from daemon_state table — see `rag::status`).
     pub(crate) rag_model_loaded: bool,
+    /// Configured embeddings model id, snapshotted from config.toml at
+    /// startup — lets the status widgets show "unavailable" when the
+    /// configured provider is one this binary cannot serve (see
+    /// `rag::status::compute_rag_status`), instead of only failing at
+    /// query time.
+    pub(crate) rag_embeddings_model: String,
     /// Whether the RagInfo panel has focus in Agents sidebar mode.
     pub(crate) agents_rag_focused: bool,
 

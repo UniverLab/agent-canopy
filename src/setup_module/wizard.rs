@@ -105,7 +105,36 @@ pub fn run_setup(force_skills: bool) -> Result<()> {
         .prompt()
         .map_err(|e| anyhow::anyhow!("RAG selection cancelled: {}", e))?;
 
-    let (embeddings_model, similarity_threshold, rag_personal_dirs) = if use_rag {
+    let rag_capable = crate::rag::embedding_client::provider_available(
+        crate::rag::embedding_client::EmbeddingProvider::Local,
+    );
+
+    let (embeddings_model, similarity_threshold, rag_personal_dirs) = if use_rag && !rag_capable {
+        // This build has no way to serve any model the wizard can currently
+        // offer — every option in `select_local_embeddings_model` is a local
+        // (fastembed/ONNX) model. Refuse to offer them rather than saving a
+        // config that `canopy doctor` and `rag_search` will only later
+        // discover cannot actually run.
+        println!();
+        println!("  \x1b[31m✗  This canopy build cannot run local embedding models.\x1b[0m");
+        println!(
+            "  \x1b[90m{}\x1b[0m",
+            crate::rag::embedding_client::LOCAL_EMBEDDINGS_UNAVAILABLE_REASON
+        );
+        println!(
+            "  \x1b[90mRAG will stay disabled. Install a build with local-embeddings, or\x1b[0m"
+        );
+        println!("  \x1b[90mconfigure a cloud embeddings model manually in config.toml.\x1b[0m");
+        println!();
+        wiz.add(
+            "\x1b[33m⚠\x1b[0m RAG: disabled — build lacks local-embeddings support".to_string(),
+        );
+        (
+            String::new(),
+            existing_config.similarity_threshold,
+            Vec::new(),
+        )
+    } else if use_rag {
         // ── Select local embedding model ──────────────────────────
         wiz.render()?;
         let embeddings_model = select_local_embeddings_model(&existing_config.embeddings_model)?;

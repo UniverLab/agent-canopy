@@ -32,9 +32,27 @@ pub fn client_from_config(config: &CanopyConfig) -> Result<Box<dyn EmbeddingClie
         }
         #[cfg(not(feature = "local-embeddings"))]
         Some(EmbeddingProvider::Local) => {
-            bail!("Local embeddings require the 'local-embeddings' feature")
+            bail!("Local embeddings unavailable: {LOCAL_EMBEDDINGS_UNAVAILABLE_REASON}")
         }
         None => bail!("Unsupported embeddings model: {model}"),
+    }
+}
+
+/// Reason shown wherever a build cannot serve local embedding models —
+/// doctor, setup, RAG status, and this module's own error path all share
+/// this string so the explanation is identical everywhere it surfaces.
+pub const LOCAL_EMBEDDINGS_UNAVAILABLE_REASON: &str =
+    "this canopy binary was built without the 'local-embeddings' feature (no ONNX Runtime support)";
+
+/// Whether this binary can actually serve the given provider, as opposed to
+/// whether a model string merely names it. Doctor/setup/RAG-status must all
+/// route through this single check instead of sprinkling their own
+/// `cfg!(feature = "local-embeddings")` — that duplication is exactly how the
+/// capability/configuration gap re-opens.
+pub fn provider_available(provider: EmbeddingProvider) -> bool {
+    match provider {
+        EmbeddingProvider::Local => cfg!(feature = "local-embeddings"),
+        EmbeddingProvider::OpenAi | EmbeddingProvider::Gemini => true,
     }
 }
 
@@ -516,6 +534,39 @@ mod tests {
             .err()
             .expect("missing model should fail");
         assert!(error.to_string().contains("not configured"));
+    }
+
+    #[test]
+    fn cloud_providers_are_always_available() {
+        assert!(provider_available(EmbeddingProvider::OpenAi));
+        assert!(provider_available(EmbeddingProvider::Gemini));
+    }
+
+    #[test]
+    #[cfg(feature = "local-embeddings")]
+    fn local_provider_available_when_feature_compiled_in() {
+        assert!(provider_available(EmbeddingProvider::Local));
+    }
+
+    #[test]
+    #[cfg(not(feature = "local-embeddings"))]
+    fn local_provider_unavailable_without_feature() {
+        assert!(!provider_available(EmbeddingProvider::Local));
+    }
+
+    #[test]
+    #[cfg(not(feature = "local-embeddings"))]
+    fn client_from_config_names_the_reason_for_local_without_feature() {
+        let config = CanopyConfig {
+            embeddings_model: LOCAL_MODEL_IDS[0].to_string(),
+            ..Default::default()
+        };
+        let error = client_from_config(&config)
+            .err()
+            .expect("local model without the feature should fail");
+        assert!(error
+            .to_string()
+            .contains(LOCAL_EMBEDDINGS_UNAVAILABLE_REASON));
     }
 
     #[test]

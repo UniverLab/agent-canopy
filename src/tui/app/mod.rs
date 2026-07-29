@@ -177,6 +177,7 @@ impl App {
             playground_project_hash: None,
             rag_paused: false,
             rag_model_loaded: false,
+            rag_embeddings_model: canopy_config.embeddings_model.clone(),
             agents_rag_focused: false,
             sync_scroll_offset: 0,
             last_sync_area: None,

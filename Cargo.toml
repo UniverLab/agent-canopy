@@ -138,6 +138,18 @@ tempfile = "3.8"
 
 [features]
 default = []
+# Kept optional and off by default in both CI and release builds — not
+# enabled here. fastembed's `ort` backend only ships prebuilt ONNX Runtime
+# binaries for glibc targets; this crate's Linux release target is
+# x86_64-unknown-linux-musl (for a fully static, portable binary), so there
+# is no prebuilt to download there, and the released tarballs ship a single
+# binary with no mechanism to carry a matching dylib alongside it. Making
+# this a default/release feature would mean either abandoning the musl
+# target or shipping a fragile dylib+rpath bundle — for a dependency this
+# heavy (ndarray, tokenizers, image, hf-hub) on top of already ~40 MB
+# tarballs. Instead, doctor/setup/rag-status all check capability
+# (`embedding_client::provider_available`) and refuse/warn explicitly when
+# this feature is off, so the absence is visible rather than silently green.
 local-embeddings = ["dep:fastembed"]
 
 [lints.clippy]

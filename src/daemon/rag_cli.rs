@@ -146,7 +146,8 @@ async fn handle_rag_report(data_dir: &std::path::Path, db: &Database) -> Result<
         .iter()
         .filter(|q| q.status == "processing")
         .count();
-    let model_status = crate::rag::status::compute_rag_model_status(
+    let model_status = crate::rag::status::compute_rag_status(
+        config.embeddings_model.trim(),
         is_paused,
         crate::rag::status::is_model_loaded(db),
         processing_items as i64,
@@ -179,6 +180,8 @@ async fn handle_rag_report(data_dir: &std::path::Path, db: &Database) -> Result<
                 "\x1b[32m● ready (model loaded)\x1b[0m".to_string(),
             crate::rag::status::RagModelStatus::Sleeping =>
                 "\x1b[90m○ sleeping (lazy — loads on demand)\x1b[0m".to_string(),
+            crate::rag::status::RagModelStatus::Unavailable(reason) =>
+                format!("\x1b[31m✗ unavailable\x1b[0m — {reason}"),
         }
     );
     if model_status == crate::rag::status::RagModelStatus::Ready {

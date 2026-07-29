@@ -1081,13 +1081,15 @@ fn draw_knowledge_overview(frame: &mut Frame, area: Rect, app: &App, theme: &The
 }
 
 fn rag_status(app: &App, theme: &Theme) -> (&'static str, Color) {
-    use crate::rag::status::{compute_rag_model_status, RagModelStatus};
+    use crate::rag::status::{compute_rag_status, RagModelStatus};
 
-    match compute_rag_model_status(
+    match compute_rag_status(
+        &app.rag_embeddings_model,
         app.rag_paused,
         app.rag_model_loaded,
         app.rag_info.processing_items,
     ) {
+        RagModelStatus::Unavailable(_) => ("✗ unavailable", Color::Red),
         RagModelStatus::Paused => ("⏸ paused", Color::Yellow),
         RagModelStatus::Ready if app.rag_info.processing_items > 0 => ("◉ indexing", Color::Yellow),
         RagModelStatus::Ready => ("● ready", theme.header_color),
@@ -1152,6 +1154,20 @@ fn rag_summary_lines(
 fn draw_rag_info_overview(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let (status_text, status_color) = rag_status(app, theme);
     let mut lines = rag_summary_lines(app, status_text, status_color, rag_queue_text(app), theme);
+
+    if let crate::rag::status::RagModelStatus::Unavailable(reason) =
+        crate::rag::status::compute_rag_status(
+            &app.rag_embeddings_model,
+            app.rag_paused,
+            app.rag_model_loaded,
+            app.rag_info.processing_items,
+        )
+    {
+        lines.push(Line::from(Span::styled(
+            format!("  {reason}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
 
     if !app.rag_file_status.is_empty() {
         lines.push(Line::from(""));
@@ -2338,5 +2354,23 @@ mod tests {
             &theme,
         );
         assert!(!lines.is_empty());
+    }
+
+    #[test]
+    #[cfg(not(feature = "local-embeddings"))]
+    fn rag_status_reports_unavailable_for_local_model_without_feature() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(db, data_dir.path()).unwrap();
+        // Even a "loaded" daemon state must not mask the capability gap.
+        app.rag_embeddings_model = "baai/bge-small-en-v1.5".to_string();
+        app.rag_model_loaded = true;
+        let theme = Theme::classic();
+        let (text, color) = rag_status(&app, &theme);
+        assert_eq!(text, "✗ unavailable");
+        assert_eq!(color, Color::Red);
     }
 }

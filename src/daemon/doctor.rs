@@ -161,7 +161,22 @@ pub(crate) async fn run_doctor() -> Result<()> {
                 Some(("GEMINI_API_KEY", std::env::var("GEMINI_API_KEY").is_ok()))
             }
             Some(crate::rag::embedding_client::EmbeddingProvider::Local) => {
-                println!(" \x1b[32m✓\x1b[0m Local model — no API key required");
+                if crate::rag::embedding_client::provider_available(
+                    crate::rag::embedding_client::EmbeddingProvider::Local,
+                ) {
+                    println!(" \x1b[32m✓\x1b[0m Local model — no API key required");
+                } else {
+                    println!(
+                        " \x1b[31m✗\x1b[0m Local embeddings unavailable — {}",
+                        crate::rag::embedding_client::LOCAL_EMBEDDINGS_UNAVAILABLE_REASON
+                    );
+                    issues.push(
+                        "This canopy build cannot run local embedding models. Run 'canopy setup' \
+                         to switch to a cloud provider, or install a build with the \
+                         'local-embeddings' feature."
+                            .to_string(),
+                    );
+                }
                 None
             }
             None => {
@@ -525,11 +540,17 @@ mod tests {
     /// A fully configured, fully healthy `$HOME`: existing data dir and DB
     /// with an agent, a `config.toml` marked configured with one CLI that
     /// resolves via an absolute path, a live daemon PID (the test process's
-    /// own pid — guaranteed running), a local embeddings model (no API key
-    /// needed), a RAG directory whose single indexable file is already
+    /// own pid — guaranteed running), a cloud embeddings model with its API
+    /// key exported, a RAG directory whose single indexable file is already
     /// reflected 1:1 in the vector store, and a pre-existing (empty at
     /// doctor-time) LanceDB directory. This is built to land on the
     /// zero-issues "All checks passed!" branch.
+    ///
+    /// Deliberately uses a cloud provider rather than a local model: doctor's
+    /// local-embeddings branch is capability-gated on the `local-embeddings`
+    /// feature (see the `run_doctor_reports_local_embeddings_*` tests below),
+    /// so a fixture asserting zero issues must not depend on that optional
+    /// feature being compiled in.
     #[tokio::test]
     #[ignore]
     async fn run_doctor_reports_all_clear_on_a_healthy_home() {
@@ -547,7 +568,7 @@ mod tests {
         std::fs::create_dir_all(&rag_dir).unwrap();
         std::fs::write(rag_dir.join("notes.md"), "# hello\nworld").unwrap();
 
-        // Config: configured, one resolvable CLI, local embeddings model,
+        // Config: configured, one resolvable CLI, cloud embeddings model,
         // the RAG dir above, similarity threshold untouched.
         let config = CanopyConfig {
             configured_at: Some(chrono::Utc::now().to_rfc3339()),
@@ -556,7 +577,7 @@ mod tests {
                 binary: "/bin/echo".to_string(),
                 ..Default::default()
             }],
-            embeddings_model: "baai/bge-small-en-v1.5".to_string(),
+            embeddings_model: "text-embedding-3-small".to_string(),
             rag_personal_dirs: vec![rag_dir.to_string_lossy().to_string()],
             ..Default::default()
         };
@@ -575,21 +596,30 @@ mod tests {
         // Pre-create the LanceDB dir + one chunk matching the single disk
         // file, so unique_paths == disk_files (no mismatch warning) and
         // the vector store already "exists" when doctor checks for it.
+        // 1536 dims matches text-embedding-3-small.
         let lancedb_path = canopy_dir.join("rag").join("vectors.lancedb");
-        let store = VectorStore::open_at(&lancedb_path, 384).await.unwrap();
+        let store = VectorStore::open_at(&lancedb_path, 1536).await.unwrap();
         store
             .insert_chunk(&VectorChunk {
                 id: "chunk-1".to_string(),
                 file_path: rag_dir.join("notes.md").to_string_lossy().to_string(),
                 content: "hello world".to_string(),
-                embedding: vec![0.1f32; 384],
+                embedding: vec![0.1f32; 1536],
                 created_at: 1_715_000_000,
             })
             .await
             .unwrap();
         drop(store);
 
+        let prev_key = std::env::var("OPENAI_API_KEY").ok();
+        unsafe { std::env::set_var("OPENAI_API_KEY", "test-key") };
+
         let (result, output) = run_doctor_captured(home.path()).await;
+
+        match prev_key {
+            Some(v) => unsafe { std::env::set_var("OPENAI_API_KEY", v) },
+            None => unsafe { std::env::remove_var("OPENAI_API_KEY") },
+        }
 
         assert!(result.is_ok());
         assert!(output.contains("Data directory:"));
@@ -600,8 +630,8 @@ mod tests {
         assert!(output.contains("Setup completed"));
         assert!(output.contains("echo-cli →"));
         assert!(output.contains("via absolute path"));
-        assert!(output.contains("Embeddings model: baai/bge-small-en-v1.5"));
-        assert!(output.contains("Local model — no API key required"));
+        assert!(output.contains("Embeddings model: text-embedding-3-small"));
+        assert!(output.contains("API key OPENAI_API_KEY is set"));
         assert!(output.contains("RAG dir:"));
         assert!(output.contains("1 indexable file(s)"));
         assert!(output.contains("ragignore:"));
@@ -715,5 +745,61 @@ mod tests {
         assert!(result.is_ok());
         assert!(output.contains("Model 'some-unknown-model-9000' is not supported"));
         assert!(output.contains("select a supported embedding model"));
+    }
+
+    /// A local embeddings model configured on a binary built WITHOUT the
+    /// 'local-embeddings' feature — the exact defect this module fixes: the
+    /// old code printed a green "no API key required" line by reading
+    /// configuration only. Doctor must now check capability and report red
+    /// with the reason, plus an actionable issue.
+    #[tokio::test]
+    #[ignore]
+    #[cfg(not(feature = "local-embeddings"))]
+    async fn run_doctor_reports_local_embeddings_unavailable_without_feature() {
+        let home = tempfile::tempdir().unwrap();
+        let canopy_dir = home.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+
+        let config = CanopyConfig {
+            embeddings_model: "baai/bge-small-en-v1.5".to_string(),
+            ..Default::default()
+        };
+        config.save(&canopy_dir).unwrap();
+
+        let (result, output) = run_doctor_captured(home.path()).await;
+
+        assert!(result.is_ok());
+        assert!(output.contains("Embeddings model: baai/bge-small-en-v1.5"));
+        assert!(
+            !output.contains("Local model — no API key required"),
+            "must not claim a capability this build does not have:\n{output}"
+        );
+        assert!(output.contains("Local embeddings unavailable"));
+        assert!(output.contains("without the 'local-embeddings' feature"));
+        assert!(output.contains("cannot run local embedding models"));
+    }
+
+    /// The same configuration on a binary built WITH the 'local-embeddings'
+    /// feature: doctor should report the capability as available.
+    #[tokio::test]
+    #[ignore]
+    #[cfg(feature = "local-embeddings")]
+    async fn run_doctor_reports_local_embeddings_available_with_feature() {
+        let home = tempfile::tempdir().unwrap();
+        let canopy_dir = home.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+
+        let config = CanopyConfig {
+            embeddings_model: "baai/bge-small-en-v1.5".to_string(),
+            ..Default::default()
+        };
+        config.save(&canopy_dir).unwrap();
+
+        let (result, output) = run_doctor_captured(home.path()).await;
+
+        assert!(result.is_ok());
+        assert!(output.contains("Embeddings model: baai/bge-small-en-v1.5"));
+        assert!(output.contains("Local model — no API key required"));
+        assert!(!output.contains("Local embeddings unavailable"));
     }
 }
