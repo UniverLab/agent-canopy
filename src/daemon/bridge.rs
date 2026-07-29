@@ -27,6 +27,53 @@ use crate::shared::sync_identity::{
 
 const MCP_SESSION_HEADER: &str = "mcp-session-id";
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(800);
+/// Substring rmcp's `LocalSessionManager` puts in the body of both its 404
+/// branches (`session.rs`/`tower.rs` in the `rmcp` crate) when a session id
+/// was attached but the daemon has no record of it — e.g. after a restart
+/// wiped its in-memory session table.
+const SESSION_NOT_FOUND_MARKER: &str = "Session not found";
+
+/// A non-2xx response from the daemon's `/mcp` endpoint, carrying the status
+/// and body so callers can distinguish a dead-session 404 from other
+/// failures instead of matching on a formatted string.
+#[derive(Debug)]
+struct DaemonHttpError {
+    status: reqwest::StatusCode,
+    body: String,
+}
+
+impl std::fmt::Display for DaemonHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "daemon returned HTTP {}: {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for DaemonHttpError {}
+
+impl DaemonHttpError {
+    fn is_session_not_found(&self) -> bool {
+        self.status == reqwest::StatusCode::NOT_FOUND
+            && self.body.contains(SESSION_NOT_FOUND_MARKER)
+    }
+}
+
+fn is_session_not_found_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<DaemonHttpError>()
+        .is_some_and(DaemonHttpError::is_session_not_found)
+}
+
+fn http_status_of(err: &anyhow::Error) -> Option<reqwest::StatusCode> {
+    err.downcast_ref::<DaemonHttpError>().map(|e| e.status)
+}
+
+/// Best-effort JSON-RPC `method` extraction for diagnostics; never fails the
+/// request path if the line isn't valid JSON.
+fn jsonrpc_method(line: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(str::to_string))
+        .unwrap_or_else(|| "<unknown>".to_string())
+}
 
 pub(crate) async fn run_bridge(
     agent_id_arg: Option<String>,
@@ -192,7 +239,10 @@ async fn run_proxy_loop(port: u16, agent_id: &str) -> Result<()> {
             continue;
         }
 
-        let result = forward_request(
+        let method = jsonrpc_method(&line);
+        let mut session_attached = session_id.is_some();
+
+        let mut result = forward_request(
             &client,
             &endpoint,
             agent_id,
@@ -201,6 +251,30 @@ async fn run_proxy_loop(port: u16, agent_id: &str) -> Result<()> {
             session_id.as_deref(),
         )
         .await;
+
+        // A cached session only ever dies this way when the daemon restarted
+        // and lost its in-memory session table. Clear it and retry once
+        // without a session header so the daemon can start a new one; a
+        // second failure (e.g. the retried method isn't `initialize`, which
+        // is the only request rmcp accepts session-less) falls through to
+        // the normal error reporting below instead of looping.
+        if session_attached && matches!(&result, Err(err) if is_session_not_found_error(err)) {
+            eprintln!(
+                "canopy bridge: daemon session not found for method {method} \
+                 (daemon likely restarted); clearing cached session and retrying once"
+            );
+            session_id = None;
+            session_attached = false;
+            result = forward_request(
+                &client,
+                &endpoint,
+                agent_id,
+                seed_id.as_deref(),
+                &line,
+                None,
+            )
+            .await;
+        }
 
         match result {
             Ok(reply) => {
@@ -214,7 +288,12 @@ async fn run_proxy_loop(port: u16, agent_id: &str) -> Result<()> {
                 stdout.flush().await?;
             }
             Err(err) => {
-                eprintln!("canopy bridge: {err}");
+                let status = http_status_of(&err)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "n/a".to_string());
+                eprintln!(
+                    "canopy bridge: {err} (status={status}, method={method}, session_attached={session_attached})"
+                );
                 let fallback = build_jsonrpc_transport_error(&line, &err.to_string());
                 stdout.write_all(fallback.as_bytes()).await?;
                 stdout.write_all(b"\n").await?;
@@ -227,6 +306,7 @@ async fn run_proxy_loop(port: u16, agent_id: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
 struct DaemonReply {
     /// JSON-RPC messages to emit on stdout (empty for accepted notifications).
     messages: Vec<String>,
@@ -283,7 +363,7 @@ async fn forward_request(
         .context("failed to read canopy daemon response body")?;
 
     if !status.is_success() {
-        anyhow::bail!("daemon returned HTTP {status}: {body}");
+        return Err(DaemonHttpError { status, body }.into());
     }
 
     let messages = if is_event_stream {
@@ -440,6 +520,187 @@ fn read_port_from_state(data_dir: &Path) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── session-not-found classification ─────────────────────────
+
+    #[test]
+    fn daemon_http_error_recognizes_session_not_found_404() {
+        let err = DaemonHttpError {
+            status: reqwest::StatusCode::NOT_FOUND,
+            body: "Not Found: Session not found".to_string(),
+        };
+        assert!(err.is_session_not_found());
+    }
+
+    #[test]
+    fn daemon_http_error_rejects_plain_404() {
+        let err = DaemonHttpError {
+            status: reqwest::StatusCode::NOT_FOUND,
+            body: "Not Found".to_string(),
+        };
+        assert!(!err.is_session_not_found());
+    }
+
+    #[test]
+    fn daemon_http_error_rejects_non_404_status() {
+        let err = DaemonHttpError {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            body: "Session not found".to_string(),
+        };
+        assert!(!err.is_session_not_found());
+    }
+
+    #[test]
+    fn is_session_not_found_error_unwraps_anyhow() {
+        let err: anyhow::Error = DaemonHttpError {
+            status: reqwest::StatusCode::NOT_FOUND,
+            body: "Not Found: Session not found".to_string(),
+        }
+        .into();
+        assert!(is_session_not_found_error(&err));
+    }
+
+    #[test]
+    fn is_session_not_found_error_false_for_unrelated_error() {
+        let err = anyhow::anyhow!("failed to reach canopy daemon");
+        assert!(!is_session_not_found_error(&err));
+    }
+
+    #[test]
+    fn http_status_of_extracts_status_from_daemon_http_error() {
+        let err: anyhow::Error = DaemonHttpError {
+            status: reqwest::StatusCode::BAD_GATEWAY,
+            body: String::new(),
+        }
+        .into();
+        assert_eq!(http_status_of(&err), Some(reqwest::StatusCode::BAD_GATEWAY));
+    }
+
+    #[test]
+    fn http_status_of_none_for_unrelated_error() {
+        let err = anyhow::anyhow!("connection refused");
+        assert!(http_status_of(&err).is_none());
+    }
+
+    // ── jsonrpc_method ────────────────────────────────────────────
+
+    #[test]
+    fn jsonrpc_method_extracts_method_name() {
+        let line = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        assert_eq!(jsonrpc_method(line), "tools/list");
+    }
+
+    #[test]
+    fn jsonrpc_method_unknown_for_invalid_json() {
+        assert_eq!(jsonrpc_method("not json"), "<unknown>");
+    }
+
+    #[test]
+    fn jsonrpc_method_unknown_when_field_missing() {
+        assert_eq!(jsonrpc_method(r#"{"jsonrpc":"2.0","id":1}"#), "<unknown>");
+    }
+
+    // ── forward_request session recovery (against a real local server) ──
+
+    /// Minimal stand-in for the daemon's `/mcp` route: rejects the session
+    /// id "dead-session" the way rmcp does after a restart wipes its
+    /// in-memory session table (404, body containing "Session not found"),
+    /// and otherwise succeeds, minting a fresh session id — so this proves
+    /// `forward_request` classifies the failure correctly and that a retry
+    /// without a session header is what actually recovers.
+    async fn spawn_fake_daemon() -> (u16, tokio::task::JoinHandle<()>) {
+        use axum::extract::Request;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+
+        async fn handle_mcp(request: Request) -> axum::response::Response {
+            let has_dead_session = request
+                .headers()
+                .get(MCP_SESSION_HEADER)
+                .and_then(|v| v.to_str().ok())
+                == Some("dead-session");
+
+            if has_dead_session {
+                return (
+                    axum::http::StatusCode::NOT_FOUND,
+                    "Not Found: Session not found",
+                )
+                    .into_response();
+            }
+
+            (
+                axum::http::StatusCode::OK,
+                [
+                    (axum::http::header::CONTENT_TYPE, "application/json"),
+                    (
+                        axum::http::header::HeaderName::from_static("mcp-session-id"),
+                        "fresh-session",
+                    ),
+                ],
+                r#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+            )
+                .into_response()
+        }
+
+        let router = axum::Router::new().route("/mcp", post(handle_mcp));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        (port, handle)
+    }
+
+    #[tokio::test]
+    async fn forward_request_reports_session_not_found_for_dead_session() {
+        let (port, server) = spawn_fake_daemon().await;
+        let endpoint = format!("http://127.0.0.1:{port}/mcp");
+        let client = Client::new();
+
+        let err = forward_request(
+            &client,
+            &endpoint,
+            "agent",
+            None,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            Some("dead-session"),
+        )
+        .await
+        .expect_err("dead session must be reported as an error");
+
+        assert!(is_session_not_found_error(&err));
+        assert_eq!(http_status_of(&err), Some(reqwest::StatusCode::NOT_FOUND));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn forward_request_recovers_once_session_header_is_dropped() {
+        let (port, server) = spawn_fake_daemon().await;
+        let endpoint = format!("http://127.0.0.1:{port}/mcp");
+        let client = Client::new();
+
+        // Same request, retried the way run_proxy_loop does: no session header.
+        let reply = forward_request(
+            &client,
+            &endpoint,
+            "agent",
+            None,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            None,
+        )
+        .await
+        .expect("session-less retry must succeed and mint a fresh session");
+
+        assert_eq!(reply.session_id.as_deref(), Some("fresh-session"));
+        assert_eq!(
+            reply.messages,
+            vec![r#"{"jsonrpc":"2.0","id":1,"result":{}}"#]
+        );
+
+        server.abort();
+    }
 
     #[test]
     fn parse_sse_extracts_single_data_event() {

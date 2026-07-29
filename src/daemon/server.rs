@@ -145,7 +145,9 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
         },
     );
 
-    let router = axum::Router::new().nest_service("/mcp", service);
+    let router = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(axum::middleware::from_fn(log_mcp_error_responses));
     let bind_addr = format!("127.0.0.1:{port}");
 
     kill_port_occupant(port);
@@ -173,6 +175,30 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
     tracing::info!("Daemon stopped");
 
     Ok(())
+}
+
+/// rmcp's `/mcp` handler returns 404 "Session not found" (and other non-2xx
+/// statuses) without ever calling `tracing::` — see the two 404 branches in
+/// `rmcp::transport::streamable_http_server::tower`. That silence is exactly
+/// what let a bridge's stale post-restart session id fail forever without a
+/// trace in daemon.log. This logs the status and whether a session id was
+/// attached (never the header value, and never the auth token) for any
+/// `/mcp` response with status >= 400.
+async fn log_mcp_error_responses(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let session_id_present = request.headers().contains_key("mcp-session-id");
+    let response = next.run(request).await;
+    let status = response.status();
+    if status.as_u16() >= 400 {
+        tracing::warn!(
+            status = %status,
+            session_id_present,
+            "/mcp request failed"
+        );
+    }
+    response
 }
 
 /// Terminate every loop node run's process this boot still owns (B12), so a
@@ -1052,5 +1078,152 @@ mod hang_repro {
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         assert_eq!(lp.autorun_at.map(|v| v.timestamp()), Some(at.timestamp()));
+    }
+}
+
+#[cfg(test)]
+mod mcp_error_logging_tests {
+    use super::*;
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use std::sync::{Arc as StdArc, Mutex};
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::Layer;
+
+    #[derive(Default, Clone)]
+    struct CapturedEvents(StdArc<Mutex<Vec<String>>>);
+
+    struct RecordingLayer(CapturedEvents);
+
+    impl<S: tracing::Subscriber> Layer<S> for RecordingLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Visitor(String);
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push_str(&format!("{}={:?} ", field.name(), value));
+                }
+            }
+            let mut visitor = Visitor(String::new());
+            event.record(&mut visitor);
+            self.0 .0.lock().unwrap().push(visitor.0);
+        }
+    }
+
+    async fn always_401(_req: axum::extract::Request) -> axum::response::Response {
+        (axum::http::StatusCode::UNAUTHORIZED, "nope").into_response()
+    }
+
+    async fn always_200(_req: axum::extract::Request) -> axum::response::Response {
+        (axum::http::StatusCode::OK, "ok").into_response()
+    }
+
+    /// Spawn a router with only `log_mcp_error_responses` wired in front of a
+    /// stub handler, and a recording tracing layer as the thread's default
+    /// subscriber. `#[tokio::test]` defaults to a current-thread runtime, so
+    /// the spawned server task runs on the same thread as the guard and
+    /// observes the same subscriber.
+    async fn spawn_with_recording_layer(
+        handler: axum::routing::MethodRouter,
+    ) -> (u16, CapturedEvents, tracing::subscriber::DefaultGuard) {
+        let captured = CapturedEvents::default();
+        let subscriber = tracing_subscriber::registry().with(RecordingLayer(captured.clone()));
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        let router = axum::Router::new()
+            .route("/mcp", handler)
+            .layer(axum::middleware::from_fn(log_mcp_error_responses));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (port, captured, guard)
+    }
+
+    #[tokio::test]
+    async fn logs_status_and_session_presence_never_header_value() {
+        let (port, captured, _guard) = spawn_with_recording_layer(post(always_401)).await;
+
+        let client = reqwest::Client::new();
+        client
+            .post(format!("http://127.0.0.1:{port}/mcp"))
+            .header("mcp-session-id", "super-secret-session-value")
+            .send()
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let events = captured.0.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains("status") && e.contains("401")),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains("session_id_present") && e.contains("true")),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.contains("super-secret-session-value")),
+            "header value must never be logged: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn logs_session_absent_when_no_header_sent() {
+        let (port, captured, _guard) = spawn_with_recording_layer(post(always_401)).await;
+
+        let client = reqwest::Client::new();
+        client
+            .post(format!("http://127.0.0.1:{port}/mcp"))
+            .send()
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let events = captured.0.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains("session_id_present") && e.contains("false")),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_log_for_successful_responses() {
+        let (port, captured, _guard) = spawn_with_recording_layer(post(always_200)).await;
+
+        let client = reqwest::Client::new();
+        client
+            .post(format!("http://127.0.0.1:{port}/mcp"))
+            .send()
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let events = captured.0.lock().unwrap();
+        let middleware_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.contains("status") || e.contains("session_id_present"))
+            .collect();
+        assert!(
+            middleware_events.is_empty(),
+            "middleware must not log for 200 responses, got: {middleware_events:?}"
+        );
     }
 }
