@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
 
-use crate::application::ports::AgentRepository;
-use crate::daemon::process::is_process_running;
+use crate::application::ports::{AgentRepository, StateRepository};
+use crate::daemon::process::{
+    diagnose_daemon, is_process_running, read_pid, resolve_port_pid, service_manager_facts,
+    DaemonState,
+};
 use crate::db::Database;
 
 pub(crate) async fn run_doctor() -> Result<()> {
@@ -64,18 +67,55 @@ pub(crate) async fn run_doctor() -> Result<()> {
         }
     }
 
-    let pid_path = canopy_dir.join("daemon.pid");
-    if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
-        if let Ok(pid) = pid_str.trim().parse::<u32>() {
-            if is_process_running(pid) {
-                println!(" \x1b[32m✓\x1b[0m Daemon running (PID: {})", pid);
-            } else {
-                println!(" \x1b[31m✗\x1b[0m Daemon not running (stale PID: {})", pid);
+    // Same fact-check `canopy daemon status` runs (kept in one place per the
+    // service-unit spec): a PID file naming a live process isn't enough to
+    // call the daemon healthy if that process isn't actually the one
+    // holding the port, or isn't the one a service manager owns.
+    let raw_pid = read_pid(&canopy_dir);
+    let state_pid = raw_pid.filter(|&p| is_process_running(p));
+    let port: u16 = db_path
+        .exists()
+        .then(|| Database::new(&db_path).ok())
+        .flatten()
+        .and_then(|db| db.get_state("port").ok().flatten())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| crate::resolve_port(None));
+    let port_pid = resolve_port_pid(port);
+    let manager = service_manager_facts();
+
+    match diagnose_daemon(state_pid, port_pid, manager.as_ref()) {
+        DaemonState::Stopped => {
+            if let Some(stale) = raw_pid {
+                println!(
+                    " \x1b[31m✗\x1b[0m Daemon not running (stale PID: {})",
+                    stale
+                );
                 issues.push("Stale PID file — run 'canopy daemon start'".to_string());
+            } else {
+                println!(" \x1b[33m⚠\x1b[0m Daemon not running");
             }
         }
-    } else {
-        println!(" \x1b[33m⚠\x1b[0m Daemon not running");
+        DaemonState::Running { pid } => {
+            println!(" \x1b[32m✓\x1b[0m Daemon running (PID: {})", pid);
+        }
+        DaemonState::Discrepancy(d) => {
+            println!(" \x1b[31m✗\x1b[0m Daemon status is inconsistent:");
+            for line in d.describe() {
+                println!("     {line}");
+            }
+            if d.is_orphan {
+                issues.push(format!(
+                    "An orphaned canopy process (PID {}) holds the port but isn't managed by {} — run 'canopy daemon stop' to clear it.",
+                    d.port_pid.expect("is_orphan implies port_pid is Some"),
+                    d.manager_name.unwrap_or("the service manager")
+                ));
+            } else {
+                issues.push(
+                    "Daemon status is inconsistent — see 'canopy daemon status' for details"
+                        .to_string(),
+                );
+            }
+        }
     }
 
     if config.is_configured() {
