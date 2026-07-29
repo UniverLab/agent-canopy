@@ -63,6 +63,34 @@ jobs:
       - name: Dry-run publish
         run: cargo publish --locked --dry-run
 
+      # The dry run never uploads, and the size ceiling only exists
+      # server-side — so a green dry run says nothing about whether the
+      # publish will fit. That is how a 41 MiB package reached the registry
+      # and came back as an HTTP/2 stream reset, which reads like a network
+      # fault. Measure what the dry run already produced.
+      - name: Check package size
+        run: |
+          crate=$(ls -1 target/package/*.crate 2>/dev/null | head -1)
+          if [ -z "$crate" ]; then
+            echo "No .crate produced by the dry run — nothing to measure."
+            exit 0
+          fi
+          size=$(stat -c%s "$crate")
+          limit=$(( 9 * 1024 * 1024 ))
+          echo "Package: $crate"
+          echo "Size:    $size bytes"
+          echo "Limit:   9 MiB (crates.io rejects over 10 MiB)"
+          if [ "$size" -gt "$limit" ]; then
+            echo "::error::Package exceeds 9 MiB."
+            echo "Largest files in the package:"
+            cargo package --locked --list --allow-dirty 2>/dev/null \
+              | while read -r f; do
+                  [ -f "$f" ] && printf '%10s  %s\n' "$(stat -c%s "$f")" "$f"
+                done | sort -rn | head -10
+            echo "Fix: extend the 'exclude' list in Cargo.toml."
+            exit 1
+          fi
+
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
