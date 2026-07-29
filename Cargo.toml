@@ -10,6 +10,11 @@ homepage = "https://github.com/UniverLab/harness-canopy"
 keywords = ["mcp", "scheduler", "cron", "file-watcher", "ai-agent"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "README.md"
+# The demo recording is ~40 MB of gif and cast files. Nothing that `cargo
+# install`s this crate needs them, and they alone push the package past the
+# 10 MiB crates.io accepts — which the registry reports as an HTTP/2 stream
+# reset, not as a size error, so it reads like a network fault.
+exclude = ["demo/"]
 
 [[bin]]
 name = "canopy"
