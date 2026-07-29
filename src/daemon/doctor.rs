@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use anyhow::{Context, Result};
 
 use crate::application::ports::{AgentRepository, StateRepository};
@@ -117,6 +119,13 @@ pub(crate) async fn run_doctor() -> Result<()> {
             }
         }
     }
+
+    // ── Service Unit ──────────────────────────────────────────────
+    // A unit that exists but points at a deleted/stale binary makes
+    // systemd/launchd retry-loop the daemon forever with nothing on the
+    // port — from here that's indistinguishable from "never started" unless
+    // doctor reads the unit itself and says so.
+    report_service_unit(&home, &mut issues);
 
     if config.is_configured() {
         println!(" \x1b[32m✓\x1b[0m Setup completed");
@@ -494,6 +503,180 @@ pub(crate) async fn run_doctor() -> Result<()> {
     Ok(())
 }
 
+/// Where this platform's service unit lives, and which manager owns it.
+/// `None` on platforms with no supported service manager (doctor's
+/// service-unit section is then simply skipped).
+fn service_unit_location(home: &Path) -> Option<(&'static str, PathBuf)> {
+    if cfg!(target_os = "macos") {
+        Some((
+            "launchd",
+            home.join("Library/LaunchAgents/com.canopy.plist"),
+        ))
+    } else if cfg!(target_os = "linux") {
+        Some((
+            "systemd",
+            home.join(".config/systemd/user").join("canopy.service"),
+        ))
+    } else {
+        None
+    }
+}
+
+/// Extract the binary path named by a systemd unit's `ExecStart=` line — the
+/// first whitespace-separated token, before its arguments (`serve --port
+/// ...`). `None` when the unit has no `ExecStart=` line.
+fn parse_systemd_exec_start_binary(unit_content: &str) -> Option<PathBuf> {
+    unit_content
+        .lines()
+        .find_map(|line| line.strip_prefix("ExecStart="))
+        .and_then(|rest| rest.split_whitespace().next())
+        .map(PathBuf::from)
+}
+
+/// Extract the binary path named by a launchd plist's `ProgramArguments`
+/// array — its first `<string>` entry, before `serve`, `--port`, `<port>`.
+/// `None` when the plist has no `ProgramArguments` array or it's empty.
+fn parse_launchd_program_binary(plist_content: &str) -> Option<PathBuf> {
+    let after_key = plist_content.split_once("<key>ProgramArguments</key>")?.1;
+    let after_array = after_key.split_once("<array>")?.1;
+    let inside_string = after_array.split_once("<string>")?.1;
+    let (binary, _) = inside_string.split_once("</string>")?;
+    Some(PathBuf::from(binary.trim()))
+}
+
+/// Extract the binary a service unit's contents name, dispatching on which
+/// manager owns it. Pure — takes the unit's contents as a string rather than
+/// a path, so the systemd/launchd formats are tested without real unit
+/// files or a live service manager.
+fn parse_unit_binary(manager: &str, unit_content: &str) -> Option<PathBuf> {
+    match manager {
+        "launchd" => parse_launchd_program_binary(unit_content),
+        _ => parse_systemd_exec_start_binary(unit_content),
+    }
+}
+
+/// What doctor should report about a service unit's binary, given facts a
+/// caller has already gathered by touching the filesystem/PATH. Pure
+/// comparison — no I/O — so every branch is reachable from synthetic inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ServiceUnitBinaryStatus {
+    /// The unit's binary is missing or not executable — the exact failure
+    /// mode that leaves systemd/launchd retry-looping with nothing on the
+    /// port.
+    Missing,
+    /// The unit's binary exists but isn't the same file as the `canopy` on
+    /// PATH.
+    Skew(PathBuf),
+    /// The unit's binary exists and either matches the one on PATH, or
+    /// there's nothing on PATH to disagree with it.
+    Consistent,
+}
+
+fn diagnose_service_unit_binary(
+    unit_binary: &Path,
+    binary_exists: bool,
+    path_binary: Option<&Path>,
+) -> ServiceUnitBinaryStatus {
+    if !binary_exists {
+        return ServiceUnitBinaryStatus::Missing;
+    }
+    match path_binary {
+        Some(p) if p != unit_binary => ServiceUnitBinaryStatus::Skew(p.to_path_buf()),
+        _ => ServiceUnitBinaryStatus::Consistent,
+    }
+}
+
+/// Does `path` exist and carry an execute bit? Doctor only ever reads unit
+/// files and stats binaries — this never shells out to `systemctl`, so it
+/// works the same in a CI container as on a developer's machine.
+#[cfg(unix)]
+fn binary_is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn binary_is_executable(path: &Path) -> bool {
+    path.is_file()
+}
+
+/// Best-effort `<binary> --version` output, trimmed. `None` on any failure —
+/// doctor reports a skew warning either way, just without a version string
+/// to show alongside a path that couldn't be run.
+fn binary_version(path: &Path) -> Option<String> {
+    let output = std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+/// Report on the systemd/launchd service unit, if any: its path, the binary
+/// it names, and whether that binary is the problem. Running the daemon by
+/// hand instead of via a unit is legitimate, so no unit at all is a neutral
+/// informational line, not a warning.
+fn report_service_unit(home: &Path, issues: &mut Vec<String>) {
+    let Some((manager, unit_path)) = service_unit_location(home) else {
+        return;
+    };
+
+    let Ok(unit_content) = std::fs::read_to_string(&unit_path) else {
+        println!(
+            " \x1b[90m–\x1b[0m No {manager} service unit installed (running the daemon by hand is fine)"
+        );
+        return;
+    };
+
+    println!(
+        " \x1b[32m✓\x1b[0m Service unit ({manager}): {}",
+        unit_path.display()
+    );
+
+    let Some(unit_binary) = parse_unit_binary(manager, &unit_content) else {
+        println!("     \x1b[33m⚠\x1b[0m Could not find the binary the unit points at");
+        return;
+    };
+
+    let binary_exists = binary_is_executable(&unit_binary);
+    let path_binary = which::which("canopy").ok();
+
+    match diagnose_service_unit_binary(&unit_binary, binary_exists, path_binary.as_deref()) {
+        ServiceUnitBinaryStatus::Missing => {
+            println!(
+                "     \x1b[31m✗\x1b[0m Points at a missing or non-executable binary: {}",
+                unit_binary.display()
+            );
+            issues.push(format!(
+                "Service unit's binary is gone ({}) — run 'canopy daemon install' to reinstall the service so it points at the current binary.",
+                unit_binary.display()
+            ));
+        }
+        ServiceUnitBinaryStatus::Skew(path_binary) => {
+            let unit_version =
+                binary_version(&unit_binary).unwrap_or_else(|| "unknown".to_string());
+            let path_version =
+                binary_version(&path_binary).unwrap_or_else(|| "unknown".to_string());
+            println!("     \x1b[33m⚠\x1b[0m Unit binary differs from the canopy on PATH:");
+            println!("         Unit: {} ({unit_version})", unit_binary.display());
+            println!("         PATH: {} ({path_version})", path_binary.display());
+            issues.push(
+                "The service unit and the canopy on your PATH are different binaries — \
+                 run 'canopy daemon install' to update the service."
+                    .to_string(),
+            );
+        }
+        ServiceUnitBinaryStatus::Consistent => {
+            println!("     \x1b[32m✓\x1b[0m Binary: {}", unit_binary.display());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,6 +687,189 @@ mod tests {
     use crate::rag::vector_store::{VectorChunk, VectorStore};
     use std::io::{Read, Write};
     use std::os::unix::io::FromRawFd;
+
+    #[test]
+    fn parse_systemd_exec_start_binary_extracts_path_before_args() {
+        let unit = "[Service]\nExecStart=/usr/local/bin/canopy serve --port 4177\n";
+        assert_eq!(
+            parse_systemd_exec_start_binary(unit),
+            Some(PathBuf::from("/usr/local/bin/canopy"))
+        );
+    }
+
+    #[test]
+    fn parse_systemd_exec_start_binary_none_without_exec_start() {
+        let unit = "[Service]\nEnvironment=PATH=/usr/bin\n";
+        assert_eq!(parse_systemd_exec_start_binary(unit), None);
+    }
+
+    #[test]
+    fn parse_launchd_program_binary_extracts_first_array_entry() {
+        let plist = r#"<?xml version="1.0"?>
+<plist>
+<dict>
+    <key>Label</key>
+    <string>com.canopy</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/canopy</string>
+        <string>serve</string>
+        <string>--port</string>
+        <string>4177</string>
+    </array>
+</dict>
+</plist>
+"#;
+        assert_eq!(
+            parse_launchd_program_binary(plist),
+            Some(PathBuf::from("/usr/local/bin/canopy"))
+        );
+    }
+
+    #[test]
+    fn parse_launchd_program_binary_none_without_program_arguments_key() {
+        let plist = "<plist><dict><key>Label</key><string>com.canopy</string></dict></plist>";
+        assert_eq!(parse_launchd_program_binary(plist), None);
+    }
+
+    #[test]
+    fn parse_unit_binary_dispatches_on_manager() {
+        let systemd_unit = "ExecStart=/opt/canopy serve --port 1\n";
+        assert_eq!(
+            parse_unit_binary("systemd", systemd_unit),
+            Some(PathBuf::from("/opt/canopy"))
+        );
+
+        let launchd_plist =
+            "<key>ProgramArguments</key><array><string>/opt/canopy</string></array>";
+        assert_eq!(
+            parse_unit_binary("launchd", launchd_plist),
+            Some(PathBuf::from("/opt/canopy"))
+        );
+    }
+
+    #[test]
+    fn diagnose_service_unit_binary_missing_when_binary_does_not_exist() {
+        let status = diagnose_service_unit_binary(
+            Path::new("/does/not/exist/canopy"),
+            false,
+            Some(Path::new("/usr/bin/canopy")),
+        );
+        assert_eq!(status, ServiceUnitBinaryStatus::Missing);
+    }
+
+    #[test]
+    fn diagnose_service_unit_binary_missing_takes_precedence_over_skew() {
+        // Even if a different `canopy` is on PATH, a unit naming a binary
+        // that doesn't exist must report Missing, not Skew — that's the
+        // actionable defect (reinstall), not a version mismatch.
+        let status = diagnose_service_unit_binary(
+            Path::new("/gone/canopy"),
+            false,
+            Some(Path::new("/usr/bin/canopy")),
+        );
+        assert_eq!(status, ServiceUnitBinaryStatus::Missing);
+    }
+
+    #[test]
+    fn diagnose_service_unit_binary_skew_when_paths_differ() {
+        let status = diagnose_service_unit_binary(
+            Path::new("/opt/canopy-old/canopy"),
+            true,
+            Some(Path::new("/usr/bin/canopy")),
+        );
+        assert_eq!(
+            status,
+            ServiceUnitBinaryStatus::Skew(PathBuf::from("/usr/bin/canopy"))
+        );
+    }
+
+    #[test]
+    fn diagnose_service_unit_binary_consistent_when_paths_match() {
+        let status = diagnose_service_unit_binary(
+            Path::new("/usr/bin/canopy"),
+            true,
+            Some(Path::new("/usr/bin/canopy")),
+        );
+        assert_eq!(status, ServiceUnitBinaryStatus::Consistent);
+    }
+
+    #[test]
+    fn diagnose_service_unit_binary_consistent_when_nothing_on_path() {
+        // Nothing to compare against — the unit's binary existing is enough.
+        let status = diagnose_service_unit_binary(Path::new("/usr/bin/canopy"), true, None);
+        assert_eq!(status, ServiceUnitBinaryStatus::Consistent);
+    }
+
+    #[test]
+    fn binary_is_executable_true_for_executable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake-canopy");
+        std::fs::write(&path, "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        assert!(binary_is_executable(&path));
+    }
+
+    #[test]
+    fn binary_is_executable_false_for_non_executable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake-canopy");
+        std::fs::write(&path, "not executable").unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+            .unwrap();
+        assert!(!binary_is_executable(&path));
+    }
+
+    #[test]
+    fn binary_is_executable_false_for_missing_file() {
+        assert!(!binary_is_executable(Path::new(
+            "/does/not/exist/fake-canopy"
+        )));
+    }
+
+    #[test]
+    fn binary_version_returns_trimmed_stdout_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake-canopy");
+        std::fs::write(&path, "#!/bin/sh\necho 'canopy 1.2.3'\n").unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        assert_eq!(binary_version(&path), Some("canopy 1.2.3".to_string()));
+    }
+
+    #[test]
+    fn binary_version_none_when_binary_missing() {
+        assert_eq!(
+            binary_version(Path::new("/does/not/exist/fake-canopy")),
+            None
+        );
+    }
+
+    #[test]
+    fn binary_version_none_on_nonzero_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake-canopy");
+        std::fs::write(&path, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        assert_eq!(binary_version(&path), None);
+    }
+
+    #[test]
+    fn service_unit_location_returns_current_platform_manager() {
+        let home = tempfile::tempdir().unwrap();
+        let location = service_unit_location(home.path());
+        if cfg!(target_os = "linux") {
+            let (manager, path) = location.expect("linux always has a supported manager");
+            assert_eq!(manager, "systemd");
+            assert!(path.ends_with(".config/systemd/user/canopy.service"));
+        } else if cfg!(target_os = "macos") {
+            let (manager, path) = location.expect("macos always has a supported manager");
+            assert_eq!(manager, "launchd");
+            assert!(path.ends_with("Library/LaunchAgents/com.canopy.plist"));
+        }
+    }
 
     /// `run_doctor` reads `$HOME` (via `dirs::home_dir()`, transitively
     /// through every helper it calls: `CanopyConfig::load`,
