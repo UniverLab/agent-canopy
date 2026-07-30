@@ -1,7 +1,7 @@
 ---
 title: CLI Reference
 description: Every canopy command and flag.
-order: 10
+order: 12
 ---
 
 # CLI Reference

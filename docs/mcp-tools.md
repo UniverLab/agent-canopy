@@ -1,7 +1,7 @@
 ---
 title: MCP Tools
 description: All 63 MCP tools exposed by the canopy daemon, by category.
-order: 9
+order: 11
 ---
 
 # MCP Tools

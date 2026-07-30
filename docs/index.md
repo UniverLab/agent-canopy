@@ -42,6 +42,8 @@ no external services, no cloud account.
 - [Agents](agents.md) — interactive, background and terminal agents; seed identities.
 - [Intelligence & Sync](intelligence-and-sync.md) — knowledge graph and multi-agent coordination.
 - [Loops](loops.md) — the DAG loop engine.
+- [Usage Patterns](usage-patterns.md) — the shapes a graph can take, and where each breaks.
+- [Recipes](recipes.md) — those shapes built end to end, with real calls and prompts.
 - [RAG Pipeline](rag.md) — personal document search.
 - [MCP Tools](mcp-tools.md) — all 63 tools by category.
 - [CLI Reference](cli-reference.md) — every `canopy` command.
