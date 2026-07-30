@@ -2,6 +2,7 @@ use anyhow::Result;
 use ratatui::crossterm::event::KeyCode;
 use std::path::PathBuf;
 
+use super::terminal_warp::{record_terminal_command, submit_warp_input};
 use crate::tui::app::types::{AgentEntry, App};
 
 // ── Suggestion picker (terminal Tab autocomplete) ───────────────────
@@ -180,6 +181,12 @@ pub fn insert_suggestion_into_terminal(app: &mut App, text: &str, is_cd: bool) {
         }
         agent.warp_cursor = full_text.len();
         agent.warp_passthrough = false;
+
+        // A cd picker selection is already a confirmed choice: run it
+        // immediately instead of leaving it in the input box for a second Enter.
+        if is_cd {
+            submit_warp_input(app, idx);
+        }
     } else {
         // Non-warp: clear PTY line with Ctrl+U then type suggestion
         let mut bytes: Vec<u8> = vec![0x15]; // Ctrl+U
@@ -188,6 +195,17 @@ pub fn insert_suggestion_into_terminal(app: &mut App, text: &str, is_cd: bool) {
         if let Ok(mut buf) = agent.input_buffer.lock() {
             buf.clear();
             buf.push_str(&full_text);
+        }
+
+        if is_cd {
+            // Submit exactly as a real Enter keypress would: send the
+            // terminating CR and mirror the shadow-buffer bookkeeping that
+            // the raw passthrough path performs for a real Enter key.
+            let _ = agent.write_to_pty(b"\r");
+            record_terminal_command(app, idx, &full_text);
+            if let Ok(mut buf) = app.terminal_agents[idx].input_buffer.lock() {
+                buf.clear();
+            }
         }
     }
 }
@@ -219,5 +237,189 @@ pub fn find_focused_terminal(app: &App) -> Option<usize> {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+    use crate::tui::agent::InteractiveAgent;
+    use crate::tui::terminal_history::{PickerMode, SessionHistory, SuggestionPicker};
+    use std::sync::Arc;
+    use tempfile::{tempdir, NamedTempFile};
+
+    fn test_db() -> Arc<Database> {
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        Arc::new(Database::new(&path).expect("create test db"))
+    }
+
+    /// `cat` is a stand-in shell: it never enters the alternate screen or
+    /// looks like a sensitive prompt, so it exercises the same code paths a
+    /// real shell would for the purposes of this suite.
+    fn spawn_test_terminal(name: &str, cwd: &str) -> InteractiveAgent {
+        InteractiveAgent::spawn_terminal(
+            "cat",
+            cwd,
+            80,
+            24,
+            Some(name),
+            &[],
+            ratatui::style::Color::White,
+        )
+        .expect("spawn terminal")
+    }
+
+    fn app_with_focused_terminal(agent: InteractiveAgent) -> App {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.terminal_agents.push(agent);
+        app.agents = vec![AgentEntry::Terminal(0)];
+        app.selected = 0;
+        app
+    }
+
+    fn input_buffer_text(agent: &InteractiveAgent) -> String {
+        agent
+            .input_buffer
+            .lock()
+            .expect("lock input buffer")
+            .clone()
+    }
+
+    /// Builds a cd picker over `cwd`, which must contain exactly one
+    /// subdirectory so the picker's default selection (index 0) is
+    /// unambiguous.
+    fn cd_picker_over(cwd: &str) -> SuggestionPicker {
+        let picker = SuggestionPicker::for_cd("", cwd, &SessionHistory::default());
+        assert_eq!(
+            picker.items.len(),
+            1,
+            "test fixture must contain exactly one subdirectory"
+        );
+        picker
+    }
+
+    #[test]
+    fn cd_picker_enter_runs_cd_immediately_in_warp_mode() {
+        let cwd = tempdir().expect("create cwd");
+        let sub = cwd.path().join("projectx");
+        std::fs::create_dir(&sub).expect("create subdir");
+        let cwd_str = cwd.path().to_string_lossy().to_string();
+
+        let agent = spawn_test_terminal("cd-warp", &cwd_str);
+        assert!(agent.warp_mode, "spawn_terminal defaults to warp mode");
+        let mut app = app_with_focused_terminal(agent);
+        app.suggestion_picker = Some(cd_picker_over(&cwd_str));
+
+        handle_suggestion_picker_key(&mut app, KeyCode::Enter).expect("handle enter");
+
+        assert!(
+            app.suggestion_picker.is_none(),
+            "picker must close on Enter"
+        );
+        let updated = &app.terminal_agents[0];
+        assert_eq!(input_buffer_text(updated), "", "input box must be clean");
+        assert_eq!(updated.warp_cursor, 0);
+        assert!(
+            !updated.warp_passthrough,
+            "submit must leave warp_passthrough reset, not mid-passthrough"
+        );
+        assert_eq!(
+            PathBuf::from(&updated.working_dir),
+            sub.canonicalize().expect("canonicalize subdir"),
+            "cwd must reflect the selected directory after a single Enter"
+        );
+    }
+
+    #[test]
+    fn cd_picker_enter_runs_cd_immediately_outside_warp_mode() {
+        let cwd = tempdir().expect("create cwd");
+        let sub = cwd.path().join("projecty");
+        std::fs::create_dir(&sub).expect("create subdir");
+        let cwd_str = cwd.path().to_string_lossy().to_string();
+
+        let mut agent = spawn_test_terminal("cd-direct", &cwd_str);
+        agent.warp_mode = false;
+        let mut app = app_with_focused_terminal(agent);
+        app.suggestion_picker = Some(cd_picker_over(&cwd_str));
+
+        handle_suggestion_picker_key(&mut app, KeyCode::Enter).expect("handle enter");
+
+        assert!(app.suggestion_picker.is_none());
+        let updated = &app.terminal_agents[0];
+        assert_eq!(
+            input_buffer_text(updated),
+            "",
+            "shadow input box must be clean after auto-submit"
+        );
+        assert_eq!(
+            PathBuf::from(&updated.working_dir),
+            sub.canonicalize().expect("canonicalize subdir"),
+            "cwd must reflect the selected directory after a single Enter"
+        );
+    }
+
+    #[test]
+    fn command_history_picker_enter_only_inserts_without_submitting() {
+        let cwd = tempdir().expect("create cwd");
+        let cwd_str = cwd.path().to_string_lossy().to_string();
+        let agent = spawn_test_terminal("history", &cwd_str);
+        let mut app = app_with_focused_terminal(agent);
+
+        app.suggestion_picker = Some(SuggestionPicker {
+            input: String::new(),
+            mode: PickerMode::CommandHistory,
+            items: vec![crate::tui::terminal_history::SuggestionItem {
+                text: "echo hi".to_string(),
+                label: "echo hi".to_string(),
+                count: 1,
+            }],
+            all_items: vec![],
+            selected: 0,
+            scroll_offset: 0,
+            cd_base_dir: None,
+            cd_current_dir: None,
+        });
+
+        handle_suggestion_picker_key(&mut app, KeyCode::Enter).expect("handle enter");
+
+        assert!(app.suggestion_picker.is_none(), "picker must close");
+        let updated = &app.terminal_agents[0];
+        assert_eq!(
+            input_buffer_text(updated),
+            "echo hi",
+            "history completion must only insert, leaving room to edit before running"
+        );
+        assert_eq!(updated.warp_cursor, "echo hi".len());
+        assert_eq!(
+            updated.working_dir, cwd_str,
+            "non-cd completions must not touch the working directory"
+        );
+    }
+
+    #[test]
+    fn esc_closes_cd_picker_without_running_anything() {
+        let cwd = tempdir().expect("create cwd");
+        let sub = cwd.path().join("untouched");
+        std::fs::create_dir(&sub).expect("create subdir");
+        let cwd_str = cwd.path().to_string_lossy().to_string();
+
+        let agent = spawn_test_terminal("cd-esc", &cwd_str);
+        let mut app = app_with_focused_terminal(agent);
+        app.suggestion_picker = Some(cd_picker_over(&cwd_str));
+
+        handle_suggestion_picker_key(&mut app, KeyCode::Esc).expect("handle esc");
+
+        assert!(app.suggestion_picker.is_none());
+        let updated = &app.terminal_agents[0];
+        assert_eq!(
+            updated.working_dir, cwd_str,
+            "Esc must not run the highlighted cd"
+        );
+        assert_eq!(input_buffer_text(updated), "");
     }
 }
