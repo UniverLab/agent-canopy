@@ -1720,6 +1720,42 @@ impl TaskTriggerHandler {
         }
     }
 
+    /// Resolve the project hash a delete tool should scope itself to: an
+    /// explicit `provided` value always wins (the same override the read
+    /// tools allow), otherwise it's auto-detected from the caller's session
+    /// workdir. Returns `None` if neither is available.
+    fn effective_project_hash_for_delete(
+        &self,
+        parts: Option<&Parts>,
+        provided: Option<&str>,
+    ) -> Option<String> {
+        if let Some(project_hash) = provided {
+            return Some(project_hash.to_string());
+        }
+        let agent_id = self.resolve_sync_agent_id(parts).ok()?;
+        resolve_effective_project_hash(&self.db, None, &agent_id)
+    }
+
+    /// `Some(error result)` if `node` belongs to a project other than
+    /// `effective_project_hash`, `None` if deletion may proceed. Nodes
+    /// without a `project_hash` aren't project-scoped, so they're always in
+    /// scope.
+    fn check_intelligence_delete_scope(
+        &self,
+        node: &crate::db::intelligence::IntelligenceNodeRecord,
+        effective_project_hash: Option<&str>,
+    ) -> Option<CallToolResult> {
+        let node_project_hash = node.project_hash.as_deref()?;
+        if effective_project_hash == Some(node_project_hash) {
+            return None;
+        }
+        Some(error_result(&format!(
+            "Intelligence node '{}' belongs to project '{}', which is outside the caller's \
+             active project scope. Pass project_hash explicitly to operate on it anyway.",
+            node.id, node_project_hash
+        )))
+    }
+
     /// Fetch knowledge for the context endpoint.
     /// When project_hash is provided, returns project-scoped facts/patterns
     /// alongside session nodes; otherwise returns all node kinds.
@@ -2800,6 +2836,122 @@ impl TaskTriggerHandler {
 
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&out).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        name = "intelligence_delete_node",
+        description = "Delete an intelligence node and every relation touching it, in one \
+         transaction (hard delete — the graph is meant to be able to forget). project_hash is \
+         auto-detected from the session workdir like the read tools; pass it explicitly to \
+         delete a node belonging to a different project. Returns a clear error, not a silent \
+         success, if the node does not exist."
+    )]
+    async fn intelligence_delete_node(
+        &self,
+        Parameters(params): Parameters<IntelligenceDeleteNodeParams>,
+        OptionalExtension(parts): OptionalExtension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_nursery(parts.as_ref())?;
+        if let Err(e) = validate_non_empty(&params.node_id, "node_id") {
+            return Ok(error_result(&e));
+        }
+
+        let effective_project_hash =
+            self.effective_project_hash_for_delete(parts.as_ref(), params.project_hash.as_deref());
+
+        let node = match self.db.get_intelligence_node(&params.node_id) {
+            Ok(Some(node)) => node,
+            Ok(None) => {
+                return Ok(error_result(&format!(
+                    "Intelligence node '{}' not found.",
+                    params.node_id
+                )))
+            }
+            Err(e) => return Err(McpError::internal_error(e.to_string(), None)),
+        };
+
+        if let Some(scope_error) =
+            self.check_intelligence_delete_scope(&node, effective_project_hash.as_deref())
+        {
+            return Ok(scope_error);
+        }
+
+        let relations_removed = match self.db.delete_intelligence_node(&params.node_id) {
+            Ok(Some(count)) => count,
+            Ok(None) => {
+                return Ok(error_result(&format!(
+                    "Intelligence node '{}' not found.",
+                    params.node_id
+                )))
+            }
+            Err(e) => return Err(McpError::internal_error(e.to_string(), None)),
+        };
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&serde_json::json!({
+                "deleted_node_id": params.node_id,
+                "relations_removed": relations_removed,
+            }))
+            .unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        name = "intelligence_delete_relation",
+        description = "Delete a single relation (edge) by ID, leaving both endpoint nodes \
+         intact. project_hash is auto-detected from the session workdir like the read tools; \
+         pass it explicitly to delete a relation touching a different project's nodes. Returns \
+         a clear error, not a silent success, if the relation does not exist."
+    )]
+    async fn intelligence_delete_relation(
+        &self,
+        Parameters(params): Parameters<IntelligenceDeleteRelationParams>,
+        OptionalExtension(parts): OptionalExtension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_nursery(parts.as_ref())?;
+
+        let effective_project_hash =
+            self.effective_project_hash_for_delete(parts.as_ref(), params.project_hash.as_deref());
+
+        let edge = match self.db.get_intelligence_edge(params.edge_id) {
+            Ok(Some(edge)) => edge,
+            Ok(None) => {
+                return Ok(error_result(&format!(
+                    "Intelligence relation '{}' not found.",
+                    params.edge_id
+                )))
+            }
+            Err(e) => return Err(McpError::internal_error(e.to_string(), None)),
+        };
+
+        for node_id in [&edge.from_node_id, &edge.to_node_id] {
+            if let Ok(Some(node)) = self.db.get_intelligence_node(node_id) {
+                if let Some(scope_error) =
+                    self.check_intelligence_delete_scope(&node, effective_project_hash.as_deref())
+                {
+                    return Ok(scope_error);
+                }
+            }
+        }
+
+        let removed = self
+            .db
+            .delete_intelligence_edge(params.edge_id)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        if !removed {
+            return Ok(error_result(&format!(
+                "Intelligence relation '{}' not found.",
+                params.edge_id
+            )));
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&serde_json::json!({
+                "deleted_edge_id": params.edge_id,
+            }))
+            .unwrap_or_default(),
         )]))
     }
 
@@ -14678,6 +14830,218 @@ mod endpoint_tests {
             .await
             .unwrap();
         assert!(is_err(&missing_root));
+    }
+
+    // ── intelligence_delete_node / intelligence_delete_relation ──────────
+
+    async fn upsert_intel_fact(
+        handler: &TaskTriggerHandler,
+        id: &str,
+        title: &str,
+        relations: Option<Vec<IntelligenceRelationParams>>,
+    ) {
+        let result = handler
+            .intelligence_upsert(
+                Parameters(IntelligenceUpsertParams {
+                    node_data: IntelligenceNodeParams {
+                        id: Some(id.to_string()),
+                        kind: "fact".to_string(),
+                        title: title.to_string(),
+                        body: "Test body".to_string(),
+                        metadata: None,
+                        project_hash: None,
+                        session_id: None,
+                        relations,
+                    },
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(!is_err(&result), "{}", text(&result));
+    }
+
+    #[tokio::test]
+    async fn intelligence_delete_node_removes_node_and_reports_relations() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let _agent_guard = AgentIdVar::set("agent-intel-delete-1");
+
+        upsert_intel_fact(&handler, "delete-a", "Node A", None).await;
+        upsert_intel_fact(
+            &handler,
+            "delete-b",
+            "Node B",
+            Some(vec![IntelligenceRelationParams {
+                to_node_id: "delete-a".to_string(),
+                relation: "supports".to_string(),
+                weight: None,
+            }]),
+        )
+        .await;
+        upsert_intel_fact(
+            &handler,
+            "delete-c",
+            "Node C",
+            Some(vec![IntelligenceRelationParams {
+                to_node_id: "delete-b".to_string(),
+                relation: "supports".to_string(),
+                weight: None,
+            }]),
+        )
+        .await;
+
+        // "delete-b" sits in the middle of a -> b, b -> c: two edges touch it.
+        let deleted = handler
+            .intelligence_delete_node(
+                Parameters(IntelligenceDeleteNodeParams {
+                    node_id: "delete-b".to_string(),
+                    project_hash: None,
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(!is_err(&deleted), "{}", text(&deleted));
+        let body = raw_text(&deleted);
+        assert!(body.contains("delete-b"));
+        assert!(body.contains("\"relations_removed\": 2"));
+
+        let searched = handler
+            .intelligence_search(
+                Parameters(IntelligenceSearchParams {
+                    query: "Node B".to_string(),
+                    kind: None,
+                    limit: Some(5),
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(!raw_text(&searched).contains("delete-b"));
+
+        // Neither surviving neighbor's graph walk should error or reference
+        // the removed middle node.
+        let from_a = handler
+            .intelligence_graph_walk(Parameters(IntelligenceGraphWalkParams {
+                node_id: "delete-a".to_string(),
+                depth: Some(3),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&from_a), "{}", text(&from_a));
+        assert!(!raw_text(&from_a).contains("delete-b"));
+
+        let from_c = handler
+            .intelligence_graph_walk(Parameters(IntelligenceGraphWalkParams {
+                node_id: "delete-c".to_string(),
+                depth: Some(3),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&from_c), "{}", text(&from_c));
+        assert!(!raw_text(&from_c).contains("delete-b"));
+    }
+
+    #[tokio::test]
+    async fn intelligence_delete_node_missing_id_returns_error_not_silent_success() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let _agent_guard = AgentIdVar::set("agent-intel-delete-2");
+
+        let deleted = handler
+            .intelligence_delete_node(
+                Parameters(IntelligenceDeleteNodeParams {
+                    node_id: "ghost-node".to_string(),
+                    project_hash: None,
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(is_err(&deleted));
+    }
+
+    #[tokio::test]
+    async fn intelligence_delete_relation_removes_edge_leaves_nodes_intact() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let _agent_guard = AgentIdVar::set("agent-intel-delete-3");
+
+        upsert_intel_fact(&handler, "rel-a", "Node A", None).await;
+        upsert_intel_fact(
+            &handler,
+            "rel-b",
+            "Node B",
+            Some(vec![IntelligenceRelationParams {
+                to_node_id: "rel-a".to_string(),
+                relation: "supports".to_string(),
+                weight: None,
+            }]),
+        )
+        .await;
+
+        let walked = handler
+            .intelligence_graph_walk(Parameters(IntelligenceGraphWalkParams {
+                node_id: "rel-b".to_string(),
+                depth: Some(1),
+            }))
+            .await
+            .unwrap();
+        let edge_id = serde_json::from_str::<serde_json::Value>(&raw_text(&walked))
+            .unwrap()
+            .get("edges")
+            .and_then(|edges| edges.as_array())
+            .and_then(|edges| edges.first())
+            .and_then(|edge| edge.get("id"))
+            .and_then(|id| id.as_i64())
+            .expect("edge id present in graph walk response");
+
+        let deleted = handler
+            .intelligence_delete_relation(
+                Parameters(IntelligenceDeleteRelationParams {
+                    edge_id,
+                    project_hash: None,
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(!is_err(&deleted), "{}", text(&deleted));
+
+        let walked_after = handler
+            .intelligence_graph_walk(Parameters(IntelligenceGraphWalkParams {
+                node_id: "rel-b".to_string(),
+                depth: Some(1),
+            }))
+            .await
+            .unwrap();
+        assert!(!raw_text(&walked_after).contains("rel-a"));
+
+        // Both endpoint nodes survive the relation delete.
+        let searched = handler
+            .intelligence_search(
+                Parameters(IntelligenceSearchParams {
+                    query: "Node".to_string(),
+                    kind: Some("fact".to_string()),
+                    limit: Some(10),
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        let search_body = raw_text(&searched);
+        assert!(search_body.contains("rel-a"));
+        assert!(search_body.contains("rel-b"));
+
+        let missing = handler
+            .intelligence_delete_relation(
+                Parameters(IntelligenceDeleteRelationParams {
+                    edge_id,
+                    project_hash: None,
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(is_err(&missing));
     }
 
     #[tokio::test]

@@ -255,6 +255,27 @@ pub struct IntelligenceGraphWalkParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct IntelligenceDeleteNodeParams {
+    /// ID of the intelligence node to delete.
+    pub node_id: String,
+    /// Optional project hash to explicitly scope the deletion, the same way
+    /// `intelligence_get_context` allows an explicit override of the
+    /// project auto-detected from the session workdir.
+    pub project_hash: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct IntelligenceDeleteRelationParams {
+    /// ID of the relation (edge) to delete, as returned in the `edges` list
+    /// of `intelligence_graph_walk`.
+    pub edge_id: i64,
+    /// Optional project hash to explicitly scope the deletion, the same way
+    /// `intelligence_get_context` allows an explicit override of the
+    /// project auto-detected from the session workdir.
+    pub project_hash: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetToolsParams {
     /// Scope of the action. One of: session_start, file_write, test_run, close_session, multi_agent.
     pub scope: String,

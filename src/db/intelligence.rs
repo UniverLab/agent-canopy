@@ -152,20 +152,88 @@ impl Database {
         }
     }
 
-    pub fn delete_intelligence_node(&self, id: &str) -> Result<()> {
+    /// Remove an intelligence node and every relation touching it, in one
+    /// transaction.
+    ///
+    /// Hard delete, not a soft-delete/tombstone: the graph is meant to be
+    /// able to forget bad or superseded knowledge, and a tombstone column
+    /// would require every read path (search, graph walk, context assembly)
+    /// to filter it out in the same change — a half-applied filter would
+    /// hide deleted nodes from search while `intelligence_get_context` kept
+    /// injecting them, which is worse than no deletion at all.
+    ///
+    /// Edges are not deleted by hand here: `intelligence_edges` declares
+    /// `ON DELETE CASCADE` on both `from_node_id` and `to_node_id`, and
+    /// `PRAGMA foreign_keys=ON` is set on every connection (see
+    /// `Database::new`), so deleting the node row cascades through both
+    /// directions automatically — a manual `DELETE FROM intelligence_edges`
+    /// alongside it would be duplicated logic that can drift. The relation
+    /// count returned to callers is captured before the delete since the
+    /// cascade itself doesn't report how many rows it removed. Both
+    /// `intelligence_edges` FK columns already have covering indexes
+    /// (`idx_intelligence_edges_from` / `idx_intelligence_edges_to`), so
+    /// this lookup and the cascade are both index-driven rather than a full
+    /// table scan.
+    ///
+    /// Returns `Ok(None)` if no node with `id` exists, so callers can
+    /// distinguish "already gone" from a successful delete rather than
+    /// treating a no-op as success.
+    pub fn delete_intelligence_node(&self, id: &str) -> Result<Option<usize>> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let tx = conn.transaction()?;
+
+        let relations_removed: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM intelligence_edges WHERE from_node_id = ?1 OR to_node_id = ?1",
+            rusqlite::params![id],
+            |row| row.get(0),
+        )?;
+
+        let rows_deleted = tx.execute(
+            "DELETE FROM intelligence_nodes WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
+
+        if rows_deleted == 0 {
+            return Ok(None);
+        }
+
+        tx.commit()?;
+        Ok(Some(relations_removed as usize))
+    }
+
+    /// Fetch a single relation (edge) by ID.
+    pub fn get_intelligence_edge(&self, edge_id: i64) -> Result<Option<IntelligenceEdgeRecord>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
-        conn.execute(
-            "DELETE FROM intelligence_edges WHERE from_node_id = ?1 OR to_node_id = ?1",
-            rusqlite::params![id],
+        let mut stmt = conn.prepare(
+            "SELECT id, from_node_id, to_node_id, relation, weight, created_at
+             FROM intelligence_edges WHERE id = ?1",
         )?;
-        conn.execute(
-            "DELETE FROM intelligence_nodes WHERE id = ?1",
-            rusqlite::params![id],
+        let mut rows = stmt.query(rusqlite::params![edge_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(Self::read_intelligence_edge(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Remove a single relation (edge) without touching either endpoint
+    /// node. Returns `false` if no edge with `edge_id` exists.
+    pub fn delete_intelligence_edge(&self, edge_id: i64) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows_deleted = conn.execute(
+            "DELETE FROM intelligence_edges WHERE id = ?1",
+            rusqlite::params![edge_id],
         )?;
-        Ok(())
+        Ok(rows_deleted > 0)
     }
 
     pub fn list_intelligence_nodes(
@@ -754,9 +822,122 @@ mod tests {
         let input = sample_node_input("node1");
         db.upsert_intelligence_node(input).unwrap();
 
-        db.delete_intelligence_node("node1").unwrap();
+        let relations_removed = db.delete_intelligence_node("node1").unwrap();
+        assert_eq!(relations_removed, Some(0));
         let retrieved = db.get_intelligence_node("node1").unwrap();
         assert!(retrieved.is_none());
+    }
+
+    #[test]
+    fn delete_intelligence_node_missing_returns_none() {
+        let db = test_db();
+        let result = db.delete_intelligence_node("nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn delete_intelligence_node_removes_edges_on_both_sides() {
+        let db = test_db();
+        db.upsert_intelligence_node(sample_node_input("a")).unwrap();
+        db.upsert_intelligence_node(IntelligenceNodeInput {
+            relations: Some(vec![IntelligenceRelationInput {
+                to_node_id: "a".to_string(),
+                relation: "supports".to_string(),
+                weight: None,
+            }]),
+            ..sample_node_input("b")
+        })
+        .unwrap();
+        db.upsert_intelligence_node(IntelligenceNodeInput {
+            relations: Some(vec![IntelligenceRelationInput {
+                to_node_id: "b".to_string(),
+                relation: "supports".to_string(),
+                weight: None,
+            }]),
+            ..sample_node_input("c")
+        })
+        .unwrap();
+
+        // "b" sits in the middle of a -> b, b -> c: two edges touch it.
+        let relations_removed = db.delete_intelligence_node("b").unwrap();
+        assert_eq!(relations_removed, Some(2));
+        assert!(db.get_intelligence_node("b").unwrap().is_none());
+        assert!(db.get_intelligence_node("a").unwrap().is_some());
+        assert!(db.get_intelligence_node("c").unwrap().is_some());
+        assert!(db.list_recent_intelligence_edges("a").unwrap().is_empty());
+        assert!(db.list_recent_intelligence_edges("c").unwrap().is_empty());
+    }
+
+    #[test]
+    fn graph_walk_after_deleting_middle_node_does_not_reference_it() {
+        let db = test_db();
+        db.upsert_intelligence_node(sample_node_input("a")).unwrap();
+        db.upsert_intelligence_node(IntelligenceNodeInput {
+            relations: Some(vec![IntelligenceRelationInput {
+                to_node_id: "a".to_string(),
+                relation: "supports".to_string(),
+                weight: None,
+            }]),
+            ..sample_node_input("b")
+        })
+        .unwrap();
+        db.upsert_intelligence_node(IntelligenceNodeInput {
+            relations: Some(vec![IntelligenceRelationInput {
+                to_node_id: "b".to_string(),
+                relation: "supports".to_string(),
+                weight: None,
+            }]),
+            ..sample_node_input("c")
+        })
+        .unwrap();
+
+        db.delete_intelligence_node("b").unwrap();
+
+        let from_a = db.walk_intelligence_graph("a", 3).unwrap().unwrap();
+        assert!(!from_a.nodes.iter().any(|n| n.id == "b"));
+        assert!(!from_a
+            .edges
+            .iter()
+            .any(|e| e.from_node_id == "b" || e.to_node_id == "b"));
+
+        let from_c = db.walk_intelligence_graph("c", 3).unwrap().unwrap();
+        assert!(!from_c.nodes.iter().any(|n| n.id == "b"));
+        assert!(!from_c
+            .edges
+            .iter()
+            .any(|e| e.from_node_id == "b" || e.to_node_id == "b"));
+    }
+
+    #[test]
+    fn delete_intelligence_edge_removes_single_relation_only() {
+        let db = test_db();
+        db.upsert_intelligence_node(sample_node_input("a")).unwrap();
+        db.upsert_intelligence_node(IntelligenceNodeInput {
+            relations: Some(vec![IntelligenceRelationInput {
+                to_node_id: "a".to_string(),
+                relation: "supports".to_string(),
+                weight: None,
+            }]),
+            ..sample_node_input("b")
+        })
+        .unwrap();
+
+        let edges = db.list_recent_intelligence_edges("a").unwrap();
+        assert_eq!(edges.len(), 1);
+        let edge_id = edges[0].id;
+
+        let removed = db.delete_intelligence_edge(edge_id).unwrap();
+        assert!(removed);
+        assert!(db.get_intelligence_edge(edge_id).unwrap().is_none());
+        assert!(db.get_intelligence_node("a").unwrap().is_some());
+        assert!(db.get_intelligence_node("b").unwrap().is_some());
+    }
+
+    #[test]
+    fn delete_intelligence_edge_missing_returns_false() {
+        let db = test_db();
+        let removed = db.delete_intelligence_edge(999999).unwrap();
+        assert!(!removed);
     }
 
     #[test]
