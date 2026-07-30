@@ -266,17 +266,21 @@ const SIDEBAR_TABS: [SidebarLayer; 3] = [
 /// than it buys, since the tab's own body shows the items anyway.
 fn tab_cell_text(label: &str, width: usize) -> String {
     let text = truncate_str(label, width);
-    let pad = width.saturating_sub(text.chars().count()) / 2;
-    format!("{}{text}", " ".repeat(pad))
+    let slack = width.saturating_sub(text.chars().count());
+    let left_pad = slack / 2;
+    let right_pad = slack - left_pad;
+    format!("{}{text}{}", " ".repeat(left_pad), " ".repeat(right_pad))
 }
 
 /// Draws the sidebar's `Live / Automation / Knowledge` tab strip: one cell
 /// per tab, each an equal share of `area.width` (the last cell absorbs the
 /// rounding remainder so the three always cover the full row exactly — no
 /// gap for the background paint underneath to show through). The active
-/// tab's cell is filled with `theme.header_color`; inactive cells are
-/// dimmed text on the sidebar background. Registers each cell's hit box in
-/// `sidebar_tab_click_map` for mouse clicks.
+/// tab's label renders in `theme.header_color` and bold, over the default
+/// background; inactive cells are dimmed text with no modifier. Registers
+/// each cell's hit box in `sidebar_tab_click_map` for mouse clicks — the
+/// hit box always spans the full cell width, regardless of the label's
+/// centring.
 fn draw_sidebar_tab_bar(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     if area.height == 0 || area.width == 0 {
         return;
@@ -295,22 +299,17 @@ fn draw_sidebar_tab_bar(frame: &mut Frame, area: Rect, app: &mut App, theme: &Th
 
         let active = app.sidebar_layer == layer;
         let text = tab_cell_text(layer_label(layer), width as usize);
-        let (fg, bg) = if active {
-            (Color::Black, theme.header_color)
+        let (fg, modifier) = if active {
+            (theme.header_color, Modifier::BOLD)
         } else {
-            (theme.dim_text, Color::Reset)
-        };
-        let modifier = if active {
-            Modifier::BOLD
-        } else {
-            Modifier::empty()
+            (theme.dim_text, Modifier::empty())
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 text,
                 Style::default().fg(fg).add_modifier(modifier),
             )))
-            .style(Style::default().bg(bg)),
+            .style(Style::default().bg(Color::Reset)),
             Rect::new(x, area.y, width, 1),
         );
         app.sidebar_tab_click_map
@@ -2329,10 +2328,14 @@ mod tests {
 
     #[test]
     fn tab_cell_text_centers_the_label_when_there_is_room() {
-        // 20 columns, 10-char label → 5 columns of padding each side, but
-        // only the leading half is materialized (the cell's own background
-        // covers the trailing half).
-        assert_eq!(tab_cell_text("Automation", 20), "     Automation");
+        // 20 columns, 10-char label → 5 columns of padding on each side.
+        assert_eq!(tab_cell_text("Automation", 20), "     Automation     ");
+    }
+
+    #[test]
+    fn tab_cell_text_odd_slack_gives_the_extra_column_to_the_right() {
+        // 11 columns, 4-char label ("Live") → 7 slack columns, split 3/4.
+        assert_eq!(tab_cell_text("Live", 11), "   Live    ");
     }
 
     #[test]
@@ -2391,6 +2394,61 @@ mod tests {
         assert_eq!(last_col_end - first_col, 33);
         for pair in app.sidebar_tab_click_map.windows(2) {
             assert_eq!(pair[0].3, pair[1].2, "cells must be contiguous");
+        }
+    }
+
+    #[test]
+    fn draw_sidebar_tab_bar_marks_the_active_tab_with_accent_bold_and_no_fill() {
+        use crate::db::Database;
+        use crate::tui::app::App;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::sync::Arc;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
+        app.sidebar_layer = SidebarLayer::Live;
+
+        let theme = Theme::classic();
+        let backend = TestBackend::new(33, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_sidebar(frame, area, &mut app, &theme);
+            })
+            .unwrap();
+
+        let (_, row, start, end) = app.sidebar_tab_click_map[0];
+        let buffer = terminal.backend().buffer().clone();
+        let mut saw_accent_glyph = false;
+        for x in start..end {
+            let cell = &buffer[(x, row)];
+            assert_eq!(
+                cell.bg,
+                Color::Reset,
+                "active tab cell must not fill its background"
+            );
+            if cell.symbol() != " " {
+                assert_eq!(cell.fg, theme.header_color);
+                assert!(cell.modifier.contains(Modifier::BOLD));
+                saw_accent_glyph = true;
+            }
+        }
+        assert!(saw_accent_glyph, "expected the active label to be drawn");
+
+        let (_, row, start, end) = app.sidebar_tab_click_map[1];
+        for x in start..end {
+            let cell = &buffer[(x, row)];
+            assert_eq!(cell.bg, Color::Reset);
+            if cell.symbol() != " " {
+                assert_eq!(cell.fg, theme.dim_text);
+                assert!(!cell.modifier.contains(Modifier::BOLD));
+            }
         }
     }
 
