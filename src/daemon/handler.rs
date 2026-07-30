@@ -2184,6 +2184,7 @@ impl TaskTriggerHandler {
         Parameters(params): Parameters<TaskModelsParams>,
     ) -> Result<CallToolResult, McpError> {
         let force_refresh = params.refresh.unwrap_or(false);
+        let full = params.full.unwrap_or(false);
 
         // Optional platform filter, validated against the platforms actually
         // configured in canopy (registry-driven) when that config is present.
@@ -2204,7 +2205,7 @@ impl TaskTriggerHandler {
             // when the registry gives us an enumeration command we use it and
             // skip models.dev entirely — never requiring it to be reachable.
             if let Some((binary, args)) = platform_enumeration_cmd(platform) {
-                return Ok(native_models_result(platform, binary, args, force_refresh).await);
+                return Ok(native_models_result(platform, binary, args, force_refresh, full).await);
             }
         }
 
@@ -2226,7 +2227,7 @@ impl TaskTriggerHandler {
         };
         let crate::domain::models_db::CatalogLoad { catalog, source } = load;
 
-        let listing = match platform {
+        let (listing, truncation) = match platform {
             Some(platform) => {
                 let providers = crate::domain::models_db::providers_for_cli(platform);
                 if providers.is_empty() {
@@ -2235,20 +2236,26 @@ impl TaskTriggerHandler {
                          Omit `platform` to list all providers.",
                     )));
                 }
-                format!(
-                    "Models available to platform '{platform}' (providers: {}):\n{}",
-                    providers.join(", "),
-                    format_platform_models(&catalog, providers)
+                let (formatted, trunc) = format_platform_models(&catalog, providers, full);
+                (
+                    format!(
+                        "Models available to platform '{platform}' (providers: {}):\n{formatted}",
+                        providers.join(", ")
+                    ),
+                    trunc,
                 )
             }
-            None => format!(
-                "Available models (use the model id as the model field):\n{}",
-                format_catalog_models(&catalog)
-            ),
+            None => {
+                let (formatted, trunc) = format_catalog_models(&catalog, full);
+                (
+                    format!("Available models (use the model id as the model field):\n{formatted}"),
+                    trunc,
+                )
+            }
         };
 
         Ok(CallToolResult::success(vec![Content::text(
-            model_result_footer(&listing, source, catalog.fetched_at),
+            model_result_footer(&listing, source, catalog.fetched_at, &truncation),
         )]))
     }
 
@@ -5470,6 +5477,7 @@ async fn native_models_result(
     binary: String,
     args: String,
     force_refresh: bool,
+    full: bool,
 ) -> CallToolResult {
     let platform_owned = platform.to_string();
     let load = tokio::task::spawn_blocking(move || {
@@ -5487,15 +5495,16 @@ async fn native_models_result(
     };
     let crate::domain::models_db::NativeLoad { catalog, source } = load;
 
+    let (listing, truncation) = format_native_models(&catalog.ids, full);
     let listing = format!(
         "Models available to platform '{platform}' (enumerated from the CLI — ids are \
-         passable verbatim):\n{}",
-        format_native_models(&catalog.ids)
+         passable verbatim):\n{listing}"
     );
     CallToolResult::success(vec![Content::text(model_result_footer(
         &listing,
         source,
         catalog.fetched_at,
+        &truncation,
     ))])
 }
 
@@ -5505,17 +5514,22 @@ fn model_result_footer(
     listing: &str,
     source: crate::domain::models_db::CatalogSource,
     fetched_at: std::time::SystemTime,
+    truncation: &crate::daemon::handler_formatting::ModelTruncation,
 ) -> String {
     let stale_hint = if source == crate::domain::models_db::CatalogSource::Stale {
         " (the source was unreachable — this cache may be out of date; retry with refresh: true)"
     } else {
         ""
     };
+    let truncation_notice = truncation
+        .notice()
+        .map(|n| format!("\n{n}"))
+        .unwrap_or_default();
     format!(
         "{listing}\n\n\
          Source: {}{stale_hint} · fetched_at: {}\n\
          Note: model availability also depends on the CLI's configured API keys. \
-         If model is omitted, the CLI uses its own default.",
+         If model is omitted, the CLI uses its own default.{truncation_notice}",
         source.as_str(),
         format_system_time(fetched_at),
     )
@@ -11366,11 +11380,13 @@ mod coverage_tests {
 
     #[test]
     fn footer_live_source() {
+        use crate::daemon::handler_formatting::ModelTruncation;
         use crate::domain::models_db::CatalogSource;
         let f = super::model_result_footer(
             "Models:",
             CatalogSource::Live,
             std::time::SystemTime::now(),
+            &ModelTruncation::default(),
         );
         assert!(f.contains("Source: live"));
         assert!(!f.contains("out of date"));
@@ -11378,11 +11394,13 @@ mod coverage_tests {
 
     #[test]
     fn footer_stale_source() {
+        use crate::daemon::handler_formatting::ModelTruncation;
         use crate::domain::models_db::CatalogSource;
         let f = super::model_result_footer(
             "Models:",
             CatalogSource::Stale,
             std::time::SystemTime::now(),
+            &ModelTruncation::default(),
         );
         assert!(f.contains("Source: stale"));
         assert!(f.contains("out of date"));
@@ -12554,6 +12572,7 @@ mod endpoint_tests {
             .task_models(Parameters(TaskModelsParams {
                 platform: Some("not-configured-platform".to_string()),
                 refresh: None,
+                full: None,
             }))
             .await
             .unwrap();
@@ -12591,6 +12610,7 @@ mod endpoint_tests {
             .task_models(Parameters(TaskModelsParams {
                 platform: Some("native-cli".to_string()),
                 refresh: Some(true),
+                full: None,
             }))
             .await
             .unwrap();
