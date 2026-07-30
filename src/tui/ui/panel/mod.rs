@@ -290,7 +290,7 @@ fn draw_log_panel_focus(frame: &mut Frame, area: Rect, app: &mut App, theme: &Th
     }
 }
 
-fn draw_preview_panel(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) -> bool {
+fn draw_preview_panel(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) -> bool {
     if app.playground_active {
         draw_playground_panel(frame, area, app, theme);
         return true;

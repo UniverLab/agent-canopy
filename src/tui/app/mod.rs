@@ -38,6 +38,7 @@ pub mod utils;
 pub(crate) use session_resume::build_resumed_session_args;
 pub use terminal_search::TerminalSearch;
 pub(crate) use types::ContextTransferSource;
+pub(crate) use types::LoopLiveFocus;
 pub use types::{
     AgentEntry, AgentSectionFocus, App, AutomationKind, Focus, ProjectTab, SidebarLayer,
 };
@@ -118,6 +119,11 @@ impl App {
             loop_live_state: None,
             loop_graph_follow: true,
             loop_graph_selected_node: None,
+            loop_live_focus: LoopLiveFocus::Graph,
+            loop_spec_strip_selected: None,
+            loop_spec_strip_scroll: 0,
+            loop_spec_strip_capacity: 0,
+            loop_spec_strip_click_map: Vec::new(),
             backlog_specs: Vec::new(),
             selected_backlog: 0,
             global_rag_queue: Vec::new(),
@@ -980,6 +986,9 @@ impl App {
             self.loop_live_state = None;
             self.loop_graph_follow = true;
             self.loop_graph_selected_node = None;
+            self.loop_live_focus = LoopLiveFocus::Graph;
+            self.loop_spec_strip_selected = None;
+            self.loop_spec_strip_scroll = 0;
             return;
         }
 
@@ -1002,6 +1011,9 @@ impl App {
             self.loop_selected_node = 0;
             self.loop_graph_follow = true;
             self.loop_graph_selected_node = None;
+            self.loop_live_focus = LoopLiveFocus::Graph;
+            self.loop_spec_strip_selected = None;
+            self.loop_spec_strip_scroll = 0;
         } else {
             self.clamp_loop_selection();
         }
@@ -1030,6 +1042,19 @@ impl App {
             if !still_present {
                 self.loop_graph_follow = true;
                 self.loop_graph_selected_node = None;
+            }
+        }
+
+        // Same rule for the spec marker strip's manual selection: a spec
+        // that's dropped out of the (possibly just-advanced) queue can't
+        // stay highlighted.
+        if let Some(selected) = self.loop_spec_strip_selected.as_deref() {
+            let still_present = self
+                .loop_live_state
+                .as_ref()
+                .is_some_and(|state| state.spec_queue.iter().any(|e| e.spec_id == selected));
+            if !still_present {
+                self.loop_spec_strip_selected = None;
             }
         }
     }
@@ -1064,6 +1089,70 @@ impl App {
     pub fn loop_graph_reset_follow(&mut self) {
         self.loop_graph_follow = true;
         self.loop_graph_selected_node = None;
+    }
+
+    /// Toggle plain-arrow-key ownership between the graph and the spec
+    /// marker strip. The two are otherwise independent: switching focus
+    /// never touches `loop_graph_follow` or the strip's own selection.
+    pub fn loop_live_toggle_focus(&mut self) {
+        self.loop_live_focus = match self.loop_live_focus {
+            LoopLiveFocus::Graph => LoopLiveFocus::SpecStrip,
+            LoopLiveFocus::SpecStrip => LoopLiveFocus::Graph,
+        };
+    }
+
+    /// Move the marker strip's selection to the next/previous spec in queue
+    /// order, entering manual selection. Never touches `loop_graph_follow` —
+    /// selecting a spec by hand in the strip is independent of the graph's
+    /// own follow/manual state. No-op when there's no live state or queue.
+    pub fn loop_spec_strip_move_selection(&mut self, forward: bool) {
+        let ids: Vec<String> = match self.loop_live_state.as_ref() {
+            Some(state) if !state.spec_queue.is_empty() => {
+                state.spec_queue.iter().map(|e| e.spec_id.clone()).collect()
+            }
+            _ => return,
+        };
+
+        let current = self.loop_spec_strip_selected.clone();
+        let idx = current
+            .as_deref()
+            .and_then(|id| ids.iter().position(|n| n == id));
+        let next_idx = match idx {
+            // Nothing selected yet: land on the strip's first/last item
+            // rather than skipping past it as if index 0 were already
+            // selected (the graph's `loop_graph_move_highlight` can assume
+            // that, since auto-follow always has *some* node highlighted;
+            // the strip starts with no selection at all).
+            None => {
+                if forward {
+                    0
+                } else {
+                    ids.len() - 1
+                }
+            }
+            Some(idx) if forward => (idx + 1) % ids.len(),
+            Some(idx) => idx.checked_sub(1).unwrap_or(ids.len() - 1),
+        };
+        self.loop_spec_strip_selected = Some(ids[next_idx].clone());
+        self.loop_spec_strip_scroll = scroll_into_view(
+            self.loop_spec_strip_scroll,
+            next_idx,
+            self.loop_spec_strip_capacity,
+        );
+    }
+
+    /// Select a spec directly by id in the marker strip (mouse click path).
+    /// Ignored if the id isn't in the current queue.
+    pub fn loop_spec_strip_select(&mut self, spec_id: String) {
+        let exists = self
+            .loop_live_state
+            .as_ref()
+            .is_some_and(|state| state.spec_queue.iter().any(|e| e.spec_id == spec_id));
+        if !exists {
+            return;
+        }
+        self.loop_spec_strip_selected = Some(spec_id);
+        self.loop_live_focus = LoopLiveFocus::SpecStrip;
     }
 
     /// The node id currently highlighted in the live loop view: the
@@ -3138,6 +3227,22 @@ fn step_ring_index(idx: usize, len: usize, forward: bool) -> usize {
     }
 }
 
+/// Shift a scroll offset by the minimum amount needed to bring `idx` into
+/// `[offset, offset + capacity)` — used to keep the spec marker strip's
+/// keyboard-driven selection visible without jumping further than needed.
+fn scroll_into_view(offset: usize, idx: usize, capacity: usize) -> usize {
+    if capacity == 0 {
+        return 0;
+    }
+    if idx < offset {
+        idx
+    } else if idx >= offset + capacity {
+        idx + 1 - capacity
+    } else {
+        offset
+    }
+}
+
 fn calculate_log_hash(raw_log: &str) -> u64 {
     raw_log.bytes().enumerate().fold(0u64, |acc, (idx, byte)| {
         acc.wrapping_add((byte as u64).wrapping_mul(idx as u64 + 1))
@@ -3199,12 +3304,14 @@ mod tests {
         adaptive_change_score, adaptive_poll_interval_ms, blend_optional_f32, blend_optional_f64,
         build_resumed_session_args, calculate_log_hash, lerp_f32, lerp_u64, log_contains_error,
         log_contains_spawn, log_contains_success, process_is_alive, process_outlives_grace,
-        sample_from, should_resume_session, step_ring_index, SystemSample,
+        sample_from, scroll_into_view, should_resume_session, step_ring_index, SystemSample,
     };
     use crate::db::session::InteractiveSession;
     use crate::db::Database;
+    use crate::domain::loops::{LoopSpecStatus, LoopStatus};
+    use crate::tui::app::loop_live_state::{LoopLiveState, SpecQueueEntry};
     use crate::tui::app::types::{
-        AgentEntry, App, AutomationKind, Focus, ProjectTab, SidebarLayer,
+        AgentEntry, App, AutomationKind, Focus, LoopLiveFocus, ProjectTab, SidebarLayer,
     };
     use std::sync::Arc;
     use tempfile::{tempdir, NamedTempFile};
@@ -4878,6 +4985,125 @@ mod tests {
         let info = app.loop_graph_highlighted_node_run_info();
         assert!(info.status.is_none());
         assert!(info.output_tail.is_none());
+    }
+
+    fn spec_queue_entry(id: &str, status: LoopSpecStatus) -> SpecQueueEntry {
+        SpecQueueEntry {
+            spec_id: id.to_string(),
+            spec_name: format!("Spec {id}"),
+            status,
+            failure_reason: None,
+        }
+    }
+
+    fn app_with_spec_queue(ids: &[&str]) -> App {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.loop_live_state = Some(LoopLiveState {
+            loop_id: "lp1".to_string(),
+            loop_name: "loop".to_string(),
+            loop_status: LoopStatus::Running,
+            workdir: "/tmp".to_string(),
+            trigger_type: "manual".to_string(),
+            schedule_expr: None,
+            watch_path: None,
+            autorun_at: None,
+            spec_queue: ids
+                .iter()
+                .map(|id| spec_queue_entry(id, LoopSpecStatus::Pending))
+                .collect(),
+            done_count: 0,
+            total_count: ids.len(),
+            current_spec_id: None,
+            effective_nodes: Vec::new(),
+            effective_edges: Vec::new(),
+            ensembles: Vec::new(),
+            current_node_id: None,
+            current_node_status: None,
+            current_node_started_at: None,
+            current_node_iteration: None,
+            current_node_output_tail: None,
+        });
+        app
+    }
+
+    #[test]
+    fn loop_spec_strip_move_selection_cycles_through_queue_and_wraps() {
+        let mut app = app_with_spec_queue(&["s1", "s2", "s3"]);
+        assert!(app.loop_spec_strip_selected.is_none());
+
+        app.loop_spec_strip_move_selection(true);
+        assert_eq!(app.loop_spec_strip_selected.as_deref(), Some("s1"));
+        app.loop_spec_strip_move_selection(true);
+        assert_eq!(app.loop_spec_strip_selected.as_deref(), Some("s2"));
+        app.loop_spec_strip_move_selection(true);
+        assert_eq!(app.loop_spec_strip_selected.as_deref(), Some("s3"));
+        // Wraps back to the first spec.
+        app.loop_spec_strip_move_selection(true);
+        assert_eq!(app.loop_spec_strip_selected.as_deref(), Some("s1"));
+
+        // Backward wraps the other way.
+        app.loop_spec_strip_move_selection(false);
+        assert_eq!(app.loop_spec_strip_selected.as_deref(), Some("s3"));
+
+        // Selecting a spec by hand (the mouse click path) and then moving by
+        // keyboard from that point lands on the same spec a second keyboard
+        // move would — click and keyboard share one selection.
+        app.loop_spec_strip_select("s2".to_string());
+        assert_eq!(app.loop_spec_strip_selected.as_deref(), Some("s2"));
+        app.loop_spec_strip_move_selection(true);
+        assert_eq!(app.loop_spec_strip_selected.as_deref(), Some("s3"));
+    }
+
+    #[test]
+    fn loop_spec_strip_move_selection_never_touches_graph_follow() {
+        let mut app = app_with_spec_queue(&["s1", "s2"]);
+        assert!(app.loop_graph_follow);
+        app.loop_spec_strip_move_selection(true);
+        assert!(
+            app.loop_graph_follow,
+            "selecting a spec in the strip must not disturb the graph's own follow state"
+        );
+    }
+
+    #[test]
+    fn loop_spec_strip_select_ignores_unknown_spec_id() {
+        let mut app = app_with_spec_queue(&["s1", "s2"]);
+        app.loop_spec_strip_select("does-not-exist".to_string());
+        assert!(app.loop_spec_strip_selected.is_none());
+    }
+
+    #[test]
+    fn loop_spec_strip_select_focuses_the_strip() {
+        let mut app = app_with_spec_queue(&["s1", "s2"]);
+        assert_eq!(app.loop_live_focus, LoopLiveFocus::Graph);
+        app.loop_spec_strip_select("s1".to_string());
+        assert_eq!(app.loop_live_focus, LoopLiveFocus::SpecStrip);
+    }
+
+    #[test]
+    fn loop_live_toggle_focus_toggles_between_graph_and_spec_strip() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        assert_eq!(app.loop_live_focus, LoopLiveFocus::Graph);
+        app.loop_live_toggle_focus();
+        assert_eq!(app.loop_live_focus, LoopLiveFocus::SpecStrip);
+        app.loop_live_toggle_focus();
+        assert_eq!(app.loop_live_focus, LoopLiveFocus::Graph);
+    }
+
+    #[test]
+    fn scroll_into_view_only_moves_when_index_leaves_the_window() {
+        // Already visible: offset unchanged.
+        assert_eq!(scroll_into_view(2, 3, 4), 2);
+        // Before the window: jump so idx becomes the first visible.
+        assert_eq!(scroll_into_view(5, 1, 4), 1);
+        // At/after the window's far edge: shift the minimum amount needed.
+        assert_eq!(scroll_into_view(0, 4, 4), 1);
+        // Zero capacity never scrolls.
+        assert_eq!(scroll_into_view(5, 9, 0), 0);
     }
 
     #[test]

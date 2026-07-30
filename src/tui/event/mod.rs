@@ -294,6 +294,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
         return Ok(());
     }
 
+    if handle_loop_live_panel_mouse(app, &mouse) {
+        return Ok(());
+    }
+
     if try_forward_mouse_to_pty(app, &mouse) {
         // The child program owns the mouse; any pending selection is stale.
         app.terminal_selection = None;
@@ -541,6 +545,75 @@ fn handle_project_panel_mouse(app: &mut App, mouse: &MouseEvent) -> bool {
         }
         _ => false,
     }
+}
+
+/// Handle a mouse event landing on the live loop view's spec marker strip —
+/// reuses the click-map-populated-during-draw pattern from the sidebar and
+/// project panel rather than a second hit-testing mechanism. A left-click on
+/// a chip selects that spec (entering manual selection, same as arrow-key
+/// navigation); the scroll wheel over the chip row pages a truncated strip.
+/// Returns `true` if consumed.
+fn handle_loop_live_panel_mouse(app: &mut App, mouse: &MouseEvent) -> bool {
+    if app.focus != Focus::Preview
+        || app.sidebar_layer != SidebarLayer::Automation
+        || app.automation_kind != crate::tui::app::AutomationKind::Loop
+    {
+        return false;
+    }
+    let (panel_w, panel_h) = app.last_panel_inner;
+    let panel_rect =
+        ratatui::layout::Rect::new(app.last_panel_x, app.last_panel_y, panel_w, panel_h);
+    if !rect_contains_point(panel_rect, mouse.column, mouse.row) {
+        return false;
+    }
+
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            match loop_spec_strip_at(app, mouse.row, mouse.column) {
+                Some(spec_id) => {
+                    app.loop_spec_strip_select(spec_id);
+                    true
+                }
+                None => false,
+            }
+        }
+        MouseEventKind::ScrollUp if loop_spec_strip_row(app) == Some(mouse.row) => {
+            scroll_loop_spec_strip(app, 1);
+            true
+        }
+        MouseEventKind::ScrollDown if loop_spec_strip_row(app) == Some(mouse.row) => {
+            scroll_loop_spec_strip(app, -1);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Map a loop-live-panel (row, col) to the spec id whose marker chip is
+/// rendered there, via the click map populated during draw.
+fn loop_spec_strip_at(app: &App, row: u16, col: u16) -> Option<String> {
+    app.loop_spec_strip_click_map
+        .iter()
+        .find(|&&(_, chip_row, start, end)| row == chip_row && col >= start && col < end)
+        .map(|(id, _, _, _)| id.clone())
+}
+
+/// The screen row the marker strip's chips are rendered on, if any are
+/// currently visible (empty when there's no spec queue to show).
+fn loop_spec_strip_row(app: &App) -> Option<u16> {
+    app.loop_spec_strip_click_map
+        .first()
+        .map(|&(_, row, _, _)| row)
+}
+
+fn scroll_loop_spec_strip(app: &mut App, dir: i32) {
+    let total = app
+        .loop_live_state
+        .as_ref()
+        .map_or(0, |state| state.spec_queue.len());
+    let capacity = app.loop_spec_strip_capacity.max(1);
+    app.loop_spec_strip_scroll =
+        clamp_sidebar_scroll(app.loop_spec_strip_scroll, total, capacity, dir);
 }
 
 /// Map a main-panel column (on the tab-bar row) to the `ProjectTab` rendered
@@ -1636,6 +1709,145 @@ mod project_panel_mouse_tests {
             Some(ProjectTab::Backlog),
             "leaving Knowledge must not itself change the remembered tab"
         );
+    }
+}
+
+#[cfg(test)]
+mod loop_live_panel_mouse_tests {
+    use super::*;
+    use crate::db::Database;
+    use crate::domain::loops::{LoopSpecStatus, LoopStatus};
+    use crate::tui::app::loop_live_state::{LoopLiveState, SpecQueueEntry};
+    use crate::tui::app::{AutomationKind, LoopLiveFocus};
+    use std::sync::Arc;
+    use tempfile::{tempdir, NamedTempFile};
+
+    fn test_db() -> Arc<Database> {
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        Arc::new(Database::new(&path).expect("create test db"))
+    }
+
+    fn spec_entry(id: &str, status: LoopSpecStatus) -> SpecQueueEntry {
+        SpecQueueEntry {
+            spec_id: id.to_string(),
+            spec_name: format!("Spec {id}"),
+            status,
+            failure_reason: None,
+        }
+    }
+
+    /// Builds an App on the live loop view with a 3-spec queue and a marker
+    /// strip click map matching what `draw_loop_live_view` would have
+    /// produced for chips at columns `[0,3)`, `[4,7)`, `[8,11)` on row 5.
+    fn app_on_loop_live_view() -> App {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.focus = Focus::Preview;
+        app.sidebar_layer = SidebarLayer::Automation;
+        app.automation_kind = AutomationKind::Loop;
+        app.loop_live_state = Some(LoopLiveState {
+            loop_id: "lp1".to_string(),
+            loop_name: "loop".to_string(),
+            loop_status: LoopStatus::Running,
+            workdir: "/tmp".to_string(),
+            trigger_type: "manual".to_string(),
+            schedule_expr: None,
+            watch_path: None,
+            autorun_at: None,
+            spec_queue: vec![
+                spec_entry("s1", LoopSpecStatus::Completed),
+                spec_entry("s2", LoopSpecStatus::Running),
+                spec_entry("s3", LoopSpecStatus::Failed),
+            ],
+            done_count: 1,
+            total_count: 3,
+            current_spec_id: Some("s2".to_string()),
+            effective_nodes: Vec::new(),
+            effective_edges: Vec::new(),
+            ensembles: Vec::new(),
+            current_node_id: None,
+            current_node_status: None,
+            current_node_started_at: None,
+            current_node_iteration: None,
+            current_node_output_tail: None,
+        });
+
+        app.last_panel_x = 0;
+        app.last_panel_y = 2;
+        app.last_panel_inner = (40, 20);
+        app.loop_spec_strip_click_map = vec![
+            ("s1".to_string(), 5, 0, 3),
+            ("s2".to_string(), 5, 4, 7),
+            ("s3".to_string(), 5, 8, 11),
+        ];
+        app.loop_spec_strip_capacity = 3;
+        app
+    }
+
+    #[test]
+    fn clicking_a_marker_selects_that_spec_and_focuses_the_strip() {
+        let mut app = app_on_loop_live_view();
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 9,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        let consumed = handle_loop_live_panel_mouse(&mut app, &mouse);
+
+        assert!(consumed);
+        assert_eq!(app.loop_spec_strip_selected.as_deref(), Some("s3"));
+        assert_eq!(app.loop_live_focus, LoopLiveFocus::SpecStrip);
+    }
+
+    #[test]
+    fn clicking_the_gap_between_chips_is_not_consumed() {
+        let mut app = app_on_loop_live_view();
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        let consumed = handle_loop_live_panel_mouse(&mut app, &mouse);
+
+        assert!(!consumed);
+        assert!(app.loop_spec_strip_selected.is_none());
+    }
+
+    #[test]
+    fn scroll_over_the_marker_row_pages_the_strip() {
+        let mut app = app_on_loop_live_view();
+        app.loop_spec_strip_capacity = 1; // force scrolling to matter
+        let mouse = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        let consumed = handle_loop_live_panel_mouse(&mut app, &mouse);
+
+        assert!(consumed);
+        assert_eq!(app.loop_spec_strip_scroll, 1);
+    }
+
+    #[test]
+    fn mouse_ignored_when_not_on_the_loop_live_view() {
+        let mut app = app_on_loop_live_view();
+        app.automation_kind = AutomationKind::Agent;
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 9,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        let consumed = handle_loop_live_panel_mouse(&mut app, &mouse);
+
+        assert!(!consumed);
+        assert!(app.loop_spec_strip_selected.is_none());
     }
 }
 

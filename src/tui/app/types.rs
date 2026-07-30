@@ -225,6 +225,18 @@ pub enum AgentSectionFocus {
     Brain,
 }
 
+/// Which sub-region of the live loop view owns plain arrow-key navigation:
+/// the node graph (`loop_graph_move_highlight`, the long-standing default)
+/// or the spec marker strip at the top (`loop_spec_strip_move_selection`).
+/// Toggled with Tab/BackTab while a loop is the active sidebar selection —
+/// see `on_loop` in `crate::tui::event::home_preview`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum LoopLiveFocus {
+    #[default]
+    Graph,
+    SpecStrip,
+}
+
 #[derive(Clone)]
 pub(crate) enum LoopEditorMode {
     AgentPrompt,
@@ -473,6 +485,24 @@ pub struct App {
     /// The node id manually highlighted in the live loop view's graph.
     /// Only meaningful while `loop_graph_follow` is `false`.
     pub(crate) loop_graph_selected_node: Option<String>,
+    /// Which sub-region of the live loop view plain arrow keys drive.
+    /// Reset to `Graph` whenever the selected loop changes.
+    pub(crate) loop_live_focus: LoopLiveFocus,
+    /// The spec id manually selected in the live loop view's marker strip
+    /// (independent of `current_spec_id` / the graph's own follow state —
+    /// selecting a spec here never touches `loop_graph_follow`). `None`
+    /// means the strip shows the running/next-pending spec by default.
+    pub(crate) loop_spec_strip_selected: Option<String>,
+    /// First visible index into `LoopLiveState::spec_queue` for the marker
+    /// strip, when there are more specs than fit in the panel's width.
+    pub(crate) loop_spec_strip_scroll: usize,
+    /// How many marker chips fit in the panel's width on the last render —
+    /// used to keep keyboard navigation's scroll offset in sync with what's
+    /// actually drawn. Populated in `draw_loop_live_view`.
+    pub(crate) loop_spec_strip_capacity: usize,
+    /// Mouse hit-test cells for the marker strip, populated during draw:
+    /// `(spec id, row, col_start, col_end)` — mirrors `sidebar_tab_click_map`.
+    pub(crate) loop_spec_strip_click_map: Vec<(String, u16, u16, u16)>,
     /// Standalone/backlog specs (no loop yet), filtered to the selected
     /// project's workdir tag when a project is selected. Refreshed alongside
     /// `projects` in `App::refresh_projects`.

@@ -60,6 +60,10 @@ pub(crate) struct SpecQueueEntry {
     pub spec_id: String,
     pub spec_name: String,
     pub status: LoopSpecStatus,
+    /// Why this spec ended up `Failed`/`Skipped`: the admin-recorded reason
+    /// if it was administratively transitioned, else the output tail of its
+    /// last run. `None` for every other status.
+    pub failure_reason: Option<String>,
 }
 
 /// One ensemble (F1) collapsed for the graph view: its join node id (so the
@@ -251,13 +255,38 @@ fn build_spec_queue(db: &Database, lp: &crate::domain::loops::Loop) -> Vec<SpecQ
         .into_iter()
         .filter_map(|spec_id| {
             let spec = db.get_loop_spec(&spec_id).ok().flatten()?;
+            let failure_reason = spec_failure_reason(db, &spec);
             Some(SpecQueueEntry {
                 spec_id: spec.id,
                 spec_name: spec.name,
                 status: spec.status,
+                failure_reason,
             })
         })
         .collect()
+}
+
+/// Reason a spec ended up `Failed`/`Skipped`, for the marker strip's detail
+/// view: the admin-recorded reason (`completed_via_reason`, set only for
+/// administrative transitions) if present, else the output tail of its last
+/// run — the best available proxy for an engine-driven failure, which
+/// doesn't persist a reason on the spec row itself. `None` for every other
+/// status, and when neither source has anything.
+fn spec_failure_reason(db: &Database, spec: &crate::domain::loops::LoopSpec) -> Option<String> {
+    if !matches!(
+        spec.status,
+        LoopSpecStatus::Failed | LoopSpecStatus::Skipped
+    ) {
+        return None;
+    }
+    if let Some(reason) = spec.completed_via_reason.clone() {
+        return Some(reason);
+    }
+    db.list_loop_runs_for_spec(&spec.id)
+        .unwrap_or_default()
+        .iter()
+        .rev()
+        .find_map(|run| extract_output_tail(&run.output))
 }
 
 /// Resolve the effective graph: spec's own graph if it has nodes, else the

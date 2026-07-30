@@ -53,7 +53,7 @@ before routing onward. It replaces what would otherwise be N member
 nodes, N prompts, and 2N+2 edges wired by hand — `loop_add_ensemble`
 creates the whole unit in one call:
 
-```
+```json
 loop_add_ensemble {
   loop_id, name: "proposers",
   prompt_template: "...",              # one prompt, shared by every member

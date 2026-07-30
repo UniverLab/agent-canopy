@@ -15,7 +15,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::super::theme::Theme;
-use super::{compact_cwd, truncate_str, STATUS_FAIL, STATUS_OK, STATUS_RUNNING};
+use super::{compact_cwd, truncate_str, STATUS_DISABLED, STATUS_FAIL, STATUS_OK, STATUS_RUNNING};
 use crate::domain::loops::{
     LoopEdgeCondition, LoopNode, LoopRunStatus, LoopSpecStatus, LoopStatus,
 };
@@ -24,11 +24,13 @@ use crate::tui::app::loop_live_state::{
 };
 use crate::tui::app::types::App;
 
-pub(crate) fn draw_loop_live_view(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+pub(crate) fn draw_loop_live_view(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     if area.width == 0 || area.height == 0 {
+        app.loop_spec_strip_click_map.clear();
         return;
     }
     let Some(state) = app.loop_live_state.as_ref() else {
+        app.loop_spec_strip_click_map.clear();
         frame.render_widget(
             Paragraph::new("No loop selected").style(Style::default().fg(theme.dim_text)),
             area,
@@ -42,8 +44,10 @@ pub(crate) fn draw_loop_live_view(frame: &mut Frame, area: Rect, app: &App, them
         .is_some_and(|meta| meta.blocked);
     let highlighted = app.loop_graph_highlighted_node_id().map(str::to_string);
     let node_info = app.loop_graph_highlighted_node_run_info();
+    let selected_spec_id = app.loop_spec_strip_selected.clone();
+    let spec_scroll = app.loop_spec_strip_scroll;
 
-    render_loop_live_view(
+    let result = render_loop_live_view(
         frame,
         area,
         &LiveViewContext {
@@ -54,8 +58,13 @@ pub(crate) fn draw_loop_live_view(frame: &mut Frame, area: Rect, app: &App, them
             blocked,
             now: Utc::now(),
             theme,
+            selected_spec_id: selected_spec_id.as_deref(),
+            spec_scroll,
         },
     );
+
+    app.loop_spec_strip_click_map = result.click_map;
+    app.loop_spec_strip_capacity = result.capacity;
 }
 
 /// Everything the pure renderer needs, gathered by [`draw_loop_live_view`]
@@ -70,13 +79,41 @@ struct LiveViewContext<'a> {
     blocked: bool,
     now: DateTime<Utc>,
     theme: &'a Theme,
+    /// Spec id manually selected in the marker strip, if any — independent
+    /// of `highlighted_node_id`/`follow`, which are the *graph's* own
+    /// follow/manual state.
+    selected_spec_id: Option<&'a str>,
+    /// First visible index into `state.spec_queue` for the marker strip.
+    spec_scroll: usize,
 }
 
-fn render_loop_live_view(frame: &mut Frame, area: Rect, ctx: &LiveViewContext) {
+/// What [`render_loop_live_view`] hands back to its `App`-owning caller:
+/// where the marker strip's chips actually landed on screen, for mouse
+/// hit-testing next frame (mirrors `sidebar_tab_click_map`'s shape).
+struct LiveViewRenderResult {
+    click_map: Vec<(String, u16, u16, u16)>,
+    capacity: usize,
+}
+
+fn render_loop_live_view(
+    frame: &mut Frame,
+    area: Rect,
+    ctx: &LiveViewContext,
+) -> LiveViewRenderResult {
     let state = ctx.state;
     let mut lines = header_lines(state, ctx.blocked, ctx.theme);
     lines.push(Line::from(""));
-    lines.extend(queue_lines(state, ctx.theme));
+
+    let chip_row = area.y + lines.len() as u16;
+    let strip = spec_strip_layout(
+        state,
+        ctx.selected_spec_id,
+        ctx.spec_scroll,
+        area.width,
+        ctx.theme,
+    );
+    lines.extend(strip.lines);
+
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "Graph",
@@ -107,6 +144,17 @@ fn render_loop_live_view(frame: &mut Frame, area: Rect, ctx: &LiveViewContext) {
     ));
 
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+
+    LiveViewRenderResult {
+        click_map: strip
+            .click_map
+            .into_iter()
+            .map(|(spec_id, col_start, col_end)| {
+                (spec_id, chip_row, area.x + col_start, area.x + col_end)
+            })
+            .collect(),
+        capacity: strip.capacity,
+    }
 }
 
 fn status_icon_and_label(
@@ -163,51 +211,170 @@ fn header_lines(state: &LoopLiveState, blocked: bool, theme: &Theme) -> Vec<Line
 
 /// Chip glyph for a queue entry: the current spec always shows `▶`
 /// regardless of its underlying status (running or the next pending one —
-/// see `assemble_loop_live_state`'s `current_spec_id` rule), executed specs
-/// (completed/failed/skipped) show `✓`, everything else is still `○`.
+/// see `assemble_loop_live_state`'s `current_spec_id` rule); otherwise the
+/// glyph reflects the terminal status directly, since that's exactly the
+/// case a user goes looking for (which spec failed vs. was skipped).
 fn spec_chip(
     entry: &SpecQueueEntry,
     current_spec_id: Option<&str>,
     theme: &Theme,
 ) -> (&'static str, Color) {
     if Some(entry.spec_id.as_str()) == current_spec_id {
-        ("▶", STATUS_RUNNING)
-    } else if entry.status == LoopSpecStatus::Pending {
-        ("○", theme.dim_text)
-    } else {
-        ("✓", STATUS_OK)
+        return ("▶", STATUS_RUNNING);
+    }
+    match entry.status {
+        LoopSpecStatus::Pending => ("○", theme.dim_text),
+        LoopSpecStatus::Running => ("▶", STATUS_RUNNING),
+        LoopSpecStatus::Completed => ("✓", STATUS_OK),
+        LoopSpecStatus::Failed => ("✗", STATUS_FAIL),
+        LoopSpecStatus::Skipped => ("⊘", STATUS_DISABLED),
     }
 }
 
-fn queue_lines(state: &LoopLiveState, theme: &Theme) -> Vec<Line<'static>> {
+/// A marker chip's fixed on-screen footprint: a 3-column core (bracketed
+/// when selected, plain otherwise) plus a 1-column gap, so the strip's
+/// column arithmetic never has to special-case which chip is selected.
+const SPEC_CHIP_WIDTH: u16 = 4;
+
+/// Columns reserved for the "(a-b of N)" suffix when the strip has to
+/// truncate — wide enough for three-digit spec counts on either side.
+const SPEC_STRIP_RANGE_SUFFIX_WIDTH: u16 = 14;
+
+/// The marker strip's rendered lines, its click map (spec id + column span,
+/// relative to the line's own start — the caller translates to absolute
+/// screen coordinates), and how many chips fit in the given width.
+struct SpecStripLayout {
+    lines: Vec<Line<'static>>,
+    click_map: Vec<(String, u16, u16)>,
+    capacity: usize,
+}
+
+/// Lay out the spec marker strip: a compact row of status chips (compressed
+/// to a scrollable window, with a "(a-b of N)" indicator, when there are
+/// more specs than fit in `area_width`) followed by the selected spec's
+/// detail — falling back to the running/next-pending spec when nothing is
+/// manually selected, matching the strip's pre-selection behavior.
+fn spec_strip_layout(
+    state: &LoopLiveState,
+    selected_spec_id: Option<&str>,
+    scroll: usize,
+    area_width: u16,
+    theme: &Theme,
+) -> SpecStripLayout {
     if state.spec_queue.is_empty() {
-        return vec![Line::from(Span::styled(
-            "Queue: (empty)",
-            Style::default().fg(theme.dim_text),
-        ))];
+        return SpecStripLayout {
+            lines: vec![Line::from(Span::styled(
+                "Queue: (empty)",
+                Style::default().fg(theme.dim_text),
+            ))],
+            click_map: Vec::new(),
+            capacity: 0,
+        };
     }
 
+    let total = state.spec_queue.len();
+    let full_capacity = (area_width / SPEC_CHIP_WIDTH).max(1) as usize;
+    let truncated = total > full_capacity;
+    let capacity = if truncated {
+        let reserved = area_width.saturating_sub(SPEC_STRIP_RANGE_SUFFIX_WIDTH);
+        (reserved / SPEC_CHIP_WIDTH).max(1) as usize
+    } else {
+        full_capacity
+    };
+    let start = scroll.min(total.saturating_sub(capacity));
+    let end = (start + capacity).min(total);
+
     let mut chips: Vec<Span<'static>> = Vec::new();
-    for entry in &state.spec_queue {
+    let mut click_map = Vec::new();
+    let mut col: u16 = 0;
+    for entry in &state.spec_queue[start..end] {
         let (icon, color) = spec_chip(entry, state.current_spec_id.as_deref(), theme);
-        chips.push(Span::styled(icon, Style::default().fg(color)));
+        let selected = Some(entry.spec_id.as_str()) == selected_spec_id;
+        let core = if selected {
+            format!("[{icon}]")
+        } else {
+            format!(" {icon} ")
+        };
+        let style = if selected {
+            Style::default().fg(color).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(color)
+        };
+        let core_width = core.chars().count() as u16;
+        click_map.push((entry.spec_id.clone(), col, col + core_width));
+        chips.push(Span::styled(core, style));
         chips.push(Span::raw(" "));
+        col += SPEC_CHIP_WIDTH;
+    }
+    if truncated {
+        chips.push(Span::styled(
+            format!(" ({}-{} of {})", start + 1, end, total),
+            Style::default().fg(theme.dim_text),
+        ));
     }
 
     let mut lines = vec![Line::from(chips)];
-    if let Some(current) = state
-        .spec_queue
-        .iter()
-        .find(|entry| Some(entry.spec_id.as_str()) == state.current_spec_id.as_deref())
-    {
-        lines.push(Line::from(Span::styled(
-            current.spec_name.clone(),
+    lines.extend(spec_detail_lines(state, selected_spec_id, theme));
+
+    SpecStripLayout {
+        lines,
+        click_map,
+        capacity,
+    }
+}
+
+/// Name, status, and (for a failed/skipped spec) the recorded reason for
+/// whichever spec the marker strip is showing: the manual selection if
+/// there is one, else the running/next-pending spec — the same fallback
+/// the strip's detail line always showed before selection existed.
+fn spec_detail_lines(
+    state: &LoopLiveState,
+    selected_spec_id: Option<&str>,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let entry = selected_spec_id
+        .and_then(|id| state.spec_queue.iter().find(|e| e.spec_id == id))
+        .or_else(|| {
+            state
+                .spec_queue
+                .iter()
+                .find(|e| Some(e.spec_id.as_str()) == state.current_spec_id.as_deref())
+        });
+    let Some(entry) = entry else {
+        return Vec::new();
+    };
+
+    let (_, color) = spec_chip(entry, state.current_spec_id.as_deref(), theme);
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            entry.spec_name.clone(),
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("[{}]", spec_status_label(entry.status)),
+            Style::default().fg(color),
+        ),
+    ])];
+    if let Some(reason) = entry.failure_reason.as_deref() {
+        lines.push(Line::from(Span::styled(
+            format!("  {reason}"),
+            Style::default().fg(theme.dim_text),
         )));
     }
     lines
+}
+
+fn spec_status_label(status: LoopSpecStatus) -> &'static str {
+    match status {
+        LoopSpecStatus::Pending => "pending",
+        LoopSpecStatus::Running => "running",
+        LoopSpecStatus::Completed => "completed",
+        LoopSpecStatus::Failed => "failed",
+        LoopSpecStatus::Skipped => "skipped",
+    }
 }
 
 /// Border/text style and marker glyph for a node box — bold accent with a
@@ -673,16 +840,19 @@ mod tests {
                     spec_id: "s1".to_string(),
                     spec_name: "B1 fix".to_string(),
                     status: LoopSpecStatus::Completed,
+                    failure_reason: None,
                 },
                 SpecQueueEntry {
                     spec_id: "s2".to_string(),
                     spec_name: "U1b live view".to_string(),
                     status: LoopSpecStatus::Running,
+                    failure_reason: None,
                 },
                 SpecQueueEntry {
                     spec_id: "s3".to_string(),
                     spec_name: "T1 theme".to_string(),
                     status: LoopSpecStatus::Pending,
+                    failure_reason: None,
                 },
             ],
             done_count: 1,
@@ -721,6 +891,8 @@ mod tests {
                     blocked: false,
                     now: Utc::now(),
                     theme: &Theme::classic(),
+                    selected_spec_id: None,
+                    spec_scroll: 0,
                 },
             );
         });
@@ -775,6 +947,8 @@ mod tests {
                     blocked: false,
                     now: Utc::now(),
                     theme: &Theme::classic(),
+                    selected_spec_id: None,
+                    spec_scroll: 0,
                 },
             );
         });
@@ -783,6 +957,144 @@ mod tests {
         assert!(text.contains("reviewed and committed"), "{text}");
         // Manual pick uses the `›` marker, not the follow `●`.
         assert!(text.contains('›'), "expected manual marker in:\n{text}");
+    }
+
+    #[test]
+    fn spec_strip_shows_distinct_markers_and_selected_detail_with_failure_reason() {
+        let mut state = running_state();
+        // s1 stays Completed (✓); make s3 Failed with a recorded reason and
+        // add a fourth, Skipped spec — before this, Failed/Skipped/Completed
+        // all rendered the same `✓`.
+        state.spec_queue[2].status = LoopSpecStatus::Failed;
+        state.spec_queue[2].failure_reason = Some("cargo test failed: 3 tests failing".to_string());
+        state.spec_queue.push(SpecQueueEntry {
+            spec_id: "s4".to_string(),
+            spec_name: "T2 skipped thing".to_string(),
+            status: LoopSpecStatus::Skipped,
+            failure_reason: Some("superseded by s5".to_string()),
+        });
+
+        let node_info = NodeRunInfo::default();
+        let text = render_to_text(80, 40, |frame, area| {
+            render_loop_live_view(
+                frame,
+                area,
+                &LiveViewContext {
+                    state: &state,
+                    follow: true,
+                    highlighted_node_id: None,
+                    node_info: &node_info,
+                    blocked: false,
+                    now: Utc::now(),
+                    theme: &Theme::classic(),
+                    selected_spec_id: Some("s3"),
+                    spec_scroll: 0,
+                },
+            );
+        });
+
+        // Distinct glyphs for completed (s1), failed (s3), and skipped (s4).
+        assert!(text.contains('✓'), "{text}");
+        assert!(text.contains('✗'), "{text}");
+        assert!(text.contains('⊘'), "{text}");
+        // The selected marker (s3, failed) is bracketed, distinct from an
+        // unselected chip and from the graph's `●` follow marker.
+        assert!(
+            text.contains("[✗]"),
+            "expected bracketed selection marker in:\n{text}"
+        );
+        // Selecting a spec shows its name, status, and the recorded failure
+        // reason — not just the running spec's name shown pre-selection.
+        assert!(text.contains("T1 theme"), "{text}");
+        assert!(text.contains("[failed]"), "{text}");
+        assert!(
+            text.contains("cargo test failed: 3 tests failing"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn spec_strip_compresses_and_shows_range_when_more_specs_than_fit() {
+        let mut state = running_state();
+        state.spec_queue = (0..20)
+            .map(|i| SpecQueueEntry {
+                spec_id: format!("s{i}"),
+                spec_name: format!("Spec {i}"),
+                status: LoopSpecStatus::Pending,
+                failure_reason: None,
+            })
+            .collect();
+        state.current_spec_id = None;
+        state.total_count = 20;
+
+        let node_info = NodeRunInfo::default();
+        let text = render_to_text(40, 40, |frame, area| {
+            render_loop_live_view(
+                frame,
+                area,
+                &LiveViewContext {
+                    state: &state,
+                    follow: true,
+                    highlighted_node_id: None,
+                    node_info: &node_info,
+                    blocked: false,
+                    now: Utc::now(),
+                    theme: &Theme::classic(),
+                    selected_spec_id: None,
+                    spec_scroll: 0,
+                },
+            );
+        });
+
+        assert!(
+            text.contains("of 20"),
+            "expected a range indicator saying which specs are shown in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn spec_strip_click_map_matches_rendered_chip_positions() {
+        let state = running_state();
+        let node_info = NodeRunInfo::default();
+        let backend = TestBackend::new(80, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut result_holder = None;
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                result_holder = Some(render_loop_live_view(
+                    frame,
+                    area,
+                    &LiveViewContext {
+                        state: &state,
+                        follow: true,
+                        highlighted_node_id: None,
+                        node_info: &node_info,
+                        blocked: false,
+                        now: Utc::now(),
+                        theme: &Theme::classic(),
+                        selected_spec_id: None,
+                        spec_scroll: 0,
+                    },
+                ));
+            })
+            .unwrap();
+        let result = result_holder.unwrap();
+
+        assert_eq!(result.click_map.len(), 3);
+        assert_eq!(result.capacity, (80 / SPEC_CHIP_WIDTH) as usize);
+        let ids: Vec<&str> = result
+            .click_map
+            .iter()
+            .map(|(id, _, _, _)| id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["s1", "s2", "s3"]);
+        // All three chips render on the same row.
+        let row = result.click_map[0].1;
+        assert!(result.click_map.iter().all(|&(_, r, _, _)| r == row));
+        // Columns are ordered and non-overlapping.
+        assert!(result.click_map[0].2 < result.click_map[1].2);
+        assert!(result.click_map[1].2 < result.click_map[2].2);
     }
 
     #[test]
@@ -819,6 +1131,8 @@ mod tests {
             blocked: false,
             now: Utc::now(),
             theme: &Theme::classic(),
+            selected_spec_id: None,
+            spec_scroll: 0,
         };
         render_to_text(1, 5, |frame, area| {
             render_loop_live_view(frame, area, &ctx);
@@ -855,6 +1169,8 @@ mod tests {
                     blocked: false,
                     now: Utc::now(),
                     theme: &Theme::classic(),
+                    selected_spec_id: None,
+                    spec_scroll: 0,
                 },
             );
         });
@@ -991,6 +1307,8 @@ mod tests {
                     blocked: false,
                     now: Utc::now(),
                     theme: &Theme::classic(),
+                    selected_spec_id: None,
+                    spec_scroll: 0,
                 },
             );
         });

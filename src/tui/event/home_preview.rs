@@ -1,7 +1,7 @@
 use anyhow::Result;
 use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
-use crate::tui::app::types::{AgentEntry, App, Focus, ProjectTab, SidebarLayer};
+use crate::tui::app::types::{AgentEntry, App, Focus, LoopLiveFocus, ProjectTab, SidebarLayer};
 
 // ── Home: screensaver — arrows enter Preview ────────────────────────
 
@@ -107,9 +107,14 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
         && app.automation_kind == crate::tui::app::AutomationKind::Loop;
 
     match code {
-        // Manual node inspection in the live loop view intercepts Esc to
-        // return to auto-follow first; a second Esc falls through to the
-        // general "back to Home" behavior below.
+        // A spec-strip selection intercepts Esc first (back to the graph
+        // sub-focus, selection cleared); manual node inspection in the
+        // graph intercepts a following Esc to return to auto-follow; only
+        // then does Esc fall through to the general "back to Home" below.
+        KeyCode::Esc if on_loop && app.loop_live_focus == LoopLiveFocus::SpecStrip => {
+            app.loop_live_focus = LoopLiveFocus::Graph;
+            app.loop_spec_strip_selected = None;
+        }
         KeyCode::Esc if on_loop && !app.loop_graph_follow => {
             app.loop_graph_reset_follow();
         }
@@ -149,6 +154,20 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
         }
         KeyCode::Up | KeyCode::Char('k') => {
             app.select_prev();
+        }
+        // Plain Tab/BackTab hand arrow-key ownership between the graph and
+        // the spec marker strip — the strip participates in the panel's
+        // existing focus order rather than a bespoke mode. Shift+←/→ is
+        // already claimed globally for the sidebar tab strip (see
+        // `sidebar_tab_step_applies`), so this uses plain Tab instead.
+        KeyCode::Tab | KeyCode::BackTab if on_loop => {
+            app.loop_live_toggle_focus();
+        }
+        KeyCode::Left if on_loop && app.loop_live_focus == LoopLiveFocus::SpecStrip => {
+            app.loop_spec_strip_move_selection(false);
+        }
+        KeyCode::Right if on_loop && app.loop_live_focus == LoopLiveFocus::SpecStrip => {
+            app.loop_spec_strip_move_selection(true);
         }
         KeyCode::Left if on_loop => {
             app.loop_graph_move_highlight(false);
