@@ -2,17 +2,37 @@ use chrono::{DateTime, Utc};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-pub fn relative_time(dt: &DateTime<Utc>) -> String {
-    let delta = Utc::now().signed_duration_since(*dt);
-    let secs = delta.num_seconds();
+/// `(value, unit)` for a past instant, or `None` for anything under a
+/// minute — the shared rounding rule behind both [`relative_time`] and
+/// [`relative_time_compact`], so the two display forms never drift apart on
+/// where an hour rounds up to a day, etc.
+fn relative_time_parts(dt: &DateTime<Utc>) -> Option<(i64, char)> {
+    let secs = Utc::now().signed_duration_since(*dt).num_seconds();
     if secs < 60 {
-        "just now".to_string()
+        None
     } else if secs < 3600 {
-        format!("{}m ago", secs / 60)
+        Some((secs / 60, 'm'))
     } else if secs < 86400 {
-        format!("{}h ago", secs / 3600)
+        Some((secs / 3600, 'h'))
     } else {
-        format!("{}d ago", secs / 86400)
+        Some((secs / 86400, 'd'))
+    }
+}
+
+pub fn relative_time(dt: &DateTime<Utc>) -> String {
+    match relative_time_parts(dt) {
+        None => "just now".to_string(),
+        Some((n, unit)) => format!("{n}{unit} ago"),
+    }
+}
+
+/// Compact form for narrow columns (sidebar loop rows): `2m`, `1h`, `3d`,
+/// no "ago" suffix. Same thresholds as [`relative_time`] — see
+/// [`relative_time_parts`].
+pub fn relative_time_compact(dt: &DateTime<Utc>) -> String {
+    match relative_time_parts(dt) {
+        None => "now".to_string(),
+        Some((n, unit)) => format!("{n}{unit}"),
     }
 }
 
@@ -29,4 +49,50 @@ pub fn is_process_running(pid: u32) -> bool {
 pub fn is_local_port_open(port: u16) -> bool {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration as ChronoDuration;
+
+    #[test]
+    fn relative_time_compact_under_a_minute() {
+        let dt = Utc::now() - ChronoDuration::seconds(30);
+        assert_eq!(relative_time_compact(&dt), "now");
+    }
+
+    #[test]
+    fn relative_time_compact_minutes() {
+        let dt = Utc::now() - ChronoDuration::minutes(2);
+        assert_eq!(relative_time_compact(&dt), "2m");
+    }
+
+    #[test]
+    fn relative_time_compact_hours() {
+        let dt = Utc::now() - ChronoDuration::hours(1);
+        assert_eq!(relative_time_compact(&dt), "1h");
+    }
+
+    #[test]
+    fn relative_time_compact_days() {
+        let dt = Utc::now() - ChronoDuration::days(3);
+        assert_eq!(relative_time_compact(&dt), "3d");
+    }
+
+    #[test]
+    fn relative_time_compact_has_no_ago_suffix() {
+        let dt = Utc::now() - ChronoDuration::hours(5);
+        assert!(!relative_time_compact(&dt).contains("ago"));
+    }
+
+    #[test]
+    fn relative_time_and_compact_share_the_same_rounding_boundary() {
+        // Both forms must flip from minutes to hours at the same instant —
+        // otherwise the sidebar and other panels would disagree about how
+        // long ago something happened.
+        let dt = Utc::now() - ChronoDuration::seconds(3600);
+        assert!(relative_time(&dt).starts_with("1h"));
+        assert!(relative_time_compact(&dt).starts_with("1h"));
+    }
 }

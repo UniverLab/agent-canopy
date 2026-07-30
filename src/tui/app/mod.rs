@@ -903,21 +903,33 @@ impl App {
         Ok(())
     }
 
-    /// Recompute the sidebar's per-loop spec progress ("done/total") and
-    /// blocked status (a `Paused` loop whose latest run recorded a
-    /// `loop_report_blocker` description). One `list_loop_specs` +, for
-    /// paused loops, one `list_loop_runs_for_loop` query per loop — bounded
-    /// by the (typically small) number of loops, run on the existing
-    /// refresh cadence rather than a dedicated poller.
+    /// Recompute the sidebar's per-loop "last activity" (see
+    /// [`LoopSidebarMeta`]) and blocked status (a `Paused` loop whose latest
+    /// run recorded a `loop_report_blocker` description). One
+    /// `list_loop_last_run_times` query for every loop's last-run time, plus,
+    /// for paused loops only, one `list_loop_runs_for_loop` query — bounded
+    /// by the (typically small) number of loops, run on the existing refresh
+    /// cadence rather than a dedicated poller.
+    ///
+    /// Deliberately reads `loop_runs` rather than `list_loop_specs`: a
+    /// queue-driven loop's specs live on the queue, not on the loop's own
+    /// `loop_specs` rows, so that query is always empty for it. `loop_runs`
+    /// is populated regardless of how the spec was bound.
     fn refresh_loop_sidebar_meta(&mut self) {
+        let last_run_times = self.db.list_loop_last_run_times().unwrap_or_default();
         let mut meta = HashMap::new();
         for lp in &self.loops {
-            let specs = self.db.list_loop_specs(&lp.id).unwrap_or_default();
-            let total = specs.len();
-            let done = specs
-                .iter()
-                .filter(|spec| spec.status == LoopSpecStatus::Completed)
-                .count();
+            let running = lp.status == LoopStatus::Running;
+            let last_run_at = last_run_times.get(&lp.id).copied();
+            let last_activity = last_run_at.unwrap_or(lp.created_at);
+            let last_run_label = if running {
+                "running".to_string()
+            } else {
+                match last_run_at {
+                    Some(at) => utils::relative_time_compact(&at),
+                    None => "never".to_string(),
+                }
+            };
             let blocked = lp.status == LoopStatus::Paused
                 && self
                     .db
@@ -928,8 +940,8 @@ impl App {
             meta.insert(
                 lp.id.clone(),
                 LoopSidebarMeta {
-                    done,
-                    total,
+                    last_activity,
+                    last_run_label,
                     blocked,
                 },
             );

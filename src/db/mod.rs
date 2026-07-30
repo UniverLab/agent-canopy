@@ -293,6 +293,12 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_loop_runs_node_iteration
                 ON loop_runs(node_id, iteration DESC);
 
+            -- Speeds the sidebar's last-activity-per-loop aggregate
+            -- (MAX(started_at) GROUP BY loop_id) into a loose index scan
+            -- instead of a full table scan.
+            CREATE INDEX IF NOT EXISTS idx_loop_runs_loop_started
+                ON loop_runs(loop_id, started_at DESC);
+
             -- N2: firings of a loop's `on_completed` hook. Deliberately not
             -- `loop_runs` — that table's spec_id/node_id are NOT NULL FKs into
             -- a spec's graph, which a completion hook (no spec, no graph node)

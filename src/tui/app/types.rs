@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
+
 use super::loop_live_state::LoopLiveState;
 use crate::application::notification_service::NotificationService;
 use crate::db::project::{RagInfoSummary, RagQueueItem};
@@ -156,15 +158,45 @@ pub(crate) struct ProjectPreviewSummary {
     pub loop_running: bool,
 }
 
-/// Per-loop rendering data for the sidebar's `Loops` section — spec progress
-/// and whether the loop is stuck on a reported blocker (a `Paused` loop whose
-/// latest run recorded a `blocker`, see `loop_report_blocker`). Computed once
-/// per refresh cycle (`App::refresh_loops`) rather than queried per frame.
-#[derive(Clone, Copy, Default)]
+/// Per-loop rendering data for the sidebar's `Loops` section: when the loop
+/// last did something, and whether it is stuck on a reported blocker (a
+/// `Paused` loop whose latest run recorded a `blocker`, see
+/// `loop_report_blocker`). Computed once per refresh cycle
+/// (`App::refresh_loops`) rather than queried or formatted per frame — the
+/// sidebar just prints `last_run_label` as-is.
+///
+/// Deliberately not a per-loop spec count: that reads `0/0` for a
+/// queue-driven loop, whose specs live on the queue rather than on the loop
+/// itself (the loop focus view's `state.done_count`/`total_count` is the
+/// correct place for that number, and is unaffected by this struct).
+#[derive(Clone)]
 pub(crate) struct LoopSidebarMeta {
-    pub done: usize,
-    pub total: usize,
+    /// Last recorded activity for this loop: the latest `loop_runs.started_at`
+    /// across every node run belonging to it, or — if it has never run — the
+    /// loop's own `created_at`. A single monotonic "last activity" key that
+    /// is defined for every loop regardless of status. Not read by anything
+    /// in this module yet — it exists so the sidebar's loop-ordering-by-recency
+    /// work can sort on it without a second query.
+    #[expect(dead_code)]
+    pub last_activity: DateTime<Utc>,
+    /// Precomputed display text for `last_activity`: a compact relative
+    /// time (`2m`, `1h`, `3d`), `"running"` while the loop is actively
+    /// executing, or `"never"` if it has never run.
+    pub last_run_label: String,
     pub blocked: bool,
+}
+
+impl Default for LoopSidebarMeta {
+    /// Only used as a placeholder before the first `refresh_loops` populates
+    /// the real map — every loop gets a real entry on every refresh, so this
+    /// value is never actually shown.
+    fn default() -> Self {
+        Self {
+            last_activity: DateTime::<Utc>::from_timestamp(0, 0).expect("epoch is representable"),
+            last_run_label: String::new(),
+            blocked: false,
+        }
+    }
 }
 
 /// Border-focus sub-section within the `Live` layer (interactive/terminal

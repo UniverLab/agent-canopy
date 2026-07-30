@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, OptionalExtension};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::io::{Error as IoError, ErrorKind};
 
 use crate::db::Database;
@@ -1097,6 +1098,34 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Most recent `loop_runs.started_at` per loop, across every loop in a
+    /// single query — the sidebar's "last activity" signal. Unlike
+    /// [`Self::list_loop_specs`] (a loop's own bound specs, empty for a
+    /// queue-driven run whose specs live on the queue instead), this reads
+    /// `loop_runs.loop_id`, which is set on every insert regardless of how
+    /// the spec was bound (see [`Self::list_loop_runs_for_loop`]), so it
+    /// reflects real execution for every loop kind. A loop absent from the
+    /// returned map has never recorded a run.
+    pub fn list_loop_last_run_times(&self) -> Result<HashMap<String, DateTime<Utc>>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt =
+            conn.prepare("SELECT loop_id, MAX(started_at) FROM loop_runs GROUP BY loop_id")?;
+        let rows = stmt.query_map(params![], |row| {
+            let loop_id: String = row.get(0)?;
+            let started_at: i64 = row.get(1)?;
+            Ok((loop_id, started_at))
+        })?;
+        let mut result = HashMap::new();
+        for row in rows {
+            let (loop_id, started_at) = row?;
+            result.insert(loop_id, from_timestamp(started_at)?);
+        }
+        Ok(result)
+    }
+
     pub fn get_loop_run(&self, run_id: &str) -> Result<Option<LoopNodeRun>> {
         let conn = self
             .conn
@@ -2062,5 +2091,65 @@ mod tests {
     fn parse_json_value_invalid() {
         let result = parse_json_value("invalid json");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn list_loop_last_run_times_empty_when_no_runs() {
+        let db = test_db();
+        let loop_obj = sample_loop("loop1");
+        db.insert_loop(&loop_obj).unwrap();
+
+        let times = db.list_loop_last_run_times().unwrap();
+        assert!(
+            times.is_empty(),
+            "a loop with no recorded runs must not appear in the map"
+        );
+    }
+
+    #[test]
+    fn list_loop_last_run_times_returns_max_started_at_per_loop() {
+        let db = test_db();
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO loops (id, name, workdir, status, created_at) VALUES ('loop1', 'l1', '/tmp', 'draft', 0)",
+            params![],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO loops (id, name, workdir, status, created_at) VALUES ('loop2', 'l2', '/tmp', 'draft', 0)",
+            params![],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO loop_specs (id, loop_id, name, position, parallelizable, status) VALUES ('spec1', 'loop1', 's1', 0, 0, 'pending')",
+            params![],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO loop_nodes (id, spec_id, loop_id, name, kind, config, position, created_at) VALUES ('n1', 'spec1', NULL, 'node1', 'agent', '{}', 0, 0)",
+            params![],
+        )
+        .unwrap();
+        // Two runs on loop1 — the later one (started_at 500) must win.
+        conn.execute(
+            "INSERT INTO loop_runs (id, loop_id, spec_id, node_id, status, started_at, iteration) VALUES ('run1', 'loop1', 'spec1', 'n1', 'success', 100, 1)",
+            params![],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO loop_runs (id, loop_id, spec_id, node_id, status, started_at, iteration) VALUES ('run2', 'loop1', 'spec1', 'n1', 'success', 500, 2)",
+            params![],
+        )
+        .unwrap();
+        drop(conn);
+
+        let times = db.list_loop_last_run_times().unwrap();
+        assert_eq!(times.len(), 1, "loop2 has no runs, so must be absent");
+        assert_eq!(
+            times.get("loop1").unwrap().timestamp(),
+            500,
+            "must report the MAX started_at, not the first run"
+        );
+        assert!(!times.contains_key("loop2"));
     }
 }

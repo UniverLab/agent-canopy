@@ -793,7 +793,7 @@ fn draw_project_loop_card(
 /// Status icon shown on an active loop's card: running takes priority, then
 /// blocked (a paused loop whose latest run recorded a `loop_report_blocker`
 /// description), then plain paused, then draft.
-fn loop_status_icon(lp: &Loop, meta: LoopSidebarMeta, theme: &Theme) -> (&'static str, Color) {
+fn loop_status_icon(lp: &Loop, meta: &LoopSidebarMeta, theme: &Theme) -> (&'static str, Color) {
     match lp.status {
         LoopStatus::Running => ("▶", STATUS_RUNNING),
         LoopStatus::Paused if meta.blocked => ("⛔", STATUS_FAIL),
@@ -807,7 +807,7 @@ fn draw_active_loop_card(
     area: Rect,
     selected: bool,
     lp: &Loop,
-    meta: LoopSidebarMeta,
+    meta: &LoopSidebarMeta,
     panel_focused: bool,
     theme: &Theme,
 ) {
@@ -833,11 +833,15 @@ fn draw_active_loop_card(
         Rect::new(area.x, area.y, area.width, 1),
     );
 
-    let progress = format!("{}/{} specs", meta.done, meta.total);
+    let last_run_style = if lp.status == LoopStatus::Running {
+        Style::default().fg(STATUS_RUNNING)
+    } else {
+        meta_style
+    };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            truncate_str(&progress, area.width as usize),
-            meta_style,
+            truncate_str(&meta.last_run_label, area.width as usize),
+            last_run_style,
         )))
         .style(Style::default().bg(bg)),
         Rect::new(area.x, area.y + 1, area.width, 1),
@@ -888,7 +892,7 @@ fn draw_automation_loops_list(frame: &mut Frame, area: Rect, app: &mut App, them
             let meta = app
                 .loop_sidebar_meta
                 .get(&lp.id)
-                .copied()
+                .cloned()
                 .unwrap_or_default();
             (lp.id.clone(), lp.clone(), meta)
         })
@@ -900,7 +904,7 @@ fn draw_automation_loops_list(frame: &mut Frame, area: Rect, app: &mut App, them
         }
         let card_area = Rect::new(area.x, y, area.width, 3);
         let selected = app.selected_loop_id.as_deref() == Some(id.as_str());
-        draw_active_loop_card(frame, card_area, selected, lp, *meta, panel_focused, theme);
+        draw_active_loop_card(frame, card_area, selected, lp, meta, panel_focused, theme);
         app.automation_loop_click_map.push((id.clone(), y, y + 3));
         y += row_h;
     }
@@ -1795,7 +1799,12 @@ mod tests {
             })
             .unwrap();
 
-        let buffer = terminal.backend().buffer().clone();
+        buffer_to_text(terminal.backend().buffer())
+    }
+
+    /// Flattens a rendered `TestBackend` buffer into a plain string (row by
+    /// row, no trailing per-cell styling) for substring assertions.
+    fn buffer_to_text(buffer: &ratatui::buffer::Buffer) -> String {
         let mut text = String::new();
         for y in 0..buffer.area.height {
             for x in 0..buffer.area.width {
@@ -1840,6 +1849,186 @@ mod tests {
         let text =
             render_sidebar_text_on_tab(1, 45, 40, &Theme::classic(), SidebarLayer::Automation);
         assert!(text.contains("Probe Loop"), "expected loop name visible");
+    }
+
+    // ── Last-run sidebar meta (replaces the old done/total spec count) ──
+
+    /// Builds an App around a caller-supplied `Loop` plus whatever the `seed`
+    /// closure inserts into the same DB, renders the Automation tab into a
+    /// TestBackend, and returns the screen text. Unlike
+    /// `render_sidebar_text_on_tab` (a fixed `Running`, spec-less "Probe
+    /// Loop"), this lets each last-run test control the loop's status and
+    /// `loop_runs` history directly.
+    fn render_automation_text_for(
+        lp: &crate::domain::loops::Loop,
+        seed: impl FnOnce(&crate::db::Database),
+    ) -> String {
+        use crate::db::Database;
+        use crate::tui::app::App;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        db.insert_loop(lp).unwrap();
+        seed(&db);
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
+        app.sidebar_layer = SidebarLayer::Automation;
+
+        let backend = TestBackend::new(50, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_sidebar(frame, area, &mut app, &Theme::classic());
+            })
+            .unwrap();
+
+        buffer_to_text(terminal.backend().buffer())
+    }
+
+    fn bare_loop(id: &str, status: LoopStatus) -> Loop {
+        Loop {
+            id: id.to_string(),
+            name: format!("Loop {id}"),
+            description: None,
+            workdir: "/tmp/probe".to_string(),
+            status,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_pool_id: None,
+            on_completed: None,
+        }
+    }
+
+    /// Records one node run against `loop_id` via a pool-driven spec — the
+    /// spec's own `loop_id` is `None` (never bound to this loop, so
+    /// `list_loop_specs(loop_id)` stays empty, exactly like a queue-driven
+    /// run), but `loop_runs.loop_id` is set, which is what the sidebar's
+    /// last-run query reads.
+    fn seed_pool_driven_run(
+        db: &crate::db::Database,
+        loop_id: &str,
+        started_at: chrono::DateTime<chrono::Utc>,
+        output: Option<serde_json::Value>,
+    ) {
+        use crate::domain::loops::{
+            LoopNode, LoopNodeKind, LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus,
+        };
+
+        let spec_id = format!("{loop_id}-spec");
+        let node_id = format!("{loop_id}-node");
+        db.insert_loop_spec(&LoopSpec {
+            id: spec_id.clone(),
+            loop_id: None,
+            name: "queued spec".to_string(),
+            description: None,
+            position: 0,
+            parallelizable: false,
+            status: LoopSpecStatus::Completed,
+            started_at: Some(started_at),
+            completed_at: Some(started_at),
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: node_id.clone(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "node".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 0,
+            created_at: started_at,
+        })
+        .unwrap();
+        db.insert_loop_run(&LoopNodeRun {
+            id: format!("{loop_id}-run"),
+            loop_id: loop_id.to_string(),
+            spec_id,
+            node_id,
+            status: LoopRunStatus::Pass,
+            input: None,
+            output,
+            started_at,
+            completed_at: Some(started_at),
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn queue_driven_loop_shows_last_run_time_not_zero_zero() {
+        let started_at = chrono::Utc::now() - chrono::Duration::minutes(2);
+        let text = render_automation_text_for(&bare_loop("q1", LoopStatus::Draft), |db| {
+            seed_pool_driven_run(db, "q1", started_at, None);
+        });
+        assert!(
+            !text.contains("0/0"),
+            "queue-driven loop must not fall back to the old done/total count: {text}"
+        );
+        assert!(
+            text.contains("2m"),
+            "expected the last run's relative time (2m) in the sidebar: {text}"
+        );
+    }
+
+    #[test]
+    fn never_run_loop_shows_plainly_not_blank_or_zero() {
+        let text = render_automation_text_for(&bare_loop("never1", LoopStatus::Draft), |_db| {});
+        assert!(
+            !text.contains("0/0"),
+            "a never-run loop must not show a misleading zero: {text}"
+        );
+        assert!(
+            text.contains("never"),
+            "a never-run loop must say so plainly: {text}"
+        );
+    }
+
+    #[test]
+    fn running_loop_shows_running_not_a_relative_time() {
+        let started_at = chrono::Utc::now() - chrono::Duration::minutes(2);
+        let text = render_automation_text_for(&bare_loop("run1", LoopStatus::Running), |db| {
+            seed_pool_driven_run(db, "run1", started_at, None);
+        });
+        assert!(
+            text.contains("running"),
+            "an actively-running loop must say 'running', not its stale last-run time: {text}"
+        );
+    }
+
+    #[test]
+    fn blocked_indicator_still_renders_for_paused_loop_with_blocker() {
+        let started_at = chrono::Utc::now() - chrono::Duration::minutes(5);
+        let text = render_automation_text_for(&bare_loop("blocked1", LoopStatus::Paused), |db| {
+            seed_pool_driven_run(
+                db,
+                "blocked1",
+                started_at,
+                Some(serde_json::json!({"blocker": "waiting on human input"})),
+            );
+        });
+        assert!(
+            text.contains('⛔'),
+            "a paused loop with a reported blocker must still show the blocked icon: {text}"
+        );
     }
 
     #[test]
