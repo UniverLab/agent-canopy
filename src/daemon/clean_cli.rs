@@ -528,9 +528,15 @@ fn print_summary(plan: &CleanPlan, retention_days: u64, dry_run: bool) {
                 p.dependents.interactive_sessions,
                 p.dependents.terminal_sessions
             );
+            println!(
+                "     Hint: if this directory was renamed or moved, `canopy project remap {} <new-path>` \
+                 keeps its history instead of deleting it.",
+                p.hash
+            );
         }
         println!(
-            "   Hint: `canopy clean --hard` removes orphaned projects (and their dependents) with confirmation."
+            "   Hint: `canopy clean --hard` removes orphaned projects (and their dependents) with confirmation — \
+             only if the directory is truly gone, not just moved."
         );
     }
 

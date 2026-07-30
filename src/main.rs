@@ -35,6 +35,7 @@ use daemon::clean_cli::handle_clean_action;
 use daemon::cli::{handle_daemon_action, DaemonAction};
 use daemon::doctor::run_doctor;
 use daemon::loop_cli::{handle_loop_action, LoopAction};
+use daemon::project_cli::{handle_project_action, ProjectAction};
 use daemon::prompts_cli::{handle_prompts_action, PromptsAction};
 use daemon::rag_cli::{handle_rag_action, RagAction};
 use daemon::server::{run_http_server, run_stdio_server};
@@ -90,6 +91,11 @@ enum Commands {
     Spec {
         #[command(subcommand)]
         action: SpecAction,
+    },
+    /// Manage the project registry (path-derived identity).
+    Project {
+        #[command(subcommand)]
+        action: ProjectAction,
     },
     /// Remove safely-removable stale data (soft cleanup, default mode).
     Clean {
@@ -168,6 +174,7 @@ async fn main() -> Result<()> {
         Some(Commands::Rag { action }) => handle_rag_action(action).await,
         Some(Commands::Loop { action }) => handle_loop_action(action).await,
         Some(Commands::Spec { action }) => handle_spec_action(action).await,
+        Some(Commands::Project { action }) => handle_project_action(action).await,
         Some(Commands::Clean {
             dry_run,
             older_than,

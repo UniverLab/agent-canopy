@@ -5351,6 +5351,68 @@ impl TaskTriggerHandler {
         }
     }
 
+    /// Point a project at a new workdir after its directory was renamed or
+    /// moved, keeping its sessions and history instead of orphaning them.
+    #[tool(
+        name = "project_remap",
+        description = "Remap a project whose directory was renamed or moved to its new path, \
+        re-keying its sessions/loops/history instead of losing them. MOVE if nothing is \
+        registered at the new path, MERGE (folding into it, removing the stale row) if a \
+        project already exists there. Refuses a new_path that doesn't exist unless force=true. \
+        Set dry_run=true to preview without changing anything."
+    )]
+    async fn project_remap(
+        &self,
+        Parameters(params): Parameters<ProjectRemapParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let new_path = std::path::Path::new(&params.new_path);
+        let resolved =
+            match crate::db::project::resolve_remap_path(new_path, params.force.unwrap_or(false)) {
+                Ok(resolved) => resolved,
+                Err(e) => return Ok(error_result(&e.to_string())),
+            };
+
+        let outcome = if params.dry_run.unwrap_or(false) {
+            self.db.remap_preview(&params.project_hash, &resolved)
+        } else {
+            self.db.remap_project(&params.project_hash, &resolved)
+        };
+
+        match outcome {
+            Ok(outcome) => {
+                let kind = match outcome.kind {
+                    crate::domain::project::RemapKind::Move => "move",
+                    crate::domain::project::RemapKind::Merge => "merge",
+                };
+                let out = serde_json::json!({
+                    "kind": kind,
+                    "dry_run": params.dry_run.unwrap_or(false),
+                    "old_hash": outcome.old_hash,
+                    "new_hash": outcome.new_hash,
+                    "new_path": outcome.new_path,
+                    "rows_moved": outcome.counts.total(),
+                    "counts": {
+                        "interactive_sessions": outcome.counts.interactive_sessions,
+                        "terminal_sessions": outcome.counts.terminal_sessions,
+                        "loops": outcome.counts.loops,
+                        "loop_specs": outcome.counts.loop_specs,
+                        "sync_messages": outcome.counts.sync_messages,
+                        "sync_locks": outcome.counts.sync_locks,
+                        "last_prompts": outcome.counts.last_prompts,
+                        "scheduled_sends": outcome.counts.scheduled_sends,
+                        "failed_scheduled_sends": outcome.counts.failed_scheduled_sends,
+                        "agents": outcome.counts.agents,
+                        "intelligence_nodes": outcome.counts.intelligence_nodes,
+                    },
+                });
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&out).unwrap_or_default(),
+                )]))
+            }
+            Err(e) => Ok(error_result(&e.to_string())),
+        }
+    }
+
     /// Full-text search over personal RAG chunks (LanceDB vector search). Rate-limited: 10/min per agent.
     #[tool(
         name = "rag_search",
@@ -14635,6 +14697,95 @@ mod endpoint_tests {
             .await
             .unwrap();
         assert!(is_err(&missing));
+    }
+
+    // ── project_remap ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn project_remap_moves_project_to_new_path() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        let base = tempdir().unwrap();
+        let old_dir = base.path().join("cadforge");
+        let new_dir = base.path().join("cadspec");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::create_dir_all(&new_dir).unwrap();
+        let project = db.register_project_path(&old_dir).unwrap();
+        db.insert_terminal_session("t-1", "t-1", "bash", &project.path)
+            .unwrap();
+
+        let result = handler
+            .project_remap(Parameters(ProjectRemapParams {
+                project_hash: project.hash.clone(),
+                new_path: new_dir.to_string_lossy().to_string(),
+                dry_run: None,
+                force: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&result), "{}", text(&result));
+        let body = raw_text(&result);
+        assert!(body.contains("\"kind\": \"move\""));
+        assert!(body.contains("\"rows_moved\": 2"));
+
+        assert!(db.get_project(&project.hash).unwrap().is_none());
+        let new_canonical = std::fs::canonicalize(&new_dir).unwrap();
+        let moved = db
+            .get_project_by_path(&new_canonical)
+            .unwrap()
+            .expect("project moved to new path");
+        assert_eq!(
+            db.project_dependent_counts(&moved.path)
+                .unwrap()
+                .terminal_sessions,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn project_remap_dry_run_changes_nothing() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        let base = tempdir().unwrap();
+        let old_dir = base.path().join("old-loc");
+        let new_dir = base.path().join("new-loc");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::create_dir_all(&new_dir).unwrap();
+        let project = db.register_project_path(&old_dir).unwrap();
+
+        let result = handler
+            .project_remap(Parameters(ProjectRemapParams {
+                project_hash: project.hash.clone(),
+                new_path: new_dir.to_string_lossy().to_string(),
+                dry_run: Some(true),
+                force: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&result), "{}", text(&result));
+        assert!(raw_text(&result).contains("\"dry_run\": true"));
+
+        // Nothing actually moved.
+        assert!(db.get_project(&project.hash).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn project_remap_refuses_missing_path_without_force() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        let base = tempdir().unwrap();
+        let old_dir = base.path().join("still-here");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        let project = db.register_project_path(&old_dir).unwrap();
+
+        let result = handler
+            .project_remap(Parameters(ProjectRemapParams {
+                project_hash: project.hash.clone(),
+                new_path: "/definitely/does/not/exist/anywhere".to_string(),
+                dry_run: None,
+                force: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&result));
+        assert!(db.get_project(&project.hash).unwrap().is_some());
     }
 
     // ── skill_list / skill_get ──

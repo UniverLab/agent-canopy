@@ -281,6 +281,20 @@ pub struct ProjectUpdateParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProjectRemapParams {
+    /// The project's current workdir_hash (see `project_search` or
+    /// `canopy clean`'s orphan report).
+    pub project_hash: String,
+    /// The project's new absolute path on disk (where the directory was
+    /// renamed or moved to).
+    pub new_path: String,
+    /// Preview which rows would move without changing anything. Default: false.
+    pub dry_run: Option<bool>,
+    /// Remap even if `new_path` doesn't exist on disk yet. Default: false.
+    pub force: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RagSearchParams {
     /// Natural-language search query.
     pub query: String,
