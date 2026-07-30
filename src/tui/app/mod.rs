@@ -41,7 +41,7 @@ pub(crate) use types::ContextTransferSource;
 pub use types::{
     AgentEntry, AgentSectionFocus, App, AutomationKind, Focus, ProjectTab, SidebarLayer,
 };
-use types::{LoopSidebarMeta, RagTransferModal};
+use types::{LoopSidebarMeta, RagTransferModal, SidebarStepMemory};
 
 impl App {
     pub fn new(db: Arc<Database>, data_dir: &Path) -> Result<Self> {
@@ -77,6 +77,7 @@ impl App {
             focus: Focus::Home,
             sidebar_layer: SidebarLayer::Live,
             automation_kind: AutomationKind::Agent,
+            sidebar_step_memory: SidebarStepMemory::default(),
             project_focus: None,
             selected_project_history: 0,
             project_history_cache: HashMap::new(),
@@ -1345,16 +1346,107 @@ impl App {
     /// at the ends. Deliberately does NOT skip empty tabs the way F2 does:
     /// a directional key that silently jumps two cells because the one in
     /// between was empty reads as a bug, and the empty tab's own state is
-    /// worth seeing.
+    /// worth seeing. Now reachable from `Focus::Agent` too (not just
+    /// Home/Preview) when no split is active — see the guard in
+    /// `event::handle_global_key` — so a step away from a layer remembers
+    /// that layer's selection and a step back restores it instead of
+    /// re-landing on its edge item the way a fresh jump (click/F2) does.
     pub(crate) fn step_sidebar_tab(&mut self, forward: bool) {
         let ring = Self::SIDEBAR_TAB_RING;
         let idx = Self::sidebar_tab_index(self.sidebar_layer);
-        let next = if forward {
-            (idx + 1) % ring.len()
-        } else {
-            idx.checked_sub(1).unwrap_or(ring.len() - 1)
-        };
-        self.switch_sidebar_tab(ring[next]);
+        let next = step_ring_index(idx, ring.len(), forward);
+        self.remember_current_sidebar_selection();
+        let target = ring[next];
+        self.agents_rag_focused = false;
+        if !self.restore_remembered_sidebar_selection(target) {
+            self.switch_sidebar_tab(target);
+        }
+    }
+
+    /// Snapshot the outgoing sidebar layer's own selection into
+    /// `sidebar_step_memory` before `step_sidebar_tab` moves off it. `Live`
+    /// and Automation's agent sub-list share `selected` as their index
+    /// space, so leaving one and entering the other would otherwise
+    /// overwrite the value the departing layer needs back.
+    fn remember_current_sidebar_selection(&mut self) {
+        match self.sidebar_layer {
+            SidebarLayer::Live => {
+                self.sidebar_step_memory.live_selected = Some(self.selected);
+            }
+            SidebarLayer::Automation => {
+                self.sidebar_step_memory.automation_kind = Some(self.automation_kind);
+                match self.automation_kind {
+                    AutomationKind::Agent => {
+                        self.sidebar_step_memory.automation_selected = Some(self.selected);
+                    }
+                    AutomationKind::Loop => {
+                        self.sidebar_step_memory.automation_loop_id = self.selected_loop_id.clone();
+                    }
+                }
+            }
+            SidebarLayer::Knowledge => {
+                self.sidebar_step_memory.knowledge_selected = Some(self.selected_project);
+            }
+        }
+    }
+
+    /// Try to restore `layer`'s remembered selection (still valid against
+    /// current data); returns `false` if nothing was remembered or it no
+    /// longer applies, so the caller falls back to the edge-jump `enter_layer`
+    /// uses for a fresh jump.
+    fn restore_remembered_sidebar_selection(&mut self, layer: SidebarLayer) -> bool {
+        match layer {
+            SidebarLayer::Live => {
+                let Some(idx) = self.sidebar_step_memory.live_selected else {
+                    return false;
+                };
+                if !self.live_indices().contains(&idx) {
+                    return false;
+                }
+                self.sidebar_layer = SidebarLayer::Live;
+                self.selected = idx;
+                true
+            }
+            SidebarLayer::Automation => match self.sidebar_step_memory.automation_kind {
+                Some(AutomationKind::Agent) => {
+                    let Some(idx) = self.sidebar_step_memory.automation_selected else {
+                        return false;
+                    };
+                    if !self.automation_agent_indices().contains(&idx) {
+                        return false;
+                    }
+                    self.sidebar_layer = SidebarLayer::Automation;
+                    self.automation_kind = AutomationKind::Agent;
+                    self.selected = idx;
+                    true
+                }
+                Some(AutomationKind::Loop) => {
+                    let Some(id) = self.sidebar_step_memory.automation_loop_id.clone() else {
+                        return false;
+                    };
+                    if !self.active_loops().iter().any(|lp| lp.id == id) {
+                        return false;
+                    }
+                    self.sidebar_layer = SidebarLayer::Automation;
+                    self.automation_kind = AutomationKind::Loop;
+                    self.selected_loop_id = Some(id);
+                    self.refresh_loops_selection();
+                    true
+                }
+                None => false,
+            },
+            SidebarLayer::Knowledge => {
+                let Some(idx) = self.sidebar_step_memory.knowledge_selected else {
+                    return false;
+                };
+                if idx >= self.projects.len() {
+                    return false;
+                }
+                self.sidebar_layer = SidebarLayer::Knowledge;
+                self.selected_project = idx;
+                true
+            }
+        }
     }
 
     /// Enter a highlighted project's Focus tab bar (functional requirement
@@ -1371,7 +1463,7 @@ impl App {
         self.project_focus = None;
     }
 
-    /// Tab/Shift+Tab or `]`/`[` inside a project's Focus tab bar.
+    /// Tab/Shift+Tab, `]`/`[`, or Shift+←/→ inside a project's Focus tab bar.
     pub(crate) fn cycle_project_tab(&mut self, forward: bool) {
         let Some(current) = self.project_focus else {
             return;
@@ -1380,12 +1472,7 @@ impl App {
             .iter()
             .position(|&t| t == current)
             .unwrap_or(0);
-        let len = ProjectTab::ALL.len();
-        let next = if forward {
-            (idx + 1) % len
-        } else {
-            idx.checked_sub(1).unwrap_or(len - 1)
-        };
+        let next = step_ring_index(idx, ProjectTab::ALL.len(), forward);
         self.enter_project_focus(ProjectTab::ALL[next]);
     }
 
@@ -3040,6 +3127,17 @@ fn load_cli_usage() -> crate::domain::usage_stats::CliUsage {
     usage
 }
 
+/// Shared ring-stepping helper for both tab strips (sidebar layers and
+/// project tabs): move one position in `forward`'s direction, wrapping at
+/// either end.
+fn step_ring_index(idx: usize, len: usize, forward: bool) -> usize {
+    if forward {
+        (idx + 1) % len
+    } else {
+        idx.checked_sub(1).unwrap_or(len - 1)
+    }
+}
+
 fn calculate_log_hash(raw_log: &str) -> u64 {
     raw_log.bytes().enumerate().fold(0u64, |acc, (idx, byte)| {
         acc.wrapping_add((byte as u64).wrapping_mul(idx as u64 + 1))
@@ -3101,7 +3199,7 @@ mod tests {
         adaptive_change_score, adaptive_poll_interval_ms, blend_optional_f32, blend_optional_f64,
         build_resumed_session_args, calculate_log_hash, lerp_f32, lerp_u64, log_contains_error,
         log_contains_spawn, log_contains_success, process_is_alive, process_outlives_grace,
-        sample_from, should_resume_session, SystemSample,
+        sample_from, should_resume_session, step_ring_index, SystemSample,
     };
     use crate::db::session::InteractiveSession;
     use crate::db::Database;
@@ -3635,6 +3733,18 @@ mod tests {
     }
 
     // ── Pure helper tests ────────────────────────────────────────
+
+    #[test]
+    fn step_ring_index_forward_wraps() {
+        assert_eq!(step_ring_index(0, 3, true), 1);
+        assert_eq!(step_ring_index(2, 3, true), 0);
+    }
+
+    #[test]
+    fn step_ring_index_backward_wraps() {
+        assert_eq!(step_ring_index(1, 3, false), 0);
+        assert_eq!(step_ring_index(0, 3, false), 2);
+    }
 
     #[test]
     fn calculate_log_hash_empty_string() {
@@ -4561,6 +4671,91 @@ mod tests {
         app.sidebar_layer = SidebarLayer::Live;
         app.step_sidebar_tab(false);
         assert_eq!(app.sidebar_layer, SidebarLayer::Knowledge);
+    }
+
+    fn bg_agent(id: &str) -> crate::domain::models::Agent {
+        crate::domain::models::Agent {
+            id: id.to_string(),
+            prompt: String::new(),
+            trigger: None,
+            cli: crate::domain::models::Cli::new("claude"),
+            model: None,
+            working_dir: None,
+            enabled: true,
+            enable_at: None,
+            created_at: chrono::Utc::now(),
+            log_path: format!("/tmp/{id}.log"),
+            timeout_minutes: 15,
+            expires_at: None,
+            last_run_at: None,
+            last_run_ok: None,
+            last_triggered_at: None,
+            trigger_count: 0,
+        }
+    }
+
+    #[test]
+    fn step_sidebar_tab_restores_non_edge_selection_on_return() {
+        // Functional requirement 6: stepping away from a layer and back must
+        // not disturb what was selected there, unlike a fresh jump (F2,
+        // click), which deliberately always lands on the tab's edge item.
+        // `Live` and Automation's agent sub-list share `selected` as their
+        // index space, so this specifically exercises the case where
+        // leaving one for the other would otherwise clobber it.
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.agents = vec![
+            AgentEntry::Group(0),
+            AgentEntry::Group(1),
+            AgentEntry::Agent(bg_agent("bg-1")),
+        ];
+        app.sidebar_layer = SidebarLayer::Live;
+        app.selected = 1; // the second (non-edge) Live item
+
+        app.step_sidebar_tab(true);
+        assert_eq!(app.sidebar_layer, SidebarLayer::Automation);
+        assert_eq!(
+            app.selected, 2,
+            "a fresh jump into Automation lands on its edge item"
+        );
+
+        app.step_sidebar_tab(false);
+        assert_eq!(app.sidebar_layer, SidebarLayer::Live);
+        assert_eq!(
+            app.selected, 1,
+            "returning to Live must restore the remembered selection, not reset to its edge"
+        );
+    }
+
+    #[test]
+    fn step_sidebar_tab_falls_back_to_edge_when_remembered_selection_is_gone() {
+        // If the remembered index no longer belongs to the layer (e.g. the
+        // entry was removed while away), stepping back must not restore a
+        // stale/invalid index — it should behave like a fresh jump instead.
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.agents = vec![
+            AgentEntry::Group(0),
+            AgentEntry::Group(1),
+            AgentEntry::Agent(bg_agent("bg-1")),
+        ];
+        app.sidebar_layer = SidebarLayer::Live;
+        app.selected = 1;
+
+        app.step_sidebar_tab(true);
+        assert_eq!(app.sidebar_layer, SidebarLayer::Automation);
+
+        // The remembered Live index (1) is no longer a Live entry.
+        app.agents[1] = AgentEntry::Agent(bg_agent("bg-2"));
+
+        app.step_sidebar_tab(false);
+        assert_eq!(app.sidebar_layer, SidebarLayer::Live);
+        assert_eq!(
+            app.selected, 0,
+            "an invalidated memory falls back to the edge item"
+        );
     }
 
     #[test]

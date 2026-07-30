@@ -120,6 +120,21 @@ pub enum ProjectTab {
     History,
 }
 
+/// Per-layer selection remembered across a keyboard tab *step*
+/// (`Shift+←/→`), so stepping away and back lands you where you left off —
+/// unlike a direct jump (mouse click, F2), which deliberately always lands
+/// on the tab's edge item. `Live` and `Automation`'s agent sub-list share
+/// `App::selected` as their index space, so a step away from one clobbers
+/// the other's value; this cache is what lets a step back restore it.
+#[derive(Clone, Default)]
+pub(crate) struct SidebarStepMemory {
+    pub(crate) live_selected: Option<usize>,
+    pub(crate) automation_kind: Option<AutomationKind>,
+    pub(crate) automation_selected: Option<usize>,
+    pub(crate) automation_loop_id: Option<String>,
+    pub(crate) knowledge_selected: Option<usize>,
+}
+
 impl ProjectTab {
     pub const ALL: [ProjectTab; 4] = [
         ProjectTab::Overview,
@@ -368,6 +383,9 @@ pub struct App {
     pub(crate) sidebar_layer: SidebarLayer,
     /// Which of Automation's two sub-lists is active for navigation.
     pub(crate) automation_kind: AutomationKind,
+    /// Remembered per-layer selection for `App::step_sidebar_tab`, so a step
+    /// away and back doesn't reset the tab you return to.
+    pub(crate) sidebar_step_memory: SidebarStepMemory,
     /// `Some(tab)` while a project is entered (Focus tab bar showing);
     /// `None` while only highlighted (Preview summary card showing).
     pub(crate) project_focus: Option<ProjectTab>,

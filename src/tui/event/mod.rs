@@ -182,17 +182,32 @@ fn handle_global_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> b
         return true;
     }
 
-    // Shift+←/→ walks the sidebar tab strip. Scoped to Home/Preview on
-    // purpose: plain ←/→ already means "collapse/expand loop" there and
-    // "move split focus" inside Focus::Agent, so claiming the shifted pair
-    // globally would shadow a binding the agent view owns.
+    // Shift+←/→ walks the sidebar tab strip — one convention for both tab
+    // strips in canopy (see `agent_focus::handle_project_focus_key` for the
+    // project-tab side), reachable from Home, Preview, and now Focus::Agent
+    // too. It used to be scoped to Home/Preview only because Focus::Agent
+    // already spends Shift+←/→ on split-pane focus (see
+    // `agent_focus::handle_split_panel_focus_shortcut`); the two can't both
+    // hold the key at once. Resolved by context: while a split is active,
+    // Shift+←/→ still means split focus — that binding is established and
+    // arguably more delicate to lose since it's how you jump to the *other*
+    // pane. Wherever a split isn't active, Shift+←/→ steps the sidebar tab
+    // instead — matching Home/Preview and, per functional requirement 1,
+    // making the strip reachable without backing out of focus first. Plain
+    // ←/→ is untouched either way (loop collapse/expand on Home, forwarded
+    // to the PTY / cursor movement everywhere else), and project focus /
+    // playground keep opting out entirely per the existing guard below.
     if matches!(code, KeyCode::Left | KeyCode::Right)
         && modifiers.contains(KeyModifiers::SHIFT)
-        && matches!(app.focus, Focus::Home | Focus::Preview)
+        && sidebar_tab_step_applies(app)
         && !app.playground_active
         && app.project_focus.is_none()
     {
-        app.step_sidebar_tab(code == KeyCode::Right);
+        let forward = code == KeyCode::Right;
+        app.step_sidebar_tab(forward);
+        if app.focus == Focus::Agent && app.sidebar_layer == SidebarLayer::Knowledge {
+            app.enter_project_focus(ProjectTab::Overview);
+        }
         return true;
     }
 
@@ -210,6 +225,18 @@ fn handle_global_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> b
     }
 
     false
+}
+
+/// Whether Shift+←/→ should step the sidebar tab strip in the app's current
+/// state: always from Home/Preview, and from Focus::Agent only when no
+/// split is active (a split keeps Shift+←/→ for split-pane focus instead —
+/// see the comment above this function's call site).
+fn sidebar_tab_step_applies(app: &App) -> bool {
+    match app.focus {
+        Focus::Home | Focus::Preview => true,
+        Focus::Agent => app.active_split_id.is_none(),
+        _ => false,
+    }
 }
 
 /// Shared by the F2 key and a sidebar right-click.
@@ -1321,11 +1348,36 @@ mod sidebar_mouse_tests {
     }
 
     #[test]
-    fn shift_arrows_are_not_claimed_inside_a_focused_agent() {
-        // Focus::Agent gives ←/→ to the split-pane focus handler; stealing
-        // the shifted pair globally would shadow it.
+    fn shift_arrows_step_sidebar_tab_inside_a_focused_agent_without_a_split() {
+        // Functional requirement 1: the sidebar tab strip must be reachable
+        // from focus, not only from Home/Preview, as long as nothing else
+        // (a split) already owns Shift+←/→ there.
         let mut app = app_with_agents(3);
         app.focus = Focus::Agent;
+        app.selected = 0;
+
+        assert!(handle_global_key(
+            &mut app,
+            KeyCode::Right,
+            KeyModifiers::SHIFT
+        ));
+
+        assert_eq!(app.sidebar_layer, crate::tui::app::SidebarLayer::Automation);
+        assert!(
+            matches!(app.focus, Focus::Agent),
+            "stepping tabs from focus must not disturb what is focused"
+        );
+    }
+
+    #[test]
+    fn shift_arrows_defer_to_split_focus_when_a_split_is_active() {
+        // With a split active, Shift+←/→ keeps meaning split-pane focus —
+        // the established binding that would otherwise be shadowed by
+        // widening the sidebar-tab-step scope into Focus::Agent.
+        let mut app = app_with_agents(3);
+        app.focus = Focus::Agent;
+        app.active_split_id = Some("split-1".to_string());
+
         assert!(!handle_global_key(
             &mut app,
             KeyCode::Right,
