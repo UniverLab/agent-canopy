@@ -226,6 +226,39 @@ impl Database {
         Ok(counts)
     }
 
+    /// Rewrites the database file to return space freed by deleted rows to
+    /// the filesystem, then checkpoints the WAL into it so the `-wal` file
+    /// shrinks too. Takes an exclusive lock for the duration — callers must
+    /// make sure nothing else has the database open for writing (see
+    /// `daemon::clean_cli`'s reclaim step, which refuses to run this while
+    /// the daemon is up).
+    ///
+    /// A full `VACUUM` was chosen over `PRAGMA auto_vacuum=INCREMENTAL` +
+    /// `incremental_vacuum`: incremental auto-vacuum only takes effect for
+    /// databases created (or already fully rewritten) after the pragma is
+    /// set, so an existing database — like every one `canopy clean` will
+    /// ever run against — needs a one-time full rewrite regardless before
+    /// incremental mode does anything. A plain `VACUUM` gets the same space
+    /// back today, in one step, without also taking on a migration path and
+    /// a mode that still needs a periodic manual `incremental_vacuum` call
+    /// to keep paying off.
+    ///
+    /// If interrupted (crash, kill -9, power loss), SQLite's own commit
+    /// mechanism protects the original file: `VACUUM` builds its rewritten
+    /// copy in a separate temp database and only replaces the original as
+    /// part of committing that transaction, so a `VACUUM` that never
+    /// commits leaves the database exactly as it was — never a half
+    /// re-written, unusable file.
+    pub fn reclaim_space(&self) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        // Wait out a brief writer instead of failing instantly on
+        // `SQLITE_BUSY` — a short in-flight write (e.g. the TUI recording a
+        // session event) shouldn't abort the whole reclaim.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
+    }
+
     /// Why a project must be skipped by `--hard`, if any. Returns `Some` only
     /// when the project has either a `Running` loop or an `active`/`resumed`
     /// interactive session, both of which are in-flight state the cascade
@@ -1181,6 +1214,74 @@ mod tests {
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         let ids = db.list_agent_ids().unwrap();
         assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn reclaim_space_shrinks_file_after_bulk_delete() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("test.db");
+        let db = Database::new(&path).unwrap();
+
+        // Pad each row so the bulk insert actually grows the file across
+        // multiple pages instead of fitting in whatever SQLite pre-allocates.
+        let padding = "x".repeat(4096);
+        let mut ids = Vec::new();
+        for i in 0..500 {
+            let id = format!("s-{i}");
+            db.insert_interactive_session(
+                &id,
+                &id,
+                "opencode",
+                "/tmp",
+                Some(&padding),
+                None,
+                "interactive",
+                None,
+            )
+            .unwrap();
+            db.finish_interactive_session(&id, 0).unwrap();
+            ids.push(id);
+        }
+
+        // Force everything out of the WAL and into the main file so the
+        // "before" measurement reflects real page count, not whatever's
+        // still sitting in `-wal`.
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(FULL);").unwrap();
+        }
+        let size_before_delete = std::fs::metadata(&path).unwrap().len();
+
+        db.delete_interactive_sessions(&ids).unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(FULL);").unwrap();
+        }
+        let size_after_delete = std::fs::metadata(&path).unwrap().len();
+        // Deleting rows frees pages inside the file without shrinking it —
+        // this is the premise `reclaim_space` exists to fix.
+        assert_eq!(size_after_delete, size_before_delete);
+
+        db.reclaim_space().unwrap();
+        let size_after_reclaim = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            size_after_reclaim < size_after_delete,
+            "expected reclaim to shrink the file: {size_after_delete} -> {size_after_reclaim}"
+        );
+
+        // The database must still be fully usable afterwards.
+        db.insert_interactive_session(
+            "s-post-vacuum",
+            "s-post-vacuum",
+            "opencode",
+            "/tmp",
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+        assert_eq!(db.count_interactive_sessions().unwrap(), 1);
     }
 
     #[test]

@@ -25,9 +25,11 @@ pub async fn handle_clean_action(
     older_than: Option<u64>,
     hard: bool,
     yes: bool,
+    no_reclaim: bool,
 ) -> Result<()> {
     let data_dir = crate::ensure_data_dir()?;
-    let db = Database::new(&data_dir.join("background_agents.db"))?;
+    let db_path = data_dir.join("background_agents.db");
+    let db = Database::new(&db_path)?;
     let config = CanopyConfig::load(&data_dir);
     let retention_days = older_than.unwrap_or(config.clean.retention_days);
     let now_ts = chrono::Utc::now().timestamp();
@@ -35,9 +37,12 @@ pub async fn handle_clean_action(
     let plan = run_clean(&data_dir, &db, dry_run, retention_days, now_ts)?;
     print_summary(&plan, retention_days, dry_run);
 
+    let mut rows_deleted = plan.deleted_row_count() as u64;
     if hard {
-        run_hard_cascade(&db, dry_run, yes)?;
+        rows_deleted += run_hard_cascade(&db, dry_run, yes)?;
     }
+
+    reclaim_if_warranted(&db, &data_dir, &db_path, dry_run, no_reclaim, rows_deleted);
 
     Ok(())
 }
@@ -103,7 +108,10 @@ fn run_clean(
 /// [`HardCascadePlan`], print it, and (unless `dry_run`) prompt and
 /// execute. Splits the orphan work from `run_clean` so the soft-mode
 /// tests don't pay for the extra DB roundtrips when `--hard` isn't set.
-fn run_hard_cascade(db: &Database, dry_run: bool, yes: bool) -> Result<()> {
+/// Returns the number of database rows the cascade removed (real run) or
+/// would remove (`--dry-run`'s projection), so the caller can fold it into
+/// the total that decides whether reclaiming space is warranted.
+fn run_hard_cascade(db: &Database, dry_run: bool, yes: bool) -> Result<u64> {
     let candidates: Vec<HardCascadeCandidate> = db
         .list_projects()?
         .into_iter()
@@ -126,13 +134,19 @@ fn run_hard_cascade(db: &Database, dry_run: bool, yes: bool) -> Result<()> {
     print_hard_cascade_plan(&plan, dry_run);
 
     if plan.targets.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
 
     if dry_run {
         // Plan-only: no prompt, no deletes (spec: "deletes nothing, no
-        // confirmation needed").
-        return Ok(());
+        // confirmation needed"). Project the row count so `--dry-run`
+        // reports the same reclaim figures a real run would.
+        let projected = plan
+            .targets
+            .iter()
+            .map(|t| (direct_count(&t.counts) + cascade_count(&t.counts)) as u64)
+            .sum();
+        return Ok(projected);
     }
 
     if !yes {
@@ -141,18 +155,20 @@ fn run_hard_cascade(db: &Database, dry_run: bool, yes: bool) -> Result<()> {
             Ok(value) => value,
             Err(err) => {
                 eprintln!("  {err}\n  Aborting --hard: refusing to run without an explicit yes.");
-                return Ok(());
+                return Ok(0);
             }
         };
         if !proceed {
             println!("  Aborted by user — nothing deleted.");
-            return Ok(());
+            return Ok(0);
         }
     }
 
+    let mut rows_deleted = 0u64;
     for target in &plan.targets {
         match db.cascade_delete_orphan_project(&target.hash, &target.missing_path) {
             Ok(actual) => {
+                rows_deleted += (direct_count(&actual) + cascade_count(&actual)) as u64;
                 println!(
                     " \x1b[32m✓\x1b[0m  Removed {} ({}): {} direct + {} cascade rows across the project.",
                     target.name,
@@ -169,7 +185,7 @@ fn run_hard_cascade(db: &Database, dry_run: bool, yes: bool) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(rows_deleted)
 }
 
 fn direct_count(c: &clean::HardCascadeCounts) -> i64 {
@@ -400,6 +416,74 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// After a clean run, reclaim the database space its own row deletions
+/// freed — but only when that's actually warranted. Skips automatically
+/// (spec: "skipped automatically when the deletion was trivial") unless
+/// `rows_deleted` clears [`clean::RECLAIM_ROW_THRESHOLD`], skips entirely
+/// when `no_reclaim` opts out for a fast run, and never touches the file
+/// under `--dry-run` — it only prints what a real run would do.
+///
+/// Reclaiming (`VACUUM` + WAL checkpoint) takes an exclusive lock on the
+/// database, so it must not run while the daemon could be mid-write. The
+/// daemon's own singleton lock (`daemon::process::acquire_daemon_lock`) is
+/// a `daemon.pid`-backed flock; this reuses the same pid file (rather than
+/// re-acquiring the flock, which would race the daemon's own re-acquire on
+/// restart) to decide whether a daemon is up before ever calling `VACUUM`.
+fn reclaim_if_warranted(
+    db: &Database,
+    data_dir: &Path,
+    db_path: &Path,
+    dry_run: bool,
+    no_reclaim: bool,
+    rows_deleted: u64,
+) {
+    if no_reclaim || !clean::should_reclaim(rows_deleted as usize) {
+        return;
+    }
+
+    let size_before = std::fs::metadata(db_path).ok().map(|m| m.len());
+
+    if dry_run {
+        if let Some(before) = size_before {
+            println!(
+                "\n Database file: {} — would reclaim space ({rows_deleted} row(s) deleted, ≥ {} threshold; run without --dry-run to apply).",
+                format_bytes(before),
+                clean::RECLAIM_ROW_THRESHOLD,
+            );
+        }
+        return;
+    }
+
+    let daemon_running = crate::daemon::process::read_pid(data_dir)
+        .map(crate::daemon::process::is_process_running)
+        .unwrap_or(false);
+    if daemon_running {
+        println!(
+            "\n \x1b[33m⚠\x1b[0m  Skipped space reclamation: the canopy daemon is running and holds a write connection that a VACUUM's exclusive lock would conflict with. Stop it (`canopy daemon stop`) and re-run `canopy clean` to shrink the database file."
+        );
+        return;
+    }
+
+    match db.reclaim_space() {
+        Ok(()) => {
+            let size_after = std::fs::metadata(db_path).ok().map(|m| m.len());
+            match (size_before, size_after) {
+                (Some(before), Some(after)) => println!(
+                    "\n Database file: {} -> {} ({rows_deleted} row(s) reclaimed via VACUUM + WAL checkpoint)",
+                    format_bytes(before),
+                    format_bytes(after),
+                ),
+                _ => println!(
+                    "\n Reclaimed database space ({rows_deleted} row(s) via VACUUM + WAL checkpoint)."
+                ),
+            }
+        }
+        Err(err) => {
+            eprintln!("\n \x1b[33m⚠\x1b[0m  Could not reclaim database space: {err}");
+        }
+    }
+}
+
 fn print_summary(plan: &CleanPlan, retention_days: u64, dry_run: bool) {
     let verb = if dry_run { "Would remove" } else { "Removed" };
     println!(
@@ -407,7 +491,7 @@ fn print_summary(plan: &CleanPlan, retention_days: u64, dry_run: bool) {
         if dry_run { ", dry run" } else { "" }
     );
     println!(
-        " {verb} {} stale interactive session(s)",
+        " {verb} {} stale interactive session(s) (database rows)",
         plan.session_ids.len()
     );
     println!(" {verb} {} orphaned log file(s)", plan.log_files.len());
@@ -419,7 +503,15 @@ fn print_summary(plan: &CleanPlan, retention_days: u64, dry_run: bool) {
         " {verb} {} leftover RAG residue file(s)",
         plan.rag_residue_files.len()
     );
-    println!(" Reclaimed: {}", format_bytes(plan.reclaimed_bytes()));
+    // Deliberately two separate lines: a row count is not a byte count, and
+    // the row deletions above contribute nothing to this figure — it's
+    // filesystem bytes from the log/terminal/RAG files only. Freed database
+    // space is reported (if warranted) by `reclaim_if_warranted` below.
+    println!(
+        " Filesystem bytes {}: {}",
+        if dry_run { "would be freed" } else { "freed" },
+        format_bytes(plan.reclaimed_bytes())
+    );
 
     if !plan.orphaned_projects.is_empty() {
         println!(
@@ -931,5 +1023,136 @@ mod tests {
         assert!(db.get_project("hash-real").unwrap().is_some());
         assert!(db.get_project("hash-doomed").unwrap().is_none());
         assert!(db.get_project("hash-skipped").unwrap().is_some());
+    }
+
+    // ── reclaim_if_warranted ────────────────────────────────────────────
+
+    /// Combined on-disk footprint (main file + WAL) so shrinkage is
+    /// detectable regardless of whether data happened to already be
+    /// checkpointed out of the WAL at the moment of measurement.
+    fn total_db_size(db_path: &Path) -> u64 {
+        let main = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
+        let wal_path = std::path::PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+        let wal = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        main + wal
+    }
+
+    /// Inserts `count` padded, immediately-deleted sessions so the database
+    /// has freed-but-unreturned pages worth reclaiming.
+    fn bulk_insert_and_delete_sessions(db: &Database, count: usize) {
+        let padding = "x".repeat(4096);
+        let mut ids = Vec::new();
+        for i in 0..count {
+            let id = format!("s-{i}");
+            db.insert_interactive_session(
+                &id,
+                &id,
+                "opencode",
+                "/tmp",
+                Some(&padding),
+                None,
+                "interactive",
+                None,
+            )
+            .unwrap();
+            db.finish_interactive_session(&id, 0).unwrap();
+            ids.push(id);
+        }
+        db.delete_interactive_sessions(&ids).unwrap();
+    }
+
+    #[test]
+    fn reclaim_shrinks_file_when_threshold_met_and_daemon_not_running() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path();
+        let db_path = data_dir.join("test.db");
+        let db = Database::new(&db_path).unwrap();
+
+        // Above RECLAIM_ROW_THRESHOLD (50).
+        bulk_insert_and_delete_sessions(&db, 60);
+
+        let size_before = total_db_size(&db_path);
+        reclaim_if_warranted(&db, data_dir, &db_path, false, false, 60);
+        let size_after = total_db_size(&db_path);
+
+        assert!(
+            size_after < size_before,
+            "expected reclaim to shrink the file: {size_before} -> {size_after}"
+        );
+    }
+
+    #[test]
+    fn reclaim_skipped_when_deletion_is_trivial() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path();
+        let db_path = data_dir.join("test.db");
+        let db = Database::new(&db_path).unwrap();
+
+        bulk_insert_and_delete_sessions(&db, 5);
+
+        let size_before = total_db_size(&db_path);
+        // Below RECLAIM_ROW_THRESHOLD (50): must not touch the file.
+        reclaim_if_warranted(&db, data_dir, &db_path, false, false, 5);
+        let size_after = total_db_size(&db_path);
+
+        assert_eq!(size_before, size_after);
+    }
+
+    #[test]
+    fn reclaim_skipped_when_no_reclaim_flag_set() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path();
+        let db_path = data_dir.join("test.db");
+        let db = Database::new(&db_path).unwrap();
+
+        bulk_insert_and_delete_sessions(&db, 60);
+
+        let size_before = total_db_size(&db_path);
+        // Above threshold, but --no-reclaim opts out.
+        reclaim_if_warranted(&db, data_dir, &db_path, false, true, 60);
+        let size_after = total_db_size(&db_path);
+
+        assert_eq!(size_before, size_after);
+    }
+
+    #[test]
+    fn reclaim_skipped_and_untouched_under_dry_run() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path();
+        let db_path = data_dir.join("test.db");
+        let db = Database::new(&db_path).unwrap();
+
+        bulk_insert_and_delete_sessions(&db, 60);
+
+        let size_before = total_db_size(&db_path);
+        // Above threshold, but --dry-run must project only, never touch.
+        reclaim_if_warranted(&db, data_dir, &db_path, true, false, 60);
+        let size_after = total_db_size(&db_path);
+
+        assert_eq!(size_before, size_after);
+    }
+
+    #[test]
+    fn reclaim_skipped_while_daemon_is_running() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path();
+        let db_path = data_dir.join("test.db");
+        let db = Database::new(&db_path).unwrap();
+
+        bulk_insert_and_delete_sessions(&db, 60);
+
+        // Current test process is guaranteed alive, so `daemon.pid`
+        // naming it makes `is_process_running` report true, exactly as it
+        // would for a live `canopy serve`.
+        std::fs::write(data_dir.join("daemon.pid"), std::process::id().to_string()).unwrap();
+
+        let size_before = total_db_size(&db_path);
+        reclaim_if_warranted(&db, data_dir, &db_path, false, false, 60);
+        let size_after = total_db_size(&db_path);
+
+        assert_eq!(
+            size_before, size_after,
+            "must not VACUUM while the daemon holds a write connection"
+        );
     }
 }

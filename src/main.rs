@@ -110,6 +110,12 @@ enum Commands {
         /// delete a real cascade.
         #[arg(long)]
         yes: bool,
+        /// Skip reclaiming freed database space (VACUUM + WAL checkpoint)
+        /// even when this run deleted enough rows to warrant it. Use for a
+        /// fast run — reclamation takes an exclusive lock and rewrites the
+        /// whole database file.
+        #[arg(long = "no-reclaim")]
+        no_reclaim: bool,
     },
     /// Discover file-backed prompt presets (~/.canopy/prompts/).
     Prompts {
@@ -167,7 +173,8 @@ async fn main() -> Result<()> {
             older_than,
             hard,
             yes,
-        }) => handle_clean_action(dry_run, older_than, hard, yes).await,
+            no_reclaim,
+        }) => handle_clean_action(dry_run, older_than, hard, yes, no_reclaim).await,
         Some(Commands::Prompts { action }) => handle_prompts_action(action).await,
         Some(Commands::Bridge {
             agent_id,
