@@ -32,9 +32,14 @@ pub enum SectionPickerMode {
         /// `None` → create a new tools section on confirm; `Some(id)` → replace content of that section
         replace_id: Option<String>,
     },
+    /// `selected`/`scroll` index into the FILTERED list (mirroring
+    /// `PresetPicker`), so typing narrows `entries` in place without a
+    /// re-query while the highlighted row and scroll window stay in sync.
     ProjectPicker {
         selected: usize,
         entries: Vec<ProjectPickerEntry>,
+        filter: String,
+        scroll: usize,
     },
     /// Prompt-preset picker (P2): entries are read fresh from
     /// `~/.canopy/prompts/*.md` (P1) each time the picker opens — `(name,
@@ -534,6 +539,60 @@ impl SimplePromptDialog {
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.name.cmp(&right.name).then(left.path.cmp(&right.path)));
         Ok(entries)
+    }
+
+    /// Indices into `entries` whose name or path match `filter` as a
+    /// case-insensitive substring — same convention as
+    /// [`Self::filtered_preset_indices`], extended to path since a project's
+    /// path is often what a user remembers about it.
+    pub fn filtered_project_indices(entries: &[ProjectPickerEntry], filter: &str) -> Vec<usize> {
+        let query = filter.trim().to_lowercase();
+        entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                query.is_empty()
+                    || entry.name.to_lowercase().contains(&query)
+                    || entry.path.to_lowercase().contains(&query)
+            })
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    /// Height (in terminal rows, borders included) of the project picker box
+    /// for `count` filtered entries: a border top/bottom, a filter row, a
+    /// hint row, and up to 13 entry rows, capped so the box never grows
+    /// past the screen for a large workspace. The single source of truth
+    /// for both [`Self::project_picker_visible_rows`] (scrolling) and the
+    /// box's rendered area, so the two can never disagree on how many rows
+    /// fit.
+    pub fn project_picker_box_height(count: usize) -> u16 {
+        (count as u16 + 6).clamp(7, 17)
+    }
+
+    /// Number of entry rows visible inside the project picker box for
+    /// `count` filtered entries — the box height minus its 2 border rows,
+    /// 1 filter row, and 1 hint row.
+    pub fn project_picker_visible_rows(count: usize) -> usize {
+        Self::project_picker_box_height(count).saturating_sub(4) as usize
+    }
+
+    /// Recompute the scroll offset so `selected` (an index into the current
+    /// filtered list) stays inside the `visible_rows`-tall window, sliding by
+    /// exactly enough to bring it back into view. Pure and Frame-free so
+    /// scrolling logic is unit-testable on its own; also what makes the view
+    /// follow selection wraparound at either end of the list for free.
+    pub fn clamp_scroll(selected: usize, scroll: usize, visible_rows: usize) -> usize {
+        if visible_rows == 0 {
+            return 0;
+        }
+        if selected < scroll {
+            selected
+        } else if selected >= scroll + visible_rows {
+            selected + 1 - visible_rows
+        } else {
+            scroll
+        }
     }
 
     /// Set the content of a specific tools section to a single skill label.
@@ -1951,6 +2010,70 @@ mod tests {
             3
         );
         assert!(SimplePromptDialog::filtered_preset_indices(&entries, "zzz").is_empty());
+    }
+
+    fn project_entry(name: &str, path: &str) -> ProjectPickerEntry {
+        ProjectPickerEntry {
+            hash: format!("{name}-hash"),
+            name: name.to_string(),
+            path: path.to_string(),
+        }
+    }
+
+    #[test]
+    fn filtered_project_indices_matches_name_or_path_case_insensitive() {
+        let entries = vec![
+            project_entry("harness-canopy", "/home/user/harness-canopy"),
+            project_entry("otherproj", "/home/user/OTHERPROJ"),
+            project_entry("unrelated", "/srv/unrelated"),
+        ];
+
+        let by_name = SimplePromptDialog::filtered_project_indices(&entries, "HARNESS");
+        assert_eq!(by_name, vec![0]);
+
+        let by_path = SimplePromptDialog::filtered_project_indices(&entries, "otherproj");
+        assert_eq!(by_path, vec![1]);
+
+        assert_eq!(
+            SimplePromptDialog::filtered_project_indices(&entries, "").len(),
+            3
+        );
+        assert!(SimplePromptDialog::filtered_project_indices(&entries, "zzz").is_empty());
+    }
+
+    #[test]
+    fn project_picker_visible_rows_caps_at_thirteen() {
+        assert_eq!(SimplePromptDialog::project_picker_visible_rows(1), 3);
+        assert_eq!(SimplePromptDialog::project_picker_visible_rows(11), 13);
+        assert_eq!(SimplePromptDialog::project_picker_visible_rows(100), 13);
+    }
+
+    #[test]
+    fn clamp_scroll_stays_put_when_selection_already_visible() {
+        assert_eq!(SimplePromptDialog::clamp_scroll(2, 0, 5), 0);
+    }
+
+    #[test]
+    fn clamp_scroll_follows_selection_past_bottom_edge() {
+        // visible_rows=5 shows rows [0,5); selecting row 5 must slide by one.
+        assert_eq!(SimplePromptDialog::clamp_scroll(5, 0, 5), 1);
+    }
+
+    #[test]
+    fn clamp_scroll_follows_selection_past_top_edge() {
+        assert_eq!(SimplePromptDialog::clamp_scroll(2, 3, 5), 2);
+    }
+
+    #[test]
+    fn clamp_scroll_shows_last_page_when_selection_wraps_to_end() {
+        // 20 entries, 13 visible rows: wrapping to the last entry (idx 19)
+        // must scroll so the final page (rows 7..20) is shown.
+        assert_eq!(SimplePromptDialog::clamp_scroll(19, 0, 13), 7);
+    }
+
+    #[test]
+    fn clamp_scroll_resets_to_top_when_selection_wraps_to_start() {
+        assert_eq!(SimplePromptDialog::clamp_scroll(0, 7, 13), 0);
     }
 
     #[test]
