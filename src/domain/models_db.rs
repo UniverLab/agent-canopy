@@ -9,8 +9,21 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-/// How long the local cache stays valid before re-fetching.
-const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Default TTL for the models.dev catalog cache, used when nothing in
+/// `config.toml` overrides it (see `ModelsConfig::catalog_ttl_minutes`).
+/// A full models.dev fetch is a large remote call, so it defaults to a full
+/// day rather than refreshing on every miss.
+pub const DEFAULT_CATALOG_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Default TTL for a platform's native CLI model enumeration, used when
+/// nothing in `config.toml` overrides it (see
+/// `ModelsConfig::native_ttl_minutes`). Deliberately much shorter than
+/// [`DEFAULT_CATALOG_TTL`]: running a local CLI's own `models` subcommand is
+/// cheap (no large remote fetch), and its answer changes the moment the user
+/// authenticates with a new provider through that CLI — a stale native cache
+/// is far more likely to hide a model the user just unlocked than the
+/// models.dev catalog is to miss a same-day release.
+pub const DEFAULT_NATIVE_TTL: Duration = Duration::from_secs(60 * 60);
 
 const API_URL: &str = "https://models.dev/api.json";
 
@@ -120,8 +133,8 @@ fn cache_path() -> Option<PathBuf> {
 /// Load the catalog and report where it came from (`live`/`cache`/`stale`).
 ///
 /// Policy:
-/// - `force_refresh == false`: a fresh cache (within [`CACHE_TTL`]) is served
-///   as [`CatalogSource::Cache`] with **no network call** — the hot path. A
+/// - `force_refresh == false`: a fresh cache (within `ttl`) is served as
+///   [`CatalogSource::Cache`] with **no network call** — the hot path. A
 ///   stale or missing cache triggers a fetch ([`CatalogSource::Live`]); if the
 ///   fetch fails but a cache exists, it is served as [`CatalogSource::Stale`]
 ///   rather than failing hard.
@@ -130,10 +143,13 @@ fn cache_path() -> Option<PathBuf> {
 ///   `big-pickle` — appear immediately); on failure any existing cache is
 ///   served as [`CatalogSource::Stale`].
 ///
+/// `ttl` is caller-supplied (see `ModelsConfig::catalog_ttl`) rather than a
+/// compiled constant, so it can be configured in `config.toml`.
+///
 /// Returns `None` only when there is neither a usable cache nor a reachable
 /// models.dev.
-pub fn load_catalog_with_source(force_refresh: bool) -> Option<CatalogLoad> {
-    resolve_catalog(force_refresh, load_from_cache, fetch_and_cache)
+pub fn load_catalog_with_source(force_refresh: bool, ttl: Duration) -> Option<CatalogLoad> {
+    resolve_catalog(force_refresh, ttl, load_from_cache, fetch_and_cache)
 }
 
 /// TTL-and-provenance core of [`load_catalog_with_source`], with the cache read
@@ -141,13 +157,14 @@ pub fn load_catalog_with_source(force_refresh: bool) -> Option<CatalogLoad> {
 /// touching disk or the network.
 fn resolve_catalog(
     force_refresh: bool,
+    ttl: Duration,
     load_cache: impl FnOnce() -> Option<ModelCatalog>,
     fetch: impl FnOnce() -> Option<ModelCatalog>,
 ) -> Option<CatalogLoad> {
     let cached = load_cache();
 
     if !force_refresh {
-        if let Some(catalog) = cached.as_ref().filter(|c| is_fresh(c)).cloned() {
+        if let Some(catalog) = cached.as_ref().filter(|c| is_fresh(c, ttl)).cloned() {
             return Some(CatalogLoad {
                 catalog,
                 source: CatalogSource::Cache,
@@ -169,17 +186,17 @@ fn resolve_catalog(
     }
 }
 
-/// Whether a cached catalog is still within its TTL. A timestamp in the future
+/// Whether a cached catalog is still within `ttl`. A timestamp in the future
 /// (clock skew) makes `elapsed()` error; treat that as stale so a bad clock
 /// forces a refresh rather than pinning a possibly-wrong cache forever.
-fn is_fresh(catalog: &ModelCatalog) -> bool {
-    fetched_within_ttl(catalog.fetched_at)
+fn is_fresh(catalog: &ModelCatalog, ttl: Duration) -> bool {
+    fetched_within_ttl(catalog.fetched_at, ttl)
 }
 
 /// Shared TTL check used by both the models.dev catalog and the per-platform
 /// native enumeration. A future timestamp (clock skew) counts as stale.
-fn fetched_within_ttl(fetched_at: SystemTime) -> bool {
-    fetched_at.elapsed().unwrap_or(CACHE_TTL) < CACHE_TTL
+fn fetched_within_ttl(fetched_at: SystemTime, ttl: Duration) -> bool {
+    fetched_at.elapsed().unwrap_or(ttl) < ttl
 }
 
 /// Load the catalog without ever blocking on the network.
@@ -188,11 +205,11 @@ fn fetched_within_ttl(fetched_at: SystemTime) -> bool {
 /// stale or missing, a background thread refreshes it for the next caller.
 /// Use this from interactive paths (TUI dialogs) where a synchronous fetch
 /// would freeze the UI for up to the request timeout.
-pub fn load_catalog_nonblocking() -> Option<ModelCatalog> {
+pub fn load_catalog_nonblocking(ttl: Duration) -> Option<ModelCatalog> {
     let cached = load_from_cache();
     let fresh = cached
         .as_ref()
-        .is_some_and(|c| c.fetched_at.elapsed().unwrap_or(CACHE_TTL) < CACHE_TTL);
+        .is_some_and(|c| fetched_within_ttl(c.fetched_at, ttl));
 
     if !fresh {
         std::thread::spawn(|| {
@@ -248,18 +265,21 @@ pub struct NativeLoad {
 /// served with no CLI call ([`CatalogSource::Cache`]); a stale/missing cache
 /// (or `force_refresh`) runs `<binary> <args>` ([`CatalogSource::Live`]); a
 /// failed run falls back to any existing cache as [`CatalogSource::Stale`]
-/// rather than failing hard. Returns `None` only when there is neither a usable
-/// cache nor a successful enumeration.
+/// rather than failing hard. `ttl` is caller-supplied (see
+/// `ModelsConfig::native_ttl`) rather than a compiled constant. Returns `None`
+/// only when there is neither a usable cache nor a successful enumeration.
 pub fn load_native_models(
     cli: &str,
     binary: &str,
     args: &str,
     force_refresh: bool,
+    ttl: Duration,
 ) -> Option<NativeLoad> {
     let cli = cli.to_string();
     let cache_key = cli.clone();
     resolve_native(
         force_refresh,
+        ttl,
         || load_native_from_cache(&cache_key),
         || {
             let ids = run_model_enumeration(binary, args)?;
@@ -278,6 +298,7 @@ pub fn load_native_models(
 /// testable without touching disk or spawning a process.
 fn resolve_native(
     force_refresh: bool,
+    ttl: Duration,
     load_cache: impl FnOnce() -> Option<NativeCatalog>,
     enumerate: impl FnOnce() -> Option<NativeCatalog>,
 ) -> Option<NativeLoad> {
@@ -286,7 +307,7 @@ fn resolve_native(
     if !force_refresh {
         if let Some(catalog) = cached
             .as_ref()
-            .filter(|c| fetched_within_ttl(c.fetched_at))
+            .filter(|c| fetched_within_ttl(c.fetched_at, ttl))
             .cloned()
         {
             return Some(NativeLoad {
@@ -509,6 +530,12 @@ mod tests {
     use std::cell::Cell;
     use std::time::Duration;
 
+    /// TTL used throughout these tests wherever the exact value doesn't
+    /// matter beyond "the configured TTL" — both `resolve_catalog` and
+    /// `resolve_native` take it as an explicit parameter now that it's
+    /// configurable rather than a compiled constant.
+    const TTL: Duration = DEFAULT_CATALOG_TTL;
+
     fn catalog(ids: &[(&str, &str)], age: Duration) -> ModelCatalog {
         ModelCatalog {
             models: ids
@@ -534,6 +561,7 @@ mod tests {
         let fetched = Cell::new(false);
         let load = resolve_catalog(
             false,
+            TTL,
             || {
                 Some(catalog(
                     &[("anthropic", "claude-x")],
@@ -554,10 +582,11 @@ mod tests {
     fn stale_cache_triggers_fetch_and_reports_live() {
         let load = resolve_catalog(
             false,
+            TTL,
             || {
                 Some(catalog(
                     &[("anthropic", "old")],
-                    CACHE_TTL + Duration::from_secs(1),
+                    TTL + Duration::from_secs(1),
                 ))
             },
             || Some(catalog(&[("anthropic", "new")], Duration::ZERO)),
@@ -571,10 +600,11 @@ mod tests {
     fn stale_cache_with_failed_fetch_is_served_stale_not_hard_failure() {
         let load = resolve_catalog(
             false,
+            TTL,
             || {
                 Some(catalog(
                     &[("anthropic", "old")],
-                    CACHE_TTL + Duration::from_secs(1),
+                    TTL + Duration::from_secs(1),
                 ))
             },
             || None,
@@ -586,7 +616,7 @@ mod tests {
 
     #[test]
     fn no_cache_and_failed_fetch_returns_none() {
-        let load = resolve_catalog(false, || None, || None);
+        let load = resolve_catalog(false, TTL, || None, || None);
         assert!(load.is_none());
     }
 
@@ -595,6 +625,7 @@ mod tests {
         let fetched = Cell::new(false);
         let load = resolve_catalog(
             true,
+            TTL,
             || Some(catalog(&[("anthropic", "cached")], Duration::from_secs(1))),
             || {
                 fetched.set(true);
@@ -611,6 +642,7 @@ mod tests {
     fn force_refresh_falls_back_to_stale_cache_when_fetch_fails() {
         let load = resolve_catalog(
             true,
+            TTL,
             || Some(catalog(&[("anthropic", "cached")], Duration::from_secs(1))),
             || None,
         )
@@ -643,7 +675,7 @@ mod tests {
             Some(parse_catalog(body, SystemTime::now()))
         };
 
-        let cached = resolve_catalog(false, old_cache, fetch_with_pickle).unwrap();
+        let cached = resolve_catalog(false, TTL, old_cache, fetch_with_pickle).unwrap();
         assert_eq!(cached.source, CatalogSource::Cache);
         assert!(
             !ids(&cached).contains(&"big-pickle".to_string()),
@@ -651,7 +683,7 @@ mod tests {
         );
 
         // Forcing a refresh pulls it in from models.dev.
-        let refreshed = resolve_catalog(true, old_cache, fetch_with_pickle).unwrap();
+        let refreshed = resolve_catalog(true, TTL, old_cache, fetch_with_pickle).unwrap();
         assert_eq!(refreshed.source, CatalogSource::Live);
         let entry = refreshed
             .catalog
@@ -734,6 +766,7 @@ mod tests {
         let enumerated = Cell::new(false);
         let load = resolve_native(
             false,
+            TTL,
             || Some(native(&["opencode/big-pickle"], Duration::from_secs(60))),
             || {
                 enumerated.set(true);
@@ -754,12 +787,8 @@ mod tests {
     fn stale_native_cache_reenumerates_and_reports_live() {
         let load = resolve_native(
             false,
-            || {
-                Some(native(
-                    &["opencode/old"],
-                    CACHE_TTL + Duration::from_secs(1),
-                ))
-            },
+            TTL,
+            || Some(native(&["opencode/old"], TTL + Duration::from_secs(1))),
             || {
                 Some(native(
                     &["opencode/mimo-v2.5-free", "opencode/big-pickle"],
@@ -783,10 +812,11 @@ mod tests {
     fn failed_native_enumeration_falls_back_to_stale_cache() {
         let load = resolve_native(
             false,
+            TTL,
             || {
                 Some(native(
                     &["opencode/big-pickle"],
-                    CACHE_TTL + Duration::from_secs(1),
+                    TTL + Duration::from_secs(1),
                 ))
             },
             || None,
@@ -798,7 +828,7 @@ mod tests {
 
     #[test]
     fn no_native_cache_and_failed_enumeration_returns_none() {
-        assert!(resolve_native(false, || None, || None).is_none());
+        assert!(resolve_native(false, TTL, || None, || None).is_none());
     }
 
     #[test]
@@ -806,6 +836,7 @@ mod tests {
         let enumerated = Cell::new(false);
         let load = resolve_native(
             true,
+            TTL,
             || Some(native(&["opencode/cached"], Duration::from_secs(1))),
             || {
                 enumerated.set(true);
@@ -1079,21 +1110,27 @@ mod tests {
 
     #[test]
     fn resolve_native_no_cache_and_successful_enumerate() {
-        let load =
-            resolve_native(false, || None, || Some(native(&["m1"], Duration::ZERO))).unwrap();
+        let load = resolve_native(
+            false,
+            TTL,
+            || None,
+            || Some(native(&["m1"], Duration::ZERO)),
+        )
+        .unwrap();
         assert_eq!(load.source, CatalogSource::Live);
         assert_eq!(load.catalog.ids, vec!["m1".to_string()]);
     }
 
     #[test]
     fn force_refresh_enumeration_failure_returns_none_without_cache() {
-        assert!(resolve_native(true, || None, || None).is_none());
+        assert!(resolve_native(true, TTL, || None, || None).is_none());
     }
 
     #[test]
     fn force_refresh_with_cache_but_failed_enumeration_returns_stale() {
         let load = resolve_native(
             true,
+            TTL,
             || Some(native(&["cached"], Duration::from_secs(1))),
             || None,
         )

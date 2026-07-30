@@ -107,7 +107,14 @@ impl NewAgentDialog {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default()
         });
-        let catalog = models_db::load_catalog_nonblocking();
+        let catalog_ttl = dirs::home_dir()
+            .map(|home| {
+                crate::domain::canopy_config::CanopyConfig::load(&home.join(".canopy"))
+                    .models
+                    .catalog_ttl()
+            })
+            .unwrap_or(models_db::DEFAULT_CATALOG_TTL);
+        let catalog = models_db::load_catalog_nonblocking(catalog_ttl);
         let seed_options = load_seed_options();
         let mut dialog = Self {
             edit_id: None,

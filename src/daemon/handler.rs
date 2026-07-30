@@ -2177,7 +2177,7 @@ impl TaskTriggerHandler {
     /// List available AI models.
     #[tool(
         name = "agent_models",
-        description = "List AI models available for use with agents. Pass an optional `platform` (e.g. \"opencode\") to filter to the models that platform can reach; pass `refresh: true` to force a fresh fetch. Every returned model id is the literal string that platform's CLI accepts for its model field — for a universal gateway that is the provider-prefixed form (opencode/big-pickle), for claude the bare form (claude-opus-4-8) — so an id can be copied verbatim into the model field of agent_add or agent_watch. Includes cache provenance (source: cache|live|stale, fetched_at)."
+        description = "List AI models available for use with agents. Pass an optional `platform` (e.g. \"opencode\") to filter to the models that platform can reach; pass `refresh: true` to force a fresh fetch instead of serving a cache that's within its TTL (`canopy models refresh` does the same from the CLI, for one platform or all). Every returned model id is the literal string that platform's CLI accepts for its model field — for a universal gateway that is the provider-prefixed form (opencode/big-pickle), for claude the bare form (claude-opus-4-8) — so an id can be copied verbatim into the model field of agent_add or agent_watch. Includes cache provenance (source: cache|live|stale, fetched_at, age, and whether a refresh is due) — the TTL itself is configurable in config.toml under `[models]`."
     )]
     async fn task_models(
         &self,
@@ -2211,8 +2211,9 @@ impl TaskTriggerHandler {
 
         // models.dev-derived path: the all-providers listing, or a platform
         // without native enumeration (e.g. claude, whose bare ids are correct).
+        let ttl = configured_models().catalog_ttl();
         let load = tokio::task::spawn_blocking(move || {
-            crate::domain::models_db::load_catalog_with_source(force_refresh)
+            crate::domain::models_db::load_catalog_with_source(force_refresh, ttl)
         })
         .await
         .ok()
@@ -2255,7 +2256,7 @@ impl TaskTriggerHandler {
         };
 
         Ok(CallToolResult::success(vec![Content::text(
-            model_result_footer(&listing, source, catalog.fetched_at, &truncation),
+            model_result_footer(&listing, source, catalog.fetched_at, ttl, &truncation),
         )]))
     }
 
@@ -5542,8 +5543,15 @@ async fn native_models_result(
     full: bool,
 ) -> CallToolResult {
     let platform_owned = platform.to_string();
+    let ttl = configured_models().native_ttl();
     let load = tokio::task::spawn_blocking(move || {
-        crate::domain::models_db::load_native_models(&platform_owned, &binary, &args, force_refresh)
+        crate::domain::models_db::load_native_models(
+            &platform_owned,
+            &binary,
+            &args,
+            force_refresh,
+            ttl,
+        )
     })
     .await
     .ok()
@@ -5566,30 +5574,57 @@ async fn native_models_result(
         &listing,
         source,
         catalog.fetched_at,
+        ttl,
         &truncation,
     ))])
 }
 
+/// This daemon's `[models]` TTL configuration, read fresh from
+/// `~/.canopy/config.toml` on every call (like `rag_max_file_bytes`) so a
+/// config edit is picked up on the next `agent_models` call without
+/// restarting the daemon. Falls back to the compiled defaults when no home
+/// directory or config file can be found.
+fn configured_models() -> crate::domain::canopy_config::ModelsConfig {
+    dirs::home_dir()
+        .map(|home| crate::domain::canopy_config::CanopyConfig::load(&home.join(".canopy")).models)
+        .unwrap_or_default()
+}
+
 /// The shared provenance/footer block for `agent_models`, used by both the
-/// models.dev and native-enumeration paths.
+/// models.dev and native-enumeration paths. States the cache's age and
+/// whether a refresh is due, not just its timestamp — and when the source was
+/// unreachable, folds how stale the served cache is into that same notice.
 fn model_result_footer(
     listing: &str,
     source: crate::domain::models_db::CatalogSource,
     fetched_at: std::time::SystemTime,
+    ttl: std::time::Duration,
     truncation: &crate::daemon::handler_formatting::ModelTruncation,
 ) -> String {
-    let stale_hint = if source == crate::domain::models_db::CatalogSource::Stale {
-        " (the source was unreachable — this cache may be out of date; retry with refresh: true)"
+    let age = fetched_at.elapsed().unwrap_or_default();
+    let age_str = format_duration_short(age);
+    let ttl_str = format_duration_short(ttl);
+    let refresh_due = age >= ttl;
+
+    let provenance_note = if source == crate::domain::models_db::CatalogSource::Stale {
+        format!(
+            " (source unreachable — serving a cache that is already {age_str} old, past \
+             the {ttl_str} refresh interval; retry with refresh: true once it's reachable)"
+        )
+    } else if refresh_due {
+        " (refresh due — pass refresh: true to update now)".to_string()
     } else {
-        ""
+        String::new()
     };
+
     let truncation_notice = truncation
         .notice()
         .map(|n| format!("\n{n}"))
         .unwrap_or_default();
     format!(
         "{listing}\n\n\
-         Source: {}{stale_hint} · fetched_at: {}\n\
+         Source: {}{provenance_note} · age: {age_str} (refresh interval {ttl_str}) · \
+         fetched_at: {}\n\
          Note: model availability also depends on the CLI's configured API keys. \
          If model is omitted, the CLI uses its own default.{truncation_notice}",
         source.as_str(),
@@ -5601,6 +5636,36 @@ fn model_result_footer(
 /// `agent_models` cache metadata.
 fn format_system_time(time: std::time::SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339()
+}
+
+/// Render a `Duration` as a short human-readable age/TTL (`45s`, `12m`,
+/// `2h15m`, `3d4h`) for the `agent_models` footer — coarse on purpose, since
+/// the footer only needs to convey rough freshness, not precise timing.
+fn format_duration_short(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m");
+    }
+    let hours = mins / 60;
+    let rem_mins = mins % 60;
+    if hours < 24 {
+        return if rem_mins == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h{rem_mins}m")
+        };
+    }
+    let days = hours / 24;
+    let rem_hours = hours % 24;
+    if rem_hours == 0 {
+        format!("{days}d")
+    } else {
+        format!("{days}d{rem_hours}h")
+    }
 }
 
 /// Find and skip `loop_id`'s currently `running` spec — its own bound spec,
@@ -11448,24 +11513,87 @@ mod coverage_tests {
             "Models:",
             CatalogSource::Live,
             std::time::SystemTime::now(),
+            std::time::Duration::from_secs(24 * 60 * 60),
             &ModelTruncation::default(),
         );
         assert!(f.contains("Source: live"));
-        assert!(!f.contains("out of date"));
+        assert!(!f.contains("unreachable"));
+        assert!(f.contains("age:"));
+        assert!(f.contains("refresh interval"));
     }
 
     #[test]
-    fn footer_stale_source() {
+    fn footer_stale_source_says_how_stale_in_the_same_line() {
+        use crate::daemon::handler_formatting::ModelTruncation;
+        use crate::domain::models_db::CatalogSource;
+        let fetched_at = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 3600);
+        let f = super::model_result_footer(
+            "Models:",
+            CatalogSource::Stale,
+            fetched_at,
+            std::time::Duration::from_secs(24 * 60 * 60),
+            &ModelTruncation::default(),
+        );
+        let source_line = f
+            .lines()
+            .find(|l| l.starts_with("Source:"))
+            .expect("footer must have a Source line");
+        assert!(source_line.contains("unreachable"));
+        // How stale must be on the *same* line as the unreachable notice, not
+        // just somewhere in the footer. 30h renders as "1d6h".
+        assert!(source_line.contains("1d6h"));
+    }
+
+    #[test]
+    fn footer_fresh_cache_does_not_say_refresh_due() {
         use crate::daemon::handler_formatting::ModelTruncation;
         use crate::domain::models_db::CatalogSource;
         let f = super::model_result_footer(
             "Models:",
-            CatalogSource::Stale,
-            std::time::SystemTime::now(),
+            CatalogSource::Cache,
+            std::time::SystemTime::now() - std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(24 * 60 * 60),
             &ModelTruncation::default(),
         );
-        assert!(f.contains("Source: stale"));
-        assert!(f.contains("out of date"));
+        assert!(!f.contains("refresh due"));
+        assert!(f.contains("age: 1m"));
+    }
+
+    #[test]
+    fn footer_states_refresh_due_when_age_exceeds_ttl() {
+        use crate::daemon::handler_formatting::ModelTruncation;
+        use crate::domain::models_db::CatalogSource;
+        // A source other than Stale whose age has still crept past the TTL
+        // (e.g. the TTL was lowered after the cache was written) must still
+        // surface a due-for-refresh notice, not just the raw age.
+        let fetched_at = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
+        let f = super::model_result_footer(
+            "Models:",
+            CatalogSource::Live,
+            fetched_at,
+            std::time::Duration::from_secs(3600),
+            &ModelTruncation::default(),
+        );
+        assert!(f.contains("refresh due"));
+    }
+
+    #[test]
+    fn format_duration_short_renders_expected_units() {
+        use std::time::Duration;
+        assert_eq!(super::format_duration_short(Duration::from_secs(45)), "45s");
+        assert_eq!(super::format_duration_short(Duration::from_secs(90)), "1m");
+        assert_eq!(
+            super::format_duration_short(Duration::from_secs(2 * 3600 + 15 * 60)),
+            "2h15m"
+        );
+        assert_eq!(
+            super::format_duration_short(Duration::from_secs(24 * 3600)),
+            "1d"
+        );
+        assert_eq!(
+            super::format_duration_short(Duration::from_secs(3 * 24 * 3600 + 4 * 3600)),
+            "3d4h"
+        );
     }
 
     // ── build_ensemble_unit: with and without on_fail_to ───────────

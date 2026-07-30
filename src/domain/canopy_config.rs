@@ -70,6 +70,10 @@ pub struct CanopyConfig {
     #[serde(default)]
     pub skills: SkillsConfig,
 
+    /// `[models]` settings for the `agent_models` catalog cache.
+    #[serde(default)]
+    pub models: ModelsConfig,
+
     /// TUI color theme: `"classic"` (bordered) or `"modern"` (borderless).
     /// A plain `String` (not an enum) so a config written by a newer binary
     /// with a theme this binary doesn't know about still deserializes fine —
@@ -185,6 +189,60 @@ impl Default for CleanConfig {
         Self {
             retention_days: default_retention_days(),
         }
+    }
+}
+
+/// Settings for the `agent_models` catalog cache. Read from the `[models]`
+/// table in `config.toml`.
+///
+/// The two caches get independent TTLs rather than sharing one: the
+/// models.dev catalog is a large remote fetch, so it defaults to a full day.
+/// A platform's native CLI model enumeration (e.g. `opencode models`) is a
+/// cheap local subprocess call whose answer changes the moment the user
+/// authenticates with a new provider through that CLI, so it defaults much
+/// shorter — a stale native cache is far more likely to hide a model the
+/// user just unlocked than the models.dev catalog is to miss a same-day
+/// release. Either can still be forced fresh early via `agent_models
+/// refresh: true` or `canopy models refresh`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelsConfig {
+    /// Minutes the models.dev catalog cache is served before a refresh is
+    /// attempted.
+    #[serde(default = "default_catalog_ttl_minutes")]
+    pub catalog_ttl_minutes: u64,
+    /// Minutes a platform's native CLI model enumeration is served before
+    /// re-running it.
+    #[serde(default = "default_native_ttl_minutes")]
+    pub native_ttl_minutes: u64,
+}
+
+impl Default for ModelsConfig {
+    fn default() -> Self {
+        Self {
+            catalog_ttl_minutes: default_catalog_ttl_minutes(),
+            native_ttl_minutes: default_native_ttl_minutes(),
+        }
+    }
+}
+
+fn default_catalog_ttl_minutes() -> u64 {
+    super::models_db::DEFAULT_CATALOG_TTL.as_secs() / 60
+}
+
+fn default_native_ttl_minutes() -> u64 {
+    super::models_db::DEFAULT_NATIVE_TTL.as_secs() / 60
+}
+
+impl ModelsConfig {
+    /// The models.dev catalog TTL as a `Duration`, floored at one minute so a
+    /// hand-edited `0` in config.toml can't turn every call into a fetch.
+    pub fn catalog_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.catalog_ttl_minutes.max(1) * 60)
+    }
+
+    /// The native-enumeration TTL as a `Duration`, floored at one minute.
+    pub fn native_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.native_ttl_minutes.max(1) * 60)
     }
 }
 
@@ -313,6 +371,7 @@ impl Default for CanopyConfig {
             ensemble_concurrency_cap: default_ensemble_concurrency_cap(),
             clean: CleanConfig::default(),
             skills: SkillsConfig::default(),
+            models: ModelsConfig::default(),
             theme: default_theme(),
             rag_max_file_mb: default_rag_max_file_mb(),
         }
@@ -418,6 +477,66 @@ mod tests {
 
         config.rag_max_file_mb = 0;
         assert_eq!(config.rag_max_file_bytes(), 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn models_config_defaults_to_24h_catalog_and_1h_native_ttl() {
+        let config = ModelsConfig::default();
+        assert_eq!(config.catalog_ttl_minutes, 24 * 60);
+        assert_eq!(config.native_ttl_minutes, 60);
+        assert_eq!(
+            config.catalog_ttl(),
+            std::time::Duration::from_secs(24 * 60 * 60)
+        );
+        assert_eq!(config.native_ttl(), std::time::Duration::from_secs(60 * 60));
+    }
+
+    #[test]
+    fn models_ttl_defaults_when_absent_from_config_toml() {
+        let dir = TempDir::new().unwrap();
+        let canopy_dir = dir.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        // Simulates a config written before the `[models]` table existed.
+        let toml = r#"embeddings_model = "intfloat/multilingual-e5-base""#;
+        std::fs::write(canopy_dir.join("config.toml"), toml).unwrap();
+
+        let loaded = CanopyConfig::load(&canopy_dir);
+        assert_eq!(loaded.models.catalog_ttl_minutes, 24 * 60);
+        assert_eq!(loaded.models.native_ttl_minutes, 60);
+    }
+
+    #[test]
+    fn models_ttl_round_trips_via_config_toml() {
+        let dir = TempDir::new().unwrap();
+        let canopy_dir = dir.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+
+        let config = CanopyConfig {
+            models: ModelsConfig {
+                catalog_ttl_minutes: 120,
+                native_ttl_minutes: 5,
+            },
+            ..Default::default()
+        };
+        config.save(&canopy_dir).unwrap();
+
+        let loaded = CanopyConfig::load(&canopy_dir);
+        assert_eq!(loaded.models.catalog_ttl_minutes, 120);
+        assert_eq!(loaded.models.native_ttl_minutes, 5);
+        assert_eq!(
+            loaded.models.catalog_ttl(),
+            std::time::Duration::from_secs(120 * 60)
+        );
+    }
+
+    #[test]
+    fn models_ttl_floors_a_zero_configured_value_at_one_minute() {
+        let config = ModelsConfig {
+            catalog_ttl_minutes: 0,
+            native_ttl_minutes: 0,
+        };
+        assert_eq!(config.catalog_ttl(), std::time::Duration::from_secs(60));
+        assert_eq!(config.native_ttl(), std::time::Duration::from_secs(60));
     }
 
     #[test]

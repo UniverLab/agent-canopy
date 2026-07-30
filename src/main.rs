@@ -35,6 +35,7 @@ use daemon::clean_cli::handle_clean_action;
 use daemon::cli::{handle_daemon_action, DaemonAction};
 use daemon::doctor::run_doctor;
 use daemon::loop_cli::{handle_loop_action, LoopAction};
+use daemon::models_cli::{handle_models_action, ModelsAction};
 use daemon::project_cli::{handle_project_action, ProjectAction};
 use daemon::prompts_cli::{handle_prompts_action, PromptsAction};
 use daemon::rag_cli::{handle_rag_action, RagAction};
@@ -91,6 +92,11 @@ enum Commands {
     Spec {
         #[command(subcommand)]
         action: SpecAction,
+    },
+    /// Inspect or refresh the `agent_models` catalog cache.
+    Models {
+        #[command(subcommand)]
+        action: ModelsAction,
     },
     /// Manage the project registry (path-derived identity).
     Project {
@@ -174,6 +180,7 @@ async fn main() -> Result<()> {
         Some(Commands::Rag { action }) => handle_rag_action(action).await,
         Some(Commands::Loop { action }) => handle_loop_action(action).await,
         Some(Commands::Spec { action }) => handle_spec_action(action).await,
+        Some(Commands::Models { action }) => handle_models_action(action).await,
         Some(Commands::Project { action }) => handle_project_action(action).await,
         Some(Commands::Clean {
             dry_run,

@@ -11,6 +11,7 @@ pub(crate) mod handler_formatting;
 pub(crate) mod handler_helpers;
 pub(crate) mod helpers;
 pub(crate) mod loop_cli;
+pub(crate) mod models_cli;
 pub(crate) mod params;
 pub(crate) mod process;
 pub(crate) mod project_cli;
