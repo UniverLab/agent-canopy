@@ -8,7 +8,6 @@ use std::sync::Arc;
 use axum::http::request::Parts;
 use rmcp::handler::server::common::AsRequestContext;
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
 use rmcp::tool;
 use rmcp::tool_handler;
@@ -47,6 +46,7 @@ use crate::daemon::handler_helpers::{
 };
 use crate::daemon::helpers::{data_dir, error_result, notify_run_result, success_result};
 use crate::daemon::params::*;
+use crate::daemon::params_extract::Parameters;
 use crate::db::intelligence::IntelligenceNodeRecord;
 use crate::db::Database;
 use crate::domain::blueprints::{merge_blueprint_config, validate_blueprint_deletable, Blueprint};
@@ -6196,6 +6196,41 @@ mod tests {
         }
     }
 
+    /// The `#[tool]` macro locates a handler's parameter wrapper by the
+    /// literal ident `Parameters`, then generates
+    /// `schema_for_type::<Parameters<T>>()` for the advertised MCP
+    /// `input_schema`. Swapping in this crate's own `Parameters<T>` (for
+    /// enriched deserialization-failure messages) must not silently fall
+    /// back to an empty schema — clients still need the real shape to build
+    /// correct calls in the first place.
+    #[test]
+    fn tool_router_still_advertises_real_input_schemas_for_swapped_parameters_type() {
+        let tools = TaskTriggerHandler::tool_router().list_all();
+
+        let create_seed = tools
+            .iter()
+            .find(|tool| tool.name == "create_seed")
+            .expect("create_seed tool should be registered");
+        let props = create_seed
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("create_seed input_schema should have properties");
+        assert!(props.contains_key("name"));
+        assert!(props.contains_key("directives"));
+
+        let intelligence_upsert = tools
+            .iter()
+            .find(|tool| tool.name == "intelligence_upsert")
+            .expect("intelligence_upsert tool should be registered");
+        let props = intelligence_upsert
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("intelligence_upsert input_schema should have properties");
+        assert!(props.contains_key("node_data"));
+    }
+
     #[test]
     fn validate_ensemble_members_rejects_below_minimum() {
         let members = vec![ensemble_member_params("claude")];
@@ -6961,7 +6996,7 @@ mod tests {
     /// queue row.
     #[tokio::test]
     async fn queue_create_and_pool_alias_route_to_same_handler() {
-        use rmcp::handler::server::wrapper::Parameters;
+        use crate::daemon::params_extract::Parameters;
 
         let (_dir, db, handler) = queue_test_handler();
 
@@ -6996,7 +7031,7 @@ mod tests {
     /// returns queue-worded confirmation.
     #[tokio::test]
     async fn queue_add_spec_and_pool_alias_are_equivalent() {
-        use rmcp::handler::server::wrapper::Parameters;
+        use crate::daemon::params_extract::Parameters;
 
         let (_dir, db, handler) = queue_test_handler();
         for id in ["spec-a", "spec-b"] {
@@ -7033,7 +7068,7 @@ mod tests {
     /// and the `pool_list` alias produces the identical payload.
     #[tokio::test]
     async fn queue_list_and_pool_alias_use_queue_keys() {
-        use rmcp::handler::server::wrapper::Parameters;
+        use crate::daemon::params_extract::Parameters;
 
         let (_dir, db, handler) = queue_test_handler();
         db.insert_loop_spec(&standalone_spec("spec-a")).unwrap();
@@ -7070,7 +7105,7 @@ mod tests {
     /// empty-launch error naming that queue — proof the id resolved.
     #[tokio::test]
     async fn loop_run_accepts_pool_id_alias() {
-        use rmcp::handler::server::wrapper::Parameters;
+        use crate::daemon::params_extract::Parameters;
 
         let (dir, db, handler) = queue_test_handler();
         db.insert_loop(&Loop {
@@ -7108,7 +7143,7 @@ mod tests {
     /// Q1: when both `queue_id` and `pool_id` are set, `queue_id` wins.
     #[tokio::test]
     async fn loop_run_prefers_queue_id_over_pool_id() {
-        use rmcp::handler::server::wrapper::Parameters;
+        use crate::daemon::params_extract::Parameters;
 
         let (dir, db, handler) = queue_test_handler();
         db.insert_loop(&Loop {
@@ -7847,7 +7882,7 @@ mod tests {
     /// succeed and report the time that was cleared.
     #[tokio::test]
     async fn loop_schedule_autorun_cancels_pending_schedule_on_failed_loop() {
-        use rmcp::handler::server::wrapper::Parameters;
+        use crate::daemon::params_extract::Parameters;
 
         let (dir, db, handler) = queue_test_handler();
         let loop_id = "loop-failed-autorun";
@@ -7884,7 +7919,7 @@ mod tests {
     /// status a loop with a pending autorun can hold.
     #[tokio::test]
     async fn loop_schedule_autorun_cancels_pending_schedule_on_completed_loop() {
-        use rmcp::handler::server::wrapper::Parameters;
+        use crate::daemon::params_extract::Parameters;
 
         let (dir, db, handler) = queue_test_handler();
         let loop_id = "loop-completed-autorun";
@@ -7916,7 +7951,7 @@ mod tests {
     /// already satisfied.
     #[tokio::test]
     async fn loop_schedule_autorun_cancel_with_nothing_scheduled_is_not_an_error() {
-        use rmcp::handler::server::wrapper::Parameters;
+        use crate::daemon::params_extract::Parameters;
 
         let (dir, db, handler) = queue_test_handler();
         let loop_id = "loop-no-autorun";
@@ -7947,7 +7982,7 @@ mod tests {
     /// and default the action to `retry_current_node` when omitted.
     #[tokio::test]
     async fn loop_schedule_continue_sets_pending_schedule_with_default_action() {
-        use rmcp::handler::server::wrapper::Parameters;
+        use crate::daemon::params_extract::Parameters;
 
         let (dir, db, handler) = queue_test_handler();
         let loop_id = "loop-paused-continue";
@@ -7986,7 +8021,7 @@ mod tests {
     /// An explicit `skip_next_spec` action must be persisted as given.
     #[tokio::test]
     async fn loop_schedule_continue_persists_explicit_skip_action() {
-        use rmcp::handler::server::wrapper::Parameters;
+        use crate::daemon::params_extract::Parameters;
 
         let (dir, db, handler) = queue_test_handler();
         let loop_id = "loop-paused-continue-skip";
@@ -8013,7 +8048,7 @@ mod tests {
     /// An invalid action must be rejected without touching the schedule.
     #[tokio::test]
     async fn loop_schedule_continue_rejects_invalid_action() {
-        use rmcp::handler::server::wrapper::Parameters;
+        use crate::daemon::params_extract::Parameters;
 
         let (dir, db, handler) = queue_test_handler();
         let loop_id = "loop-paused-continue-bad-action";
@@ -8045,7 +8080,7 @@ mod tests {
     /// `loop_schedule_autorun`'s cancel semantics (B41).
     #[tokio::test]
     async fn loop_schedule_continue_cancels_pending_schedule() {
-        use rmcp::handler::server::wrapper::Parameters;
+        use crate::daemon::params_extract::Parameters;
 
         let (dir, db, handler) = queue_test_handler();
         let loop_id = "loop-paused-continue-cancel";
@@ -8088,7 +8123,7 @@ mod tests {
     /// Cancelling when nothing is scheduled must succeed and say so.
     #[tokio::test]
     async fn loop_schedule_continue_cancel_with_nothing_scheduled_is_not_an_error() {
-        use rmcp::handler::server::wrapper::Parameters;
+        use crate::daemon::params_extract::Parameters;
 
         let (dir, db, handler) = queue_test_handler();
         let loop_id = "loop-paused-no-continue";
@@ -8118,7 +8153,7 @@ mod tests {
     /// they can never be conflated at fire time.
     #[tokio::test]
     async fn loop_schedule_continue_and_loop_schedule_autorun_are_independent() {
-        use rmcp::handler::server::wrapper::Parameters;
+        use crate::daemon::params_extract::Parameters;
 
         let (dir, db, handler) = queue_test_handler();
         let loop_id = "loop-independent-schedules";
@@ -12219,6 +12254,7 @@ mod endpoint_tests {
     use crate::application::notification_service::{
         DefaultNotificationService, NotificationService,
     };
+    use crate::daemon::params_extract::Parameters;
     use crate::db::Database;
     use crate::domain::models::{Agent, Cli, RunLog, RunStatus, TriggerType};
     use crate::executor::Executor;
@@ -12226,7 +12262,6 @@ mod endpoint_tests {
     use crate::rag::ingestion::IngestionManager;
     use crate::sync_manager::SyncManager;
     use crate::watchers::WatcherEngine;
-    use rmcp::handler::server::wrapper::Parameters;
     use tempfile::tempdir;
     use tokio::sync::Notify;
 
