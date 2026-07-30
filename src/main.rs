@@ -228,6 +228,12 @@ pub(crate) fn ensure_data_dir() -> Result<std::path::PathBuf> {
     let data_dir = home.join(".canopy");
     std::fs::create_dir_all(&data_dir)?;
     std::fs::create_dir_all(data_dir.join("logs"))?;
+    // Migrate a pre-existing flat/JSON layout to the current one (TOML for
+    // hand-inspectable files, a named `cache/` dir for program-managed
+    // caches). Idempotent and cheap once migrated, so it's safe to run on
+    // every call rather than gating it behind a first-run flag.
+    domain::usage_stats::migrate_legacy_json(&data_dir);
+    domain::models_db::migrate_legacy_caches(&data_dir);
     Ok(data_dir)
 }
 

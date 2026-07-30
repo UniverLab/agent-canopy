@@ -1,12 +1,13 @@
 //! Cached model catalog from <https://models.dev>.
 //!
 //! Provides a flat list of AI model entries with provider metadata,
-//! cached locally for fast lookup.  The catalog can be filtered by
-//! CLI name so the new-agent dialog only shows relevant models.
+//! cached locally under `~/.canopy/cache/` for fast lookup. The catalog can
+//! be filtered by CLI name so the new-agent dialog only shows relevant
+//! models.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 /// Default TTL for the models.dev catalog cache, used when nothing in
@@ -123,9 +124,85 @@ pub fn providers_for_cli(cli: &str) -> &[&str] {
 }
 
 // ── Cache path ──────────────────────────────────────────────────────
+//
+// Both the models.dev catalog and the per-platform native enumeration are
+// pure caches canopy repopulates on a miss — never hand-edited — so they
+// live as JSON under a directory that names them: `~/.canopy/cache/`,
+// alongside (not mixed into) the downloaded embedding models under
+// `~/.canopy/models/`. A `models/catalog/` split was considered instead,
+// but `~/.canopy/models/` is already the fastembed download root (1.1 GB,
+// out of scope for this layout — see `rag::model_acquisition`), so nesting
+// catalog caches there would mean either touching that tree or leaving a
+// `models/embeddings/` vs `models/catalog/` split where only one side
+// matches what's actually on disk. A sibling `cache/` tree keeps the
+// catalog caches named for what they are without relocating the embeddings.
+
+/// Directory name for cache files that live under `~/.canopy/` but are
+/// namespaced away from the top level and from `~/.canopy/models/`.
+const CACHE_DIR: &str = "cache";
 
 fn cache_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".canopy/models_cache.json"))
+    dirs::home_dir().map(|h| {
+        h.join(".canopy")
+            .join(CACHE_DIR)
+            .join("models_catalog.json")
+    })
+}
+
+/// One-time migration of the legacy flat cache files (`models_cache.json`,
+/// `models_native_<cli>.json`) that used to live directly under
+/// `~/.canopy` into `~/.canopy/cache/`.
+///
+/// Safe to call on every startup: each file migrates independently and is a
+/// no-op once its new-layout counterpart already exists. These are pure
+/// JSON caches canopy repopulates on any miss (see the module-level cache
+/// path comment), so — unlike `usage.toml` — no format conversion is
+/// needed: a same-filesystem `rename` is atomic, so a crash mid-migration
+/// leaves the file readable at exactly one of the two paths, never neither.
+/// Never touches `~/.canopy/models/` (the embedding model download cache).
+pub fn migrate_legacy_caches(canopy_dir: &Path) {
+    let cache_dir = canopy_dir.join(CACHE_DIR);
+
+    move_if_absent(
+        &canopy_dir.join("models_cache.json"),
+        &cache_dir.join("models_catalog.json"),
+        &cache_dir,
+    );
+
+    let Ok(entries) = std::fs::read_dir(canopy_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_legacy_native_cache = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name.starts_with("models_native_") && name.ends_with(".json"));
+        if !is_legacy_native_cache {
+            continue;
+        }
+        // Unwrap is safe: `is_legacy_native_cache` only matches when
+        // `file_name()` returned `Some`.
+        let file_name = path.file_name().unwrap();
+        move_if_absent(&path, &cache_dir.join(file_name), &cache_dir);
+    }
+}
+
+/// Move `old_path` to `new_path` (creating `parent` first) unless `new_path`
+/// already exists, in which case any leftover `old_path` — e.g. from a crash
+/// between a prior migration's rename and cleanup — is removed instead.
+fn move_if_absent(old_path: &Path, new_path: &Path, parent: &Path) {
+    if new_path.exists() {
+        let _ = std::fs::remove_file(old_path);
+        return;
+    }
+    if !old_path.exists() {
+        return;
+    }
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let _ = std::fs::rename(old_path, new_path);
 }
 
 // ── Public API ──────────────────────────────────────────────────────
@@ -373,7 +450,11 @@ fn native_cache_path(cli: &str) -> Option<PathBuf> {
             }
         })
         .collect();
-    dirs::home_dir().map(|h| h.join(format!(".canopy/models_native_{safe}.json")))
+    dirs::home_dir().map(|h| {
+        h.join(".canopy")
+            .join(CACHE_DIR)
+            .join(format!("models_native_{safe}.json"))
+    })
 }
 
 fn load_native_from_cache(cli: &str) -> Option<NativeCatalog> {
@@ -535,6 +616,86 @@ mod tests {
     /// `resolve_native` take it as an explicit parameter now that it's
     /// configurable rather than a compiled constant.
     const TTL: Duration = DEFAULT_CATALOG_TTL;
+
+    // ── migrate_legacy_caches ────────────────────────────────────────
+
+    #[test]
+    fn migrate_moves_catalog_and_native_caches_into_cache_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("models_cache.json"), r#"{"catalog":true}"#).unwrap();
+        std::fs::write(
+            dir.path().join("models_native_opencode.json"),
+            r#"{"native":"opencode"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("models_native_claude.json"),
+            r#"{"native":"claude"}"#,
+        )
+        .unwrap();
+
+        migrate_legacy_caches(dir.path());
+
+        assert!(!dir.path().join("models_cache.json").exists());
+        assert!(!dir.path().join("models_native_opencode.json").exists());
+        assert!(!dir.path().join("models_native_claude.json").exists());
+
+        let cache_dir = dir.path().join("cache");
+        assert_eq!(
+            std::fs::read_to_string(cache_dir.join("models_catalog.json")).unwrap(),
+            r#"{"catalog":true}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(cache_dir.join("models_native_opencode.json")).unwrap(),
+            r#"{"native":"opencode"}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(cache_dir.join("models_native_claude.json")).unwrap(),
+            r#"{"native":"claude"}"#
+        );
+    }
+
+    #[test]
+    fn migrate_never_touches_embedding_models_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("some-embedding-file.onnx"), b"not a cache").unwrap();
+        std::fs::write(dir.path().join("models_cache.json"), "{}").unwrap();
+
+        migrate_legacy_caches(dir.path());
+
+        // The embedding download tree is untouched: still present, and
+        // nothing from it leaked into the new cache dir.
+        assert!(models_dir.join("some-embedding-file.onnx").exists());
+        assert!(!dir.path().join("cache").join("models").exists());
+    }
+
+    #[test]
+    fn migrate_is_idempotent_when_cache_already_exists() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache_dir = dir.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join("models_catalog.json"), r#"{"fresh":true}"#).unwrap();
+        // A leftover legacy file from a crash between a prior migration's
+        // rename and its cleanup must not clobber the already-migrated copy.
+        std::fs::write(dir.path().join("models_cache.json"), r#"{"stale":true}"#).unwrap();
+
+        migrate_legacy_caches(dir.path());
+
+        assert!(!dir.path().join("models_cache.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(cache_dir.join("models_catalog.json")).unwrap(),
+            r#"{"fresh":true}"#
+        );
+    }
+
+    #[test]
+    fn migrate_noop_on_fresh_install() {
+        let dir = tempfile::TempDir::new().unwrap();
+        migrate_legacy_caches(dir.path());
+        assert!(!dir.path().join("cache").exists());
+    }
 
     fn catalog(ids: &[(&str, &str)], age: Duration) -> ModelCatalog {
         ModelCatalog {

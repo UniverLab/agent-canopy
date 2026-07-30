@@ -1,6 +1,8 @@
 //! CLI usage statistics — tracks how often each CLI is launched.
 //!
-//! Persisted in `~/.canopy/usage.json` as a simple `{ "cli_name": count }` map.
+//! Persisted in `~/.canopy/usage.toml` as a simple `{ "cli_name": count }` map
+//! — TOML like every other hand-inspectable file directly under `~/.canopy`
+//! (`config.toml`), even though nothing but canopy itself ever edits it.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -16,20 +18,20 @@ pub struct CliUsage {
 }
 
 impl CliUsage {
-    /// Load usage stats from `~/.canopy/usage.json`. Returns empty if missing.
+    /// Load usage stats from `~/.canopy/usage.toml`. Returns empty if missing.
     pub fn load(canopy_dir: &Path) -> Self {
-        let path = canopy_dir.join("usage.json");
+        let path = canopy_dir.join("usage.toml");
         std::fs::read_to_string(&path)
             .ok()
-            .and_then(|content| serde_json::from_str::<CliUsage>(&content).ok())
+            .and_then(|content| toml::from_str::<CliUsage>(&content).ok())
             .unwrap_or_default()
     }
 
-    /// Save usage stats to `~/.canopy/usage.json`.
+    /// Save usage stats to `~/.canopy/usage.toml`.
     pub fn save(&self, canopy_dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(canopy_dir)?;
-        let content = serde_json::to_string_pretty(self)?;
-        std::fs::write(canopy_dir.join("usage.json"), content)
+        let content = toml::to_string_pretty(self).unwrap_or_default();
+        std::fs::write(canopy_dir.join("usage.toml"), content)
     }
 
     /// Ensure `first_run_at` is set. Returns true if it was just initialized.
@@ -59,6 +61,46 @@ impl CliUsage {
         pairs.sort_by(|a, b| b.1.cmp(a.1));
         pairs
     }
+}
+
+/// One-time migration of the legacy `usage.json` (JSON) to `usage.toml`.
+///
+/// Safe to call on every startup: a no-op once `usage.toml` exists. Never
+/// loses counts — the new file is written to a temp path and atomically
+/// renamed into place *before* the old file is removed, so a crash at any
+/// point leaves either `usage.json` or `usage.toml` on disk, never neither.
+/// A corrupt or unreadable `usage.json` is left untouched rather than
+/// discarded, so a future run (or a human) can still recover it.
+pub fn migrate_legacy_json(canopy_dir: &Path) {
+    let old_path = canopy_dir.join("usage.json");
+    let new_path = canopy_dir.join("usage.toml");
+
+    if new_path.exists() {
+        // Migration already completed on a prior run; a leftover old file
+        // (e.g. a crash between the rename and the removal below) is safe to
+        // clean up now.
+        let _ = std::fs::remove_file(&old_path);
+        return;
+    }
+
+    let Ok(content) = std::fs::read_to_string(&old_path) else {
+        return;
+    };
+    let Ok(usage) = serde_json::from_str::<CliUsage>(&content) else {
+        return;
+    };
+    let Ok(toml_content) = toml::to_string_pretty(&usage) else {
+        return;
+    };
+
+    let tmp_path = canopy_dir.join("usage.toml.tmp");
+    if std::fs::write(&tmp_path, toml_content).is_err() {
+        return;
+    }
+    if std::fs::rename(&tmp_path, &new_path).is_err() {
+        return;
+    }
+    let _ = std::fs::remove_file(&old_path);
 }
 
 #[cfg(test)]
@@ -200,10 +242,92 @@ mod tests {
     }
 
     #[test]
-    fn test_load_corrupted_json_returns_default() {
+    fn test_load_corrupted_toml_returns_default() {
         let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("usage.json"), "not valid json").unwrap();
+        std::fs::write(dir.path().join("usage.toml"), "not valid toml {{{").unwrap();
         let usage = CliUsage::load(dir.path());
         assert!(usage.counts.is_empty());
+    }
+
+    #[test]
+    fn test_save_writes_toml_not_json() {
+        let dir = TempDir::new().unwrap();
+        let mut usage = CliUsage::default();
+        usage.record("claude");
+        usage.save(dir.path()).unwrap();
+
+        assert!(dir.path().join("usage.toml").exists());
+        assert!(!dir.path().join("usage.json").exists());
+        let content = std::fs::read_to_string(dir.path().join("usage.toml")).unwrap();
+        assert!(content.contains("claude"));
+        // A JSON document never parses as TOML unless it's degenerate; this
+        // guards against silently regressing back to JSON on save.
+        assert!(toml::from_str::<CliUsage>(&content).is_ok());
+    }
+
+    // ── migrate_legacy_json ─────────────────────────────────────────────
+
+    #[test]
+    fn migrate_converts_json_to_toml_and_removes_old_file() {
+        let dir = TempDir::new().unwrap();
+        let mut usage = CliUsage::default();
+        usage.record("opencode");
+        usage.record("opencode");
+        usage.record("kiro");
+        usage.first_run_at = Some("2024-01-01T00:00:00Z".to_string());
+        std::fs::write(
+            dir.path().join("usage.json"),
+            serde_json::to_string_pretty(&usage).unwrap(),
+        )
+        .unwrap();
+
+        migrate_legacy_json(dir.path());
+
+        assert!(!dir.path().join("usage.json").exists());
+        assert!(dir.path().join("usage.toml").exists());
+        let loaded = CliUsage::load(dir.path());
+        assert_eq!(loaded.get("opencode"), 2);
+        assert_eq!(loaded.get("kiro"), 1);
+        assert_eq!(loaded.first_run_at.as_deref(), Some("2024-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn migrate_is_idempotent_when_toml_already_exists() {
+        let dir = TempDir::new().unwrap();
+        let mut usage = CliUsage::default();
+        usage.record("new-counts");
+        usage.save(dir.path()).unwrap();
+        // A leftover old file (e.g. from a crash between rename and
+        // removal on a prior run) must not clobber the already-migrated
+        // usage.toml.
+        std::fs::write(dir.path().join("usage.json"), r#"{"counts":{"stale":99}}"#).unwrap();
+
+        migrate_legacy_json(dir.path());
+
+        assert!(!dir.path().join("usage.json").exists());
+        let loaded = CliUsage::load(dir.path());
+        assert_eq!(loaded.get("new-counts"), 1);
+        assert_eq!(loaded.get("stale"), 0);
+    }
+
+    #[test]
+    fn migrate_noop_when_neither_file_exists() {
+        let dir = TempDir::new().unwrap();
+        migrate_legacy_json(dir.path());
+        assert!(!dir.path().join("usage.json").exists());
+        assert!(!dir.path().join("usage.toml").exists());
+    }
+
+    #[test]
+    fn migrate_leaves_corrupted_old_file_untouched() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("usage.json"), "not valid json").unwrap();
+
+        migrate_legacy_json(dir.path());
+
+        // Never discard data we can't parse: the old file must survive so a
+        // later run (or a human) can still recover it.
+        assert!(dir.path().join("usage.json").exists());
+        assert!(!dir.path().join("usage.toml").exists());
     }
 }

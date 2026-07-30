@@ -2222,7 +2222,7 @@ impl TaskTriggerHandler {
         let Some(load) = load else {
             return Ok(error_result(
                 "Model catalog unavailable: could not reach models.dev and no local \
-                 cache exists at ~/.canopy/models_cache.json. Omit the model field to \
+                 cache exists at ~/.canopy/cache/models_catalog.json. Omit the model field to \
                  use the CLI's default, or retry once network access is restored.",
             ));
         };
