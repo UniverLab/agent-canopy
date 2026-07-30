@@ -9,6 +9,25 @@ use crate::daemon::process::{
 };
 use crate::db::Database;
 
+/// Print doctor's "verified" line — the ✓ glyph reserved for a check that
+/// actually exercised the capability it reports on (opened the database,
+/// opened the vector store, confirmed a resolved binary is executable,
+/// ...), never one that merely read a declared value or stat'd a path.
+/// This is the only place in this module allowed to embed the raw glyph
+/// escape sequence: `success_glyph_only_printed_by_shared_helper` (in
+/// `tests`) greps this file's own source and fails if that sequence shows
+/// up anywhere else, so a future check can't print a false-positive tick
+/// just by typing it inline the way the old vector-store check did.
+fn success(message: impl std::fmt::Display) {
+    println!(" \x1b[32m✓\x1b[0m {message}");
+}
+
+/// [`success`], indented for a line nested under a parent check (e.g. the
+/// service unit's binary detail line).
+fn success_nested(message: impl std::fmt::Display) {
+    println!("     \x1b[32m✓\x1b[0m {message}");
+}
+
 pub(crate) async fn run_doctor() -> Result<()> {
     use crate::shared::banner;
 
@@ -21,8 +40,11 @@ pub(crate) async fn run_doctor() -> Result<()> {
 
     let mut issues: Vec<String> = Vec::new();
 
+    // capability: `exists()` is a live stat, not a cached/declared value —
+    // the fact asserted ("this directory is on disk right now") is exactly
+    // what's checked.
     if canopy_dir.exists() {
-        println!(" \x1b[32m✓\x1b[0m Data directory: {}", canopy_dir.display());
+        success(format!("Data directory: {}", canopy_dir.display()));
     } else {
         println!(
             " \x1b[31m✗\x1b[0m Data directory not found: {}",
@@ -31,27 +53,46 @@ pub(crate) async fn run_doctor() -> Result<()> {
         issues.push("Run 'canopy setup' to initialize".to_string());
     }
 
+    // capability: the tick now requires the database to actually open, not
+    // just for its file to exist — a corrupt/unreadable db file used to
+    // print the same green line as a healthy one because the old code
+    // printed the tick before attempting `Database::new`.
     if db_path.exists() {
-        println!(" \x1b[32m✓\x1b[0m Database: {}", db_path.display());
-        if let Ok(db) = Database::new(&db_path) {
-            if let Ok(agents) = db.list_agents() {
-                let cron_count = agents.iter().filter(|a| a.is_cron()).count();
-                let watch_count = agents.iter().filter(|a| a.is_watch()).count();
-                println!(
-                    " Agents: {} (cron: {}, watch: {})",
-                    agents.len(),
-                    cron_count,
-                    watch_count
-                );
+        match Database::new(&db_path) {
+            Ok(db) => {
+                success(format!("Database: {}", db_path.display()));
+                if let Ok(agents) = db.list_agents() {
+                    let cron_count = agents.iter().filter(|a| a.is_cron()).count();
+                    let watch_count = agents.iter().filter(|a| a.is_watch()).count();
+                    println!(
+                        " Agents: {} (cron: {}, watch: {})",
+                        agents.len(),
+                        cron_count,
+                        watch_count
+                    );
+                }
+            }
+            Err(e) => {
+                println!(" \x1b[31m✗\x1b[0m Database exists but could not be opened: {e}");
+                issues.push(format!(
+                    "Database at {} could not be opened ({e}) — it may be corrupt.",
+                    db_path.display()
+                ));
             }
         }
     } else {
         println!(" \x1b[33m⚠\x1b[0m Database not found (will be created on setup)");
     }
 
+    // declaration: `is_configured()` only checks a persisted marker
+    // (`configured_at.is_some()`) — the claim made here is exactly that
+    // marker's presence, nothing about setup's outcome, so no further
+    // verification applies. A config string existing is not a capability,
+    // so this stays informational (no tick) rather than routing through
+    // `success`.
     let config = crate::domain::canopy_config::CanopyConfig::load(&canopy_dir);
     if config.is_configured() {
-        println!(" \x1b[32m✓\x1b[0m Config: config.toml");
+        println!(" \x1b[90m–\x1b[0m Config: config.toml");
         if config.clis.is_empty() {
             println!(" Harnesses: (none configured)");
         } else {
@@ -97,8 +138,11 @@ pub(crate) async fn run_doctor() -> Result<()> {
                 println!(" \x1b[33m⚠\x1b[0m Daemon not running");
             }
         }
+        // capability: `diagnose_daemon` cross-checks the PID file against
+        // who actually holds the port and what the service manager thinks —
+        // a live PID alone is not enough to reach this branch.
         DaemonState::Running { pid } => {
-            println!(" \x1b[32m✓\x1b[0m Daemon running (PID: {})", pid);
+            success(format!("Daemon running (PID: {pid})"));
         }
         DaemonState::Discrepancy(d) => {
             println!(" \x1b[31m✗\x1b[0m Daemon status is inconsistent:");
@@ -127,8 +171,11 @@ pub(crate) async fn run_doctor() -> Result<()> {
     // doctor reads the unit itself and says so.
     report_service_unit(&home, &mut issues);
 
+    // declaration: same marker as the "Config: config.toml" check above —
+    // kept as a separate line for readability, not a separate fact. Same
+    // reasoning applies: informational, not a tick.
     if config.is_configured() {
-        println!(" \x1b[32m✓\x1b[0m Setup completed");
+        println!(" \x1b[90m–\x1b[0m Setup completed");
     } else {
         println!(" \x1b[33m⚠\x1b[0m Setup not completed");
         issues.push("Run 'canopy setup'".to_string());
@@ -146,6 +193,27 @@ pub(crate) async fn run_doctor() -> Result<()> {
     } else {
         for cli_config in &config.clis {
             match cli_config.resolve() {
+                // declaration, partially: `resolve()`'s PATH-search step
+                // (`which`) does confirm a real file, but its absolute-path
+                // step accepts the string as-is without checking the file
+                // exists — so a stale absolute path in config.toml would
+                // otherwise resolve "Ok" and print a green tick for a
+                // binary that isn't there. `binary_is_executable` (the
+                // probe the service-unit check already uses) closes that
+                // gap instead of duplicating a second existence check.
+                Ok((resolved, step)) if !binary_is_executable(&resolved) => {
+                    println!(
+                        " \x1b[31m✗\x1b[0m {} → {} (via {} — file missing or not executable)",
+                        cli_config.name,
+                        resolved.display(),
+                        step.label()
+                    );
+                    issues.push(format!(
+                        "'{}' resolved to {} but that file is missing or not executable.",
+                        cli_config.name,
+                        resolved.display()
+                    ));
+                }
                 Ok((resolved, step)) => {
                     // Check daemon reachability: does the binary also
                     // resolve under the daemon's captured PATH?
@@ -155,12 +223,12 @@ pub(crate) async fn run_doctor() -> Result<()> {
                         None => true,
                     };
                     if daemon_reachable {
-                        println!(
-                            " \x1b[32m✓\x1b[0m {} → {} (via {})",
+                        success(format!(
+                            "{} → {} (via {})",
                             cli_config.name,
                             resolved.display(),
                             step.label()
-                        );
+                        ));
                     } else {
                         println!(
                             " \x1b[33m⚠\x1b[0m {} → {} (via {} — reachable now but NOT from the daemon)",
@@ -190,12 +258,16 @@ pub(crate) async fn run_doctor() -> Result<()> {
     // ── RAG Health ──────────────────────────────────────────────
     let config = crate::domain::canopy_config::CanopyConfig::load(&canopy_dir);
 
+    // declaration: names the configured model string; whether it's actually
+    // usable is what the branches below (API key presence, local-embeddings
+    // capability) exist to verify. A config string is not a capability, so
+    // this is informational, not a tick.
     if config.embeddings_model.is_empty() {
         println!(" \x1b[31m✗\x1b[0m Embeddings model not configured (run 'canopy setup')");
         issues.push("Configure embeddings model via 'canopy setup'".to_string());
     } else {
         println!(
-            " \x1b[32m✓\x1b[0m Embeddings model: {}",
+            " \x1b[90m–\x1b[0m Embeddings model: {}",
             config.embeddings_model
         );
 
@@ -209,6 +281,11 @@ pub(crate) async fn run_doctor() -> Result<()> {
             Some(crate::rag::embedding_client::EmbeddingProvider::Gemini) => {
                 Some(("GEMINI_API_KEY", std::env::var("GEMINI_API_KEY").is_ok()))
             }
+            // capability: `provider_available` checks whether this binary
+            // was built with the `local-embeddings` feature, not just
+            // whether the model name string looks local — a released
+            // binary without the feature must not claim "no API key
+            // required" for a capability it doesn't have.
             Some(crate::rag::embedding_client::EmbeddingProvider::Local) => {
                 if crate::rag::embedding_client::provider_available(
                     crate::rag::embedding_client::EmbeddingProvider::Local,
@@ -248,7 +325,7 @@ pub(crate) async fn run_doctor() -> Result<()> {
                             ));
                         }
                         None => {
-                            println!(" \x1b[32m✓\x1b[0m Local model — no API key required");
+                            success("Local model — no API key required");
                         }
                     }
                 } else {
@@ -276,9 +353,13 @@ pub(crate) async fn run_doctor() -> Result<()> {
             }
         };
 
+        // declaration: an env var being set doesn't prove it's a valid
+        // credential — only a real API call could confirm that, which is
+        // too expensive for an interactive check. This reports presence,
+        // not validity.
         if let Some((key_var, present)) = api_key_info {
             if present {
-                println!(" \x1b[32m✓\x1b[0m API key {key_var} is set");
+                success(format!("API key {key_var} is set"));
             } else {
                 println!(" \x1b[31m✗\x1b[0m {key_var} is NOT set — indexing will fail silently");
                 issues.push("Export the required API key before starting the daemon".to_string());
@@ -290,12 +371,16 @@ pub(crate) async fn run_doctor() -> Result<()> {
     // silently falls back to the default for an out-of-range config.toml value
     // (indexing must never honor an unbounded/huge cap), but that fallback
     // must not read as silently green here.
+    // capability: `validate_rag_max_file_mb` re-derives whether the
+    // configured value is actually the one indexing will use, rather than
+    // trusting the config.toml number at face value — that's what catches
+    // the silent-fallback case flagged below.
     match crate::domain::canopy_config::validate_rag_max_file_mb(config.rag_max_file_mb) {
         Ok(()) => {
-            println!(
-                " \x1b[32m✓\x1b[0m Indexing size limit: {} MB per file",
+            success(format!(
+                "Indexing size limit: {} MB per file",
                 config.rag_max_file_mb
-            );
+            ));
         }
         Err(reason) => {
             let effective_mb = config.rag_max_file_bytes() / (1024 * 1024);
@@ -336,7 +421,9 @@ pub(crate) async fn run_doctor() -> Result<()> {
                     .iter()
                     .filter(|e| e.metadata().is_ok_and(|m| m.len() > max_bytes))
                     .count();
-                println!(" \x1b[32m✓\x1b[0m RAG dir: {dir} ({file_count} indexable file(s))");
+                // capability: walks the directory and counts what's
+                // actually indexable there, not just that the path exists.
+                success(format!("RAG dir: {dir} ({file_count} indexable file(s))"));
                 total_files += file_count;
                 oversize_files += dir_oversize;
             } else {
@@ -362,14 +449,23 @@ pub(crate) async fn run_doctor() -> Result<()> {
         }
     }
 
+    // capability: presence of the file is exactly the claim made — ragignore
+    // has no separate "does it work" question beyond existing on disk.
     let ragignore_path = canopy_dir.join("ragignore");
     if ragignore_path.exists() {
-        println!(" \x1b[32m✓\x1b[0m ragignore: {}", ragignore_path.display());
+        success(format!("ragignore: {}", ragignore_path.display()));
     } else {
         println!(" \x1b[90m–\x1b[0m ragignore not found (optional — create ~/.canopy/ragignore to exclude files)");
     }
 
-    // LanceDB vector store
+    // ── Vector Store ──────────────────────────────────────────────
+    // capability: this must open the store — a corrupt LanceDB manifest,
+    // for instance, previously left the directory on disk while every
+    // query against it failed, and the old check (`lancedb_path.exists()`)
+    // printed the same green tick for that as for a healthy store. Opening
+    // it is also what's needed to read the chunk count below, so the two
+    // checks that used to live in separate sections are merged into one
+    // capability probe.
     let lancedb_path = match crate::rag::vector_store::VectorStore::default_lancedb_path() {
         Ok(p) => p,
         Err(_) => {
@@ -381,94 +477,102 @@ pub(crate) async fn run_doctor() -> Result<()> {
         }
     };
 
-    if lancedb_path.exists() {
-        println!(" \x1b[32m✓\x1b[0m Vector store: {}", lancedb_path.display());
-    } else {
-        println!(
-            " \x1b[90m–\x1b[0m Vector store not yet created (will be created on first indexing)"
-        );
-    }
+    // Opening the store requires knowing its embedding dimensionality,
+    // which only a resolvable embeddings model tells us.
+    let known_dimensions = (!config.embeddings_model.is_empty())
+        .then(|| crate::rag::embedding_client::model_dimensions(&config.embeddings_model).ok())
+        .flatten();
 
-    // Chunk count from LanceDB
-    if !config.embeddings_model.is_empty() {
-        if let Ok(dimensions) =
-            crate::rag::embedding_client::model_dimensions(&config.embeddings_model)
-        {
-            match crate::rag::vector_store::VectorStore::new(dimensions).await {
-                Ok(store) => match store.count_chunks().await {
-                    Ok(total) => {
-                        if total > 0 {
-                            println!(" \x1b[32m✓\x1b[0m Indexed chunks: {total}");
-                            if let Ok(unique) = store.count_unique_paths().await {
-                                println!(" \x1b[32m✓\x1b[0m Indexed files: {unique}");
+    match known_dimensions {
+        None => {
+            // declaration: no embeddings model to open the store with, so
+            // this can only report whether something is present on disk —
+            // never a tick, since presence was never verified to work.
+            if lancedb_path.exists() {
+                println!(
+                    " \x1b[90m–\x1b[0m Vector store present at {} (cannot verify without a configured embeddings model)",
+                    lancedb_path.display()
+                );
+            } else {
+                println!(
+                    " \x1b[90m–\x1b[0m Vector store not yet created (will be created on first indexing)"
+                );
+            }
+        }
+        Some(dimensions) => match crate::rag::vector_store::VectorStore::new(dimensions).await {
+            Err(e) => {
+                println!(" \x1b[31m✗\x1b[0m Could not open LanceDB: {e}");
+                issues.push(
+                    "LanceDB open error — check if the embeddings model is supported".to_string(),
+                );
+            }
+            Ok(store) => match store.count_chunks().await {
+                Err(_) => {
+                    println!(" \x1b[90m–\x1b[0m Could not read chunk count from LanceDB");
+                }
+                Ok(total) => {
+                    success(format!("Vector store: {}", lancedb_path.display()));
+                    if total > 0 {
+                        success(format!("Indexed chunks: {total}"));
+                        if let Ok(unique) = store.count_unique_paths().await {
+                            success(format!("Indexed files: {unique}"));
 
-                                // Surface mismatch between files on disk and indexed files.
-                                let disk_files: usize = config
-                                    .rag_personal_dirs
-                                    .iter()
-                                    .map(std::path::Path::new)
-                                    .filter(|p| p.exists())
-                                    .flat_map(|p| {
-                                        walkdir::WalkDir::new(p)
-                                            .follow_links(false)
-                                            .into_iter()
-                                            .filter_map(|e| e.ok())
-                                            .filter(|e| {
-                                                e.file_type().is_file()
-                                                    && crate::rag::chunker::detect_lang(
-                                                        &e.path().to_string_lossy(),
-                                                    )
-                                                    .is_some()
-                                            })
-                                    })
-                                    .count();
+                            // Surface mismatch between files on disk and indexed files.
+                            let disk_files: usize = config
+                                .rag_personal_dirs
+                                .iter()
+                                .map(std::path::Path::new)
+                                .filter(|p| p.exists())
+                                .flat_map(|p| {
+                                    walkdir::WalkDir::new(p)
+                                        .follow_links(false)
+                                        .into_iter()
+                                        .filter_map(|e| e.ok())
+                                        .filter(|e| {
+                                            e.file_type().is_file()
+                                                && crate::rag::chunker::detect_lang(
+                                                    &e.path().to_string_lossy(),
+                                                )
+                                                .is_some()
+                                        })
+                                })
+                                .count();
 
-                                if disk_files > 0 && (unique as usize) < disk_files {
-                                    println!(
-                                        " \x1b[33m⚠\x1b[0m {disk_files} indexable file(s) on disk but only {unique} indexed — \
-                                         check daemon logs for embedding errors"
-                                    );
-                                    issues.push(
-                                        "Some files may not be indexed — verify API key and daemon logs"
-                                            .to_string(),
-                                    );
-                                }
-                            }
-                        } else {
-                            println!(" \x1b[31m✗\x1b[0m No chunks indexed yet");
-                            if !config.rag_personal_dirs.is_empty() {
-                                let is_local = matches!(
-                                    crate::rag::embedding_client::provider_for_model(
-                                        &config.embeddings_model
-                                    ),
-                                    Some(crate::rag::embedding_client::EmbeddingProvider::Local)
+                            if disk_files > 0 && (unique as usize) < disk_files {
+                                println!(
+                                    " \x1b[33m⚠\x1b[0m {disk_files} indexable file(s) on disk but only {unique} indexed — \
+                                     check daemon logs for embedding errors"
                                 );
                                 issues.push(
-                                    if is_local {
-                                        "RAG directories are configured but nothing is indexed — \
-                                         ensure the daemon is running"
-                                    } else {
-                                        "RAG directories are configured but nothing is indexed — \
-                                         ensure the daemon is running and the API key env var is set"
-                                    }
-                                    .to_string(),
+                                    "Some files may not be indexed — verify API key and daemon logs"
+                                        .to_string(),
                                 );
                             }
                         }
+                    } else {
+                        println!(" \x1b[31m✗\x1b[0m No chunks indexed yet");
+                        if !config.rag_personal_dirs.is_empty() {
+                            let is_local = matches!(
+                                crate::rag::embedding_client::provider_for_model(
+                                    &config.embeddings_model
+                                ),
+                                Some(crate::rag::embedding_client::EmbeddingProvider::Local)
+                            );
+                            issues.push(
+                                if is_local {
+                                    "RAG directories are configured but nothing is indexed — \
+                                     ensure the daemon is running"
+                                } else {
+                                    "RAG directories are configured but nothing is indexed — \
+                                     ensure the daemon is running and the API key env var is set"
+                                }
+                                .to_string(),
+                            );
+                        }
                     }
-                    Err(_) => {
-                        println!(" \x1b[90m–\x1b[0m Could not read chunk count from LanceDB");
-                    }
-                },
-                Err(e) => {
-                    println!(" \x1b[31m✗\x1b[0m Could not open LanceDB: {e}");
-                    issues.push(
-                        "LanceDB open error — check if the embeddings model is supported"
-                            .to_string(),
-                    );
                 }
-            }
-        }
+            },
+        },
     }
 
     // Queue count from SQLite
@@ -633,10 +737,10 @@ fn report_service_unit(home: &Path, issues: &mut Vec<String>) {
         return;
     };
 
-    println!(
-        " \x1b[32m✓\x1b[0m Service unit ({manager}): {}",
-        unit_path.display()
-    );
+    // declaration: the unit file being readable is exactly what's claimed
+    // here — whether the binary it points at actually works is the
+    // separate, capability-checked line below.
+    success(format!("Service unit ({manager}): {}", unit_path.display()));
 
     let Some(unit_binary) = parse_unit_binary(manager, &unit_content) else {
         println!("     \x1b[33m⚠\x1b[0m Could not find the binary the unit points at");
@@ -671,8 +775,10 @@ fn report_service_unit(home: &Path, issues: &mut Vec<String>) {
                     .to_string(),
             );
         }
+        // capability: reached only when `binary_is_executable` confirmed
+        // the file on disk, not just that the unit names some path.
         ServiceUnitBinaryStatus::Consistent => {
-            println!("     \x1b[32m✓\x1b[0m Binary: {}", unit_binary.display());
+            success_nested(format!("Binary: {}", unit_binary.display()));
         }
     }
 }
@@ -1329,5 +1435,83 @@ mod tests {
         assert!(output.contains("Local model download failed"));
         assert!(output.contains("connection reset"));
         assert!(output.contains("canopy rag model retry"));
+    }
+
+    /// A LanceDB directory that exists on disk but is not a valid store
+    /// (here: a plain file sitting where the store's directory should be,
+    /// standing in for any on-disk corruption) must never read as healthy.
+    /// This is the regression test for the defect this module fixes: the
+    /// old check was `lancedb_path.exists()`, which is true for a corrupt
+    /// store exactly as it is for a working one.
+    #[tokio::test]
+    #[ignore]
+    async fn run_doctor_reports_corrupt_vector_store_without_a_green_tick() {
+        let home = tempfile::tempdir().unwrap();
+        let canopy_dir = home.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+
+        let config = CanopyConfig {
+            embeddings_model: "text-embedding-3-small".to_string(),
+            ..Default::default()
+        };
+        config.save(&canopy_dir).unwrap();
+
+        // Put a plain file where VectorStore::open_at's `create_dir_all`
+        // needs to make a directory — opening it must fail, the way a
+        // corrupt LanceDB manifest would fail in the wild.
+        let rag_dir = canopy_dir.join("rag");
+        std::fs::create_dir_all(&rag_dir).unwrap();
+        std::fs::write(rag_dir.join("vectors.lancedb"), b"not a lancedb store").unwrap();
+
+        let prev_key = std::env::var("OPENAI_API_KEY").ok();
+        unsafe { std::env::set_var("OPENAI_API_KEY", "test-key") };
+
+        let (result, output) = run_doctor_captured(home.path()).await;
+
+        match prev_key {
+            Some(v) => unsafe { std::env::set_var("OPENAI_API_KEY", v) },
+            None => unsafe { std::env::remove_var("OPENAI_API_KEY") },
+        }
+
+        assert!(result.is_ok());
+        assert!(
+            !output.contains("\x1b[32m✓\x1b[0m Vector store"),
+            "a corrupt store must not print a green tick:\n{output}"
+        );
+        assert!(
+            output.contains("Could not open LanceDB"),
+            "expected the open failure to be surfaced:\n{output}"
+        );
+    }
+
+    /// The green ✓ glyph doctor uses for a verified capability must only
+    /// ever be printed by the `success`/`success_nested` helpers — never
+    /// typed inline by an individual check. This is what stops a future
+    /// check from reintroducing the bug class this module fixes (a green
+    /// tick for something that was only declared, not exercised): as long
+    /// as every tick routes through one place, that place is the one spot
+    /// that has to earn the reviewer's trust, instead of every check site.
+    #[test]
+    fn success_glyph_only_printed_by_shared_helper() {
+        let source = include_str!("doctor.rs");
+        // Scan only the non-test code: test bodies legitimately reference
+        // the glyph sequence in assertions (e.g. the corrupt-store test
+        // above), which isn't the thing this test guards against.
+        let production_code = source
+            .split("mod tests {")
+            .next()
+            .expect("this file always contains the literal \"mod tests {\"");
+        // Raw string: `include_str!` reads the file's literal text, where
+        // an escape sequence like `\x1b` is four literal characters
+        // (backslash, x, 1, b), not an evaluated control byte — the search
+        // pattern must match that literal text, not the compiled string.
+        let raw_glyph_occurrences = production_code.matches(r"\x1b[32m✓\x1b[0m").count();
+        assert_eq!(
+            raw_glyph_occurrences, 2,
+            "the ✓ glyph must only be embedded by `success` and `success_nested` \
+             (2 occurrences expected: one per helper's println!) — a new direct \
+             occurrence means some check is printing a tick without going through \
+             the shared helper"
+        );
     }
 }
