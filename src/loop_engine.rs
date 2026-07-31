@@ -1646,6 +1646,14 @@ impl LoopEngine {
                 "Quorum node '{}' cannot execute directly; it only runs as part of ensemble fan-out.",
                 node.name
             ),
+            // Model/persistence/validation only in this iteration — a router
+            // is never executed. This arm exists only so the match stays
+            // exhaustive; reaching it is always a bug upstream (`run_spec`
+            // should never dispatch a router node to `execute_node`).
+            LoopNodeKind::Router => bail!(
+                "Router node '{}' cannot execute; routers are not yet engine-executed.",
+                node.name
+            ),
         }
     }
 
@@ -2917,7 +2925,7 @@ fn select_next_step(
         [] => Ok(None),
         [edge] => Ok(Some(StepSelection {
             cursor: SpecCursor::Node(edge.to_node.clone()),
-            edge_condition: edge.condition,
+            edge_condition: edge.condition.clone(),
         })),
         _ => {
             let distinct_targets = matching
@@ -2928,7 +2936,7 @@ fn select_next_step(
                 let to_node = *distinct_targets.iter().next().expect("len == 1");
                 return Ok(Some(StepSelection {
                     cursor: SpecCursor::Node(to_node.to_string()),
-                    edge_condition: matching[0].condition,
+                    edge_condition: matching[0].condition.clone(),
                 }));
             }
             for details in ensembles {
@@ -2940,7 +2948,7 @@ fn select_next_step(
                 if member_ids == distinct_targets {
                     return Ok(Some(StepSelection {
                         cursor: SpecCursor::Ensemble(details.ensemble.id.clone()),
-                        edge_condition: matching[0].condition,
+                        edge_condition: matching[0].condition.clone(),
                     }));
                 }
             }

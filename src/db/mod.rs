@@ -265,6 +265,7 @@ impl Database {
                 from_node TEXT NOT NULL REFERENCES loop_nodes(id) ON DELETE CASCADE,
                 to_node TEXT NOT NULL REFERENCES loop_nodes(id) ON DELETE CASCADE,
                 condition TEXT NOT NULL,
+                route TEXT,
                 CHECK ((spec_id IS NULL) <> (loop_id IS NULL))
             );
 
@@ -896,6 +897,23 @@ impl Database {
             .unwrap_or(false);
         if !has_group_name {
             conn.execute("ALTER TABLE pool_members ADD COLUMN group_name TEXT", [])
+                .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // `route` (router nodes): the label a `route`-conditioned edge names,
+        // alongside `condition = 'route'` — see
+        // `domain::loops::LoopEdgeCondition::{as_str, route_label, from_parts}`.
+        // NULL for every pre-existing edge (none of them can be a router's
+        // route edge, since `LoopNodeKind::Router` didn't exist yet either).
+        let has_edge_route: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loop_edges') WHERE name = 'route'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_edge_route {
+            conn.execute("ALTER TABLE loop_edges ADD COLUMN route TEXT", [])
                 .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
         }
 

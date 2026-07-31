@@ -51,9 +51,10 @@ use crate::db::intelligence::IntelligenceNodeRecord;
 use crate::db::Database;
 use crate::domain::blueprints::{merge_blueprint_config, validate_blueprint_deletable, Blueprint};
 use crate::domain::loops::{
+    validate_router_edges_declared, validate_router_route_coverage, validate_router_routes,
     validate_spec_description_template, Ensemble, EnsembleMember, Loop, LoopDetails, LoopEdge,
     LoopEdgeCondition, LoopNode, LoopNodeKind, LoopNodeRun, LoopResetOutcome, LoopRunStatus,
-    LoopSpec, LoopSpecStatus, LoopStatus, SpecAdminStatusOutcome,
+    LoopSpec, LoopSpecStatus, LoopStatus, RouterRoute, SpecAdminStatusOutcome,
 };
 use crate::domain::models::{Agent, Trigger};
 use crate::domain::pools::{Pool, PoolDetails};
@@ -315,7 +316,7 @@ fn build_ensemble_unit(spec: &EnsembleUnitSpec) -> BuiltEnsembleUnit {
             loop_id: spec.loop_id.clone(),
             from_node: spec.entry_from_node.to_string(),
             to_node: node_id.clone(),
-            condition: spec.entry_condition,
+            condition: spec.entry_condition.clone(),
         });
         edges.push(LoopEdge {
             id: uuid::Uuid::new_v4().to_string(),
@@ -373,7 +374,7 @@ fn build_ensemble_unit(spec: &EnsembleUnitSpec) -> BuiltEnsembleUnit {
         prompt_template: spec.prompt_template.to_string(),
         join_node_id,
         entry_from_node: spec.entry_from_node.to_string(),
-        entry_condition: spec.entry_condition,
+        entry_condition: spec.entry_condition.clone(),
         min_pass: spec.min_pass,
         straggler_timeout_minutes: spec.straggler_timeout_minutes,
         timeout_minutes: spec.timeout_minutes,
@@ -534,9 +535,62 @@ fn validate_edge_condition(condition: &str) -> Result<LoopEdgeCondition, String>
         .ok_or_else(|| "Loop edge condition must be one of: pass, fail, always.".to_string())
 }
 
+/// [`validate_edge_condition`] plus `route` support for
+/// `loop_add_edge`/`loop_update_edge`: a `"route"` condition requires a
+/// non-empty `route` param naming the label. `pass`/`fail`/`always` are
+/// unaffected — delegated straight to [`validate_edge_condition`].
+fn validate_edge_condition_with_route(
+    condition: &str,
+    route: Option<&str>,
+) -> Result<LoopEdgeCondition, String> {
+    if condition.trim() == "route" {
+        let label = route
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                "Loop edge condition 'route' requires a non-empty 'route' label.".to_string()
+            })?;
+        return Ok(LoopEdgeCondition::Route(label.to_string()));
+    }
+    validate_edge_condition(condition)
+        .map_err(|_| "Loop edge condition must be one of: pass, fail, always, route.".to_string())
+}
+
+/// If `condition` is a `Route`, validate that its label names a route
+/// actually declared by the router node `from_node_id` — never accepted
+/// free-form. Every other condition is a no-op.
+fn validate_route_edge_target(
+    db: &Database,
+    from_node_id: &str,
+    condition: &LoopEdgeCondition,
+) -> Result<(), String> {
+    let Some(label) = condition.route_label() else {
+        return Ok(());
+    };
+    let from_node = validate_node_exists(db, from_node_id)?;
+    if from_node.kind != LoopNodeKind::Router {
+        return Err(format!(
+            "Edge condition 'route' requires from_node '{from_node_id}' to be a router node, not '{}'.",
+            from_node.kind.display_str()
+        ));
+    }
+    let (routes, _fallback) = parse_router_routes(&from_node.config)?;
+    if !routes.iter().any(|route| route.label == label) {
+        return Err(format!(
+            "Edge names undeclared route '{label}'. Router '{from_node_id}' declares: {}.",
+            routes
+                .iter()
+                .map(|route| route.label.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    Ok(())
+}
+
 fn validate_node_kind(kind: &str) -> Result<LoopNodeKind, String> {
     LoopNodeKind::from_str(kind.trim())
-        .ok_or_else(|| "Loop node kind must be one of: agent, check, gate.".to_string())
+        .ok_or_else(|| "Loop node kind must be one of: agent, check, gate, router.".to_string())
 }
 
 /// `loop_add_node`/`loop_update_node`'s `kind: "join"` guard — a quorum node is
@@ -668,9 +722,59 @@ fn validate_node_config(kind: LoopNodeKind, config: &serde_json::Value) -> Resul
         // reach this arm anyway since `loop_add_node`/`loop_update_node`
         // refuse `kind: "join"` outright.
         LoopNodeKind::Join => {}
+        LoopNodeKind::Router => {
+            let (routes, fallback) = parse_router_routes(config)?;
+            validate_router_routes(&routes, &fallback)?;
+        }
     }
 
     Ok(())
+}
+
+/// Parse a router node's `config` into its declared routes + fallback
+/// label. Shared by [`validate_node_config`]'s config-shape check and by
+/// edge validation (`loop_add_edge`/`loop_update_edge`/`loop_update_node`),
+/// which need to check a route name against what a router actually
+/// declares.
+fn parse_router_routes(config: &serde_json::Value) -> Result<(Vec<RouterRoute>, String), String> {
+    let map = config.as_object().ok_or_else(|| {
+        format!(
+            "Loop node config must be a JSON object, not {}. Pass an object (e.g. {{\"routes\": [...]}}) rather than a JSON-encoded string.",
+            json_value_kind_name(config)
+        )
+    })?;
+    let routes_value = map.get("routes").ok_or_else(|| {
+        "Loop node config for kind 'router' must include a 'routes' array.".to_string()
+    })?;
+    let routes_array = routes_value
+        .as_array()
+        .ok_or_else(|| "Loop node config field 'routes' must be an array.".to_string())?;
+    let routes = routes_array
+        .iter()
+        .map(|entry| {
+            let obj = entry.as_object().ok_or_else(|| {
+                "Each router route must be an object with 'label' and 'description' fields."
+                    .to_string()
+            })?;
+            let label = obj
+                .get("label")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let description = obj
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            Ok(RouterRoute { label, description })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let fallback = map
+        .get("fallback")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Ok((routes, fallback))
 }
 
 /// Look up a blueprint by name, or an actionable error listing every
@@ -1246,6 +1350,11 @@ fn plan_node_copy(db: &Database, params: &LoopCopyNodeParams) -> Result<NodeCopy
             Some(value) => validate_edge_condition(value)?,
             None => LoopEdgeCondition::Always,
         };
+        wiring.insert("entry_from_node".into(), serde_json::json!(from));
+        wiring.insert(
+            "entry_condition".into(),
+            serde_json::json!(condition.as_str()),
+        );
         edges.push(LoopEdge {
             id: uuid::Uuid::new_v4().to_string(),
             spec_id: spec_id.clone(),
@@ -1254,11 +1363,6 @@ fn plan_node_copy(db: &Database, params: &LoopCopyNodeParams) -> Result<NodeCopy
             to_node: new_id.clone(),
             condition,
         });
-        wiring.insert("entry_from_node".into(), serde_json::json!(from));
-        wiring.insert(
-            "entry_condition".into(),
-            serde_json::json!(condition.as_str()),
-        );
     }
     for (field, target_node, cond) in [
         ("on_pass_to", &params.on_pass_to, LoopEdgeCondition::Pass),
@@ -1385,7 +1489,7 @@ fn plan_ensemble_copy(
         .filter(|s| !s.is_empty())
     {
         Some(value) => validate_edge_condition(value)?,
-        None => source.entry_condition,
+        None => source.entry_condition.clone(),
     };
     let on_pass_to = params
         .on_pass_to
@@ -1464,7 +1568,7 @@ fn plan_ensemble_copy(
         prompt_template: &prompt_template,
         members: &members,
         entry_from_node: &entry_from_node,
-        entry_condition,
+        entry_condition: entry_condition.clone(),
         on_pass_to: &on_pass_to,
         on_fail_to: on_fail_to.as_deref(),
         min_pass,
@@ -3911,6 +4015,32 @@ impl TaskTriggerHandler {
             if let Err(e) = validate_node_config(effective_kind, effective_config) {
                 return Ok(error_result(&e));
             }
+            // A router's routes must stay consistent with whatever edges
+            // already name them: no edge left pointing at a route that was
+            // just removed, and (once wiring has started) no declared route
+            // left without one — see `validate_router_route_coverage`.
+            if effective_kind == LoopNodeKind::Router {
+                let (routes, _fallback) = match parse_router_routes(effective_config) {
+                    Ok(parsed) => parsed,
+                    Err(e) => return Ok(error_result(&e)),
+                };
+                let edges = match (&node.spec_id, &node.loop_id) {
+                    (Some(spec_id), _) => {
+                        self.db.list_loop_edges(spec_id).map_err(internal_error)?
+                    }
+                    (_, Some(loop_id)) => self
+                        .db
+                        .list_loop_edges_for_loop(loop_id)
+                        .map_err(internal_error)?,
+                    (None, None) => Vec::new(),
+                };
+                if let Err(e) = validate_router_edges_declared(&routes, node_id, &edges) {
+                    return Ok(error_result(&e));
+                }
+                if let Err(e) = validate_router_route_coverage(&routes, node_id, &edges) {
+                    return Ok(error_result(&e));
+                }
+            }
         }
 
         self.db
@@ -3928,7 +4058,10 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<LoopAddEdgeParams>,
     ) -> Result<CallToolResult, McpError> {
-        let condition = match validate_edge_condition(params.condition.trim()) {
+        let condition = match validate_edge_condition_with_route(
+            params.condition.trim(),
+            params.route.as_deref(),
+        ) {
             Ok(c) => c,
             Err(e) => return Ok(error_result(&e)),
         };
@@ -3961,6 +4094,9 @@ impl TaskTriggerHandler {
             return Ok(error_result(&e));
         }
         if let Err(e) = validate_node_not_ensemble_owned(&self.db, &params.to_node) {
+            return Ok(error_result(&e));
+        }
+        if let Err(e) = validate_route_edge_target(&self.db, &params.from_node, &condition) {
             return Ok(error_result(&e));
         }
 
@@ -4001,10 +4137,16 @@ impl TaskTriggerHandler {
         if let Err(e) = validate_node_not_ensemble_owned(&self.db, &edge.to_node) {
             return Ok(error_result(&e));
         }
-        let condition = match validate_edge_condition(params.condition.trim()) {
+        let condition = match validate_edge_condition_with_route(
+            params.condition.trim(),
+            params.route.as_deref(),
+        ) {
             Ok(c) => c,
             Err(e) => return Ok(error_result(&e)),
         };
+        if let Err(e) = validate_route_edge_target(&self.db, &edge.from_node, &condition) {
+            return Ok(error_result(&e));
+        }
 
         if edge.condition == condition {
             return Ok(success_result(&format!(
@@ -4015,7 +4157,7 @@ impl TaskTriggerHandler {
         }
 
         self.db
-            .update_loop_edge_condition(&edge.id, condition)
+            .update_loop_edge_condition(&edge.id, &condition)
             .map_err(internal_error)?;
 
         Ok(success_result(&format!("Loop edge '{}' updated.", edge.id)))
@@ -4442,7 +4584,7 @@ impl TaskTriggerHandler {
                         loop_id: details.ensemble.loop_id.clone(),
                         from_node: details.ensemble.entry_from_node.clone(),
                         to_node: node_id.clone(),
-                        condition: details.ensemble.entry_condition,
+                        condition: details.ensemble.entry_condition.clone(),
                     };
                     let join_edge = LoopEdge {
                         id: uuid::Uuid::new_v4().to_string(),
@@ -4573,7 +4715,7 @@ impl TaskTriggerHandler {
                 self.db
                     .delete_loop_edges_from_node_with_condition(
                         &details.ensemble.join_node_id,
-                        LoopEdgeCondition::Pass,
+                        &LoopEdgeCondition::Pass,
                     )
                     .map_err(internal_error)?;
                 self.db
@@ -4592,7 +4734,7 @@ impl TaskTriggerHandler {
                 self.db
                     .delete_loop_edges_from_node_with_condition(
                         &details.ensemble.join_node_id,
-                        LoopEdgeCondition::Fail,
+                        &LoopEdgeCondition::Fail,
                     )
                     .map_err(internal_error)?;
                 if let Some(target) = on_fail_to
@@ -6006,7 +6148,7 @@ fn loop_details_json(db: &Database, lp: &LoopDetails) -> anyhow::Result<serde_js
         "completed_at": lp.lp.completed_at.map(|value| value.to_rfc3339()),
         "autorun_at": lp.lp.autorun_at.map(|value| value.to_rfc3339()),
         "graph": {
-            "nodes": lp.graph_nodes.iter().map(loop_node_json).collect::<Vec<_>>(),
+            "nodes": lp.graph_nodes.iter().map(|node| loop_node_json(node, &lp.graph_edges)).collect::<Vec<_>>(),
             "edges": lp.graph_edges.iter().map(loop_edge_json).collect::<Vec<_>>(),
             "ensembles": ensembles,
         },
@@ -6115,14 +6257,14 @@ fn loop_spec_details_json(
         "spec_start_head": spec.spec.spec_start_head,
         "started_at": spec.spec.started_at.map(|value| value.to_rfc3339()),
         "completed_at": spec.spec.completed_at.map(|value| value.to_rfc3339()),
-        "nodes": spec.nodes.iter().map(loop_node_json).collect::<Vec<_>>(),
+        "nodes": spec.nodes.iter().map(|node| loop_node_json(node, &spec.edges)).collect::<Vec<_>>(),
         "edges": spec.edges.iter().map(loop_edge_json).collect::<Vec<_>>(),
         "ensembles": ensembles,
         "runs": runs,
     }))
 }
 
-fn loop_node_json(node: &LoopNode) -> serde_json::Value {
+fn loop_node_json(node: &LoopNode, edges: &[LoopEdge]) -> serde_json::Value {
     serde_json::json!({
         "id": node.id,
         "spec_id": node.spec_id,
@@ -6132,7 +6274,36 @@ fn loop_node_json(node: &LoopNode) -> serde_json::Value {
         "config": node.config,
         "position": node.position,
         "created_at": node.created_at.to_rfc3339(),
+        "routes": router_routes_json(node, edges),
     })
+}
+
+/// For a router node, every declared route alongside the edge (if any) that
+/// currently serves it — `loop_get`'s view into "which edge serves each
+/// route". `None` for every other node kind (or if the router's `config`
+/// somehow fails to parse — `loop_get` should never fail outright over a
+/// display concern).
+fn router_routes_json(node: &LoopNode, edges: &[LoopEdge]) -> Option<serde_json::Value> {
+    if node.kind != LoopNodeKind::Router {
+        return None;
+    }
+    let (routes, fallback) = parse_router_routes(&node.config).ok()?;
+    Some(serde_json::json!(routes
+        .iter()
+        .map(|route| {
+            let serving_edge = edges.iter().find(|edge| {
+                edge.from_node == node.id
+                    && edge.condition.route_label() == Some(route.label.as_str())
+            });
+            serde_json::json!({
+                "label": route.label,
+                "description": route.description,
+                "fallback": route.label == fallback,
+                "edge_id": serving_edge.map(|edge| edge.id.clone()),
+                "to_node": serving_edge.map(|edge| edge.to_node.clone()),
+            })
+        })
+        .collect::<Vec<_>>()))
 }
 
 fn loop_edge_json(edge: &LoopEdge) -> serde_json::Value {
@@ -6143,6 +6314,7 @@ fn loop_edge_json(edge: &LoopEdge) -> serde_json::Value {
         "from_node": edge.from_node,
         "to_node": edge.to_node,
         "condition": edge.condition.as_str(),
+        "route": edge.condition.route_label(),
     })
 }
 
@@ -6315,14 +6487,14 @@ mod tests {
         node_copy_note, perform_loop_reset, plan_ensemble_copy, plan_node_copy, rag_result_json,
         resolve_graph_target, resolve_node_kind_and_config, resolve_reported_run,
         spec_summary_json, validate_absolute_dir, validate_at_least_one_bool,
-        validate_blueprint_exists, validate_edge_condition, validate_ensemble_members,
-        validate_node_config, validate_node_kind, validate_node_not_ensemble_owned,
-        validate_non_empty, validate_not_join_kind, validate_pool_exists,
-        validate_pool_member_removable, validate_pool_not_consumed, validate_pool_reorder,
-        validate_pool_reorder_locking, validate_spec_deletable, validate_spec_exists,
-        validate_spec_set_status_target, validate_spec_status, validate_spec_workdir,
-        BuiltEnsembleUnit, EnsembleMemberParams, EnsembleUnitSpec, TaskTriggerHandler,
-        MISSING_SYNC_IDENTITY_MESSAGE,
+        validate_blueprint_exists, validate_edge_condition, validate_edge_condition_with_route,
+        validate_ensemble_members, validate_node_config, validate_node_kind,
+        validate_node_not_ensemble_owned, validate_non_empty, validate_not_join_kind,
+        validate_pool_exists, validate_pool_member_removable, validate_pool_not_consumed,
+        validate_pool_reorder, validate_pool_reorder_locking, validate_route_edge_target,
+        validate_spec_deletable, validate_spec_exists, validate_spec_set_status_target,
+        validate_spec_status, validate_spec_workdir, BuiltEnsembleUnit, EnsembleMemberParams,
+        EnsembleUnitSpec, TaskTriggerHandler, MISSING_SYNC_IDENTITY_MESSAGE,
     };
     use crate::daemon::params::{
         LoopCompletionHookParams, LoopCopyEnsembleParams, LoopCopyNodeParams, LoopRunParams,
@@ -6898,6 +7070,46 @@ mod tests {
             &serde_json::json!({ "evaluate": "output_contains", "value": "ok" })
         )
         .is_ok());
+    }
+
+    fn router_config(routes: &serde_json::Value, fallback: &str) -> serde_json::Value {
+        serde_json::json!({ "routes": routes, "fallback": fallback })
+    }
+
+    fn two_routes_json() -> serde_json::Value {
+        serde_json::json!([
+            { "label": "retry", "description": "Retry the current step." },
+            { "label": "escalate", "description": "Hand off to a human." },
+        ])
+    }
+
+    #[test]
+    fn validate_node_config_router_accepts_valid_shape() {
+        let config = router_config(&two_routes_json(), "retry");
+        assert!(validate_node_config(LoopNodeKind::Router, &config).is_ok());
+    }
+
+    #[test]
+    fn validate_node_config_router_rejects_fewer_than_two_routes() {
+        let config = router_config(
+            &serde_json::json!([{ "label": "retry", "description": "Retry." }]),
+            "retry",
+        );
+        let error = validate_node_config(LoopNodeKind::Router, &config).unwrap_err();
+        assert!(error.contains("at least 2 routes"), "{error}");
+    }
+
+    #[test]
+    fn validate_node_config_router_rejects_no_fallback() {
+        let config = serde_json::json!({ "routes": two_routes_json() });
+        let error = validate_node_config(LoopNodeKind::Router, &config).unwrap_err();
+        assert!(error.contains("fallback"), "{error}");
+    }
+
+    #[test]
+    fn validate_node_config_router_rejects_missing_routes_field() {
+        let error = validate_node_config(LoopNodeKind::Router, &serde_json::json!({})).unwrap_err();
+        assert!(error.contains("'routes'"), "{error}");
     }
 
     #[test]
@@ -9063,6 +9275,150 @@ mod tests {
         assert!(err.contains("pass"), "{err}");
         assert!(err.contains("fail"), "{err}");
         assert!(err.contains("always"), "{err}");
+    }
+
+    // ── validate_edge_condition_with_route ───────────────────────────
+
+    #[test]
+    fn validate_edge_condition_with_route_builds_route_condition() {
+        let c = validate_edge_condition_with_route("route", Some("escalate")).unwrap();
+        assert_eq!(c, LoopEdgeCondition::Route("escalate".to_string()));
+    }
+
+    #[test]
+    fn validate_edge_condition_with_route_requires_non_empty_label() {
+        let err = validate_edge_condition_with_route("route", None).unwrap_err();
+        assert!(err.contains("non-empty 'route' label"), "{err}");
+
+        let err = validate_edge_condition_with_route("route", Some("  ")).unwrap_err();
+        assert!(err.contains("non-empty 'route' label"), "{err}");
+    }
+
+    #[test]
+    fn validate_edge_condition_with_route_leaves_simple_conditions_untouched() {
+        assert_eq!(
+            validate_edge_condition_with_route("pass", None).unwrap(),
+            LoopEdgeCondition::Pass
+        );
+        assert_eq!(
+            validate_edge_condition_with_route("fail", None).unwrap(),
+            LoopEdgeCondition::Fail
+        );
+        assert_eq!(
+            validate_edge_condition_with_route("always", None).unwrap(),
+            LoopEdgeCondition::Always
+        );
+        assert!(validate_edge_condition_with_route("sideways", None).is_err());
+    }
+
+    // ── validate_route_edge_target ────────────────────────────────────
+
+    #[test]
+    fn validate_route_edge_target_is_noop_for_non_route_conditions() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        // No node inserted at all — a non-route condition must never look it
+        // up, let alone fail over a missing node.
+        assert!(validate_route_edge_target(&db, "missing-node", &LoopEdgeCondition::Pass).is_ok());
+    }
+
+    /// Insert a standalone spec (no owning loop) so a test can hang nodes
+    /// off it without needing a full `Loop` row too.
+    fn insert_standalone_spec(db: &Database, id: &str) {
+        db.insert_loop_spec(&LoopSpec {
+            id: id.to_string(),
+            loop_id: None,
+            name: id.to_string(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn validate_route_edge_target_rejects_non_router_from_node() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        insert_standalone_spec(&db, "spec-1");
+        db.insert_loop_node(&LoopNode {
+            id: "agent-1".to_string(),
+            spec_id: Some("spec-1".to_string()),
+            loop_id: None,
+            name: "Agent".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({ "platform": "claude" }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let err = validate_route_edge_target(
+            &db,
+            "agent-1",
+            &LoopEdgeCondition::Route("retry".to_string()),
+        )
+        .unwrap_err();
+        assert!(err.contains("router node"), "{err}");
+    }
+
+    #[test]
+    fn validate_route_edge_target_rejects_undeclared_route() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        insert_standalone_spec(&db, "spec-1");
+        db.insert_loop_node(&LoopNode {
+            id: "router-1".to_string(),
+            spec_id: Some("spec-1".to_string()),
+            loop_id: None,
+            name: "Router".to_string(),
+            kind: LoopNodeKind::Router,
+            config: router_config(&two_routes_json(), "retry"),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let err = validate_route_edge_target(
+            &db,
+            "router-1",
+            &LoopEdgeCondition::Route("nonexistent".to_string()),
+        )
+        .unwrap_err();
+        assert!(err.contains("undeclared route 'nonexistent'"), "{err}");
+    }
+
+    #[test]
+    fn validate_route_edge_target_accepts_declared_route() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        insert_standalone_spec(&db, "spec-1");
+        db.insert_loop_node(&LoopNode {
+            id: "router-1".to_string(),
+            spec_id: Some("spec-1".to_string()),
+            loop_id: None,
+            name: "Router".to_string(),
+            kind: LoopNodeKind::Router,
+            config: router_config(&two_routes_json(), "retry"),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        assert!(validate_route_edge_target(
+            &db,
+            "router-1",
+            &LoopEdgeCondition::Route("escalate".to_string()),
+        )
+        .is_ok());
     }
 
     // ── validate_node_kind ──────────────────────────────────────────
@@ -11408,7 +11764,7 @@ mod coverage_tests {
             position: 5,
             created_at: chrono::Utc::now(),
         };
-        let json = super::loop_node_json(&node);
+        let json = super::loop_node_json(&node, &[]);
         assert_eq!(json["id"], "n1");
         assert_eq!(json["spec_id"], "s1");
         assert!(json["loop_id"].is_null());
@@ -11428,7 +11784,7 @@ mod coverage_tests {
             position: 10,
             created_at: chrono::Utc::now(),
         };
-        let json = super::loop_node_json(&node);
+        let json = super::loop_node_json(&node, &[]);
         assert_eq!(json["kind"], "quorum");
     }
 
@@ -13940,6 +14296,7 @@ mod endpoint_tests {
                 from_node: a.clone(),
                 to_node: b.clone(),
                 condition: "always".to_string(),
+                route: None,
             }))
             .await
             .unwrap();
@@ -13953,6 +14310,7 @@ mod endpoint_tests {
                 from_node: a.clone(),
                 to_node: "not-a-real-node".to_string(),
                 condition: "always".to_string(),
+                route: None,
             }))
             .await
             .unwrap();
@@ -13965,6 +14323,7 @@ mod endpoint_tests {
                 from_node: a,
                 to_node: b,
                 condition: "sideways".to_string(),
+                route: None,
             }))
             .await
             .unwrap();
@@ -13978,6 +14337,7 @@ mod endpoint_tests {
             .loop_update_edge(Parameters(LoopUpdateEdgeParams {
                 edge_id: edge_id.clone(),
                 condition: "fail".to_string(),
+                route: None,
             }))
             .await
             .unwrap();
@@ -13987,6 +14347,7 @@ mod endpoint_tests {
             .loop_update_edge(Parameters(LoopUpdateEdgeParams {
                 edge_id: edge_id.clone(),
                 condition: "fail".to_string(),
+                route: None,
             }))
             .await
             .unwrap();
@@ -13997,10 +14358,266 @@ mod endpoint_tests {
             .loop_update_edge(Parameters(LoopUpdateEdgeParams {
                 edge_id: "ghost-edge".to_string(),
                 condition: "pass".to_string(),
+                route: None,
             }))
             .await
             .unwrap();
         assert!(is_err(&missing_edge));
+    }
+
+    // ── router nodes (routes + route edges) ──────────────────────────
+
+    fn router_node_config(
+        routes: &serde_json::Value,
+        fallback: &str,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::json!({ "routes": routes, "fallback": fallback })
+            .as_object()
+            .unwrap()
+            .clone()
+    }
+
+    fn two_routes() -> serde_json::Value {
+        serde_json::json!([
+            { "label": "retry", "description": "Retry the current step." },
+            { "label": "escalate", "description": "Hand off to a human." },
+        ])
+    }
+
+    #[tokio::test]
+    async fn loop_add_node_router_created_persisted_and_read_back_with_routes() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+
+        let router_result = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Router".to_string(),
+                kind: Some("router".to_string()),
+                config: Some(router_node_config(&two_routes(), "retry")),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&router_result), "{}", text(&router_result));
+        let router_id = extract_id(&router_result, "node_id");
+
+        let retry_target = add_agent_node(&handler, &spec.id, "Retry target").await;
+        let escalate_target = add_agent_node(&handler, &spec.id, "Escalate target").await;
+
+        for (route, target) in [("retry", &retry_target), ("escalate", &escalate_target)] {
+            let edge = handler
+                .loop_add_edge(Parameters(LoopAddEdgeParams {
+                    spec_id: Some(spec.id.clone()),
+                    loop_id: None,
+                    from_node: router_id.clone(),
+                    to_node: target.clone(),
+                    condition: "route".to_string(),
+                    route: Some(route.to_string()),
+                }))
+                .await
+                .unwrap();
+            assert!(!is_err(&edge), "{}", text(&edge));
+        }
+
+        let got = handler
+            .loop_get(Parameters(LoopGetParams {
+                loop_id: lp.id.clone(),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&got), "{}", text(&got));
+        let json: serde_json::Value = serde_json::from_str(&raw_text(&got)).unwrap();
+        let nodes = json["specs"][0]["nodes"].as_array().unwrap();
+        let router_json = nodes
+            .iter()
+            .find(|n| n["id"] == router_id)
+            .expect("router node present in loop_get");
+        assert_eq!(router_json["kind"], "router");
+        let routes = router_json["routes"].as_array().expect("routes array");
+        assert_eq!(routes.len(), 2);
+        let retry_route = routes
+            .iter()
+            .find(|r| r["label"] == "retry")
+            .expect("retry route present");
+        assert_eq!(retry_route["fallback"], true);
+        assert_eq!(retry_route["to_node"], retry_target);
+        let escalate_route = routes
+            .iter()
+            .find(|r| r["label"] == "escalate")
+            .expect("escalate route present");
+        assert_eq!(escalate_route["fallback"], false);
+        assert_eq!(escalate_route["to_node"], escalate_target);
+    }
+
+    #[tokio::test]
+    async fn loop_add_node_router_rejects_fewer_than_two_routes_and_missing_fallback() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+
+        let too_few = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Router".to_string(),
+                kind: Some("router".to_string()),
+                config: Some(router_node_config(
+                    &serde_json::json!([{ "label": "retry", "description": "Retry." }]),
+                    "retry",
+                )),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&too_few));
+        assert!(text(&too_few).contains("at least 2 routes"));
+
+        let mut no_fallback_config = router_node_config(&two_routes(), "retry");
+        no_fallback_config.remove("fallback");
+        let no_fallback = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: Some(spec.id),
+                loop_id: None,
+                name: "Router".to_string(),
+                kind: Some("router".to_string()),
+                config: Some(no_fallback_config),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&no_fallback));
+        assert!(text(&no_fallback).contains("fallback"));
+    }
+
+    #[tokio::test]
+    async fn loop_add_edge_route_condition_rejects_undeclared_route_and_non_router_source() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+
+        let router_result = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Router".to_string(),
+                kind: Some("router".to_string()),
+                config: Some(router_node_config(&two_routes(), "retry")),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        let router_id = extract_id(&router_result, "node_id");
+        let target = add_agent_node(&handler, &spec.id, "Target").await;
+
+        let undeclared = handler
+            .loop_add_edge(Parameters(LoopAddEdgeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                from_node: router_id.clone(),
+                to_node: target.clone(),
+                condition: "route".to_string(),
+                route: Some("nonexistent".to_string()),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&undeclared));
+        assert!(text(&undeclared).contains("undeclared route"));
+
+        let non_router = add_agent_node(&handler, &spec.id, "Non-router source").await;
+        let wrong_source = handler
+            .loop_add_edge(Parameters(LoopAddEdgeParams {
+                spec_id: Some(spec.id),
+                loop_id: None,
+                from_node: non_router,
+                to_node: target,
+                condition: "route".to_string(),
+                route: Some("retry".to_string()),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&wrong_source));
+        assert!(text(&wrong_source).contains("router node"));
+    }
+
+    #[tokio::test]
+    async fn loop_update_node_router_enforces_route_coverage_and_edge_consistency() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+
+        let router_result = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Router".to_string(),
+                kind: Some("router".to_string()),
+                config: Some(router_node_config(&two_routes(), "retry")),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        let router_id = extract_id(&router_result, "node_id");
+        let retry_target = add_agent_node(&handler, &spec.id, "Retry target").await;
+
+        // Wire only the "retry" route — "escalate" is declared but not yet
+        // served by any edge.
+        let edge = handler
+            .loop_add_edge(Parameters(LoopAddEdgeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                from_node: router_id.clone(),
+                to_node: retry_target,
+                condition: "route".to_string(),
+                route: Some("retry".to_string()),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&edge), "{}", text(&edge));
+
+        // Re-asserting the same routes now that wiring has started must
+        // fail: "escalate" has no outgoing edge.
+        let no_coverage = handler
+            .loop_update_node(Parameters(LoopUpdateNodeParams {
+                node_id: router_id.clone(),
+                name: None,
+                kind: None,
+                config: Some(router_node_config(&two_routes(), "retry")),
+                position: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&no_coverage));
+        assert!(text(&no_coverage).contains("'escalate' has no outgoing edge"));
+
+        // Changing the declared routes so they no longer include "retry"
+        // leaves the existing retry-labeled edge dangling on an undeclared
+        // route.
+        let stale_edge = handler
+            .loop_update_node(Parameters(LoopUpdateNodeParams {
+                node_id: router_id.clone(),
+                name: None,
+                kind: None,
+                config: Some(router_node_config(
+                    &serde_json::json!([
+                        { "label": "escalate", "description": "Hand off to a human." },
+                        { "label": "abort", "description": "Give up." },
+                    ]),
+                    "escalate",
+                )),
+                position: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&stale_edge));
+        assert!(text(&stale_edge).contains("undeclared route 'retry'"));
     }
 
     // ── loop_add_ensemble ──────────────────────────────────────────

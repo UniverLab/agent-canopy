@@ -846,8 +846,8 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         conn.execute(
-            "INSERT INTO loop_edges (id, spec_id, loop_id, from_node, to_node, condition)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO loop_edges (id, spec_id, loop_id, from_node, to_node, condition, route)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 &edge.id,
                 &edge.spec_id,
@@ -855,6 +855,7 @@ impl Database {
                 &edge.from_node,
                 &edge.to_node,
                 edge.condition.as_str(),
+                edge.condition.route_label(),
             ],
         )?;
         Ok(())
@@ -889,8 +890,8 @@ impl Database {
         )?;
         for edge in edges {
             tx.execute(
-                "INSERT INTO loop_edges (id, spec_id, loop_id, from_node, to_node, condition)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO loop_edges (id, spec_id, loop_id, from_node, to_node, condition, route)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     &edge.id,
                     &edge.spec_id,
@@ -898,6 +899,7 @@ impl Database {
                     &edge.from_node,
                     &edge.to_node,
                     edge.condition.as_str(),
+                    edge.condition.route_label(),
                 ],
             )?;
         }
@@ -911,7 +913,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, spec_id, loop_id, from_node, to_node, condition
+            "SELECT id, spec_id, loop_id, from_node, to_node, condition, route
              FROM loop_edges WHERE spec_id = ?1 ORDER BY rowid ASC",
         )?;
         let rows = stmt.query_map(params![spec_id], map_loop_edge_row)?;
@@ -928,7 +930,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, spec_id, loop_id, from_node, to_node, condition
+            "SELECT id, spec_id, loop_id, from_node, to_node, condition, route
              FROM loop_edges WHERE loop_id = ?1 ORDER BY rowid ASC",
         )?;
         let rows = stmt.query_map(params![loop_id], map_loop_edge_row)?;
@@ -943,7 +945,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, spec_id, loop_id, from_node, to_node, condition
+            "SELECT id, spec_id, loop_id, from_node, to_node, condition, route
              FROM loop_edges WHERE id = ?1",
         )?;
         stmt.query_row(params![edge_id], map_loop_edge_row)
@@ -954,7 +956,7 @@ impl Database {
     pub fn update_loop_edge_condition(
         &self,
         edge_id: &str,
-        condition: LoopEdgeCondition,
+        condition: &LoopEdgeCondition,
     ) -> Result<bool> {
         let conn = self
             .conn
@@ -962,9 +964,10 @@ impl Database {
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let rows = conn.execute(
             "UPDATE loop_edges
-             SET condition = ?1
-             WHERE id = ?2",
-            params![condition.as_str(), edge_id],
+             SET condition = ?1,
+                 route = ?2
+             WHERE id = ?3",
+            params![condition.as_str(), condition.route_label(), edge_id],
         )?;
         Ok(rows > 0)
     }
@@ -1786,16 +1789,19 @@ fn map_loop_node_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoopNode> {
 }
 
 fn map_loop_edge_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoopEdge> {
-    let condition = LoopEdgeCondition::from_str(&row.get::<_, String>(5)?).ok_or_else(|| {
-        rusqlite::Error::FromSqlConversionFailure(
-            5,
-            rusqlite::types::Type::Text,
-            Box::new(IoError::new(
-                ErrorKind::InvalidData,
-                "Invalid loop edge condition",
-            )),
-        )
-    })?;
+    let condition_tag: String = row.get(5)?;
+    let route_label: Option<String> = row.get(6)?;
+    let condition =
+        LoopEdgeCondition::from_parts(&condition_tag, route_label).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Text,
+                Box::new(IoError::new(
+                    ErrorKind::InvalidData,
+                    "Invalid loop edge condition",
+                )),
+            )
+        })?;
 
     Ok(LoopEdge {
         id: row.get(0)?,

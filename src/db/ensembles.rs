@@ -420,7 +420,7 @@ impl Database {
     pub fn delete_loop_edges_from_node_with_condition(
         &self,
         node_id: &str,
-        condition: LoopEdgeCondition,
+        condition: &LoopEdgeCondition,
     ) -> Result<()> {
         let conn = self
             .conn

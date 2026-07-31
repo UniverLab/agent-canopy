@@ -544,16 +544,24 @@ pub struct LoopAddEdgeParams {
     pub from_node: String,
     /// Destination node ID.
     pub to_node: String,
-    /// Routing condition: pass, fail, or always.
+    /// Routing condition: pass, fail, always, or route.
     pub condition: String,
+    /// Route label this edge serves — required when `condition` is
+    /// `"route"`, and must name one of `from_node`'s declared routes (see
+    /// `loop_add_node`'s router `config.routes`). Ignored otherwise.
+    pub route: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LoopUpdateEdgeParams {
     /// Existing edge ID.
     pub edge_id: String,
-    /// New routing condition: pass, fail, or always.
+    /// New routing condition: pass, fail, always, or route.
     pub condition: String,
+    /// Route label this edge serves — required when `condition` is
+    /// `"route"`, and must name one of the edge's `from_node`'s declared
+    /// routes. Ignored otherwise.
+    pub route: Option<String>,
 }
 
 /// One ensemble member: differs from its siblings only by

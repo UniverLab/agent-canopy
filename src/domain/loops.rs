@@ -212,6 +212,12 @@ pub enum LoopNodeKind {
     /// consolidates their outputs, and routes onward. See
     /// [`crate::loop_engine::LoopEngine`]'s ensemble fan-out handling.
     Join,
+    /// A branch point that declares 2-8 named routes (see [`RouterRoute`])
+    /// instead of the binary pass/fail an agent/check/gate node produces.
+    /// Model, persistence and validation only in this iteration — the engine
+    /// never executes a router (see
+    /// [`crate::loop_engine::LoopEngine::execute_node`]'s `Router` arm).
+    Router,
 }
 
 impl LoopNodeKind {
@@ -223,6 +229,7 @@ impl LoopNodeKind {
             Self::Check => "check",
             Self::Gate => "gate",
             Self::Join => "join",
+            Self::Router => "router",
         }
     }
 
@@ -242,28 +249,53 @@ impl LoopNodeKind {
             "check" => Some(Self::Check),
             "gate" => Some(Self::Gate),
             "join" => Some(Self::Join),
+            "router" => Some(Self::Router),
             _ => None,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoopEdgeCondition {
     Pass,
     Fail,
     Always,
+    /// Router-only: this edge is taken when the router selects the named
+    /// route. The label must match one of the router node's declared
+    /// [`RouterRoute`]s — validated at edge add/update time (see
+    /// `daemon::handler`'s `loop_add_edge`/`loop_update_edge`), never
+    /// accepted free-form.
+    Route(String),
 }
 
 impl LoopEdgeCondition {
-    pub fn as_str(self) -> &'static str {
+    /// The DB/JSON tag for this condition. For `Route`, this is the fixed
+    /// tag `"route"` — the label itself lives in [`Self::route_label`] (and,
+    /// in storage, a sibling `route` column — see
+    /// [`crate::db::Database::insert_loop_edge`]) so this stays a cheap
+    /// `&str` borrow rather than an allocation.
+    pub fn as_str(&self) -> &str {
         match self {
             Self::Pass => "pass",
             Self::Fail => "fail",
             Self::Always => "always",
+            Self::Route(_) => "route",
         }
     }
 
+    /// The route label this edge names, if this is a `Route` condition.
+    pub fn route_label(&self) -> Option<&str> {
+        match self {
+            Self::Route(label) => Some(label),
+            _ => None,
+        }
+    }
+
+    /// Parses only the three condition kinds that round-trip through a
+    /// single string — unchanged from before `Route` existed. A `Route`
+    /// condition instead round-trips through [`Self::from_parts`], since it
+    /// needs the sibling `route` column's label.
     pub fn from_str(value: &str) -> Option<Self> {
         match value {
             "pass" => Some(Self::Pass),
@@ -272,6 +304,137 @@ impl LoopEdgeCondition {
             _ => None,
         }
     }
+
+    /// Reconstruct a condition from its DB-persisted `(tag, route_label)`
+    /// pair — the inverse of [`Self::as_str`]/[`Self::route_label`]. `tag`
+    /// `"route"` requires a non-empty `route_label`; every other tag falls
+    /// back to [`Self::from_str`] and ignores `route_label`.
+    pub fn from_parts(tag: &str, route_label: Option<String>) -> Option<Self> {
+        match tag {
+            "route" => route_label
+                .filter(|label| !label.trim().is_empty())
+                .map(Self::Route),
+            other => Self::from_str(other),
+        }
+    }
+}
+
+/// Minimum/maximum number of routes a [`LoopNodeKind::Router`] node may
+/// declare.
+pub const ROUTER_MIN_ROUTES: usize = 2;
+pub const ROUTER_MAX_ROUTES: usize = 8;
+
+/// One route a router node can select: a short label plus a one-line
+/// description of when to take it. Declared in the node's `config` (the
+/// `routes` array) and referenced by an edge's [`LoopEdgeCondition::Route`]
+/// label — never persisted separately.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouterRoute {
+    pub label: String,
+    pub description: String,
+}
+
+/// Validate a router node's declared routes + fallback shape: `2`-`8`
+/// routes, unique non-empty labels each with a non-empty description, and a
+/// `fallback` that names one of them. Pure config-shape check — it doesn't
+/// need the graph's edges, so it applies equally at node add and update
+/// time (see `daemon::handler::validate_node_config`'s `Router` arm).
+pub fn validate_router_routes(routes: &[RouterRoute], fallback: &str) -> Result<(), String> {
+    if routes.len() < ROUTER_MIN_ROUTES {
+        return Err(format!(
+            "A router must declare at least {ROUTER_MIN_ROUTES} routes, got {}.",
+            routes.len()
+        ));
+    }
+    if routes.len() > ROUTER_MAX_ROUTES {
+        return Err(format!(
+            "A router must declare at most {ROUTER_MAX_ROUTES} routes, got {}.",
+            routes.len()
+        ));
+    }
+
+    let mut seen_labels = std::collections::HashSet::new();
+    for route in routes {
+        if route.label.trim().is_empty() {
+            return Err("Every router route must have a non-empty label.".to_string());
+        }
+        if route.description.trim().is_empty() {
+            return Err(format!(
+                "Router route '{}' must have a non-empty description.",
+                route.label
+            ));
+        }
+        if !seen_labels.insert(route.label.as_str()) {
+            return Err(format!(
+                "Router route label '{}' is declared more than once.",
+                route.label
+            ));
+        }
+    }
+
+    if fallback.trim().is_empty() {
+        return Err("A router must declare one route as fallback.".to_string());
+    }
+    if !routes.iter().any(|route| route.label == fallback) {
+        return Err(format!(
+            "Router fallback '{fallback}' does not name a declared route."
+        ));
+    }
+
+    Ok(())
+}
+
+/// Validate that every `route`-conditioned edge out of `node_id` names a
+/// route actually declared by `routes` — called whenever a router's routes
+/// list or its edges change, so an edge can never be left pointing at a
+/// route that no longer exists.
+pub fn validate_router_edges_declared(
+    routes: &[RouterRoute],
+    node_id: &str,
+    edges: &[LoopEdge],
+) -> Result<(), String> {
+    for edge in edges.iter().filter(|edge| edge.from_node == node_id) {
+        if let Some(label) = edge.condition.route_label() {
+            if !routes.iter().any(|route| route.label == label) {
+                return Err(format!(
+                    "Edge '{}' names undeclared route '{label}'.",
+                    edge.id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate that every declared route already has at least one outgoing
+/// `route` edge from `node_id` — but only once the router has begun being
+/// wired (at least one `route` edge already exists from it). A brand new
+/// router with no edges at all is a valid, not-yet-wired state; once wiring
+/// starts, every declared route must be covered.
+pub fn validate_router_route_coverage(
+    routes: &[RouterRoute],
+    node_id: &str,
+    edges: &[LoopEdge],
+) -> Result<(), String> {
+    let route_edges: Vec<&LoopEdge> = edges
+        .iter()
+        .filter(|edge| edge.from_node == node_id && edge.condition.route_label().is_some())
+        .collect();
+    if route_edges.is_empty() {
+        return Ok(());
+    }
+    for route in routes {
+        let served = route_edges
+            .iter()
+            .any(|edge| edge.condition.route_label() == Some(route.label.as_str()));
+        if !served {
+            return Err(format!(
+                "Router route '{}' has no outgoing edge.",
+                route.label
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -691,8 +854,10 @@ pub struct EnsembleDetails {
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_spec_description_template, LoopEdgeCondition, LoopNodeKind, LoopResetOutcome,
-        LoopRunStatus, LoopSpecStatus, LoopStatus, SpecAdminStatusOutcome,
+        validate_router_edges_declared, validate_router_route_coverage, validate_router_routes,
+        validate_spec_description_template, LoopEdge, LoopEdgeCondition, LoopNodeKind,
+        LoopResetOutcome, LoopRunStatus, LoopSpecStatus, LoopStatus, RouterRoute,
+        SpecAdminStatusOutcome,
     };
 
     #[test]
@@ -1696,10 +1861,10 @@ In Scope:
             LoopEdgeCondition::Always,
         ];
         for c in conds {
-            let c_str = c.as_str();
+            let c_str = c.as_str().to_string();
             assert_eq!(
-                LoopEdgeCondition::from_str(c_str),
-                Some(c),
+                LoopEdgeCondition::from_str(&c_str),
+                Some(c.clone()),
                 "roundtrip failed for {c_str}"
             );
         }
@@ -1942,8 +2107,8 @@ In Scope:
         ];
         for i in 0..all.len() {
             for j in (i + 1)..all.len() {
-                let a = all[i];
-                let b = all[j];
+                let a = &all[i];
+                let b = &all[j];
                 assert_ne!(a, b, "{a:?} should differ from {b:?}");
             }
         }
@@ -1993,7 +2158,7 @@ In Scope:
     #[test]
     fn loop_edge_condition_is_clone() {
         let c = LoopEdgeCondition::Always;
-        let cloned = c;
+        let cloned = c.clone();
         assert_eq!(c, cloned);
     }
 
@@ -2641,5 +2806,269 @@ UI
                 "alias {alias:?} should match"
             );
         }
+    }
+
+    // ── LoopNodeKind::Router: as_str / from_str / display_str ───────────
+
+    #[test]
+    fn loop_node_kind_router_as_str() {
+        assert_eq!(LoopNodeKind::Router.as_str(), "router");
+    }
+
+    #[test]
+    fn loop_node_kind_router_from_str_roundtrip() {
+        assert_eq!(LoopNodeKind::from_str("router"), Some(LoopNodeKind::Router));
+        assert_eq!(
+            LoopNodeKind::from_str(LoopNodeKind::Router.as_str()),
+            Some(LoopNodeKind::Router)
+        );
+    }
+
+    #[test]
+    fn loop_node_kind_router_display_str_matches_as_str() {
+        assert_eq!(LoopNodeKind::Router.display_str(), "router");
+    }
+
+    #[test]
+    fn loop_node_kind_router_serde_roundtrip() {
+        let json = serde_json::to_string(&LoopNodeKind::Router).unwrap();
+        assert_eq!(json, "\"router\"");
+        let deserialized: LoopNodeKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, LoopNodeKind::Router);
+    }
+
+    // ── LoopEdgeCondition::Route: as_str / route_label / from_parts ─────
+
+    #[test]
+    fn loop_edge_condition_route_as_str_is_fixed_tag() {
+        let c = LoopEdgeCondition::Route("escalate".to_string());
+        assert_eq!(c.as_str(), "route");
+    }
+
+    #[test]
+    fn loop_edge_condition_route_label_returns_the_label() {
+        let c = LoopEdgeCondition::Route("escalate".to_string());
+        assert_eq!(c.route_label(), Some("escalate"));
+    }
+
+    #[test]
+    fn loop_edge_condition_non_route_has_no_route_label() {
+        assert_eq!(LoopEdgeCondition::Pass.route_label(), None);
+        assert_eq!(LoopEdgeCondition::Fail.route_label(), None);
+        assert_eq!(LoopEdgeCondition::Always.route_label(), None);
+    }
+
+    #[test]
+    fn loop_edge_condition_from_str_does_not_parse_route() {
+        // `Route` needs the sibling label, which a bare string can't carry —
+        // only `from_parts` (DB round trip) or the `route:` MCP param path
+        // can construct it.
+        assert_eq!(LoopEdgeCondition::from_str("route"), None);
+    }
+
+    #[test]
+    fn loop_edge_condition_from_parts_reconstructs_route() {
+        let c = LoopEdgeCondition::from_parts("route", Some("escalate".to_string()));
+        assert_eq!(c, Some(LoopEdgeCondition::Route("escalate".to_string())));
+    }
+
+    #[test]
+    fn loop_edge_condition_from_parts_route_without_label_is_none() {
+        assert_eq!(LoopEdgeCondition::from_parts("route", None), None);
+        assert_eq!(
+            LoopEdgeCondition::from_parts("route", Some("".to_string())),
+            None
+        );
+    }
+
+    #[test]
+    fn loop_edge_condition_from_parts_falls_back_to_from_str() {
+        assert_eq!(
+            LoopEdgeCondition::from_parts("pass", None),
+            Some(LoopEdgeCondition::Pass)
+        );
+        assert_eq!(LoopEdgeCondition::from_parts("bogus", None), None);
+    }
+
+    // ── validate_router_routes ───────────────────────────────────────────
+
+    fn two_routes() -> Vec<RouterRoute> {
+        vec![
+            RouterRoute {
+                label: "retry".to_string(),
+                description: "Retry the current step.".to_string(),
+            },
+            RouterRoute {
+                label: "escalate".to_string(),
+                description: "Hand off to a human.".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn validate_router_routes_accepts_valid_shape() {
+        assert!(validate_router_routes(&two_routes(), "retry").is_ok());
+    }
+
+    #[test]
+    fn validate_router_routes_rejects_fewer_than_two() {
+        let routes = vec![RouterRoute {
+            label: "retry".to_string(),
+            description: "Retry the current step.".to_string(),
+        }];
+        let err = validate_router_routes(&routes, "retry").unwrap_err();
+        assert!(err.contains("at least 2 routes"));
+    }
+
+    #[test]
+    fn validate_router_routes_rejects_more_than_eight() {
+        let routes = (0..9)
+            .map(|i| RouterRoute {
+                label: format!("route{i}"),
+                description: "A route.".to_string(),
+            })
+            .collect::<Vec<_>>();
+        let err = validate_router_routes(&routes, "route0").unwrap_err();
+        assert!(err.contains("at most 8 routes"));
+    }
+
+    #[test]
+    fn validate_router_routes_rejects_empty_label() {
+        let routes = vec![
+            RouterRoute {
+                label: "  ".to_string(),
+                description: "desc".to_string(),
+            },
+            RouterRoute {
+                label: "escalate".to_string(),
+                description: "desc".to_string(),
+            },
+        ];
+        let err = validate_router_routes(&routes, "escalate").unwrap_err();
+        assert!(err.contains("non-empty label"));
+    }
+
+    #[test]
+    fn validate_router_routes_rejects_empty_description() {
+        let routes = vec![
+            RouterRoute {
+                label: "retry".to_string(),
+                description: "".to_string(),
+            },
+            RouterRoute {
+                label: "escalate".to_string(),
+                description: "desc".to_string(),
+            },
+        ];
+        let err = validate_router_routes(&routes, "retry").unwrap_err();
+        assert!(err.contains("non-empty description"));
+    }
+
+    #[test]
+    fn validate_router_routes_rejects_duplicate_labels() {
+        let routes = vec![
+            RouterRoute {
+                label: "retry".to_string(),
+                description: "desc one".to_string(),
+            },
+            RouterRoute {
+                label: "retry".to_string(),
+                description: "desc two".to_string(),
+            },
+        ];
+        let err = validate_router_routes(&routes, "retry").unwrap_err();
+        assert!(err.contains("declared more than once"));
+    }
+
+    #[test]
+    fn validate_router_routes_rejects_no_fallback() {
+        let err = validate_router_routes(&two_routes(), "").unwrap_err();
+        assert!(err.contains("must declare one route as fallback"));
+    }
+
+    #[test]
+    fn validate_router_routes_rejects_fallback_naming_undeclared_route() {
+        let err = validate_router_routes(&two_routes(), "nonexistent").unwrap_err();
+        assert!(err.contains("does not name a declared route"));
+    }
+
+    // ── validate_router_edges_declared ───────────────────────────────────
+
+    fn route_edge(id: &str, from_node: &str, label: &str) -> LoopEdge {
+        LoopEdge {
+            id: id.to_string(),
+            spec_id: Some("spec-1".to_string()),
+            loop_id: None,
+            from_node: from_node.to_string(),
+            to_node: "target".to_string(),
+            condition: LoopEdgeCondition::Route(label.to_string()),
+        }
+    }
+
+    #[test]
+    fn validate_router_edges_declared_accepts_declared_labels() {
+        let edges = vec![route_edge("e1", "router-1", "retry")];
+        assert!(validate_router_edges_declared(&two_routes(), "router-1", &edges).is_ok());
+    }
+
+    #[test]
+    fn validate_router_edges_declared_rejects_undeclared_label() {
+        let edges = vec![route_edge("e1", "router-1", "nonexistent")];
+        let err = validate_router_edges_declared(&two_routes(), "router-1", &edges).unwrap_err();
+        assert!(err.contains("undeclared route 'nonexistent'"));
+    }
+
+    #[test]
+    fn validate_router_edges_declared_ignores_edges_from_other_nodes() {
+        let edges = vec![route_edge("e1", "other-node", "nonexistent")];
+        assert!(validate_router_edges_declared(&two_routes(), "router-1", &edges).is_ok());
+    }
+
+    #[test]
+    fn validate_router_edges_declared_ignores_non_route_edges() {
+        let edges = vec![LoopEdge {
+            id: "e1".to_string(),
+            spec_id: Some("spec-1".to_string()),
+            loop_id: None,
+            from_node: "router-1".to_string(),
+            to_node: "target".to_string(),
+            condition: LoopEdgeCondition::Always,
+        }];
+        assert!(validate_router_edges_declared(&two_routes(), "router-1", &edges).is_ok());
+    }
+
+    // ── validate_router_route_coverage ───────────────────────────────────
+
+    #[test]
+    fn validate_router_route_coverage_unwired_router_is_valid() {
+        // A freshly created router with no edges at all yet is a valid,
+        // in-progress state — not every declared route needs an edge until
+        // wiring has started.
+        assert!(validate_router_route_coverage(&two_routes(), "router-1", &[]).is_ok());
+    }
+
+    #[test]
+    fn validate_router_route_coverage_rejects_partial_coverage() {
+        let edges = vec![route_edge("e1", "router-1", "retry")];
+        let err = validate_router_route_coverage(&two_routes(), "router-1", &edges).unwrap_err();
+        assert!(err.contains("Router route 'escalate' has no outgoing edge."));
+    }
+
+    #[test]
+    fn validate_router_route_coverage_accepts_full_coverage() {
+        let edges = vec![
+            route_edge("e1", "router-1", "retry"),
+            route_edge("e2", "router-1", "escalate"),
+        ];
+        assert!(validate_router_route_coverage(&two_routes(), "router-1", &edges).is_ok());
+    }
+
+    #[test]
+    fn validate_router_route_coverage_ignores_edges_from_other_nodes() {
+        // A route edge that exists but belongs to a different node must not
+        // count as this router having started wiring — with zero edges of
+        // its own, `router-1` is still in the valid "not yet wired" state.
+        let edges = vec![route_edge("e1", "other-node", "retry")];
+        assert!(validate_router_route_coverage(&two_routes(), "router-1", &edges).is_ok());
     }
 }

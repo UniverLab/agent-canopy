@@ -1128,7 +1128,7 @@ fn loop_updates_persist_metadata_and_positions() {
         Some(4),
     )
     .unwrap();
-    db.update_loop_edge_condition(&edge.id, LoopEdgeCondition::Fail)
+    db.update_loop_edge_condition(&edge.id, &LoopEdgeCondition::Fail)
         .unwrap();
 
     let lp = db.get_loop(&lp.id).unwrap().unwrap();

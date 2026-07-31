@@ -538,11 +538,11 @@ fn collapse_ensemble_targets(
                 if seen_ensembles.insert(ensemble.ensemble_id.as_str()) {
                     out.push((
                         format!("{} [{} models]", ensemble.name, ensemble.members.len()),
-                        *condition,
+                        condition.clone(),
                     ));
                 }
             }
-            None => out.push((target.name.clone(), *condition)),
+            None => out.push((target.name.clone(), condition.clone())),
         }
     }
     out
@@ -576,7 +576,7 @@ fn graph_lines(
             outgoing
                 .entry(edge.from_node.as_str())
                 .or_default()
-                .push((target, edge.condition));
+                .push((target, edge.condition.clone()));
         }
     }
 
