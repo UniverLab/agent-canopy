@@ -177,17 +177,38 @@ one narrow job:
 The previous node's CLI died. Decide whether it can be retried.
 
 # [HOW]
-1. Run `date -Iseconds` first. You do not know what time it is.
-2. Read the failure output below.
-3. If the CLI ran out of quota and names a reset time: compute the next
-   instant strictly after now (and less than 24h away), call
-   graph_schedule_autorun with it, then report FAIL.
+1. Read the failure output below. Do not open files, do not run git.
+2. If it names a usage, session or quota limit: call
+   graph_schedule_autorun with the failure text copied verbatim as
+   quota_reset_message. Do NOT compute a time yourself — the engine
+   derives it from the message. Then report FAIL.
+3. If the engine answers that it could not derive a reset instant:
+   call graph_report_blocker describing which limit was hit and what a
+   human must do. That call finalizes the run; do not also report.
 4. If it is a transient failure you can repair: repair it, report PASS.
-5. If the working tree is dirty from the death, clean it before reporting.
+5. Anything else, or any doubt: report FAIL, summary "UNDIAGNOSED".
 
 # [OUTPUT]
 {{previous_feedback}}
 ```
+
+Step 3 exists because of a real run. The implementer died on
+`You've hit your monthly spend limit · raise it at claude.ai/settings/usage`
+— a limit with no reset time in it, because a spend ceiling is not a rolling
+window. The classifier did the right thing: it passed the message to the
+engine, the engine could not derive an instant, and it refused to invent one.
+But with no third branch it fell through to a plain fail, and the graph
+stopped with its reason readable only in the database.
+
+`graph_report_blocker` is the difference between a graph that is `failed` and
+one that is `blocked` with a sentence explaining what you have to do. Prefer
+it for every failure that will not lift on its own.
+
+Note what the prompt does **not** do: it never computes a reset time. Models
+do not know what time it is, and a real run that was allowed to do the
+arithmetic scheduled its wake-up for 6am *the next day* — a 23-hour stall.
+Let the engine parse the message; let the model only decide which message it
+is looking at.
 
 ### Running it
 
