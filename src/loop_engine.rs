@@ -11,7 +11,7 @@ use crate::daemon::process::KILL_GRACE;
 use crate::db::Database;
 use crate::domain::loops::{
     EnsembleDetails, EnsembleMember, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind,
-    LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus,
+    LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus, RouterRoute,
 };
 use crate::domain::models::Cli;
 
@@ -1199,8 +1199,26 @@ impl LoopEngine {
                 }
             };
 
-            let step_selection =
-                select_next_step(edges, &ensembles, &from_node_id, final_execution.status)?;
+            // A router that finished `Pass` routes by its chosen label
+            // (`select_router_step`), never by Pass/Fail/Always
+            // (`select_next_step`) — a router's verdict has no notion of
+            // success/failure. A failed router (spawn failure/timeout, per
+            // `execute_router_node`) falls through to `select_next_step`
+            // exactly like any other node's fail edge.
+            let is_routed_router = nodes_by_id
+                .get(from_node_id.as_str())
+                .is_some_and(|node| node.kind == LoopNodeKind::Router)
+                && final_execution.status == LoopRunStatus::Pass;
+            let step_selection = if is_routed_router {
+                let route_label = final_execution
+                    .output
+                    .get("route")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                select_router_step(edges, &from_node_id, route_label)?
+            } else {
+                select_next_step(edges, &ensembles, &from_node_id, final_execution.status)?
+            };
 
             let run_id_field = run_id.as_deref().unwrap_or("");
             match &step_selection {
@@ -1212,6 +1230,7 @@ impl LoopEngine {
                             to_node = %target,
                             status = ?final_execution.status,
                             edge_condition = sel.edge_condition.as_str(),
+                            route = sel.edge_condition.route_label().unwrap_or(""),
                             "edge traversed"
                         );
                     }
@@ -1646,14 +1665,9 @@ impl LoopEngine {
                 "Quorum node '{}' cannot execute directly; it only runs as part of ensemble fan-out.",
                 node.name
             ),
-            // Model/persistence/validation only in this iteration — a router
-            // is never executed. This arm exists only so the match stays
-            // exhaustive; reaching it is always a bug upstream (`run_spec`
-            // should never dispatch a router node to `execute_node`).
-            LoopNodeKind::Router => bail!(
-                "Router node '{}' cannot execute; routers are not yet engine-executed.",
-                node.name
-            ),
+            LoopNodeKind::Router => {
+                execute_router_node(&self.db, node, previous_output, run_id, workdir).await
+            }
         }
     }
 
@@ -2617,6 +2631,193 @@ fn agent_spawn_failure(
     }
 }
 
+/// Read a router node's `routes` + `fallback` straight from its `config`.
+/// The shape (`2`-`8` unique-labeled routes, a fallback naming one of them)
+/// is already enforced at `loop_add_node`/`loop_update_node` time (see
+/// `daemon::handler::validate_node_config`'s `Router` arm) — this only
+/// defends against that guard somehow having been bypassed, so it bails with
+/// a generic engine error rather than re-deriving the MCP layer's messages.
+fn parse_router_config(node: &LoopNode) -> Result<(Vec<RouterRoute>, String)> {
+    let map = node
+        .config
+        .as_object()
+        .ok_or_else(|| anyhow!("Router node '{}' has a non-object config.", node.name))?;
+    let routes = map
+        .get("routes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            anyhow!(
+                "Router node '{}' config is missing a 'routes' array.",
+                node.name
+            )
+        })?
+        .iter()
+        .map(|entry| RouterRoute {
+            label: entry
+                .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            description: entry
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        })
+        .collect::<Vec<_>>();
+    let fallback = map
+        .get("fallback")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            anyhow!(
+                "Router node '{}' config is missing a 'fallback' label.",
+                node.name
+            )
+        })?
+        .to_string();
+    Ok((routes, fallback))
+}
+
+/// Compose a router node's one-shot prompt: its input (the previous node's
+/// output, bounded the same way [`render_agent_prompt`] bounds
+/// `{{previous_feedback}}`) plus its declared routes with descriptions and a
+/// hard instruction to answer with exactly one route label and nothing else.
+/// Deliberately carries none of `render_agent_prompt`'s
+/// `loop_complete_node`/`loop_report_blocker` reporting contract — a router
+/// never self-reports; its whole answer is read straight from process
+/// stdout by [`match_router_token`].
+fn render_router_prompt(previous_output: Option<&Value>, routes: &[RouterRoute]) -> String {
+    let input = previous_output
+        .map(|value| serde_json::to_string_pretty(value).unwrap_or_default())
+        .unwrap_or_else(|| "(none)".to_string());
+    let input = bound_previous_feedback(input);
+    let route_list = routes
+        .iter()
+        .map(|route| format!("- {}: {}", route.label, route.description))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "# [INPUT]\n{input}\n\n# [ROUTES]\nPick exactly one route below and answer with ONLY its label — no punctuation, no explanation, nothing before or after it.\n\n{route_list}\n"
+    )
+}
+
+/// Strict single-token match of a router's raw answer against its declared
+/// routes: trim the whole answer and compare it for exact equality against
+/// each label — never a substring/`contains` check (that's exactly what
+/// would let a bare route word inside narration silently trigger a route).
+/// `None` means the raw answer didn't cleanly name a declared route, so the
+/// caller falls back to the node's declared fallback route.
+fn match_router_token<'a>(raw_answer: &str, routes: &'a [RouterRoute]) -> Option<&'a str> {
+    let token = raw_answer.trim();
+    routes
+        .iter()
+        .find(|route| route.label == token)
+        .map(|route| route.label.as_str())
+}
+
+/// Execute a router node (M2): spawn the configured platform/model exactly
+/// like an agent node's cold start ([`execute_agent_node`]), then read its
+/// one-shot answer straight from stdout — a router never self-reports via
+/// `loop_complete_node`, so [`self_reported_execution`] never applies here,
+/// and it never resumes a prior session (there is nothing to continue: each
+/// visit is an independent classification).
+///
+/// A spawn failure or timeout is a node failure like any other node's —
+/// `run_agent_process`'s own `Fail` verdict is returned unchanged, and the
+/// caller in `run_spec` routes it through the graph's ordinary fail edge
+/// (see the `select_router_step` vs. `select_next_step` branch there). Any
+/// run that actually finished instead always resolves `Pass` with a chosen
+/// route: the raw answer matched against a declared label if it is exactly
+/// one, or the node's declared fallback — logged either way (chosen route +
+/// raw answer) so an operator can see what the model actually said, per
+/// B43's node-run lifecycle logging.
+async fn execute_router_node(
+    db: &Database,
+    node: &LoopNode,
+    previous_output: Option<&Value>,
+    run_id: &str,
+    workdir: &str,
+) -> Result<NodeExecution> {
+    let (routes, fallback) = parse_router_config(node)?;
+
+    let cli_name = node
+        .config
+        .get("platform")
+        .or_else(|| node.config.get("cli"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("Router node '{}' is missing a platform/cli.", node.name))?;
+    let cli = Cli::resolve(Some(cli_name)).map_err(anyhow::Error::msg)?;
+    let model = node.config.get("model").and_then(Value::as_str);
+    let timeout_minutes = node
+        .config
+        .get("timeout_minutes")
+        .and_then(Value::as_u64)
+        .unwrap_or(30);
+    let base_strategy = cli.strategy();
+
+    let prompt = render_router_prompt(previous_output, &routes);
+    let strategy = sized_strategy(&base_strategy, &prompt);
+
+    let execution = run_agent_process(
+        db,
+        run_id,
+        &cli,
+        &strategy,
+        node,
+        &prompt,
+        model,
+        workdir,
+        timeout_minutes,
+        None,
+    )
+    .await?;
+
+    if execution.status != LoopRunStatus::Pass {
+        return Ok(execution);
+    }
+
+    let raw_answer = execution
+        .output
+        .get("stdout")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let (chosen_route, used_fallback) = match match_router_token(&raw_answer, &routes) {
+        Some(label) => (label.to_string(), false),
+        None => (fallback.clone(), true),
+    };
+
+    tracing::info!(
+        run_id,
+        node = %node.name,
+        route = %chosen_route,
+        raw_answer = %raw_answer,
+        used_fallback,
+        "router node decided route"
+    );
+
+    Ok(NodeExecution {
+        status: LoopRunStatus::Pass,
+        output: serde_json::json!({
+            "kind": "router",
+            "node_id": node.id,
+            "cli": cli.as_str(),
+            "model": model,
+            "raw_answer": raw_answer,
+            "route": chosen_route,
+            "used_fallback": used_fallback,
+        }),
+        summary: format!(
+            "Router node '{}' selected route '{}'{}.",
+            node.name,
+            chosen_route,
+            if used_fallback { " (fallback)" } else { "" }
+        ),
+    })
+}
+
 /// Hard cap on how long a session-list invocation may run during
 /// list-after-run capture (RS1 phase 2). Capture is best-effort and must
 /// never stall a run's bookkeeping, so a slow/hung list command is abandoned
@@ -2953,6 +3154,53 @@ fn select_next_step(
                 }
             }
             bail!("Node '{}' has ambiguous outgoing edges.", from_node)
+        }
+    }
+}
+
+/// Resolve a router node's next graph step: the edge out of `from_node`
+/// whose declared route matches `route_label` exactly (see
+/// [`LoopEdgeCondition::Route`]). Used instead of [`select_next_step`] only
+/// when the node just executed is a [`LoopNodeKind::Router`] that finished
+/// `Pass` — a router's own verdict carries no notion of success/failure, only
+/// a choice among its declared routes, so Pass/Fail/Always-conditioned edges
+/// never apply here. A failed router (spawn failure/timeout) instead falls
+/// through to `select_next_step` like any other node, per its fail-edge
+/// contract.
+fn select_router_step(
+    edges: &[LoopEdge],
+    from_node: &str,
+    route_label: &str,
+) -> Result<Option<StepSelection>> {
+    let matching = edges
+        .iter()
+        .filter(|edge| edge.from_node == from_node)
+        .filter(|edge| edge.condition.route_label() == Some(route_label))
+        .collect::<Vec<_>>();
+
+    match matching.as_slice() {
+        [] => Ok(None),
+        [edge] => Ok(Some(StepSelection {
+            cursor: SpecCursor::Node(edge.to_node.clone()),
+            edge_condition: edge.condition.clone(),
+        })),
+        _ => {
+            let distinct_targets = matching
+                .iter()
+                .map(|edge| edge.to_node.as_str())
+                .collect::<HashSet<_>>();
+            if distinct_targets.len() == 1 {
+                let to_node = *distinct_targets.iter().next().expect("len == 1");
+                return Ok(Some(StepSelection {
+                    cursor: SpecCursor::Node(to_node.to_string()),
+                    edge_condition: matching[0].condition.clone(),
+                }));
+            }
+            bail!(
+                "Router node '{}' has ambiguous outgoing edges for route '{}'.",
+                from_node,
+                route_label
+            )
         }
     }
 }
@@ -10456,5 +10704,386 @@ echo done
             flaky_runs.iter().any(|r| r.status == LoopRunStatus::Pass),
             "the retry should pass"
         );
+    }
+
+    // ── M2: router node execution ────────────────────────────────────────
+
+    fn router_node(
+        id: &str,
+        spec_id: &str,
+        platform: &str,
+        routes: &[(&str, &str)],
+        fallback: &str,
+        position: i64,
+    ) -> LoopNode {
+        let routes_json: Vec<Value> = routes
+            .iter()
+            .map(|(label, description)| {
+                serde_json::json!({ "label": label, "description": description })
+            })
+            .collect();
+        LoopNode {
+            id: id.to_string(),
+            spec_id: Some(spec_id.to_string()),
+            loop_id: None,
+            name: id.to_string(),
+            kind: LoopNodeKind::Router,
+            config: serde_json::json!({
+                "platform": platform,
+                "routes": routes_json,
+                "fallback": fallback,
+                "timeout_minutes": 1,
+            }),
+            position,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn route_edge(
+        id: &str,
+        spec_id: &str,
+        from_node: &str,
+        to_node: &str,
+        label: &str,
+    ) -> LoopEdge {
+        LoopEdge {
+            id: id.to_string(),
+            spec_id: Some(spec_id.to_string()),
+            loop_id: None,
+            from_node: from_node.to_string(),
+            to_node: to_node.to_string(),
+            condition: LoopEdgeCondition::Route(label.to_string()),
+        }
+    }
+
+    fn sample_routes() -> Vec<RouterRoute> {
+        vec![
+            RouterRoute {
+                label: "billing".to_string(),
+                description: "Billing questions".to_string(),
+            },
+            RouterRoute {
+                label: "technical".to_string(),
+                description: "Technical issues".to_string(),
+            },
+            RouterRoute {
+                label: "other".to_string(),
+                description: "Everything else".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn parse_router_config_reads_routes_and_fallback() {
+        let node = router_node(
+            "r1",
+            "spec-1",
+            "test-cli",
+            &[("billing", "b"), ("technical", "t")],
+            "technical",
+            1,
+        );
+        let (routes, fallback) = parse_router_config(&node).unwrap();
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].label, "billing");
+        assert_eq!(routes[0].description, "b");
+        assert_eq!(fallback, "technical");
+    }
+
+    #[test]
+    fn parse_router_config_rejects_missing_routes_array() {
+        let mut node = router_node(
+            "r1",
+            "spec-1",
+            "test-cli",
+            &[("billing", "b")],
+            "billing",
+            1,
+        );
+        node.config.as_object_mut().unwrap().remove("routes");
+        let err = parse_router_config(&node).unwrap_err();
+        assert!(err.to_string().contains("routes"));
+    }
+
+    #[test]
+    fn parse_router_config_rejects_missing_fallback() {
+        let mut node = router_node(
+            "r1",
+            "spec-1",
+            "test-cli",
+            &[("billing", "b")],
+            "billing",
+            1,
+        );
+        node.config.as_object_mut().unwrap().remove("fallback");
+        let err = parse_router_config(&node).unwrap_err();
+        assert!(err.to_string().contains("fallback"));
+    }
+
+    #[test]
+    fn match_router_token_matches_exact_trimmed_label() {
+        let routes = sample_routes();
+        assert_eq!(match_router_token("billing\n", &routes), Some("billing"));
+        assert_eq!(
+            match_router_token("  technical  ", &routes),
+            Some("technical")
+        );
+    }
+
+    #[test]
+    fn match_router_token_rejects_bare_word_inside_narration() {
+        let routes = sample_routes();
+        assert_eq!(
+            match_router_token("I think billing is the right route here.", &routes),
+            None,
+            "a route label appearing inside narration must never match"
+        );
+    }
+
+    #[test]
+    fn match_router_token_returns_none_for_unknown_answer() {
+        let routes = sample_routes();
+        assert_eq!(match_router_token("nonsense", &routes), None);
+    }
+
+    #[test]
+    fn select_router_step_resolves_matching_route_edge() {
+        let edges = vec![
+            route_edge("e1", "s", "r", "n-billing", "billing"),
+            route_edge("e2", "s", "r", "n-technical", "technical"),
+        ];
+        let sel = select_router_step(&edges, "r", "technical")
+            .unwrap()
+            .unwrap();
+        assert_eq!(sel.cursor, SpecCursor::Node("n-technical".to_string()));
+    }
+
+    #[test]
+    fn select_router_step_returns_none_when_route_unwired() {
+        let edges = vec![route_edge("e1", "s", "r", "n-billing", "billing")];
+        assert!(select_router_step(&edges, "r", "technical")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn select_router_step_ambiguous_distinct_targets_errors() {
+        let edges = vec![
+            route_edge("e1", "s", "r", "n-a", "billing"),
+            route_edge("e2", "s", "r", "n-b", "billing"),
+        ];
+        let err = select_router_step(&edges, "r", "billing").unwrap_err();
+        assert!(err.to_string().contains("ambiguous"));
+    }
+
+    #[tokio::test]
+    async fn execute_router_node_spawn_failure_is_a_node_failure() {
+        let (_dir, db) = test_db();
+        let fake_home = setup_multi_cli_home(&[("broken-cli", "/nonexistent/nowhere/binary-xyz")]);
+        let node = router_node(
+            "r1",
+            "spec-1",
+            "broken-cli",
+            &[("billing", "Billing"), ("technical", "Technical")],
+            "technical",
+            1,
+        );
+
+        let _home = HomeGuard::set(fake_home.path());
+        let execution = execute_router_node(&db, &node, None, "run-router-spawn-fail", "/tmp")
+            .await
+            .unwrap();
+        drop(_home);
+
+        assert_eq!(execution.status, LoopRunStatus::Fail);
+        assert!(
+            execution.output.get("route").is_none(),
+            "a spawn failure must not carry a chosen route"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_router_node_matches_declared_route_from_stdout() {
+        let (dir, db) = test_db();
+        let script = write_member_script(dir.path(), "router-billing.sh", "printf 'billing\\n'");
+        let fake_home = setup_multi_cli_home(&[("router-billing-cli", &script)]);
+        let node = router_node(
+            "r1",
+            "spec-1",
+            "router-billing-cli",
+            &[("billing", "Billing"), ("technical", "Technical")],
+            "technical",
+            1,
+        );
+
+        let _home = HomeGuard::set(fake_home.path());
+        let execution = execute_router_node(&db, &node, None, "run-router-billing", "/tmp")
+            .await
+            .unwrap();
+        drop(_home);
+
+        assert_eq!(execution.status, LoopRunStatus::Pass);
+        assert_eq!(
+            execution.output.get("route").and_then(Value::as_str),
+            Some("billing")
+        );
+        assert_eq!(
+            execution
+                .output
+                .get("used_fallback")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            execution.output.get("raw_answer").and_then(Value::as_str),
+            Some("billing")
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_router_node_falls_back_and_records_raw_answer_when_unparseable() {
+        let (dir, db) = test_db();
+        let script = write_member_script(
+            dir.path(),
+            "router-narration.sh",
+            "printf 'I think billing fits best.\\n'",
+        );
+        let fake_home = setup_multi_cli_home(&[("router-narration-cli", &script)]);
+        let node = router_node(
+            "r1",
+            "spec-1",
+            "router-narration-cli",
+            &[("billing", "Billing"), ("technical", "Technical")],
+            "technical",
+            1,
+        );
+
+        let _home = HomeGuard::set(fake_home.path());
+        let execution = execute_router_node(&db, &node, None, "run-router-narration", "/tmp")
+            .await
+            .unwrap();
+        drop(_home);
+
+        assert_eq!(execution.status, LoopRunStatus::Pass);
+        assert_eq!(
+            execution.output.get("route").and_then(Value::as_str),
+            Some("technical"),
+            "an unparseable answer must take the declared fallback"
+        );
+        assert_eq!(
+            execution
+                .output
+                .get("used_fallback")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            execution.output.get("raw_answer").and_then(Value::as_str),
+            Some("I think billing fits best.")
+        );
+    }
+
+    /// Acceptance: a three-route router loop takes a different path per
+    /// input, and each decision — chosen route, raw answer — is persisted on
+    /// the router node's own run row: the same JSON blob `execute_router_node`
+    /// logs via `tracing::info!` (B43's node-run lifecycle logging) is what
+    /// `update_loop_run_result` writes, so the run row is the queryable
+    /// record of what the daemon log carries.
+    #[tokio::test]
+    async fn three_route_router_loop_takes_a_different_path_per_input() {
+        for (answer, expected_marker) in [
+            ("billing", "billing.marker"),
+            ("technical", "technical.marker"),
+            ("other", "other.marker"),
+        ] {
+            let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+            let script =
+                write_member_script(dir.path(), "router.sh", &format!("printf '{answer}\\n'"));
+            let fake_home = setup_multi_cli_home(&[("router-cli", &script)]);
+
+            db.insert_loop_node(&router_node(
+                "router",
+                &spec_id,
+                "router-cli",
+                &[
+                    ("billing", "Billing questions"),
+                    ("technical", "Technical issues"),
+                    ("other", "Everything else"),
+                ],
+                "other",
+                1,
+            ))
+            .unwrap();
+
+            for (position, (route_label, marker_name, node_id)) in [
+                ("billing", "billing.marker", "path-billing"),
+                ("technical", "technical.marker", "path-technical"),
+                ("other", "other.marker", "path-other"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                db.insert_loop_node(&LoopNode {
+                    id: node_id.to_string(),
+                    spec_id: Some(spec_id.clone()),
+                    loop_id: None,
+                    name: node_id.to_string(),
+                    kind: LoopNodeKind::Check,
+                    config: serde_json::json!({
+                        "command": format!("touch \"{}\"", dir.path().join(marker_name).display()),
+                        "success_condition": "exit_code_0"
+                    }),
+                    position: 2 + position as i64,
+                    created_at: chrono::Utc::now(),
+                })
+                .unwrap();
+                db.insert_loop_edge(&route_edge(
+                    &format!("edge-{route_label}"),
+                    &spec_id,
+                    "router",
+                    node_id,
+                    route_label,
+                ))
+                .unwrap();
+            }
+
+            let _home = HomeGuard::set(fake_home.path());
+            let result = engine.run_loop(loop_id.clone(), None, None).await;
+            drop(_home);
+            result.unwrap();
+
+            let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+            assert_eq!(
+                spec.status,
+                LoopSpecStatus::Completed,
+                "route '{answer}' must complete the spec"
+            );
+
+            for marker in ["billing.marker", "technical.marker", "other.marker"] {
+                let exists = dir.path().join(marker).exists();
+                if marker == expected_marker {
+                    assert!(exists, "expected marker '{marker}' for answer '{answer}'");
+                } else {
+                    assert!(
+                        !exists,
+                        "unexpected marker '{marker}' for answer '{answer}'"
+                    );
+                }
+            }
+
+            let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+            let router_run = runs.iter().find(|r| r.node_id == "router").unwrap();
+            assert_eq!(router_run.status, LoopRunStatus::Pass);
+            let output = router_run.output.as_ref().unwrap();
+            assert_eq!(output.get("route").and_then(Value::as_str), Some(answer));
+            assert_eq!(
+                output.get("raw_answer").and_then(Value::as_str),
+                Some(answer)
+            );
+            assert_eq!(
+                output.get("used_fallback").and_then(Value::as_bool),
+                Some(false)
+            );
+        }
     }
 }
