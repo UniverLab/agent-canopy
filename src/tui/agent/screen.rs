@@ -88,11 +88,19 @@ fn read_abs_range(
     collected
 }
 
+/// Divider written after replayed scrollback so a restored terminal can't be
+/// mistaken for a fresh one, or for the boundary where live output resumes.
+/// Dim SGR (`\x1b[2m`)/reset so it reads as chrome, not as something the
+/// previous session printed.
+const HISTORY_REPLAY_MARKER: &[u8] = b"\x1b[2m--- restored session history above ---\x1b[0m\r\n";
+
 impl InteractiveAgent {
     /// Replay persisted plain-text scrollback into the VT100 parser.
     ///
     /// This reconstructs terminal history after session resume by feeding each
-    /// line as terminal output with CRLF separators.
+    /// line as terminal output with CRLF separators, followed by a dim marker
+    /// line so the operator can see where the replay ends and live output
+    /// begins.
     pub fn replay_scrollback_lines(&self, lines: &[String]) {
         if lines.is_empty() {
             return;
@@ -104,6 +112,7 @@ impl InteractiveAgent {
                 replay.extend_from_slice(line.as_bytes());
                 replay.extend_from_slice(b"\r\n");
             }
+            replay.extend_from_slice(HISTORY_REPLAY_MARKER);
             vt.process(&replay);
         }
         // Do NOT update last_output_at here. Replay is a history reconstruction
@@ -750,5 +759,53 @@ mod tests {
             wide_continuation: false,
         });
         assert_eq!(snap.selection_text((0, 0), (0, 2)), "a c");
+    }
+
+    // ── replay_scrollback_lines ─────────────────────────────────
+
+    /// `cat` is a lightweight stand-in shell; these tests only exercise the
+    /// vt100 replay path and never depend on what `cat` does with stdin.
+    fn spawn_test_terminal(name: &str) -> InteractiveAgent {
+        InteractiveAgent::spawn_terminal(
+            "cat",
+            "/tmp",
+            80,
+            24,
+            Some(name),
+            &[],
+            ratatui::style::Color::White,
+        )
+        .expect("spawn terminal")
+    }
+
+    #[test]
+    fn replay_scrollback_lines_reproduces_the_given_lines() {
+        let agent = spawn_test_terminal("replay-basic");
+        agent.replay_scrollback_lines(&["old line one".to_string(), "old line two".to_string()]);
+        let out = agent.last_lines(50);
+        assert!(out.contains("old line one"));
+        assert!(out.contains("old line two"));
+    }
+
+    #[test]
+    fn replay_scrollback_lines_marks_replayed_content_as_history() {
+        let agent = spawn_test_terminal("replay-marker");
+        agent.replay_scrollback_lines(&["previous session output".to_string()]);
+        let out = agent.last_lines(50);
+        assert!(
+            out.contains("restored session history above"),
+            "restored content must be visually marked as history: {out:?}"
+        );
+    }
+
+    #[test]
+    fn replay_scrollback_lines_empty_is_a_noop() {
+        let agent = spawn_test_terminal("replay-empty");
+        agent.replay_scrollback_lines(&[]);
+        let out = agent.last_lines(50);
+        assert!(
+            out.trim().is_empty(),
+            "replaying no lines must not print a marker or anything else: {out:?}"
+        );
     }
 }
