@@ -1346,17 +1346,25 @@ fn agent_card_meta<'a>(agent: &'a AgentEntry, app: &'a App, theme: &Theme) -> Ag
     }
 }
 
-/// Status color for an interactive/terminal session card. Blue is reserved
-/// for background agents (see `agent_status` in `panel/details.rs`) — a PTY
-/// is either alive (green) or dead (red). A running session pulses between
+/// Status color for an interactive/terminal session card. A PTY is either
+/// alive (green) or dead — and dead now splits into two: a session that
+/// exited 0 reads as successful (`STATUS_OK`, blue), any other exit code
+/// reads as failed (`STATUS_FAIL`, red). A running session pulses between
 /// dim and bright green while it's registering activity (see
 /// `ACTIVITY_IDLE_THRESHOLD_MS` and `pulse_active` — never blank, B21) and
 /// holds solid green — "healthy, available" — once output has been quiet
-/// for a while. Any exit, clean or not, means the PTY is dead: red.
+/// for a while.
+///
+/// "Exit 0 means success" is scoped to *this* rendering decision only. It's
+/// a safe read for a user-ended interactive session, but it is not a
+/// general-purpose success signal — this project has been bitten before by
+/// CLIs that print an error and still exit 0. Do not lift this assumption
+/// into exit-code handling elsewhere without re-litigating it there.
 fn session_status_color(status: &AgentStatus, pulsing: bool, animation_tick: u32) -> Color {
     match status {
         AgentStatus::Running if pulsing => pulse_active(animation_tick),
         AgentStatus::Running => STATUS_RUNNING,
+        AgentStatus::Exited(0) => STATUS_OK,
         AgentStatus::Exited(_) => STATUS_FAIL,
     }
 }
@@ -2378,14 +2386,111 @@ mod tests {
     }
 
     #[test]
-    fn exit_clean_or_not_is_dead_pty_red() {
+    fn exit_clean_is_success_blue_regardless_of_activity() {
         assert_eq!(
             session_status_color(&AgentStatus::Exited(0), true, 0),
-            STATUS_FAIL
+            STATUS_OK
         );
         assert_eq!(
             session_status_color(&AgentStatus::Exited(0), false, 0),
+            STATUS_OK
+        );
+    }
+
+    #[test]
+    fn exit_nonzero_is_failure_red_regardless_of_activity() {
+        assert_eq!(
+            session_status_color(&AgentStatus::Exited(7), true, 0),
             STATUS_FAIL
+        );
+        assert_eq!(
+            session_status_color(&AgentStatus::Exited(7), false, 0),
+            STATUS_FAIL
+        );
+    }
+
+    #[test]
+    fn exited_0_and_exited_1_sidebar_cards_render_different_colors() {
+        // The point of the fix is contrast: a clean exit and a failed exit
+        // sitting side by side must be visually distinguishable, not just
+        // individually "correct" in isolation.
+        use crate::db::Database;
+        use crate::tui::agent::InteractiveAgent;
+        use crate::tui::app::App;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
+
+        let mut ok_agent = InteractiveAgent::spawn_terminal(
+            "cat",
+            "/tmp",
+            80,
+            24,
+            Some("ok-exit"),
+            &[],
+            ratatui::style::Color::White,
+        )
+        .expect("spawn ok-exit agent");
+        ok_agent.status = AgentStatus::Exited(0);
+        app.interactive_agents.push(ok_agent);
+
+        let mut fail_agent = InteractiveAgent::spawn_terminal(
+            "cat",
+            "/tmp",
+            80,
+            24,
+            Some("fail-exit"),
+            &[],
+            ratatui::style::Color::White,
+        )
+        .expect("spawn fail-exit agent");
+        fail_agent.status = AgentStatus::Exited(1);
+        app.interactive_agents.push(fail_agent);
+
+        app.agents.push(AgentEntry::Interactive(0));
+        app.agents.push(AgentEntry::Interactive(1));
+
+        let theme = Theme::classic();
+        let backend = TestBackend::new(50, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_sidebar(frame, area, &mut app, &theme);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text = buffer_to_text(&buffer);
+
+        // Scan the row containing each agent's name for the "▌" status
+        // gutter glyph, wherever the card's left border happens to sit.
+        let gutter_color_for = |name: &str| -> Color {
+            let y = text
+                .lines()
+                .position(|line| line.contains(name))
+                .unwrap_or_else(|| panic!("expected {name} listed: {text}"));
+            for x in 0..buffer.area.width {
+                let cell = &buffer[(x, y as u16)];
+                if cell.symbol() == "▌" {
+                    return cell.fg;
+                }
+            }
+            panic!("no status gutter glyph found on {name}'s row");
+        };
+
+        let ok_color = gutter_color_for("ok-exit");
+        let fail_color = gutter_color_for("fail-exit");
+        assert_eq!(ok_color, STATUS_OK, "clean exit must render success blue");
+        assert_eq!(fail_color, STATUS_FAIL, "failed exit must render fail red");
+        assert_ne!(
+            ok_color, fail_color,
+            "clean and failed exits must be visually distinguishable"
         );
     }
 
@@ -2443,9 +2548,14 @@ mod tests {
             pty_session_status_color(false, &AgentStatus::Running, false, true, 0),
             STATUS_RUNNING
         );
-        // Exited stays red regardless of signals.
+        // Exited status ignores the pulsing signal either way, but now
+        // depends on the exit code: clean exit is blue, not red.
         assert_eq!(
             pty_session_status_color(false, &AgentStatus::Exited(0), true, false, 0),
+            STATUS_OK
+        );
+        assert_eq!(
+            pty_session_status_color(false, &AgentStatus::Exited(1), true, false, 0),
             STATUS_FAIL
         );
     }
