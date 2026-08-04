@@ -911,6 +911,7 @@ mod tests {
         status: crate::domain::loops::LoopStatus,
     ) -> crate::domain::loops::Loop {
         crate::domain::loops::Loop {
+            archived: false,
             id: id.to_string(),
             name: "Autorun test loop".to_string(),
             description: None,
@@ -1051,6 +1052,7 @@ mod tests {
         let workdir = tempfile::tempdir().unwrap();
         let loop_id = "failed-autorun".to_string();
         db.insert_loop(&Loop {
+            archived: false,
             id: loop_id.clone(),
             name: "Autorun test loop".to_string(),
             description: None,
@@ -1155,6 +1157,7 @@ mod tests {
         let workdir = tempfile::tempdir().unwrap();
         let loop_id = "failed-pool-autorun".to_string();
         db.insert_loop(&Loop {
+            archived: false,
             id: loop_id.clone(),
             name: "Autorun pool test loop".to_string(),
             description: None,
@@ -1413,6 +1416,7 @@ mod tests {
         let workdir = tempfile::tempdir().unwrap();
         let loop_id = "paused-auto-continue".to_string();
         db.insert_loop(&Loop {
+            archived: false,
             id: loop_id.clone(),
             name: "Auto-continue test loop".to_string(),
             description: None,
@@ -1522,6 +1526,7 @@ mod tests {
         let workdir = tempfile::tempdir().unwrap();
         let loop_id = "paused-auto-continue-skip".to_string();
         db.insert_loop(&Loop {
+            archived: false,
             id: loop_id.clone(),
             name: "Auto-continue skip test loop".to_string(),
             description: None,

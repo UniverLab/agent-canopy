@@ -811,6 +811,7 @@ mod tests {
         status: crate::domain::loops::LoopStatus,
     ) -> crate::domain::loops::Loop {
         crate::domain::loops::Loop {
+            archived: false,
             id: id.to_string(),
             name: format!("loop-{id}"),
             description: None,

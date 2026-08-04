@@ -790,6 +790,7 @@ mod hang_repro {
         let loop_id = "wf-hang-repro".to_string();
         let spec_id = "spec-hang-repro".to_string();
         db.insert_loop(&Loop {
+            archived: false,
             id: loop_id.clone(),
             name: "Repro Loop".to_string(),
             description: None,

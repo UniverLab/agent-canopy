@@ -3896,6 +3896,7 @@ mod tests {
         let dir = tempdir()?;
         let db = Arc::new(Database::new(&dir.path().join("test.db"))?);
         let lp = crate::domain::loops::Loop {
+            archived: false,
             id: "wf-test".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -4086,6 +4087,7 @@ mod tests {
         let dir = tempdir()?;
         let db = Arc::new(Database::new(&dir.path().join("test.db"))?);
         let lp = crate::domain::loops::Loop {
+            archived: false,
             id: "wf-test".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -5017,6 +5019,7 @@ mod tests {
     #[test]
     fn render_agent_prompt_includes_reporting_contract() {
         let lp = crate::domain::loops::Loop {
+            archived: false,
             id: "wf".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -5186,6 +5189,7 @@ mod tests {
         // was a 65KB test log blowing up argv. The full text must never be
         // interpolated whole; the marker must show it was cut.
         let lp = crate::domain::loops::Loop {
+            archived: false,
             id: "wf".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -7424,6 +7428,7 @@ echo done
         let dir = tempdir()?;
         let db = Arc::new(Database::new(&dir.path().join("test.db"))?);
         let lp = crate::domain::loops::Loop {
+            archived: false,
             id: "wf-test".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -7683,6 +7688,7 @@ echo done
         let engine = LoopEngine::new(Arc::clone(&db), Arc::new(DefaultNotificationService));
 
         let lp = crate::domain::loops::Loop {
+            archived: false,
             id: "wf-workdir".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -8172,6 +8178,7 @@ echo done
 
         // 2. Render the full prompt — elision must survive composition.
         let lp = crate::domain::loops::Loop {
+            archived: false,
             id: "wf".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -9675,6 +9682,7 @@ echo done
     #[tokio::test]
     async fn render_completion_hook_prompt_substitutes_all_placeholders() {
         let lp = crate::domain::loops::Loop {
+            archived: false,
             id: "wf".to_string(),
             name: "MyLoop".to_string(),
             description: None,
@@ -9712,6 +9720,7 @@ echo done
     #[tokio::test]
     async fn render_completion_hook_prompt_empty_specs_shows_none() {
         let lp = crate::domain::loops::Loop {
+            archived: false,
             id: "wf".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -11043,6 +11052,7 @@ echo done
         let dir = tempdir().unwrap();
         let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
         let lp = crate::domain::loops::Loop {
+            archived: false,
             id: "wf-pool-ensemble".to_string(),
             name: "Loop".to_string(),
             description: None,

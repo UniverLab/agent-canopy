@@ -82,14 +82,27 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
         }
         return Ok(());
     }
-    if app.delete_loop_confirm {
+    if app.archive_loop_confirm {
         match code {
             KeyCode::Char('y') | KeyCode::Enter => {
-                let _ = app.delete_selected_loop();
-                app.delete_loop_confirm = false;
+                let _ = app.archive_selected_loop();
+                app.archive_loop_confirm = false;
             }
             KeyCode::Char('n') | KeyCode::Esc => {
-                app.delete_loop_confirm = false;
+                app.archive_loop_confirm = false;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+    if app.permanent_delete_loop_confirm {
+        match code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                let _ = app.permanent_delete_selected_archived_loop();
+                app.permanent_delete_loop_confirm = false;
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                app.permanent_delete_loop_confirm = false;
             }
             _ => {}
         }
@@ -218,11 +231,26 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
         KeyCode::Char('E') if on_loop => {
             app.open_edit_loop_dialog();
         }
+        // 'A' toggles the Loops section between the main list and the
+        // archive — the archive's only entry point, deliberately a toggle
+        // on the existing section rather than a separate sidebar layer, so
+        // archived loops stay in the same mental place as active ones.
+        KeyCode::Char('A') if on_loop => {
+            app.toggle_loop_archive_view();
+        }
+        // 'R' restores the highlighted archived loop back to the main list.
+        KeyCode::Char('R') if on_loop && app.loop_view_archived => {
+            let _ = app.restore_selected_archived_loop();
+        }
         KeyCode::F(4) => {
             if app.sidebar_layer == SidebarLayer::Knowledge {
                 app.delete_project_confirm = true;
+            } else if on_loop && app.loop_view_archived {
+                // Permanent deletion is reachable only from the archive, on
+                // an already-archived loop — never the first press of F4.
+                app.permanent_delete_loop_confirm = true;
             } else if on_loop {
-                app.delete_loop_confirm = true;
+                app.archive_loop_confirm = true;
             } else if !app.agents_rag_focused {
                 let _ = app.delete_selected();
             }
@@ -1052,21 +1080,78 @@ mod preview_key_tests {
     }
 
     #[test]
-    fn preview_delete_loop_confirm_y_deletes() {
+    fn preview_archive_loop_confirm_y_archives() {
         let mut app = app_with_agents();
         app.focus = Focus::Preview;
-        app.delete_loop_confirm = true;
+        app.archive_loop_confirm = true;
         handle_preview_key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE).unwrap();
-        assert!(!app.delete_loop_confirm);
+        assert!(!app.archive_loop_confirm);
     }
 
     #[test]
-    fn preview_delete_loop_confirm_n_cancels() {
+    fn preview_archive_loop_confirm_n_cancels() {
         let mut app = app_with_agents();
         app.focus = Focus::Preview;
-        app.delete_loop_confirm = true;
+        app.archive_loop_confirm = true;
         handle_preview_key(&mut app, KeyCode::Char('n'), KeyModifiers::NONE).unwrap();
-        assert!(!app.delete_loop_confirm);
+        assert!(!app.archive_loop_confirm);
+    }
+
+    #[test]
+    fn preview_permanent_delete_loop_confirm_y_deletes() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Preview;
+        app.permanent_delete_loop_confirm = true;
+        handle_preview_key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE).unwrap();
+        assert!(!app.permanent_delete_loop_confirm);
+    }
+
+    #[test]
+    fn preview_permanent_delete_loop_confirm_n_cancels() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Preview;
+        app.permanent_delete_loop_confirm = true;
+        handle_preview_key(&mut app, KeyCode::Char('n'), KeyModifiers::NONE).unwrap();
+        assert!(!app.permanent_delete_loop_confirm);
+    }
+
+    #[test]
+    fn preview_f4_on_loop_opens_archive_confirm_not_permanent_delete() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Preview;
+        app.sidebar_layer = SidebarLayer::Automation;
+        app.automation_kind = crate::tui::app::AutomationKind::Loop;
+        app.loop_view_archived = false;
+        handle_preview_key(&mut app, KeyCode::F(4), KeyModifiers::NONE).unwrap();
+        assert!(app.archive_loop_confirm);
+        assert!(!app.permanent_delete_loop_confirm);
+    }
+
+    #[test]
+    fn preview_f4_in_archived_view_opens_permanent_delete_confirm() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Preview;
+        app.sidebar_layer = SidebarLayer::Automation;
+        app.automation_kind = crate::tui::app::AutomationKind::Loop;
+        app.loop_view_archived = true;
+        handle_preview_key(&mut app, KeyCode::F(4), KeyModifiers::NONE).unwrap();
+        assert!(app.permanent_delete_loop_confirm);
+        assert!(!app.archive_loop_confirm);
+    }
+
+    #[test]
+    fn preview_shift_a_toggles_loop_archive_view() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Preview;
+        app.sidebar_layer = SidebarLayer::Automation;
+        app.automation_kind = crate::tui::app::AutomationKind::Loop;
+        assert!(!app.loop_view_archived);
+
+        handle_preview_key(&mut app, KeyCode::Char('A'), KeyModifiers::NONE).unwrap();
+        assert!(app.loop_view_archived);
+
+        handle_preview_key(&mut app, KeyCode::Char('A'), KeyModifiers::NONE).unwrap();
+        assert!(!app.loop_view_archived);
     }
 
     #[test]

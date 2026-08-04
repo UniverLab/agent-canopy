@@ -463,6 +463,7 @@ mod tests {
 
     fn make_loop(id: &str, status: LoopStatus) -> Loop {
         Loop {
+            archived: false,
             id: id.to_string(),
             name: format!("Loop {id}"),
             description: None,

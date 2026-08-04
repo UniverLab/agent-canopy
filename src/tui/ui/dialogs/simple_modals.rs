@@ -26,11 +26,20 @@ pub fn draw_delete_project_confirm(frame: &mut Frame, theme: &Theme) {
     );
 }
 
-pub fn draw_delete_loop_confirm(frame: &mut Frame, theme: &Theme) {
+pub fn draw_archive_loop_confirm(frame: &mut Frame, theme: &Theme) {
     draw_modal_confirm(
         frame,
-        " Delete Loop? ",
-        "Are you sure you want to delete this loop?\nY/Enter = Confirm  N/Esc = Cancel",
+        " Archive Loop? ",
+        "Archive this loop? It leaves the main list but its specs and run history stay intact — restore it anytime from the archive.\nY/Enter = Confirm  N/Esc = Cancel",
+        theme,
+    );
+}
+
+pub fn draw_permanent_delete_loop_confirm(frame: &mut Frame, theme: &Theme) {
+    draw_modal_confirm(
+        frame,
+        " Permanently Delete Loop? ",
+        "Permanently delete this loop? This destroys its full run history — every node run, output, and session id — forever. This cannot be undone.\nY/Enter = Confirm  N/Esc = Cancel",
         theme,
     );
 }
@@ -245,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn draw_delete_loop_confirm_renders_without_panic() {
+    fn draw_archive_loop_confirm_renders_without_panic() {
         use crate::db::Database;
         use crate::tui::app::types::App;
         use ratatui::backend::TestBackend;
@@ -264,7 +273,22 @@ mod tests {
         let theme = Theme::classic();
         terminal
             .draw(|frame| {
-                draw_delete_loop_confirm(frame, &theme);
+                draw_archive_loop_confirm(frame, &theme);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn draw_permanent_delete_loop_confirm_renders_without_panic() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::classic();
+        terminal
+            .draw(|frame| {
+                draw_permanent_delete_loop_confirm(frame, &theme);
             })
             .unwrap();
     }

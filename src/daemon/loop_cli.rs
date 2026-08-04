@@ -39,7 +39,7 @@ pub(crate) async fn handle_loop_action(action: LoopAction) -> Result<()> {
 }
 
 fn handle_loop_list(db: &Database, workdir: Option<&str>) -> Result<()> {
-    let loops = db.list_loops(workdir)?;
+    let loops = db.list_loops(workdir, false)?;
 
     if loops.is_empty() {
         println!("No loops found.");
@@ -76,7 +76,9 @@ fn handle_loop_list(db: &Database, workdir: Option<&str>) -> Result<()> {
 }
 
 fn handle_loop_info(db: &Database, id_or_name: &str) -> Result<()> {
-    let loops = db.list_loops(None)?;
+    // Resolves by id/name (not a browsing list), so an archived loop must
+    // still be found here.
+    let loops = db.list_loops(None, true)?;
     let lp = resolve_loop(&loops, id_or_name)?;
 
     println!("\n\x1b[1m── Loop: {} ──\x1b[0m", lp.name);
@@ -538,6 +540,7 @@ mod tests {
 
     fn make_loop(id: &str, name: &str, status: LoopStatus) -> Loop {
         Loop {
+            archived: false,
             id: id.to_string(),
             name: name.to_string(),
             description: None,

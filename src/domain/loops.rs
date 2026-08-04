@@ -154,6 +154,19 @@ pub enum LoopResetOutcome {
     },
 }
 
+/// Outcome of [`crate::db::Database::archive_loop`] — mirrors
+/// [`LoopResetOutcome`]'s shape (an explicit outcome enum rather than a bare
+/// bool/error) so the caller can render a precise message for each refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveLoopOutcome {
+    NotFound,
+    /// A `running` loop must be paused first — archiving is for work that's
+    /// finished with.
+    Running,
+    AlreadyArchived,
+    Archived,
+}
+
 #[derive(Debug, Clone)]
 pub enum SpecAdminStatusOutcome {
     Success,
@@ -528,6 +541,13 @@ pub struct Loop {
     /// `render_completion_hook_prompt` for its placeholders.
     #[serde(default)]
     pub on_completed: Option<LoopCompletionHook>,
+    /// Archived loops leave every browsing listing (sidebar, `canopy loop
+    /// list`, MCP `loop_list`) but keep their row, specs, and full run
+    /// history — a deliberate, reversible, always-counted alternative to
+    /// permanent deletion. `false` for every pre-existing loop after
+    /// migration. See `Database::{archive_loop, restore_loop}`.
+    #[serde(default)]
+    pub archived: bool,
 }
 
 /// Config for a loop's `on_completed` hook — deliberately shaped like an
@@ -1082,6 +1102,7 @@ Task:
 
     fn loop_with_trigger(status: LoopStatus, trigger: Option<super::Trigger>) -> super::Loop {
         super::Loop {
+            archived: false,
             id: "wf".to_string(),
             name: "Loop".to_string(),
             description: None,

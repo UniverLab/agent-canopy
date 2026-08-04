@@ -564,6 +564,7 @@ mod tests {
         on_completed: Option<crate::domain::loops::LoopCompletionHook>,
     ) -> crate::domain::loops::Loop {
         crate::domain::loops::Loop {
+            archived: false,
             id: "loop-1".to_string(),
             name: "sample".to_string(),
             description: None,

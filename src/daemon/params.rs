@@ -870,10 +870,28 @@ pub struct LoopPreflightParams {
     pub timeout_seconds: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct LoopListParams {
     /// Optional absolute workdir filter.
     pub workdir: Option<String>,
+    /// Include archived loops in the results. Defaults to `false` — the
+    /// same "browsing" view as the TUI's main Loops list, which excludes
+    /// archived loops. An archived loop is still reachable directly by id
+    /// via `loop_get` regardless of this flag.
+    #[serde(default)]
+    pub include_archived: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopArchiveParams {
+    /// Loop ID to archive.
+    pub loop_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopRestoreParams {
+    /// Loop ID to restore from the archive back to the main list.
+    pub loop_id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

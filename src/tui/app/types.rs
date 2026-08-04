@@ -626,7 +626,10 @@ pub struct App {
     pub(crate) pending_launch_dialog: Option<NewAgentDialog>,
     pub(crate) quit_confirm: bool,
     pub(crate) delete_project_confirm: bool,
-    pub(crate) delete_loop_confirm: bool,
+    pub(crate) archive_loop_confirm: bool,
+    /// Permanent-delete confirmation, reachable only from the archived
+    /// view on an already-archived loop — see [`App::permanent_delete_selected_archived_loop`].
+    pub(crate) permanent_delete_loop_confirm: bool,
 
     // Brian's Brain automaton (sidebar decoration)
     pub(crate) sidebar_brain: Option<crate::tui::brians_brain::BriansBrain>,
@@ -672,6 +675,18 @@ pub struct App {
     /// tab.
     pub(crate) sidebar_tab_click_map: Vec<(SidebarLayer, u16, u16, u16)>,
     pub(crate) loops: Vec<Loop>,
+    /// Archived loops (excluded from `loops`), populated only while
+    /// `loop_view_archived` is true — see [`App::refresh_loops`].
+    pub(crate) archived_loops: Vec<Loop>,
+    /// Count of archived loops, kept up to date on every refresh so it's
+    /// visible from the main view at all times regardless of
+    /// `loop_view_archived`.
+    pub(crate) archived_loop_count: usize,
+    /// Whether the Loops sidebar section is currently showing the archive
+    /// (`true`) instead of the main list (`false`) — a toggle on the
+    /// existing Loops section rather than a separate sidebar layer, so
+    /// archived loops stay in the same mental place as active ones.
+    pub(crate) loop_view_archived: bool,
     pub(crate) selected_loop_id: Option<String>,
     pub(crate) loop_details: Option<LoopDetails>,
     pub(crate) loop_runs: Vec<LoopNodeRun>,

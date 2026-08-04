@@ -52,10 +52,10 @@ use crate::db::Database;
 use crate::domain::blueprints::{merge_blueprint_config, validate_blueprint_deletable, Blueprint};
 use crate::domain::loops::{
     validate_router_edges_declared, validate_router_route_coverage, validate_router_routes,
-    validate_spec_description_template, Ensemble, EnsembleMember, EnsembleMemberSpec, Loop,
-    LoopDetails, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind, LoopNodeRun,
-    LoopResetOutcome, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus, RouterRoute,
-    SpecAdminStatusOutcome,
+    validate_spec_description_template, ArchiveLoopOutcome, Ensemble, EnsembleMember,
+    EnsembleMemberSpec, Loop, LoopDetails, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind,
+    LoopNodeRun, LoopResetOutcome, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus,
+    RouterRoute, SpecAdminStatusOutcome,
 };
 use crate::domain::models::{Agent, Trigger};
 use crate::domain::pools::{Pool, PoolDetails};
@@ -1661,6 +1661,7 @@ fn build_loop_summary_json(db: &Database, lp: &Loop) -> Result<serde_json::Value
         "blocker": current_spec.and_then(|v| v.blocker),
         "created_at": lp.created_at.to_rfc3339(),
         "workdir": lp.workdir,
+        "archived": lp.archived,
     }))
 }
 
@@ -3342,6 +3343,7 @@ impl TaskTriggerHandler {
         };
 
         let lp = Loop {
+            archived: false,
             id: uuid::Uuid::new_v4().to_string(),
             name: name.to_string(),
             description: params.description.filter(|value| !value.trim().is_empty()),
@@ -5122,7 +5124,10 @@ impl TaskTriggerHandler {
     ) -> Result<CallToolResult, McpError> {
         let loops = self
             .db
-            .list_loops(params.workdir.as_deref())
+            .list_loops(
+                params.workdir.as_deref(),
+                params.include_archived.unwrap_or(false),
+            )
             .map_err(internal_error)?;
 
         let out = build_loop_list_json(&self.db, &loops)?;
@@ -5655,6 +5660,59 @@ impl TaskTriggerHandler {
         } else {
             Ok(error_result(&format!(
                 "Loop '{}' is not running or does not exist.",
+                params.loop_id
+            )))
+        }
+    }
+
+    #[tool(
+        name = "loop_archive",
+        description = "Archive a loop: it leaves the main loop_list/sidebar view but its row, specs, and full run history are untouched (never deleted, never moved to another table) and it can be restored with loop_restore at any time. Refuses a `running` loop — pause it first. Permanent deletion is a separate, deliberate act on an already-archived loop, not something F4/this tool does."
+    )]
+    async fn loop_archive(
+        &self,
+        Parameters(params): Parameters<LoopArchiveParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.db.archive_loop(&params.loop_id).map_err(internal_error)? {
+            ArchiveLoopOutcome::Archived => Ok(success_result(&format!(
+                "Loop '{}' archived. Its specs and run history are intact; restore it with loop_restore.",
+                params.loop_id
+            ))),
+            ArchiveLoopOutcome::AlreadyArchived => Ok(error_result(&format!(
+                "Loop '{}' is already archived.",
+                params.loop_id
+            ))),
+            ArchiveLoopOutcome::Running => Ok(error_result(&format!(
+                "Loop '{}' is running — pause it before archiving.",
+                params.loop_id
+            ))),
+            ArchiveLoopOutcome::NotFound => Ok(error_result(&format!(
+                "Loop '{}' not found.",
+                params.loop_id
+            ))),
+        }
+    }
+
+    #[tool(
+        name = "loop_restore",
+        description = "Restore an archived loop back to the main loop_list/sidebar view. The loop's row, specs, and run history were never touched by archiving, so this is a plain flag flip."
+    )]
+    async fn loop_restore(
+        &self,
+        Parameters(params): Parameters<LoopRestoreParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let restored = self
+            .db
+            .restore_loop(&params.loop_id)
+            .map_err(internal_error)?;
+        if restored {
+            Ok(success_result(&format!(
+                "Loop '{}' restored to the main list.",
+                params.loop_id
+            )))
+        } else {
+            Ok(error_result(&format!(
+                "Loop '{}' not found or not archived.",
                 params.loop_id
             )))
         }
@@ -6407,6 +6465,7 @@ fn loop_details_json(db: &Database, lp: &LoopDetails) -> anyhow::Result<serde_js
         "started_at": lp.lp.started_at.map(|value| value.to_rfc3339()),
         "completed_at": lp.lp.completed_at.map(|value| value.to_rfc3339()),
         "autorun_at": lp.lp.autorun_at.map(|value| value.to_rfc3339()),
+        "archived": lp.lp.archived,
         "graph": {
             "nodes": lp.graph_nodes.iter().map(|node| loop_node_json(node, &lp.graph_edges)).collect::<Vec<_>>(),
             "edges": lp.graph_edges.iter().map(loop_edge_json).collect::<Vec<_>>(),
@@ -7214,6 +7273,7 @@ mod tests {
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         let loop_id = "loop-reset-test".to_string();
         db.insert_loop(&Loop {
+            archived: false,
             id: loop_id.clone(),
             name: "Loop".to_string(),
             description: None,
@@ -7298,6 +7358,7 @@ mod tests {
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         let loop_id = "loop-pool-reset-test".to_string();
         db.insert_loop(&Loop {
+            archived: false,
             id: loop_id.clone(),
             name: "Loop".to_string(),
             description: None,
@@ -7881,6 +7942,7 @@ mod tests {
 
         let (dir, db, handler) = queue_test_handler();
         db.insert_loop(&Loop {
+            archived: false,
             id: "loop-1".to_string(),
             name: "loop-1".to_string(),
             description: None,
@@ -7919,6 +7981,7 @@ mod tests {
 
         let (dir, db, handler) = queue_test_handler();
         db.insert_loop(&Loop {
+            archived: false,
             id: "loop-1".to_string(),
             name: "loop-1".to_string(),
             description: None,
@@ -8052,6 +8115,7 @@ mod tests {
     /// A minimal loop row, needed only to satisfy `loop_runs.loop_id`'s FK.
     fn insert_test_loop(db: &Database, id: &str) {
         db.insert_loop(&Loop {
+            archived: false,
             id: id.to_string(),
             name: id.to_string(),
             description: None,
@@ -8496,6 +8560,7 @@ mod tests {
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         let loop_id = "loop-with-graph".to_string();
         db.insert_loop(&Loop {
+            archived: false,
             id: loop_id.clone(),
             name: "Loop".to_string(),
             description: None,
@@ -8542,6 +8607,7 @@ mod tests {
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         let loop_id = "loop-with-pinned-skills".to_string();
         db.insert_loop(&Loop {
+            archived: false,
             id: loop_id.clone(),
             name: "Loop".to_string(),
             description: None,
@@ -8592,6 +8658,7 @@ mod tests {
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         let loop_id = "loop-with-autorun".to_string();
         db.insert_loop(&Loop {
+            archived: false,
             id: loop_id.clone(),
             name: "Loop".to_string(),
             description: None,
@@ -8632,6 +8699,7 @@ mod tests {
 
     fn autorun_test_loop(loop_id: &str, workdir: &str, status: LoopStatus) -> Loop {
         Loop {
+            archived: false,
             id: loop_id.to_string(),
             name: loop_id.to_string(),
             description: None,
@@ -10204,6 +10272,7 @@ mod tests {
 
     fn make_loop_with_trigger(trigger: Option<Trigger>) -> Loop {
         Loop {
+            archived: false,
             id: "loop-1".to_string(),
             name: "Test Loop".to_string(),
             description: None,
@@ -10559,6 +10628,7 @@ mod additional_tests {
 
     fn insert_test_loop(db: &Database, id: &str) {
         db.insert_loop(&Loop {
+            archived: false,
             id: id.to_string(),
             name: id.to_string(),
             description: None,
@@ -11765,6 +11835,7 @@ mod additional_tests {
     #[test]
     fn loop_trigger_json_manual() {
         let lp = Loop {
+            archived: false,
             id: "l1".to_string(),
             name: "l1".to_string(),
             description: None,
@@ -11788,6 +11859,7 @@ mod additional_tests {
     #[test]
     fn loop_trigger_json_cron() {
         let lp = Loop {
+            archived: false,
             id: "l1".to_string(),
             name: "l1".to_string(),
             description: None,
@@ -11940,6 +12012,7 @@ mod coverage_tests {
 
     fn make_loop(loop_id: &str, status: LoopStatus) -> Loop {
         Loop {
+            archived: false,
             id: loop_id.to_string(),
             name: loop_id.to_string(),
             description: None,
@@ -14162,6 +14235,7 @@ mod endpoint_tests {
 
     fn insert_test_loop(db: &Database, workdir: &std::path::Path) -> Loop {
         let lp = Loop {
+            archived: false,
             id: uuid::Uuid::new_v4().to_string(),
             name: "Test Loop".to_string(),
             description: None,
@@ -15204,7 +15278,10 @@ mod endpoint_tests {
         assert!(is_err(&missing));
 
         let listed = handler
-            .loop_list(Parameters(LoopListParams { workdir: None }))
+            .loop_list(Parameters(LoopListParams {
+                workdir: None,
+                include_archived: None,
+            }))
             .await
             .unwrap();
         assert!(raw_text(&listed).contains(&lp.id));
@@ -15212,6 +15289,7 @@ mod endpoint_tests {
         let filtered_out = handler
             .loop_list(Parameters(LoopListParams {
                 workdir: Some("/nowhere".to_string()),
+                include_archived: None,
             }))
             .await
             .unwrap();

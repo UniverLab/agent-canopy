@@ -1157,6 +1157,7 @@ mod tests {
         db.insert_terminal_session("term-1", "term-1", "bash", workdir)
             .unwrap();
         db.insert_loop(&crate::domain::loops::Loop {
+            archived: false,
             id: "loop-1".to_string(),
             name: "loop-1".to_string(),
             description: None,
@@ -1362,6 +1363,7 @@ mod tests {
         db.upsert_project(&sample_project_at("hash-b", "/proj-b"))
             .unwrap();
         db.insert_loop(&crate::domain::loops::Loop {
+            archived: false,
             id: "loop-b".to_string(),
             name: "loop-b".to_string(),
             description: None,

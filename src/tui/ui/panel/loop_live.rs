@@ -1543,6 +1543,7 @@ mod tests {
         use crate::domain::loops::{Loop, LoopNodeRun, LoopSpec};
 
         let lp = Loop {
+            archived: false,
             id: "lp1".to_string(),
             name: "team loop".to_string(),
             description: None,

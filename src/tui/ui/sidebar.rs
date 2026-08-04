@@ -533,10 +533,20 @@ fn draw_automation_body(
         );
     }
     if let Some(sub) = take_top(&mut remaining, alloc[1]) {
+        // The archived count is always shown here — even while browsing the
+        // main list — so the archive is never an invisible state; see the
+        // F4-archive spec's "always-visible count" requirement.
+        let title = if app.loop_view_archived {
+            format!(" archived loops ({}) ", app.archived_loop_count)
+        } else if app.archived_loop_count > 0 {
+            format!(" loops · {} archived ", app.archived_loop_count)
+        } else {
+            " loops ".to_string()
+        };
         render_titled_panel(
             frame,
             sub,
-            " loops ",
+            &title,
             Style::default().fg(theme.dim_text),
             automation_border_style(app, AutomationKind::Loop, theme),
             theme,
@@ -1774,6 +1784,7 @@ mod tests {
             .unwrap();
         }
         db.insert_loop(&Loop {
+            archived: false,
             id: "wf-probe".to_string(),
             name: "Probe Loop".to_string(),
             description: None,
@@ -1902,6 +1913,7 @@ mod tests {
 
     fn bare_loop(id: &str, status: LoopStatus) -> Loop {
         Loop {
+            archived: false,
             id: id.to_string(),
             name: format!("Loop {id}"),
             description: None,

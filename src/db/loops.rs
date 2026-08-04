@@ -7,9 +7,9 @@ use std::io::{Error as IoError, ErrorKind};
 
 use crate::db::Database;
 use crate::domain::loops::{
-    Loop, LoopCompletionHook, LoopCompletionHookRun, LoopDetails, LoopEdge, LoopEdgeCondition,
-    LoopNode, LoopNodeKind, LoopNodeRun, LoopResetOutcome, LoopRunStatus, LoopSpec,
-    LoopSpecDetails, LoopSpecStatus, LoopStatus, SpecAdminStatusOutcome,
+    ArchiveLoopOutcome, Loop, LoopCompletionHook, LoopCompletionHookRun, LoopDetails, LoopEdge,
+    LoopEdgeCondition, LoopNode, LoopNodeKind, LoopNodeRun, LoopResetOutcome, LoopRunStatus,
+    LoopSpec, LoopSpecDetails, LoopSpecStatus, LoopStatus, SpecAdminStatusOutcome,
 };
 use crate::domain::models::Trigger;
 
@@ -31,8 +31,8 @@ impl Database {
         let (trigger_type, trigger_config) = encode_loop_trigger(lp.trigger.as_ref())?;
         let on_completed = encode_loop_completion_hook(lp.on_completed.as_ref())?;
         conn.execute(
-            "INSERT INTO loops (id, name, description, workdir, status, trigger_type, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            "INSERT INTO loops (id, name, description, workdir, status, trigger_type, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action, archived)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 &lp.id,
                 &lp.name,
@@ -49,6 +49,7 @@ impl Database {
                 on_completed,
                 lp.auto_continue_at.map(|value| value.timestamp()),
                 &lp.auto_continue_action,
+                lp.archived,
             ],
         )?;
         Ok(())
@@ -89,7 +90,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action, archived
              FROM loops WHERE autorun_at IS NOT NULL",
         )?;
         let rows = stmt.query_map([], map_loop_row)?;
@@ -144,7 +145,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action, archived
              FROM loops WHERE auto_continue_at IS NOT NULL",
         )?;
         let rows = stmt.query_map([], map_loop_row)?;
@@ -203,7 +204,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action, archived
              FROM loops WHERE trigger_type = ?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![trigger_type], map_loop_row)?;
@@ -248,7 +249,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action, archived
              FROM loops WHERE id = ?1",
         )?;
 
@@ -257,19 +258,36 @@ impl Database {
             .map_err(Into::into)
     }
 
-    pub fn list_loops(&self, workdir: Option<&str>) -> Result<Vec<Loop>> {
+    /// List loops, optionally narrowed to one `workdir`. `include_archived`
+    /// controls whether archived loops are included: `false` is the
+    /// "browsing" view (sidebar, `canopy loop list`, MCP `loop_list`) — an
+    /// archived loop is excluded by the query itself (not filtered in
+    /// memory), never by loading every row and discarding some. Pass `true`
+    /// for a lookup that must still resolve an archived loop (e.g. `canopy
+    /// loop info` by id/name) or to list the archived set for the archive
+    /// view.
+    pub fn list_loops(&self, workdir: Option<&str>, include_archived: bool) -> Result<Vec<Loop>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
-        let sql = if workdir.is_some() {
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action
-             FROM loops WHERE workdir = ?1 ORDER BY created_at DESC"
+        let archived_clause = if include_archived {
+            ""
         } else {
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action
-             FROM loops ORDER BY created_at DESC"
+            " AND archived = 0"
         };
-        let mut stmt = conn.prepare(sql)?;
+        let sql = if workdir.is_some() {
+            format!(
+                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action, archived
+                 FROM loops WHERE workdir = ?1{archived_clause} ORDER BY created_at DESC"
+            )
+        } else {
+            format!(
+                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action, archived
+                 FROM loops WHERE 1=1{archived_clause} ORDER BY created_at DESC"
+            )
+        };
+        let mut stmt = conn.prepare(&sql)?;
         let rows = if let Some(workdir) = workdir {
             stmt.query_map(params![workdir], map_loop_row)?
         } else {
@@ -278,6 +296,71 @@ impl Database {
 
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    /// Archive a loop: it leaves every browsing listing (`list_loops` with
+    /// `include_archived: false`) but its row, specs, and run history are
+    /// untouched — a single-row, atomic flag flip, never a delete/recreate
+    /// or a move to another table (the loop keeps its id and every foreign
+    /// key into it). Refuses a `running` loop (archiving is for work that's
+    /// finished with; pause it first) and a loop that's already archived.
+    pub fn archive_loop(&self, loop_id: &str) -> Result<ArchiveLoopOutcome> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let row: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT status, archived FROM loops WHERE id = ?1",
+                params![loop_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((status, archived)) = row else {
+            return Ok(ArchiveLoopOutcome::NotFound);
+        };
+        if LoopStatus::from_str(&status) == LoopStatus::Running {
+            return Ok(ArchiveLoopOutcome::Running);
+        }
+        if archived != 0 {
+            return Ok(ArchiveLoopOutcome::AlreadyArchived);
+        }
+        conn.execute(
+            "UPDATE loops SET archived = 1 WHERE id = ?1",
+            params![loop_id],
+        )?;
+        Ok(ArchiveLoopOutcome::Archived)
+    }
+
+    /// Restore an archived loop back to the main browsing list. A single-row,
+    /// atomic flag flip — everything the loop carries (specs, run history)
+    /// was never touched by archiving in the first place. Returns `true` when
+    /// a row was actually flipped (i.e. it existed and was archived).
+    pub fn restore_loop(&self, loop_id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE loops SET archived = 0 WHERE id = ?1 AND archived = 1",
+            params![loop_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Count of archived loops — the always-visible number that makes the
+    /// archive non-invisible (see the F4-archive spec). A dedicated `COUNT(*)`
+    /// query, not `list_loops(...).len()`, so the main view never pays for
+    /// loading every archived row just to show a number.
+    pub fn count_archived_loops(&self) -> Result<i64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        conn.query_row("SELECT COUNT(*) FROM loops WHERE archived = 1", [], |row| {
+            row.get(0)
+        })
+        .map_err(Into::into)
     }
 
     pub fn update_loop_status(
@@ -1405,7 +1488,7 @@ impl Database {
 
         let orphaned: Vec<Loop> = {
             let mut stmt = tx.prepare(
-                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action
+                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action, archived
                  FROM loops WHERE status = ?1",
             )?;
             let rows = stmt.query_map(params![LoopStatus::Running.as_str()], map_loop_row)?;
@@ -1775,6 +1858,7 @@ fn map_loop_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Loop> {
             .map(from_timestamp)
             .transpose()?,
         auto_continue_action: row.get(13)?,
+        archived: row.get(14)?,
     })
 }
 
@@ -2020,6 +2104,7 @@ mod tests {
 
     fn sample_loop(id: &str) -> Loop {
         Loop {
+            archived: false,
             id: id.to_string(),
             name: format!("Loop {id}"),
             description: None,
@@ -2071,7 +2156,7 @@ mod tests {
     #[test]
     fn list_loops_empty() {
         let db = test_db();
-        let loops = db.list_loops(None).unwrap();
+        let loops = db.list_loops(None, false).unwrap();
         assert!(loops.is_empty());
     }
 
@@ -2083,7 +2168,7 @@ mod tests {
         db.insert_loop(&loop1).unwrap();
         db.insert_loop(&loop2).unwrap();
 
-        let loops = db.list_loops(None).unwrap();
+        let loops = db.list_loops(None, false).unwrap();
         assert_eq!(loops.len(), 2);
     }
 

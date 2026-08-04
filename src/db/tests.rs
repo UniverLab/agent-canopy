@@ -92,6 +92,7 @@ fn sample_manual_agent(id: &str) -> Agent {
 
 fn sample_loop(id: &str) -> Loop {
     Loop {
+        archived: false,
         id: id.to_string(),
         name: "Auth loop".to_string(),
         description: Some("Implements auth in ordered specs".to_string()),
@@ -4572,4 +4573,250 @@ fn list_project_history_merges_finished_loops_and_past_sessions_newest_first() {
     assert!(!history.iter().any(|e| e.name.contains("other-project")));
     assert!(!history.iter().any(|e| e.name == "Active session"));
     assert!(!history.iter().any(|e| e.name == "Idle terminal"));
+}
+
+// ── Archiving (F4): archive/restore preserve identity and history ──────
+
+/// The property that matters most: archiving a loop with real run history,
+/// then restoring it, must leave that history byte-for-byte intact — not
+/// just flip the `archived` flag. Archiving is deliberately a flag flip, not
+/// a delete-and-recreate or a move to another table, so the loop's id and
+/// its specs/nodes/runs (all foreign-keyed to that id) never move either.
+#[test]
+fn archive_then_restore_preserves_identity_and_run_history() {
+    let db = test_db();
+    let lp = sample_loop("wf-archive");
+    let spec = sample_loop_spec(&lp.id, "spec-archive", 1);
+    let node = sample_loop_node(&spec.id, "node-archive", 1);
+    let run = LoopNodeRun {
+        id: "run-archive".to_string(),
+        loop_id: lp.id.clone(),
+        spec_id: spec.id.clone(),
+        node_id: node.id.clone(),
+        status: LoopRunStatus::Pass,
+        input: Some(serde_json::json!({"feedback": "prior attempt"})),
+        output: Some(serde_json::json!({"summary": "diagnosed the failure"})),
+        started_at: Utc::now(),
+        completed_at: Some(Utc::now()),
+        iteration: 3,
+        pid: None,
+        boot_id: Some("boot-archive".to_string()),
+        session_id: Some("session-archive".to_string()),
+    };
+    db.insert_loop(&lp).unwrap();
+    db.insert_loop_spec(&spec).unwrap();
+    db.insert_loop_node(&node).unwrap();
+    db.insert_loop_run(&run).unwrap();
+
+    let outcome = db.archive_loop(&lp.id).unwrap();
+    assert_eq!(outcome, crate::domain::loops::ArchiveLoopOutcome::Archived);
+
+    // Excluded from the browsing listing (the query itself filters, not an
+    // in-memory pass) ...
+    assert!(!db
+        .list_loops(None, false)
+        .unwrap()
+        .iter()
+        .any(|l| l.id == lp.id));
+    // ... but still resolvable directly by id, and it kept its own id (no
+    // delete-and-recreate).
+    let archived = db.get_loop(&lp.id).unwrap().unwrap();
+    assert_eq!(archived.id, lp.id);
+    assert!(archived.archived);
+    // ... and included when a caller explicitly asks for archived loops too.
+    assert!(db
+        .list_loops(None, true)
+        .unwrap()
+        .iter()
+        .any(|l| l.id == lp.id));
+
+    // The run history — the entire point of archiving over deleting — is
+    // untouched: same spec, same node, same run with its exact payloads.
+    let specs = db.list_loop_specs(&lp.id).unwrap();
+    assert_eq!(specs.len(), 1);
+    assert_eq!(specs[0].id, spec.id);
+    let runs = db.list_loop_runs_for_spec(&spec.id).unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].id, run.id);
+    assert_eq!(runs[0].iteration, 3);
+    assert_eq!(runs[0].session_id.as_deref(), Some("session-archive"));
+    assert_eq!(
+        runs[0]
+            .output
+            .as_ref()
+            .and_then(|value| value.get("summary")),
+        Some(&serde_json::json!("diagnosed the failure"))
+    );
+
+    // Restoring flips the flag back and the loop reappears in the main
+    // listing — still the same row, still the same history.
+    assert!(db.restore_loop(&lp.id).unwrap());
+    let restored = db.get_loop(&lp.id).unwrap().unwrap();
+    assert!(!restored.archived);
+    assert!(db
+        .list_loops(None, false)
+        .unwrap()
+        .iter()
+        .any(|l| l.id == lp.id));
+    let runs_after_restore = db.list_loop_runs_for_spec(&spec.id).unwrap();
+    assert_eq!(runs_after_restore.len(), 1);
+    assert_eq!(runs_after_restore[0].id, run.id);
+}
+
+#[test]
+fn count_archived_loops_reflects_archive_state() {
+    let db = test_db();
+    let a = sample_loop("wf-count-a");
+    let b = sample_loop("wf-count-b");
+    db.insert_loop(&a).unwrap();
+    db.insert_loop(&b).unwrap();
+    assert_eq!(db.count_archived_loops().unwrap(), 0);
+
+    db.archive_loop(&a.id).unwrap();
+    assert_eq!(db.count_archived_loops().unwrap(), 1);
+
+    db.archive_loop(&b.id).unwrap();
+    assert_eq!(db.count_archived_loops().unwrap(), 2);
+
+    db.restore_loop(&a.id).unwrap();
+    assert_eq!(db.count_archived_loops().unwrap(), 1);
+}
+
+#[test]
+fn archive_loop_refuses_a_running_loop() {
+    let db = test_db();
+    let mut lp = sample_loop("wf-running");
+    lp.status = LoopStatus::Running;
+    db.insert_loop(&lp).unwrap();
+
+    let outcome = db.archive_loop(&lp.id).unwrap();
+    assert_eq!(outcome, crate::domain::loops::ArchiveLoopOutcome::Running);
+
+    // Refused, not silently ignored: the loop is still in the main listing.
+    let reloaded = db.get_loop(&lp.id).unwrap().unwrap();
+    assert!(!reloaded.archived);
+    assert_eq!(db.count_archived_loops().unwrap(), 0);
+}
+
+#[test]
+fn archive_loop_already_archived_reports_already_archived() {
+    let db = test_db();
+    let lp = sample_loop("wf-double-archive");
+    db.insert_loop(&lp).unwrap();
+
+    assert_eq!(
+        db.archive_loop(&lp.id).unwrap(),
+        crate::domain::loops::ArchiveLoopOutcome::Archived
+    );
+    assert_eq!(
+        db.archive_loop(&lp.id).unwrap(),
+        crate::domain::loops::ArchiveLoopOutcome::AlreadyArchived
+    );
+}
+
+#[test]
+fn restore_loop_not_archived_is_a_noop() {
+    let db = test_db();
+    let lp = sample_loop("wf-not-archived");
+    db.insert_loop(&lp).unwrap();
+
+    assert!(!db.restore_loop(&lp.id).unwrap());
+    assert!(!db.restore_loop("ghost-loop").unwrap());
+}
+
+/// Permanent deletion — reachable only from the archive on an
+/// already-archived loop — must actually destroy the run history it warns
+/// about, unlike archiving. Exercises the same cascade `ON DELETE CASCADE`
+/// relationships archiving is designed to never touch.
+#[test]
+fn permanent_delete_removes_the_loop_and_its_run_history() {
+    let db = test_db();
+    let lp = sample_loop("wf-permanent-delete");
+    let spec = sample_loop_spec(&lp.id, "spec-permanent-delete", 1);
+    let node = sample_loop_node(&spec.id, "node-permanent-delete", 1);
+    let run = LoopNodeRun {
+        id: "run-permanent-delete".to_string(),
+        loop_id: lp.id.clone(),
+        spec_id: spec.id.clone(),
+        node_id: node.id.clone(),
+        status: LoopRunStatus::Fail,
+        input: None,
+        output: None,
+        started_at: Utc::now(),
+        completed_at: Some(Utc::now()),
+        iteration: 1,
+        pid: None,
+        boot_id: None,
+        session_id: None,
+    };
+    db.insert_loop(&lp).unwrap();
+    db.insert_loop_spec(&spec).unwrap();
+    db.insert_loop_node(&node).unwrap();
+    db.insert_loop_run(&run).unwrap();
+    db.archive_loop(&lp.id).unwrap();
+
+    db.delete_loop(&lp.id).unwrap();
+
+    assert!(db.get_loop(&lp.id).unwrap().is_none());
+    assert!(db.list_loop_specs(&lp.id).unwrap().is_empty());
+    assert!(db.get_loop_run(&run.id).unwrap().is_none());
+}
+
+/// Older databases predate the `archived` column entirely. Opening one
+/// (`Database::new` runs the migration) must add the column, defaulting
+/// every existing row to not-archived with no data movement, and the
+/// migration must be a no-op on a second open.
+#[test]
+fn archived_migration_defaults_existing_rows_and_is_idempotent() {
+    let tmp = NamedTempFile::new().expect("create temp file");
+    let path = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+
+    {
+        let conn = rusqlite::Connection::open(&path).expect("open raw legacy db");
+        conn.execute_batch(
+            "CREATE TABLE loops (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                workdir TEXT NOT NULL,
+                status TEXT NOT NULL,
+                trigger_type TEXT,
+                trigger_config TEXT,
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER,
+                autorun_at INTEGER,
+                spec_pool TEXT,
+                active_run_pool_id TEXT,
+                on_completed TEXT,
+                auto_continue_at INTEGER,
+                auto_continue_action TEXT
+             );
+             INSERT INTO loops (id, name, workdir, status, created_at)
+                 VALUES ('legacy-loop', 'Legacy', '/tmp', 'completed', 0);",
+        )
+        .expect("seed legacy schema");
+    }
+
+    let db = Database::new(&path).expect("open pre-archived db, running migration");
+    let lp = db.get_loop("legacy-loop").unwrap().unwrap();
+    assert_eq!(lp.name, "Legacy");
+    assert!(
+        !lp.archived,
+        "pre-existing rows must default to not archived"
+    );
+
+    // The new column is actually usable after migration.
+    assert_eq!(
+        db.archive_loop("legacy-loop").unwrap(),
+        crate::domain::loops::ArchiveLoopOutcome::Archived
+    );
+    drop(db);
+
+    // Reopening after the migration already ran must be a no-op: same data,
+    // no error (idempotent), archived state preserved.
+    let db = Database::new(&path).expect("reopen db after migration already applied");
+    let lp = db.get_loop("legacy-loop").unwrap().unwrap();
+    assert!(lp.archived);
 }

@@ -159,8 +159,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         dialogs::draw_quit_confirm(frame, &theme);
     } else if app.delete_project_confirm {
         dialogs::draw_delete_project_confirm(frame, &theme);
-    } else if app.delete_loop_confirm {
-        dialogs::draw_delete_loop_confirm(frame, &theme);
+    } else if app.archive_loop_confirm {
+        dialogs::draw_archive_loop_confirm(frame, &theme);
+    } else if app.permanent_delete_loop_confirm {
+        dialogs::draw_permanent_delete_loop_confirm(frame, &theme);
     }
 
     if app.show_legend {

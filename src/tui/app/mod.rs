@@ -92,7 +92,8 @@ impl App {
             pending_launch_dialog: None,
             quit_confirm: false,
             delete_project_confirm: false,
-            delete_loop_confirm: false,
+            archive_loop_confirm: false,
+            permanent_delete_loop_confirm: false,
             sidebar_brain: None,
             home_brain: None,
             sidebar_click_map: Vec::new(),
@@ -108,6 +109,9 @@ impl App {
             project_tab_row_click_map: Vec::new(),
             sidebar_tab_click_map: Vec::new(),
             loops: Vec::new(),
+            archived_loops: Vec::new(),
+            archived_loop_count: 0,
+            loop_view_archived: false,
             selected_loop_id: None,
             loop_details: None,
             loop_runs: Vec::new(),
@@ -822,7 +826,7 @@ impl App {
                 .unwrap_or(0);
             let last_activity = self
                 .db
-                .list_loops(Some(project.path.as_str()))
+                .list_loops(Some(project.path.as_str()), true)
                 .ok()
                 .and_then(|loops| loops.iter().map(|lp| lp.created_at.timestamp()).max());
             cache.insert(
@@ -904,7 +908,14 @@ impl App {
     }
 
     fn refresh_loops(&mut self) -> Result<()> {
-        self.loops = self.db.list_loops(None)?;
+        self.loops = self.db.list_loops(None, false)?;
+        self.archived_loop_count = self.db.count_archived_loops().unwrap_or(0) as usize;
+        if self.loop_view_archived {
+            self.archived_loops = self.db.list_loops(None, true)?;
+            self.archived_loops.retain(|lp| lp.archived);
+        } else {
+            self.archived_loops.clear();
+        }
         self.refresh_loop_sidebar_meta();
         self.refresh_loops_selection();
         Ok(())
@@ -972,6 +983,11 @@ impl App {
     /// on the refresh cadence, not queried here, so listing every loop adds
     /// no per-tick database work.
     pub fn sidebar_loops(&self) -> Vec<&crate::domain::loops::Loop> {
+        if self.loop_view_archived {
+            let mut loops: Vec<&crate::domain::loops::Loop> = self.archived_loops.iter().collect();
+            loops.sort_by_key(|lp| std::cmp::Reverse(lp.created_at));
+            return loops;
+        }
         let mut loops: Vec<&crate::domain::loops::Loop> = self.loops.iter().collect();
         loops.sort_by_key(|lp| {
             std::cmp::Reverse(
@@ -1257,12 +1273,20 @@ impl App {
     }
 
     pub fn visible_loops(&self) -> Vec<&crate::domain::loops::Loop> {
-        self.loops.iter().collect()
+        if self.loop_view_archived {
+            self.archived_loops.iter().collect()
+        } else {
+            self.loops.iter().collect()
+        }
     }
 
     pub fn selected_loop(&self) -> Option<&crate::domain::loops::Loop> {
         let selected_id = self.selected_loop_id.as_ref()?;
-        self.loops.iter().find(|lp| lp.id == *selected_id)
+        if self.loop_view_archived {
+            self.archived_loops.iter().find(|lp| lp.id == *selected_id)
+        } else {
+            self.loops.iter().find(|lp| lp.id == *selected_id)
+        }
     }
 
     pub fn selected_loop_spec(&self) -> Option<&crate::domain::loops::LoopSpecDetails> {
@@ -1300,7 +1324,39 @@ impl App {
         Ok(())
     }
 
-    pub fn delete_selected_loop(&mut self) -> Result<()> {
+    /// Archive the loop currently selected in the main (non-archived) view.
+    /// A no-op (not an error) when nothing is selected, the loop is already
+    /// archived, or it's still `running` (archiving is for work that's
+    /// finished with — pause it first).
+    pub fn archive_selected_loop(&mut self) -> Result<()> {
+        let Some(lp) = self.selected_loop() else {
+            return Ok(());
+        };
+        self.db.archive_loop(&lp.id)?;
+        self.refresh_loops()?;
+        self.refresh_projects()?;
+        self.refresh_rag_state()?;
+        Ok(())
+    }
+
+    /// Restore the loop currently selected in the archived view back to the
+    /// main list. A no-op when nothing is selected.
+    pub fn restore_selected_archived_loop(&mut self) -> Result<()> {
+        let Some(lp) = self.selected_loop() else {
+            return Ok(());
+        };
+        self.db.restore_loop(&lp.id)?;
+        self.refresh_loops()?;
+        self.refresh_projects()?;
+        self.refresh_rag_state()?;
+        Ok(())
+    }
+
+    /// Permanently delete the loop currently selected in the archived view —
+    /// the deliberate, separate act this spec keeps behind the archive: it
+    /// destroys the loop's row and, via `ON DELETE CASCADE`, its specs and
+    /// full run history. A no-op when nothing is selected.
+    pub fn permanent_delete_selected_archived_loop(&mut self) -> Result<()> {
         let Some(lp) = self.selected_loop() else {
             return Ok(());
         };
@@ -1309,6 +1365,15 @@ impl App {
         self.refresh_projects()?;
         self.refresh_rag_state()?;
         Ok(())
+    }
+
+    /// Toggle the Loops sidebar section between the main list and the
+    /// archive. Refreshes immediately so the archived list is populated the
+    /// moment it becomes visible (`refresh_loops` only loads
+    /// `archived_loops` while this flag is set).
+    pub fn toggle_loop_archive_view(&mut self) {
+        self.loop_view_archived = !self.loop_view_archived;
+        let _ = self.refresh_loops();
     }
 
     pub fn delete_selected_knowledge(&mut self) -> Result<()> {
@@ -3840,6 +3905,7 @@ mod tests {
         status: crate::domain::loops::LoopStatus,
     ) -> crate::domain::loops::Loop {
         crate::domain::loops::Loop {
+            archived: false,
             id: id.to_string(),
             name: name.to_string(),
             description: None,
@@ -5475,6 +5541,7 @@ mod tests {
         };
 
         db.insert_loop(&Loop {
+            archived: false,
             id: "rlp1".to_string(),
             name: "router loop".to_string(),
             description: None,

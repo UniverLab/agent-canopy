@@ -938,6 +938,25 @@ impl Database {
             .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
         }
 
+        // Archiving (F4): a loop can leave the sidebar's browsing list
+        // without losing its row, specs, or run history — the reversible
+        // alternative to `delete_loop`. A constant `DEFAULT 0` means every
+        // pre-existing loop reads as not-archived with no data movement.
+        let has_archived: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loops') WHERE name = 'archived'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_archived {
+            conn.execute(
+                "ALTER TABLE loops ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
         Ok(())
     }
 }

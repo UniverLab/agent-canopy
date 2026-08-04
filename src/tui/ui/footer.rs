@@ -7,7 +7,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use super::theme::Theme;
-use crate::tui::app::types::{AgentEntry, App, Focus, ProjectTab, SidebarLayer};
+use crate::tui::app::types::{AgentEntry, App, AutomationKind, Focus, ProjectTab, SidebarLayer};
 
 pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let activity_available = app.activity_panel_available();
@@ -41,9 +41,29 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Them
                 h.push(("Esc", "home"));
                 h
             } else {
+                let on_loop = app.sidebar_layer == SidebarLayer::Automation
+                    && app.automation_kind == AutomationKind::Loop;
                 let is_bg = matches!(app.selected_agent(), Some(AgentEntry::Agent(_)));
                 let mut h = vec![("↑↓", "nav"), ("Enter", "focus"), ("Shift+←→", "tab")];
-                if is_bg {
+                if on_loop {
+                    h.push(("e", "edit"));
+                    if app.loop_view_archived {
+                        h.push(("R", "restore"));
+                        h.push(("F4", "delete forever"));
+                    } else {
+                        h.push(("F4", "archive"));
+                    }
+                    h.push((
+                        "A",
+                        if app.loop_view_archived {
+                            "loops"
+                        } else if app.archived_loop_count > 0 {
+                            "archived"
+                        } else {
+                            "archive"
+                        },
+                    ));
+                } else if is_bg {
                     h.push(("e", "edit"));
                     h.push(("d", "toggle"));
                     h.push(("F4", "delete"));
