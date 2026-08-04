@@ -475,33 +475,121 @@ impl Database {
             .map_err(Into::into)
     }
 
-    /// Seed the builtin ensemble blueprints (currently just
-    /// "ensemble-proposers") if missing. Idempotent, mirroring
-    /// [`Self::seed_builtin_blueprints`] — safe to call on every daemon
-    /// startup.
-    pub fn seed_builtin_ensemble_blueprints(&self) -> Result<()> {
-        for (name, prompt_template, members, min_pass) in builtin_ensemble_blueprint_specs() {
-            if self.get_ensemble_blueprint_by_name(name)?.is_some() {
-                continue;
-            }
-            self.insert_ensemble_blueprint(&EnsembleBlueprint {
-                id: uuid::Uuid::new_v4().to_string(),
-                name: name.to_string(),
-                prompt_template: prompt_template.to_string(),
-                members: members
-                    .into_iter()
-                    .map(|(platform, model, prompt_override)| {
-                        (
-                            platform.to_string(),
-                            model.map(str::to_string),
-                            prompt_override.map(str::to_string),
-                        )
-                    })
-                    .collect(),
+    pub fn list_ensemble_blueprints(&self) -> Result<Vec<EnsembleBlueprint>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, prompt_template, members, min_pass, builtin, created_at
+             FROM ensemble_blueprints ORDER BY builtin DESC, name ASC",
+        )?;
+        let rows = stmt.query_map([], map_ensemble_blueprint_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Delete an ensemble blueprint by name. Mirrors
+    /// [`Self::delete_blueprint_by_name`]: callers own any builtin guard —
+    /// this performs none itself.
+    pub fn delete_ensemble_blueprint_by_name(&self, name: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "DELETE FROM ensemble_blueprints WHERE name = ?1",
+            params![name],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Overwrite a builtin ensemble blueprint row's `prompt_template`/
+    /// `members`/`min_pass` in place — the ensemble mirror of
+    /// [`Self::update_builtin_blueprint`], reconciling a stale builtin shape
+    /// (e.g. a hardcoded model identity from before this field was dropped)
+    /// with the current spec. Only ever called from
+    /// [`Self::seed_builtin_ensemble_blueprints`].
+    fn update_builtin_ensemble_blueprint(
+        &self,
+        id: &str,
+        prompt_template: &str,
+        members: &[EnsembleMemberSpec],
+        min_pass: Option<i64>,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        conn.execute(
+            "UPDATE ensemble_blueprints SET prompt_template = ?1, members = ?2, min_pass = ?3 WHERE id = ?4",
+            params![
+                prompt_template,
+                serde_json::to_string(members)?,
                 min_pass,
-                builtin: true,
-                created_at: Utc::now(),
-            })?;
+                id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Seed the builtin ensemble blueprints (currently just
+    /// "ensemble-proposers") and keep already-seeded builtin rows in sync
+    /// with the current `builtin_ensemble_blueprint_specs()` shape —
+    /// idempotent and safe on every daemon startup, mirroring
+    /// [`Self::seed_builtin_blueprints`]'s stale-name-delete /
+    /// drifted-config-overwrite / leave-custom-rows-alone behavior exactly.
+    pub fn seed_builtin_ensemble_blueprints(&self) -> Result<()> {
+        let specs = builtin_ensemble_blueprint_specs();
+        let current_names: std::collections::HashSet<&str> =
+            specs.iter().map(|(name, ..)| *name).collect();
+
+        for existing in self.list_ensemble_blueprints()? {
+            if existing.builtin && !current_names.contains(existing.name.as_str()) {
+                self.delete_ensemble_blueprint_by_name(&existing.name)?;
+            }
+        }
+
+        for (name, prompt_template, members, min_pass) in specs {
+            let members: Vec<EnsembleMemberSpec> = members
+                .into_iter()
+                .map(|(platform, model, prompt_override)| {
+                    (
+                        platform.to_string(),
+                        model.map(str::to_string),
+                        prompt_override.map(str::to_string),
+                    )
+                })
+                .collect();
+
+            match self.get_ensemble_blueprint_by_name(name)? {
+                Some(existing) if existing.builtin => {
+                    if existing.prompt_template != prompt_template
+                        || existing.members != members
+                        || existing.min_pass != min_pass
+                    {
+                        self.update_builtin_ensemble_blueprint(
+                            &existing.id,
+                            prompt_template,
+                            &members,
+                            min_pass,
+                        )?;
+                    }
+                }
+                // Name already claimed by a custom ensemble blueprint — leave it be.
+                Some(_) => {}
+                None => {
+                    self.insert_ensemble_blueprint(&EnsembleBlueprint {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        name: name.to_string(),
+                        prompt_template: prompt_template.to_string(),
+                        members,
+                        min_pass,
+                        builtin: true,
+                        created_at: Utc::now(),
+                    })?;
+                }
+            }
         }
         Ok(())
     }
@@ -1298,6 +1386,98 @@ mod tests {
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         let result = db.get_ensemble_blueprint_by_name("nonexistent").unwrap();
         assert!(result.is_none());
+    }
+
+    /// An installation whose `ensemble_blueprints` row still carries the old
+    /// hardcoded free-tier model identities must have them reconciled away
+    /// (to `None`) on the next startup reseed, and the reseed must be
+    /// idempotent.
+    #[test]
+    fn seed_builtin_ensemble_blueprints_migrates_hardcoded_model_identities() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+
+        db.delete_ensemble_blueprint_by_name("ensemble-proposers")
+            .unwrap();
+        db.insert_ensemble_blueprint(&EnsembleBlueprint {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "ensemble-proposers".to_string(),
+            prompt_template: "Draft it".to_string(),
+            members: vec![
+                (
+                    "openrouter".to_string(),
+                    Some("deepseek/deepseek-chat-v3.1:free".to_string()),
+                    None,
+                ),
+                (
+                    "openrouter".to_string(),
+                    Some("qwen/qwen3-coder:free".to_string()),
+                    None,
+                ),
+                (
+                    "openrouter".to_string(),
+                    Some("meta-llama/llama-3.3-70b-instruct:free".to_string()),
+                    None,
+                ),
+            ],
+            min_pass: None,
+            builtin: true,
+            created_at: Utc::now(),
+        })
+        .unwrap();
+
+        db.seed_builtin_ensemble_blueprints().unwrap();
+
+        let migrated = db
+            .get_ensemble_blueprint_by_name("ensemble-proposers")
+            .unwrap()
+            .unwrap();
+        assert_eq!(migrated.members.len(), 3);
+        for (platform, model, _) in &migrated.members {
+            assert_eq!(platform, "openrouter");
+            assert!(model.is_none(), "model identity must be reconciled away");
+        }
+
+        // Idempotent: a second reseed changes nothing further.
+        db.seed_builtin_ensemble_blueprints().unwrap();
+        let after_second = db
+            .get_ensemble_blueprint_by_name("ensemble-proposers")
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_second.members, migrated.members);
+    }
+
+    /// A custom ensemble blueprint that claims the builtin's name must never
+    /// be overwritten or deleted by the migration.
+    #[test]
+    fn seed_builtin_ensemble_blueprints_never_touches_a_custom_blueprint_with_a_builtin_name() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        db.delete_ensemble_blueprint_by_name("ensemble-proposers")
+            .unwrap();
+
+        let custom = EnsembleBlueprint {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "ensemble-proposers".to_string(),
+            prompt_template: "my own take".to_string(),
+            members: vec![("claude".to_string(), None, None)],
+            min_pass: Some(1),
+            builtin: false,
+            created_at: Utc::now(),
+        };
+        db.insert_ensemble_blueprint(&custom).unwrap();
+
+        db.seed_builtin_ensemble_blueprints().unwrap();
+
+        let fetched = db
+            .get_ensemble_blueprint_by_name("ensemble-proposers")
+            .unwrap()
+            .unwrap();
+        assert!(
+            !fetched.builtin,
+            "custom ensemble blueprint must stay custom"
+        );
+        assert_eq!(fetched.prompt_template, "my own take");
     }
 
     /// A member's `prompt_override` round-trips through `insert_ensemble_unit`

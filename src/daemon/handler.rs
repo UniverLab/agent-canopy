@@ -687,6 +687,20 @@ fn json_value_kind_name(value: &serde_json::Value) -> &'static str {
     }
 }
 
+/// Whether an agent node's config names a harness — a non-empty `platform`
+/// or `cli` field. Shared by [`validate_node_config`]'s `Agent` arm (the
+/// general "this config can run" gate) and `resolve_node_kind_and_config`'s
+/// blueprint branch (which needs the same check before merge, to give a
+/// blueprint-specific error instead of the generic one).
+fn config_has_agent_harness(map: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let has_non_empty_str = |field: &str| {
+        map.get(field)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+    };
+    has_non_empty_str("platform") || has_non_empty_str("cli")
+}
+
 /// Validate that a loop node's config is a JSON object with the fields its
 /// kind needs at execution time. This exists because a double-encoded config
 /// (e.g. `"{\"platform\": \"mimo\"}"` instead of `{"platform": "mimo"}`) used
@@ -709,7 +723,7 @@ fn validate_node_config(kind: LoopNodeKind, config: &serde_json::Value) -> Resul
 
     match kind {
         LoopNodeKind::Agent => {
-            if !has_non_empty_str("platform") && !has_non_empty_str("cli") {
+            if !config_has_agent_harness(map) {
                 return Err(
                     "Loop node config for kind 'agent' must include a non-empty 'platform' (or 'cli') field.".to_string(),
                 );
@@ -839,6 +853,21 @@ fn resolve_node_kind_and_config(
             };
             let overrides = config_overrides.map(serde_json::Value::Object);
             let merged = merge_blueprint_config(&bp.config, overrides.as_ref());
+            // Blueprints intentionally carry no platform/cli (see
+            // `builtin_blueprint_specs`) — which harness runs a node is the
+            // caller's decision, supplied here via `config_overrides`, never
+            // a default this resolver falls back to. Catching the missing
+            // case here (rather than only via `validate_node_config`'s
+            // generic message) lets the error name the blueprint and say
+            // *why* the field is missing instead of just that it is.
+            if node_kind == LoopNodeKind::Agent {
+                let has_harness = merged.as_object().is_some_and(config_has_agent_harness);
+                if !has_harness {
+                    return Err(format!(
+                        "Blueprint '{blueprint_name}' intentionally does not provide a platform (or cli) — which harness runs a node is the caller's decision, not the blueprint's. Pass config_overrides with a non-empty 'platform' (and 'model' if that platform needs one) to select the harness."
+                    ));
+                }
+            }
             Ok((node_kind, merged))
         }
         None => {
@@ -7593,11 +7622,11 @@ mod tests {
             .map(|b| b.name)
             .collect();
         for expected in [
-            "implementer-claude",
+            "implementer",
             "cargo-gates",
-            "reviewer-committer-mimo",
+            "reviewer-committer",
             "commit-check",
-            "resilience-mimo",
+            "resilience",
         ] {
             assert!(
                 names_after_first_start.contains(&expected.to_string()),
@@ -7653,11 +7682,11 @@ mod tests {
         // Deleting a builtin is refused at the validation layer with an
         // actionable message, before ever touching the DB.
         let builtin = db
-            .get_blueprint_by_name("implementer-claude")
+            .get_blueprint_by_name("implementer")
             .unwrap()
             .expect("builtin should exist");
         let error = super::validate_blueprint_deletable(&builtin).unwrap_err();
-        assert!(error.contains("implementer-claude"));
+        assert!(error.contains("implementer"));
         assert!(error.contains("cannot be deleted"));
     }
 
@@ -7666,24 +7695,68 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Database::new(&dir.path().join("test.db")).unwrap();
 
+        // The builtin carries no platform (see `builtin_blueprint_specs`),
+        // so the caller must supply one via `config_overrides` — this also
+        // exercises the required-override path with a successful call.
         let mut overrides = serde_json::Map::new();
-        overrides.insert(
-            "prompt".to_string(),
-            serde_json::json!("custom overridden prompt"),
-        );
+        overrides.insert("platform".to_string(), serde_json::json!("claude"));
+        overrides.insert("model".to_string(), serde_json::json!("opus"));
 
-        let (kind, config) = resolve_node_kind_and_config(
-            &db,
-            None,
-            None,
-            Some("implementer-claude"),
-            Some(overrides),
-        )
-        .expect("blueprint resolution should succeed");
+        let (kind, config) =
+            resolve_node_kind_and_config(&db, None, None, Some("implementer"), Some(overrides))
+                .expect("blueprint resolution should succeed");
 
         assert_eq!(kind, LoopNodeKind::Agent);
-        assert_eq!(config["prompt"], "custom overridden prompt");
-        // Other templated keys (e.g. platform) survive the shallow merge.
+        assert_eq!(config["platform"], "claude");
+        assert_eq!(config["model"], "opus");
+        // The templated key (prompt_preset) survives the shallow merge.
+        assert_eq!(config["prompt_preset"], "implementer");
+    }
+
+    /// The caller-must-supply-a-harness contract, from the other side: an
+    /// agent blueprint's config omits `platform`/`cli` by design (see
+    /// `builtin_blueprint_specs`), so creating a node from one without
+    /// `config_overrides` supplying it must fail — never silently fall back
+    /// to a default harness — with a message that names the missing field
+    /// and says the omission is intentional.
+    #[test]
+    fn loop_add_node_from_agent_blueprint_without_harness_override_fails_with_useful_message() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+
+        let error =
+            resolve_node_kind_and_config(&db, None, None, Some("implementer"), None).unwrap_err();
+
+        assert!(error.contains("implementer"), "{error}");
+        assert!(error.contains("platform"), "{error}");
+        assert!(
+            error.contains("intentionally"),
+            "error should explain the blueprint intentionally omits a harness: {error}"
+        );
+    }
+
+    /// A custom blueprint that pins its own platform (the pre-existing,
+    /// still-supported pattern) needs no override at all — only the
+    /// harness-free builtins require one.
+    #[test]
+    fn loop_add_node_from_custom_blueprint_with_platform_needs_no_override() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        db.insert_blueprint(&Blueprint {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "my-pinned-implementer".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "claude", "prompt": "go implement it"}),
+            builtin: false,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let (kind, config) =
+            resolve_node_kind_and_config(&db, None, None, Some("my-pinned-implementer"), None)
+                .expect("a custom blueprint with its own platform should not require an override");
+
+        assert_eq!(kind, LoopNodeKind::Agent);
         assert_eq!(config["platform"], "claude");
     }
 
@@ -7695,11 +7768,11 @@ mod tests {
         let error = validate_blueprint_exists(&db, "does-not-exist").unwrap_err();
 
         assert!(error.contains("does-not-exist"));
-        assert!(error.contains("implementer-claude"));
+        assert!(error.contains("implementer"));
         assert!(error.contains("cargo-gates"));
-        assert!(error.contains("reviewer-committer-mimo"));
+        assert!(error.contains("reviewer-committer"));
         assert!(error.contains("commit-check"));
-        assert!(error.contains("resilience-mimo"));
+        assert!(error.contains("resilience"));
     }
 
     #[test]

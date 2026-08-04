@@ -26,16 +26,24 @@ pub struct Blueprint {
     pub created_at: DateTime<Utc>,
 }
 
-/// The proven 5-node pattern, seeded as builtins if missing at daemon
-/// startup: an implementer, a gate check, a reviewer/committer, a commit
-/// check, and a resilience/unblock step.
+/// The proven 5-node pattern, seeded (and kept in sync — see
+/// `Database::seed_builtin_blueprints`) as builtins at daemon startup: an
+/// implementer, a gate check, a reviewer/committer, a commit check, and a
+/// resilience/unblock step.
+///
+/// None of these carry a `platform`/`cli`/`model`: a blueprint describes the
+/// *role* a node plays (its kind and its prompt), not which harness runs it.
+/// Which harness executes a node is a per-installation, per-budget decision
+/// that belongs to whoever assembles the loop, supplied via `loop_add_node`'s
+/// `config_overrides` — never a default baked into the blueprint. See the
+/// module doc and `validate_node_config`'s `Agent` arm, which is what
+/// actually enforces this at node-creation time.
 pub fn builtin_blueprint_specs() -> Vec<(&'static str, LoopNodeKind, Value)> {
     vec![
         (
-            "implementer-claude",
+            "implementer",
             LoopNodeKind::Agent,
             serde_json::json!({
-                "platform": "claude",
                 "prompt_preset": "implementer"
             }),
         ),
@@ -47,10 +55,9 @@ pub fn builtin_blueprint_specs() -> Vec<(&'static str, LoopNodeKind, Value)> {
             }),
         ),
         (
-            "reviewer-committer-mimo",
+            "reviewer-committer",
             LoopNodeKind::Agent,
             serde_json::json!({
-                "platform": "mimo",
                 "prompt_preset": "reviewer"
             }),
         ),
@@ -62,10 +69,9 @@ pub fn builtin_blueprint_specs() -> Vec<(&'static str, LoopNodeKind, Value)> {
             }),
         ),
         (
-            "resilience-mimo",
+            "resilience",
             LoopNodeKind::Agent,
             serde_json::json!({
-                "platform": "mimo",
                 "prompt_preset": "resilience"
             }),
         ),
@@ -103,10 +109,19 @@ pub type EnsembleBlueprintSpec = (
     Option<i64>,
 );
 
-/// The builtin "ensemble-proposers" pattern (F1's canonical use (a)): 3 free
-/// OpenRouter models draft a solution for the same spec in parallel, so an
+/// The builtin "ensemble-proposers" pattern (F1's canonical use (a)): 3
+/// OpenRouter members draft a solution for the same spec in parallel, so an
 /// implementer downstream spends its (potentially non-free) quota only once,
 /// on a pre-digested task instead of a blank spec.
+///
+/// What makes this pattern reusable is the member *count* (3, for enough
+/// diversity without runaway cost) and the shared prompt — not which model
+/// each member runs. A specific free-tier model name (e.g.
+/// `deepseek/deepseek-chat-v3.1:free`) can be renamed, deprecated, or
+/// rate-limited out from under a blueprint that hardcodes it, exactly like
+/// pinning a harness in a single-node blueprint would; `model: None` lets
+/// OpenRouter (or whoever assembles the loop, via `loop_add_ensemble`'s
+/// `members` param) pick one.
 pub fn builtin_ensemble_blueprint_specs() -> Vec<EnsembleBlueprintSpec> {
     vec![(
         "ensemble-proposers",
@@ -115,13 +130,9 @@ pub fn builtin_ensemble_blueprint_specs() -> Vec<EnsembleBlueprintSpec> {
          seeing this spec itself, so leave nothing implicit:\n\n{{spec_content}}\n\n\
          Previous feedback (if any): {{previous_feedback}}",
         vec![
-            ("openrouter", Some("deepseek/deepseek-chat-v3.1:free"), None),
-            ("openrouter", Some("qwen/qwen3-coder:free"), None),
-            (
-                "openrouter",
-                Some("meta-llama/llama-3.3-70b-instruct:free"),
-                None,
-            ),
+            ("openrouter", None, None),
+            ("openrouter", None, None),
+            ("openrouter", None, None),
         ],
         None,
     )]
@@ -223,13 +234,44 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "implementer-claude",
+                "implementer",
                 "cargo-gates",
-                "reviewer-committer-mimo",
+                "reviewer-committer",
                 "commit-check",
-                "resilience-mimo",
+                "resilience",
             ]
         );
+    }
+
+    /// A blueprint name must describe the node's role, not which harness
+    /// happens to run it — no builtin name should carry a CLI/platform token
+    /// like the pre-rename `implementer-claude`/`*-mimo` names did.
+    #[test]
+    fn builtin_blueprint_names_carry_no_harness_token() {
+        for (name, _, _) in builtin_blueprint_specs() {
+            for token in ["claude", "mimo", "codex", "openrouter"] {
+                assert!(
+                    !name.contains(token),
+                    "blueprint name '{name}' must not encode a harness (found '{token}')"
+                );
+            }
+        }
+    }
+
+    /// The harness that runs a node is a per-installation decision the
+    /// caller supplies via `config_overrides` at node-creation time, never a
+    /// default baked into the blueprint — so no builtin config may carry
+    /// `platform`, `cli`, or `model`.
+    #[test]
+    fn builtin_blueprint_specs_carry_no_platform_cli_or_model() {
+        for (name, _, config) in builtin_blueprint_specs() {
+            for field in ["platform", "cli", "model"] {
+                assert!(
+                    config.get(field).is_none(),
+                    "blueprint '{name}' must not carry a '{field}' field"
+                );
+            }
+        }
     }
 
     #[test]
@@ -257,14 +299,14 @@ mod tests {
     fn validate_blueprint_deletable_refuses_builtins() {
         let bp = Blueprint {
             id: "1".to_string(),
-            name: "implementer-claude".to_string(),
+            name: "implementer".to_string(),
             kind: LoopNodeKind::Agent,
             config: serde_json::json!({}),
             builtin: true,
             created_at: Utc::now(),
         };
         let error = validate_blueprint_deletable(&bp).unwrap_err();
-        assert!(error.contains("implementer-claude"));
+        assert!(error.contains("implementer"));
         assert!(error.contains("cannot be deleted"));
     }
 
@@ -276,6 +318,25 @@ mod tests {
         assert!(!prompt_template.is_empty());
         assert!(members.len() >= 2 && members.len() <= 8);
         assert!(min_pass.is_none());
+    }
+
+    /// The model *identity* each member runs is not the reusable part of an
+    /// ensemble blueprint (member count + shared prompt are) — a hardcoded
+    /// free-tier model name can vanish or rate-limit out from under it.
+    #[test]
+    fn builtin_ensemble_blueprint_specs_carry_no_model_identity() {
+        let specs = builtin_ensemble_blueprint_specs();
+        let (name, _, members, _) = &specs[0];
+        for (platform, model, _) in members {
+            assert!(
+                !platform.is_empty(),
+                "ensemble '{name}' member needs a platform"
+            );
+            assert!(
+                model.is_none(),
+                "ensemble '{name}' member must not carry a hardcoded model"
+            );
+        }
     }
 
     #[test]
