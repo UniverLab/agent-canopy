@@ -564,14 +564,22 @@ pub struct LoopUpdateEdgeParams {
     pub route: Option<String>,
 }
 
-/// One ensemble member: differs from its siblings only by
-/// platform/model — homogeneous by design (v1), see `loop_add_ensemble`.
+/// One ensemble member: differs from its siblings by platform/model and,
+/// optionally, its own prompt — see `loop_add_ensemble`.
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct EnsembleMemberParams {
     /// CLI platform for this member (e.g. "claude", "openrouter").
     pub platform: String,
     /// Optional model override for this member.
     pub model: Option<String>,
+    /// Optional prompt for this member only, replacing the ensemble's shared
+    /// `prompt_template` — same placeholders (e.g. `{{spec_content}}`,
+    /// `{{previous_feedback}}`), rendered the same way. Lets a panel review
+    /// the same input from several angles (context, security, conventions...)
+    /// in one ensemble instead of one prompt across different models. Omit to
+    /// use the shared prompt, same as every member before this field existed.
+    /// Independent of `platform`/`model`.
+    pub prompt_override: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -587,8 +595,9 @@ pub struct LoopAddEnsembleParams {
     /// placeholders as an agent node's `prompt_template`. Required unless
     /// `blueprint` supplies one.
     pub prompt_template: Option<String>,
-    /// 2-8 members: parallel proposer/reviewer variants that differ only by
-    /// platform/model. Required unless `blueprint` supplies them.
+    /// 2-8 members: parallel proposer/reviewer variants that differ by
+    /// platform/model and, optionally, per-member `prompt_override`. Required
+    /// unless `blueprint` supplies them.
     pub members: Option<Vec<EnsembleMemberParams>>,
     /// Name of an existing ensemble blueprint (e.g. "ensemble-proposers") to
     /// source `prompt_template`/`members` from when they're omitted above.
@@ -623,8 +632,10 @@ pub struct LoopUpdateEnsembleParams {
     /// New shared prompt, propagated to every current member.
     pub prompt_template: Option<String>,
     /// Replacement member list (2-8 entries) — added/removed/replaced by
-    /// position. Individual member overrides are not supported; this always
-    /// replaces the full list.
+    /// position, always the full list (there is no way to patch a single
+    /// member in place). Each entry may set its own `prompt_override`; a
+    /// member without one uses the (possibly also-updated) shared
+    /// `prompt_template`.
     pub members: Option<Vec<EnsembleMemberParams>>,
     /// New pass threshold.
     pub min_pass: Option<i64>,

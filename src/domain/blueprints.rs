@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::domain::loops::LoopNodeKind;
+use crate::domain::loops::{EnsembleMemberSpec, LoopNodeKind};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Blueprint {
@@ -81,8 +81,10 @@ pub struct EnsembleBlueprint {
     pub id: String,
     pub name: String,
     pub prompt_template: String,
-    /// `(platform, model)` pairs, in the order members are created.
-    pub members: Vec<(String, Option<String>)>,
+    /// `(platform, model, prompt_override)` triples, in the order members
+    /// are created. `prompt_override` replaces `prompt_template` for that
+    /// member only — same convention as `EnsembleMember::prompt_override`.
+    pub members: Vec<EnsembleMemberSpec>,
     /// Suggested `min_pass`. `None` means "every member" — the same default
     /// `loop_add_ensemble` uses when the caller doesn't pass `min_pass`.
     pub min_pass: Option<i64>,
@@ -92,11 +94,12 @@ pub struct EnsembleBlueprint {
 
 /// `(name, prompt_template, members, min_pass)` — the raw tuple shape a
 /// builtin ensemble blueprint spec is defined as, before being seeded into
-/// the `ensemble_blueprints` table as an [`EnsembleBlueprint`] row.
+/// the `ensemble_blueprints` table as an [`EnsembleBlueprint`] row. Each
+/// member is `(platform, model, prompt_override)`.
 pub type EnsembleBlueprintSpec = (
     &'static str,
     &'static str,
-    Vec<(&'static str, Option<&'static str>)>,
+    Vec<(&'static str, Option<&'static str>, Option<&'static str>)>,
     Option<i64>,
 );
 
@@ -112,9 +115,13 @@ pub fn builtin_ensemble_blueprint_specs() -> Vec<EnsembleBlueprintSpec> {
          seeing this spec itself, so leave nothing implicit:\n\n{{spec_content}}\n\n\
          Previous feedback (if any): {{previous_feedback}}",
         vec![
-            ("openrouter", Some("deepseek/deepseek-chat-v3.1:free")),
-            ("openrouter", Some("qwen/qwen3-coder:free")),
-            ("openrouter", Some("meta-llama/llama-3.3-70b-instruct:free")),
+            ("openrouter", Some("deepseek/deepseek-chat-v3.1:free"), None),
+            ("openrouter", Some("qwen/qwen3-coder:free"), None),
+            (
+                "openrouter",
+                Some("meta-llama/llama-3.3-70b-instruct:free"),
+                None,
+            ),
         ],
         None,
     )]
@@ -376,8 +383,9 @@ mod tests {
                 (
                     "openrouter".to_string(),
                     Some("deepseek/deepseek-chat-v3.1:free".to_string()),
+                    None,
                 ),
-                ("claude".to_string(), None),
+                ("claude".to_string(), None, Some("review it".to_string())),
             ],
             min_pass: Some(1),
             builtin: false,

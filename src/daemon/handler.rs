@@ -52,9 +52,10 @@ use crate::db::Database;
 use crate::domain::blueprints::{merge_blueprint_config, validate_blueprint_deletable, Blueprint};
 use crate::domain::loops::{
     validate_router_edges_declared, validate_router_route_coverage, validate_router_routes,
-    validate_spec_description_template, Ensemble, EnsembleMember, Loop, LoopDetails, LoopEdge,
-    LoopEdgeCondition, LoopNode, LoopNodeKind, LoopNodeRun, LoopResetOutcome, LoopRunStatus,
-    LoopSpec, LoopSpecStatus, LoopStatus, RouterRoute, SpecAdminStatusOutcome,
+    validate_spec_description_template, Ensemble, EnsembleMember, EnsembleMemberSpec, Loop,
+    LoopDetails, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind, LoopNodeRun,
+    LoopResetOutcome, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus, RouterRoute,
+    SpecAdminStatusOutcome,
 };
 use crate::domain::models::{Agent, Trigger};
 use crate::domain::pools::{Pool, PoolDetails};
@@ -200,11 +201,11 @@ const DEFAULT_ENSEMBLE_MEMBER_TIMEOUT_MINUTES: i64 = 30;
 
 /// Validate a `loop_add_ensemble`/`loop_update_ensemble` member list: 2-8
 /// entries, each with a non-empty `platform`. Returns the normalized
-/// `(platform, model)` pairs in the caller's order — the order consolidation
-/// and resize diffs rely on.
+/// `(platform, model, prompt_override)` triples in the caller's order — the
+/// order consolidation and resize diffs rely on.
 fn validate_ensemble_members(
     members: &[EnsembleMemberParams],
-) -> Result<Vec<(String, Option<String>)>, String> {
+) -> Result<Vec<EnsembleMemberSpec>, String> {
     if members.len() < ENSEMBLE_MIN_MEMBERS || members.len() > ENSEMBLE_MAX_MEMBERS {
         return Err(format!(
             "An ensemble must have {ENSEMBLE_MIN_MEMBERS}-{ENSEMBLE_MAX_MEMBERS} members, got {}.",
@@ -224,24 +225,37 @@ fn validate_ensemble_members(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_string);
-            Ok((platform.to_string(), model))
+            let prompt_override = member
+                .prompt_override
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            Ok((platform.to_string(), model, prompt_override))
         })
         .collect()
 }
 
-/// Build a member agent node's `config` — the shared ensemble prompt plus
-/// this member's own platform/model, the same shape `validate_node_config`'s
-/// `Agent` arm expects.
+/// This member's effective prompt: its own `prompt_override` if it has one,
+/// else the ensemble's shared `prompt_template`.
+fn effective_member_prompt<'a>(prompt_override: Option<&'a str>, shared: &'a str) -> &'a str {
+    prompt_override.unwrap_or(shared)
+}
+
+/// Build a member agent node's `config` — its effective prompt (its own
+/// override, or the shared ensemble prompt) plus this member's own
+/// platform/model, the same shape `validate_node_config`'s `Agent` arm
+/// expects.
 fn member_node_config(
     platform: &str,
     model: Option<&str>,
-    prompt_template: &str,
+    effective_prompt: &str,
     timeout_minutes: i64,
 ) -> serde_json::Value {
     serde_json::json!({
         "platform": platform,
         "model": model,
-        "prompt_template": prompt_template,
+        "prompt_template": effective_prompt,
         "timeout_minutes": timeout_minutes,
     })
 }
@@ -255,7 +269,7 @@ struct EnsembleUnitSpec<'a> {
     loop_id: Option<String>,
     name: &'a str,
     prompt_template: &'a str,
-    members: &'a [(String, Option<String>)],
+    members: &'a [EnsembleMemberSpec],
     entry_from_node: &'a str,
     entry_condition: LoopEdgeCondition,
     on_pass_to: &'a str,
@@ -293,8 +307,10 @@ fn build_ensemble_unit(spec: &EnsembleUnitSpec) -> BuiltEnsembleUnit {
     let mut ensemble_members = Vec::with_capacity(spec.members.len());
     let mut edges = Vec::new();
 
-    for (index, (platform, model)) in spec.members.iter().enumerate() {
+    for (index, (platform, model, prompt_override)) in spec.members.iter().enumerate() {
         let node_id = uuid::Uuid::new_v4().to_string();
+        let effective_prompt =
+            effective_member_prompt(prompt_override.as_deref(), spec.prompt_template);
         member_nodes.push(LoopNode {
             id: node_id.clone(),
             spec_id: spec.spec_id.clone(),
@@ -304,7 +320,7 @@ fn build_ensemble_unit(spec: &EnsembleUnitSpec) -> BuiltEnsembleUnit {
             config: member_node_config(
                 platform,
                 model.as_deref(),
-                spec.prompt_template,
+                effective_prompt,
                 spec.timeout_minutes,
             ),
             position: next_position,
@@ -332,6 +348,7 @@ fn build_ensemble_unit(spec: &EnsembleUnitSpec) -> BuiltEnsembleUnit {
             position: index as i64,
             platform: platform.clone(),
             model: model.clone(),
+            prompt_override: prompt_override.clone(),
         });
         next_position += 1;
     }
@@ -607,9 +624,9 @@ fn validate_not_join_kind(kind: LoopNodeKind) -> Result<(), String> {
 }
 
 /// Refuse to edit a node directly with `loop_update_node`/`loop_add_edge` if
-/// it belongs to an ensemble (member or quorum) — F1's "individual member
-/// overrides are NOT supported in v1": the ensemble is homogeneous by
-/// design, so every edit to a member/quorum goes through
+/// it belongs to an ensemble (member or quorum) — a member's prompt/platform/
+/// model (including its optional `prompt_override`) and the quorum's own
+/// config are all owned by the ensemble unit, so every edit goes through
 /// `loop_update_ensemble`, never a direct node/edge tool.
 fn validate_node_not_ensemble_owned(db: &Database, node_id: &str) -> Result<(), String> {
     if let Some(details) = db
@@ -1466,12 +1483,18 @@ fn plan_ensemble_copy(
         .to_string();
 
     let members_replaced = params.members.is_some();
-    let members: Vec<(String, Option<String>)> = match &params.members {
+    let members: Vec<EnsembleMemberSpec> = match &params.members {
         Some(explicit) => validate_ensemble_members(explicit)?,
         None => details
             .members
             .iter()
-            .map(|m| (m.platform.clone(), m.model.clone()))
+            .map(|m| {
+                (
+                    m.platform.clone(),
+                    m.model.clone(),
+                    m.prompt_override.clone(),
+                )
+            })
             .collect(),
     };
 
@@ -4165,7 +4188,7 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "loop_add_ensemble",
-        description = "Create an ensemble in ONE call: N (2-8) parallel agent-node members sharing one prompt, plus the quorum that waits for all of them, consolidates their outputs, and routes onward. Members differ only by platform/model. (Formerly called 'fusion' — retired to avoid colliding with OpenRouter's fusion technology.)"
+        description = "Create an ensemble in ONE call: N (2-8) parallel agent-node members sharing one prompt by default, plus the quorum that waits for all of them, consolidates their outputs (attributed per member), and routes onward. Members differ by platform/model, and each may set its own prompt_override to review the same input from a different angle instead of sharing the template. (Formerly called 'fusion' — retired to avoid colliding with OpenRouter's fusion technology.)"
     )]
     async fn loop_add_ensemble(
         &self,
@@ -4215,7 +4238,7 @@ impl TaskTriggerHandler {
         };
         let prompt_template = prompt_template.as_str();
 
-        let members: Vec<(String, Option<String>)> = match &params.members {
+        let members: Vec<EnsembleMemberSpec> = match &params.members {
             Some(explicit) => match validate_ensemble_members(explicit) {
                 Ok(members) => members,
                 Err(e) => return Ok(error_result(&e)),
@@ -4467,7 +4490,7 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "loop_update_ensemble",
-        description = "Update an ensemble's shared prompt (propagated to every member), member list (platform/model — added/removed/replaced by position), quorum config (min_pass, straggler_timeout_minutes, timeout_minutes), and/or exit wiring (on_pass_to/on_fail_to) — all in one call, without touching individual member nodes directly."
+        description = "Update an ensemble's shared prompt (propagated to every member without its own prompt_override), member list (platform/model/prompt_override — added/removed/replaced by position), quorum config (min_pass, straggler_timeout_minutes, timeout_minutes), and/or exit wiring (on_pass_to/on_fail_to) — all in one call, without touching individual member nodes directly."
     )]
     async fn loop_update_ensemble(
         &self,
@@ -4532,21 +4555,25 @@ impl TaskTriggerHandler {
             let old_len = old_members.len();
             let new_len = members.len();
 
-            for (index, (platform, model)) in members.iter().enumerate().take(old_len.min(new_len))
+            for (index, (platform, model, prompt_override)) in
+                members.iter().enumerate().take(old_len.min(new_len))
             {
                 let existing = &old_members[index];
                 self.db
-                    .update_ensemble_member_platform(
+                    .update_ensemble_member(
                         ensemble_id,
                         &existing.node_id,
                         platform,
                         model.as_deref(),
+                        prompt_override.as_deref(),
                     )
                     .map_err(internal_error)?;
+                let effective_prompt =
+                    effective_member_prompt(prompt_override.as_deref(), prompt_template);
                 let config = member_node_config(
                     platform,
                     model.as_deref(),
-                    prompt_template,
+                    effective_prompt,
                     timeout_minutes,
                 );
                 self.db
@@ -4559,10 +4586,14 @@ impl TaskTriggerHandler {
                     .last()
                     .map(|node| node.position + 1)
                     .unwrap_or(1);
-                for (i, (platform, model)) in members[old_len..new_len].iter().enumerate() {
+                for (i, (platform, model, prompt_override)) in
+                    members[old_len..new_len].iter().enumerate()
+                {
                     let next_position = start_position + i as i64;
                     let next_member_position = old_len as i64 + i as i64;
                     let node_id = uuid::Uuid::new_v4().to_string();
+                    let effective_prompt =
+                        effective_member_prompt(prompt_override.as_deref(), prompt_template);
                     let node = LoopNode {
                         id: node_id.clone(),
                         spec_id: details.ensemble.spec_id.clone(),
@@ -4572,7 +4603,7 @@ impl TaskTriggerHandler {
                         config: member_node_config(
                             platform,
                             model.as_deref(),
-                            prompt_template,
+                            effective_prompt,
                             timeout_minutes,
                         ),
                         position: next_position,
@@ -4600,6 +4631,7 @@ impl TaskTriggerHandler {
                         position: next_member_position,
                         platform: platform.clone(),
                         model: model.clone(),
+                        prompt_override: prompt_override.clone(),
                     };
                     self.db
                         .add_ensemble_member(&member, &node, &entry_edge, &join_edge)
@@ -4622,7 +4654,9 @@ impl TaskTriggerHandler {
                 })?;
         } else if params.prompt_template.is_some() || params.timeout_minutes.is_some() {
             // Prompt and/or shared timeout changed without a member-list
-            // resize: propagate onto every existing member's config as-is.
+            // resize: propagate onto every existing member's config as-is,
+            // except a member with its own prompt_override keeps rendering
+            // that instead of the (possibly just-changed) shared prompt.
             let prompt_template = params
                 .prompt_template
                 .as_deref()
@@ -4631,10 +4665,12 @@ impl TaskTriggerHandler {
                 .timeout_minutes
                 .unwrap_or(details.ensemble.timeout_minutes);
             for member in &details.members {
+                let effective_prompt =
+                    effective_member_prompt(member.prompt_override.as_deref(), prompt_template);
                 let config = member_node_config(
                     &member.platform,
                     member.model.as_deref(),
-                    prompt_template,
+                    effective_prompt,
                     timeout_minutes,
                 );
                 self.db
@@ -6187,6 +6223,12 @@ fn ensemble_details_json(details: &crate::domain::loops::EnsembleDetails) -> ser
             "position": member.position,
             "platform": member.platform,
             "model": member.model,
+            "prompt_override": member.prompt_override,
+            // Which prompt this member actually renders — "override" (its own
+            // prompt_override) or "shared" (the ensemble's prompt_template) —
+            // so a client can tell the two apart without diffing member config
+            // against the ensemble row itself.
+            "prompt_source": if member.prompt_override.is_some() { "override" } else { "shared" },
         })).collect::<Vec<_>>(),
     })
 }
@@ -6481,12 +6523,12 @@ mod tests {
     use super::{
         build_ensemble_unit, build_get_tools_response, build_id_result, build_json_result,
         build_loop_completion_hook, build_loop_trigger, build_loop_update_response,
-        build_node_update_response, build_spec_update_response, handle_retry_current_node,
-        handle_skip_next_spec, header_str, json_value_kind_name, loop_details_json,
-        loop_run_status_guard, loop_trigger_json, member_node_config, missing_sync_identity_error,
-        node_copy_note, perform_loop_reset, plan_ensemble_copy, plan_node_copy, rag_result_json,
-        resolve_graph_target, resolve_node_kind_and_config, resolve_reported_run,
-        spec_summary_json, validate_absolute_dir, validate_at_least_one_bool,
+        build_node_update_response, build_spec_update_response, effective_member_prompt,
+        handle_retry_current_node, handle_skip_next_spec, header_str, json_value_kind_name,
+        loop_details_json, loop_run_status_guard, loop_trigger_json, member_node_config,
+        missing_sync_identity_error, node_copy_note, perform_loop_reset, plan_ensemble_copy,
+        plan_node_copy, rag_result_json, resolve_graph_target, resolve_node_kind_and_config,
+        resolve_reported_run, spec_summary_json, validate_absolute_dir, validate_at_least_one_bool,
         validate_blueprint_exists, validate_edge_condition, validate_edge_condition_with_route,
         validate_ensemble_members, validate_node_config, validate_node_kind,
         validate_node_not_ensemble_owned, validate_non_empty, validate_not_join_kind,
@@ -6517,6 +6559,18 @@ mod tests {
         EnsembleMemberParams {
             platform: platform.to_string(),
             model: None,
+            prompt_override: None,
+        }
+    }
+
+    fn ensemble_member_params_with_prompt(
+        platform: &str,
+        prompt_override: &str,
+    ) -> EnsembleMemberParams {
+        EnsembleMemberParams {
+            platform: platform.to_string(),
+            model: None,
+            prompt_override: Some(prompt_override.to_string()),
         }
     }
 
@@ -6585,6 +6639,36 @@ mod tests {
         ];
         let err = validate_ensemble_members(&members).unwrap_err();
         assert!(err.contains("platform"), "{err}");
+    }
+
+    /// `prompt_override` is normalized like `model`: trimmed, and a
+    /// whitespace-only override collapses to `None` (use the shared
+    /// prompt), not an override of empty string.
+    #[test]
+    fn validate_ensemble_members_trims_prompt_override_and_blanks_to_none() {
+        let members = vec![
+            ensemble_member_params_with_prompt("claude", "  review for security  "),
+            {
+                let mut m = ensemble_member_params("codex");
+                m.prompt_override = Some("   ".to_string());
+                m
+            },
+        ];
+        let result = validate_ensemble_members(&members).unwrap();
+        assert_eq!(result[0].2.as_deref(), Some("review for security"));
+        assert_eq!(result[1].2, None);
+    }
+
+    #[test]
+    fn effective_member_prompt_prefers_override_over_shared() {
+        assert_eq!(
+            effective_member_prompt(Some("angle-specific prompt"), "shared prompt"),
+            "angle-specific prompt"
+        );
+        assert_eq!(
+            effective_member_prompt(None, "shared prompt"),
+            "shared prompt"
+        );
     }
 
     /// F1's "no nested ensembles" rule: wiring into a node that already
@@ -6731,6 +6815,7 @@ mod tests {
                 position: 0,
                 platform: "claude".to_string(),
                 model: None,
+                prompt_override: None,
             },
             EnsembleMember {
                 ensemble_id: "ens1".to_string(),
@@ -6738,6 +6823,7 @@ mod tests {
                 position: 1,
                 platform: "codex".to_string(),
                 model: None,
+                prompt_override: None,
             },
         ];
         db.insert_ensemble_unit(&ensemble, &members, &member_nodes, &join_node, &edges)
@@ -8594,8 +8680,8 @@ mod tests {
         to: &str,
     ) -> BuiltEnsembleUnit {
         let members = [
-            ("claude".to_string(), None),
-            ("codex".to_string(), Some("o1".to_string())),
+            ("claude".to_string(), None, None),
+            ("codex".to_string(), Some("o1".to_string()), None),
         ];
         let built = build_ensemble_unit(&EnsembleUnitSpec {
             spec_id: spec_id.map(str::to_string),
@@ -10721,10 +10807,12 @@ mod additional_tests {
             EnsembleMemberParams {
                 platform: "claude".to_string(),
                 model: None,
+                prompt_override: None,
             },
             EnsembleMemberParams {
                 platform: "\t\n".to_string(),
                 model: None,
+                prompt_override: None,
             },
         ];
         let err = validate_ensemble_members(&members).unwrap_err();
@@ -10739,10 +10827,12 @@ mod additional_tests {
             EnsembleMemberParams {
                 platform: "claude".to_string(),
                 model: Some("  opus-4  ".to_string()),
+                prompt_override: None,
             },
             EnsembleMemberParams {
                 platform: "mimo".to_string(),
                 model: Some("   ".to_string()),
+                prompt_override: None,
             },
         ];
         let result = validate_ensemble_members(&members).unwrap();
@@ -11920,6 +12010,7 @@ mod coverage_tests {
                     position: 0,
                     platform: "claude".into(),
                     model: None,
+                    prompt_override: Some("review for security issues only".into()),
                 },
                 EnsembleMember {
                     ensemble_id: "ens1".into(),
@@ -11927,6 +12018,7 @@ mod coverage_tests {
                     position: 1,
                     platform: "codex".into(),
                     model: Some("o1".into()),
+                    prompt_override: None,
                 },
             ],
         };
@@ -11936,6 +12028,14 @@ mod coverage_tests {
         assert_eq!(json["effective_straggler_timeout_minutes"], 10);
         assert_eq!(json["on_fail_to"], "cleanup");
         assert_eq!(json["members"].as_array().unwrap().len(), 2);
+        let members = json["members"].as_array().unwrap();
+        assert_eq!(members[0]["prompt_source"], "override");
+        assert_eq!(
+            members[0]["prompt_override"],
+            "review for security issues only"
+        );
+        assert_eq!(members[1]["prompt_source"], "shared");
+        assert!(members[1]["prompt_override"].is_null());
     }
 
     #[test]
@@ -11963,6 +12063,7 @@ mod coverage_tests {
                 position: 0,
                 platform: "claude".into(),
                 model: None,
+                prompt_override: None,
             }],
         };
         let json = super::ensemble_details_json(&details);
@@ -12143,7 +12244,10 @@ mod coverage_tests {
 
     #[test]
     fn ensemble_unit_with_fail_to() {
-        let members = vec![("claude".into(), None), ("codex".into(), Some("o1".into()))];
+        let members = vec![
+            ("claude".into(), None, None),
+            ("codex".into(), Some("o1".into()), None),
+        ];
         let built = build_ensemble_unit(&EnsembleUnitSpec {
             spec_id: Some("s1".into()),
             loop_id: None,
@@ -12171,7 +12275,7 @@ mod coverage_tests {
 
     #[test]
     fn ensemble_unit_no_fail_to() {
-        let members = vec![("claude".into(), None)];
+        let members = vec![("claude".into(), None, None)];
         let built = build_ensemble_unit(&EnsembleUnitSpec {
             spec_id: None,
             loop_id: Some("l1".into()),
@@ -12199,9 +12303,9 @@ mod coverage_tests {
     #[test]
     fn ensemble_unit_positions_sequential() {
         let members = vec![
-            ("p1".into(), None),
-            ("p2".into(), None),
-            ("p3".into(), None),
+            ("p1".into(), None, None),
+            ("p2".into(), None, None),
+            ("p3".into(), None, None),
         ];
         let built = build_ensemble_unit(&EnsembleUnitSpec {
             spec_id: None,
@@ -12555,6 +12659,7 @@ mod coverage_tests {
             .map(|i| EnsembleMemberParams {
                 platform: format!("p{i}"),
                 model: None,
+                prompt_override: None,
             })
             .collect();
         assert!(validate_ensemble_members(&m).is_ok());
@@ -12566,6 +12671,7 @@ mod coverage_tests {
             .map(|i| EnsembleMemberParams {
                 platform: format!("p{i}"),
                 model: None,
+                prompt_override: None,
             })
             .collect();
         assert!(validate_ensemble_members(&m).is_ok());
@@ -12577,6 +12683,7 @@ mod coverage_tests {
             .map(|i| EnsembleMemberParams {
                 platform: format!("p{i}"),
                 model: None,
+                prompt_override: None,
             })
             .collect();
         assert!(validate_ensemble_members(&m).unwrap_err().contains("2-8"));
@@ -12588,10 +12695,12 @@ mod coverage_tests {
             EnsembleMemberParams {
                 platform: "claude".into(),
                 model: Some("".into()),
+                prompt_override: None,
             },
             EnsembleMemberParams {
                 platform: "mimo".into(),
                 model: None,
+                prompt_override: None,
             },
         ];
         let result = validate_ensemble_members(&m).unwrap();
@@ -14634,10 +14743,12 @@ mod endpoint_tests {
             crate::daemon::params::EnsembleMemberParams {
                 platform: "claude".to_string(),
                 model: None,
+                prompt_override: None,
             },
             crate::daemon::params::EnsembleMemberParams {
                 platform: "opencode".to_string(),
                 model: None,
+                prompt_override: None,
             },
         ];
 
@@ -15052,10 +15163,12 @@ mod endpoint_tests {
                     crate::daemon::params::EnsembleMemberParams {
                         platform: "claude".to_string(),
                         model: None,
+                        prompt_override: None,
                     },
                     crate::daemon::params::EnsembleMemberParams {
                         platform: "opencode".to_string(),
                         model: None,
+                        prompt_override: None,
                     },
                 ]),
                 blueprint: None,
@@ -15120,6 +15233,125 @@ mod endpoint_tests {
         assert!(is_err(&missing_source));
     }
 
+    /// A member's `prompt_override` replaces the shared `prompt_template` for
+    /// that member only — everything else (platform/model semantics, the
+    /// other members, `loop_get`'s prompt_source, and `loop_copy_ensemble`
+    /// carrying it forward) keeps working exactly as before this field
+    /// existed.
+    #[tokio::test]
+    async fn loop_add_ensemble_member_prompt_override_replaces_shared_prompt_for_that_member_only()
+    {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let entry = add_agent_node(&handler, &spec.id, "Entry").await;
+        let arbiter = add_agent_node(&handler, &spec.id, "Arbiter").await;
+
+        let created = handler
+            .loop_add_ensemble(Parameters(LoopAddEnsembleParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Panel".to_string(),
+                prompt_template: Some("shared review prompt".to_string()),
+                members: Some(vec![
+                    crate::daemon::params::EnsembleMemberParams {
+                        platform: "claude".to_string(),
+                        model: None,
+                        prompt_override: Some("review for security issues".to_string()),
+                    },
+                    crate::daemon::params::EnsembleMemberParams {
+                        platform: "codex".to_string(),
+                        model: None,
+                        prompt_override: None,
+                    },
+                ]),
+                blueprint: None,
+                from_node: entry,
+                condition: "always".to_string(),
+                min_pass: Some(2),
+                straggler_timeout_minutes: None,
+                timeout_minutes: None,
+                on_pass_to: arbiter,
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&created), "{}", text(&created));
+        let ensemble_id = extract_id(&created, "ensemble_id");
+        let details = db.get_ensemble_details(&ensemble_id).unwrap().unwrap();
+
+        // Platform/model are untouched by the override — it's an independent
+        // knob, not a replacement for them.
+        assert_eq!(details.members[0].platform, "claude");
+        assert_eq!(
+            details.members[0].prompt_override.as_deref(),
+            Some("review for security issues")
+        );
+        assert_eq!(details.members[1].prompt_override, None);
+
+        let overridden_node = db
+            .get_loop_node(&details.members[0].node_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            overridden_node
+                .config
+                .get("prompt_template")
+                .and_then(|v| v.as_str()),
+            Some("review for security issues")
+        );
+        let shared_node = db
+            .get_loop_node(&details.members[1].node_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            shared_node
+                .config
+                .get("prompt_template")
+                .and_then(|v| v.as_str()),
+            Some("shared review prompt")
+        );
+
+        // loop_get's ensemble view distinguishes shared vs. override per
+        // member without the caller having to diff node config themselves.
+        let ensembles_json = crate::daemon::handler::ensemble_details_json(&details);
+        let members_json = ensembles_json["members"].as_array().unwrap();
+        assert_eq!(members_json[0]["prompt_source"], "override");
+        assert_eq!(members_json[1]["prompt_source"], "shared");
+
+        // Copying without replacing members carries each member's own
+        // override (or lack of one) forward into the copy.
+        let copied = handler
+            .loop_copy_ensemble(Parameters(LoopCopyEnsembleParams {
+                source_ensemble_id: ensemble_id.clone(),
+                spec_id: None,
+                loop_id: None,
+                name: Some("Panel copy".to_string()),
+                prompt_template: None,
+                members: None,
+                min_pass: None,
+                timeout_minutes: None,
+                straggler_timeout_minutes: None,
+                from_node: None,
+                condition: None,
+                on_pass_to: None,
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&copied), "{}", text(&copied));
+        let copied_ensemble_id = extract_id(&copied, "ensemble_id");
+        let copied_details = db
+            .get_ensemble_details(&copied_ensemble_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            copied_details.members[0].prompt_override.as_deref(),
+            Some("review for security issues")
+        );
+        assert_eq!(copied_details.members[1].prompt_override, None);
+    }
+
     // ── loop_update_ensemble ────────────────────────────────────────
 
     #[tokio::test]
@@ -15141,10 +15373,12 @@ mod endpoint_tests {
                     crate::daemon::params::EnsembleMemberParams {
                         platform: "claude".to_string(),
                         model: None,
+                        prompt_override: None,
                     },
                     crate::daemon::params::EnsembleMemberParams {
                         platform: "opencode".to_string(),
                         model: None,
+                        prompt_override: None,
                     },
                 ]),
                 blueprint: None,
@@ -15204,14 +15438,17 @@ mod endpoint_tests {
                     crate::daemon::params::EnsembleMemberParams {
                         platform: "claude".to_string(),
                         model: None,
+                        prompt_override: None,
                     },
                     crate::daemon::params::EnsembleMemberParams {
                         platform: "opencode".to_string(),
                         model: None,
+                        prompt_override: None,
                     },
                     crate::daemon::params::EnsembleMemberParams {
                         platform: "gemini".to_string(),
                         model: None,
+                        prompt_override: Some("Review only for test coverage gaps.".to_string()),
                     },
                 ]),
                 min_pass: None,
@@ -15225,6 +15462,26 @@ mod endpoint_tests {
         assert!(!is_err(&grown), "{}", text(&grown));
         let details = db.get_ensemble_details(&ensemble_id).unwrap().unwrap();
         assert_eq!(details.members.len(), 3);
+        // The new member's own prompt_override is persisted on the ensemble
+        // row and propagated into its node config as the effective prompt,
+        // while the other two still carry no override.
+        assert_eq!(details.members[0].prompt_override, None);
+        assert_eq!(details.members[1].prompt_override, None);
+        assert_eq!(
+            details.members[2].prompt_override.as_deref(),
+            Some("Review only for test coverage gaps.")
+        );
+        let gemini_node = db
+            .get_loop_node(&details.members[2].node_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            gemini_node
+                .config
+                .get("prompt_template")
+                .and_then(|v| v.as_str()),
+            Some("Review only for test coverage gaps.")
+        );
 
         // Shrink membership 3 -> 2.
         let shrunk = handler
@@ -15235,10 +15492,12 @@ mod endpoint_tests {
                     crate::daemon::params::EnsembleMemberParams {
                         platform: "claude".to_string(),
                         model: None,
+                        prompt_override: None,
                     },
                     crate::daemon::params::EnsembleMemberParams {
                         platform: "opencode".to_string(),
                         model: None,
+                        prompt_override: None,
                     },
                 ]),
                 min_pass: None,

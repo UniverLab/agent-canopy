@@ -347,6 +347,7 @@ impl Database {
                 position INTEGER NOT NULL,
                 platform TEXT NOT NULL,
                 model TEXT,
+                prompt_override TEXT,
                 PRIMARY KEY (ensemble_id, node_id)
             );
 
@@ -915,6 +916,26 @@ impl Database {
         if !has_edge_route {
             conn.execute("ALTER TABLE loop_edges ADD COLUMN route TEXT", [])
                 .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // Per-member prompt override: a member can now render its own prompt
+        // instead of the ensemble's shared `prompt_template` — see
+        // `EnsembleMember::prompt_override`. NULL for every pre-existing
+        // member, which is exactly "use the shared template", so no
+        // behavioural migration is needed alongside the column add.
+        let has_member_prompt_override: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('ensemble_members') WHERE name = 'prompt_override'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_member_prompt_override {
+            conn.execute(
+                "ALTER TABLE ensemble_members ADD COLUMN prompt_override TEXT",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
         }
 
         Ok(())

@@ -3282,14 +3282,20 @@ fn terminate_run_row(db: &Database, run: &LoopNodeRun, reason: &str) {
     );
 }
 
-/// `"platform"` or `"platform/model"` — the label used in an ensemble's
-/// consolidated `"## <label> [pass|fail]"` sections and in the TUI's
-/// collapsed ensemble view.
+/// `"platform #N"` or `"platform/model #N"` (1-based `N` from the member's
+/// position) — the label used in an ensemble's consolidated
+/// `"## <label> [pass|fail]"` sections and in the TUI's collapsed ensemble
+/// view. The position suffix is always included, not just when it would
+/// disambiguate: a multi-angle panel commonly runs several members on the
+/// same platform/model with only their `prompt_override` differing, so
+/// platform/model alone can name the same label for every section — the
+/// position is what actually attributes a section to one member.
 fn member_label(member: &EnsembleMember) -> String {
-    match member.model.as_deref().map(str::trim) {
+    let base = match member.model.as_deref().map(str::trim) {
         Some(model) if !model.is_empty() => format!("{}/{}", member.platform, model),
         _ => member.platform.clone(),
-    }
+    };
+    format!("{base} #{}", member.position + 1)
 }
 
 /// The human-readable text to carry into an ensemble's consolidated doc for
@@ -6557,6 +6563,7 @@ echo done
                     position: i as i64,
                     platform: "claude".to_string(),
                     model: None,
+                    prompt_override: None,
                 })
                 .collect(),
         }
@@ -9444,6 +9451,7 @@ echo done
                 position: i as i64,
                 platform: platform.to_string(),
                 model: None,
+                prompt_override: None,
             })
             .collect();
 
@@ -9789,6 +9797,174 @@ echo done
         );
     }
 
+    /// A multi-angle panel (the point of per-member `prompt_override`): three
+    /// members sharing the SAME platform/model — so `member_label`'s old
+    /// "platform/model" text alone would produce three identical, unlabeled
+    /// "## shared-cli [pass]" headings — each renders its own override
+    /// instead of the (unused here) shared prompt. The quorum must still
+    /// attribute each section to its own member (by position, since
+    /// platform/model can no longer do it) and each section's content must
+    /// be that member's own rendered prompt, not another member's or the
+    /// shared template.
+    #[tokio::test]
+    async fn ensemble_execute_attributes_members_sharing_platform_by_prompt_override() {
+        let (dir, db, engine, _loop_id, spec_id) = loop_fixture().unwrap();
+        // A single registered CLI, `cat`, echoes its composed prompt back on
+        // stdout verbatim — letting the consolidated doc prove which prompt
+        // text each member actually rendered.
+        let fake_home = setup_multi_cli_home(&[(
+            "shared-cli",
+            &write_member_script(dir.path(), "echo.sh", "cat"),
+        )]);
+
+        db.insert_loop_node(&LoopNode {
+            id: "kickoff".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "kickoff".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "printf ok", "success_condition": "exit_code_0"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        let pass_marker = dir.path().join("pass.marker");
+        db.insert_loop_node(&touch_marker_node("on-pass", &spec_id, &pass_marker, 100))
+            .unwrap();
+
+        let overrides = [
+            ("m-context", "OVERRIDE-CONTEXT-ANGLE"),
+            ("m-security", "OVERRIDE-SECURITY-ANGLE"),
+            ("m-conventions", "OVERRIDE-CONVENTIONS-ANGLE"),
+        ];
+        let now = chrono::Utc::now();
+        let member_nodes: Vec<LoopNode> = overrides
+            .iter()
+            .enumerate()
+            .map(|(i, (node_id, prompt))| LoopNode {
+                id: node_id.to_string(),
+                spec_id: Some(spec_id.clone()),
+                loop_id: None,
+                name: format!("Panel [{}]", i + 1),
+                kind: LoopNodeKind::Agent,
+                config: serde_json::json!({
+                    "platform": "shared-cli",
+                    "prompt_template": prompt,
+                    "timeout_minutes": 5,
+                }),
+                position: 2 + i as i64,
+                created_at: now,
+            })
+            .collect();
+        let join_node = LoopNode {
+            id: "join1".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "quorum".to_string(),
+            kind: LoopNodeKind::Join,
+            config: serde_json::json!({ "ensemble_id": "ens1" }),
+            position: 2 + overrides.len() as i64,
+            created_at: now,
+        };
+        let mut edges = Vec::new();
+        for (node_id, _) in &overrides {
+            edges.push(LoopEdge {
+                id: format!("kickoff->{node_id}"),
+                spec_id: Some(spec_id.clone()),
+                loop_id: None,
+                from_node: "kickoff".to_string(),
+                to_node: node_id.to_string(),
+                condition: LoopEdgeCondition::Always,
+            });
+            edges.push(LoopEdge {
+                id: format!("{node_id}->join1"),
+                spec_id: Some(spec_id.clone()),
+                loop_id: None,
+                from_node: node_id.to_string(),
+                to_node: "join1".to_string(),
+                condition: LoopEdgeCondition::Always,
+            });
+        }
+        edges.push(LoopEdge {
+            id: "join1->on-pass".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "join1".to_string(),
+            to_node: "on-pass".to_string(),
+            condition: LoopEdgeCondition::Pass,
+        });
+        let ensemble = crate::domain::loops::Ensemble {
+            id: "ens1".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "Panel".to_string(),
+            prompt_template: "shared prompt (unused — every member overrides it)".to_string(),
+            join_node_id: "join1".to_string(),
+            entry_from_node: "kickoff".to_string(),
+            entry_condition: LoopEdgeCondition::Always,
+            min_pass: 3,
+            straggler_timeout_minutes: None,
+            timeout_minutes: 5,
+            on_pass_to: "on-pass".to_string(),
+            on_fail_to: None,
+            created_at: now,
+        };
+        let ensemble_members: Vec<EnsembleMember> = overrides
+            .iter()
+            .enumerate()
+            .map(|(i, (node_id, prompt))| EnsembleMember {
+                ensemble_id: "ens1".to_string(),
+                node_id: node_id.to_string(),
+                position: i as i64,
+                platform: "shared-cli".to_string(),
+                model: None,
+                prompt_override: Some(prompt.to_string()),
+            })
+            .collect();
+        db.insert_ensemble_unit(
+            &ensemble,
+            &ensemble_members,
+            &member_nodes,
+            &join_node,
+            &edges,
+        )
+        .unwrap();
+
+        let _home = HomeGuard::set(fake_home.path());
+        engine
+            .run_loop("wf-test".to_string(), None, None)
+            .await
+            .unwrap();
+        drop(_home);
+
+        let join = join_run(&db, &spec_id, "join1");
+        assert_eq!(join.status, LoopRunStatus::Pass);
+        assert!(pass_marker.exists());
+        let doc = join.output.unwrap()["consolidated_doc"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Every member shares "shared-cli" with no model, so the label alone
+        // no longer disambiguates — three distinct, position-numbered
+        // headings must still exist.
+        assert!(doc.contains("## shared-cli #1 [pass]"), "{doc}");
+        assert!(doc.contains("## shared-cli #2 [pass]"), "{doc}");
+        assert!(doc.contains("## shared-cli #3 [pass]"), "{doc}");
+
+        // Each section carries that member's own rendered prompt, not the
+        // (unused) shared template and not another member's override.
+        let pos1 = doc.find("## shared-cli #1").unwrap();
+        let pos2 = doc.find("## shared-cli #2").unwrap();
+        let pos3 = doc.find("## shared-cli #3").unwrap();
+        assert!(doc[pos1..pos2].contains("OVERRIDE-CONTEXT-ANGLE"));
+        assert!(!doc[pos1..pos2].contains("OVERRIDE-SECURITY-ANGLE"));
+        assert!(doc[pos2..pos3].contains("OVERRIDE-SECURITY-ANGLE"));
+        assert!(!doc[pos2..pos3].contains("OVERRIDE-CONVENTIONS-ANGLE"));
+        assert!(doc[pos3..].contains("OVERRIDE-CONVENTIONS-ANGLE"));
+        assert!(!doc.contains("shared prompt (unused"));
+    }
+
     /// Straggler kill + fail counting (B12): a member that hangs past the
     /// ensemble's straggler timeout is killed at the OS level (not just
     /// marked failed while the process keeps running), and counts as a
@@ -10002,6 +10178,7 @@ echo done
                 position: i as i64,
                 platform: platform.to_string(),
                 model: None,
+                prompt_override: None,
             })
             .collect();
 

@@ -1057,6 +1057,7 @@ mod tests {
                 position: i as i64,
                 platform: "openrouter".to_string(),
                 model: Some(format!("model-{i}")),
+                prompt_override: None,
             })
             .collect();
         db.insert_ensemble_unit(&ensemble, &members, &member_nodes, &join_node, &edges)

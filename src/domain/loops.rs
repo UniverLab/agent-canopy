@@ -774,9 +774,12 @@ pub struct LoopDetails {
     pub completion_hook_runs: Vec<LoopCompletionHookRun>,
 }
 
-/// An ensemble (F1): a group of homogeneous agent-node members that receive
-/// the same shared prompt in parallel, plus the join gate that waits for
-/// every member, consolidates their outputs, and routes onward. Persisted as
+/// An ensemble (F1): a group of agent-node members, run in parallel, plus
+/// the join gate that waits for every member, consolidates their outputs,
+/// and routes onward. Members share one prompt by default but may each carry
+/// their own `prompt_override` (see [`EnsembleMember::prompt_override`]) so a
+/// panel can review the same input from several angles at once instead of
+/// just several models. Persisted as
 /// its own row so `loop_get`/`loop_update_ensemble` can address the whole
 /// unit — the members and join themselves are ordinary [`LoopNode`] rows
 /// (see [`EnsembleMember`]), wired with ordinary [`LoopEdge`] rows, so the
@@ -828,9 +831,17 @@ impl Ensemble {
     }
 }
 
-/// One homogeneous member of an [`Ensemble`] — differs from its siblings
-/// only in `platform`/`model`; `node_id` points at the underlying
-/// [`LoopNodeKind::Agent`] row that actually executes.
+/// `(platform, model, prompt_override)` — the normalized shape of one
+/// ensemble member's identity, shared by `loop_add_ensemble`/
+/// `loop_update_ensemble`'s validated input, [`EnsembleBlueprint`]'s stored
+/// members, and [`EnsembleMember`] itself.
+///
+/// [`EnsembleBlueprint`]: crate::domain::blueprints::EnsembleBlueprint
+pub type EnsembleMemberSpec = (String, Option<String>, Option<String>);
+
+/// One member of an [`Ensemble`] — differs from its siblings in
+/// `platform`/`model` and, optionally, its own prompt; `node_id` points at
+/// the underlying [`LoopNodeKind::Agent`] row that actually executes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnsembleMember {
     pub ensemble_id: String,
@@ -841,6 +852,13 @@ pub struct EnsembleMember {
     pub position: i64,
     pub platform: String,
     pub model: Option<String>,
+    /// This member's own prompt, replacing the ensemble's shared
+    /// `prompt_template` for this member only — same placeholders, rendered
+    /// the same way. `None` (the default) means the member renders the
+    /// shared template exactly as every ensemble did before this field
+    /// existed. Independent of `platform`/`model`: an override never changes
+    /// which CLI/model runs it.
+    pub prompt_override: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
