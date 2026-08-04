@@ -956,6 +956,18 @@ impl LoopEngine {
                     // node's previous run in this dispatch → resume.
                     let mut resume_candidate = resumable_sessions.get(node_id.as_str()).cloned();
 
+                    // RS3/R1: whether `resume_candidate` (once populated below)
+                    // crosses a spec boundary — i.e. was captured by a DIFFERENT
+                    // spec, not this one. `group_session_for_node` only ever
+                    // returns a session belonging to an earlier-positioned
+                    // sibling (see its query), so any hit from it is a
+                    // cross-spec resume by construction; the RS2 in-dispatch map
+                    // above is always this spec's own session, so a hit there
+                    // never is. This is the ONE thing `render_resume_prompt`
+                    // needs to know to decide whether the new spec has ever
+                    // been shown to the resumed session.
+                    let mut resume_crosses_spec = false;
+
                     // RS3 group-session handoff: a grouped spec's FIRST visit to
                     // this node (nothing yet in `resumable_sessions` for it)
                     // resumes the group's live session for this node — the
@@ -975,6 +987,7 @@ impl LoopEngine {
                                 &spec.id,
                                 node_id.as_str(),
                             )?;
+                            resume_crosses_spec = resume_candidate.is_some();
                         }
                     }
                     let mut run_id = uuid::Uuid::new_v4().to_string();
@@ -1036,6 +1049,7 @@ impl LoopEngine {
                                 &run_id,
                                 workdir,
                                 resume_candidate.as_deref(),
+                                resume_crosses_spec,
                             )
                             .await?;
                         let run = self.db.get_loop_run(&run_id)?.ok_or_else(|| {
@@ -1054,7 +1068,19 @@ impl LoopEngine {
                             // session if it managed to create one before dying;
                             // an infra crash at spawn usually created none, so
                             // this is normally `None` → the retry cold-starts.
-                            resume_candidate = run.session_id.clone();
+                            // If the crashed attempt was itself a cross-spec
+                            // (RS3) resume and it continued the SAME foreign
+                            // session before dying, the retry is still that
+                            // same cross-spec resume; any other outcome (a
+                            // fresh session captured on cold fallback, or none
+                            // at all) means the retry is not, and the next
+                            // `execute_node` call renders normally for
+                            // whichever case it's in.
+                            let new_candidate = run.session_id.clone();
+                            resume_crosses_spec = resume_crosses_spec
+                                && new_candidate.is_some()
+                                && new_candidate == resume_candidate;
+                            resume_candidate = new_candidate;
                             run_id = begin_infra_retry(
                                 &self.db,
                                 lp,
@@ -1409,6 +1435,12 @@ impl LoopEngine {
                                 &member_run_id,
                                 &workdir,
                                 resume_candidate.as_deref(),
+                                // RS3 group-session handoff is scoped to the
+                                // sequential bounce path only; an ensemble
+                                // member's own resume (B19 infra-retry) is
+                                // always its own crashed attempt's session,
+                                // never a different spec's.
+                                false,
                                 dynamic_skills.as_ref(),
                             )
                             .await?;
@@ -1637,6 +1669,7 @@ impl LoopEngine {
         run_id: &str,
         workdir: &str,
         resume_session_id: Option<&str>,
+        resume_crosses_spec: bool,
     ) -> Result<NodeExecution> {
         match node.kind {
             LoopNodeKind::Check => {
@@ -1653,6 +1686,7 @@ impl LoopEngine {
                     run_id,
                     workdir,
                     resume_session_id,
+                    resume_crosses_spec,
                     self.dynamic_skills.as_ref(),
                 )
                 .await
@@ -2205,6 +2239,13 @@ fn self_reported_execution(run: Option<&LoopNodeRun>, node: &LoopNode) -> Option
 /// capture skipped), and — if the resume flag is rejected / crashes at spawn —
 /// falls back to a byte-identical cold start whose verdict the node then uses.
 /// Every other case cold-starts exactly as before.
+///
+/// `resume_crosses_spec` (RS3) marks the one exception to "only feedback, no
+/// spec": when the session being resumed was captured by a DIFFERENT spec (a
+/// context-group handoff), the resumed session has never seen this spec's
+/// content, so the incremental prompt renders it — plus a boundary notice
+/// that the previous spec is done — instead of the bare feedback-only
+/// template. See [`render_resume_prompt`].
 #[allow(clippy::too_many_arguments)]
 async fn execute_agent_node(
     db: &Arc<Database>,
@@ -2215,6 +2256,7 @@ async fn execute_agent_node(
     run_id: &str,
     workdir: &str,
     resume_session_id: Option<&str>,
+    resume_crosses_spec: bool,
     dynamic_skills: Option<&Arc<crate::dynamic_skills::SkillStore>>,
 ) -> Result<NodeExecution> {
     let cli_name = node
@@ -2241,11 +2283,19 @@ async fn execute_agent_node(
     // ── RS2 resume attempt ──────────────────────────────────────────────
     if let Some(sid) = resume_session_id {
         if node_allows_resume && base_strategy.supports_resume_by_id() {
-            let resume_template = node
-                .config
-                .get("resume_prompt")
-                .and_then(Value::as_str)
-                .unwrap_or(RESUME_PROMPT_DEFAULT);
+            // RS3: a cross-spec resume always uses the engine's own boundary
+            // template, ignoring any node-level `resume_prompt` override —
+            // the choice depends on runtime state (which spec the resumed
+            // session was captured under) that a static per-node template
+            // cannot know, so it is not the node's to make.
+            let resume_template = if resume_crosses_spec {
+                RESUME_PROMPT_CROSS_SPEC_DEFAULT
+            } else {
+                node.config
+                    .get("resume_prompt")
+                    .and_then(Value::as_str)
+                    .unwrap_or(RESUME_PROMPT_DEFAULT)
+            };
             let resume_prompt = render_resume_prompt(
                 lp,
                 spec,
@@ -3539,19 +3589,43 @@ fn render_agent_prompt(
     )
 }
 
-/// Default incremental prompt for a RESUMED agent run (RS2). Deliberately
-/// omits the full `[LOOP CONTEXT]`/`[SPEC]` block that a cold start renders:
-/// the resumed session already holds all of that in its own history, so
+/// Default incremental prompt for a SAME-SPEC resumed agent run (RS2): a
+/// fail-edge bounce or B19 infra retry, where the resumed session was
+/// captured by THIS spec earlier in this same dispatch. Deliberately omits
+/// the full `[LOOP CONTEXT]`/`[SPEC]` block that a cold start renders: the
+/// resumed session already holds all of that in its own history, so
 /// re-sending it wastes tokens and can confuse the model into re-reading the
 /// whole task. Only the new feedback and a one-line reminder of the reporting
-/// contract are sent. Overridable per node via the `resume_prompt` config key.
+/// contract are sent. Overridable per node via the `resume_prompt` config
+/// key — but only for this same-spec case; see
+/// [`RESUME_PROMPT_CROSS_SPEC_DEFAULT`] for the other one.
 const RESUME_PROMPT_DEFAULT: &str = "# [CONTINUE]\nYou are resuming your existing session for this task. The full task context is already in your session history — only the new feedback is included below. Address it, then report.\n\n# [PREVIOUS FEEDBACK]\n{{previous_feedback}}\n\n# [REPORTING]\nWhen you finish, call loop_complete_node with run_id=\"{{run_id}}\", node_id=\"{{node_id}}\", status=\"pass\"|\"fail\", a concise summary, and your output.\nIf you are blocked and need human intervention, call loop_report_blocker with run_id=\"{{run_id}}\", node_id=\"{{node_id}}\" and the blocker description.\n";
 
-/// Render a resumed run's incremental prompt (RS2) from `template` (the node's
-/// `resume_prompt` or [`RESUME_PROMPT_DEFAULT`]). Same `{{previous_feedback}}`
-/// bounding as [`render_agent_prompt`], plus the run/node/spec placeholders the
-/// reporting contract needs — but never `{{spec_content}}`, since a resume must
-/// not re-render the spec block the session already has.
+/// Default incremental prompt for a CROSS-SPEC resumed agent run (RS3): a
+/// context-group handoff, where the session being resumed was captured by a
+/// DIFFERENT spec — the previous grouped sibling on this node. Unlike
+/// [`RESUME_PROMPT_DEFAULT`], the claim "the full task context is already in
+/// your session history" is false here (the session has never seen THIS
+/// spec), so it is never sent: this template renders `{{spec_content}}`
+/// instead, plus a short boundary notice that the previous spec is finished
+/// and already committed, so its conclusions are not to be restated as this
+/// spec's own work. Selected by the engine itself, from its own state (which
+/// spec captured the session being resumed) — never overridable via the
+/// node's `resume_prompt` config key, since that choice depends on runtime
+/// state a static per-node template cannot know.
+const RESUME_PROMPT_CROSS_SPEC_DEFAULT: &str = "# [CONTINUE: NEW SPEC]\nYou are resuming your existing session, but for a NEW spec. The previous spec you were working on is finished and already committed — do not restate its conclusions or describe its prior work as this spec's output. Only the spec below is outstanding; address it, then report.\n\n# [SPEC]\n{{spec_content}}\n\n# [PREVIOUS FEEDBACK]\n{{previous_feedback}}\n\n# [REPORTING]\nWhen you finish, call loop_complete_node with run_id=\"{{run_id}}\", node_id=\"{{node_id}}\", status=\"pass\"|\"fail\", a concise summary, and your output.\nIf you are blocked and need human intervention, call loop_report_blocker with run_id=\"{{run_id}}\", node_id=\"{{node_id}}\" and the blocker description.\n";
+
+/// Render a resumed run's incremental prompt (RS2/RS3) from `template` — the
+/// node's `resume_prompt` override or [`RESUME_PROMPT_DEFAULT`] for a
+/// same-spec bounce, [`RESUME_PROMPT_CROSS_SPEC_DEFAULT`] for a cross-spec
+/// (RS3) handoff. The caller picks which (see `execute_agent_node`); this
+/// function only renders whichever it's given. Same `{{previous_feedback}}`
+/// bounding as [`render_agent_prompt`], plus the run/node/spec placeholders
+/// the reporting contract needs. `{{spec_content}}` is substituted ONLY when
+/// `template` asks for it — the same-spec default never does (the session
+/// already has that spec in its history; re-rendering it wastes tokens and
+/// invites regurgitation), but the cross-spec default does (that session has
+/// never seen this spec).
 fn render_resume_prompt(
     lp: &crate::domain::loops::Loop,
     spec: &LoopSpec,
@@ -3565,11 +3639,13 @@ fn render_resume_prompt(
         .map(|value| serde_json::to_string_pretty(value).unwrap_or_default())
         .unwrap_or_else(|| "(none)".to_string());
     let previous_feedback = bound_previous_feedback(previous_feedback);
+    let spec_content = spec.description.as_deref().unwrap_or(&spec.name);
     template
         .replace("{{loop_name}}", &lp.name)
         .replace("{{workdir}}", workdir)
         .replace("{{spec_id}}", &spec.id)
         .replace("{{spec_name}}", &spec.name)
+        .replace("{{spec_content}}", spec_content)
         .replace("{{node}}", &node.name)
         .replace("{{node_id}}", &node.id)
         .replace("{{run_id}}", run_id)
@@ -5424,6 +5500,7 @@ mod tests {
                 "run-pin",
                 dir.path().to_str().unwrap(),
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -5862,6 +5939,7 @@ echo done
     async fn run_resume_agent_node(
         node_extra: Value,
         resume_session_id: Option<&str>,
+        cross_spec: bool,
         set_flag: Option<&str>,
         list_cmd: Option<&str>,
         fail_resume: bool,
@@ -5901,6 +5979,7 @@ echo done
             "run-r",
             dir.path().to_str().unwrap(),
             resume_session_id,
+            cross_spec,
             None,
         )
         .await
@@ -5915,7 +5994,7 @@ echo done
     #[tokio::test]
     async fn resume_uses_resume_flag_and_incremental_prompt() {
         let (execution, run, argv) =
-            run_resume_agent_node(Value::Null, Some("ses_prev"), None, None, false).await;
+            run_resume_agent_node(Value::Null, Some("ses_prev"), false, None, None, false).await;
         assert_eq!(execution.status, LoopRunStatus::Pass);
         assert!(argv.contains("--resume"), "resume flag must be passed");
         assert!(argv.contains("ses_prev"), "the resumed id must be passed");
@@ -5924,7 +6003,11 @@ echo done
         assert!(argv.contains("[CONTINUE]"), "resume prompt must be sent");
         assert!(
             !argv.contains("# [SPEC]"),
-            "a resume must not re-render the full spec block"
+            "a same-spec resume must not re-render the full spec block"
+        );
+        assert!(
+            !argv.contains("finished and already committed"),
+            "a same-spec resume must not carry the cross-spec boundary notice"
         );
         // The resumed run records the SAME session id; capture is skipped.
         assert_eq!(run.session_id.as_deref(), Some("ses_prev"));
@@ -5935,6 +6018,7 @@ echo done
         let (execution, _run, argv) = run_resume_agent_node(
             serde_json::json!({ "resume": false }),
             Some("ses_prev"),
+            false,
             None,
             None,
             false,
@@ -5955,7 +6039,7 @@ echo done
     async fn first_visit_without_session_is_cold() {
         // No resume_session_id offered (first visit to the node) → cold.
         let (execution, _run, argv) =
-            run_resume_agent_node(Value::Null, None, None, None, false).await;
+            run_resume_agent_node(Value::Null, None, false, None, None, false).await;
         assert_eq!(execution.status, LoopRunStatus::Pass);
         assert!(!argv.contains("--resume"));
         assert!(argv.contains("# [SPEC]"));
@@ -5966,7 +6050,7 @@ echo done
         // The resume attempt is rejected at spawn (FAIL_RESUME); the engine
         // must fall back to a cold start whose (passing) verdict the node uses.
         let (execution, _run, argv) =
-            run_resume_agent_node(Value::Null, Some("ses_prev"), None, None, true).await;
+            run_resume_agent_node(Value::Null, Some("ses_prev"), false, None, None, true).await;
         assert_eq!(
             execution.status,
             LoopRunStatus::Pass,
@@ -5987,6 +6071,7 @@ echo done
         let (execution, run, argv) = run_resume_agent_node(
             Value::Null,
             Some("ses_prev"),
+            false,
             Some("--set"),
             Some("list"),
             false,
@@ -6001,6 +6086,61 @@ echo done
         assert!(
             !argv.contains("--set"),
             "set-at-spawn flag must not be injected on a resumed spawn"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_spec_resume_renders_new_spec_and_boundary_notice() {
+        // RS3: the session being resumed was captured by a DIFFERENT spec (a
+        // context-group handoff) — the resumed session has never seen THIS
+        // spec, so unlike a same-spec bounce it must get the full spec
+        // content plus a notice that the previous spec is done.
+        let (execution, run, argv) =
+            run_resume_agent_node(Value::Null, Some("ses_prev"), true, None, None, false).await;
+        assert_eq!(execution.status, LoopRunStatus::Pass);
+        assert!(argv.contains("--resume"), "still a genuine resume");
+        assert!(argv.contains("ses_prev"), "the resumed id must be passed");
+        assert!(
+            argv.contains("# [SPEC]"),
+            "a cross-spec resume must render the new spec's content"
+        );
+        assert!(
+            argv.contains("Functional Requirements:\n- A"),
+            "the rendered spec content must be THIS spec's own, not omitted"
+        );
+        assert!(
+            argv.contains("finished and already committed"),
+            "must state the previous spec is done"
+        );
+        assert!(
+            !argv.contains("The full task context is already in your session history"),
+            "the false same-session claim must never be sent on a cross-spec resume"
+        );
+        assert_eq!(run.session_id.as_deref(), Some("ses_prev"));
+    }
+
+    #[tokio::test]
+    async fn cross_spec_resume_ignores_node_level_resume_prompt_override() {
+        // The boundary choice depends on runtime state (which spec captured
+        // the resumed session) that a static per-node template cannot know,
+        // so a cross-spec resume must use the engine's own template
+        // regardless of any `resume_prompt` override configured on the node.
+        let (_execution, _run, argv) = run_resume_agent_node(
+            serde_json::json!({ "resume_prompt": "CUSTOM {{previous_feedback}}" }),
+            Some("ses_prev"),
+            true,
+            None,
+            None,
+            false,
+        )
+        .await;
+        assert!(
+            !argv.contains("CUSTOM"),
+            "a node-level resume_prompt override must be ignored on a cross-spec resume"
+        );
+        assert!(
+            argv.contains("# [SPEC]"),
+            "the engine's own cross-spec template must be used instead"
         );
     }
 
@@ -6217,6 +6357,171 @@ echo done
         assert!(
             !argv.contains("--resume"),
             "no resume flag may appear for an ungrouped queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn grouped_spec_resume_across_boundary_shows_new_spec_not_old() {
+        // Reproduces the incident on loop 824de730-7fec-4031-800a-7933d2cf94c1,
+        // group `rag`: spec 2's implementer resumed spec 1's session and, with
+        // the old RESUME_PROMPT_DEFAULT claiming full context was already in
+        // history, was never shown ANY spec at all — it reported PASS after
+        // fourteen minutes describing spec 1's (already-committed) work,
+        // the only work it had ever seen. The fix must show the resumed
+        // session its OWN (spec 2's) content, plus a notice that spec 1 is
+        // done, so it neither regurgitates spec 1 nor works blind.
+        let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+        let argv_file = dir.path().join("argv.log");
+        let script = write_argv_echo_cli(dir.path());
+        let mut env = HashMap::new();
+        env.insert(
+            "ARGV_FILE".to_string(),
+            argv_file.to_string_lossy().into_owned(),
+        );
+        env.insert("RESUME_FLAG".to_string(), "--resume".to_string());
+        let cli = argv_cli_config(&script, env, Some("--resume"), Some("--set"), None);
+        let home = write_resume_cli_home(cli);
+
+        let mut spec_1 = standalone_spec("rag-1", 1);
+        spec_1.description = Some("SPEC-1-MARKER: bridge restart recovery".to_string());
+        let mut spec_2 = standalone_spec("rag-2", 2);
+        spec_2.description = Some("SPEC-2-MARKER: rag ingestion pipeline".to_string());
+        db.insert_loop_spec(&spec_1).unwrap();
+        db.insert_loop_spec(&spec_2).unwrap();
+        insert_pool_with_grouped_members(
+            &db,
+            "pool-1",
+            &[("rag-1", Some("rag")), ("rag-2", Some("rag"))],
+        );
+
+        // Loop-level agent node: both grouped members drain the same node id,
+        // exactly like the incident's implementer node.
+        db.insert_loop_node(&LoopNode {
+            id: "node-impl".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "impl".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({ "platform": "resume-cli" }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let guard = HomeGuard::set(home.path());
+        engine
+            .run_loop(loop_id.clone(), Some("pool-1".to_string()), None)
+            .await
+            .unwrap();
+        drop(guard);
+
+        let argv = std::fs::read_to_string(&argv_file).unwrap();
+        let invocations: Vec<&str> = argv.split("===\n").collect();
+        assert_eq!(
+            invocations.len(),
+            3, // two real invocations + trailing empty split segment
+            "expected exactly one cold spawn (spec 1) and one resumed spawn (spec 2)"
+        );
+
+        // Invocation 1: spec 1 cold-starts and gets its own content.
+        assert!(invocations[0].contains("SPEC-1-MARKER"));
+
+        // Invocation 2: spec 2 resumes spec 1's session, but must be shown
+        // its OWN spec — never spec 1's — plus the boundary notice.
+        let spec_2_invocation = invocations[1];
+        assert!(
+            spec_2_invocation.contains("--resume"),
+            "spec 2 must resume spec 1's session"
+        );
+        assert!(
+            spec_2_invocation.contains("SPEC-2-MARKER"),
+            "the resumed session must be shown spec 2's OWN content — the bug \
+             this reproduces showed it no spec content at all"
+        );
+        assert!(
+            spec_2_invocation.contains("finished and already committed"),
+            "must state spec 1 is done so its conclusions aren't restated"
+        );
+        assert!(
+            !spec_2_invocation.contains("The full task context is already in your session history"),
+            "the false same-session claim is exactly what caused the incident's \
+             14-minute regurgitation and must never be sent on a cross-spec resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn grouped_reviewer_resume_across_boundary_gets_new_spec_not_stuck() {
+        // Reproduces the second incident, group `daemon`: the REVIEWER node
+        // resumed across a spec boundary and, with the old prompt, had only
+        // spec 1 ("bridge restart recovery", already complete) in context —
+        // it said so plainly: "I need the spec content to know what work to
+        // do next." Same fix, different node role — a `review` node instead
+        // of `impl`, proving the fix is node-role-agnostic.
+        let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+        let argv_file = dir.path().join("argv.log");
+        let script = write_argv_echo_cli(dir.path());
+        let mut env = HashMap::new();
+        env.insert(
+            "ARGV_FILE".to_string(),
+            argv_file.to_string_lossy().into_owned(),
+        );
+        env.insert("RESUME_FLAG".to_string(), "--resume".to_string());
+        let cli = argv_cli_config(&script, env, Some("--resume"), Some("--set"), None);
+        let home = write_resume_cli_home(cli);
+
+        let mut spec_1 = standalone_spec("daemon-1", 1);
+        spec_1.description = Some("DAEMON-SPEC-1: bridge restart recovery".to_string());
+        let mut spec_2 = standalone_spec("daemon-2", 2);
+        spec_2.description = Some("DAEMON-SPEC-2: watchdog heartbeat timeout".to_string());
+        db.insert_loop_spec(&spec_1).unwrap();
+        db.insert_loop_spec(&spec_2).unwrap();
+        insert_pool_with_grouped_members(
+            &db,
+            "pool-1",
+            &[("daemon-1", Some("daemon")), ("daemon-2", Some("daemon"))],
+        );
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-review".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "review".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({ "platform": "resume-cli" }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let guard = HomeGuard::set(home.path());
+        engine
+            .run_loop(loop_id.clone(), Some("pool-1".to_string()), None)
+            .await
+            .unwrap();
+        drop(guard);
+
+        let argv = std::fs::read_to_string(&argv_file).unwrap();
+        let invocations: Vec<&str> = argv.split("===\n").collect();
+        assert_eq!(invocations.len(), 3, "one cold spawn, one resumed spawn");
+
+        let reviewer_invocation = invocations[1];
+        assert!(
+            reviewer_invocation.contains("--resume"),
+            "the reviewer must resume spec 1's session"
+        );
+        assert!(
+            reviewer_invocation.contains("DAEMON-SPEC-2"),
+            "the resumed reviewer must be shown spec 2's content — the incident's \
+             reviewer had none and had to ask for it"
+        );
+        assert!(
+            reviewer_invocation.contains("finished and already committed"),
+            "must state spec 1 is done"
+        );
+        assert!(
+            !reviewer_invocation
+                .contains("The full task context is already in your session history"),
+            "must not claim stale context is complete"
         );
     }
 
