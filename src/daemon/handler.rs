@@ -5213,6 +5213,136 @@ impl TaskTriggerHandler {
     }
 
     #[tool(
+        name = "agent_probe",
+        description = "Actually invoke a configured platform headlessly with a trivial prompt and report whether a real, usable response comes back — the verdict is based on the response content, not the exit code, so a harness that prints its own error and exits 0 is reported broken rather than healthy. Omit `platform` to probe every platform configured in canopy (each with its own default model); pass `platform` alone to probe its default model, or `platform`+`model` together to validate the exact pair a loop node would use. On failure, reports the harness's own error text (redacted of secrets) so you learn *why* (missing API key vs. wrong model name vs. it never answered), not just that it failed. Spends real tokens/quota per platform probed — call this explicitly, never automatically or on a schedule."
+    )]
+    async fn agent_probe(
+        &self,
+        Parameters(params): Parameters<AgentProbeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if params.model.is_some() && params.platform.is_none() {
+            return Ok(error_result(
+                "`model` requires `platform` — omit both to probe every configured platform's \
+                 default model.",
+            ));
+        }
+
+        let Some(home) = dirs::home_dir() else {
+            return Err(internal_error("No home directory"));
+        };
+        let config = crate::domain::canopy_config::CanopyConfig::load(&home.join(".canopy"));
+
+        let targets: Vec<crate::daemon::probe::ProbeTarget> = match params.platform.as_deref() {
+            Some(platform) => vec![crate::daemon::probe::ProbeTarget {
+                platform: platform.to_string(),
+                model: params.model.clone(),
+            }],
+            None => config
+                .clis
+                .iter()
+                .map(|cli| crate::daemon::probe::ProbeTarget {
+                    platform: cli.name.clone(),
+                    model: None,
+                })
+                .collect(),
+        };
+
+        if targets.is_empty() {
+            return Ok(error_result(
+                "No platforms configured in canopy. Run 'canopy setup'.",
+            ));
+        }
+
+        let timeout_secs = clamp_probe_timeout(params.timeout_seconds);
+        let reports = crate::daemon::probe::probe_targets(
+            &config,
+            &targets,
+            None,
+            std::time::Duration::from_secs(timeout_secs),
+        )
+        .await;
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&serde_json::json!({
+                "timeout_seconds": timeout_secs,
+                "would_fail": reports.iter().filter(|r| !r.outcome.reachable()).count(),
+                "probes": reports.iter().map(|r| r.to_json()).collect::<Vec<_>>(),
+            }))
+            .unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        name = "loop_preflight",
+        description = "Probe every distinct platform+model pair a loop's agent nodes, ensemble members, and on_completed hook reference — before spending a real loop_run on a harness that's installed and configured but can't actually produce a response. A platform used by several nodes is probed once, not once per node; the result names every node/hook that references a failing pair. Verdict is based on response content, not exit code (see agent_probe). Spends real tokens/quota per distinct pair — call this explicitly before loop_run, never automatically."
+    )]
+    async fn loop_preflight(
+        &self,
+        Parameters(params): Parameters<LoopPreflightParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let details = match self.db.get_loop_details(&params.loop_id) {
+            Ok(Some(details)) => details,
+            Ok(None) => {
+                return Ok(error_result(&format!(
+                    "Loop '{}' not found.",
+                    params.loop_id
+                )))
+            }
+            Err(e) => return Err(internal_error(e.to_string())),
+        };
+
+        let loop_targets = crate::daemon::probe::distinct_targets_for_loop(&details);
+        if loop_targets.is_empty() {
+            return Ok(success_result(&format!(
+                "Loop '{}' has no agent nodes, ensemble members, or on_completed hook to probe.",
+                params.loop_id
+            )));
+        }
+
+        let Some(home) = dirs::home_dir() else {
+            return Err(internal_error("No home directory"));
+        };
+        let config = crate::domain::canopy_config::CanopyConfig::load(&home.join(".canopy"));
+
+        let timeout_secs = clamp_probe_timeout(params.timeout_seconds);
+        let targets: Vec<crate::daemon::probe::ProbeTarget> =
+            loop_targets.iter().map(|t| t.target.clone()).collect();
+        let reports = crate::daemon::probe::probe_targets(
+            &config,
+            &targets,
+            Some(&details.lp.workdir),
+            std::time::Duration::from_secs(timeout_secs),
+        )
+        .await;
+
+        let probes: Vec<serde_json::Value> = reports
+            .iter()
+            .zip(loop_targets.iter())
+            .map(|(report, loop_target)| {
+                let mut value = report.to_json();
+                if let serde_json::Value::Object(map) = &mut value {
+                    map.insert(
+                        "used_by".to_string(),
+                        serde_json::json!(loop_target.used_by),
+                    );
+                }
+                value
+            })
+            .collect();
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&serde_json::json!({
+                "loop_id": params.loop_id,
+                "timeout_seconds": timeout_secs,
+                "pairs_checked": reports.len(),
+                "would_fail": reports.iter().filter(|r| !r.outcome.reachable()).count(),
+                "probes": probes,
+            }))
+            .unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
         name = "loop_run",
         description = "Run a loop in the background, spec by spec. With `queue_id`, runs the queue's pending specs (in queue order) through the loop's graph instead of the loop's own bound specs. (`pool_id` is a deprecated alias for `queue_id`; `queue_id` wins if both are set.) `workdir` overrides the loop's workdir for this run only."
     )]
@@ -5907,6 +6037,20 @@ impl TaskTriggerHandler {
     }
 }
 
+/// Resolve `agent_probe`/`loop_preflight`'s `timeout_seconds` param to an
+/// actual bound: the configured default when omitted, clamped to
+/// `[MIN_PROBE_TIMEOUT_SECS, MAX_PROBE_TIMEOUT_SECS]` otherwise — a probe is
+/// a liveness check, not a capability benchmark, so callers can't ask for an
+/// unbounded wait.
+fn clamp_probe_timeout(requested: Option<u64>) -> u64 {
+    requested
+        .unwrap_or(crate::daemon::probe::DEFAULT_PROBE_TIMEOUT_SECS)
+        .clamp(
+            crate::daemon::probe::MIN_PROBE_TIMEOUT_SECS,
+            crate::daemon::probe::MAX_PROBE_TIMEOUT_SECS,
+        )
+}
+
 /// Validate a requested `agent_models` platform against the CLIs actually
 /// configured in canopy (registry-driven, from `~/.canopy/config.toml`).
 /// Returns `Some(error_message)` if config exists and the platform isn't among
@@ -6536,7 +6680,7 @@ static SECRET_PATTERNS: std::sync::LazyLock<Vec<regex::Regex>> = std::sync::Lazy
     .collect()
 });
 
-fn redact_secrets(text: &str) -> String {
+pub(crate) fn redact_secrets(text: &str) -> String {
     let mut result = text.to_string();
     for pattern in SECRET_PATTERNS.iter() {
         result = pattern.replace_all(&result, "[REDACTED]").into_owned();

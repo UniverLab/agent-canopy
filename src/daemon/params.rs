@@ -841,6 +841,35 @@ pub struct LoopNodeRunGetParams {
     pub run_id: String,
 }
 
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct AgentProbeParams {
+    /// Platform to probe (e.g. "claude"). Omit to probe every platform
+    /// configured in canopy, each with its own default model.
+    #[serde(default)]
+    pub platform: Option<String>,
+    /// Model to probe for `platform` — validates the exact platform+model
+    /// pair a loop node would use, instead of the platform's default.
+    /// Requires `platform`; omit both to sweep every configured platform.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Seconds to wait for a response before reporting a timeout (distinct
+    /// from a response that came back but didn't contain the probe token).
+    /// Defaults to 30, clamped to [5, 120] — this is a liveness check, not a
+    /// capability benchmark.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopPreflightParams {
+    /// Loop ID to preflight.
+    pub loop_id: String,
+    /// Seconds to wait for each probe's response before reporting a
+    /// timeout. Defaults to 30, clamped to [5, 120].
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LoopListParams {
     /// Optional absolute workdir filter.

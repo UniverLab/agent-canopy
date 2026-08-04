@@ -14,6 +14,7 @@ pub(crate) mod loop_cli;
 pub(crate) mod models_cli;
 pub(crate) mod params;
 pub(crate) mod params_extract;
+pub(crate) mod probe;
 pub(crate) mod process;
 pub(crate) mod project_cli;
 pub(crate) mod prompts_cli;
