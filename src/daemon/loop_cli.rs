@@ -1,13 +1,23 @@
 //! CLI handlers for `canopy loop` subcommands.
 //!
-//! Read-only: mirrors `canopy rag report` (see `rag_cli.rs`) in spirit — a
-//! terminal view onto state that previously required querying
-//! `background_agents.db` directly.
+//! `list`/`info` are read-only: mirror `canopy rag report` (see
+//! `rag_cli.rs`) in spirit — a terminal view onto state that previously
+//! required querying `background_agents.db` directly. Every other
+//! subcommand (`run`/`pause`/`continue`/`reset`/`autorun`) changes loop
+//! state, so it resolves the target loop against that same local database
+//! (exactly as `list`/`info` already do — see [`resolve_loop`]) but then
+//! delegates the actual mutation to the daemon's MCP tool of the same name
+//! via `daemon::cli_daemon::call_tool`, never touching the database itself.
+//! This is the second surface for the operations `loop_run`/`loop_pause`/
+//! `loop_continue`/`loop_reset`/`loop_schedule_autorun` already expose over
+//! MCP — for when an MCP client can't reach them but the daemon and its
+//! database still can.
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use clap::Subcommand;
 
+use crate::daemon::cli_daemon::call_tool;
 use crate::db::Database;
 use crate::domain::loops::{
     Loop, LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus,
@@ -26,16 +36,265 @@ pub(crate) enum LoopAction {
         /// Full loop id, an unambiguous id prefix, or the exact loop name.
         id_or_name: String,
     },
+    /// Run a loop in the background, spec by spec.
+    Run {
+        /// Full loop id, an unambiguous id prefix, or the exact loop name.
+        id_or_name: String,
+        /// Run this queue's pending specs (in queue order) through the
+        /// loop's graph instead of the loop's own bound specs.
+        #[arg(long)]
+        queue: Option<String>,
+        /// Absolute workdir override for this run only.
+        #[arg(long)]
+        workdir: Option<String>,
+    },
+    /// Pause a running loop after the current node finishes.
+    Pause {
+        /// Full loop id, an unambiguous id prefix, or the exact loop name.
+        id_or_name: String,
+    },
+    /// Continue a paused loop by retrying the current node or skipping to
+    /// the next spec.
+    Continue {
+        /// Full loop id, an unambiguous id prefix, or the exact loop name.
+        id_or_name: String,
+        /// Retry the node that was running when the loop paused.
+        #[arg(long = "retry-current-node")]
+        retry_current_node: bool,
+        /// Skip the current spec and move on to the next one.
+        #[arg(long = "skip-next-spec")]
+        skip_next_spec: bool,
+    },
+    /// Reset a completed/failed loop back to pending so `run` can relaunch
+    /// it.
+    Reset {
+        /// Full loop id, an unambiguous id prefix, or the exact loop name.
+        id_or_name: String,
+        /// Reset exactly these spec IDs, even if already completed. Omit to
+        /// reset every non-completed spec, leaving completed ones untouched.
+        #[arg(long)]
+        specs: Vec<String>,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Schedule a one-shot future resume for a loop, or cancel a pending one.
+    Autorun {
+        /// Full loop id, an unambiguous id prefix, or the exact loop name.
+        id_or_name: String,
+        /// ISO 8601 timestamp at which the loop should resume, e.g.
+        /// "2026-07-10T09:00:00Z".
+        #[arg(long)]
+        at: Option<String>,
+        /// Raw CLI quota-limit message (e.g. "resets 1pm (America/Bogota)")
+        /// to compute the resume instant from, instead of passing `--at`.
+        #[arg(long = "quota-reset-message")]
+        quota_reset_message: Option<String>,
+        /// Cancel any pending autorun instead of scheduling one.
+        #[arg(long)]
+        cancel: bool,
+    },
 }
 
-pub(crate) async fn handle_loop_action(action: LoopAction) -> Result<()> {
+pub(crate) async fn handle_loop_action(
+    action: LoopAction,
+    port_override: Option<u16>,
+) -> Result<()> {
     let data_dir = crate::ensure_data_dir()?;
     let db = Database::new(&data_dir.join("background_agents.db"))?;
 
     match action {
         LoopAction::List { workdir } => handle_loop_list(&db, workdir.as_deref()),
         LoopAction::Info { id_or_name } => handle_loop_info(&db, &id_or_name),
+        LoopAction::Run {
+            id_or_name,
+            queue,
+            workdir,
+        } => handle_loop_run(&db, port_override, &id_or_name, queue, workdir),
+        LoopAction::Pause { id_or_name } => handle_loop_pause(&db, port_override, &id_or_name),
+        LoopAction::Continue {
+            id_or_name,
+            retry_current_node,
+            skip_next_spec,
+        } => handle_loop_continue(
+            &db,
+            port_override,
+            &id_or_name,
+            retry_current_node,
+            skip_next_spec,
+        ),
+        LoopAction::Reset {
+            id_or_name,
+            specs,
+            yes,
+        } => handle_loop_reset(&db, port_override, &id_or_name, &specs, yes),
+        LoopAction::Autorun {
+            id_or_name,
+            at,
+            quota_reset_message,
+            cancel,
+        } => handle_loop_autorun(
+            &db,
+            port_override,
+            &id_or_name,
+            at.as_deref(),
+            quota_reset_message.as_deref(),
+            cancel,
+        ),
     }
+}
+
+fn handle_loop_run(
+    db: &Database,
+    port_override: Option<u16>,
+    id_or_name: &str,
+    queue: Option<String>,
+    workdir: Option<String>,
+) -> Result<()> {
+    let loops = db.list_loops(None, true)?;
+    let lp = resolve_loop(&loops, id_or_name)?;
+
+    let mut args = serde_json::json!({ "loop_id": lp.id });
+    if let Some(queue_id) = queue {
+        args["queue_id"] = serde_json::json!(queue_id);
+    }
+    if let Some(workdir) = workdir {
+        args["workdir"] = serde_json::json!(workdir);
+    }
+
+    println!("{}", call_tool(port_override, "loop_run", &args)?);
+    Ok(())
+}
+
+fn handle_loop_pause(db: &Database, port_override: Option<u16>, id_or_name: &str) -> Result<()> {
+    let loops = db.list_loops(None, true)?;
+    let lp = resolve_loop(&loops, id_or_name)?;
+
+    println!(
+        "{}",
+        call_tool(
+            port_override,
+            "loop_pause",
+            &serde_json::json!({ "loop_id": lp.id }),
+        )?
+    );
+    Ok(())
+}
+
+fn handle_loop_continue(
+    db: &Database,
+    port_override: Option<u16>,
+    id_or_name: &str,
+    retry_current_node: bool,
+    skip_next_spec: bool,
+) -> Result<()> {
+    let action = match (retry_current_node, skip_next_spec) {
+        (true, false) => "retry_current_node",
+        (false, true) => "skip_next_spec",
+        (false, false) => {
+            return Err(anyhow!(
+                "Specify one of --retry-current-node or --skip-next-spec."
+            ))
+        }
+        (true, true) => {
+            return Err(anyhow!(
+                "--retry-current-node and --skip-next-spec are mutually exclusive."
+            ))
+        }
+    };
+
+    let loops = db.list_loops(None, true)?;
+    let lp = resolve_loop(&loops, id_or_name)?;
+
+    println!(
+        "{}",
+        call_tool(
+            port_override,
+            "loop_continue",
+            &serde_json::json!({ "loop_id": lp.id, "action": action }),
+        )?
+    );
+    Ok(())
+}
+
+fn handle_loop_reset(
+    db: &Database,
+    port_override: Option<u16>,
+    id_or_name: &str,
+    specs: &[String],
+    yes: bool,
+) -> Result<()> {
+    let loops = db.list_loops(None, true)?;
+    let lp = resolve_loop(&loops, id_or_name)?;
+
+    if !yes && !confirm_reset(&lp.name)? {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    let mut args = serde_json::json!({ "loop_id": lp.id });
+    if !specs.is_empty() {
+        args["specs"] = serde_json::json!(specs);
+    }
+
+    println!("{}", call_tool(port_override, "loop_reset", &args)?);
+    Ok(())
+}
+
+/// Interactive confirmation for `loop reset`, bypassable with `--yes` — the
+/// same `inquire::Confirm`-with-default-false pattern `canopy clean --hard`
+/// already uses for its own destructive cascade, and the CLI counterpart to
+/// the TUI's y/n modal for a loop deletion.
+fn confirm_reset(loop_name: &str) -> Result<bool> {
+    use inquire::Confirm;
+    Confirm::new(&format!(
+        "Reset loop '{loop_name}' back to pending? This clears progress on its non-completed specs."
+    ))
+    .with_default(false)
+    .with_help_message("y: reset, n/Esc: abort")
+    .prompt()
+    .map_err(|err| anyhow!("{err}"))
+}
+
+fn handle_loop_autorun(
+    db: &Database,
+    port_override: Option<u16>,
+    id_or_name: &str,
+    at: Option<&str>,
+    quota_reset_message: Option<&str>,
+    cancel: bool,
+) -> Result<()> {
+    let set_count = [at.is_some(), quota_reset_message.is_some(), cancel]
+        .iter()
+        .filter(|set| **set)
+        .count();
+    if set_count == 0 {
+        return Err(anyhow!(
+            "Specify one of --at, --quota-reset-message, or --cancel."
+        ));
+    }
+    if set_count > 1 {
+        return Err(anyhow!(
+            "--at, --quota-reset-message, and --cancel are mutually exclusive."
+        ));
+    }
+
+    let loops = db.list_loops(None, true)?;
+    let lp = resolve_loop(&loops, id_or_name)?;
+
+    let args = if cancel {
+        serde_json::json!({ "loop_id": lp.id })
+    } else if let Some(at) = at {
+        serde_json::json!({ "loop_id": lp.id, "at": at })
+    } else {
+        serde_json::json!({ "loop_id": lp.id, "quota_reset_message": quota_reset_message })
+    };
+
+    println!(
+        "{}",
+        call_tool(port_override, "loop_schedule_autorun", &args)?
+    );
+    Ok(())
 }
 
 fn handle_loop_list(db: &Database, workdir: Option<&str>) -> Result<()> {
@@ -535,6 +794,121 @@ mod tests {
         match cli.action {
             LoopAction::Info { id_or_name } => assert_eq!(id_or_name, "my-loop"),
             other => panic!("expected Info, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_parses_queue_and_workdir() {
+        let cli = TestCli::try_parse_from(["test", "run", "my-loop"]).expect("should parse");
+        match cli.action {
+            LoopAction::Run {
+                id_or_name,
+                queue,
+                workdir,
+            } => {
+                assert_eq!(id_or_name, "my-loop");
+                assert!(queue.is_none());
+                assert!(workdir.is_none());
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+
+        let cli = TestCli::try_parse_from([
+            "test",
+            "run",
+            "my-loop",
+            "--queue",
+            "q1",
+            "--workdir",
+            "/tmp/proj",
+        ])
+        .expect("should parse");
+        match cli.action {
+            LoopAction::Run {
+                id_or_name,
+                queue,
+                workdir,
+            } => {
+                assert_eq!(id_or_name, "my-loop");
+                assert_eq!(queue.as_deref(), Some("q1"));
+                assert_eq!(workdir.as_deref(), Some("/tmp/proj"));
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pause_requires_id_or_name() {
+        assert!(TestCli::try_parse_from(["test", "pause"]).is_err());
+        let cli = TestCli::try_parse_from(["test", "pause", "my-loop"]).expect("should parse");
+        match cli.action {
+            LoopAction::Pause { id_or_name } => assert_eq!(id_or_name, "my-loop"),
+            other => panic!("expected Pause, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn continue_parses_retry_and_skip_flags() {
+        let cli = TestCli::try_parse_from(["test", "continue", "my-loop", "--retry-current-node"])
+            .expect("should parse");
+        match cli.action {
+            LoopAction::Continue {
+                id_or_name,
+                retry_current_node,
+                skip_next_spec,
+            } => {
+                assert_eq!(id_or_name, "my-loop");
+                assert!(retry_current_node);
+                assert!(!skip_next_spec);
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
+
+        let cli = TestCli::try_parse_from(["test", "continue", "my-loop", "--skip-next-spec"])
+            .expect("should parse");
+        match cli.action {
+            LoopAction::Continue { skip_next_spec, .. } => assert!(skip_next_spec),
+            other => panic!("expected Continue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reset_parses_repeated_specs_and_yes() {
+        let cli = TestCli::try_parse_from([
+            "test", "reset", "my-loop", "--specs", "a", "--specs", "b", "--yes",
+        ])
+        .expect("should parse");
+        match cli.action {
+            LoopAction::Reset {
+                id_or_name,
+                specs,
+                yes,
+            } => {
+                assert_eq!(id_or_name, "my-loop");
+                assert_eq!(specs, vec!["a".to_string(), "b".to_string()]);
+                assert!(yes);
+            }
+            other => panic!("expected Reset, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn autorun_parses_at_quota_message_and_cancel() {
+        let cli =
+            TestCli::try_parse_from(["test", "autorun", "my-loop", "--at", "2026-07-10T09:00:00Z"])
+                .expect("should parse");
+        match cli.action {
+            LoopAction::Autorun { at, .. } => {
+                assert_eq!(at.as_deref(), Some("2026-07-10T09:00:00Z"));
+            }
+            other => panic!("expected Autorun, got {other:?}"),
+        }
+
+        let cli = TestCli::try_parse_from(["test", "autorun", "my-loop", "--cancel"])
+            .expect("should parse");
+        match cli.action {
+            LoopAction::Autorun { cancel, .. } => assert!(cancel),
+            other => panic!("expected Autorun, got {other:?}"),
         }
     }
 
@@ -1102,5 +1476,237 @@ mod tests {
         let at = DateTime::<Utc>::from_timestamp(23 * 3600 + 59 * 60, 0).unwrap();
         let result = format_autorun_compact(at);
         assert!(result.contains("23:59Z"));
+    }
+
+    // ── state-changing handlers: daemon delegation ──────────────────
+
+    use crate::tui::mcp_client::test_support::{spawn_fake_daemon, unused_port};
+
+    fn db_with_loop(id: &str, name: &str, status: LoopStatus) -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(&dir.path().join("t.db")).unwrap();
+        db.insert_loop(&make_loop(id, name, status)).unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn handle_loop_run_calls_loop_run_tool_with_resolved_id() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Draft);
+        let fake = spawn_fake_daemon(serde_json::json!({
+            "content": [{"type": "text", "text": "Loop 'loop-1' launched in background."}],
+            "isError": false
+        }));
+        let port: u16 = fake.port.parse().unwrap();
+
+        handle_loop_run(&db, Some(port), "my-loop", Some("q1".to_string()), None)
+            .expect("run should succeed");
+
+        let calls = fake.recorded_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["name"], "loop_run");
+        assert_eq!(calls[0]["arguments"]["loop_id"], "loop-1");
+        assert_eq!(calls[0]["arguments"]["queue_id"], "q1");
+    }
+
+    #[test]
+    fn handle_loop_run_rejects_unknown_loop_before_touching_daemon() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Draft);
+        // No fake daemon is spawned — a request that reaches the network at
+        // all would fail differently (connection refused) than the
+        // not-found error resolution must produce locally.
+        let err = handle_loop_run(&db, Some(65535), "missing", None, None).unwrap_err();
+        assert!(err.to_string().contains("No loop matches"));
+    }
+
+    #[test]
+    fn handle_loop_pause_calls_loop_pause_tool() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Running);
+        let fake = spawn_fake_daemon(serde_json::json!({
+            "content": [{"type": "text", "text": "Loop 'loop-1' marked to pause."}],
+            "isError": false
+        }));
+        let port: u16 = fake.port.parse().unwrap();
+
+        handle_loop_pause(&db, Some(port), "loop-1").expect("pause should succeed");
+
+        let calls = fake.recorded_calls();
+        assert_eq!(calls[0]["name"], "loop_pause");
+        assert_eq!(calls[0]["arguments"]["loop_id"], "loop-1");
+    }
+
+    #[test]
+    fn handle_loop_continue_sends_retry_current_node_action() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Paused);
+        let fake = spawn_fake_daemon(serde_json::json!({
+            "content": [{"type": "text", "text": "resumed"}],
+            "isError": false
+        }));
+        let port: u16 = fake.port.parse().unwrap();
+
+        handle_loop_continue(&db, Some(port), "loop-1", true, false).expect("should succeed");
+
+        let calls = fake.recorded_calls();
+        assert_eq!(calls[0]["arguments"]["action"], "retry_current_node");
+    }
+
+    #[test]
+    fn handle_loop_continue_sends_skip_next_spec_action() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Paused);
+        let fake = spawn_fake_daemon(serde_json::json!({
+            "content": [{"type": "text", "text": "resumed"}],
+            "isError": false
+        }));
+        let port: u16 = fake.port.parse().unwrap();
+
+        handle_loop_continue(&db, Some(port), "loop-1", false, true).expect("should succeed");
+
+        let calls = fake.recorded_calls();
+        assert_eq!(calls[0]["arguments"]["action"], "skip_next_spec");
+    }
+
+    #[test]
+    fn handle_loop_continue_rejects_when_neither_flag_set() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Paused);
+        let err = handle_loop_continue(&db, Some(65535), "loop-1", false, false).unwrap_err();
+        assert!(err.to_string().contains("Specify one of"));
+    }
+
+    #[test]
+    fn handle_loop_continue_rejects_when_both_flags_set() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Paused);
+        let err = handle_loop_continue(&db, Some(65535), "loop-1", true, true).unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn handle_loop_reset_with_yes_sends_explicit_specs() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Failed);
+        // `yes: true` bypasses the interactive confirmation prompt (which
+        // would otherwise block on a non-tty test run), exercising the
+        // confirmed path deterministically.
+        let fake = spawn_fake_daemon(serde_json::json!({
+            "content": [{"type": "text", "text": "Loop 'loop-1' reset."}],
+            "isError": false
+        }));
+        let port: u16 = fake.port.parse().unwrap();
+
+        handle_loop_reset(
+            &db,
+            Some(port),
+            "loop-1",
+            &["spec-a".to_string(), "spec-b".to_string()],
+            true,
+        )
+        .expect("reset should succeed");
+
+        let calls = fake.recorded_calls();
+        assert_eq!(calls[0]["name"], "loop_reset");
+        assert_eq!(calls[0]["arguments"]["loop_id"], "loop-1");
+        assert_eq!(
+            calls[0]["arguments"]["specs"],
+            serde_json::json!(["spec-a", "spec-b"])
+        );
+    }
+
+    #[test]
+    fn handle_loop_reset_omits_specs_field_when_none_given() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Failed);
+        let fake = spawn_fake_daemon(serde_json::json!({
+            "content": [{"type": "text", "text": "Loop 'loop-1' reset."}],
+            "isError": false
+        }));
+        let port: u16 = fake.port.parse().unwrap();
+
+        handle_loop_reset(&db, Some(port), "loop-1", &[], true).expect("reset should succeed");
+
+        let calls = fake.recorded_calls();
+        assert!(calls[0]["arguments"].get("specs").is_none());
+    }
+
+    #[test]
+    fn handle_loop_autorun_sends_at() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Draft);
+        let fake = spawn_fake_daemon(serde_json::json!({
+            "content": [{"type": "text", "text": "scheduled"}],
+            "isError": false
+        }));
+        let port: u16 = fake.port.parse().unwrap();
+
+        handle_loop_autorun(
+            &db,
+            Some(port),
+            "loop-1",
+            Some("2026-07-10T09:00:00Z"),
+            None,
+            false,
+        )
+        .expect("autorun should succeed");
+
+        let calls = fake.recorded_calls();
+        assert_eq!(calls[0]["arguments"]["at"], "2026-07-10T09:00:00Z");
+    }
+
+    #[test]
+    fn handle_loop_autorun_cancel_omits_at_and_message() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Draft);
+        let fake = spawn_fake_daemon(serde_json::json!({
+            "content": [{"type": "text", "text": "cancelled"}],
+            "isError": false
+        }));
+        let port: u16 = fake.port.parse().unwrap();
+
+        handle_loop_autorun(&db, Some(port), "loop-1", None, None, true)
+            .expect("autorun cancel should succeed");
+
+        let calls = fake.recorded_calls();
+        assert!(calls[0]["arguments"].get("at").is_none());
+        assert!(calls[0]["arguments"].get("quota_reset_message").is_none());
+    }
+
+    #[test]
+    fn handle_loop_autorun_rejects_no_flags() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Draft);
+        let err = handle_loop_autorun(&db, Some(65535), "loop-1", None, None, false).unwrap_err();
+        assert!(err.to_string().contains("Specify one of"));
+    }
+
+    #[test]
+    fn handle_loop_autorun_rejects_multiple_flags() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Draft);
+        let err = handle_loop_autorun(
+            &db,
+            Some(65535),
+            "loop-1",
+            Some("2026-07-10T09:00:00Z"),
+            None,
+            true,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    /// The case this spec exists for: the daemon is unreachable on the
+    /// resolved port, and the failure must read as "daemon unreachable",
+    /// never as "the loop does not exist" (the loop resolves fine locally
+    /// against the same database `loop list`/`loop info` already read).
+    #[test]
+    fn handle_loop_pause_reports_daemon_unreachable_distinctly_from_not_found() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Running);
+
+        for _ in 0..5 {
+            let port: u16 = unused_port().parse().unwrap();
+            match handle_loop_pause(&db, Some(port), "loop-1") {
+                Err(err) => {
+                    let chain: Vec<String> = err.chain().map(ToString::to_string).collect();
+                    assert!(chain
+                        .iter()
+                        .any(|m| m.contains("could not reach the daemon")));
+                    assert!(!chain.iter().any(|m| m.contains("No loop matches")));
+                    return;
+                }
+                Ok(()) => continue,
+            }
+        }
+        panic!("port kept getting claimed by another test after 5 attempts");
     }
 }

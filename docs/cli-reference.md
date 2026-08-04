@@ -45,6 +45,44 @@ first if needed, and checking for updates).
 Loop ids can be specified by exact id, exact name, or unambiguous id
 prefix. Ambiguous references list the candidates.
 
+## Loop control
+
+Mirrors the `loop_run`/`loop_pause`/`loop_continue`/`loop_reset`/
+`loop_schedule_autorun` MCP tools — a second way to reach the same daemon
+operations when an MCP client can't. Every command resolves `<id-or-name>`
+locally (same rule as loop inspection above) and then delegates the actual
+state change to the daemon over its existing MCP endpoint; it never writes
+to the database directly. If the daemon isn't reachable on the resolved
+port, the error says so explicitly instead of looking like the loop is
+missing.
+
+| Command | Description |
+|---|---|
+| `canopy loop run <id-or-name>` | Run a loop in the background, spec by spec |
+| `canopy loop run <id-or-name> --queue <queue-id>` | Run the queue's pending specs through the loop's graph instead |
+| `canopy loop run <id-or-name> --workdir <path>` | Override the loop's workdir for this run only |
+| `canopy loop pause <id-or-name>` | Pause a running loop after the current node finishes |
+| `canopy loop continue <id-or-name> --retry-current-node` | Resume a paused loop by retrying the current node |
+| `canopy loop continue <id-or-name> --skip-next-spec` | Resume a paused loop by skipping to the next spec |
+| `canopy loop reset <id-or-name>` | Reset a completed/failed loop back to pending (prompts for confirmation) |
+| `canopy loop reset <id-or-name> --specs <id>...` | Reset specific spec ids, even if already completed |
+| `canopy loop reset <id-or-name> --yes` | Skip the confirmation prompt |
+| `canopy loop autorun <id-or-name> --at <iso8601>` | Schedule a one-shot resume at a future time |
+| `canopy loop autorun <id-or-name> --quota-reset-message <text>` | Schedule a resume from a raw CLI quota-limit message |
+| `canopy loop autorun <id-or-name> --cancel` | Cancel a pending autorun schedule |
+
+## Spec backlog
+
+| Command | Description |
+|---|---|
+| `canopy spec create --name <name> --description <text>` | Create a standalone spec (a backlog item) |
+| `canopy spec create ... --workdir <path>` | Tag the new spec with a workdir, for backlog filtering |
+| `canopy spec create ... --queue <queue-id>` | Also append the new spec to an existing queue |
+| `canopy spec create ... --queue <queue-id> --group <group>` | Add it to the queue within a context group |
+| `canopy spec complete <spec-id> --reason <text>` | Mark a standalone spec as completed |
+| `canopy spec skip <spec-id> --reason <text>` | Mark a standalone spec as skipped |
+| `canopy spec reopen <spec-id> --reason <text>` | Reopen a completed/skipped spec back to pending |
+
 ## RAG
 
 | Command | Description |

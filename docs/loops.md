@@ -239,8 +239,11 @@ by reconstructing what ran from the run history.
 
 Loops can be authored programmatically by agents through these tools,
 or edited in the [TUI loop editor](tui.md) with inline JSON config
-validation. The `canopy loop list` and `canopy loop info` CLI
-subcommands provide read-only inspection from the terminal.
+validation. The `canopy loop` CLI subcommands mirror the runtime tools
+from the terminal: `list`/`info` are read-only inspection, and
+`run`/`pause`/`continue`/`reset`/`autorun` delegate the matching MCP
+tool to the daemon — a second way to drive a loop when an MCP client
+can't reach it. See the [CLI reference](cli-reference.md#loop-control).
 
 ## Node blueprints
 

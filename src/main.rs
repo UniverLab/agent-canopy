@@ -83,7 +83,8 @@ enum Commands {
         #[command(subcommand)]
         action: RagAction,
     },
-    /// Inspect loop state (read-only).
+    /// Inspect and control loop state (list/info are read-only;
+    /// run/pause/continue/reset/autorun delegate to the daemon).
     Loop {
         #[command(subcommand)]
         action: LoopAction,
@@ -178,8 +179,8 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(Commands::Rag { action }) => handle_rag_action(action).await,
-        Some(Commands::Loop { action }) => handle_loop_action(action).await,
-        Some(Commands::Spec { action }) => handle_spec_action(action).await,
+        Some(Commands::Loop { action }) => handle_loop_action(action, cli.port).await,
+        Some(Commands::Spec { action }) => handle_spec_action(action, cli.port).await,
         Some(Commands::Models { action }) => handle_models_action(action).await,
         Some(Commands::Project { action }) => handle_project_action(action).await,
         Some(Commands::Clean {

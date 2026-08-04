@@ -492,7 +492,14 @@ fn resolve_workdir(workdir_arg: Option<PathBuf>) -> Result<String> {
 }
 
 /// Daemon port discovery: `--port` → `CANOPY_PORT` → daemon state in DB → 7755.
-fn resolve_bridge_port(port_arg: Option<u16>) -> u16 {
+///
+/// Shared with the state-changing `canopy loop`/`canopy spec` subcommands
+/// (`daemon::cli_daemon`) so every CLI path that talks to the daemon's MCP
+/// endpoint resolves the port the same way the bridge does — reading the
+/// daemon's own reported port from `background_agents.db` rather than
+/// assuming the default, which is what makes this resolution survive a
+/// stale process squatting on 7755.
+pub(crate) fn resolve_bridge_port(port_arg: Option<u16>) -> u16 {
     if let Some(port) = port_arg {
         return port;
     }
