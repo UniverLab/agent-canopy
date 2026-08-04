@@ -5133,6 +5133,86 @@ impl TaskTriggerHandler {
     }
 
     #[tool(
+        name = "loop_node_runs_list",
+        description = "List a loop's node run history — what `loop_get` omits (it only carries a loop's *bound* specs, empty for a queue-driven run). Defaults to the most recent runs first, so the run that failed a `failed` loop is normally the very first result without knowing any node id ahead of time. Narrow to one spec or node with `spec_id`/`node_id`. Output/input are omitted here since they can be large; fetch a specific run's full output with loop_node_run_get using its `id`."
+    )]
+    async fn loop_node_runs_list(
+        &self,
+        Parameters(params): Parameters<LoopNodeRunsListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if self
+            .db
+            .get_loop(&params.loop_id)
+            .map_err(internal_error)?
+            .is_none()
+        {
+            return Ok(error_result(&format!(
+                "Loop '{}' not found.",
+                params.loop_id
+            )));
+        }
+
+        let limit = params.limit.unwrap_or(20).clamp(1, 200) as i64;
+        let offset = params.offset.unwrap_or(0) as i64;
+
+        let runs = self
+            .db
+            .list_loop_node_runs(
+                &params.loop_id,
+                params.spec_id.as_deref(),
+                params.node_id.as_deref(),
+                limit,
+                offset,
+            )
+            .map_err(internal_error)?;
+
+        let out = runs
+            .iter()
+            .map(|run| loop_node_run_summary_json(&self.db, run))
+            .collect::<Vec<_>>();
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&serde_json::json!({
+                "loop_id": params.loop_id,
+                "limit": limit,
+                "offset": offset,
+                "runs": out,
+            }))
+            .unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        name = "loop_node_run_get",
+        description = "Fetch one node run's full stored input/output by run id (see loop_node_runs_list). This is the second step of failure diagnosis: list to find the offending run, then fetch its output here — the exact stderr/stdout/reported_output the engine recorded, including `infra_attempt`/`infra_crash` markers when present. Secret-shaped substrings (API keys, tokens, private key blocks) are redacted before the output crosses this boundary."
+    )]
+    async fn loop_node_run_get(
+        &self,
+        Parameters(params): Parameters<LoopNodeRunGetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let Some(run) = self
+            .db
+            .get_loop_run(&params.run_id)
+            .map_err(internal_error)?
+        else {
+            return Ok(error_result(&format!(
+                "Node run '{}' not found.",
+                params.run_id
+            )));
+        };
+        let node_name = self
+            .db
+            .get_loop_node(&run.node_id)
+            .map_err(internal_error)?
+            .map(|node| node.name);
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&loop_node_run_detail_json(&run, node_name.as_deref()))
+                .unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
         name = "loop_run",
         description = "Run a loop in the background, spec by spec. With `queue_id`, runs the queue's pending specs (in queue order) through the loop's graph instead of the loop's own bound specs. (`pool_id` is a deprecated alias for `queue_id`; `queue_id` wins if both are set.) `workdir` overrides the loop's workdir for this run only."
     )]
@@ -6381,6 +6461,104 @@ fn loop_run_blocker(run: &crate::domain::loops::LoopNodeRun) -> Option<String> {
         .and_then(|output| output.get("blocker"))
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+/// One row of `loop_node_runs_list` — deliberately excludes `input`/`output`
+/// (can be large; a caller wanting them calls `loop_node_run_get` with this
+/// row's `id`) but resolves `node_name` so a caller isn't left matching a
+/// bare node id back to the graph by hand.
+fn loop_node_run_summary_json(db: &Database, run: &LoopNodeRun) -> serde_json::Value {
+    let node_name = db
+        .get_loop_node(&run.node_id)
+        .ok()
+        .flatten()
+        .map(|node| node.name);
+    serde_json::json!({
+        "id": run.id,
+        "spec_id": run.spec_id,
+        "node_id": run.node_id,
+        "node_name": node_name,
+        "status": run.status.as_str(),
+        "iteration": run.iteration,
+        "started_at": run.started_at.to_rfc3339(),
+        "completed_at": run.completed_at.map(|value| value.to_rfc3339()),
+        "session_id": run.session_id,
+    })
+}
+
+/// The `loop_node_run_get` response: everything `loop_node_run_summary_json`
+/// carries, plus the full `input`/`output` the engine stored — redacted
+/// (see [`redact_sensitive_value`]) since either can carry secret-shaped
+/// content echoed by the wrapped CLI. `output` preserves whatever the engine
+/// wrote verbatim otherwise, including the B19 `infra_attempt`/`infra_crash`
+/// markers a caller needs to tell an infra retry from a semantic failure.
+fn loop_node_run_detail_json(run: &LoopNodeRun, node_name: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "id": run.id,
+        "loop_id": run.loop_id,
+        "spec_id": run.spec_id,
+        "node_id": run.node_id,
+        "node_name": node_name,
+        "status": run.status.as_str(),
+        "iteration": run.iteration,
+        "input": run.input.as_ref().map(redact_sensitive_value),
+        "output": run.output.as_ref().map(redact_sensitive_value),
+        "started_at": run.started_at.to_rfc3339(),
+        "completed_at": run.completed_at.map(|value| value.to_rfc3339()),
+        "session_id": run.session_id,
+    })
+}
+
+/// Secret-shaped substrings a node run's stored input/output can carry
+/// through whatever CLI it wrapped (an API key echoed into a shell command,
+/// a leaked token in stderr, a pasted private key). Compiled once and
+/// applied uniformly to every string leaf in the run's JSON — see
+/// [`redact_sensitive_value`] — rather than to specific fields like `stdout`
+/// or `command`, since sensitive content can land in any of them alike and a
+/// per-field allowlist would miss the next field name that carries it.
+static SECRET_PATTERNS: std::sync::LazyLock<Vec<regex::Regex>> = std::sync::LazyLock::new(|| {
+    [
+        // Anthropic/OpenAI-style API keys: sk-..., sk-ant-...
+        r"sk-[A-Za-z0-9_-]{16,}",
+        // GitHub personal/app/oauth/refresh tokens.
+        r"gh[pousr]_[A-Za-z0-9]{20,}",
+        // AWS access key IDs.
+        r"AKIA[0-9A-Z]{16}",
+        // Bearer tokens in an Authorization header or similar.
+        r"(?i)bearer\s+[A-Za-z0-9._-]{16,}",
+        // key/value assignments: api_key=..., "password": "...", token: ...
+        r#"(?i)(api[_-]?key|secret|password|access[_-]?token|token)["']?\s*[:=]\s*["']?[A-Za-z0-9._\-/+]{8,}"#,
+        // PEM private key blocks.
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
+    ]
+    .iter()
+    .map(|pattern| regex::Regex::new(pattern).expect("valid redaction regex"))
+    .collect()
+});
+
+fn redact_secrets(text: &str) -> String {
+    let mut result = text.to_string();
+    for pattern in SECRET_PATTERNS.iter() {
+        result = pattern.replace_all(&result, "[REDACTED]").into_owned();
+    }
+    result
+}
+
+/// Recursively redacts every string leaf of a node run's stored `input`/
+/// `output` before it crosses the MCP boundary via `loop_node_run_get`.
+fn redact_sensitive_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(s) => serde_json::Value::String(redact_secrets(s)),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(redact_sensitive_value).collect())
+        }
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), redact_sensitive_value(v)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
 }
 
 fn transport_details(port: u16) -> (&'static str, String) {
@@ -14894,6 +15072,248 @@ mod endpoint_tests {
             .await
             .unwrap();
         assert!(!raw_text(&filtered_out).contains(&lp.id));
+    }
+
+    // ── loop_node_runs_list / loop_node_run_get ────────────────────
+
+    fn insert_named_node(db: &Database, spec_id: &str, name: &str, position: i64) -> LoopNode {
+        let node = LoopNode {
+            id: uuid::Uuid::new_v4().to_string(),
+            spec_id: Some(spec_id.to_string()),
+            loop_id: None,
+            name: name.to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "claude"}),
+            position,
+            created_at: chrono::Utc::now(),
+        };
+        db.insert_loop_node(&node).unwrap();
+        node
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_finalized_node_run(
+        db: &Database,
+        loop_id: &str,
+        spec_id: &str,
+        node_id: &str,
+        status: LoopRunStatus,
+        output: Option<serde_json::Value>,
+        started_at: chrono::DateTime<chrono::Utc>,
+    ) -> LoopNodeRun {
+        let run = LoopNodeRun {
+            id: uuid::Uuid::new_v4().to_string(),
+            loop_id: loop_id.to_string(),
+            spec_id: spec_id.to_string(),
+            node_id: node_id.to_string(),
+            status,
+            input: None,
+            output,
+            started_at,
+            completed_at: Some(started_at),
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: Some("ses_test_123".to_string()),
+        };
+        db.insert_loop_run(&run).unwrap();
+        run
+    }
+
+    #[tokio::test]
+    async fn loop_node_runs_list_defaults_to_most_recent_first_and_resolves_node_name() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let node_a = insert_named_node(&db, &spec.id, "build", 1);
+        let node_b = insert_named_node(&db, &spec.id, "review", 2);
+
+        let now = chrono::Utc::now();
+        let older = insert_finalized_node_run(
+            &db,
+            &lp.id,
+            &spec.id,
+            &node_a.id,
+            LoopRunStatus::Pass,
+            Some(serde_json::json!({"reported_output": "ok"})),
+            now - chrono::Duration::minutes(10),
+        );
+        let newer = insert_finalized_node_run(
+            &db,
+            &lp.id,
+            &spec.id,
+            &node_b.id,
+            LoopRunStatus::Fail,
+            Some(serde_json::json!({"stderr": "Error: Unsupported model mimo-auto"})),
+            now,
+        );
+
+        let listed = handler
+            .loop_node_runs_list(Parameters(LoopNodeRunsListParams {
+                loop_id: lp.id.clone(),
+                spec_id: None,
+                node_id: None,
+                limit: None,
+                offset: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&listed), "{}", text(&listed));
+        let body = raw_text(&listed);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let runs = parsed["runs"].as_array().unwrap();
+        assert_eq!(
+            runs[0]["id"], newer.id,
+            "the most recently started run must lead the default listing"
+        );
+        assert_eq!(runs[1]["id"], older.id);
+        assert_eq!(runs[0]["node_name"], "review");
+        assert_eq!(runs[0]["status"], "fail");
+        assert_eq!(runs[0]["session_id"], "ses_test_123");
+        assert!(
+            runs[0].get("output").is_none(),
+            "list responses must omit output — fetch it via loop_node_run_get"
+        );
+
+        let unknown_loop = handler
+            .loop_node_runs_list(Parameters(LoopNodeRunsListParams {
+                loop_id: "ghost".to_string(),
+                spec_id: None,
+                node_id: None,
+                limit: None,
+                offset: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&unknown_loop));
+    }
+
+    #[tokio::test]
+    async fn loop_node_runs_list_filters_by_spec_and_node_and_respects_limit() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec1 = insert_test_spec(&db, &lp.id, 1);
+        let spec2 = insert_test_spec(&db, &lp.id, 2);
+        let node1 = insert_named_node(&db, &spec1.id, "node1", 1);
+        let node2 = insert_named_node(&db, &spec2.id, "node2", 1);
+        let now = chrono::Utc::now();
+        insert_finalized_node_run(
+            &db,
+            &lp.id,
+            &spec1.id,
+            &node1.id,
+            LoopRunStatus::Pass,
+            None,
+            now - chrono::Duration::minutes(2),
+        );
+        let spec2_run = insert_finalized_node_run(
+            &db,
+            &lp.id,
+            &spec2.id,
+            &node2.id,
+            LoopRunStatus::Pass,
+            None,
+            now - chrono::Duration::minutes(1),
+        );
+        insert_finalized_node_run(
+            &db,
+            &lp.id,
+            &spec1.id,
+            &node1.id,
+            LoopRunStatus::Fail,
+            None,
+            now,
+        );
+
+        let by_spec = handler
+            .loop_node_runs_list(Parameters(LoopNodeRunsListParams {
+                loop_id: lp.id.clone(),
+                spec_id: Some(spec2.id.clone()),
+                node_id: None,
+                limit: None,
+                offset: None,
+            }))
+            .await
+            .unwrap();
+        let by_spec_runs = serde_json::from_str::<serde_json::Value>(&raw_text(&by_spec)).unwrap()
+            ["runs"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(by_spec_runs.len(), 1);
+        assert_eq!(by_spec_runs[0]["id"], spec2_run.id);
+
+        let limited = handler
+            .loop_node_runs_list(Parameters(LoopNodeRunsListParams {
+                loop_id: lp.id.clone(),
+                spec_id: None,
+                node_id: None,
+                limit: Some(1),
+                offset: None,
+            }))
+            .await
+            .unwrap();
+        let limited_runs = serde_json::from_str::<serde_json::Value>(&raw_text(&limited)).unwrap()
+            ["runs"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(limited_runs.len(), 1, "limit must bound the page size");
+        assert_eq!(
+            limited_runs[0]["status"], "fail",
+            "the single returned run must be the most recent one"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_node_run_get_returns_full_output_and_redacts_secrets() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let node = insert_named_node(&db, &spec.id, "resilience", 1);
+        let run = insert_finalized_node_run(
+            &db,
+            &lp.id,
+            &spec.id,
+            &node.id,
+            LoopRunStatus::Fail,
+            Some(serde_json::json!({
+                "cli": "mimocode",
+                "stderr": "Error: Unsupported model mimo-auto",
+                "stdout": "leaked token=abcdefghij1234567890 in output",
+                "infra_attempt": 1,
+                "infra_crash": true,
+            })),
+            chrono::Utc::now(),
+        );
+
+        let got = handler
+            .loop_node_run_get(Parameters(LoopNodeRunGetParams {
+                run_id: run.id.clone(),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&got), "{}", text(&got));
+        let body = raw_text(&got);
+        assert!(body.contains("Unsupported model mimo-auto"));
+        assert!(body.contains("\"node_name\": \"resilience\""));
+        assert!(
+            body.contains("\"infra_attempt\": 1") && body.contains("\"infra_crash\": true"),
+            "B19 infra markers must survive verbatim: {body}"
+        );
+        assert!(
+            !body.contains("abcdefghij1234567890"),
+            "a token-shaped value must be redacted, not passed through: {body}"
+        );
+        assert!(body.contains("[REDACTED]"));
+
+        let missing = handler
+            .loop_node_run_get(Parameters(LoopNodeRunGetParams {
+                run_id: "ghost-run".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&missing));
     }
 
     // ── loop_pause / loop_continue ────────────────────────────────

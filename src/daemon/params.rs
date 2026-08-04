@@ -819,6 +819,29 @@ pub struct LoopGetParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopNodeRunsListParams {
+    /// Loop ID whose node runs to list.
+    pub loop_id: String,
+    /// Narrow to one spec's runs.
+    pub spec_id: Option<String>,
+    /// Narrow to one node's runs.
+    pub node_id: Option<String>,
+    /// Maximum number of runs to return, most recent first. Defaults to 20,
+    /// capped at 200.
+    pub limit: Option<u32>,
+    /// Number of most-recent runs to skip before returning `limit` more —
+    /// page past the default page (e.g. `offset: 20` for the next page after
+    /// the default). Defaults to 0.
+    pub offset: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopNodeRunGetParams {
+    /// The node run ID (the `id` field from loop_node_runs_list's results).
+    pub run_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LoopListParams {
     /// Optional absolute workdir filter.
     pub workdir: Option<String>,

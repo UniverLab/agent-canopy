@@ -1129,6 +1129,58 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Page through a loop's node runs, most-recent-first, optionally
+    /// narrowed to one spec and/or one node — the query a failure
+    /// investigation needs (`loop_node_runs_list`): find what ran, in what
+    /// order, without knowing a node id ahead of time. Unlike
+    /// [`Self::list_loop_runs_for_loop`] (oldest-first, unbounded — built for
+    /// the engine replaying a whole run), this is bounded by `limit`/`offset`
+    /// so a loop with hundreds of runs stays a usable response.
+    ///
+    /// `loop_id` alone rides `idx_loop_runs_loop_started(loop_id,
+    /// started_at DESC)` directly, matching this query's default order.
+    /// Adding `spec_id`/`node_id` applies as a residual filter on top of that
+    /// same index scan — both columns already carry their own index
+    /// (`idx_loop_runs_spec_started`, `idx_loop_runs_node_iteration`) for
+    /// other call sites, but the scan here is bounded by `loop_id` first
+    /// either way, so no additional composite index is needed.
+    pub fn list_loop_node_runs(
+        &self,
+        loop_id: &str,
+        spec_id: Option<&str>,
+        node_id: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<LoopNodeRun>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+
+        let mut sql = String::from(
+            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id, session_id
+             FROM loop_runs WHERE loop_id = ?",
+        );
+        let mut query_params: Vec<&dyn rusqlite::ToSql> = vec![&loop_id];
+        if let Some(spec_id) = spec_id.as_ref() {
+            sql.push_str(" AND spec_id = ?");
+            query_params.push(spec_id);
+        }
+        if let Some(node_id) = node_id.as_ref() {
+            sql.push_str(" AND node_id = ?");
+            query_params.push(node_id);
+        }
+        sql.push_str(" ORDER BY started_at DESC, iteration DESC LIMIT ? OFFSET ?");
+        query_params.push(&limit);
+        query_params.push(&offset);
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(query_params.as_slice(), map_loop_run_row)?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     /// Most recent `loop_runs.started_at` per loop, across every loop in a
     /// single query — the sidebar's "last activity" signal. Unlike
     /// [`Self::list_loop_specs`] (a loop's own bound specs, empty for a
@@ -2185,5 +2237,132 @@ mod tests {
             "must report the MAX started_at, not the first run"
         );
         assert!(!times.contains_key("loop2"));
+    }
+
+    /// Seeds loop1 (spec1: nodes n1/n2, spec2: node n3) and loop2 (spec3:
+    /// node n4) with runs at increasing `started_at`, so tests can assert
+    /// default ordering, spec/node filters, and paging against a fixture
+    /// that mirrors a real multi-spec, multi-node loop.
+    fn seed_node_runs_fixture(db: &Database) {
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO loops (id, name, workdir, status, created_at) VALUES ('loop1', 'l1', '/tmp', 'running', 0)",
+            params![],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO loops (id, name, workdir, status, created_at) VALUES ('loop2', 'l2', '/tmp', 'running', 0)",
+            params![],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO loop_specs (id, loop_id, name, position, parallelizable, status) VALUES ('spec1', 'loop1', 's1', 0, 0, 'pending')",
+            params![],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO loop_specs (id, loop_id, name, position, parallelizable, status) VALUES ('spec2', 'loop1', 's2', 1, 0, 'pending')",
+            params![],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO loop_specs (id, loop_id, name, position, parallelizable, status) VALUES ('spec3', 'loop2', 's3', 0, 0, 'pending')",
+            params![],
+        )
+        .unwrap();
+        for (node_id, spec_id, position) in [
+            ("n1", "spec1", 0),
+            ("n2", "spec1", 1),
+            ("n3", "spec2", 0),
+            ("n4", "spec3", 0),
+        ] {
+            conn.execute(
+                "INSERT INTO loop_nodes (id, spec_id, loop_id, name, kind, config, position, created_at) VALUES (?1, ?2, NULL, ?1, 'agent', '{}', ?3, 0)",
+                params![node_id, spec_id, position],
+            )
+            .unwrap();
+        }
+        // loop1: run1 (spec1/n1, t=100), run2 (spec1/n2, t=200), run3
+        // (spec2/n3, t=300, fail). loop2: run4 (spec3/n4, t=400) — must never
+        // leak into a loop1 query.
+        for (id, loop_id, spec_id, node_id, status, started_at) in [
+            ("run1", "loop1", "spec1", "n1", "pass", 100),
+            ("run2", "loop1", "spec1", "n2", "pass", 200),
+            ("run3", "loop1", "spec2", "n3", "fail", 300),
+            ("run4", "loop2", "spec3", "n4", "pass", 400),
+        ] {
+            conn.execute(
+                "INSERT INTO loop_runs (id, loop_id, spec_id, node_id, status, started_at, iteration) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+                params![id, loop_id, spec_id, node_id, status, started_at],
+            )
+            .unwrap();
+        }
+        drop(conn);
+    }
+
+    #[test]
+    fn list_loop_node_runs_defaults_to_most_recent_first_scoped_to_loop() {
+        let db = test_db();
+        seed_node_runs_fixture(&db);
+
+        let runs = db.list_loop_node_runs("loop1", None, None, 10, 0).unwrap();
+        let ids: Vec<&str> = runs.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["run3", "run2", "run1"],
+            "most-recent-started_at run must lead, and loop2's run4 must never appear"
+        );
+    }
+
+    #[test]
+    fn list_loop_node_runs_filters_by_spec_and_node() {
+        let db = test_db();
+        seed_node_runs_fixture(&db);
+
+        let by_spec = db
+            .list_loop_node_runs("loop1", Some("spec1"), None, 10, 0)
+            .unwrap();
+        assert_eq!(
+            by_spec.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["run2", "run1"]
+        );
+
+        let by_node = db
+            .list_loop_node_runs("loop1", None, Some("n3"), 10, 0)
+            .unwrap();
+        assert_eq!(
+            by_node.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["run3"]
+        );
+
+        let by_both = db
+            .list_loop_node_runs("loop1", Some("spec1"), Some("n1"), 10, 0)
+            .unwrap();
+        assert_eq!(
+            by_both.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["run1"]
+        );
+    }
+
+    #[test]
+    fn list_loop_node_runs_pages_with_limit_and_offset() {
+        let db = test_db();
+        seed_node_runs_fixture(&db);
+
+        let first_page = db.list_loop_node_runs("loop1", None, None, 2, 0).unwrap();
+        assert_eq!(
+            first_page.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["run3", "run2"]
+        );
+
+        let second_page = db.list_loop_node_runs("loop1", None, None, 2, 2).unwrap();
+        assert_eq!(
+            second_page
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["run1"],
+            "offset must skip past the first page's runs, not repeat them"
+        );
     }
 }
