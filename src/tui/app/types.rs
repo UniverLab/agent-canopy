@@ -189,16 +189,17 @@ pub(crate) struct LoopSidebarMeta {
     /// Last recorded activity for this loop: the latest `loop_runs.started_at`
     /// across every node run belonging to it, or — if it has never run — the
     /// loop's own `created_at`. A single monotonic "last activity" key that
-    /// is defined for every loop regardless of status. Not read by anything
-    /// in this module yet — it exists so the sidebar's loop-ordering-by-recency
-    /// work can sort on it without a second query.
-    #[expect(dead_code)]
+    /// is defined for every loop regardless of status — the sort key behind
+    /// `App::sidebar_loops`' most-recent-first ordering.
     pub last_activity: DateTime<Utc>,
     /// Precomputed display text for `last_activity`: a compact relative
     /// time (`2m`, `1h`, `3d`), `"running"` while the loop is actively
     /// executing, or `"never"` if it has never run.
     pub last_run_label: String,
     pub blocked: bool,
+    /// `"resumes 5m"`-style label when the loop has a pending
+    /// `loop_schedule_autorun`, `None` otherwise.
+    pub autorun_label: Option<String>,
 }
 
 impl Default for LoopSidebarMeta {
@@ -210,6 +211,7 @@ impl Default for LoopSidebarMeta {
             last_activity: DateTime::<Utc>::from_timestamp(0, 0).expect("epoch is representable"),
             last_run_label: String::new(),
             blocked: false,
+            autorun_label: None,
         }
     }
 }

@@ -36,6 +36,23 @@ pub fn relative_time_compact(dt: &DateTime<Utc>) -> String {
     }
 }
 
+/// Compact form for a future instant relative to now: `2m`, `1h`, `3d`, or
+/// `"due"` once `dt` has passed — used for a loop's pending `autorun_at` in
+/// the sidebar. Mirrors [`relative_time_compact`]'s thresholds but counts
+/// down instead of up.
+pub fn relative_time_until_compact(dt: &DateTime<Utc>) -> String {
+    let secs = dt.signed_duration_since(Utc::now()).num_seconds();
+    if secs < 60 {
+        "due".to_string()
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86400)
+    }
+}
+
 pub fn tail_lines(content: &str, n: usize) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let start = lines.len().saturating_sub(n);

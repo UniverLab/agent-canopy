@@ -511,7 +511,7 @@ fn draw_automation_body(
     background_indices: &[usize],
     theme: &Theme,
 ) {
-    let loop_count = app.active_loops().len();
+    let loop_count = app.sidebar_loops().len();
     let demands = [
         card_list_demand(background_indices.len()),
         card_list_demand(loop_count),
@@ -789,15 +789,21 @@ fn draw_project_loop_card(
 
 // ── Automation layer: loops sub-list ────────────────────────────────
 
-/// Status icon shown on an active loop's card: running takes priority, then
-/// blocked (a paused loop whose latest run recorded a `loop_report_blocker`
-/// description), then plain paused, then draft.
+/// Status icon shown on a loop's card. Every one of the five statuses gets
+/// its own icon/color pair so a listed loop is identifiable at a glance
+/// without hiding any of them (running/paused/draft/failed/completed are
+/// listed side by side now that the sidebar no longer filters by status);
+/// `blocked` is a `Paused` sub-state (its latest run recorded a
+/// `loop_report_blocker` description) that borrows `Failed`'s color to flag
+/// it needs the same attention, distinguished from `Failed` by icon.
 fn loop_status_icon(lp: &Loop, meta: &LoopSidebarMeta, theme: &Theme) -> (&'static str, Color) {
     match lp.status {
         LoopStatus::Running => ("▶", STATUS_RUNNING),
         LoopStatus::Paused if meta.blocked => ("⛔", STATUS_FAIL),
         LoopStatus::Paused => ("⏸", Color::Yellow),
-        LoopStatus::Draft | LoopStatus::Completed | LoopStatus::Failed => ("·", theme.dim_text),
+        LoopStatus::Draft => ("○", theme.dim_text),
+        LoopStatus::Completed => ("✓", STATUS_OK),
+        LoopStatus::Failed => ("✗", STATUS_FAIL),
     }
 }
 
@@ -837,9 +843,13 @@ fn draw_active_loop_card(
     } else {
         meta_style
     };
+    let last_run_text = match &meta.autorun_label {
+        Some(autorun) => format!("{} · {autorun}", meta.last_run_label),
+        None => meta.last_run_label.clone(),
+    };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            truncate_str(&meta.last_run_label, area.width as usize),
+            truncate_str(&last_run_text, area.width as usize),
             last_run_style,
         )))
         .style(Style::default().bg(bg)),
@@ -856,11 +866,11 @@ fn draw_active_loop_card(
 }
 
 fn draw_automation_loops_list(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
-    let loops = app.active_loops();
+    let loops = app.sidebar_loops();
     if loops.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "No active loops",
+                "No loops",
                 Style::default().fg(Color::DarkGray),
             ))),
             area,
@@ -1785,7 +1795,7 @@ mod tests {
         let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
         app.sidebar_layer = active_layer;
         assert!(
-            !app.active_loops().is_empty(),
+            !app.sidebar_loops().is_empty(),
             "loop should be loaded from db"
         );
 
@@ -1998,6 +2008,115 @@ mod tests {
         assert!(
             text.contains("never"),
             "a never-run loop must say so plainly: {text}"
+        );
+    }
+
+    /// Scans row `y` for the first cell matching one of `loop_status_icon`'s
+    /// glyphs, returning its `(symbol, fg color)` — used to check that every
+    /// status renders a visually distinct card without depending on the
+    /// inner panel's exact border offset.
+    fn status_icon_cell(buffer: &ratatui::buffer::Buffer, y: u16) -> (String, Color) {
+        for x in 0..buffer.area.width {
+            let cell = &buffer[(x, y)];
+            if matches!(cell.symbol(), "▶" | "⏸" | "⛔" | "○" | "✓" | "✗") {
+                return (cell.symbol().to_string(), cell.fg);
+            }
+        }
+        panic!("no status icon glyph found in row {y}");
+    }
+
+    #[test]
+    fn sidebar_lists_every_status_ordered_by_recency_and_visually_distinguishable() {
+        use crate::db::Database;
+        use crate::tui::app::App;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+
+        // Staggered `created_at`, oldest first, so recency ordering is
+        // unambiguous once sorted (none of these loops have run, so
+        // `last_activity` falls back to `created_at`).
+        let base = chrono::Utc::now() - chrono::Duration::hours(10);
+        let mut draft = bare_loop("s-draft", LoopStatus::Draft);
+        draft.created_at = base;
+        db.insert_loop(&draft).unwrap();
+
+        let mut failed = bare_loop("s-failed", LoopStatus::Failed);
+        failed.created_at = base + chrono::Duration::minutes(10);
+        failed.autorun_at = Some(chrono::Utc::now() + chrono::Duration::minutes(20));
+        db.insert_loop(&failed).unwrap();
+
+        let mut completed = bare_loop("s-completed", LoopStatus::Completed);
+        completed.created_at = base + chrono::Duration::minutes(20);
+        db.insert_loop(&completed).unwrap();
+
+        let mut paused = bare_loop("s-paused", LoopStatus::Paused);
+        paused.created_at = base + chrono::Duration::minutes(30);
+        db.insert_loop(&paused).unwrap();
+
+        let mut running = bare_loop("s-running", LoopStatus::Running);
+        running.created_at = base + chrono::Duration::minutes(40);
+        db.insert_loop(&running).unwrap();
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
+        app.sidebar_layer = SidebarLayer::Automation;
+        app.automation_kind = AutomationKind::Loop;
+
+        let theme = Theme::classic();
+        let backend = TestBackend::new(50, 60);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_sidebar(frame, area, &mut app, &theme);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text = buffer_to_text(&buffer);
+
+        for name in [
+            "Loop s-draft",
+            "Loop s-failed",
+            "Loop s-completed",
+            "Loop s-paused",
+            "Loop s-running",
+        ] {
+            assert!(text.contains(name), "expected {name} listed: {text}");
+        }
+
+        let click_map = app.automation_loop_click_map.clone();
+        let ids: Vec<&str> = click_map.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "s-running",
+                "s-paused",
+                "s-completed",
+                "s-failed",
+                "s-draft",
+            ],
+            "every status must be listed, ordered by last activity most recent first"
+        );
+
+        let icons: Vec<(String, Color)> = click_map
+            .iter()
+            .map(|(_, y_start, _)| status_icon_cell(&buffer, *y_start))
+            .collect();
+        let unique: std::collections::HashSet<_> = icons.iter().cloned().collect();
+        assert_eq!(
+            unique.len(),
+            icons.len(),
+            "each of the five statuses must render a distinct icon/color pair: {icons:?}"
+        );
+
+        assert!(
+            text.contains("resumes"),
+            "a pending autorun must be visible on its loop's sidebar entry: {text}"
         );
     }
 

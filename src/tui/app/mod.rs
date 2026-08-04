@@ -467,7 +467,7 @@ impl App {
     fn navigate_automation(&mut self, forward: bool) {
         let agent_indices = self.automation_agent_indices();
         let loop_ids: Vec<String> = self
-            .active_loops()
+            .sidebar_loops()
             .into_iter()
             .map(|lp| lp.id.clone())
             .collect();
@@ -586,7 +586,7 @@ impl App {
             SidebarLayer::Automation => {
                 let agent_indices = self.automation_agent_indices();
                 let loop_ids: Vec<String> = self
-                    .active_loops()
+                    .sidebar_loops()
                     .into_iter()
                     .map(|lp| lp.id.clone())
                     .collect();
@@ -802,7 +802,7 @@ impl App {
     /// (functional requirement 3).
     fn refresh_project_preview_cache(&mut self) {
         let running_workdirs: HashSet<String> = self
-            .active_loops()
+            .sidebar_loops()
             .iter()
             .filter(|lp| lp.status == LoopStatus::Running)
             .map(|lp| lp.workdir.clone())
@@ -944,33 +944,42 @@ impl App {
                     .ok()
                     .and_then(|runs| runs.last().and_then(|run| run.output.clone()))
                     .is_some_and(|output| output.get("blocker").is_some());
+            let autorun_label = lp
+                .autorun_at
+                .map(|at| format!("resumes {}", utils::relative_time_until_compact(&at)));
             meta.insert(
                 lp.id.clone(),
                 LoopSidebarMeta {
                     last_activity,
                     last_run_label,
                     blocked,
+                    autorun_label,
                 },
             );
         }
         self.loop_sidebar_meta = meta;
     }
 
-    /// Non-terminal loops (`Draft`/`Running`/`Paused`) for the sidebar's
-    /// `Loops` section, with running loops sorted first, then paused
-    /// (including blocked), then draft — ties broken by the existing
-    /// `created_at DESC` order from `list_loops`.
-    pub fn active_loops(&self) -> Vec<&crate::domain::loops::Loop> {
-        let mut loops: Vec<&crate::domain::loops::Loop> = self
-            .loops
-            .iter()
-            .filter(|lp| !matches!(lp.status, LoopStatus::Completed | LoopStatus::Failed))
-            .collect();
-        loops.sort_by_key(|lp| match lp.status {
-            LoopStatus::Running => 0,
-            LoopStatus::Paused => 1,
-            LoopStatus::Draft => 2,
-            LoopStatus::Completed | LoopStatus::Failed => 3,
+    /// Every loop for the sidebar's `Loops` section, ordered by last
+    /// activity (most recent first) with **no filtering by status** — a
+    /// loop that reaches a terminal state stays listed so the operator can
+    /// see it failed/completed and act on it (selection and F4's
+    /// confirmation flow reach every loop regardless of status). Ties
+    /// broken by the existing `created_at DESC` order from `list_loops`,
+    /// since the sort is stable.
+    ///
+    /// `last_activity` is precomputed by [`Self::refresh_loop_sidebar_meta`]
+    /// on the refresh cadence, not queried here, so listing every loop adds
+    /// no per-tick database work.
+    pub fn sidebar_loops(&self) -> Vec<&crate::domain::loops::Loop> {
+        let mut loops: Vec<&crate::domain::loops::Loop> = self.loops.iter().collect();
+        loops.sort_by_key(|lp| {
+            std::cmp::Reverse(
+                self.loop_sidebar_meta
+                    .get(&lp.id)
+                    .map(|meta| meta.last_activity)
+                    .unwrap_or(lp.created_at),
+            )
         });
         loops
     }
@@ -1514,7 +1523,7 @@ impl App {
                     let Some(id) = self.sidebar_step_memory.automation_loop_id.clone() else {
                         return false;
                     };
-                    if !self.active_loops().iter().any(|lp| lp.id == id) {
+                    if !self.sidebar_loops().iter().any(|lp| lp.id == id) {
                         return false;
                     }
                     self.sidebar_layer = SidebarLayer::Automation;
@@ -3872,27 +3881,45 @@ mod tests {
     }
 
     #[test]
-    fn active_loops_orders_running_before_paused_before_draft() {
+    fn sidebar_loops_orders_by_recency_across_all_statuses() {
         use crate::domain::loops::LoopStatus;
 
         let db = test_db();
-        db.insert_loop(&make_loop("l-draft", "Draft Loop", LoopStatus::Draft))
-            .unwrap();
-        db.insert_loop(&make_loop("l-done", "Done Loop", LoopStatus::Completed))
-            .unwrap();
-        db.insert_loop(&make_loop("l-paused", "Paused Loop", LoopStatus::Paused))
-            .unwrap();
-        db.insert_loop(&make_loop("l-running", "Running Loop", LoopStatus::Running))
-            .unwrap();
+        let base = chrono::Utc::now() - chrono::Duration::hours(10);
+
+        let mut draft = make_loop("l-draft", "Draft Loop", LoopStatus::Draft);
+        draft.created_at = base;
+        db.insert_loop(&draft).unwrap();
+
+        let mut failed = make_loop("l-failed", "Failed Loop", LoopStatus::Failed);
+        failed.created_at = base + chrono::Duration::minutes(10);
+        db.insert_loop(&failed).unwrap();
+
+        let mut done = make_loop("l-done", "Done Loop", LoopStatus::Completed);
+        done.created_at = base + chrono::Duration::minutes(20);
+        db.insert_loop(&done).unwrap();
+
+        let mut paused = make_loop("l-paused", "Paused Loop", LoopStatus::Paused);
+        paused.created_at = base + chrono::Duration::minutes(30);
+        db.insert_loop(&paused).unwrap();
+
+        let mut running = make_loop("l-running", "Running Loop", LoopStatus::Running);
+        running.created_at = base + chrono::Duration::minutes(40);
+        db.insert_loop(&running).unwrap();
 
         let data_dir = tempdir().expect("create data dir");
         let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
 
-        let ids: Vec<&str> = app.active_loops().iter().map(|lp| lp.id.as_str()).collect();
-        assert_eq!(ids, vec!["l-running", "l-paused", "l-draft"]);
-        assert!(
-            !ids.contains(&"l-done"),
-            "completed loops must not appear in active_loops"
+        let ids: Vec<&str> = app
+            .sidebar_loops()
+            .iter()
+            .map(|lp| lp.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["l-running", "l-paused", "l-done", "l-failed", "l-draft"],
+            "every loop must be listed regardless of status, ordered by last \
+             activity (created_at, since none of these have run) most recent first"
         );
     }
 
@@ -4812,10 +4839,10 @@ mod tests {
         assert_eq!(app.log_scroll, 0);
     }
 
-    // ── active_loops filtering ───────────────────────────────────
+    // ── sidebar_loops: no status filtering ──────────────────────
 
     #[test]
-    fn active_loops_excludes_completed_and_failed() {
+    fn sidebar_loops_includes_every_status() {
         use crate::domain::loops::LoopStatus;
         let db = test_db();
         db.insert_loop(&make_loop("l1", "Running", LoopStatus::Running))
@@ -4831,12 +4858,23 @@ mod tests {
 
         let data_dir = tempdir().expect("create data dir");
         let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
-        let active: Vec<&str> = app.active_loops().iter().map(|lp| lp.id.as_str()).collect();
-        assert!(!active.contains(&"l4"));
-        assert!(!active.contains(&"l5"));
-        assert!(active.contains(&"l1"));
-        assert!(active.contains(&"l2"));
-        assert!(active.contains(&"l3"));
+        let listed: Vec<&str> = app
+            .sidebar_loops()
+            .iter()
+            .map(|lp| lp.id.as_str())
+            .collect();
+        assert!(
+            listed.contains(&"l4"),
+            "a completed loop must stay in the sidebar list"
+        );
+        assert!(
+            listed.contains(&"l5"),
+            "a failed loop must stay in the sidebar list"
+        );
+        assert!(listed.contains(&"l1"));
+        assert!(listed.contains(&"l2"));
+        assert!(listed.contains(&"l3"));
+        assert_eq!(listed.len(), 5, "no loop is dropped by status");
     }
 
     // ── Playground state tests ───────────────────────────────────
@@ -4956,11 +4994,11 @@ mod tests {
     // ── Additional navigation and state tests ───────────────────
 
     #[test]
-    fn active_loops_empty_when_no_loops() {
+    fn sidebar_loops_empty_when_no_loops() {
         let db = test_db();
         let data_dir = tempdir().expect("create data dir");
         let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
-        assert!(app.active_loops().is_empty());
+        assert!(app.sidebar_loops().is_empty());
     }
 
     #[test]
