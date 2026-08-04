@@ -1848,6 +1848,22 @@ fn merge_attempt_marker(output: &Value, attempt: u32, is_crash: bool) -> Value {
 /// semantic pass, a failure past the crash window, or a permanent spawn
 /// failure (binary not found, permission denied) is never an infra crash.
 ///
+/// Also never an infra crash: an empty-stdout `Fail` from
+/// [`agent_finished_execution`] (marked `no_output`). That case is a process
+/// that ran to completion and exited cleanly — nothing "crashed" — so it's a
+/// different failure shape than a fast nonzero-exit death, and the two must
+/// not be conflated. A spawn/runtime crash is plausibly transient (a flaky
+/// fork, a momentarily-unavailable resource) and retrying it can land
+/// differently; an agent that starts fine, exits 0, and says nothing is far
+/// more often a deterministic misconfiguration (the `mimo-auto`/`mimocode`
+/// incident: an unsupported model name that fails identically every time).
+/// Retrying that would burn the infra-retry budget reproducing the same
+/// empty result before finally reaching the fail edge — delaying, not
+/// preventing, the exact ping-pong this fix exists to stop. So it fails
+/// plainly and routes down the fail edge on the first attempt, same as any
+/// other semantic fail, leaving the resilience/medic node downstream free to
+/// diagnose it immediately instead of after a few silent retries.
+///
 /// Shared by the sequential node path ([`LoopEngine::run_spec`]) and, since
 /// B26, by ensemble members ([`LoopEngine::execute_ensemble`]) — both use the
 /// identical rule so a crashed member is retried exactly like a lone node and
@@ -1866,8 +1882,14 @@ fn is_infra_crash(
         .get("spawn_permanent")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let no_output = execution
+        .output
+        .get("no_output")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     !self_reported
         && !permanent
+        && !no_output
         && node.kind == LoopNodeKind::Agent
         && execution.status == LoopRunStatus::Fail
         && (chrono::Utc::now() - run.started_at).num_seconds() < crash_max_secs as i64
@@ -2578,23 +2600,84 @@ async fn run_agent_process(
             exit_code,
             stdout,
             stderr,
-        }) => Ok(NodeExecution {
-            status: if exit_code == 0 {
-                LoopRunStatus::Pass
-            } else {
-                LoopRunStatus::Fail
-            },
-            output: serde_json::json!({
-                "kind": "agent",
-                "node_id": node.id,
-                "cli": cli.as_str(),
-                "model": model,
-                "exit_code": exit_code,
-                "stdout": stdout,
-                "stderr": stderr,
-            }),
-            summary: format!("Agent node '{}' exited with code {}.", node.name, exit_code),
-        }),
+        }) => Ok(agent_finished_execution(
+            node, cli, model, exit_code, &stdout, &stderr,
+        )),
+    }
+}
+
+/// Turn a completed (non-timeout, non-spawn-failure) CLI run into its
+/// verdict. `exit_code == 0` is necessary but not sufficient for `Pass`: a
+/// CLI that fails to start its model, prints to stderr, and still exits 0
+/// produces empty stdout — no self-report, no route answer, nothing a
+/// downstream node can read as a result. Crediting that with `Pass` is
+/// exactly the defect from the 2026-08 `mimocode`/`mimo-auto` incident,
+/// where four such runs were routed down the `pass` edge and the resilience
+/// node whose entire job was to catch this never ran once.
+///
+/// So: empty stdout is `Fail` regardless of `exit_code`, marked `no_output`
+/// so [`is_infra_crash`] can tell it apart from a fast nonzero-exit crash
+/// (see that function's doc comment for why the two must not be treated the
+/// same), and — when stderr has text — carried into `error` so
+/// [`member_output_text`]'s existing `error` fallback surfaces it in an
+/// ensemble's consolidated doc, and a downstream node reading
+/// `{{previous_feedback}}` (the whole JSON blob, not just `stdout`) sees it
+/// too instead of a silent `(none)`.
+///
+/// An agent that exits 0 with real stdout keeps passing exactly as before —
+/// this only changes the empty-stdout case, which used to be an
+/// unconditional `Pass`.
+fn agent_finished_execution(
+    node: &LoopNode,
+    cli: &Cli,
+    model: Option<&str>,
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+) -> NodeExecution {
+    // Only the exit-0 + empty-stdout combination is the new failure shape
+    // (a process that ran to completion and said nothing). A nonzero exit
+    // with empty stdout is the ordinary fast-crash signature `is_infra_crash`
+    // already retries — most crashing CLIs print nothing before dying — so it
+    // must NOT pick up the `no_output` marker or this fix would silently
+    // stop retrying every plain crash that happens not to log to stdout.
+    let zero_exit_no_output = exit_code == 0 && stdout.is_empty();
+    let status = if exit_code == 0 && !zero_exit_no_output {
+        LoopRunStatus::Pass
+    } else {
+        LoopRunStatus::Fail
+    };
+    let mut output = serde_json::json!({
+        "kind": "agent",
+        "node_id": node.id,
+        "cli": cli.as_str(),
+        "model": model,
+        "exit_code": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+    });
+    if zero_exit_no_output {
+        let reason = if stderr.is_empty() {
+            "agent produced no output".to_string()
+        } else {
+            format!("agent produced no output; stderr: {stderr}")
+        };
+        if let Value::Object(map) = &mut output {
+            map.insert("no_output".to_string(), Value::Bool(true));
+            map.insert("error".to_string(), Value::String(reason));
+        }
+    }
+    NodeExecution {
+        status,
+        summary: if zero_exit_no_output {
+            format!(
+                "Agent node '{}' produced no output (exit code 0).",
+                node.name
+            )
+        } else {
+            format!("Agent node '{}' exited with code {}.", node.name, exit_code)
+        },
+        output,
     }
 }
 
@@ -6159,6 +6242,185 @@ echo done
         assert!(execution.output.get("error").is_some());
     }
 
+    /// The `mimocode`/`mimo-auto` incident, reproduced exactly: a CLI that
+    /// fails to start its model, prints its complaint to stderr, produces
+    /// empty stdout, and still exits 0. This must never be recorded as
+    /// `Pass` — a downstream `pass` edge must not fire for a run that never
+    /// actually did anything.
+    #[tokio::test]
+    async fn run_agent_process_empty_stdout_zero_exit_is_fail_not_pass() {
+        let (dir, db) = test_db();
+        let cli = Cli::new("test-cli");
+        let script = write_member_script(
+            dir.path(),
+            "mimocode.sh",
+            ">&2 printf 'Error: Unsupported model mimo-auto'\nexit 0",
+        );
+        let strategy = sample_strategy(&script);
+        let node = sample_agent_node();
+
+        let execution = run_agent_process(
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            execution.status,
+            LoopRunStatus::Fail,
+            "empty stdout must be a Fail even though the process exited 0"
+        );
+        assert_eq!(
+            execution.output.get("exit_code").and_then(Value::as_i64),
+            Some(0)
+        );
+        assert_eq!(
+            execution.output.get("no_output").and_then(Value::as_bool),
+            Some(true),
+            "the no-output reason must be distinguishable from a self-reported FAIL"
+        );
+        // The stderr text must be surfaced in a form a downstream node's
+        // `(none)` fallback can act on, not silently dropped.
+        let error_text = execution
+            .output
+            .get("error")
+            .and_then(Value::as_str)
+            .expect("no-output run must carry an error field");
+        assert!(error_text.contains("Unsupported model mimo-auto"));
+        assert_eq!(
+            execution.output.get("stderr").and_then(Value::as_str),
+            Some("Error: Unsupported model mimo-auto")
+        );
+        assert!(
+            !execution.summary.to_lowercase().contains("reported"),
+            "must not read as a self-report of any kind"
+        );
+
+        // Must not be eligible for infra-crash retry: this is a deterministic
+        // misconfiguration (wrong/unsupported model), not a transient crash —
+        // retrying would just reproduce the identical empty result up to the
+        // retry budget before finally reaching the fail edge.
+        let run = LoopNodeRun {
+            id: "run-test".to_string(),
+            loop_id: "loop1".to_string(),
+            spec_id: "spec1".to_string(),
+            node_id: node.id.clone(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        };
+        assert!(
+            !is_infra_crash(&node, &execution, &run, 0, 3, 60),
+            "an empty-output zero-exit run must not be retried as an infra crash"
+        );
+    }
+
+    /// The inverse of the no-output fix: an agent that exits 0 and produces
+    /// real stdout must keep passing exactly as before. Guards against the
+    /// no-output fix becoming an overly broad check that makes well-behaved
+    /// nodes flaky.
+    #[tokio::test]
+    async fn run_agent_process_normal_stdout_zero_exit_still_passes() {
+        let (dir, db) = test_db();
+        let cli = Cli::new("test-cli");
+        let script = write_member_script(dir.path(), "ok.sh", "printf 'all done'");
+        let strategy = sample_strategy(&script);
+        let node = sample_agent_node();
+
+        let execution = run_agent_process(
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(execution.status, LoopRunStatus::Pass);
+        assert_eq!(
+            execution.output.get("stdout").and_then(Value::as_str),
+            Some("all done")
+        );
+        assert!(execution.output.get("no_output").is_none());
+    }
+
+    /// A fast nonzero-exit crash that (like most real crashes) prints
+    /// nothing to stdout must still be retried as an infra crash exactly as
+    /// before — the no-output fix only targets the exit-0 shape, and must
+    /// not silently swallow the existing nonzero-exit crash-retry path by
+    /// tagging every empty-stdout failure alike.
+    #[tokio::test]
+    async fn run_agent_process_empty_stdout_nonzero_exit_stays_infra_crash_eligible() {
+        let (dir, db) = test_db();
+        let cli = Cli::new("test-cli");
+        let script = write_member_script(dir.path(), "dead.sh", "exit 1");
+        let strategy = sample_strategy(&script);
+        let node = sample_agent_node();
+
+        let execution = run_agent_process(
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(execution.status, LoopRunStatus::Fail);
+        assert!(
+            execution.output.get("no_output").is_none(),
+            "a nonzero-exit crash must not be conflated with the exit-0 no-output case"
+        );
+
+        let run = LoopNodeRun {
+            id: "run-test".to_string(),
+            loop_id: "loop1".to_string(),
+            spec_id: "spec1".to_string(),
+            node_id: node.id.clone(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        };
+        assert!(
+            is_infra_crash(&node, &execution, &run, 0, 3, 60),
+            "a fast nonzero-exit crash with empty stdout must remain infra-crash eligible"
+        );
+    }
+
+    /// A self-reported FAIL (the agent called `loop_complete_node` itself)
+    /// must route on its own reported verdict, never on the no-output rule —
+    /// even when the CLI process that follows the self-report happens to
+    /// exit 0 with no further stdout.
+    #[tokio::test]
+    async fn self_reported_fail_is_not_reclassified_as_no_output() {
+        let (_dir, db, _engine, loop_id) = bare_loop_fixture().unwrap();
+        let node = seed_agent_run(&db, &loop_id, "run-selfreport");
+        db.update_loop_run_result(
+            "run-selfreport",
+            LoopRunStatus::Fail,
+            Some(&serde_json::json!({ "summary": "agent reported it failed" })),
+            Some(chrono::Utc::now()),
+        )
+        .unwrap();
+
+        let run = db.get_loop_run("run-selfreport").unwrap();
+        let reported = self_reported_execution(run.as_ref(), &node)
+            .expect("a completed run row must be read as self-reported");
+        assert_eq!(reported.status, LoopRunStatus::Fail);
+        assert!(reported.output.get("no_output").is_none());
+
+        assert!(
+            !is_infra_crash(&node, &reported, &run.unwrap(), 0, 3, 60),
+            "a self-reported fail must never be classified as an infra crash"
+        );
+    }
+
     /// B39: a permanent spawn failure (missing binary) must produce a
     /// `spawn_permanent` flag in the output and must NOT be classified as an
     /// infra crash — exactly one run row, no `infra_attempt` marker.
@@ -8452,7 +8714,7 @@ echo done
             ),
             (
                 "member-ok",
-                &write_member_script(dir.path(), "ok.sh", "exit 0"),
+                &write_member_script(dir.path(), "ok.sh", "printf ok"),
             ),
         ]);
 
@@ -9637,11 +9899,11 @@ echo done
         let fake_home = setup_multi_cli_home(&[
             (
                 "member-ok-a",
-                &write_member_script(dir.path(), "a.sh", "exit 0"),
+                &write_member_script(dir.path(), "a.sh", "printf ok"),
             ),
             (
                 "member-ok-b",
-                &write_member_script(dir.path(), "b.sh", "exit 0"),
+                &write_member_script(dir.path(), "b.sh", "printf ok"),
             ),
             (
                 "member-bad",
@@ -9692,7 +9954,7 @@ echo done
         let fake_home = setup_multi_cli_home(&[
             (
                 "member-ok",
-                &write_member_script(dir.path(), "a.sh", "exit 0"),
+                &write_member_script(dir.path(), "a.sh", "printf ok"),
             ),
             (
                 "member-bad-a",
@@ -10216,7 +10478,7 @@ echo done
             dir.path(),
             "flap.sh",
             &format!(
-                "n=$(cat \"{c}\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"{c}\"; [ \"$n\" -ge 2 ] && exit 0 || exit 1",
+                "n=$(cat \"{c}\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"{c}\"; [ \"$n\" -ge 2 ] && (printf ok; exit 0) || exit 1",
                 c = counter.display(),
             ),
         );
@@ -10224,7 +10486,7 @@ echo done
             ("member-flap", &flap),
             (
                 "member-ok",
-                &write_member_script(dir.path(), "ok.sh", "exit 0"),
+                &write_member_script(dir.path(), "ok.sh", "printf ok"),
             ),
         ]);
         insert_infra_ensemble(
@@ -10276,7 +10538,7 @@ echo done
             ),
             (
                 "member-ok",
-                &write_member_script(dir.path(), "ok.sh", "exit 0"),
+                &write_member_script(dir.path(), "ok.sh", "printf ok"),
             ),
         ]);
         insert_infra_ensemble(
@@ -10322,6 +10584,75 @@ echo done
         );
         assert_eq!(dead[0].output.as_ref().unwrap()["infra_attempt"], 0);
         assert_eq!(dead[1].output.as_ref().unwrap()["infra_attempt"], 1);
+    }
+
+    /// The `mimocode`/`mimo-auto` incident inside an ensemble: a member that
+    /// exits 0 with empty stdout (and stderr complaining about its model)
+    /// must count as a member FAIL, not a pass — a crashed member must never
+    /// count toward the join's pass quorum. With min_pass=2 and only one
+    /// genuinely healthy member, 1/2 must fail the join. It must also
+    /// resolve on the FIRST attempt (one run row), never retried as an infra
+    /// crash, since this is a deterministic misconfiguration that would just
+    /// reproduce the identical empty result.
+    #[tokio::test]
+    async fn ensemble_member_empty_output_zero_exit_counts_as_fail_not_pass() {
+        let (dir, db, engine, _loop_id, spec_id) = loop_fixture().unwrap();
+        let fake_home = setup_multi_cli_home(&[
+            (
+                "member-no-output",
+                &write_member_script(
+                    dir.path(),
+                    "no-output.sh",
+                    ">&2 printf 'Error: Unsupported model mimo-auto'\nexit 0",
+                ),
+            ),
+            (
+                "member-ok",
+                &write_member_script(dir.path(), "ok.sh", "printf ok"),
+            ),
+        ]);
+        insert_infra_ensemble(
+            &db,
+            &spec_id,
+            &[("m-no-output", "member-no-output"), ("m-ok", "member-ok")],
+            2,
+            Some(1),
+            &serde_json::json!({ "infra_backoff_seconds": 0 }),
+        );
+
+        let _home = HomeGuard::set(fake_home.path());
+        engine
+            .run_loop("wf-test".to_string(), None, None)
+            .await
+            .unwrap();
+        drop(_home);
+
+        let join = join_run(&db, &spec_id, "join1");
+        assert_eq!(
+            join.status,
+            LoopRunStatus::Fail,
+            "an empty-output member exiting 0 must not count toward the pass quorum -> 1/2 -> join fails"
+        );
+        assert_eq!(join.output.as_ref().unwrap()["passed"], 1);
+
+        let runs = member_runs(&db, &spec_id, "m-no-output");
+        assert_eq!(
+            runs.len(),
+            1,
+            "an exit-0 no-output member must resolve on the first attempt, never infra-retried"
+        );
+        assert_eq!(runs[0].status, LoopRunStatus::Fail);
+        assert_eq!(
+            runs[0].output.as_ref().unwrap()["no_output"],
+            serde_json::Value::Bool(true)
+        );
+        assert!(
+            runs[0].output.as_ref().unwrap()["error"]
+                .as_str()
+                .unwrap()
+                .contains("Unsupported model mimo-auto"),
+            "the member's stderr must be surfaced in the stored output"
+        );
     }
 
     /// Straggler-window interaction (documented behavior): the ensemble's
@@ -10432,11 +10763,11 @@ echo done
         let fake_home = setup_multi_cli_home(&[
             (
                 "member-ok-a",
-                &write_member_script(dir.path(), "a.sh", "exit 0"),
+                &write_member_script(dir.path(), "a.sh", "printf ok"),
             ),
             (
                 "member-ok-b",
-                &write_member_script(dir.path(), "b.sh", "exit 0"),
+                &write_member_script(dir.path(), "b.sh", "printf ok"),
             ),
         ]);
         db.insert_loop_node(&touch_marker_node(
@@ -10788,7 +11119,7 @@ echo done
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\nif [ -f \"{m}\" ]; then exit 0; else touch \"{m}\"; exit 1; fi\n",
+                "#!/bin/sh\nif [ -f \"{m}\" ]; then printf ok; exit 0; else touch \"{m}\"; exit 1; fi\n",
                 m = marker.to_string_lossy()
             ),
         )
