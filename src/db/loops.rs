@@ -972,6 +972,34 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Repoint an existing edge at a new target node — used to rewire a
+    /// router route to a different destination without dropping and
+    /// re-creating the edge (which would lose its id).
+    pub fn update_loop_edge_target(&self, edge_id: &str, to_node: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE loop_edges SET to_node = ?1 WHERE id = ?2",
+            params![to_node, edge_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Drop a single edge — used when a router's routes editor removes a
+    /// declared route that already had an edge wired to it, so the edge
+    /// never outlives the route it named (see
+    /// [`crate::domain::loops::validate_router_edges_declared`]).
+    pub fn delete_loop_edge(&self, edge_id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute("DELETE FROM loop_edges WHERE id = ?1", params![edge_id])?;
+        Ok(rows > 0)
+    }
+
     pub fn insert_loop_run(&self, run: &LoopNodeRun) -> Result<()> {
         let conn = self
             .conn

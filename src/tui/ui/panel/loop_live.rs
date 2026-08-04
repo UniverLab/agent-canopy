@@ -15,9 +15,11 @@ use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::super::theme::Theme;
-use super::{compact_cwd, truncate_str, STATUS_DISABLED, STATUS_FAIL, STATUS_OK, STATUS_RUNNING};
+use super::{
+    compact_cwd, truncate_str, KIND_ROUTER, STATUS_DISABLED, STATUS_FAIL, STATUS_OK, STATUS_RUNNING,
+};
 use crate::domain::loops::{
-    LoopEdgeCondition, LoopNode, LoopRunStatus, LoopSpecStatus, LoopStatus,
+    LoopEdgeCondition, LoopNode, LoopNodeKind, LoopRunStatus, LoopSpecStatus, LoopStatus,
 };
 use crate::tui::app::loop_live_state::{
     EnsembleLiveInfo, LoopLiveState, NodeRunInfo, SpecQueueEntry,
@@ -421,22 +423,30 @@ fn node_box_lines(
     let max_name = inner.saturating_sub(2 + kind_tag.len());
     let name_display = truncate_str(&node.name, max_name);
     let spaces = inner.saturating_sub(2 + name_display.len() + kind_tag.len());
+    // A router is a branch point, not a pass/fail step like agent/check/gate
+    // — tag it with its own color so it reads as distinct at a glance
+    // instead of only through the text tag every kind already carries.
+    let kind_tag_style = if node.kind == LoopNodeKind::Router {
+        Style::default()
+            .fg(KIND_ROUTER)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        text_style
+    };
 
     vec![
         Line::from(Span::styled(
             format!("  ┌{}┐", "─".repeat(inner)),
             border_style,
         )),
-        Line::from(Span::styled(
-            format!(
-                "  │{} {}{}{}│",
-                marker,
-                name_display,
-                " ".repeat(spaces),
-                kind_tag
+        Line::from(vec![
+            Span::styled(
+                format!("  │{marker} {name_display}{}", " ".repeat(spaces)),
+                text_style,
             ),
-            text_style,
-        )),
+            Span::styled(kind_tag, kind_tag_style),
+            Span::styled("│", text_style),
+        ]),
         Line::from(Span::styled(
             format!("  └{}┘", "─".repeat(inner)),
             border_style,
@@ -509,14 +519,46 @@ fn ensemble_member_status_tag(
     }
 }
 
-fn edge_lines(edges: &[(String, LoopEdgeCondition)], theme: &Theme) -> Vec<Line<'static>> {
+/// `taken_route` is the route label the edges' shared `from_node`'s latest
+/// completed run selected, if it's a router (see
+/// [`crate::tui::app::loop_live_state::LoopLiveState::router_taken_routes`]).
+/// A `Route`-conditioned edge whose label matches it renders with a `✓` and
+/// the OK color instead of the generic dim tree branch, so a completed
+/// router run's actual path is visible at a glance among its N routes.
+fn edge_lines(
+    edges: &[(String, LoopEdgeCondition)],
+    taken_route: Option<&str>,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for (i, (label, condition)) in edges.iter().enumerate() {
         let branch = if i == edges.len() - 1 { "└" } else { "├" };
-        lines.push(Line::from(Span::styled(
-            format!("   {}─ {} → {}", branch, condition.as_str(), label),
-            Style::default().fg(theme.dim_text),
-        )));
+        // A `Route` condition's `as_str()` is the fixed tag `"route"` — show
+        // the declared route label itself instead, since that's what's
+        // actually legible/actionable to a reader picking among routes.
+        match condition.route_label() {
+            Some(route) => {
+                let taken = taken_route == Some(route);
+                let (marker, style) = if taken {
+                    (
+                        "✓",
+                        Style::default().fg(STATUS_OK).add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    (" ", Style::default().fg(theme.dim_text))
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("   {branch}─{marker} {route} → {label}"),
+                    style,
+                )));
+            }
+            None => {
+                lines.push(Line::from(Span::styled(
+                    format!("   {}─ {} → {}", branch, condition.as_str(), label),
+                    Style::default().fg(theme.dim_text),
+                )));
+            }
+        }
     }
     lines
 }
@@ -622,10 +664,11 @@ fn graph_lines(
             ));
 
             // The collapsed box's own outgoing routing is the join's real
-            // outgoing edges (on_pass_to/on_fail_to).
+            // outgoing edges (on_pass_to/on_fail_to) — a join never routes
+            // by label, so no taken-route marker applies here.
             if let Some(edges) = outgoing.get(ensemble.join_node_id.as_str()) {
                 let labeled = collapse_ensemble_targets(edges, &ensemble_by_member);
-                lines.extend(edge_lines(&labeled, theme));
+                lines.extend(edge_lines(&labeled, None, theme));
                 lines.push(Line::from(""));
             } else if idx + 1 < nodes.len() {
                 lines.push(Line::from(""));
@@ -638,7 +681,11 @@ fn graph_lines(
 
         if let Some(edges) = outgoing.get(node.id.as_str()) {
             let labeled = collapse_ensemble_targets(edges, &ensemble_by_member);
-            lines.extend(edge_lines(&labeled, theme));
+            let taken_route = state
+                .router_taken_routes
+                .get(node.id.as_str())
+                .map(String::as_str);
+            lines.extend(edge_lines(&labeled, taken_route, theme));
             lines.push(Line::from(""));
         } else if idx + 1 < nodes.len() {
             lines.push(Line::from(""));
@@ -723,6 +770,13 @@ fn footer_lines(
         meta.push(Span::styled(
             format!("iter {iteration}"),
             Style::default().fg(theme.dim_text),
+        ));
+    }
+    if let Some(route) = node_info.chosen_route.as_deref() {
+        meta.push(Span::raw("  "));
+        meta.push(Span::styled(
+            format!("route → {route}"),
+            Style::default().fg(STATUS_OK).add_modifier(Modifier::BOLD),
         ));
     }
     lines.push(Line::from(meta));
@@ -861,6 +915,7 @@ mod tests {
             effective_nodes: team_nodes(),
             effective_edges: team_edges(),
             ensembles: Vec::new(),
+            router_taken_routes: HashMap::new(),
             current_node_id: Some("n0".to_string()),
             current_node_status: Some(LoopRunStatus::Running),
             current_node_started_at: Some(Utc::now() - chrono::Duration::seconds(75)),
@@ -877,6 +932,7 @@ mod tests {
             started_at: state.current_node_started_at,
             iteration: state.current_node_iteration,
             output_tail: state.current_node_output_tail.clone(),
+            chosen_route: None,
         };
 
         let text = render_to_text(80, 40, |frame, area| {
@@ -934,6 +990,7 @@ mod tests {
             started_at: Some(Utc::now() - chrono::Duration::seconds(10)),
             iteration: Some(1),
             output_tail: Some("reviewed and committed".to_string()),
+            chosen_route: None,
         };
         let text = render_to_text(80, 40, |frame, area| {
             render_loop_live_view(
@@ -1155,6 +1212,7 @@ mod tests {
             started_at: state.current_node_started_at,
             iteration: state.current_node_iteration,
             output_tail: state.current_node_output_tail.clone(),
+            chosen_route: None,
         };
 
         let text = render_to_text(80, 40, |frame, area| {
@@ -1327,6 +1385,149 @@ mod tests {
         // routing to the arbiter still renders.
         assert!(text.contains("Kickoff"), "{text}");
         assert!(text.contains("Arbiter"), "{text}");
+    }
+
+    #[test]
+    fn router_node_renders_distinctly_with_every_route_legible_at_real_width() {
+        let mut state = running_state();
+        state.effective_nodes = vec![
+            LoopNode {
+                id: "router".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                name: "Classify request".to_string(),
+                kind: LoopNodeKind::Router,
+                config: json!({}),
+                position: 0,
+                created_at: Utc::now(),
+            },
+            LoopNode {
+                id: "billing".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                name: "Billing specialist".to_string(),
+                kind: LoopNodeKind::Agent,
+                config: json!({}),
+                position: 1,
+                created_at: Utc::now(),
+            },
+            LoopNode {
+                id: "technical".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                name: "Technical specialist".to_string(),
+                kind: LoopNodeKind::Agent,
+                config: json!({}),
+                position: 2,
+                created_at: Utc::now(),
+            },
+            LoopNode {
+                id: "sales".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                name: "Sales specialist".to_string(),
+                kind: LoopNodeKind::Agent,
+                config: json!({}),
+                position: 3,
+                created_at: Utc::now(),
+            },
+            LoopNode {
+                id: "escalation".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                name: "Human escalation".to_string(),
+                kind: LoopNodeKind::Agent,
+                config: json!({}),
+                position: 4,
+                created_at: Utc::now(),
+            },
+        ];
+        state.effective_edges = vec![
+            (
+                "router",
+                "billing",
+                LoopEdgeCondition::Route("billing".to_string()),
+            ),
+            (
+                "router",
+                "technical",
+                LoopEdgeCondition::Route("technical".to_string()),
+            ),
+            (
+                "router",
+                "sales",
+                LoopEdgeCondition::Route("sales".to_string()),
+            ),
+            (
+                "router",
+                "escalation",
+                LoopEdgeCondition::Route("escalation".to_string()),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (from, to, condition))| LoopEdge {
+            id: format!("re{i}"),
+            spec_id: Some("spec-1".to_string()),
+            loop_id: None,
+            from_node: from.to_string(),
+            to_node: to.to_string(),
+            condition,
+        })
+        .collect();
+        state.router_taken_routes = [("router".to_string(), "technical".to_string())]
+            .into_iter()
+            .collect();
+        state.current_node_id = Some("router".to_string());
+
+        let node_info = NodeRunInfo {
+            chosen_route: Some("technical".to_string()),
+            ..NodeRunInfo::default()
+        };
+        // A "real" panel width — wider than the box's own clamp — so a
+        // router with 4 routes has plenty of room; nothing here should ever
+        // need to wrap or truncate.
+        let text = render_to_text(100, 40, |frame, area| {
+            render_loop_live_view(
+                frame,
+                area,
+                &LiveViewContext {
+                    state: &state,
+                    follow: true,
+                    highlighted_node_id: state.current_node_id.as_deref(),
+                    node_info: &node_info,
+                    blocked: false,
+                    now: Utc::now(),
+                    theme: &Theme::classic(),
+                    selected_spec_id: None,
+                    spec_scroll: 0,
+                },
+            );
+        });
+
+        // Router carries its own kind tag alongside the agent boxes it
+        // routes to.
+        assert!(text.contains("[router]"), "{text}");
+        assert!(text.contains("[agent]"), "{text}");
+        // Every one of the 4 declared routes is fully legible: its label,
+        // arrow, and target name all appear intact — none truncated with
+        // "…" or split by an unwanted wrap.
+        for (route, target) in [
+            ("billing", "Billing specialist"),
+            ("technical", "Technical specialist"),
+            ("sales", "Sales specialist"),
+            ("escalation", "Human escalation"),
+        ] {
+            let expected = format!("{route} → {target}");
+            assert!(text.contains(&expected), "missing {expected:?} in:\n{text}");
+        }
+        // The route the completed run actually took is marked distinctly
+        // from the other three.
+        assert!(
+            text.contains("✓ technical → Technical specialist"),
+            "{text}"
+        );
+        assert!(text.contains("route → technical"), "{text}");
     }
 
     fn test_db_and_dir() -> (Arc<Database>, tempfile::TempDir) {

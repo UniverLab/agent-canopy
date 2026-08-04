@@ -241,6 +241,31 @@ pub(crate) enum LoopLiveFocus {
 pub(crate) enum LoopEditorMode {
     AgentPrompt,
     NodeConfig,
+    /// A [`crate::domain::loops::LoopNodeKind::Router`] node's structured
+    /// routes/fallback/wiring editor — replaces the raw JSON buffer used by
+    /// [`LoopEditorMode::NodeConfig`] with the `router_*` fields below, since
+    /// wiring an edge per route isn't expressible as node config alone.
+    RouterRoutes,
+}
+
+/// Which sub-field of the currently-focused route row
+/// [`LoopEditorDialog::router_field`] points at.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RouterField {
+    Label,
+    Description,
+    Target,
+}
+
+/// One route being edited in the router routes dialog: the declared
+/// label/description (persisted into the node's `config`) plus the target
+/// node its `route` edge should point at (persisted as a separate
+/// [`crate::domain::loops::LoopEdge`] on save — `None` means not wired yet).
+#[derive(Clone, Default)]
+pub(crate) struct RouterRouteDraft {
+    pub label: String,
+    pub description: String,
+    pub target_node_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -253,6 +278,14 @@ pub(crate) struct LoopEditorDialog {
     pub cursor: usize,
     pub mode: LoopEditorMode,
     pub parse_error: Option<String>,
+    /// `RouterRoutes` mode only, below — unused (empty) otherwise.
+    pub router_routes: Vec<RouterRouteDraft>,
+    pub router_fallback: String,
+    pub router_route_index: usize,
+    pub router_field: RouterField,
+    /// Candidate `(node_id, node_name)` targets a route can wire to: every
+    /// other node in the router's graph.
+    pub router_targets: Vec<(String, String)>,
 }
 
 impl LoopEditorDialog {
@@ -274,6 +307,180 @@ impl LoopEditorDialog {
             cursor,
             mode,
             parse_error: None,
+            router_routes: Vec::new(),
+            router_fallback: String::new(),
+            router_route_index: 0,
+            router_field: RouterField::Label,
+            router_targets: Vec::new(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_router_routes(
+        node_id: String,
+        node_name: String,
+        title: String,
+        help: String,
+        routes: Vec<RouterRouteDraft>,
+        fallback: String,
+        targets: Vec<(String, String)>,
+    ) -> Self {
+        Self {
+            node_id,
+            node_name,
+            title,
+            help,
+            buffer: String::new(),
+            cursor: 0,
+            mode: LoopEditorMode::RouterRoutes,
+            parse_error: None,
+            router_routes: routes,
+            router_fallback: fallback,
+            router_route_index: 0,
+            router_field: RouterField::Label,
+            router_targets: targets,
+        }
+    }
+
+    /// The label/description text behind the focused route's focused field,
+    /// if the focus is on a text field (not the target picker).
+    pub fn router_focused_text_mut(&mut self) -> Option<&mut String> {
+        let field = self.router_field;
+        let route = self.router_routes.get_mut(self.router_route_index)?;
+        match field {
+            RouterField::Label => Some(&mut route.label),
+            RouterField::Description => Some(&mut route.description),
+            RouterField::Target => None,
+        }
+    }
+
+    /// Append to the focused route's focused text field. No-op on the
+    /// target field (see [`Self::cycle_router_target`] instead) — fields are
+    /// short single-line labels, so editing is append/pop-at-end only,
+    /// unlike the free-cursor `buffer` used by the other editor modes.
+    pub fn router_push_char(&mut self, value: char) {
+        if let Some(text) = self.router_focused_text_mut() {
+            text.push(value);
+        }
+    }
+
+    /// Drop the last character of the focused route's focused text field.
+    pub fn router_pop_char(&mut self) {
+        if let Some(text) = self.router_focused_text_mut() {
+            text.pop();
+        }
+    }
+
+    /// Unwire the focused route's target (Backspace while it's focused).
+    pub fn router_clear_target(&mut self) {
+        if let Some(route) = self.router_routes.get_mut(self.router_route_index) {
+            route.target_node_id = None;
+        }
+    }
+
+    /// Cycle the focused route's target through `(none) -> targets... ->
+    /// (none)`, in `router_targets` order.
+    pub fn cycle_router_target(&mut self, forward: bool) {
+        let Some(route) = self.router_routes.get_mut(self.router_route_index) else {
+            return;
+        };
+        if self.router_targets.is_empty() {
+            route.target_node_id = None;
+            return;
+        }
+        let current = route
+            .target_node_id
+            .as_deref()
+            .and_then(|id| self.router_targets.iter().position(|(tid, _)| tid == id));
+        // Index space is `[None, targets[0], targets[1], ...]`.
+        let len = self.router_targets.len() + 1;
+        let current_index = current.map(|i| i + 1).unwrap_or(0);
+        let next_index = if forward {
+            (current_index + 1) % len
+        } else {
+            (current_index + len - 1) % len
+        };
+        route.target_node_id = if next_index == 0 {
+            None
+        } else {
+            Some(self.router_targets[next_index - 1].0.clone())
+        };
+    }
+
+    /// Move route/field focus to the next sub-field, wrapping to the next
+    /// route's first field at the end.
+    pub fn router_next_field(&mut self) {
+        self.router_field = match self.router_field {
+            RouterField::Label => RouterField::Description,
+            RouterField::Description => RouterField::Target,
+            RouterField::Target => {
+                if !self.router_routes.is_empty() {
+                    self.router_route_index =
+                        (self.router_route_index + 1) % self.router_routes.len();
+                }
+                RouterField::Label
+            }
+        };
+    }
+
+    pub fn router_prev_field(&mut self) {
+        self.router_field = match self.router_field {
+            RouterField::Target => RouterField::Description,
+            RouterField::Description => RouterField::Label,
+            RouterField::Label => {
+                if !self.router_routes.is_empty() {
+                    self.router_route_index = self
+                        .router_route_index
+                        .checked_sub(1)
+                        .unwrap_or(self.router_routes.len() - 1);
+                }
+                RouterField::Target
+            }
+        };
+    }
+
+    /// Move the route selection itself (Up/Down), keeping the focused
+    /// sub-field.
+    pub fn router_move_route(&mut self, forward: bool) {
+        if self.router_routes.is_empty() {
+            return;
+        }
+        self.router_route_index = if forward {
+            (self.router_route_index + 1) % self.router_routes.len()
+        } else {
+            self.router_route_index
+                .checked_sub(1)
+                .unwrap_or(self.router_routes.len() - 1)
+        };
+    }
+
+    /// Append a fresh, unwired route and focus it (Ctrl+N).
+    pub fn router_add_route(&mut self) {
+        self.router_routes.push(RouterRouteDraft::default());
+        self.router_route_index = self.router_routes.len() - 1;
+        self.router_field = RouterField::Label;
+    }
+
+    /// Drop the focused route (Ctrl+D). If it was the fallback, the fallback
+    /// is cleared — [`crate::domain::loops::validate_router_routes`] will
+    /// catch an empty/dangling fallback on save.
+    pub fn router_remove_route(&mut self) {
+        if self.router_routes.is_empty() {
+            return;
+        }
+        let removed = self.router_routes.remove(self.router_route_index);
+        if self.router_fallback == removed.label {
+            self.router_fallback.clear();
+        }
+        if self.router_route_index >= self.router_routes.len() {
+            self.router_route_index = self.router_routes.len().saturating_sub(1);
+        }
+    }
+
+    /// Set the focused route as the fallback (Ctrl+F).
+    pub fn router_set_fallback(&mut self) {
+        if let Some(route) = self.router_routes.get(self.router_route_index) {
+            self.router_fallback = route.label.clone();
         }
     }
 
@@ -678,4 +885,170 @@ pub(crate) struct ProjectRelationDialog {
 pub(crate) struct WorkdirSystemState {
     pub sent: bool,
     pub sent_as_solo: bool,
+}
+
+#[cfg(test)]
+mod router_routes_dialog_tests {
+    use super::{LoopEditorDialog, RouterField, RouterRouteDraft};
+
+    fn dialog_with_routes(labels: &[&str]) -> LoopEditorDialog {
+        let routes = labels
+            .iter()
+            .map(|label| RouterRouteDraft {
+                label: label.to_string(),
+                description: format!("{label} desc"),
+                target_node_id: None,
+            })
+            .collect();
+        let targets = vec![
+            ("n1".to_string(), "Node One".to_string()),
+            ("n2".to_string(), "Node Two".to_string()),
+        ];
+        LoopEditorDialog::new_router_routes(
+            "router1".to_string(),
+            "Classify".to_string(),
+            "title".to_string(),
+            "help".to_string(),
+            routes,
+            String::new(),
+            targets,
+        )
+    }
+
+    #[test]
+    fn router_next_field_cycles_through_a_route_then_advances_to_the_next() {
+        let mut dialog = dialog_with_routes(&["a", "b"]);
+        assert_eq!(dialog.router_field, RouterField::Label);
+
+        dialog.router_next_field();
+        assert_eq!(dialog.router_field, RouterField::Description);
+        assert_eq!(dialog.router_route_index, 0);
+
+        dialog.router_next_field();
+        assert_eq!(dialog.router_field, RouterField::Target);
+        assert_eq!(dialog.router_route_index, 0);
+
+        dialog.router_next_field();
+        assert_eq!(dialog.router_field, RouterField::Label);
+        assert_eq!(dialog.router_route_index, 1, "wraps to the next route");
+    }
+
+    #[test]
+    fn router_prev_field_is_the_exact_inverse() {
+        let mut dialog = dialog_with_routes(&["a", "b"]);
+        dialog.router_route_index = 1;
+        dialog.router_field = RouterField::Label;
+
+        dialog.router_prev_field();
+        assert_eq!(dialog.router_field, RouterField::Target);
+        assert_eq!(
+            dialog.router_route_index, 0,
+            "wraps back to the previous route"
+        );
+    }
+
+    #[test]
+    fn router_push_and_pop_char_edit_the_focused_route_field() {
+        let mut dialog = dialog_with_routes(&["", ""]);
+        dialog.router_routes[0].description.clear();
+        dialog.router_field = RouterField::Label;
+        dialog.router_push_char('b');
+        dialog.router_push_char('i');
+        dialog.router_push_char('n');
+        assert_eq!(dialog.router_routes[0].label, "bin");
+
+        dialog.router_pop_char();
+        assert_eq!(dialog.router_routes[0].label, "bi");
+
+        dialog.router_next_field();
+        dialog.router_push_char('x');
+        assert_eq!(dialog.router_routes[0].description, "x");
+        // The other route is untouched.
+        assert_eq!(dialog.router_routes[1].label, "");
+    }
+
+    #[test]
+    fn cycle_router_target_moves_through_none_and_every_candidate() {
+        let mut dialog = dialog_with_routes(&["a"]);
+        assert_eq!(dialog.router_routes[0].target_node_id, None);
+
+        dialog.cycle_router_target(true);
+        assert_eq!(
+            dialog.router_routes[0].target_node_id.as_deref(),
+            Some("n1")
+        );
+
+        dialog.cycle_router_target(true);
+        assert_eq!(
+            dialog.router_routes[0].target_node_id.as_deref(),
+            Some("n2")
+        );
+
+        dialog.cycle_router_target(true);
+        assert_eq!(
+            dialog.router_routes[0].target_node_id, None,
+            "wraps back to unwired after the last candidate"
+        );
+
+        dialog.cycle_router_target(false);
+        assert_eq!(
+            dialog.router_routes[0].target_node_id.as_deref(),
+            Some("n2")
+        );
+    }
+
+    #[test]
+    fn router_clear_target_unwires_the_focused_route() {
+        let mut dialog = dialog_with_routes(&["a"]);
+        dialog.router_routes[0].target_node_id = Some("n1".to_string());
+        dialog.router_clear_target();
+        assert_eq!(dialog.router_routes[0].target_node_id, None);
+    }
+
+    #[test]
+    fn router_add_route_appends_and_focuses_a_fresh_unwired_route() {
+        let mut dialog = dialog_with_routes(&["a", "b"]);
+        dialog.router_add_route();
+
+        assert_eq!(dialog.router_routes.len(), 3);
+        assert_eq!(dialog.router_route_index, 2);
+        assert_eq!(dialog.router_field, RouterField::Label);
+        assert_eq!(dialog.router_routes[2].label, "");
+        assert_eq!(dialog.router_routes[2].target_node_id, None);
+    }
+
+    #[test]
+    fn router_remove_route_drops_it_and_clears_a_dangling_fallback() {
+        let mut dialog = dialog_with_routes(&["a", "b", "c"]);
+        dialog.router_fallback = "b".to_string();
+        dialog.router_route_index = 1;
+
+        dialog.router_remove_route();
+
+        assert_eq!(dialog.router_routes.len(), 2);
+        assert!(dialog.router_routes.iter().all(|r| r.label != "b"));
+        assert_eq!(
+            dialog.router_fallback, "",
+            "fallback naming the removed route is cleared, not left dangling"
+        );
+    }
+
+    #[test]
+    fn router_remove_route_keeps_an_unrelated_fallback() {
+        let mut dialog = dialog_with_routes(&["a", "b", "c"]);
+        dialog.router_fallback = "a".to_string();
+        dialog.router_route_index = 1; // removes "b"
+
+        dialog.router_remove_route();
+
+        assert_eq!(dialog.router_fallback, "a");
+    }
+
+    #[test]
+    fn router_set_fallback_names_the_focused_route() {
+        let mut dialog = dialog_with_routes(&["a", "b"]);
+        dialog.router_route_index = 1;
+        dialog.router_set_fallback();
+        assert_eq!(dialog.router_fallback, "b");
+    }
 }

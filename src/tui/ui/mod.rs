@@ -32,6 +32,11 @@ pub(crate) const STATUS_OK: Color = Color::Rgb(66, 165, 245);
 pub(crate) const STATUS_FAIL: Color = Color::Rgb(229, 57, 53);
 pub(crate) const STATUS_WAIT_ON: Color = Color::Rgb(255, 255, 0);
 pub(crate) const STATUS_WAIT_OFF: Color = Color::Rgb(30, 30, 30);
+/// Tag color for a [`crate::domain::loops::LoopNodeKind::Router`] node's
+/// `[router]` kind tag in the live loop graph, so a branch point reads as
+/// visually distinct from agent/check/gate/quorum boxes at a glance instead
+/// of only via the text tag.
+pub(crate) const KIND_ROUTER: Color = Color::Rgb(171, 71, 188);
 
 /// Border set for a themed panel: `ALL` for classic, `NONE` for modern
 /// (which separates panels by background-color contrast instead).

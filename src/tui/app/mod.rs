@@ -1181,6 +1181,7 @@ impl App {
                 started_at: state.current_node_started_at,
                 iteration: state.current_node_iteration,
                 output_tail: state.current_node_output_tail.clone(),
+                chosen_route: highlighted.and_then(|id| state.router_taken_routes.get(id).cloned()),
             };
         }
         let (Some(spec_id), Some(node_id)) = (state.current_spec_id.as_deref(), highlighted) else {
@@ -1661,17 +1662,8 @@ impl App {
         let Some(node) = self.selected_loop_node() else {
             return Ok(());
         };
-
-        let (title, help, buffer, mode) = self.build_editor_dialog_content(node);
-
-        self.loop_editor_dialog = Some(crate::tui::app::types::LoopEditorDialog::new(
-            node.id.clone(),
-            node.name.clone(),
-            title,
-            help,
-            buffer,
-            mode,
-        ));
+        let dialog = self.build_editor_dialog_content(node);
+        self.loop_editor_dialog = Some(dialog);
         self.focus = Focus::LoopEditorDialog;
         Ok(())
     }
@@ -1719,15 +1711,8 @@ impl App {
 
         // Pre-fill the editor with the copy's config (identical to the
         // source's) so the user can immediately adjust it.
-        let (title, help, buffer, mode) = self.build_editor_dialog_content(&copy);
-        self.loop_editor_dialog = Some(crate::tui::app::types::LoopEditorDialog::new(
-            copy.id.clone(),
-            copy.name,
-            title,
-            help,
-            buffer,
-            mode,
-        ));
+        let dialog = self.build_editor_dialog_content(&copy);
+        self.loop_editor_dialog = Some(dialog);
         self.focus = Focus::LoopEditorDialog;
         Ok(())
     }
@@ -1735,34 +1720,26 @@ impl App {
     fn build_editor_dialog_content(
         &self,
         node: &crate::domain::loops::LoopNode,
-    ) -> (
-        String,
-        String,
-        String,
-        crate::tui::app::types::LoopEditorMode,
-    ) {
-        if node.kind == LoopNodeKind::Agent {
-            self.build_agent_prompt_dialog(node)
-        } else {
-            self.build_node_config_dialog(node)
+    ) -> crate::tui::app::types::LoopEditorDialog {
+        match node.kind {
+            LoopNodeKind::Agent => self.build_agent_prompt_dialog(node),
+            LoopNodeKind::Router => self.build_router_routes_dialog(node),
+            _ => self.build_node_config_dialog(node),
         }
     }
 
     fn build_agent_prompt_dialog(
         &self,
         node: &crate::domain::loops::LoopNode,
-    ) -> (
-        String,
-        String,
-        String,
-        crate::tui::app::types::LoopEditorMode,
-    ) {
+    ) -> crate::tui::app::types::LoopEditorDialog {
         let prompt = node
             .config
             .get("prompt_template")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        (
+        crate::tui::app::types::LoopEditorDialog::new(
+            node.id.clone(),
+            node.name.clone(),
             format!(" Loop Prompt · {} ", node.name),
             "Ctrl+S save  ·  Enter newline  ·  Esc cancel".to_string(),
             prompt.to_string(),
@@ -1773,17 +1750,132 @@ impl App {
     fn build_node_config_dialog(
         &self,
         node: &crate::domain::loops::LoopNode,
-    ) -> (
-        String,
-        String,
-        String,
-        crate::tui::app::types::LoopEditorMode,
-    ) {
-        (
+    ) -> crate::tui::app::types::LoopEditorDialog {
+        crate::tui::app::types::LoopEditorDialog::new(
+            node.id.clone(),
+            node.name.clone(),
             format!(" Loop Config · {} ", node.name),
             "Ctrl+S save JSON  ·  Enter newline  ·  Esc cancel".to_string(),
             serde_json::to_string_pretty(&node.config).unwrap_or_default(),
             crate::tui::app::types::LoopEditorMode::NodeConfig,
+        )
+    }
+
+    /// Every other node in `node`'s graph — candidate targets a router
+    /// route can wire an edge to.
+    fn router_candidate_targets(
+        &self,
+        node: &crate::domain::loops::LoopNode,
+    ) -> Vec<(String, String)> {
+        let siblings = match (&node.spec_id, &node.loop_id) {
+            (Some(spec_id), _) => self.db.list_loop_nodes(spec_id).unwrap_or_default(),
+            (None, Some(loop_id)) => self
+                .db
+                .list_loop_nodes_for_loop(loop_id)
+                .unwrap_or_default(),
+            (None, None) => Vec::new(),
+        };
+        siblings
+            .into_iter()
+            .filter(|sibling| sibling.id != node.id)
+            .map(|sibling| (sibling.id, sibling.name))
+            .collect()
+    }
+
+    /// This router node's currently-persisted `route`-conditioned outgoing
+    /// edges, keyed by nothing in particular — callers match by route label
+    /// via [`crate::domain::loops::LoopEdgeCondition::route_label`].
+    fn router_existing_edges(
+        &self,
+        node: &crate::domain::loops::LoopNode,
+    ) -> Vec<crate::domain::loops::LoopEdge> {
+        let edges = match (&node.spec_id, &node.loop_id) {
+            (Some(spec_id), _) => self.db.list_loop_edges(spec_id).unwrap_or_default(),
+            (None, Some(loop_id)) => self
+                .db
+                .list_loop_edges_for_loop(loop_id)
+                .unwrap_or_default(),
+            (None, None) => Vec::new(),
+        };
+        edges
+            .into_iter()
+            .filter(|edge| edge.from_node == node.id)
+            .collect()
+    }
+
+    /// Best-effort extraction of a router node's declared routes + fallback
+    /// out of its raw `config` — used only to pre-fill the dialog. Shape
+    /// correctness is enforced on save by
+    /// [`crate::domain::loops::validate_router_routes`], not here.
+    fn parse_router_config(
+        config: &serde_json::Value,
+    ) -> (Vec<crate::domain::loops::RouterRoute>, String) {
+        let map = config.as_object();
+        let routes = map
+            .and_then(|m| m.get("routes"))
+            .and_then(serde_json::Value::as_array)
+            .map(|routes| {
+                routes
+                    .iter()
+                    .filter_map(serde_json::Value::as_object)
+                    .map(|obj| crate::domain::loops::RouterRoute {
+                        label: obj
+                            .get("label")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        description: obj
+                            .get("description")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let fallback = map
+            .and_then(|m| m.get("fallback"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        (routes, fallback)
+    }
+
+    fn build_router_routes_dialog(
+        &self,
+        node: &crate::domain::loops::LoopNode,
+    ) -> crate::tui::app::types::LoopEditorDialog {
+        let (parsed_routes, fallback) = Self::parse_router_config(&node.config);
+        let existing_edges = self.router_existing_edges(node);
+        let mut routes: Vec<crate::tui::app::types::RouterRouteDraft> = parsed_routes
+            .into_iter()
+            .map(|route| {
+                let target = existing_edges
+                    .iter()
+                    .find(|edge| edge.condition.route_label() == Some(route.label.as_str()))
+                    .map(|edge| edge.to_node.clone());
+                crate::tui::app::types::RouterRouteDraft {
+                    label: route.label,
+                    description: route.description,
+                    target_node_id: target,
+                }
+            })
+            .collect();
+        // A brand new router (empty `routes`) starts with the domain's
+        // minimum so the form is immediately shaped like a valid one.
+        while routes.len() < crate::domain::loops::ROUTER_MIN_ROUTES {
+            routes.push(crate::tui::app::types::RouterRouteDraft::default());
+        }
+        let targets = self.router_candidate_targets(node);
+        crate::tui::app::types::LoopEditorDialog::new_router_routes(
+            node.id.clone(),
+            node.name.clone(),
+            format!(" Router Routes · {} ", node.name),
+            "Tab field · ↑↓ route · ←→ target · Ctrl+N add · Ctrl+D delete · Ctrl+F fallback · Ctrl+S save · Esc cancel"
+                .to_string(),
+            routes,
+            fallback,
+            targets,
         )
     }
 
@@ -1801,6 +1893,13 @@ impl App {
             return Ok(());
         };
 
+        if matches!(
+            dialog.mode,
+            crate::tui::app::types::LoopEditorMode::RouterRoutes
+        ) {
+            return self.save_router_routes_dialog(dialog, &node);
+        }
+
         let updated_config = self.compute_updated_node_config(&dialog, &node)?;
         self.db.update_loop_node_details(
             &dialog.node_id,
@@ -1812,6 +1911,119 @@ impl App {
         self.focus = Focus::Preview;
         self.refresh_loops()?;
         Ok(())
+    }
+
+    /// Validate then persist a router's routes dialog: the declared
+    /// routes/fallback shape (into `node.config`) and each route's edge
+    /// wiring (as separate `route`-conditioned [`crate::domain::loops::LoopEdge`]s).
+    /// Both domain checks run against the *intended* state before anything
+    /// is written, so a rejected save never leaves a half-wired router.
+    fn save_router_routes_dialog(
+        &mut self,
+        dialog: crate::tui::app::types::LoopEditorDialog,
+        node: &crate::domain::loops::LoopNode,
+    ) -> Result<()> {
+        let routes: Vec<crate::domain::loops::RouterRoute> = dialog
+            .router_routes
+            .iter()
+            .map(|draft| crate::domain::loops::RouterRoute {
+                label: draft.label.trim().to_string(),
+                description: draft.description.trim().to_string(),
+            })
+            .collect();
+        let fallback = dialog.router_fallback.trim().to_string();
+
+        if let Err(message) = crate::domain::loops::validate_router_routes(&routes, &fallback) {
+            return self.reopen_router_dialog_with_error(dialog, message);
+        }
+
+        let intended_edges: Vec<crate::domain::loops::LoopEdge> = dialog
+            .router_routes
+            .iter()
+            .filter_map(|draft| {
+                let target = draft.target_node_id.clone()?;
+                Some(crate::domain::loops::LoopEdge {
+                    id: String::new(),
+                    spec_id: node.spec_id.clone(),
+                    loop_id: node.loop_id.clone(),
+                    from_node: node.id.clone(),
+                    to_node: target,
+                    condition: crate::domain::loops::LoopEdgeCondition::Route(
+                        draft.label.trim().to_string(),
+                    ),
+                })
+            })
+            .collect();
+        if let Err(message) =
+            crate::domain::loops::validate_router_route_coverage(&routes, &node.id, &intended_edges)
+        {
+            return self.reopen_router_dialog_with_error(dialog, message);
+        }
+
+        let config = serde_json::json!({
+            "routes": routes
+                .iter()
+                .map(|route| serde_json::json!({
+                    "label": route.label,
+                    "description": route.description,
+                }))
+                .collect::<Vec<_>>(),
+            "fallback": fallback,
+        });
+        self.db
+            .update_loop_node_details(&dialog.node_id, None, None, Some(&config), None)?;
+
+        let existing_edges = self.router_existing_edges(node);
+        for draft in &dialog.router_routes {
+            let label = draft.label.trim();
+            let existing = existing_edges
+                .iter()
+                .find(|edge| edge.condition.route_label() == Some(label));
+            match (&draft.target_node_id, existing) {
+                (Some(target), Some(edge)) if &edge.to_node != target => {
+                    self.db.update_loop_edge_target(&edge.id, target)?;
+                }
+                (Some(target), None) => {
+                    self.db.insert_loop_edge(&crate::domain::loops::LoopEdge {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        spec_id: node.spec_id.clone(),
+                        loop_id: node.loop_id.clone(),
+                        from_node: node.id.clone(),
+                        to_node: target.clone(),
+                        condition: crate::domain::loops::LoopEdgeCondition::Route(
+                            label.to_string(),
+                        ),
+                    })?;
+                }
+                _ => {}
+            }
+        }
+        // A route dropped from the form (Ctrl+D) leaves its old edge naming
+        // a route the node no longer declares — drop the edge too so
+        // `validate_router_edges_declared` never has to catch it later.
+        for edge in &existing_edges {
+            let Some(label) = edge.condition.route_label() else {
+                continue;
+            };
+            if !routes.iter().any(|route| route.label == label) {
+                self.db.delete_loop_edge(&edge.id)?;
+            }
+        }
+
+        self.focus = Focus::Preview;
+        self.refresh_loops()?;
+        Ok(())
+    }
+
+    fn reopen_router_dialog_with_error(
+        &mut self,
+        mut dialog: crate::tui::app::types::LoopEditorDialog,
+        message: String,
+    ) -> Result<()> {
+        dialog.parse_error = Some(message);
+        self.loop_editor_dialog = Some(dialog);
+        self.focus = Focus::LoopEditorDialog;
+        Err(anyhow::anyhow!("Invalid router routes"))
     }
 
     fn compute_updated_node_config(
@@ -1835,6 +2047,12 @@ impl App {
                     }
                 }
             }
+            // Router routes are saved through `save_router_routes_dialog`
+            // before this function is ever reached — see
+            // `save_loop_editor_dialog`'s mode check.
+            crate::tui::app::types::LoopEditorMode::RouterRoutes => unreachable!(
+                "RouterRoutes is handled by save_router_routes_dialog before this call"
+            ),
         }
     }
 
@@ -3313,6 +3531,7 @@ mod tests {
     use crate::tui::app::types::{
         AgentEntry, App, AutomationKind, Focus, LoopLiveFocus, ProjectTab, SidebarLayer,
     };
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::{tempdir, NamedTempFile};
 
@@ -5019,6 +5238,7 @@ mod tests {
             effective_nodes: Vec::new(),
             effective_edges: Vec::new(),
             ensembles: Vec::new(),
+            router_taken_routes: HashMap::new(),
             current_node_id: None,
             current_node_status: None,
             current_node_started_at: None,
@@ -5203,5 +5423,291 @@ mod tests {
         app.copied_at = std::time::Instant::now() - std::time::Duration::from_secs(5);
         app.dismiss_copied();
         assert!(!app.show_copied);
+    }
+
+    // ── Router routes dialog (open/pre-fill/save) ────────────────────
+
+    /// Seeds a `Draft` loop with one spec containing a 4-route router node
+    /// ("billing"/"technical"/"sales"/"escalation", fallback "escalation")
+    /// already wired to `billing`, plus three plain agent target nodes —
+    /// the fixture every router-dialog test in this section starts from.
+    fn seed_router_loop(db: &Database) {
+        use crate::domain::loops::{
+            Loop, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind, LoopSpec,
+        };
+
+        db.insert_loop(&Loop {
+            id: "rlp1".to_string(),
+            name: "router loop".to_string(),
+            description: None,
+            workdir: "/tmp/router-test".to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_pool_id: None,
+            on_completed: None,
+        })
+        .unwrap();
+        db.insert_loop_spec(&LoopSpec {
+            id: "rs1".to_string(),
+            loop_id: Some("rlp1".to_string()),
+            name: "spec one".to_string(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "router".to_string(),
+            spec_id: Some("rs1".to_string()),
+            loop_id: None,
+            name: "Classify".to_string(),
+            kind: LoopNodeKind::Router,
+            config: serde_json::json!({
+                "routes": [
+                    {"label": "billing", "description": "billing desc"},
+                    {"label": "technical", "description": "technical desc"},
+                    {"label": "sales", "description": "sales desc"},
+                    {"label": "escalation", "description": "escalation desc"},
+                ],
+                "fallback": "escalation",
+            }),
+            position: 0,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        for (id, name, position) in [
+            ("billing_agent", "Billing specialist", 1),
+            ("technical_agent", "Technical specialist", 2),
+            ("sales_agent", "Sales specialist", 3),
+        ] {
+            db.insert_loop_node(&LoopNode {
+                id: id.to_string(),
+                spec_id: Some("rs1".to_string()),
+                loop_id: None,
+                name: name.to_string(),
+                kind: LoopNodeKind::Agent,
+                config: serde_json::json!({}),
+                position,
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        }
+        db.insert_loop_edge(&LoopEdge {
+            id: "e_billing".to_string(),
+            spec_id: Some("rs1".to_string()),
+            loop_id: None,
+            from_node: "router".to_string(),
+            to_node: "billing_agent".to_string(),
+            condition: LoopEdgeCondition::Route("billing".to_string()),
+        })
+        .unwrap();
+    }
+
+    fn app_on_router_node(db: &Arc<Database>, data_dir: &std::path::Path) -> App {
+        let mut app = App::new(Arc::clone(db), data_dir).expect("create app");
+        app.refresh_loops().expect("refresh loops");
+        app.loop_selected_spec = 0;
+        app.loop_selected_node = 0; // "router" is position 0
+        assert_eq!(
+            app.selected_loop_node().map(|n| n.id.as_str()),
+            Some("router"),
+            "fixture invariant: router node must be selected"
+        );
+        app
+    }
+
+    #[test]
+    fn open_loop_editor_dialog_prefills_router_routes_fallback_and_existing_wiring() {
+        let db = test_db();
+        seed_router_loop(&db);
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = app_on_router_node(&db, data_dir.path());
+
+        app.open_loop_editor_dialog().expect("open editor");
+
+        let dialog = app.loop_editor_dialog.as_ref().expect("dialog opens");
+        assert!(matches!(
+            dialog.mode,
+            crate::tui::app::types::LoopEditorMode::RouterRoutes
+        ));
+        assert_eq!(dialog.router_routes.len(), 4);
+        assert_eq!(dialog.router_fallback, "escalation");
+
+        let billing = dialog
+            .router_routes
+            .iter()
+            .find(|r| r.label == "billing")
+            .expect("billing route present");
+        assert_eq!(billing.description, "billing desc");
+        assert_eq!(billing.target_node_id.as_deref(), Some("billing_agent"));
+
+        let technical = dialog
+            .router_routes
+            .iter()
+            .find(|r| r.label == "technical")
+            .expect("technical route present");
+        assert_eq!(
+            technical.target_node_id, None,
+            "not yet wired in the fixture"
+        );
+
+        // Candidate targets exclude the router itself.
+        assert!(!dialog.router_targets.iter().any(|(id, _)| id == "router"));
+        assert!(dialog
+            .router_targets
+            .iter()
+            .any(|(id, _)| id == "technical_agent"));
+    }
+
+    #[test]
+    fn save_router_routes_dialog_rejects_an_invalid_fallback_with_a_readable_message() {
+        let db = test_db();
+        seed_router_loop(&db);
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = app_on_router_node(&db, data_dir.path());
+        app.open_loop_editor_dialog().expect("open editor");
+
+        app.loop_editor_dialog.as_mut().unwrap().router_fallback = "not-a-route".to_string();
+
+        let result = app.save_loop_editor_dialog();
+        assert!(result.is_err(), "invalid fallback must not save");
+
+        let dialog = app
+            .loop_editor_dialog
+            .as_ref()
+            .expect("dialog stays open on validation failure");
+        let message = dialog.parse_error.as_deref().unwrap_or_default();
+        assert!(
+            message.contains("not-a-route"),
+            "error should be a readable, specific message: {message:?}"
+        );
+
+        // Nothing was written.
+        let node = db.get_loop_node("router").unwrap().unwrap();
+        assert_eq!(node.config["fallback"], "escalation");
+    }
+
+    #[test]
+    fn save_router_routes_dialog_rejects_partial_wiring_before_writing_anything() {
+        let db = test_db();
+        seed_router_loop(&db);
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = app_on_router_node(&db, data_dir.path());
+        app.open_loop_editor_dialog().expect("open editor");
+
+        // "billing" is already wired (from the fixture); leaving every other
+        // route unwired is a rejected half-wired state, not a valid save.
+        let result = app.save_loop_editor_dialog();
+        assert!(result.is_err());
+        assert!(app
+            .loop_editor_dialog
+            .as_ref()
+            .unwrap()
+            .parse_error
+            .is_some());
+
+        // The pre-existing edge is untouched.
+        let edges = db.list_loop_edges("rs1").unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].to_node, "billing_agent");
+    }
+
+    #[test]
+    fn save_router_routes_dialog_persists_config_and_wires_every_route() {
+        let db = test_db();
+        seed_router_loop(&db);
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = app_on_router_node(&db, data_dir.path());
+        app.open_loop_editor_dialog().expect("open editor");
+
+        {
+            let dialog = app.loop_editor_dialog.as_mut().unwrap();
+            for route in dialog.router_routes.iter_mut() {
+                route.target_node_id = Some(match route.label.as_str() {
+                    "billing" => "billing_agent".to_string(),
+                    "technical" => "technical_agent".to_string(),
+                    "sales" => "sales_agent".to_string(),
+                    "escalation" => "billing_agent".to_string(),
+                    other => panic!("unexpected route {other}"),
+                });
+            }
+        }
+
+        app.save_loop_editor_dialog().expect("save succeeds");
+
+        assert!(app.loop_editor_dialog.is_none(), "dialog closes on save");
+
+        let node = db.get_loop_node("router").unwrap().unwrap();
+        assert_eq!(node.config["fallback"], "escalation");
+        assert_eq!(node.config["routes"].as_array().unwrap().len(), 4);
+
+        let edges = db.list_loop_edges("rs1").unwrap();
+        assert_eq!(edges.len(), 4, "every route now has exactly one edge");
+        let by_route: HashMap<&str, &str> = edges
+            .iter()
+            .map(|e| {
+                (
+                    e.condition.route_label().expect("route edge"),
+                    e.to_node.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(by_route["billing"], "billing_agent");
+        assert_eq!(by_route["technical"], "technical_agent");
+        assert_eq!(by_route["sales"], "sales_agent");
+        assert_eq!(by_route["escalation"], "billing_agent");
+    }
+
+    #[test]
+    fn save_router_routes_dialog_drops_the_edge_of_a_removed_route() {
+        let db = test_db();
+        seed_router_loop(&db);
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = app_on_router_node(&db, data_dir.path());
+        app.open_loop_editor_dialog().expect("open editor");
+
+        {
+            let dialog = app.loop_editor_dialog.as_mut().unwrap();
+            // Drop "billing" — the one route the fixture already wired.
+            let idx = dialog
+                .router_routes
+                .iter()
+                .position(|r| r.label == "billing")
+                .unwrap();
+            dialog.router_route_index = idx;
+            dialog.router_remove_route();
+            // The remaining 3 routes must all be wired for this to be a
+            // valid, non-partial save.
+            for route in dialog.router_routes.iter_mut() {
+                route.target_node_id = Some("technical_agent".to_string());
+            }
+            dialog.router_fallback = "escalation".to_string();
+        }
+
+        app.save_loop_editor_dialog().expect("save succeeds");
+
+        let edges = db.list_loop_edges("rs1").unwrap();
+        assert_eq!(edges.len(), 3);
+        assert!(
+            !edges
+                .iter()
+                .any(|e| e.condition.route_label() == Some("billing")),
+            "the removed route's edge must not survive the save"
+        );
     }
 }

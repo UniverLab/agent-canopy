@@ -1,8 +1,12 @@
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::db::Database;
-use crate::domain::loops::{LoopEdge, LoopNode, LoopRunStatus, LoopSpecStatus, LoopStatus};
+use crate::domain::loops::{
+    LoopEdge, LoopNode, LoopNodeKind, LoopRunStatus, LoopSpecStatus, LoopStatus,
+};
 
 /// A snapshot of the currently-selected loop's runtime state, assembled
 /// fresh on every TUI tick. Renderer-agnostic (no ratatui types).
@@ -40,6 +44,10 @@ pub(crate) struct LoopLiveState {
     /// models]" box with live per-member state, instead of drawing N+1
     /// separate boxes.
     pub ensembles: Vec<EnsembleLiveInfo>,
+    /// For every [`LoopNodeKind::Router`] node in `effective_nodes` with a
+    /// completed run, the route label it selected — lets the graph view mark
+    /// which of a router's N edges a run actually took, not just list them.
+    pub router_taken_routes: HashMap<String, String>,
 
     // ── Current node ────────────────────────────────────────────
     /// Id of the node currently executing, or the most recent completed node.
@@ -122,6 +130,8 @@ pub(crate) fn assemble_loop_live_state(
     let (effective_nodes, effective_edges) =
         resolve_effective_graph(db, details, current_spec_id.as_deref());
     let ensembles = resolve_ensembles_live_info(db, &effective_nodes, current_spec_id.as_deref());
+    let router_taken_routes =
+        resolve_router_taken_routes(db, &effective_nodes, current_spec_id.as_deref());
 
     // ── Current node + output tail ──────────────────────────────
     let (current_node_id, current_node_info) = resolve_current_node(db, current_spec_id.as_deref());
@@ -142,6 +152,7 @@ pub(crate) fn assemble_loop_live_state(
         effective_nodes,
         effective_edges,
         ensembles,
+        router_taken_routes,
         current_node_id,
         current_node_status: current_node_info.status,
         current_node_started_at: current_node_info.started_at,
@@ -192,6 +203,30 @@ fn resolve_ensembles_live_info(
         .collect()
 }
 
+/// For every [`LoopNodeKind::Router`] node in `effective_nodes`, resolve the
+/// route its latest run selected (if it has completed one) — the graph view
+/// uses this to mark which of a router's several edges was actually taken,
+/// per the live view's "shows which route a completed run took" contract.
+/// Routers with no run yet, or whose latest run hasn't recorded a route
+/// (still running), are simply absent from the map.
+fn resolve_router_taken_routes(
+    db: &Database,
+    effective_nodes: &[LoopNode],
+    current_spec_id: Option<&str>,
+) -> HashMap<String, String> {
+    let Some(spec_id) = current_spec_id else {
+        return HashMap::new();
+    };
+    effective_nodes
+        .iter()
+        .filter(|node| node.kind == LoopNodeKind::Router)
+        .filter_map(|node| {
+            let info = resolve_node_run_info(db, spec_id, &node.id);
+            info.chosen_route.map(|route| (node.id.clone(), route))
+        })
+        .collect()
+}
+
 /// Latest-run info for a single node: status, start time, iteration, and a
 /// bounded output tail. Shared by the snapshot's auto-detected "current"
 /// node and by [`resolve_node_run_info`] for a caller-requested node.
@@ -202,6 +237,10 @@ pub(crate) struct NodeRunInfo {
     pub started_at: Option<DateTime<Utc>>,
     pub iteration: Option<i64>,
     pub output_tail: Option<String>,
+    /// The route label a router node's run selected, if this run is a
+    /// router's (see `loop_engine::execute_router_node`'s `"route"` output
+    /// field). `None` for every other node kind.
+    pub chosen_route: Option<String>,
 }
 
 impl NodeRunInfo {
@@ -211,8 +250,21 @@ impl NodeRunInfo {
             started_at: Some(run.started_at),
             iteration: Some(run.iteration),
             output_tail: extract_output_tail(&run.output),
+            chosen_route: extract_chosen_route(&run.output),
         }
     }
+}
+
+/// Pull the `"route"` field out of a router run's output JSON (see
+/// `loop_engine::execute_router_node`'s `NodeExecution::output`) — `None` for
+/// any run whose output isn't shaped like a router's (every other node
+/// kind).
+fn extract_chosen_route(output: &Option<Value>) -> Option<String> {
+    output
+        .as_ref()?
+        .get("route")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// Latest run info for `node_id` within `spec_id`: the active (running) run

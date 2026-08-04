@@ -1719,6 +1719,7 @@ mod loop_live_panel_mouse_tests {
     use crate::domain::loops::{LoopSpecStatus, LoopStatus};
     use crate::tui::app::loop_live_state::{LoopLiveState, SpecQueueEntry};
     use crate::tui::app::{AutomationKind, LoopLiveFocus};
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::{tempdir, NamedTempFile};
 
@@ -1768,6 +1769,7 @@ mod loop_live_panel_mouse_tests {
             effective_nodes: Vec::new(),
             effective_edges: Vec::new(),
             ensembles: Vec::new(),
+            router_taken_routes: HashMap::new(),
             current_node_id: None,
             current_node_status: None,
             current_node_started_at: None,
