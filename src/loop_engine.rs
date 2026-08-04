@@ -5146,7 +5146,7 @@ mod tests {
         let expected = crate::domain::prompts::builtin_prompt_preset_specs()
             .into_iter()
             .find(|(name, _)| *name == "reviewer")
-            .map(|(_, content)| content.to_string())
+            .map(|(_, content)| content)
             .unwrap();
 
         assert_eq!(resolve_node_prompt_template(&node, &prompts_dir), expected);
