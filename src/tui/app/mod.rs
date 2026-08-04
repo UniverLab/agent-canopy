@@ -1975,6 +1975,20 @@ impl App {
         }
 
         let updated_config = self.compute_updated_node_config(&dialog, &node)?;
+        // Same allowlist `loop_add_node`/`loop_update_node` enforce (see
+        // `daemon::handler::validate_node_config`) — a raw NodeConfig-mode
+        // edit is the one TUI path that can hand-write a config the engine
+        // will silently ignore (e.g. `prompt` instead of `prompt_template`),
+        // so it must be rejected here too, not just from the MCP tools.
+        if let Err(message) =
+            crate::daemon::handler::validate_node_config(node.kind, &updated_config)
+        {
+            let mut d = dialog.clone();
+            d.parse_error = Some(message);
+            self.loop_editor_dialog = Some(d);
+            self.focus = Focus::LoopEditorDialog;
+            return Err(anyhow::anyhow!("Invalid node config"));
+        }
         self.db.update_loop_node_details(
             &dialog.node_id,
             None,
@@ -5813,6 +5827,109 @@ mod tests {
                 .iter()
                 .any(|e| e.condition.route_label() == Some("billing")),
             "the removed route's edge must not survive the save"
+        );
+    }
+
+    /// `NodeConfig` mode is the one TUI path that hand-writes a node's raw
+    /// config JSON (a `check` node here — agent nodes go through the
+    /// structured `AgentPrompt` mode instead), so it's the one that can
+    /// reintroduce the exact incident shape (a config key the engine will
+    /// never read) if left unvalidated. Saving must be rejected the same
+    /// way `loop_add_node`/`loop_update_node` reject it, and the bad config
+    /// must never reach the DB.
+    #[test]
+    fn save_loop_editor_dialog_rejects_unknown_config_key_in_node_config_mode() {
+        use crate::domain::loops::{Loop, LoopNode, LoopNodeKind, LoopSpec};
+
+        let db = test_db();
+        db.insert_loop(&Loop {
+            archived: false,
+            id: "clp1".to_string(),
+            name: "check loop".to_string(),
+            description: None,
+            workdir: "/tmp/check-test".to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_pool_id: None,
+            on_completed: None,
+        })
+        .unwrap();
+        db.insert_loop_spec(&LoopSpec {
+            id: "cs1".to_string(),
+            loop_id: Some("clp1".to_string()),
+            name: "spec one".to_string(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "check1".to_string(),
+            spec_id: Some("cs1".to_string()),
+            loop_id: None,
+            name: "Gate".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "true"}),
+            position: 0,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.refresh_loops().expect("refresh loops");
+        app.loop_selected_spec = 0;
+        app.loop_selected_node = 0;
+        assert_eq!(
+            app.selected_loop_node().map(|n| n.id.as_str()),
+            Some("check1"),
+            "fixture invariant: check node must be selected"
+        );
+
+        app.open_loop_editor_dialog().expect("open editor");
+        assert!(matches!(
+            app.loop_editor_dialog.as_ref().unwrap().mode,
+            crate::tui::app::types::LoopEditorMode::NodeConfig
+        ));
+        app.loop_editor_dialog.as_mut().unwrap().buffer =
+            serde_json::json!({"command": "true", "unexpected_field": true}).to_string();
+
+        let result = app.save_loop_editor_dialog();
+        assert!(result.is_err(), "an unrecognized config key must not save");
+
+        let dialog = app
+            .loop_editor_dialog
+            .as_ref()
+            .expect("dialog reopens with the error visible");
+        assert!(
+            dialog
+                .parse_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("unexpected_field"),
+            "{:?}",
+            dialog.parse_error
+        );
+
+        let stored = db.get_loop_node("check1").unwrap().unwrap();
+        assert_eq!(
+            stored.config,
+            serde_json::json!({"command": "true"}),
+            "the invalid config must never reach the DB"
         );
     }
 }

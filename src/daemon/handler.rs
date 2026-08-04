@@ -701,19 +701,135 @@ fn config_has_agent_harness(map: &serde_json::Map<String, serde_json::Value>) ->
     has_non_empty_str("platform") || has_non_empty_str("cli")
 }
 
+/// Every config key an `agent` node is actually read for — see
+/// `execute_agent_node`/`resolve_node_prompt_template` in `loop_engine.rs`.
+/// Notably absent: `prompt`. An agent's prompt is `prompt_template` (or
+/// `prompt_preset`); `prompt` is a plain node never reads, and a node that
+/// carries it silently runs on the bare fallback template instead — the
+/// defect this allowlist exists to catch. `commit_rights` (B37) is accepted
+/// on every kind since the engine checks it uniformly regardless of which
+/// node in the graph actually moves HEAD.
+const AGENT_CONFIG_KEYS: &[&str] = &[
+    "platform",
+    "cli",
+    "model",
+    "timeout_minutes",
+    "resume",
+    "resume_prompt",
+    "prompt_template",
+    "prompt_preset",
+    "commit_rights",
+];
+/// Every config key a `check` node is read for — see `execute_check_node`.
+const CHECK_CONFIG_KEYS: &[&str] = &[
+    "command",
+    "success_condition",
+    "timeout_seconds",
+    "commit_rights",
+];
+/// Every config key a `gate` node is read for — see `execute_gate_node`.
+const GATE_CONFIG_KEYS: &[&str] = &["evaluate", "value", "commit_rights"];
+/// Every config key a `router` node is read for — see `parse_router_routes`.
+const ROUTER_CONFIG_KEYS: &[&str] = &["routes", "fallback", "commit_rights"];
+
+/// The config keys a node's kind is actually read for, or `None` for `Join`
+/// (engine-managed — see `validate_node_config`'s `Join` arm — so there is
+/// no caller-supplied key to check against). Shared by
+/// [`validate_known_config_keys`] (write-time rejection) and
+/// [`unknown_config_keys`] (read-only detection of already-stored nodes via
+/// the `loop_audit_node_configs` tool), so the two can never name a
+/// different accepted set for the same kind.
+fn allowed_config_keys(kind: LoopNodeKind) -> Option<&'static [&'static str]> {
+    match kind {
+        LoopNodeKind::Agent => Some(AGENT_CONFIG_KEYS),
+        LoopNodeKind::Check => Some(CHECK_CONFIG_KEYS),
+        LoopNodeKind::Gate => Some(GATE_CONFIG_KEYS),
+        LoopNodeKind::Router => Some(ROUTER_CONFIG_KEYS),
+        LoopNodeKind::Join => None,
+    }
+}
+
+/// Every key in `map` that `kind` will never read, sorted. Empty for `Join`
+/// (see [`allowed_config_keys`]) and for a config that only carries
+/// recognized keys. Pure read-only classification — no error message, no
+/// early return — so it doubles as both [`validate_known_config_keys`]'s
+/// rejection check and `loop_audit_node_configs`'s detection query over
+/// nodes that predate this validation.
+fn unknown_config_keys(
+    kind: LoopNodeKind,
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<String> {
+    let Some(allowed) = allowed_config_keys(kind) else {
+        return Vec::new();
+    };
+    let mut unknown: Vec<String> = map
+        .keys()
+        .filter(|key| !allowed.contains(&key.as_str()))
+        .cloned()
+        .collect();
+    unknown.sort_unstable();
+    unknown
+}
+
+/// Reject any config key a node's kind will never read. This is what makes
+/// `{ "platform": "claude", "prompt": "..." }` on an agent node fail loudly
+/// at write time instead of being accepted, stored, and silently run on the
+/// bare fallback template (`resolve_node_prompt_template`'s default) — the
+/// exact incident this check exists to prevent. `prompt` on an agent node
+/// gets its own message naming `prompt_template` as the field that actually
+/// gets read; every other unrecognized key gets the generic message naming
+/// what the kind does accept.
+fn validate_known_config_keys(
+    kind: LoopNodeKind,
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let unknown = unknown_config_keys(kind, map);
+    let Some(bad_key) = unknown.first() else {
+        return Ok(());
+    };
+    // `allowed_config_keys` is `None` only for `Join`, for which
+    // `unknown_config_keys` always returns empty — so reaching here means
+    // it returned `Some`.
+    let allowed = allowed_config_keys(kind).expect("non-empty unknown keys implies Some(allowed)");
+    let mut accepted = allowed.to_vec();
+    accepted.sort_unstable();
+
+    if kind == LoopNodeKind::Agent && bad_key == "prompt" {
+        return Err(format!(
+            "Loop node config for kind 'agent' does not read a 'prompt' key; use 'prompt_template' (or 'prompt_preset') instead. Accepted keys: {}.",
+            accepted.join(", ")
+        ));
+    }
+    Err(format!(
+        "Loop node config for kind '{}' has unrecognized key '{bad_key}'. Accepted keys: {}.",
+        kind.as_str(),
+        accepted.join(", ")
+    ))
+}
+
 /// Validate that a loop node's config is a JSON object with the fields its
 /// kind needs at execution time. This exists because a double-encoded config
 /// (e.g. `"{\"platform\": \"mimo\"}"` instead of `{"platform": "mimo"}`) used
 /// to be accepted at creation time and only surfaced as an engine crash
 /// ("Agent node ... is missing a platform/cli") mid-run, long after the node
-/// was saved.
-fn validate_node_config(kind: LoopNodeKind, config: &serde_json::Value) -> Result<(), String> {
+/// was saved. It also rejects any key the node's kind will never read (see
+/// [`validate_known_config_keys`]) — the same "surfaced at write time, not
+/// run time" guarantee, for the case where the config shape is otherwise
+/// valid but carries a key like `prompt` that a typo or a wrong mental model
+/// (confusing it with the loop completion hook's own `prompt` field) put
+/// there instead of `prompt_template`.
+pub(crate) fn validate_node_config(
+    kind: LoopNodeKind,
+    config: &serde_json::Value,
+) -> Result<(), String> {
     let Some(map) = config.as_object() else {
         return Err(format!(
             "Loop node config must be a JSON object, not {}. Pass an object (e.g. {{\"platform\": \"claude\"}}) rather than a JSON-encoded string.",
             json_value_kind_name(config)
         ));
     };
+
+    validate_known_config_keys(kind, map)?;
 
     let has_non_empty_str = |field: &str| {
         map.get(field)
@@ -5144,6 +5260,54 @@ impl TaskTriggerHandler {
     }
 
     #[tool(
+        name = "loop_audit_node_configs",
+        description = "Scan every loop node in the database for a config key its kind will never read (e.g. 'prompt' on an agent node, which the engine silently ignores in favor of 'prompt_template'). Write-time validation (loop_add_node/loop_update_node) rejects this going forward; this tool finds nodes that predate it and are still silently degraded."
+    )]
+    async fn loop_audit_node_configs(&self) -> Result<CallToolResult, McpError> {
+        let nodes = self.db.list_all_loop_nodes().map_err(internal_error)?;
+
+        let mut flagged = Vec::new();
+        for node in &nodes {
+            let Some(map) = node.config.as_object() else {
+                continue;
+            };
+            let unknown = unknown_config_keys(node.kind, map);
+            if unknown.is_empty() {
+                continue;
+            }
+            // A spec-scoped node's own row has no `loop_id` (only the spec
+            // does) — resolve it so a flagged node can be traced back to the
+            // loop that owns it without a second round-trip.
+            let loop_id = match &node.loop_id {
+                Some(loop_id) => Some(loop_id.clone()),
+                None => match &node.spec_id {
+                    Some(spec_id) => self
+                        .db
+                        .get_loop_spec(spec_id)
+                        .map_err(internal_error)?
+                        .and_then(|spec| spec.loop_id),
+                    None => None,
+                },
+            };
+            flagged.push(serde_json::json!({
+                "node_id": node.id,
+                "name": node.name,
+                "kind": node.kind.display_str(),
+                "spec_id": node.spec_id,
+                "loop_id": loop_id,
+                "unknown_keys": unknown,
+            }));
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&serde_json::json!({
+                "flagged_nodes": flagged,
+            }))
+            .unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
         name = "loop_list",
         description = "List loops, optionally filtered by workdir."
     )]
@@ -6629,7 +6793,22 @@ fn loop_node_json(node: &LoopNode, edges: &[LoopEdge]) -> serde_json::Value {
         "position": node.position,
         "created_at": node.created_at.to_rfc3339(),
         "routes": router_routes_json(node, edges),
+        "prompt_source": agent_prompt_source_json(node),
     })
+}
+
+/// For an agent node, which branch of `resolve_node_prompt_template`'s
+/// precedence it will actually run on — `"explicit"`, `"preset"`, or
+/// `"default_fallback"` (see `loop_engine::agent_prompt_source`) — so
+/// `loop_get` makes a node quietly running on the bare fallback template
+/// (no `prompt_template`, no `prompt_preset`) visible without requiring a
+/// run first. `None` for every other node kind, same convention as
+/// [`router_routes_json`].
+fn agent_prompt_source_json(node: &LoopNode) -> Option<&'static str> {
+    if node.kind != LoopNodeKind::Agent {
+        return None;
+    }
+    Some(crate::loop_engine::agent_prompt_source(&node.config))
 }
 
 /// For a router node, every declared route alongside the edge (if any) that
@@ -6938,15 +7117,16 @@ mod tests {
         loop_details_json, loop_run_status_guard, loop_trigger_json, member_node_config,
         missing_sync_identity_error, node_copy_note, perform_loop_reset, plan_ensemble_copy,
         plan_node_copy, rag_result_json, resolve_graph_target, resolve_node_kind_and_config,
-        resolve_reported_run, spec_summary_json, validate_absolute_dir, validate_at_least_one_bool,
-        validate_blueprint_exists, validate_edge_condition, validate_edge_condition_with_route,
-        validate_ensemble_members, validate_node_config, validate_node_kind,
-        validate_node_not_ensemble_owned, validate_non_empty, validate_not_join_kind,
-        validate_pool_exists, validate_pool_member_removable, validate_pool_not_consumed,
-        validate_pool_reorder, validate_pool_reorder_locking, validate_route_edge_target,
-        validate_spec_deletable, validate_spec_exists, validate_spec_set_status_target,
-        validate_spec_status, validate_spec_workdir, BuiltEnsembleUnit, EnsembleMemberParams,
-        EnsembleUnitSpec, TaskTriggerHandler, MISSING_SYNC_IDENTITY_MESSAGE,
+        resolve_reported_run, spec_summary_json, unknown_config_keys, validate_absolute_dir,
+        validate_at_least_one_bool, validate_blueprint_exists, validate_edge_condition,
+        validate_edge_condition_with_route, validate_ensemble_members, validate_node_config,
+        validate_node_kind, validate_node_not_ensemble_owned, validate_non_empty,
+        validate_not_join_kind, validate_pool_exists, validate_pool_member_removable,
+        validate_pool_not_consumed, validate_pool_reorder, validate_pool_reorder_locking,
+        validate_route_edge_target, validate_spec_deletable, validate_spec_exists,
+        validate_spec_set_status_target, validate_spec_status, validate_spec_workdir,
+        BuiltEnsembleUnit, EnsembleMemberParams, EnsembleUnitSpec, TaskTriggerHandler,
+        MISSING_SYNC_IDENTITY_MESSAGE,
     };
     use crate::daemon::params::{
         LoopCompletionHookParams, LoopCopyEnsembleParams, LoopCopyNodeParams, LoopRunParams,
@@ -7608,6 +7788,94 @@ mod tests {
     fn validate_node_config_router_rejects_missing_routes_field() {
         let error = validate_node_config(LoopNodeKind::Router, &serde_json::json!({})).unwrap_err();
         assert!(error.contains("'routes'"), "{error}");
+    }
+
+    /// The exact incident shape (loop `824de730-7fec-4031-800a-7933d2cf94c1`,
+    /// node `d0458fe0-24b8-4a29-8a69-7bb0e742e046`): an agent node config
+    /// with `prompt` instead of `prompt_template` must fail loudly, naming
+    /// `prompt_template` as the field that's actually read — not be accepted
+    /// and silently run on the bare fallback template.
+    #[test]
+    fn validate_node_config_agent_rejects_prompt_key_naming_prompt_template() {
+        let config = serde_json::json!({ "platform": "claude", "prompt": "do the thing" });
+        let error = validate_node_config(LoopNodeKind::Agent, &config).unwrap_err();
+        assert!(error.contains("'prompt'"), "{error}");
+        assert!(
+            error.contains("prompt_template"),
+            "error must name the correct key: {error}"
+        );
+    }
+
+    #[test]
+    fn validate_node_config_rejects_unknown_key_for_every_kind() {
+        let agent_error = validate_node_config(
+            LoopNodeKind::Agent,
+            &serde_json::json!({ "platform": "claude", "unexpected_field": true }),
+        )
+        .unwrap_err();
+        assert!(agent_error.contains("unexpected_field"), "{agent_error}");
+        assert!(agent_error.contains("'agent'"), "{agent_error}");
+
+        let check_error = validate_node_config(
+            LoopNodeKind::Check,
+            &serde_json::json!({ "command": "true", "unexpected_field": true }),
+        )
+        .unwrap_err();
+        assert!(check_error.contains("unexpected_field"), "{check_error}");
+
+        let gate_error = validate_node_config(
+            LoopNodeKind::Gate,
+            &serde_json::json!({ "evaluate": "output_contains", "value": "ok", "unexpected_field": true }),
+        )
+        .unwrap_err();
+        assert!(gate_error.contains("unexpected_field"), "{gate_error}");
+
+        let router_error = validate_node_config(
+            LoopNodeKind::Router,
+            &serde_json::json!({ "routes": two_routes_json(), "fallback": "retry", "unexpected_field": true }),
+        )
+        .unwrap_err();
+        assert!(router_error.contains("unexpected_field"), "{router_error}");
+    }
+
+    /// `commit_rights` (B37) is engine-checked on every node kind
+    /// uniformly, so it must be accepted everywhere, not just on agent
+    /// nodes.
+    #[test]
+    fn validate_node_config_accepts_commit_rights_on_every_kind() {
+        assert!(validate_node_config(
+            LoopNodeKind::Agent,
+            &serde_json::json!({ "platform": "claude", "commit_rights": true })
+        )
+        .is_ok());
+        assert!(validate_node_config(
+            LoopNodeKind::Check,
+            &serde_json::json!({ "command": "true", "commit_rights": true })
+        )
+        .is_ok());
+    }
+
+    /// Neither `prompt_template` nor `prompt_preset` is still a VALID agent
+    /// config (the bare fallback template is deliberately kept reachable —
+    /// see the spec's "keep the fallback" constraint) — this only rejects
+    /// keys the engine never reads, not this legitimate default-reliant
+    /// shape. Visibility into "this node runs on the default" is a separate
+    /// concern, handled by `agent_prompt_source`/`loop_node_json`'s
+    /// `prompt_source` field, not by rejecting the config outright.
+    #[test]
+    fn validate_node_config_agent_without_prompt_template_or_preset_is_still_valid() {
+        assert!(validate_node_config(
+            LoopNodeKind::Agent,
+            &serde_json::json!({ "platform": "claude" })
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn unknown_config_keys_is_empty_for_join_regardless_of_content() {
+        let config = serde_json::json!({ "anything": "goes", "ensemble_id": "e1" });
+        let map = config.as_object().unwrap();
+        assert!(unknown_config_keys(LoopNodeKind::Join, map).is_empty());
     }
 
     #[test]
@@ -14781,6 +15049,38 @@ mod endpoint_tests {
         assert!(text(&join_rejected).contains("engine-managed"));
     }
 
+    /// The exact incident shape, through the real `loop_add_node` tool
+    /// call: a `prompt` key (instead of `prompt_template`) must be rejected
+    /// at write time, naming the correct key, and must never reach the DB.
+    #[tokio::test]
+    async fn loop_add_node_rejects_prompt_key_naming_prompt_template() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+
+        let mut config = agent_node_config("claude");
+        config.insert(
+            "prompt".to_string(),
+            serde_json::Value::String("implement the spec".to_string()),
+        );
+
+        let rejected = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Implementer".to_string(),
+                kind: Some("agent".to_string()),
+                config: Some(config),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&rejected), "{}", text(&rejected));
+        assert!(text(&rejected).contains("prompt_template"));
+        assert!(db.list_loop_nodes(&spec.id).unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn loop_update_node_renames_and_validates() {
         let (dir, db, handler) = endpoint_test_handler();
@@ -15367,6 +15667,139 @@ mod endpoint_tests {
             .await
             .unwrap();
         assert!(!raw_text(&filtered_out).contains(&lp.id));
+    }
+
+    /// `loop_get`'s node JSON must make an agent node's prompt source
+    /// visible: `"explicit"` for a `prompt_template`, `"preset"` for a
+    /// `prompt_preset`, and — the case this spec exists for — the node
+    /// running on the bare fallback nobody chose must be distinguishable
+    /// too, as `"default_fallback"`, without requiring a run first.
+    #[tokio::test]
+    async fn loop_get_reports_prompt_source_for_agent_nodes() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+
+        let mut explicit_config = agent_node_config("claude");
+        explicit_config.insert(
+            "prompt_template".to_string(),
+            serde_json::Value::String("do the thing".to_string()),
+        );
+        let explicit_id = extract_id(
+            &handler
+                .loop_add_node(Parameters(LoopAddNodeParams {
+                    spec_id: Some(spec.id.clone()),
+                    loop_id: None,
+                    name: "Explicit".to_string(),
+                    kind: Some("agent".to_string()),
+                    config: Some(explicit_config),
+                    blueprint: None,
+                    config_overrides: None,
+                }))
+                .await
+                .unwrap(),
+            "node_id",
+        );
+
+        let mut preset_config = agent_node_config("claude");
+        preset_config.insert(
+            "prompt_preset".to_string(),
+            serde_json::Value::String("implementer".to_string()),
+        );
+        let preset_id = extract_id(
+            &handler
+                .loop_add_node(Parameters(LoopAddNodeParams {
+                    spec_id: Some(spec.id.clone()),
+                    loop_id: None,
+                    name: "Preset".to_string(),
+                    kind: Some("agent".to_string()),
+                    config: Some(preset_config),
+                    blueprint: None,
+                    config_overrides: None,
+                }))
+                .await
+                .unwrap(),
+            "node_id",
+        );
+
+        let default_id = extract_id(
+            &handler
+                .loop_add_node(Parameters(LoopAddNodeParams {
+                    spec_id: Some(spec.id.clone()),
+                    loop_id: None,
+                    name: "Default".to_string(),
+                    kind: Some("agent".to_string()),
+                    config: Some(agent_node_config("claude")),
+                    blueprint: None,
+                    config_overrides: None,
+                }))
+                .await
+                .unwrap(),
+            "node_id",
+        );
+
+        let got = handler
+            .loop_get(Parameters(LoopGetParams {
+                loop_id: lp.id.clone(),
+            }))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw_text(&got)).unwrap();
+        let nodes = json["specs"][0]["nodes"].as_array().unwrap();
+        let prompt_source_of = |node_id: &str| -> String {
+            nodes
+                .iter()
+                .find(|n| n["id"] == node_id)
+                .unwrap_or_else(|| panic!("node {node_id} not found in {nodes:?}"))["prompt_source"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(prompt_source_of(&explicit_id), "explicit");
+        assert_eq!(prompt_source_of(&preset_id), "preset");
+        assert_eq!(prompt_source_of(&default_id), "default_fallback");
+    }
+
+    /// `loop_audit_node_configs` must find a node that predates write-time
+    /// validation and still carries a key its kind never reads — verified
+    /// against the exact incident shape (a `prompt` key on an agent node)
+    /// and resolving the owning loop through the node's spec, since a
+    /// spec-scoped node's own row has no `loop_id`.
+    #[tokio::test]
+    async fn loop_audit_node_configs_finds_node_with_ignored_prompt_key() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+
+        // Bypass `loop_add_node`'s validation to simulate a node that was
+        // written before this spec's check existed — exactly how loop
+        // `824de730-7fec-4031-800a-7933d2cf94c1`'s node
+        // `d0458fe0-24b8-4a29-8a69-7bb0e742e046` ended up carrying `prompt`.
+        let legacy_node = LoopNode {
+            id: uuid::Uuid::new_v4().to_string(),
+            spec_id: Some(spec.id.clone()),
+            loop_id: None,
+            name: "Legacy Implementer".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "claude", "prompt": "implement the spec"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+        db.insert_loop_node(&legacy_node).unwrap();
+
+        // A clean node must not show up in the audit.
+        let clean_node = insert_named_node(&db, &spec.id, "Clean", 2);
+
+        let audited = handler.loop_audit_node_configs().await.unwrap();
+        assert!(!is_err(&audited), "{}", text(&audited));
+        let json: serde_json::Value = serde_json::from_str(&raw_text(&audited)).unwrap();
+        let flagged = json["flagged_nodes"].as_array().unwrap();
+        assert_eq!(flagged.len(), 1);
+        let flagged_node = &flagged[0];
+        assert_eq!(flagged_node["node_id"], legacy_node.id);
+        assert_eq!(flagged_node["loop_id"], lp.id);
+        assert_eq!(flagged_node["unknown_keys"], serde_json::json!(["prompt"]));
+        assert!(flagged.iter().all(|n| n["node_id"] != clean_node.id));
     }
 
     // ── loop_node_runs_list / loop_node_run_get ────────────────────

@@ -2630,6 +2630,7 @@ async fn run_agent_process(
                 "model": model,
                 "error": "timed out",
                 "timeout_minutes": timeout_minutes,
+                "prompt_source": agent_prompt_source(&node.config),
             });
             let _ = db.update_loop_run_result(
                 run_id,
@@ -2705,6 +2706,7 @@ fn agent_finished_execution(
         "exit_code": exit_code,
         "stdout": stdout,
         "stderr": stderr,
+        "prompt_source": agent_prompt_source(&node.config),
     });
     if zero_exit_no_output {
         let reason = if stderr.is_empty() {
@@ -2743,6 +2745,7 @@ fn agent_spawn_failure(
         "cli": cli.as_str(),
         "model": model,
         "error": error.message,
+        "prompt_source": agent_prompt_source(&node.config),
     });
     // A permanent failure is recorded with its reason so the run reads as
     // "failed fast on purpose" rather than "retried and gave up" — the two
@@ -3542,6 +3545,31 @@ fn resolve_node_prompt_template(node: &LoopNode, prompts_dir: &std::path::Path) 
         return crate::domain::prompts::resolve_prompt_preset(prompts_dir, preset_name);
     }
     "{{spec_content}}\n\n{{previous_feedback}}".to_string()
+}
+
+/// Classifies which branch of [`resolve_node_prompt_template`]'s precedence
+/// an agent node's config will actually take — `"explicit"` (`prompt_template`
+/// set), `"preset"` (`prompt_preset` set), or `"default_fallback"` (neither,
+/// so the node silently runs on the bare fallback template nobody chose).
+/// Read-only mirror of that function's own precedence check — never the
+/// other way around, so the two can't drift. Surfaced in `loop_get`'s node
+/// JSON (`daemon::handler::loop_node_json`) and recorded on every agent run's
+/// output, so a node running on the default is distinguishable from one
+/// running its author's prompt without having to inspect its raw config.
+pub(crate) fn agent_prompt_source(config: &Value) -> &'static str {
+    let has_non_empty_str = |field: &str| {
+        config
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+    };
+    if has_non_empty_str("prompt_template") {
+        "explicit"
+    } else if has_non_empty_str("prompt_preset") {
+        "preset"
+    } else {
+        "default_fallback"
+    }
 }
 
 fn render_agent_prompt(

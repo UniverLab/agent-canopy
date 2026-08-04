@@ -878,6 +878,28 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Every loop node in the database, across every loop and spec — unlike
+    /// [`list_loop_nodes`]/[`list_loop_nodes_for_loop`], which scope to one
+    /// graph. Used by the `loop_audit_node_configs` MCP tool to find nodes
+    /// already carrying a config key their kind will never read (e.g. a
+    /// `prompt` key on an agent node — see
+    /// `daemon::handler::validate_node_config`), which write-time validation
+    /// alone can't catch for nodes created before it existed.
+    pub fn list_all_loop_nodes(&self) -> Result<Vec<LoopNode>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, spec_id, loop_id, name, kind, config, position, created_at
+             FROM loop_nodes ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], map_loop_node_row)?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn get_loop_node(&self, node_id: &str) -> Result<Option<LoopNode>> {
         let conn = self
             .conn
@@ -2449,5 +2471,62 @@ mod tests {
             vec!["run1"],
             "offset must skip past the first page's runs, not repeat them"
         );
+    }
+
+    #[test]
+    fn list_all_loop_nodes_returns_every_node_regardless_of_spec_or_loop_scope() {
+        let db = test_db();
+        let lp = sample_loop("loop-1");
+        db.insert_loop(&lp).unwrap();
+        let spec = LoopSpec {
+            id: "spec-1".to_string(),
+            loop_id: Some(lp.id.clone()),
+            name: "Spec".to_string(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        db.insert_loop_spec(&spec).unwrap();
+
+        let spec_scoped = LoopNode {
+            id: "node-spec".to_string(),
+            spec_id: Some(spec.id),
+            loop_id: None,
+            name: "Spec Node".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "claude"}),
+            position: 1,
+            created_at: Utc::now(),
+        };
+        let loop_scoped = LoopNode {
+            id: "node-loop".to_string(),
+            spec_id: None,
+            loop_id: Some(lp.id),
+            name: "Loop Node".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "true"}),
+            position: 1,
+            created_at: Utc::now(),
+        };
+        db.insert_loop_node(&spec_scoped).unwrap();
+        db.insert_loop_node(&loop_scoped).unwrap();
+
+        let all_ids: Vec<String> = db
+            .list_all_loop_nodes()
+            .unwrap()
+            .into_iter()
+            .map(|node| node.id)
+            .collect();
+        assert_eq!(all_ids.len(), 2);
+        assert!(all_ids.contains(&"node-spec".to_string()));
+        assert!(all_ids.contains(&"node-loop".to_string()));
     }
 }
