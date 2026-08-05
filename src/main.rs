@@ -129,6 +129,13 @@ enum Commands {
         /// whole database file.
         #[arg(long = "no-reclaim")]
         no_reclaim: bool,
+        /// Consent to stop the running daemon for the duration of a
+        /// warranted reclaim (refuse-if-busy, stop, quick_check, cleanup,
+        /// VACUUM + WAL checkpoint, restart), then restart it exactly as it
+        /// was running. Without this, an interactive terminal is prompted;
+        /// a non-interactive run skips reclamation while the daemon is up.
+        #[arg(long = "stop-daemon")]
+        stop_daemon: bool,
     },
     /// Discover file-backed prompt presets (~/.canopy/prompts/).
     Prompts {
@@ -189,7 +196,8 @@ async fn main() -> Result<()> {
             hard,
             yes,
             no_reclaim,
-        }) => handle_clean_action(dry_run, older_than, hard, yes, no_reclaim).await,
+            stop_daemon,
+        }) => handle_clean_action(dry_run, older_than, hard, yes, no_reclaim, stop_daemon).await,
         Some(Commands::Prompts { action }) => handle_prompts_action(action).await,
         Some(Commands::Bridge {
             agent_id,

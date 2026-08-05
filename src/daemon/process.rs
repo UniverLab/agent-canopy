@@ -406,6 +406,85 @@ fn parse_launchctl_pid(text: &str) -> Option<u32> {
     })
 }
 
+/// Ask the platform service manager to stop the canopy unit/agent — used
+/// instead of signalling the managed PID directly when restoring the
+/// daemon after `canopy clean`'s reclaim window (B-decision 4/5): the
+/// installed unit has `Restart=on-failure`, so a bare `SIGTERM` reads to
+/// systemd as an unclean exit and it respawns the process out from under
+/// the exclusive `VACUUM` this stop was for. Going through the manager's
+/// own stop verb is the only way to get a stop it won't immediately undo.
+#[cfg(target_os = "linux")]
+pub(crate) fn service_manager_stop() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "stop", SYSTEMD_UNIT_NAME])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn service_manager_start() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "start", SYSTEMD_UNIT_NAME])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn service_manager_stop() -> bool {
+    let Some(path) = launchd_plist_path() else {
+        return false;
+    };
+    std::process::Command::new("launchctl")
+        .args(["unload", &path.display().to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn service_manager_start() -> bool {
+    let Some(path) = launchd_plist_path() else {
+        return false;
+    };
+    std::process::Command::new("launchctl")
+        .args(["load", &path.display().to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn service_manager_stop() -> bool {
+    false
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn service_manager_start() -> bool {
+    false
+}
+
+/// Is a service-manager unit/agent installed for canopy on this platform,
+/// regardless of whether it currently owns a running process? Used by
+/// `canopy clean`'s reclaim window to refuse stopping a service-manager-
+/// owned daemon whose unit has since gone missing (B-decision 5: detect a
+/// missing unit before stopping, not after).
+#[cfg(target_os = "linux")]
+pub(crate) fn service_unit_installed() -> bool {
+    systemd_service_installed()
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn service_unit_installed() -> bool {
+    launchd_service_installed()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn service_unit_installed() -> bool {
+    false
+}
+
 /// Facts about the service manager (if any) that owns the canopy daemon on
 /// this platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

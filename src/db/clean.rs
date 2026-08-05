@@ -259,6 +259,61 @@ impl Database {
         Ok(())
     }
 
+    /// A lightweight, single-pass integrity check — good enough to catch a
+    /// visibly broken file before an in-place-rewriting `VACUUM` entrenches
+    /// the damage. Returns `"ok"` when the database is fine; any other
+    /// string names the specific problem(s) `PRAGMA quick_check` found (it
+    /// can return multiple rows, joined here with `"; "`).
+    ///
+    /// Deliberately `quick_check`, not the fuller, slower
+    /// `PRAGMA integrity_check`: by the time `canopy clean`'s reclaim window
+    /// calls this, the service is already down and this gate only needs to
+    /// refuse a visibly broken file before `VACUUM` runs — the thorough scan
+    /// belongs to a periodic health routine, not the critical path of a
+    /// service-down window.
+    pub fn quick_check(&self) -> Result<String> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut stmt = conn.prepare("PRAGMA quick_check")?;
+        let rows: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.join("; "))
+    }
+
+    /// What's currently in flight that a `canopy clean --stop-daemon`
+    /// reclaim window must not interrupt: a running loop, or a live
+    /// interactive session (a human or TUI actively attached). Mirrors the
+    /// same `status = 'running'` / `status IN ('active', 'resumed')` checks
+    /// [`Self::project_hard_cascade_skip_reason`] already uses for "a human
+    /// or TUI is looking at this right now", just scoped to the whole
+    /// install instead of one project.
+    pub fn busy_reasons(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut reasons = Vec::new();
+
+        let running_loops: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM loops WHERE status = 'running'",
+            [],
+            |row| row.get(0),
+        )?;
+        if running_loops > 0 {
+            reasons.push(format!("{running_loops} loop(s) currently running"));
+        }
+
+        let active_sessions: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM interactive_sessions WHERE status IN ('active', 'resumed')",
+            [],
+            |row| row.get(0),
+        )?;
+        if active_sessions > 0 {
+            reasons.push(format!(
+                "{active_sessions} interactive session(s) attached (a TUI is in use)"
+            ));
+        }
+
+        Ok(reasons)
+    }
+
     /// Why a project must be skipped by `--hard`, if any. Returns `Some` only
     /// when the project has either a `Running` loop or an `active`/`resumed`
     /// interactive session, both of which are in-flight state the cascade
@@ -1313,5 +1368,108 @@ mod tests {
     fn parse_rfc3339_ts_invalid() {
         let ts = parse_rfc3339_ts("invalid");
         assert_eq!(ts, 0);
+    }
+
+    // ── quick_check ─────────────────────────────────────────────────────
+
+    #[test]
+    fn quick_check_reports_ok_for_a_healthy_database() {
+        let db = test_db();
+        assert_eq!(db.quick_check().unwrap(), "ok");
+    }
+
+    #[test]
+    fn quick_check_reports_the_problem_for_a_corrupted_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("corrupt.db");
+        // Build a real database first so the file has a valid SQLite header,
+        // then stomp on page data after every handle to it is dropped —
+        // writing garbage over a file that was never a database at all just
+        // produces a "not a database" file-format error, not the kind of
+        // in-page corruption `quick_check` is meant to catch.
+        {
+            let db = Database::new(&path).unwrap();
+            db.insert_terminal_session("t1", "t1", "bash", "/tmp")
+                .unwrap();
+            drop(db);
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        let start = bytes.len() / 2;
+        let end = start + 200.min(bytes.len() - start);
+        for b in &mut bytes[start..end] {
+            *b ^= 0xFF;
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        let db = Database::new(&path).unwrap();
+        let verdict = db.quick_check().unwrap();
+        assert_ne!(verdict, "ok", "corrupted file must not report ok");
+    }
+
+    // ── busy_reasons ────────────────────────────────────────────────────
+
+    #[test]
+    fn busy_reasons_empty_when_nothing_in_flight() {
+        let db = test_db();
+        assert!(db.busy_reasons().unwrap().is_empty());
+    }
+
+    #[test]
+    fn busy_reasons_reports_a_running_loop() {
+        let db = test_db();
+        db.insert_loop(&make_loop("loop-1", "/tmp/proj", LoopStatus::Running))
+            .unwrap();
+
+        let reasons = db.busy_reasons().unwrap();
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].contains("running"), "{reasons:?}");
+    }
+
+    #[test]
+    fn busy_reasons_ignores_a_completed_loop() {
+        let db = test_db();
+        db.insert_loop(&make_loop("loop-1", "/tmp/proj", LoopStatus::Completed))
+            .unwrap();
+
+        assert!(db.busy_reasons().unwrap().is_empty());
+    }
+
+    #[test]
+    fn busy_reasons_reports_an_active_interactive_session() {
+        let db = test_db();
+        db.insert_interactive_session(
+            "s-active",
+            "s-active",
+            "opencode",
+            "/tmp",
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+
+        let reasons = db.busy_reasons().unwrap();
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].contains("interactive session"), "{reasons:?}");
+    }
+
+    #[test]
+    fn busy_reasons_ignores_a_completed_session() {
+        let db = test_db();
+        db.insert_interactive_session(
+            "s-done",
+            "s-done",
+            "opencode",
+            "/tmp",
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+        db.finish_interactive_session("s-done", 0).unwrap();
+
+        assert!(db.busy_reasons().unwrap().is_empty());
     }
 }

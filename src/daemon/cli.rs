@@ -58,7 +58,7 @@ pub(crate) async fn handle_daemon_action(
 /// seeds a fresh `background_agents.db` as a side effect when the path is
 /// missing, and a read-only status/stop check must not do that on a
 /// machine that has never started the daemon.
-fn configured_port(data_dir: &std::path::Path) -> u16 {
+pub(crate) fn configured_port(data_dir: &std::path::Path) -> u16 {
     let db_path = data_dir.join("background_agents.db");
     db_path
         .exists()
