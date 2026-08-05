@@ -71,6 +71,59 @@ pub(crate) async fn run_doctor() -> Result<()> {
                         watch_count
                     );
                 }
+
+                // capability: `quick_check` is run here directly (same cheap
+                // PRAGMA `canopy clean` gates its reclaim on), distinct from
+                // the daemon's own daily `integrity_check` reported just
+                // below — doctor needs an answer in an interactive
+                // round-trip, so it can't afford the full scan.
+                match db.quick_check() {
+                    Ok(verdict) if verdict == "ok" => {
+                        success("Database quick_check: ok".to_string());
+                    }
+                    Ok(verdict) => {
+                        println!(
+                            " \x1b[31m✗\x1b[0m Database quick_check reported a problem: {verdict}"
+                        );
+                        issues.push(format!(
+                            "Database quick_check found a problem: {verdict}. Back up what you can and investigate."
+                        ));
+                    }
+                    Err(e) => {
+                        println!(" \x1b[33m⚠\x1b[0m Could not run quick_check: {e}");
+                    }
+                }
+
+                // declaration: this reports the daemon's daily health
+                // routine's *last recorded* outcome, not a check run here —
+                // "never run" must read distinctly from "ran and passed",
+                // which is exactly what `DbHealthStatus::last_run_at` being
+                // `None` vs `Some` distinguishes.
+                let health_status = crate::daemon::health_routine::load_status(&db);
+                match (health_status.last_run_at, health_status.outcome) {
+                    (Some(when), Some(crate::domain::db_health::DbHealthOutcome::Passed)) => {
+                        success(format!(
+                            "Daily health routine: passed (last run {})",
+                            when.to_rfc3339()
+                        ));
+                    }
+                    (Some(when), Some(outcome)) => {
+                        println!(
+                            " \x1b[31m✗\x1b[0m Daily health routine: {outcome:?} (last run {})",
+                            when.to_rfc3339()
+                        );
+                        if let Some(result) = &health_status.integrity_result {
+                            println!("     integrity_check: {result}");
+                        }
+                        issues.push(format!(
+                            "The daily database health routine last reported {outcome:?} at {} — run 'canopy daemon health-check' for details.",
+                            when.to_rfc3339()
+                        ));
+                    }
+                    _ => {
+                        println!(" \x1b[33m⚠\x1b[0m Daily health routine: never run");
+                    }
+                }
             }
             Err(e) => {
                 println!(" \x1b[31m✗\x1b[0m Database exists but could not be opened: {e}");

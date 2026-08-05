@@ -968,6 +968,7 @@ pub mod clean;
 pub mod ensembles;
 pub mod gamification;
 pub mod group;
+pub mod health;
 pub mod intelligence;
 pub mod last_prompts;
 pub mod loops;

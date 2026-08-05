@@ -5,6 +5,7 @@ use rmcp::ServiceExt;
 
 use crate::application::notification_service::{DefaultNotificationService, NotificationService};
 use crate::application::ports::StateRepository;
+use crate::daemon::health_routine::HealthRoutine;
 use crate::daemon::process::{
     acquire_daemon_lock, kill_port_occupant, remove_pid_file, write_pid_file,
 };
@@ -102,6 +103,9 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
     let scheduler_notify = cron_scheduler.notifier();
     let scheduler_cancel = Arc::clone(&cron_scheduler).start();
 
+    let health_routine = Arc::new(HealthRoutine::new(Arc::clone(&db), data_dir.clone()));
+    let health_routine_cancel = health_routine.start();
+
     let handler_db = Arc::clone(&db);
     let handler_executor = Arc::clone(&executor);
     let handler_watcher_engine = Arc::clone(&watcher_engine);
@@ -168,6 +172,7 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
         .await?;
 
     scheduler_cancel.cancel();
+    health_routine_cancel.cancel();
     watcher_engine.stop_all().await;
     terminate_owned_running_node_processes(&db).await;
     remove_pid_file(&data_dir);
@@ -313,6 +318,9 @@ pub(crate) async fn run_stdio_server() -> Result<()> {
     ));
     let scheduler_notify = cron_scheduler.notifier();
     let _scheduler_cancel = Arc::clone(&cron_scheduler).start();
+
+    let health_routine = Arc::new(HealthRoutine::new(Arc::clone(&db), data_dir.clone()));
+    let _health_routine_cancel = health_routine.start();
 
     let handler = TaskTriggerHandler::new(
         Arc::clone(&db),

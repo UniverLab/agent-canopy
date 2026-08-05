@@ -11,8 +11,10 @@ use crate::daemon::process::{
 #[cfg(target_os = "linux")]
 use crate::daemon::process::{is_service_enabled, is_systemd_available};
 
+use crate::daemon::health_routine;
 use crate::daemon::service_install;
 use crate::db::Database;
+use crate::domain::db_health::DbHealthOutcome;
 
 #[derive(Subcommand)]
 pub(crate) enum DaemonAction {
@@ -30,6 +32,9 @@ pub(crate) enum DaemonAction {
     InstallService,
     /// Remove the daemon system service.
     UninstallService,
+    /// Run the daily database integrity check and backup routine now,
+    /// instead of waiting for the daemon to find an idle moment.
+    HealthCheck,
 }
 
 pub(crate) async fn handle_daemon_action(
@@ -46,6 +51,7 @@ pub(crate) async fn handle_daemon_action(
         DaemonAction::Logs => handle_logs(&data_dir),
         DaemonAction::InstallService => handle_install_service(port_override),
         DaemonAction::UninstallService => handle_uninstall_service(),
+        DaemonAction::HealthCheck => handle_health_check(&data_dir),
     }
 }
 
@@ -345,6 +351,78 @@ fn handle_install_service(port_override: Option<u16>) -> Result<()> {
             Err(e)
         }
     }
+}
+
+/// Run the health routine immediately, bypassing the daemon's idle/24h-due
+/// gate (`HealthRoutine::maybe_run`) entirely — that gate exists so the
+/// *automatic* daily run never fights the daemon for attention, not to stop
+/// an operator who explicitly asked for a check right now. Safe to run
+/// alongside a live daemon: `VACUUM INTO` (decision 4 in the health-routine
+/// spec) takes a read snapshot and never blocks writers, so this needs no
+/// coordination with a running daemon process — it just opens the same
+/// database file directly, the way `doctor` and `daemon status` already do.
+fn handle_health_check(data_dir: &std::path::Path) -> Result<()> {
+    let db_path = data_dir.join(health_routine::DB_FILE_NAME);
+    if !db_path.exists() {
+        println!(
+            "No database found at {} — nothing to check.",
+            db_path.display()
+        );
+        return Ok(());
+    }
+    let backup_path = data_dir.join(health_routine::BACKUP_FILE_NAME);
+    let db = Database::new(&db_path)?;
+
+    println!("Running database health check...");
+    let status = health_routine::run_health_check(&db, &db_path, &backup_path);
+    health_routine::save_status(&db, &status)?;
+
+    match status.outcome {
+        Some(DbHealthOutcome::Passed) => {
+            println!("\x1b[32m✓\x1b[0m integrity_check: ok");
+            println!(
+                "\x1b[32m✓\x1b[0m Backup written and verified: {}",
+                status.backup_path.unwrap_or_default()
+            );
+        }
+        Some(DbHealthOutcome::IntegrityFailed) => {
+            println!(
+                "\x1b[31m✗\x1b[0m integrity_check failed: {}",
+                status.integrity_result.unwrap_or_default()
+            );
+            println!("No backup was attempted — a backup from a corrupt source would overwrite the last good one.");
+        }
+        Some(DbHealthOutcome::BackupVerificationFailed) => {
+            println!("\x1b[32m✓\x1b[0m integrity_check: ok");
+            println!(
+                "\x1b[31m✗\x1b[0m The new backup failed its own verification and was discarded."
+            );
+            if let Some(path) = &status.backup_path {
+                println!("Previous backup left in place: {path}");
+            }
+        }
+        Some(DbHealthOutcome::BackupSkippedInsufficientDiskSpace) => {
+            println!("\x1b[32m✓\x1b[0m integrity_check: ok");
+            println!("\x1b[33m⚠\x1b[0m Backup skipped — not enough free disk space.");
+            if let Some(path) = &status.backup_path {
+                println!("Previous backup left in place: {path}");
+            }
+        }
+        None => println!("\x1b[31m✗\x1b[0m Health check did not complete."),
+    }
+
+    if !status.foreign_key_violations.is_empty() {
+        println!(
+            "\x1b[33m⚠\x1b[0m foreign_key_check found {} violation(s):",
+            status.foreign_key_violations.len()
+        );
+        for violation in &status.foreign_key_violations {
+            println!("    {violation}");
+        }
+        println!("Not fatal — run 'canopy clean' to resolve orphaned rows.");
+    }
+
+    Ok(())
 }
 
 fn handle_uninstall_service() -> Result<()> {

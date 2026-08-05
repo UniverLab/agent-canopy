@@ -10,6 +10,7 @@ pub(crate) mod cli_daemon;
 pub(crate) mod doctor;
 pub(crate) mod handler_formatting;
 pub(crate) mod handler_helpers;
+pub(crate) mod health_routine;
 pub(crate) mod helpers;
 pub(crate) mod loop_cli;
 pub(crate) mod models_cli;
