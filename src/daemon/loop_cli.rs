@@ -391,11 +391,11 @@ fn handle_loop_info(db: &Database, id_or_name: &str) -> Result<()> {
             );
         }
     } else if !all_runs.is_empty() {
-        // No specs are bound to this loop directly — it's draining a pool
-        // (pool members never set `loop_specs.loop_id`, see `LoopEngine::
+        // No specs are bound to this loop directly — it's draining a queue
+        // (queue members never set `loop_specs.loop_id`, see `LoopEngine::
         // run_loop`), so there's no fixed queue to show. Reconstruct what
         // ran so far from `loop_runs`, which always records the real
-        // `loop_id` regardless of pool membership.
+        // `loop_id` regardless of queue membership.
         println!(" (queue-driven — showing specs worked so far, not the full queue)");
         for spec_id in distinct_spec_ids_in_order(&all_runs) {
             if let Some(spec) = db.get_loop_spec(spec_id)? {
@@ -461,9 +461,9 @@ fn handle_loop_info(db: &Database, id_or_name: &str) -> Result<()> {
             .unwrap_or_default();
         // RS3: flag a run that continued a context group's warm session (its
         // session id was first captured by a grouped sibling on this node).
-        let group_note = match (lp.active_run_pool_id.as_deref(), run.session_id.as_deref()) {
-            (Some(pool_id), Some(session_id)) => db
-                .group_resume_source(pool_id, &run.spec_id, &run.node_id, session_id)?
+        let group_note = match (lp.active_run_queue_id.as_deref(), run.session_id.as_deref()) {
+            (Some(queue_id), Some(session_id)) => db
+                .group_resume_source(queue_id, &run.spec_id, &run.node_id, session_id)?
                 .map(|group| format!("  \x1b[36m(resumed group {group})\x1b[0m"))
                 .unwrap_or_default(),
             _ => String::new(),
@@ -548,17 +548,17 @@ fn spec_progress(specs: &[LoopSpec]) -> (usize, usize) {
     (done, specs.len())
 }
 
-/// `done/total` progress for a loop's `loop list` row. A pool-driven run binds
-/// no specs of its own (`loop_specs.loop_id` stays null for pool members), so
+/// `done/total` progress for a loop's `loop list` row. A queue-driven run binds
+/// no specs of its own (`loop_specs.loop_id` stays null for queue members), so
 /// counting `bound_specs` renders a misleading `0/0`. When the loop's row
-/// carries an `active_run_pool_id`, count that pool's members instead —
+/// carries an `active_run_queue_id`, count that queue's members instead —
 /// mirroring `LoopEngine::spec_progress`, which the running engine uses for the
-/// same loop. Falls back to the bound specs for ordinary (non-pool) loops.
+/// same loop. Falls back to the bound specs for ordinary (non-queue) loops.
 fn loop_progress(db: &Database, lp: &Loop, bound_specs: &[LoopSpec]) -> Result<(usize, usize)> {
-    let Some(pool_id) = lp.active_run_pool_id.as_deref() else {
+    let Some(queue_id) = lp.active_run_queue_id.as_deref() else {
         return Ok(spec_progress(bound_specs));
     };
-    let ids = db.list_pool_member_spec_ids(pool_id)?;
+    let ids = db.list_queue_member_spec_ids(queue_id)?;
     let mut done = 0;
     for id in &ids {
         if let Some(spec) = db.get_loop_spec(id)? {
@@ -582,7 +582,7 @@ fn current_spec(specs: &[LoopSpec]) -> Option<&LoopSpec> {
 }
 
 /// Name of the spec a loop is actively working through, for both bound-spec
-/// loops (via [`current_spec`]) and pool-driven loops, which never bind a
+/// loops (via [`current_spec`]) and queue-driven loops, which never bind a
 /// spec to `loop_specs.loop_id` and so must fall back to `loop_runs` (see
 /// [`Database::list_loop_runs_for_loop`]) to find what's currently running.
 fn current_spec_name(db: &Database, lp: &Loop, bound_specs: &[LoopSpec]) -> Result<Option<String>> {
@@ -606,7 +606,7 @@ fn current_running_run(runs: &[LoopNodeRun]) -> Option<&LoopNodeRun> {
 }
 
 /// Spec ids referenced by `runs`, in first-seen (chronological) order with
-/// duplicates dropped — used to approximate a pool-driven loop's queue from
+/// duplicates dropped — used to approximate a queue-driven loop's queue from
 /// its run history, since the queue itself isn't persisted per loop.
 fn distinct_spec_ids_in_order(runs: &[LoopNodeRun]) -> Vec<&str> {
     let mut seen = std::collections::HashSet::new();
@@ -697,7 +697,7 @@ fn spec_status_icon(status: LoopSpecStatus) -> &'static str {
 }
 
 /// B36: a run cut short by a daemon restart/kill is recorded as `fail` (see
-/// `reconcile_orphaned_loops` / `reconcile_stranded_pool_specs`), but it must
+/// `reconcile_orphaned_loops` / `reconcile_stranded_queue_specs`), but it must
 /// never render like an ordinary node failure — its own icon, distinct from
 /// both a genuine fail and a healthy pass.
 fn run_status_icon(status: LoopRunStatus, output: Option<&serde_json::Value>) -> &'static str {
@@ -927,7 +927,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         }
     }
@@ -968,74 +968,74 @@ mod tests {
     }
 
     #[test]
-    fn loop_progress_counts_pool_members_when_active_run_pool_id_set() {
-        use crate::domain::pools::Pool;
+    fn loop_progress_counts_queue_members_when_active_run_queue_id_set() {
+        use crate::domain::queues::Queue;
 
         let dir = tempfile::tempdir().unwrap();
         let db = Database::new(&dir.path().join("t.db")).unwrap();
 
-        // A pool-driven loop binds no specs of its own, so counting bound
+        // A queue-driven loop binds no specs of its own, so counting bound
         // specs would render a misleading 0/0.
-        let mut lp = make_loop("loop-1", "pool-loop", LoopStatus::Running);
-        lp.active_run_pool_id = Some("pool-1".to_string());
+        let mut lp = make_loop("loop-1", "queue-loop", LoopStatus::Running);
+        lp.active_run_queue_id = Some("queue-1".to_string());
         db.insert_loop(&lp).unwrap();
-        db.insert_pool(&Pool {
-            id: "pool-1".to_string(),
+        db.insert_queue(&Queue {
+            id: "queue-1".to_string(),
             name: "P".to_string(),
             created_at: Utc::now(),
         })
         .unwrap();
 
-        // Two standalone pool members (loop_id: None, like real ones): one
+        // Two standalone queue members (loop_id: None, like real ones): one
         // completed, one pending.
         for (id, status) in [
             ("spec-a", LoopSpecStatus::Completed),
             ("spec-b", LoopSpecStatus::Pending),
         ] {
-            let mut spec = make_spec("pool", id, 0, status);
+            let mut spec = make_spec("queue", id, 0, status);
             spec.id = id.to_string();
             spec.loop_id = None;
             db.insert_loop_spec(&spec).unwrap();
-            db.append_pool_member("pool-1", id, None).unwrap();
+            db.append_queue_member("queue-1", id, None).unwrap();
         }
 
-        // Bound specs empty; pool progress is 1/2.
+        // Bound specs empty; queue progress is 1/2.
         assert_eq!(loop_progress(&db, &lp, &[]).unwrap(), (1, 2));
     }
 
     #[test]
-    fn loop_progress_shows_n_of_n_for_completed_pool_loop() {
-        use crate::domain::pools::Pool;
+    fn loop_progress_shows_n_of_n_for_completed_queue_loop() {
+        use crate::domain::queues::Queue;
 
         let dir = tempfile::tempdir().unwrap();
         let db = Database::new(&dir.path().join("t.db")).unwrap();
 
-        // B31: a finished pool-driven loop keeps its `active_run_pool_id`, so
+        // B31: a finished queue-driven loop keeps its `active_run_queue_id`, so
         // even in a terminal status it must still render its real n/n queue
         // progress rather than the 0/0 a bound-spec count would produce.
-        let mut lp = make_loop("loop-done", "pool-loop", LoopStatus::Completed);
-        lp.active_run_pool_id = Some("pool-1".to_string());
+        let mut lp = make_loop("loop-done", "queue-loop", LoopStatus::Completed);
+        lp.active_run_queue_id = Some("queue-1".to_string());
         db.insert_loop(&lp).unwrap();
-        db.insert_pool(&Pool {
-            id: "pool-1".to_string(),
+        db.insert_queue(&Queue {
+            id: "queue-1".to_string(),
             name: "P".to_string(),
             created_at: Utc::now(),
         })
         .unwrap();
 
         for id in ["spec-a", "spec-b"] {
-            let mut spec = make_spec("pool", id, 0, LoopSpecStatus::Completed);
+            let mut spec = make_spec("queue", id, 0, LoopSpecStatus::Completed);
             spec.id = id.to_string();
             spec.loop_id = None;
             db.insert_loop_spec(&spec).unwrap();
-            db.append_pool_member("pool-1", id, None).unwrap();
+            db.append_queue_member("queue-1", id, None).unwrap();
         }
 
         assert_eq!(loop_progress(&db, &lp, &[]).unwrap(), (2, 2));
     }
 
     #[test]
-    fn loop_progress_falls_back_to_bound_specs_without_pool() {
+    fn loop_progress_falls_back_to_bound_specs_without_queue() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::new(&dir.path().join("t.db")).unwrap();
         let lp = make_loop("loop-2", "bound", LoopStatus::Running);

@@ -78,15 +78,15 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
         Err(e) => tracing::error!("Failed to reconcile orphaned loops: {}", e),
     }
 
-    match db.reconcile_stranded_pool_specs() {
+    match db.reconcile_stranded_queue_specs() {
         Ok(count) if count > 0 => {
             tracing::warn!(
-                "Reconciled {} stranded pool spec(s) left running by a previous daemon",
+                "Reconciled {} stranded queue spec(s) left running by a previous daemon",
                 count
             );
         }
         Ok(_) => {}
-        Err(e) => tracing::error!("Failed to reconcile stranded pool specs: {}", e),
+        Err(e) => tracing::error!("Failed to reconcile stranded queue specs: {}", e),
     }
 
     if let Err(e) = watcher_engine.reload_from_db().await {
@@ -294,15 +294,15 @@ pub(crate) async fn run_stdio_server() -> Result<()> {
         Err(e) => tracing::error!("Failed to reconcile orphaned loops: {}", e),
     }
 
-    match db.reconcile_stranded_pool_specs() {
+    match db.reconcile_stranded_queue_specs() {
         Ok(count) if count > 0 => {
             tracing::warn!(
-                "Reconciled {} stranded pool spec(s) left running by a previous daemon",
+                "Reconciled {} stranded queue spec(s) left running by a previous daemon",
                 count
             );
         }
         Ok(_) => {}
-        Err(e) => tracing::error!("Failed to reconcile stranded pool specs: {}", e),
+        Err(e) => tracing::error!("Failed to reconcile stranded queue specs: {}", e),
     }
 
     startup_personal_rag(Arc::clone(&ingestion), &data_dir).await;
@@ -811,7 +811,7 @@ mod hang_repro {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         })
         .unwrap();

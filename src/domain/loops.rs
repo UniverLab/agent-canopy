@@ -517,20 +517,20 @@ pub struct Loop {
     /// auto-continue fire branch.
     #[serde(default)]
     pub auto_continue_action: Option<String>,
-    /// The pool a run against this loop is currently — or most recently —
+    /// The queue a run against this loop is currently — or most recently —
     /// drew from, persisted the moment that run starts (`None` for a
     /// bound-spec run). Interrupted runs (a quota failure, a daemon restart)
     /// leave this set so every resume path — scheduled autorun, `loop_reset`
-    /// — knows which pool to pick up rather than falling back to the loop's
+    /// — knows which queue to pick up rather than falling back to the loop's
     /// (often empty) bound specs. It survives genuine completion too (B31),
-    /// giving a finished pool-driven loop the only link back to the queue it
+    /// giving a finished queue-driven loop the only link back to the queue it
     /// ran so `loop list` / `loop info` can render its real `n/n` progress
     /// instead of `0/0`. A stale value never pollutes a later run: every
     /// launch path overwrites this field before the first spec executes, so
-    /// a fresh `loop_run` against a different pool (or a bound-spec run,
+    /// a fresh `loop_run` against a different queue (or a bound-spec run,
     /// which writes `None`) replaces it.
     #[serde(default)]
-    pub active_run_pool_id: Option<String>,
+    pub active_run_queue_id: Option<String>,
     /// Optional post-completion hook (N2): an agent-node-style config the
     /// engine fires exactly once, right after a run transitions to
     /// `Completed` — never on `failed`/`paused`, never retroactively, and
@@ -1115,7 +1115,7 @@ Task:
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         }
     }

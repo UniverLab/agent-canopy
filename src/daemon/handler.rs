@@ -58,7 +58,7 @@ use crate::domain::loops::{
     RouterRoute, SpecAdminStatusOutcome,
 };
 use crate::domain::models::{Agent, Trigger};
-use crate::domain::pools::{Pool, PoolDetails};
+use crate::domain::queues::{Queue, QueueDetails};
 use crate::domain::sync::{MessageKind, MissionImpact, WorkspaceStatus};
 use crate::domain::validation::validate_id;
 use crate::executor::Executor;
@@ -498,8 +498,8 @@ fn validate_position_conflict(
 /// Refuse to delete a spec that's still bound to a loop, with an actionable
 /// message pointing at the fix (detach it, or delete the loop instead).
 ///
-/// Note: a spec that's a member of a [`Pool`] can still be deleted — the
-/// `pool_members` row cascades away with it (see `pools` table). Pools are
+/// Note: a spec that's a member of a [`Queue`] can still be deleted — the
+/// `queue_members` row cascades away with it (see `queues` table). Queues are
 /// just queues over specs that already exist; they don't own them the way a
 /// loop owns its bound specs.
 fn validate_spec_deletable(spec: &LoopSpec) -> Result<(), String> {
@@ -999,27 +999,27 @@ fn resolve_node_kind_and_config(
     }
 }
 
-fn validate_pool_exists(db: &Database, pool_id: &str) -> Result<Pool, String> {
-    db.get_pool(pool_id)
+fn validate_queue_exists(db: &Database, queue_id: &str) -> Result<Queue, String> {
+    db.get_queue(queue_id)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Queue '{pool_id}' not found."))
+        .ok_or_else(|| format!("Queue '{queue_id}' not found."))
 }
 
-/// Refuse to start a pool run when one of the pool's specs is already
-/// `running` under a different loop. A pool spec's own `loop_id` stays
-/// `None` (pool membership never binds it), so ownership is read off the
+/// Refuse to start a queue run when one of the queue's specs is already
+/// `running` under a different loop. A queue spec's own `loop_id` stays
+/// `None` (queue membership never binds it), so ownership is read off the
 /// spec's most recent `loop_runs` row instead — the loop that most recently
 /// touched the spec is the only one that could have set it `running`.
 ///
 /// This is a start-time check, not a lock: two `loop_run` calls issued in
 /// the same instant, before either has run a single node, can still race.
-fn validate_pool_not_consumed(
+fn validate_queue_not_consumed(
     db: &Database,
-    pool_id: &str,
+    queue_id: &str,
     requesting_loop_id: &str,
 ) -> Result<(), String> {
     for spec_id in db
-        .list_pool_member_spec_ids(pool_id)
+        .list_queue_member_spec_ids(queue_id)
         .map_err(|e| e.to_string())?
     {
         let Some(spec) = db.get_loop_spec(&spec_id).map_err(|e| e.to_string())? else {
@@ -1036,7 +1036,7 @@ fn validate_pool_not_consumed(
         if owner_loop_id.as_deref() != Some(requesting_loop_id) {
             let owner = owner_loop_id.unwrap_or_else(|| "another loop".to_string());
             return Err(format!(
-                "Queue '{pool_id}' spec '{spec_id}' is already running under loop '{owner}'; wait for it to finish, or pause that loop, before starting a new run against this queue."
+                "Queue '{queue_id}' spec '{spec_id}' is already running under loop '{owner}'; wait for it to finish, or pause that loop, before starting a new run against this queue."
             ));
         }
     }
@@ -1048,7 +1048,7 @@ fn validate_pool_not_consumed(
 /// reorder (a subset, or a list with an unrecognized id) so the operation is
 /// always "here is the whole new order," never a swap of two entries applied
 /// on top of unknown existing state.
-fn validate_pool_reorder(current: &[String], spec_ids: &[String]) -> Result<(), String> {
+fn validate_queue_reorder(current: &[String], spec_ids: &[String]) -> Result<(), String> {
     if spec_ids.len() != current.len() {
         return Err(format!(
             "Reorder must list all {} queue spec(s) exactly once; got {}.",
@@ -1069,34 +1069,34 @@ fn validate_pool_reorder(current: &[String], spec_ids: &[String]) -> Result<(), 
     Ok(())
 }
 
-/// Live pools (R6): refuse to remove a pool member that is currently
-/// `running` — the tool-layer half of the same lock `pool_reorder` enforces
-/// via [`validate_pool_reorder_locking`]. A spec that isn't a pool member at
-/// all, or isn't found, is left for [`Database::remove_pool_member`]'s own
+/// Live queues (R6): refuse to remove a queue member that is currently
+/// `running` — the tool-layer half of the same lock `queue_reorder` enforces
+/// via [`validate_queue_reorder_locking`]. A spec that isn't a queue member at
+/// all, or isn't found, is left for [`Database::remove_queue_member`]'s own
 /// "no such spec" error — this only ever blocks a positive `running` match.
-fn validate_pool_member_removable(
+fn validate_queue_member_removable(
     db: &Database,
-    pool_id: &str,
+    queue_id: &str,
     spec_id: &str,
 ) -> Result<(), String> {
     if let Some(spec) = db.get_loop_spec(spec_id).map_err(|e| e.to_string())? {
         if spec.status == LoopSpecStatus::Running {
             return Err(format!(
-                "Spec '{spec_id}' is currently running and cannot be removed from queue '{pool_id}'; wait for it to finish, or pause the loop, first."
+                "Spec '{spec_id}' is currently running and cannot be removed from queue '{queue_id}'; wait for it to finish, or pause the loop, first."
             ));
         }
     }
     Ok(())
 }
 
-/// Live pools (R6): the currently running spec and every already-executed
-/// one (`completed`/`failed`/`skipped`) are immutable in the pool's order —
-/// only `pending` members may move. Call after [`validate_pool_reorder`] has
+/// Live queues (R6): the currently running spec and every already-executed
+/// one (`completed`/`failed`/`skipped`) are immutable in the queue's order —
+/// only `pending` members may move. Call after [`validate_queue_reorder`] has
 /// already confirmed `spec_ids` is a total permutation of `current`: under
 /// that guarantee, a locked member "doesn't move" iff it sits at the same
 /// index in both slices, since moving it necessarily displaces whatever now
 /// occupies its old slot.
-fn validate_pool_reorder_locking(
+fn validate_queue_reorder_locking(
     db: &Database,
     current: &[String],
     spec_ids: &[String],
@@ -1120,10 +1120,10 @@ fn validate_pool_reorder_locking(
     Ok(())
 }
 
-fn pool_details_json(details: &PoolDetails) -> serde_json::Value {
+fn queue_details_json(details: &QueueDetails) -> serde_json::Value {
     serde_json::json!({
-        "id": details.pool.id,
-        "name": details.pool.name,
+        "id": details.queue.id,
+        "name": details.queue.name,
         "members": details
             .members
             .iter()
@@ -1176,14 +1176,14 @@ fn loop_run_status_guard(loop_id: &str, status: LoopStatus) -> Result<(), String
 
 /// Validate every ensemble (F1) reachable by a `loop_run` call — the loop's
 /// own top-level graph, plus the own graph of every spec that could actually
-/// run (the loop's bound specs, and a pool's members when `pool_id` is
+/// run (the loop's bound specs, and a queue's members when `queue_id` is
 /// given). A spec with no nodes of its own falls back to the loop-level
 /// graph at execution time (see `LoopEngine::run_spec`), so it's skipped
 /// here rather than double-validated.
 fn validate_loop_ensembles_for_run(
     db: &Database,
     loop_id: &str,
-    pool_id: Option<&str>,
+    queue_id: Option<&str>,
 ) -> Result<(), String> {
     let graph_nodes = db
         .list_loop_nodes_for_loop(loop_id)
@@ -1206,9 +1206,9 @@ fn validate_loop_ensembles_for_run(
         .into_iter()
         .map(|spec| spec.id)
         .collect();
-    if let Some(pool_id) = pool_id {
+    if let Some(queue_id) = queue_id {
         spec_ids.extend(
-            db.list_pool_member_spec_ids(pool_id)
+            db.list_queue_member_spec_ids(queue_id)
                 .map_err(|e| e.to_string())?,
         );
     }
@@ -3501,7 +3501,7 @@ impl TaskTriggerHandler {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         };
 
@@ -4965,15 +4965,7 @@ impl TaskTriggerHandler {
     // ---- Queue tools (Q1) --------------------------------------------------
     //
     // A "queue" is an ordered list of existing specs, decoupled from any one
-    // loop. The `queue_*` tools below are the primary surface; the `pool_*`
-    // tools further down are DEPRECATED thin aliases kept for back-compat.
-    // Both call the shared `do_queue_*` helpers so there is exactly one
-    // implementation and one place that routes: alias in, one handler out.
-    //
-    // NOTE: the DB/engine layer still speaks "pool" internally (the `pools`
-    // table, `insert_pool`, `list_pool_member_spec_ids`, `validate_pool_*`,
-    // etc.). That is deliberate — Q1 renames only the MCP/user surface, never
-    // the storage layer. The helpers keep `pool`-named DB calls unchanged.
+    // loop.
 
     async fn do_queue_create(&self, name: &str) -> Result<CallToolResult, McpError> {
         let name = name.trim();
@@ -4981,14 +4973,14 @@ impl TaskTriggerHandler {
             return Ok(error_result(&e));
         }
 
-        let pool = Pool {
+        let queue = Queue {
             id: uuid::Uuid::new_v4().to_string(),
             name: name.to_string(),
             created_at: chrono::Utc::now(),
         };
-        self.db.insert_pool(&pool).map_err(internal_error)?;
+        self.db.insert_queue(&queue).map_err(internal_error)?;
 
-        Ok(build_id_result(&pool.id, "queue_id"))
+        Ok(build_id_result(&queue.id, "queue_id"))
     }
 
     async fn do_queue_add_spec(
@@ -4998,7 +4990,7 @@ impl TaskTriggerHandler {
         group: Option<&str>,
     ) -> Result<CallToolResult, McpError> {
         let queue_id = queue_id.trim();
-        if let Err(e) = validate_pool_exists(&self.db, queue_id) {
+        if let Err(e) = validate_queue_exists(&self.db, queue_id) {
             return Ok(error_result(&e));
         }
         let spec_id = spec_id.trim();
@@ -5007,7 +4999,7 @@ impl TaskTriggerHandler {
         }
         let already_member = self
             .db
-            .pool_has_member(queue_id, spec_id)
+            .queue_has_member(queue_id, spec_id)
             .map_err(internal_error)?;
         if already_member {
             return Ok(error_result(&format!(
@@ -5019,7 +5011,7 @@ impl TaskTriggerHandler {
         let group = group.map(str::trim).filter(|g| !g.is_empty());
 
         self.db
-            .append_pool_member(queue_id, spec_id, group)
+            .append_queue_member(queue_id, spec_id, group)
             .map_err(internal_error)?;
 
         let group_note = group
@@ -5035,21 +5027,21 @@ impl TaskTriggerHandler {
 
         let body = match queue_id {
             Some(queue_id) => {
-                let details = match self.db.get_pool_details(queue_id) {
+                let details = match self.db.get_queue_details(queue_id) {
                     Ok(Some(details)) => details,
                     Ok(None) => return Ok(error_result(&format!("Queue '{queue_id}' not found."))),
                     Err(e) => return Err(internal_error(e.to_string())),
                 };
-                serde_json::json!({ "queue": pool_details_json(&details) })
+                serde_json::json!({ "queue": queue_details_json(&details) })
             }
             None => {
-                let pools = self.db.list_pools().map_err(internal_error)?;
+                let queues = self.db.list_queues().map_err(internal_error)?;
                 serde_json::json!({
-                    "queues": pools
+                    "queues": queues
                         .iter()
-                        .map(|pool| serde_json::json!({
-                            "id": pool.id,
-                            "name": pool.name,
+                        .map(|queue| serde_json::json!({
+                            "id": queue.id,
+                            "name": queue.name,
                         }))
                         .collect::<Vec<_>>(),
                 })
@@ -5067,16 +5059,16 @@ impl TaskTriggerHandler {
         spec_id: &str,
     ) -> Result<CallToolResult, McpError> {
         let queue_id = queue_id.trim();
-        if let Err(e) = validate_pool_exists(&self.db, queue_id) {
+        if let Err(e) = validate_queue_exists(&self.db, queue_id) {
             return Ok(error_result(&e));
         }
         let spec_id = spec_id.trim();
-        if let Err(e) = validate_pool_member_removable(&self.db, queue_id, spec_id) {
+        if let Err(e) = validate_queue_member_removable(&self.db, queue_id, spec_id) {
             return Ok(error_result(&e));
         }
         let removed = self
             .db
-            .remove_pool_member(queue_id, spec_id)
+            .remove_queue_member(queue_id, spec_id)
             .map_err(internal_error)?;
         if !removed {
             return Ok(error_result(&format!(
@@ -5095,22 +5087,22 @@ impl TaskTriggerHandler {
         spec_ids: &[String],
     ) -> Result<CallToolResult, McpError> {
         let queue_id = queue_id.trim();
-        if let Err(e) = validate_pool_exists(&self.db, queue_id) {
+        if let Err(e) = validate_queue_exists(&self.db, queue_id) {
             return Ok(error_result(&e));
         }
         let current = self
             .db
-            .list_pool_member_spec_ids(queue_id)
+            .list_queue_member_spec_ids(queue_id)
             .map_err(internal_error)?;
-        if let Err(e) = validate_pool_reorder(&current, spec_ids) {
+        if let Err(e) = validate_queue_reorder(&current, spec_ids) {
             return Ok(error_result(&e));
         }
-        if let Err(e) = validate_pool_reorder_locking(&self.db, &current, spec_ids) {
+        if let Err(e) = validate_queue_reorder_locking(&self.db, &current, spec_ids) {
             return Ok(error_result(&e));
         }
 
         self.db
-            .reorder_pool_members(queue_id, spec_ids)
+            .reorder_queue_members(queue_id, spec_ids)
             .map_err(internal_error)?;
 
         Ok(success_result(&format!("Queue '{queue_id}' reordered.")))
@@ -5171,64 +5163,6 @@ impl TaskTriggerHandler {
         Parameters(params): Parameters<QueueReorderParams>,
     ) -> Result<CallToolResult, McpError> {
         self.do_queue_reorder(&params.queue_id, &params.spec_ids)
-            .await
-    }
-
-    #[tool(
-        name = "pool_create",
-        description = "DEPRECATED: use queue_create instead. Create a queue: an ordered list of existing specs, decoupled from any one loop."
-    )]
-    async fn pool_create(
-        &self,
-        Parameters(params): Parameters<PoolCreateParams>,
-    ) -> Result<CallToolResult, McpError> {
-        self.do_queue_create(&params.name).await
-    }
-
-    #[tool(
-        name = "pool_add_spec",
-        description = "DEPRECATED: use queue_add_spec instead. Append an existing spec to the end of a queue."
-    )]
-    async fn pool_add_spec(
-        &self,
-        Parameters(params): Parameters<PoolAddSpecParams>,
-    ) -> Result<CallToolResult, McpError> {
-        self.do_queue_add_spec(&params.pool_id, &params.spec_id, params.group.as_deref())
-            .await
-    }
-
-    #[tool(
-        name = "pool_list",
-        description = "DEPRECATED: use queue_list instead. List a queue's ordered members, or every queue (summary only) if pool_id is omitted."
-    )]
-    async fn pool_list(
-        &self,
-        Parameters(params): Parameters<PoolListParams>,
-    ) -> Result<CallToolResult, McpError> {
-        self.do_queue_list(params.pool_id.as_deref()).await
-    }
-
-    #[tool(
-        name = "pool_remove_spec",
-        description = "DEPRECATED: use queue_remove_spec instead. Remove a spec from a queue."
-    )]
-    async fn pool_remove_spec(
-        &self,
-        Parameters(params): Parameters<PoolRemoveSpecParams>,
-    ) -> Result<CallToolResult, McpError> {
-        self.do_queue_remove_spec(&params.pool_id, &params.spec_id)
-            .await
-    }
-
-    #[tool(
-        name = "pool_reorder",
-        description = "DEPRECATED: use queue_reorder instead. Reorder a queue. `spec_ids` must list every queue member exactly once, in the desired order — a total replacement, not a partial swap."
-    )]
-    async fn pool_reorder(
-        &self,
-        Parameters(params): Parameters<PoolReorderParams>,
-    ) -> Result<CallToolResult, McpError> {
-        self.do_queue_reorder(&params.pool_id, &params.spec_ids)
             .await
     }
 
@@ -5542,7 +5476,7 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "loop_run",
-        description = "Run a loop in the background, spec by spec. With `queue_id`, runs the queue's pending specs (in queue order) through the loop's graph instead of the loop's own bound specs. (`pool_id` is a deprecated alias for `queue_id`; `queue_id` wins if both are set.) `workdir` overrides the loop's workdir for this run only."
+        description = "Run a loop in the background, spec by spec. With `queue_id`, runs the queue's pending specs (in queue order) through the loop's graph instead of the loop's own bound specs. `workdir` overrides the loop's workdir for this run only."
     )]
     async fn loop_run(
         &self,
@@ -5563,20 +5497,16 @@ impl TaskTriggerHandler {
             return Ok(error_result(&message));
         }
 
-        // `queue_id` is the current surface name; `pool_id` is the deprecated
-        // alias. Prefer `queue_id`, fall back to `pool_id`. Everything
-        // downstream (engine, db) keeps its internal `pool_id` naming.
-        let pool_id = params
+        let queue_id = params
             .queue_id
             .as_deref()
-            .or(params.pool_id.as_deref())
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        if let Some(pool_id) = pool_id {
-            if let Err(e) = validate_pool_exists(&self.db, pool_id) {
+        if let Some(queue_id) = queue_id {
+            if let Err(e) = validate_queue_exists(&self.db, queue_id) {
                 return Ok(error_result(&e));
             }
-            if let Err(e) = validate_pool_not_consumed(&self.db, pool_id, &params.loop_id) {
+            if let Err(e) = validate_queue_not_consumed(&self.db, queue_id, &params.loop_id) {
                 return Ok(error_result(&e));
             }
         }
@@ -5592,7 +5522,7 @@ impl TaskTriggerHandler {
             }
         }
 
-        if let Err(e) = validate_loop_ensembles_for_run(&self.db, &params.loop_id, pool_id) {
+        if let Err(e) = validate_loop_ensembles_for_run(&self.db, &params.loop_id, queue_id) {
             return Ok(error_result(&e));
         }
 
@@ -5605,7 +5535,7 @@ impl TaskTriggerHandler {
         // `Running`, so every other launch path inherits it too.
         match self
             .loop_engine
-            .empty_launch_check(&params.loop_id, pool_id)
+            .empty_launch_check(&params.loop_id, queue_id)
         {
             Ok(Some(message)) => return Ok(error_result(&message)),
             Ok(None) => {}
@@ -5614,7 +5544,7 @@ impl TaskTriggerHandler {
 
         Arc::clone(&self.loop_engine).start_background_run(
             params.loop_id.clone(),
-            pool_id.map(str::to_string),
+            queue_id.map(str::to_string),
             workdir.map(str::to_string),
         );
         Ok(success_result(&format!(
@@ -5634,7 +5564,7 @@ impl TaskTriggerHandler {
     /// can never diverge in behavior.
     #[tool(
         name = "loop_reset",
-        description = "Reset a completed/failed loop back to pending so loop_run can relaunch it. Without `specs`, resets every non-completed spec, leaving already-completed ones untouched so loop_run resumes at the first pending spec. With `specs`, resets exactly those spec IDs, even if they were completed. If the loop's last run was against a pool, its pool members are what get reset (same semantics), since a pool run's own bound specs are typically empty. Rejects a `running` loop — call loop_pause first. Note: a `failed` loop with a pending loop_schedule_autorun resets and resumes itself automatically when the schedule fires — call this manually only to reset sooner, reset a `completed` loop, or reset specific spec IDs."
+        description = "Reset a completed/failed loop back to pending so loop_run can relaunch it. Without `specs`, resets every non-completed spec, leaving already-completed ones untouched so loop_run resumes at the first pending spec. With `specs`, resets exactly those spec IDs, even if they were completed. If the loop's last run was against a queue, its queue members are what get reset (same semantics), since a queue run's own bound specs are typically empty. Rejects a `running` loop — call loop_pause first. Note: a `failed` loop with a pending loop_schedule_autorun resets and resumes itself automatically when the schedule fires — call this manually only to reset sooner, reset a `completed` loop, or reset specific spec IDs."
     )]
     async fn loop_reset(
         &self,
@@ -5656,7 +5586,7 @@ impl TaskTriggerHandler {
     /// a human decision, made via `loop_reset` + `loop_run`.
     #[tool(
         name = "loop_schedule_autorun",
-        description = "Schedule a one-shot resume for a loop at a future ISO 8601 time, or cancel a pending one. When the scheduler reaches that time: a `failed` loop is auto-reset (same transition as loop_reset) and resumed — useful for a loop that failed on a quota to reschedule its own resumption at the exact reset time; a `completed` loop is left alone (the schedule is cleared but the loop is not re-run — use loop_reset + loop_run to re-run a finished loop); any other fireable status launches normally. If the loop's last run was against a pool, the resume targets that same pool (its pending members, in queue order) instead of the loop's own bound specs. The schedule always clears after firing (one-shot). Omit both `at` and `quota_reset_message` to cancel any pending autorun instead of scheduling one — valid regardless of the loop's current status, and a no-op (not an error) if nothing was scheduled. After a quota failure, prefer `quota_reset_message` (the raw CLI text, e.g. \"resets 1pm (America/Bogota)\") over computing `at` yourself — the engine parses the stated local time/timezone and converts it deterministically, avoiding scheduling errors from doing that arithmetic by hand."
+        description = "Schedule a one-shot resume for a loop at a future ISO 8601 time, or cancel a pending one. When the scheduler reaches that time: a `failed` loop is auto-reset (same transition as loop_reset) and resumed — useful for a loop that failed on a quota to reschedule its own resumption at the exact reset time; a `completed` loop is left alone (the schedule is cleared but the loop is not re-run — use loop_reset + loop_run to re-run a finished loop); any other fireable status launches normally. If the loop's last run was against a queue, the resume targets that same queue (its pending members, in queue order) instead of the loop's own bound specs. The schedule always clears after firing (one-shot). Omit both `at` and `quota_reset_message` to cancel any pending autorun instead of scheduling one — valid regardless of the loop's current status, and a no-op (not an error) if nothing was scheduled. After a quota failure, prefer `quota_reset_message` (the raw CLI text, e.g. \"resets 1pm (America/Bogota)\") over computing `at` yourself — the engine parses the stated local time/timezone and converts it deterministically, avoiding scheduling errors from doing that arithmetic by hand."
     )]
     async fn loop_schedule_autorun(
         &self,
@@ -5948,8 +5878,8 @@ impl TaskTriggerHandler {
             }
         }
 
-        // Resume with the loop's persisted run context — a paused pool run
-        // must pick the same pool back up, not the loop's own bound specs.
+        // Resume with the loop's persisted run context — a paused queue run
+        // must pick the same queue back up, not the loop's own bound specs.
         // The flip to `Running` is NOT done here: the dispatch's own atomic
         // loop claim (B42) owns that transition, so this resume and any other
         // launch racing it converge on one guarded entry point instead of each
@@ -6474,10 +6404,10 @@ fn format_duration_short(d: std::time::Duration) -> String {
 }
 
 /// Find and skip `loop_id`'s currently `running` spec — its own bound spec,
-/// or, for a pool-driven run, the pool member currently in flight. A pool
-/// member's `loop_id` column stays `None` (pool membership never binds it),
+/// or, for a queue-driven run, the queue member currently in flight. A queue
+/// member's `loop_id` column stays `None` (queue membership never binds it),
 /// so `list_loop_specs(loop_id)` alone can't see it (B18): the loop's
-/// persisted `active_run_pool_id` is what names the pool to look in instead.
+/// persisted `active_run_queue_id` is what names the queue to look in instead.
 pub(crate) fn handle_skip_next_spec(db: &Database, loop_id: &str) -> Result<(), McpError> {
     let bound_running = db
         .list_loop_specs(loop_id)
@@ -6487,7 +6417,7 @@ pub(crate) fn handle_skip_next_spec(db: &Database, loop_id: &str) -> Result<(), 
 
     let current_spec = match bound_running {
         Some(spec) => spec,
-        None => pool_running_spec(db, loop_id)?.ok_or_else(|| {
+        None => queue_running_spec(db, loop_id)?.ok_or_else(|| {
             McpError::invalid_params("No running spec found to skip from this paused loop.", None)
         })?,
     };
@@ -6510,7 +6440,7 @@ pub(crate) fn handle_retry_current_node(db: &Database, loop_id: &str) -> Result<
         .map_err(internal_error)?
         .into_iter()
         .find(|spec| spec.status == LoopSpecStatus::Running);
-    if bound_running.is_none() && pool_running_spec(db, loop_id)?.is_none() {
+    if bound_running.is_none() && queue_running_spec(db, loop_id)?.is_none() {
         return Err(McpError::invalid_params(
             "No running spec found to retry from this paused loop.",
             None,
@@ -6519,18 +6449,18 @@ pub(crate) fn handle_retry_current_node(db: &Database, loop_id: &str) -> Result<
     Ok(())
 }
 
-/// The `running` member of `loop_id`'s currently active pool run, if any —
-/// `None` if the loop isn't drawing from a pool, or no member is `running`.
-fn pool_running_spec(db: &Database, loop_id: &str) -> Result<Option<LoopSpec>, McpError> {
-    let Some(pool_id) = db
+/// The `running` member of `loop_id`'s currently active queue run, if any —
+/// `None` if the loop isn't drawing from a queue, or no member is `running`.
+fn queue_running_spec(db: &Database, loop_id: &str) -> Result<Option<LoopSpec>, McpError> {
+    let Some(queue_id) = db
         .get_loop(loop_id)
         .map_err(internal_error)?
-        .and_then(|lp| lp.active_run_pool_id)
+        .and_then(|lp| lp.active_run_queue_id)
     else {
         return Ok(None);
     };
     for spec_id in db
-        .list_pool_member_spec_ids(&pool_id)
+        .list_queue_member_spec_ids(&queue_id)
         .map_err(internal_error)?
     {
         if let Some(spec) = db.get_loop_spec(&spec_id).map_err(internal_error)? {
@@ -7121,18 +7051,16 @@ mod tests {
         validate_at_least_one_bool, validate_blueprint_exists, validate_edge_condition,
         validate_edge_condition_with_route, validate_ensemble_members, validate_node_config,
         validate_node_kind, validate_node_not_ensemble_owned, validate_non_empty,
-        validate_not_join_kind, validate_pool_exists, validate_pool_member_removable,
-        validate_pool_not_consumed, validate_pool_reorder, validate_pool_reorder_locking,
+        validate_not_join_kind, validate_queue_exists, validate_queue_member_removable,
+        validate_queue_not_consumed, validate_queue_reorder, validate_queue_reorder_locking,
         validate_route_edge_target, validate_spec_deletable, validate_spec_exists,
         validate_spec_set_status_target, validate_spec_status, validate_spec_workdir,
         BuiltEnsembleUnit, EnsembleMemberParams, EnsembleUnitSpec, TaskTriggerHandler,
         MISSING_SYNC_IDENTITY_MESSAGE,
     };
     use crate::daemon::params::{
-        LoopCompletionHookParams, LoopCopyEnsembleParams, LoopCopyNodeParams, LoopRunParams,
+        LoopCompletionHookParams, LoopCopyEnsembleParams, LoopCopyNodeParams,
         LoopScheduleAutorunParams, LoopScheduleContinueParams, LoopTriggerParams,
-        PoolAddSpecParams, PoolCreateParams, PoolListParams, QueueAddSpecParams, QueueCreateParams,
-        QueueListParams,
     };
     use crate::db::Database;
     use crate::domain::blueprints::Blueprint;
@@ -7141,7 +7069,7 @@ mod tests {
         LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus,
     };
     use crate::domain::models::Trigger;
-    use crate::domain::pools::Pool;
+    use crate::domain::queues::Queue;
     use crate::shared::sync_identity::CANOPY_AGENT_ID_HEADER;
     use tempfile::tempdir;
 
@@ -7495,7 +7423,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         })
         .unwrap();
@@ -7555,17 +7483,17 @@ mod tests {
         assert!(spec.completed_at.is_none());
     }
 
-    /// A loop whose last run was against a pool has empty (or irrelevant)
-    /// bound specs — the pool's *members* are what actually need resetting.
+    /// A loop whose last run was against a queue has empty (or irrelevant)
+    /// bound specs — the queue's *members* are what actually need resetting.
     /// `loop_reset` must find them via the loop's persisted
-    /// `active_run_pool_id`, reset every non-completed one back to pending
+    /// `active_run_queue_id`, reset every non-completed one back to pending
     /// (completed members untouched), and report the real count — not "0
     /// spec(s) reset", the false report from the incident this spec fixes.
     #[test]
-    fn loop_reset_pool_run_resets_pending_pool_members_and_reports_count() {
+    fn loop_reset_queue_run_resets_pending_queue_members_and_reports_count() {
         let dir = tempdir().unwrap();
         let db = Database::new(&dir.path().join("test.db")).unwrap();
-        let loop_id = "loop-pool-reset-test".to_string();
+        let loop_id = "loop-queue-reset-test".to_string();
         db.insert_loop(&Loop {
             archived: false,
             id: loop_id.clone(),
@@ -7580,7 +7508,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: Some("pool-1".to_string()),
+            active_run_queue_id: Some("queue-1".to_string()),
             on_completed: None,
         })
         .unwrap();
@@ -7601,20 +7529,20 @@ mod tests {
             completed_via_reason: None,
             completed_via_at: None,
         };
-        db.insert_loop_spec(&standalone("pool-done", 1, LoopSpecStatus::Completed))
+        db.insert_loop_spec(&standalone("queue-done", 1, LoopSpecStatus::Completed))
             .unwrap();
-        db.insert_loop_spec(&standalone("pool-failed", 2, LoopSpecStatus::Failed))
+        db.insert_loop_spec(&standalone("queue-failed", 2, LoopSpecStatus::Failed))
             .unwrap();
-        db.insert_loop_spec(&standalone("pool-pending", 3, LoopSpecStatus::Pending))
+        db.insert_loop_spec(&standalone("queue-pending", 3, LoopSpecStatus::Pending))
             .unwrap();
-        db.insert_pool(&Pool {
-            id: "pool-1".to_string(),
-            name: "pool-1".to_string(),
+        db.insert_queue(&Queue {
+            id: "queue-1".to_string(),
+            name: "queue-1".to_string(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
-        for spec_id in ["pool-done", "pool-failed", "pool-pending"] {
-            db.append_pool_member("pool-1", spec_id, None).unwrap();
+        for spec_id in ["queue-done", "queue-failed", "queue-pending"] {
+            db.append_queue_member("queue-1", spec_id, None).unwrap();
         }
 
         let result = perform_loop_reset(&db, &loop_id, None).unwrap();
@@ -7625,13 +7553,13 @@ mod tests {
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         assert_eq!(lp.status, LoopStatus::Draft);
 
-        let done = db.get_loop_spec("pool-done").unwrap().unwrap();
-        let failed = db.get_loop_spec("pool-failed").unwrap().unwrap();
-        let pending = db.get_loop_spec("pool-pending").unwrap().unwrap();
+        let done = db.get_loop_spec("queue-done").unwrap().unwrap();
+        let failed = db.get_loop_spec("queue-failed").unwrap().unwrap();
+        let pending = db.get_loop_spec("queue-pending").unwrap().unwrap();
         assert_eq!(
             done.status,
             LoopSpecStatus::Completed,
-            "completed pool member must be left untouched"
+            "completed queue member must be left untouched"
         );
         assert_eq!(failed.status, LoopSpecStatus::Pending);
         assert!(failed.completed_at.is_none());
@@ -8091,14 +8019,14 @@ mod tests {
         }
     }
 
-    fn pool_test_db() -> (tempfile::TempDir, Database) {
+    fn queue_test_db() -> (tempfile::TempDir, Database) {
         let dir = tempdir().unwrap();
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         (dir, db)
     }
 
-    fn insert_pool(db: &Database, id: &str) {
-        db.insert_pool(&Pool {
+    fn insert_queue(db: &Database, id: &str) {
+        db.insert_queue(&Queue {
             id: id.to_string(),
             name: format!("{id}-name"),
             created_at: chrono::Utc::now(),
@@ -8107,8 +8035,8 @@ mod tests {
     }
 
     /// Build a fully-wired `TaskTriggerHandler` over an in-memory-ish temp DB
-    /// so the queue/pool `#[tool]` methods (and their shared `do_queue_*`
-    /// helpers) can be exercised end-to-end.
+    /// so the queue `#[tool]` methods (and their shared `do_queue_*` helpers)
+    /// can be exercised end-to-end.
     fn queue_test_handler() -> (
         tempfile::TempDir,
         std::sync::Arc<Database>,
@@ -8164,217 +8092,25 @@ mod tests {
         format!("{:?}", result.content)
     }
 
-    /// Q1: the primary `queue_create` and the deprecated `pool_create` alias
-    /// must both route to the same `do_queue_create` helper, both emit the
-    /// `queue_id` result key (never the old `pool_id`), and both persist a real
-    /// queue row.
-    #[tokio::test]
-    async fn queue_create_and_pool_alias_route_to_same_handler() {
-        use crate::daemon::params_extract::Parameters;
-
-        let (_dir, db, handler) = queue_test_handler();
-
-        let via_queue = handler
-            .queue_create(Parameters(QueueCreateParams {
-                name: "Primary".to_string(),
-            }))
-            .await
-            .unwrap();
-        let via_pool = handler
-            .pool_create(Parameters(PoolCreateParams {
-                name: "Alias".to_string(),
-            }))
-            .await
-            .unwrap();
-
-        for text in [result_text(&via_queue), result_text(&via_pool)] {
-            assert!(text.contains("queue_id"), "expected queue_id key: {text}");
-            assert!(
-                !text.contains("pool_id"),
-                "result must not leak pool_id: {text}"
-            );
-        }
-
-        let pools = db.list_pools().unwrap();
-        assert!(pools.iter().any(|p| p.name == "Primary"));
-        assert!(pools.iter().any(|p| p.name == "Alias"));
-    }
-
-    /// Q1: `queue_add_spec` and its `pool_add_spec` alias share one handler —
-    /// adding via either path lands the spec in the same underlying queue and
-    /// returns queue-worded confirmation.
-    #[tokio::test]
-    async fn queue_add_spec_and_pool_alias_are_equivalent() {
-        use crate::daemon::params_extract::Parameters;
-
-        let (_dir, db, handler) = queue_test_handler();
-        for id in ["spec-a", "spec-b"] {
-            db.insert_loop_spec(&standalone_spec(id)).unwrap();
-        }
-        insert_pool(&db, "queue-1");
-
-        let via_queue = handler
-            .queue_add_spec(Parameters(QueueAddSpecParams {
-                queue_id: "queue-1".to_string(),
-                spec_id: "spec-a".to_string(),
-                group: None,
-            }))
-            .await
-            .unwrap();
-        let via_pool = handler
-            .pool_add_spec(Parameters(PoolAddSpecParams {
-                pool_id: "queue-1".to_string(),
-                spec_id: "spec-b".to_string(),
-                group: None,
-            }))
-            .await
-            .unwrap();
-
-        assert!(result_text(&via_queue).contains("added to queue"));
-        assert!(result_text(&via_pool).contains("added to queue"));
-        assert_eq!(
-            db.list_pool_member_spec_ids("queue-1").unwrap(),
-            vec!["spec-a", "spec-b"]
-        );
-    }
-
-    /// Q1: `queue_list` emits the queue-worded payload keys (`queue`/`queues`),
-    /// and the `pool_list` alias produces the identical payload.
-    #[tokio::test]
-    async fn queue_list_and_pool_alias_use_queue_keys() {
-        use crate::daemon::params_extract::Parameters;
-
-        let (_dir, db, handler) = queue_test_handler();
-        db.insert_loop_spec(&standalone_spec("spec-a")).unwrap();
-        insert_pool(&db, "queue-1");
-        db.append_pool_member("queue-1", "spec-a", None).unwrap();
-
-        let all_via_queue = handler
-            .queue_list(Parameters(QueueListParams { queue_id: None }))
-            .await
-            .unwrap();
-        let all_via_pool = handler
-            .pool_list(Parameters(PoolListParams { pool_id: None }))
-            .await
-            .unwrap();
-        assert_eq!(result_text(&all_via_queue), result_text(&all_via_pool));
-        assert!(result_text(&all_via_queue).contains("queues"));
-
-        let one = handler
-            .queue_list(Parameters(QueueListParams {
-                queue_id: Some("queue-1".to_string()),
-            }))
-            .await
-            .unwrap();
-        let text = result_text(&one);
-        assert!(text.contains("queue"), "{text}");
-        assert!(
-            !text.contains("\\\"pool\\\""),
-            "must not use pool key: {text}"
-        );
-    }
-
-    /// Q1: `loop_run` accepts the deprecated `pool_id` as an alias for
-    /// `queue_id`. Routing an empty queue through it surfaces the (queue-worded)
-    /// empty-launch error naming that queue — proof the id resolved.
-    #[tokio::test]
-    async fn loop_run_accepts_pool_id_alias() {
-        use crate::daemon::params_extract::Parameters;
-
-        let (dir, db, handler) = queue_test_handler();
-        db.insert_loop(&Loop {
-            archived: false,
-            id: "loop-1".to_string(),
-            name: "loop-1".to_string(),
-            description: None,
-            workdir: dir.path().to_string_lossy().to_string(),
-            status: LoopStatus::Draft,
-            trigger: None,
-            created_at: chrono::Utc::now(),
-            started_at: None,
-            completed_at: None,
-            autorun_at: None,
-            auto_continue_at: None,
-            auto_continue_action: None,
-            active_run_pool_id: None,
-            on_completed: None,
-        })
-        .unwrap();
-        insert_pool(&db, "queue-empty");
-
-        let result = handler
-            .loop_run(Parameters(LoopRunParams {
-                loop_id: "loop-1".to_string(),
-                queue_id: None,
-                pool_id: Some("queue-empty".to_string()),
-                workdir: None,
-            }))
-            .await
-            .unwrap();
-        let text = result_text(&result);
-        assert!(text.contains("queue-empty"), "pool_id must resolve: {text}");
-    }
-
-    /// Q1: when both `queue_id` and `pool_id` are set, `queue_id` wins.
-    #[tokio::test]
-    async fn loop_run_prefers_queue_id_over_pool_id() {
-        use crate::daemon::params_extract::Parameters;
-
-        let (dir, db, handler) = queue_test_handler();
-        db.insert_loop(&Loop {
-            archived: false,
-            id: "loop-1".to_string(),
-            name: "loop-1".to_string(),
-            description: None,
-            workdir: dir.path().to_string_lossy().to_string(),
-            status: LoopStatus::Draft,
-            trigger: None,
-            created_at: chrono::Utc::now(),
-            started_at: None,
-            completed_at: None,
-            autorun_at: None,
-            auto_continue_at: None,
-            auto_continue_action: None,
-            active_run_pool_id: None,
-            on_completed: None,
-        })
-        .unwrap();
-        insert_pool(&db, "queue-win");
-        insert_pool(&db, "queue-lose");
-
-        let result = handler
-            .loop_run(Parameters(LoopRunParams {
-                loop_id: "loop-1".to_string(),
-                queue_id: Some("queue-win".to_string()),
-                pool_id: Some("queue-lose".to_string()),
-                workdir: None,
-            }))
-            .await
-            .unwrap();
-        let text = result_text(&result);
-        assert!(text.contains("queue-win"), "queue_id must win: {text}");
-        assert!(!text.contains("queue-lose"), "pool_id must lose: {text}");
-    }
-
     #[test]
-    fn pool_crud_and_ordering_round_trips() {
-        let (_dir, db) = pool_test_db();
+    fn queue_crud_and_ordering_round_trips() {
+        let (_dir, db) = queue_test_db();
         for id in ["spec-a", "spec-b", "spec-c"] {
             db.insert_loop_spec(&standalone_spec(id)).unwrap();
         }
-        insert_pool(&db, "pool-1");
+        insert_queue(&db, "queue-1");
 
-        db.append_pool_member("pool-1", "spec-a", None).unwrap();
-        db.append_pool_member("pool-1", "spec-b", None).unwrap();
-        db.append_pool_member("pool-1", "spec-c", None).unwrap();
+        db.append_queue_member("queue-1", "spec-a", None).unwrap();
+        db.append_queue_member("queue-1", "spec-b", None).unwrap();
+        db.append_queue_member("queue-1", "spec-c", None).unwrap();
 
         assert_eq!(
-            db.list_pool_member_spec_ids("pool-1").unwrap(),
+            db.list_queue_member_spec_ids("queue-1").unwrap(),
             vec!["spec-a", "spec-b", "spec-c"]
         );
 
-        let details = db.get_pool_details("pool-1").unwrap().unwrap();
-        assert_eq!(details.pool.id, "pool-1");
+        let details = db.get_queue_details("queue-1").unwrap().unwrap();
+        assert_eq!(details.queue.id, "queue-1");
         assert_eq!(
             details
                 .members
@@ -8384,41 +8120,41 @@ mod tests {
             vec!["spec-a", "spec-b", "spec-c"]
         );
 
-        assert!(db.remove_pool_member("pool-1", "spec-b").unwrap());
+        assert!(db.remove_queue_member("queue-1", "spec-b").unwrap());
         assert_eq!(
-            db.list_pool_member_spec_ids("pool-1").unwrap(),
+            db.list_queue_member_spec_ids("queue-1").unwrap(),
             vec!["spec-a", "spec-c"]
         );
-        assert!(!db.remove_pool_member("pool-1", "spec-b").unwrap());
+        assert!(!db.remove_queue_member("queue-1", "spec-b").unwrap());
 
-        assert!(db.list_pools().unwrap().iter().any(|p| p.id == "pool-1"));
+        assert!(db.list_queues().unwrap().iter().any(|p| p.id == "queue-1"));
     }
 
     #[test]
-    fn pool_reorder_is_total_and_deterministic() {
-        let (_dir, db) = pool_test_db();
+    fn queue_reorder_is_total_and_deterministic() {
+        let (_dir, db) = queue_test_db();
         for id in ["spec-a", "spec-b", "spec-c"] {
             db.insert_loop_spec(&standalone_spec(id)).unwrap();
         }
-        insert_pool(&db, "pool-1");
+        insert_queue(&db, "queue-1");
         for id in ["spec-a", "spec-b", "spec-c"] {
-            db.append_pool_member("pool-1", id, None).unwrap();
+            db.append_queue_member("queue-1", id, None).unwrap();
         }
 
-        let current = db.list_pool_member_spec_ids("pool-1").unwrap();
+        let current = db.list_queue_member_spec_ids("queue-1").unwrap();
         let order = vec![
             "spec-c".to_string(),
             "spec-a".to_string(),
             "spec-b".to_string(),
         ];
-        assert!(validate_pool_reorder(&current, &order).is_ok());
+        assert!(validate_queue_reorder(&current, &order).is_ok());
 
-        db.reorder_pool_members("pool-1", &order).unwrap();
-        assert_eq!(db.list_pool_member_spec_ids("pool-1").unwrap(), order);
+        db.reorder_queue_members("queue-1", &order).unwrap();
+        assert_eq!(db.list_queue_member_spec_ids("queue-1").unwrap(), order);
     }
 
     #[test]
-    fn pool_reorder_rejects_partial_list() {
+    fn queue_reorder_rejects_partial_list() {
         let current = vec![
             "spec-a".to_string(),
             "spec-b".to_string(),
@@ -8426,12 +8162,12 @@ mod tests {
         ];
         let order = vec!["spec-a".to_string(), "spec-b".to_string()];
 
-        let error = validate_pool_reorder(&current, &order).unwrap_err();
+        let error = validate_queue_reorder(&current, &order).unwrap_err();
         assert!(error.contains("exactly once; got 2"), "{error}");
     }
 
     #[test]
-    fn pool_reorder_rejects_unknown_spec() {
+    fn queue_reorder_rejects_unknown_spec() {
         let current = vec![
             "spec-a".to_string(),
             "spec-b".to_string(),
@@ -8443,7 +8179,7 @@ mod tests {
             "ghost".to_string(),
         ];
 
-        let error = validate_pool_reorder(&current, &order).unwrap_err();
+        let error = validate_queue_reorder(&current, &order).unwrap_err();
         assert!(error.contains("no spec 'ghost'"), "{error}");
     }
 
@@ -8469,7 +8205,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         })
         .unwrap();
@@ -8602,23 +8338,23 @@ mod tests {
     }
 
     #[test]
-    fn pool_not_consumed_allows_start_when_every_member_is_pending() {
-        let (_dir, db) = pool_test_db();
+    fn queue_not_consumed_allows_start_when_every_member_is_pending() {
+        let (_dir, db) = queue_test_db();
         db.insert_loop_spec(&standalone_spec("spec-a")).unwrap();
         db.insert_loop_spec(&standalone_spec("spec-b")).unwrap();
-        insert_pool(&db, "pool-1");
-        db.append_pool_member("pool-1", "spec-a", None).unwrap();
-        db.append_pool_member("pool-1", "spec-b", None).unwrap();
+        insert_queue(&db, "queue-1");
+        db.append_queue_member("queue-1", "spec-a", None).unwrap();
+        db.append_queue_member("queue-1", "spec-b", None).unwrap();
 
-        assert!(validate_pool_not_consumed(&db, "pool-1", "loop-requesting").is_ok());
+        assert!(validate_queue_not_consumed(&db, "queue-1", "loop-requesting").is_ok());
     }
 
     #[test]
-    fn pool_not_consumed_blocks_when_a_member_runs_under_another_loop() {
-        let (_dir, db) = pool_test_db();
+    fn queue_not_consumed_blocks_when_a_member_runs_under_another_loop() {
+        let (_dir, db) = queue_test_db();
         db.insert_loop_spec(&running_spec("spec-a")).unwrap();
-        insert_pool(&db, "pool-1");
-        db.append_pool_member("pool-1", "spec-a", None).unwrap();
+        insert_queue(&db, "queue-1");
+        db.append_queue_member("queue-1", "spec-a", None).unwrap();
         insert_test_loop(&db, "loop-other");
         insert_test_node(&db, "node-1", "spec-a");
         db.insert_loop_run(&loop_run_row(
@@ -8629,21 +8365,21 @@ mod tests {
         ))
         .unwrap();
 
-        let error = validate_pool_not_consumed(&db, "pool-1", "loop-requesting").unwrap_err();
+        let error = validate_queue_not_consumed(&db, "queue-1", "loop-requesting").unwrap_err();
 
         assert!(error.contains("spec-a"), "{error}");
         assert!(error.contains("loop-other"), "{error}");
     }
 
     #[test]
-    fn pool_not_consumed_allows_the_owning_loop_to_resume_its_own_running_spec() {
-        // A paused pool run's active spec stays `running` between node
-        // executions. Resuming the SAME loop against the SAME pool must not
+    fn queue_not_consumed_allows_the_owning_loop_to_resume_its_own_running_spec() {
+        // A paused queue run's active spec stays `running` between node
+        // executions. Resuming the SAME loop against the SAME queue must not
         // be mistaken for a conflicting run.
-        let (_dir, db) = pool_test_db();
+        let (_dir, db) = queue_test_db();
         db.insert_loop_spec(&running_spec("spec-a")).unwrap();
-        insert_pool(&db, "pool-1");
-        db.append_pool_member("pool-1", "spec-a", None).unwrap();
+        insert_queue(&db, "queue-1");
+        db.append_queue_member("queue-1", "spec-a", None).unwrap();
         insert_test_loop(&db, "loop-owner");
         insert_test_node(&db, "node-1", "spec-a");
         db.insert_loop_run(&loop_run_row(
@@ -8654,27 +8390,27 @@ mod tests {
         ))
         .unwrap();
 
-        assert!(validate_pool_not_consumed(&db, "pool-1", "loop-owner").is_ok());
+        assert!(validate_queue_not_consumed(&db, "queue-1", "loop-owner").is_ok());
     }
 
-    /// B18 (Requirement 2): `skip_next_spec` on a pool-driven paused loop
+    /// B18 (Requirement 2): `skip_next_spec` on a queue-driven paused loop
     /// must find its in-flight member through the loop's persisted
-    /// `active_run_pool_id` — the member's own `loop_id` column stays `None`
-    /// (pool membership never binds it), so `list_loop_specs(loop_id)` alone
+    /// `active_run_queue_id` — the member's own `loop_id` column stays `None`
+    /// (queue membership never binds it), so `list_loop_specs(loop_id)` alone
     /// can't see it. Before this fix `handle_skip_next_spec` always errored
-    /// "No running spec found" for a pool-driven pause.
+    /// "No running spec found" for a queue-driven pause.
     #[test]
-    fn skip_next_spec_finds_and_skips_the_running_pool_member() {
-        let (_dir, db) = pool_test_db();
+    fn skip_next_spec_finds_and_skips_the_running_queue_member() {
+        let (_dir, db) = queue_test_db();
         insert_test_loop(&db, "loop-owner");
-        db.set_loop_active_run_pool("loop-owner", Some("pool-1"))
+        db.set_loop_active_run_queue("loop-owner", Some("queue-1"))
             .unwrap();
 
         db.insert_loop_spec(&running_spec("spec-a")).unwrap();
         db.insert_loop_spec(&standalone_spec("spec-b")).unwrap();
-        insert_pool(&db, "pool-1");
-        db.append_pool_member("pool-1", "spec-a", None).unwrap();
-        db.append_pool_member("pool-1", "spec-b", None).unwrap();
+        insert_queue(&db, "queue-1");
+        db.append_queue_member("queue-1", "spec-a", None).unwrap();
+        db.append_queue_member("queue-1", "spec-b", None).unwrap();
 
         handle_skip_next_spec(&db, "loop-owner").unwrap();
 
@@ -8685,33 +8421,34 @@ mod tests {
     }
 
     #[test]
-    fn skip_next_spec_prefers_the_loop_bound_spec_over_pool_context() {
+    fn skip_next_spec_prefers_the_loop_bound_spec_over_queue_context() {
         // A loop with its own bound `running` spec must use that, even if a
-        // stale `active_run_pool_id` is still sitting on the loop from an
-        // earlier, unrelated pool run.
-        let (_dir, db) = pool_test_db();
+        // stale `active_run_queue_id` is still sitting on the loop from an
+        // earlier, unrelated queue run.
+        let (_dir, db) = queue_test_db();
         insert_test_loop(&db, "loop-owner");
-        db.set_loop_active_run_pool("loop-owner", Some("pool-1"))
+        db.set_loop_active_run_queue("loop-owner", Some("queue-1"))
             .unwrap();
 
         let mut bound = running_spec("spec-bound");
         bound.loop_id = Some("loop-owner".to_string());
         db.insert_loop_spec(&bound).unwrap();
-        db.insert_loop_spec(&running_spec("spec-pool")).unwrap();
-        insert_pool(&db, "pool-1");
-        db.append_pool_member("pool-1", "spec-pool", None).unwrap();
+        db.insert_loop_spec(&running_spec("spec-queue")).unwrap();
+        insert_queue(&db, "queue-1");
+        db.append_queue_member("queue-1", "spec-queue", None)
+            .unwrap();
 
         handle_skip_next_spec(&db, "loop-owner").unwrap();
 
         let bound_after = db.get_loop_spec("spec-bound").unwrap().unwrap();
-        let pool_after = db.get_loop_spec("spec-pool").unwrap().unwrap();
+        let queue_after = db.get_loop_spec("spec-queue").unwrap().unwrap();
         assert_eq!(bound_after.status, LoopSpecStatus::Skipped);
-        assert_eq!(pool_after.status, LoopSpecStatus::Running);
+        assert_eq!(queue_after.status, LoopSpecStatus::Running);
     }
 
     #[test]
     fn skip_next_spec_errors_when_no_spec_is_running_anywhere() {
-        let (_dir, db) = pool_test_db();
+        let (_dir, db) = queue_test_db();
         insert_test_loop(&db, "loop-owner");
 
         let error = handle_skip_next_spec(&db, "loop-owner").unwrap_err();
@@ -8719,37 +8456,37 @@ mod tests {
     }
 
     /// B35: `retry_current_node` must error when no spec is running in
-    /// either the loop's bound specs or its pool — same validation shape as
+    /// either the loop's bound specs or its queue — same validation shape as
     /// `skip_next_spec`.
     #[test]
     fn retry_current_node_errors_when_no_running_spec() {
-        let (_dir, db) = pool_test_db();
+        let (_dir, db) = queue_test_db();
         insert_test_loop(&db, "loop-owner");
         let error = handle_retry_current_node(&db, "loop-owner").unwrap_err();
         assert!(error.message.contains("No running spec found"));
     }
 
     /// B35: `retry_current_node` must find the running spec through the
-    /// loop's persisted `active_run_pool_id` (pool member has `loop_id: None`).
+    /// loop's persisted `active_run_queue_id` (queue member has `loop_id: None`).
     #[test]
-    fn retry_current_node_finds_running_pool_member() {
-        let (_dir, db) = pool_test_db();
+    fn retry_current_node_finds_running_queue_member() {
+        let (_dir, db) = queue_test_db();
         insert_test_loop(&db, "loop-owner");
-        db.set_loop_active_run_pool("loop-owner", Some("pool-1"))
+        db.set_loop_active_run_queue("loop-owner", Some("queue-1"))
             .unwrap();
 
         db.insert_loop_spec(&running_spec("spec-a")).unwrap();
         db.insert_loop_spec(&standalone_spec("spec-b")).unwrap();
-        insert_pool(&db, "pool-1");
-        db.append_pool_member("pool-1", "spec-a", None).unwrap();
-        db.append_pool_member("pool-1", "spec-b", None).unwrap();
+        insert_queue(&db, "queue-1");
+        db.append_queue_member("queue-1", "spec-a", None).unwrap();
+        db.append_queue_member("queue-1", "spec-b", None).unwrap();
 
         // Should succeed without error — a running spec exists.
         assert!(handle_retry_current_node(&db, "loop-owner").is_ok());
     }
 
     #[test]
-    fn pool_reorder_rejects_duplicate_spec() {
+    fn queue_reorder_rejects_duplicate_spec() {
         let current = vec![
             "spec-a".to_string(),
             "spec-b".to_string(),
@@ -8761,24 +8498,24 @@ mod tests {
             "spec-b".to_string(),
         ];
 
-        let error = validate_pool_reorder(&current, &order).unwrap_err();
+        let error = validate_queue_reorder(&current, &order).unwrap_err();
         assert!(error.contains("more than once"), "{error}");
     }
 
     #[test]
-    fn pool_reorder_locking_refuses_ordering_that_moves_a_running_member() {
-        // R6: the currently running spec is immutable in the pool's order.
+    fn queue_reorder_locking_refuses_ordering_that_moves_a_running_member() {
+        // R6: the currently running spec is immutable in the queue's order.
         // Swapping it with a pending member must be refused, even though the
         // result is still a valid total permutation.
-        let (_dir, db) = pool_test_db();
+        let (_dir, db) = queue_test_db();
         db.insert_loop_spec(&running_spec("spec-a")).unwrap();
         db.insert_loop_spec(&standalone_spec("spec-b")).unwrap();
         db.insert_loop_spec(&standalone_spec("spec-c")).unwrap();
-        insert_pool(&db, "pool-1");
+        insert_queue(&db, "queue-1");
         for id in ["spec-a", "spec-b", "spec-c"] {
-            db.append_pool_member("pool-1", id, None).unwrap();
+            db.append_queue_member("queue-1", id, None).unwrap();
         }
-        let current = db.list_pool_member_spec_ids("pool-1").unwrap();
+        let current = db.list_queue_member_spec_ids("queue-1").unwrap();
 
         // Moves spec-a (running) from position 0 to position 1.
         let order = vec![
@@ -8786,43 +8523,43 @@ mod tests {
             "spec-a".to_string(),
             "spec-c".to_string(),
         ];
-        assert!(validate_pool_reorder(&current, &order).is_ok());
+        assert!(validate_queue_reorder(&current, &order).is_ok());
 
-        let error = validate_pool_reorder_locking(&db, &current, &order).unwrap_err();
+        let error = validate_queue_reorder_locking(&db, &current, &order).unwrap_err();
         assert!(error.contains("spec-a"), "{error}");
         assert!(error.contains("running"), "{error}");
     }
 
     #[test]
-    fn pool_reorder_locking_refuses_ordering_that_moves_a_completed_member() {
-        let (_dir, db) = pool_test_db();
+    fn queue_reorder_locking_refuses_ordering_that_moves_a_completed_member() {
+        let (_dir, db) = queue_test_db();
         let mut done = standalone_spec("spec-a");
         done.status = LoopSpecStatus::Completed;
         db.insert_loop_spec(&done).unwrap();
         db.insert_loop_spec(&standalone_spec("spec-b")).unwrap();
-        insert_pool(&db, "pool-1");
+        insert_queue(&db, "queue-1");
         for id in ["spec-a", "spec-b"] {
-            db.append_pool_member("pool-1", id, None).unwrap();
+            db.append_queue_member("queue-1", id, None).unwrap();
         }
-        let current = db.list_pool_member_spec_ids("pool-1").unwrap();
+        let current = db.list_queue_member_spec_ids("queue-1").unwrap();
 
         let order = vec!["spec-b".to_string(), "spec-a".to_string()];
-        let error = validate_pool_reorder_locking(&db, &current, &order).unwrap_err();
+        let error = validate_queue_reorder_locking(&db, &current, &order).unwrap_err();
         assert!(error.contains("spec-a"), "{error}");
         assert!(error.contains("completed"), "{error}");
     }
 
     #[test]
-    fn pool_reorder_locking_allows_permuting_pending_members_only() {
-        let (_dir, db) = pool_test_db();
+    fn queue_reorder_locking_allows_permuting_pending_members_only() {
+        let (_dir, db) = queue_test_db();
         db.insert_loop_spec(&running_spec("spec-a")).unwrap();
         db.insert_loop_spec(&standalone_spec("spec-b")).unwrap();
         db.insert_loop_spec(&standalone_spec("spec-c")).unwrap();
-        insert_pool(&db, "pool-1");
+        insert_queue(&db, "queue-1");
         for id in ["spec-a", "spec-b", "spec-c"] {
-            db.append_pool_member("pool-1", id, None).unwrap();
+            db.append_queue_member("queue-1", id, None).unwrap();
         }
-        let current = db.list_pool_member_spec_ids("pool-1").unwrap();
+        let current = db.list_queue_member_spec_ids("queue-1").unwrap();
 
         // spec-a (running) stays at position 0; only the pending tail moves.
         let order = vec![
@@ -8830,17 +8567,17 @@ mod tests {
             "spec-c".to_string(),
             "spec-b".to_string(),
         ];
-        assert!(validate_pool_reorder_locking(&db, &current, &order).is_ok());
+        assert!(validate_queue_reorder_locking(&db, &current, &order).is_ok());
     }
 
     #[test]
-    fn pool_remove_spec_refuses_the_currently_running_spec() {
-        let (_dir, db) = pool_test_db();
+    fn queue_remove_spec_refuses_the_currently_running_spec() {
+        let (_dir, db) = queue_test_db();
         db.insert_loop_spec(&running_spec("spec-a")).unwrap();
-        insert_pool(&db, "pool-1");
-        db.append_pool_member("pool-1", "spec-a", None).unwrap();
+        insert_queue(&db, "queue-1");
+        db.append_queue_member("queue-1", "spec-a", None).unwrap();
 
-        let error = validate_pool_member_removable(&db, "pool-1", "spec-a").unwrap_err();
+        let error = validate_queue_member_removable(&db, "queue-1", "spec-a").unwrap_err();
         assert!(error.contains("spec-a"), "{error}");
         assert!(error.contains("running"), "{error}");
 
@@ -8852,23 +8589,23 @@ mod tests {
             Some(chrono::Utc::now()),
         )
         .unwrap();
-        assert!(validate_pool_member_removable(&db, "pool-1", "spec-a").is_ok());
+        assert!(validate_queue_member_removable(&db, "queue-1", "spec-a").is_ok());
     }
 
     #[test]
-    fn pool_add_spec_rejects_nonexistent_spec() {
-        let (_dir, db) = pool_test_db();
-        insert_pool(&db, "pool-1");
+    fn queue_add_spec_rejects_nonexistent_spec() {
+        let (_dir, db) = queue_test_db();
+        insert_queue(&db, "queue-1");
 
         let error = validate_spec_exists(&db, "ghost-spec").unwrap_err();
         assert!(error.contains("not found"), "{error}");
     }
 
     #[test]
-    fn pool_operations_reject_nonexistent_pool() {
-        let (_dir, db) = pool_test_db();
+    fn queue_operations_reject_nonexistent_queue() {
+        let (_dir, db) = queue_test_db();
 
-        let error = validate_pool_exists(&db, "does-not-exist").unwrap_err();
+        let error = validate_queue_exists(&db, "does-not-exist").unwrap_err();
         assert!(error.contains("not found"), "{error}");
     }
 
@@ -8914,7 +8651,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         })
         .unwrap();
@@ -8961,7 +8698,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         })
         .unwrap();
@@ -9012,7 +8749,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         })
         .unwrap();
@@ -9053,7 +8790,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         }
     }
@@ -10455,45 +10192,45 @@ mod tests {
         assert!(validate_at_least_one_bool(&[true, true, true], "fields").is_ok());
     }
 
-    // ── validate_pool_reorder ───────────────────────────────────────
+    // ── validate_queue_reorder ───────────────────────────────────────
 
     #[test]
-    fn validate_pool_reorder_accepts_valid_permutation() {
+    fn validate_queue_reorder_accepts_valid_permutation() {
         let current = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let reordered = vec!["c".to_string(), "a".to_string(), "b".to_string()];
-        assert!(validate_pool_reorder(&current, &reordered).is_ok());
+        assert!(validate_queue_reorder(&current, &reordered).is_ok());
     }
 
     #[test]
-    fn validate_pool_reorder_accepts_same_order() {
+    fn validate_queue_reorder_accepts_same_order() {
         let current = vec!["a".to_string(), "b".to_string()];
         let reordered = vec!["a".to_string(), "b".to_string()];
-        assert!(validate_pool_reorder(&current, &reordered).is_ok());
+        assert!(validate_queue_reorder(&current, &reordered).is_ok());
     }
 
     #[test]
-    fn validate_pool_reorder_rejects_length_mismatch() {
+    fn validate_queue_reorder_rejects_length_mismatch() {
         let current = vec!["a".to_string(), "b".to_string()];
         let reordered = vec!["a".to_string()];
-        let err = validate_pool_reorder(&current, &reordered).unwrap_err();
+        let err = validate_queue_reorder(&current, &reordered).unwrap_err();
         assert!(err.contains("2"), "{err}");
         assert!(err.contains("1"), "{err}");
     }
 
     #[test]
-    fn validate_pool_reorder_rejects_duplicate() {
+    fn validate_queue_reorder_rejects_duplicate() {
         let current = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let reordered = vec!["a".to_string(), "a".to_string(), "b".to_string()];
-        let err = validate_pool_reorder(&current, &reordered).unwrap_err();
+        let err = validate_queue_reorder(&current, &reordered).unwrap_err();
         assert!(err.contains("a"), "{err}");
         assert!(err.contains("more than once"), "{err}");
     }
 
     #[test]
-    fn validate_pool_reorder_rejects_unknown_id() {
+    fn validate_queue_reorder_rejects_unknown_id() {
         let current = vec!["a".to_string(), "b".to_string()];
         let reordered = vec!["a".to_string(), "x".to_string()];
-        let err = validate_pool_reorder(&current, &reordered).unwrap_err();
+        let err = validate_queue_reorder(&current, &reordered).unwrap_err();
         assert!(err.contains("x"), "{err}");
         assert!(err.contains("no spec"), "{err}");
     }
@@ -10626,7 +10363,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         }
     }
@@ -10945,7 +10682,7 @@ mod additional_tests {
         LoopStatus,
     };
     use crate::domain::models::Trigger;
-    use crate::domain::pools::Pool;
+    use crate::domain::queues::Queue;
     use tempfile::tempdir;
 
     fn standalone_spec(id: &str) -> LoopSpec {
@@ -10982,7 +10719,7 @@ mod additional_tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         })
         .unwrap();
@@ -11265,18 +11002,18 @@ mod additional_tests {
         assert!(validate_at_least_one_bool(&[], "f").is_err());
     }
 
-    // ── validate_pool_reorder edge cases ──────────────────────────
+    // ── validate_queue_reorder edge cases ──────────────────────────
 
     #[test]
-    fn validate_pool_reorder_empty_current_and_ids() {
-        assert!(validate_pool_reorder(&[], &[]).is_ok());
+    fn validate_queue_reorder_empty_current_and_ids() {
+        assert!(validate_queue_reorder(&[], &[]).is_ok());
     }
 
     #[test]
-    fn validate_pool_reorder_single_element() {
+    fn validate_queue_reorder_single_element() {
         let current = vec!["a".to_string()];
         let reordered = vec!["a".to_string()];
-        assert!(validate_pool_reorder(&current, &reordered).is_ok());
+        assert!(validate_queue_reorder(&current, &reordered).is_ok());
     }
 
     // ── validate_non_empty edge cases ─────────────────────────────
@@ -11412,25 +11149,25 @@ mod additional_tests {
         assert!(err.contains("event"), "{err}");
     }
 
-    // ── validate_pool_reorder_locking: pending spec is movable ────
+    // ── validate_queue_reorder_locking: pending spec is movable ────
 
     #[test]
-    fn validate_pool_reorder_locking_allows_moving_pending_members() {
+    fn validate_queue_reorder_locking_allows_moving_pending_members() {
         let dir = tempdir().unwrap();
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         db.insert_loop_spec(&standalone_spec("spec-a")).unwrap();
         db.insert_loop_spec(&standalone_spec("spec-b")).unwrap();
         db.insert_loop_spec(&standalone_spec("spec-c")).unwrap();
-        db.insert_pool(&Pool {
-            id: "pool-1".to_string(),
-            name: "pool-1".to_string(),
+        db.insert_queue(&Queue {
+            id: "queue-1".to_string(),
+            name: "queue-1".to_string(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
         for id in ["spec-a", "spec-b", "spec-c"] {
-            db.append_pool_member("pool-1", id, None).unwrap();
+            db.append_queue_member("queue-1", id, None).unwrap();
         }
-        let current = db.list_pool_member_spec_ids("pool-1").unwrap();
+        let current = db.list_queue_member_spec_ids("queue-1").unwrap();
 
         // All pending — any permutation is allowed.
         let order = vec![
@@ -11438,23 +11175,23 @@ mod additional_tests {
             "spec-a".to_string(),
             "spec-b".to_string(),
         ];
-        assert!(validate_pool_reorder_locking(&db, &current, &order).is_ok());
+        assert!(validate_queue_reorder_locking(&db, &current, &order).is_ok());
     }
 
-    // ── validate_pool_member_removable: non-running spec ──────────
+    // ── validate_queue_member_removable: non-running spec ──────────
 
     #[test]
-    fn validate_pool_member_removable_pending_spec_ok() {
+    fn validate_queue_member_removable_pending_spec_ok() {
         let dir = tempdir().unwrap();
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         db.insert_loop_spec(&standalone_spec("spec-a")).unwrap();
-        db.insert_pool(&Pool {
-            id: "pool-1".to_string(),
-            name: "pool-1".to_string(),
+        db.insert_queue(&Queue {
+            id: "queue-1".to_string(),
+            name: "queue-1".to_string(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
-        assert!(validate_pool_member_removable(&db, "pool-1", "spec-a").is_ok());
+        assert!(validate_queue_member_removable(&db, "queue-1", "spec-a").is_ok());
     }
 
     // ── resolve_reported_run: run not found for node_id ───────────
@@ -11479,19 +11216,19 @@ mod additional_tests {
         assert!(err.is_error.unwrap_or(false));
     }
 
-    // ── validate_pool_not_consumed: empty pool ────────────────────
+    // ── validate_queue_not_consumed: empty queue ────────────────────
 
     #[test]
-    fn validate_pool_not_consumed_empty_pool() {
+    fn validate_queue_not_consumed_empty_queue() {
         let dir = tempdir().unwrap();
         let db = Database::new(&dir.path().join("test.db")).unwrap();
-        db.insert_pool(&Pool {
-            id: "pool-empty".to_string(),
+        db.insert_queue(&Queue {
+            id: "queue-empty".to_string(),
             name: "empty".to_string(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
-        assert!(validate_pool_not_consumed(&db, "pool-empty", "loop-1").is_ok());
+        assert!(validate_queue_not_consumed(&db, "queue-empty", "loop-1").is_ok());
     }
 
     // ── loop_run_status_guard: error messages name the loop ───────
@@ -11703,28 +11440,28 @@ mod additional_tests {
         assert!(validate_node_config(LoopNodeKind::Gate, &config).is_ok());
     }
 
-    // ── validate_pool_reorder_locking: skipped spec is locked ─────
+    // ── validate_queue_reorder_locking: skipped spec is locked ─────
 
     #[test]
-    fn validate_pool_reorder_locking_refuses_moving_skipped_spec() {
+    fn validate_queue_reorder_locking_refuses_moving_skipped_spec() {
         let dir = tempdir().unwrap();
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         let mut skipped = standalone_spec("spec-a");
         skipped.status = LoopSpecStatus::Skipped;
         db.insert_loop_spec(&skipped).unwrap();
         db.insert_loop_spec(&standalone_spec("spec-b")).unwrap();
-        db.insert_pool(&Pool {
-            id: "pool-1".to_string(),
-            name: "pool-1".to_string(),
+        db.insert_queue(&Queue {
+            id: "queue-1".to_string(),
+            name: "queue-1".to_string(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
-        db.append_pool_member("pool-1", "spec-a", None).unwrap();
-        db.append_pool_member("pool-1", "spec-b", None).unwrap();
-        let current = db.list_pool_member_spec_ids("pool-1").unwrap();
+        db.append_queue_member("queue-1", "spec-a", None).unwrap();
+        db.append_queue_member("queue-1", "spec-b", None).unwrap();
+        let current = db.list_queue_member_spec_ids("queue-1").unwrap();
 
         let order = vec!["spec-b".to_string(), "spec-a".to_string()];
-        let error = validate_pool_reorder_locking(&db, &current, &order).unwrap_err();
+        let error = validate_queue_reorder_locking(&db, &current, &order).unwrap_err();
         assert!(error.contains("spec-a"), "{error}");
         assert!(error.contains("skipped"), "{error}");
     }
@@ -12189,7 +11926,7 @@ mod additional_tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         };
         let json = loop_trigger_json(&lp);
@@ -12215,7 +11952,7 @@ mod additional_tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         };
         let json = loop_trigger_json(&lp);
@@ -12223,34 +11960,34 @@ mod additional_tests {
         assert_eq!(json["schedule"], "0 9 * * *");
     }
 
-    // ── validate_pool_reorder ─────────────────────────────────────
+    // ── validate_queue_reorder ─────────────────────────────────────
 
     #[test]
-    fn validate_pool_reorder_wrong_count() {
+    fn validate_queue_reorder_wrong_count() {
         let current = vec!["a".to_string(), "b".to_string()];
         let spec_ids = vec!["a".to_string()];
-        assert!(validate_pool_reorder(&current, &spec_ids).is_err());
+        assert!(validate_queue_reorder(&current, &spec_ids).is_err());
     }
 
     #[test]
-    fn validate_pool_reorder_duplicate() {
+    fn validate_queue_reorder_duplicate() {
         let current = vec!["a".to_string(), "b".to_string()];
         let spec_ids = vec!["a".to_string(), "a".to_string()];
-        assert!(validate_pool_reorder(&current, &spec_ids).is_err());
+        assert!(validate_queue_reorder(&current, &spec_ids).is_err());
     }
 
     #[test]
-    fn validate_pool_reorder_unknown_spec() {
+    fn validate_queue_reorder_unknown_spec() {
         let current = vec!["a".to_string(), "b".to_string()];
         let spec_ids = vec!["a".to_string(), "c".to_string()];
-        assert!(validate_pool_reorder(&current, &spec_ids).is_err());
+        assert!(validate_queue_reorder(&current, &spec_ids).is_err());
     }
 
     #[test]
-    fn validate_pool_reorder_valid() {
+    fn validate_queue_reorder_valid() {
         let current = vec!["a".to_string(), "b".to_string()];
         let spec_ids = vec!["b".to_string(), "a".to_string()];
-        assert!(validate_pool_reorder(&current, &spec_ids).is_ok());
+        assert!(validate_queue_reorder(&current, &spec_ids).is_ok());
     }
 
     // ── blueprint_json ────────────────────────────────────────────
@@ -12302,7 +12039,7 @@ mod coverage_tests {
         LoopSpecStatus, LoopStatus,
     };
     use crate::domain::models::{Agent, Cli};
-    use crate::domain::pools::Pool;
+    use crate::domain::queues::Queue;
     use tempfile::tempdir;
 
     fn standalone_spec(id: &str) -> LoopSpec {
@@ -12366,7 +12103,7 @@ mod coverage_tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         }
     }
@@ -13150,50 +12887,50 @@ mod coverage_tests {
         assert!(validate_node_position_conflict(&db, &node, "n2", 2).is_ok());
     }
 
-    // ── validate_pool_not_consumed edge cases ──────────────────────
+    // ── validate_queue_not_consumed edge cases ──────────────────────
 
     #[test]
-    fn pool_not_consumed_empty_pool() {
+    fn queue_not_consumed_empty_queue() {
         let dir = tempdir().unwrap();
         let db = Database::new(&dir.path().join("test.db")).unwrap();
-        db.insert_pool(&Pool {
-            id: "pool-e".into(),
+        db.insert_queue(&Queue {
+            id: "queue-e".into(),
             name: "empty".into(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
-        assert!(validate_pool_not_consumed(&db, "pool-e", "loop-1").is_ok());
+        assert!(validate_queue_not_consumed(&db, "queue-e", "loop-1").is_ok());
     }
 
     #[test]
-    fn pool_not_consumed_pending_spec() {
+    fn queue_not_consumed_pending_spec() {
         let dir = tempdir().unwrap();
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         db.insert_loop_spec(&standalone_spec("s1")).unwrap();
-        db.insert_pool(&Pool {
-            id: "pool-p".into(),
-            name: "pool-p".into(),
+        db.insert_queue(&Queue {
+            id: "queue-p".into(),
+            name: "queue-p".into(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
-        db.append_pool_member("pool-p", "s1", None).unwrap();
-        assert!(validate_pool_not_consumed(&db, "pool-p", "loop-other").is_ok());
+        db.append_queue_member("queue-p", "s1", None).unwrap();
+        assert!(validate_queue_not_consumed(&db, "queue-p", "loop-other").is_ok());
     }
 
     #[test]
-    fn pool_not_consumed_own_loop() {
+    fn queue_not_consumed_own_loop() {
         let dir = tempdir().unwrap();
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         db.insert_loop_spec(&running_spec("s-owned")).unwrap();
         db.insert_loop(&make_loop("loop-owner", LoopStatus::Running))
             .unwrap();
-        db.insert_pool(&Pool {
-            id: "pool-o".into(),
-            name: "pool-o".into(),
+        db.insert_queue(&Queue {
+            id: "queue-o".into(),
+            name: "queue-o".into(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
-        db.append_pool_member("pool-o", "s-owned", None).unwrap();
+        db.append_queue_member("queue-o", "s-owned", None).unwrap();
         insert_test_node(&db, "node-1", "s-owned");
         db.insert_loop_run(&loop_run_row(
             "run1",
@@ -13202,36 +12939,36 @@ mod coverage_tests {
             LoopRunStatus::Running,
         ))
         .unwrap();
-        assert!(validate_pool_not_consumed(&db, "pool-o", "loop-owner").is_ok());
+        assert!(validate_queue_not_consumed(&db, "queue-o", "loop-owner").is_ok());
     }
 
-    // ── validate_pool_member_removable edge cases ──────────────────
+    // ── validate_queue_member_removable edge cases ──────────────────
 
     #[test]
-    fn pool_member_removable_pending() {
+    fn queue_member_removable_pending() {
         let dir = tempdir().unwrap();
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         db.insert_loop_spec(&standalone_spec("s1")).unwrap();
-        db.insert_pool(&Pool {
-            id: "pool-r".into(),
-            name: "pool-r".into(),
+        db.insert_queue(&Queue {
+            id: "queue-r".into(),
+            name: "queue-r".into(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
-        assert!(validate_pool_member_removable(&db, "pool-r", "s1").is_ok());
+        assert!(validate_queue_member_removable(&db, "queue-r", "s1").is_ok());
     }
 
     #[test]
-    fn pool_member_removable_nonexistent() {
+    fn queue_member_removable_nonexistent() {
         let dir = tempdir().unwrap();
         let db = Database::new(&dir.path().join("test.db")).unwrap();
-        db.insert_pool(&Pool {
-            id: "pool-r".into(),
-            name: "pool-r".into(),
+        db.insert_queue(&Queue {
+            id: "queue-r".into(),
+            name: "queue-r".into(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
-        assert!(validate_pool_member_removable(&db, "pool-r", "ghost").is_ok());
+        assert!(validate_queue_member_removable(&db, "queue-r", "ghost").is_ok());
     }
 
     // ── resolve_reported_run: stale statuses ───────────────────────
@@ -13268,7 +13005,7 @@ mod coverage_tests {
             .unwrap_or(false));
     }
 
-    // ── validate_pool_reorder_locking edge cases ───────────────────
+    // ── validate_queue_reorder_locking edge cases ───────────────────
 
     #[test]
     fn reorder_locking_all_pending() {
@@ -13277,18 +13014,18 @@ mod coverage_tests {
         db.insert_loop_spec(&standalone_spec("a")).unwrap();
         db.insert_loop_spec(&standalone_spec("b")).unwrap();
         db.insert_loop_spec(&standalone_spec("c")).unwrap();
-        db.insert_pool(&Pool {
+        db.insert_queue(&Queue {
             id: "p1".into(),
             name: "p1".into(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
         for id in ["a", "b", "c"] {
-            db.append_pool_member("p1", id, None).unwrap();
+            db.append_queue_member("p1", id, None).unwrap();
         }
-        let current = db.list_pool_member_spec_ids("p1").unwrap();
+        let current = db.list_queue_member_spec_ids("p1").unwrap();
         let order = vec!["c".into(), "a".into(), "b".into()];
-        assert!(validate_pool_reorder_locking(&db, &current, &order).is_ok());
+        assert!(validate_queue_reorder_locking(&db, &current, &order).is_ok());
     }
 
     #[test]
@@ -13299,17 +13036,17 @@ mod coverage_tests {
         f.status = LoopSpecStatus::Failed;
         db.insert_loop_spec(&f).unwrap();
         db.insert_loop_spec(&standalone_spec("p")).unwrap();
-        db.insert_pool(&Pool {
+        db.insert_queue(&Queue {
             id: "p1".into(),
             name: "p1".into(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
-        db.append_pool_member("p1", "f", None).unwrap();
-        db.append_pool_member("p1", "p", None).unwrap();
-        let current = db.list_pool_member_spec_ids("p1").unwrap();
+        db.append_queue_member("p1", "f", None).unwrap();
+        db.append_queue_member("p1", "p", None).unwrap();
+        let current = db.list_queue_member_spec_ids("p1").unwrap();
         let order = vec!["p".into(), "f".into()];
-        let err = validate_pool_reorder_locking(&db, &current, &order).unwrap_err();
+        let err = validate_queue_reorder_locking(&db, &current, &order).unwrap_err();
         assert!(err.contains("failed"), "{err}");
     }
 
@@ -13321,17 +13058,17 @@ mod coverage_tests {
         s.status = LoopSpecStatus::Skipped;
         db.insert_loop_spec(&s).unwrap();
         db.insert_loop_spec(&standalone_spec("p")).unwrap();
-        db.insert_pool(&Pool {
+        db.insert_queue(&Queue {
             id: "p1".into(),
             name: "p1".into(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
-        db.append_pool_member("p1", "s", None).unwrap();
-        db.append_pool_member("p1", "p", None).unwrap();
-        let current = db.list_pool_member_spec_ids("p1").unwrap();
+        db.append_queue_member("p1", "s", None).unwrap();
+        db.append_queue_member("p1", "p", None).unwrap();
+        let current = db.list_queue_member_spec_ids("p1").unwrap();
         let order = vec!["p".into(), "s".into()];
-        let err = validate_pool_reorder_locking(&db, &current, &order).unwrap_err();
+        let err = validate_queue_reorder_locking(&db, &current, &order).unwrap_err();
         assert!(err.contains("skipped"), "{err}");
     }
 
@@ -13342,24 +13079,24 @@ mod coverage_tests {
         db.insert_loop_spec(&running_spec("r")).unwrap();
         db.insert_loop_spec(&standalone_spec("p1")).unwrap();
         db.insert_loop_spec(&standalone_spec("p2")).unwrap();
-        db.insert_pool(&Pool {
+        db.insert_queue(&Queue {
             id: "p1".into(),
             name: "p1".into(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
-        db.append_pool_member("p1", "r", None).unwrap();
-        db.append_pool_member("p1", "p1", None).unwrap();
-        db.append_pool_member("p1", "p2", None).unwrap();
-        let current = db.list_pool_member_spec_ids("p1").unwrap();
+        db.append_queue_member("p1", "r", None).unwrap();
+        db.append_queue_member("p1", "p1", None).unwrap();
+        db.append_queue_member("p1", "p2", None).unwrap();
+        let current = db.list_queue_member_spec_ids("p1").unwrap();
         let order = vec!["r".into(), "p2".into(), "p1".into()];
-        assert!(validate_pool_reorder_locking(&db, &current, &order).is_ok());
+        assert!(validate_queue_reorder_locking(&db, &current, &order).is_ok());
     }
 
-    // ── validate_pool_reorder: all permutations ────────────────────
+    // ── validate_queue_reorder: all permutations ────────────────────
 
     #[test]
-    fn pool_reorder_all_perms_of_three() {
+    fn queue_reorder_all_perms_of_three() {
         let current = vec!["a".into(), "b".into(), "c".into()];
         for perm in [
             ["a", "b", "c"],
@@ -13370,21 +13107,21 @@ mod coverage_tests {
             ["c", "b", "a"],
         ] {
             let reordered: Vec<String> = perm.into_iter().map(String::from).collect();
-            assert!(validate_pool_reorder(&current, &reordered).is_ok());
+            assert!(validate_queue_reorder(&current, &reordered).is_ok());
         }
     }
 
     #[test]
-    fn pool_reorder_empty() {
-        assert!(validate_pool_reorder(&[], &[]).is_ok());
+    fn queue_reorder_empty() {
+        assert!(validate_queue_reorder(&[], &[]).is_ok());
     }
 
     #[test]
-    fn pool_reorder_large_pool() {
+    fn queue_reorder_large_queue() {
         let current: Vec<String> = (0..100).map(|i| format!("s{i}")).collect();
         let mut reordered = current.clone();
         reordered.reverse();
-        assert!(validate_pool_reorder(&current, &reordered).is_ok());
+        assert!(validate_queue_reorder(&current, &reordered).is_ok());
     }
 
     // ── validate_ensemble_members: boundaries ──────────────────────
@@ -14589,7 +14326,7 @@ mod endpoint_tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         };
         db.insert_loop(&lp).unwrap();

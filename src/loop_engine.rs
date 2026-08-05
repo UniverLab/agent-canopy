@@ -37,7 +37,7 @@ pub struct LoopEngine {
     /// concurrently across every loop this engine drives. Shared (not
     /// per-run) so an 8-member ensemble in one loop can't starve another
     /// loop's ensemble running at the same time — they queue for the same
-    /// pool of permits.
+    /// queue of permits.
     ensemble_concurrency: Arc<Semaphore>,
     /// Backing store (S1) for resolving skills pinned on agent nodes (S2)
     /// at spawn time. `None` in engines built without one (most tests) —
@@ -86,7 +86,7 @@ struct NodeExecution {
 }
 
 /// (B17) Distinct failure mode for [`LoopEngine::run_loop_dispatch`]'s launch
-/// guard: the loop's effective spec set (bound specs, or the given pool's
+/// guard: the loop's effective spec set (bound specs, or the given queue's
 /// pending members) was empty, so the run never actually launched. Unlike
 /// every other error `run_loop_dispatch` can return, this one must never flip
 /// the loop to `Failed` — [`LoopEngine::start_background_run`] and
@@ -136,7 +136,7 @@ impl LoopEngine {
     }
 
     /// Same as [`Self::start_background`], but optionally drives the loop's
-    /// pending pool specs (see [`Self::run_loop`]) and/or overrides the
+    /// pending queue specs (see [`Self::run_loop`]) and/or overrides the
     /// workdir for this run only.
     ///
     /// This is a fresh dispatch, not a resume — it backs `loop_run`, the tool
@@ -151,12 +151,12 @@ impl LoopEngine {
     pub fn start_background_run(
         self: Arc<Self>,
         loop_id: String,
-        pool_id: Option<String>,
+        queue_id: Option<String>,
         workdir_override: Option<String>,
     ) {
         tokio::spawn(async move {
             if let Err(error) = self
-                .run_loop(loop_id.clone(), pool_id, workdir_override)
+                .run_loop(loop_id.clone(), queue_id, workdir_override)
                 .await
             {
                 if error.downcast_ref::<EmptySpecSetError>().is_some() {
@@ -202,24 +202,24 @@ impl LoopEngine {
 
     /// Run `loop_id`'s specs through its graph (R2).
     ///
-    /// With `pool_id`: runs the pool's pending members, in the pool's queue
-    /// order, instead of the loop's own bound specs. Pool membership never
+    /// With `queue_id`: runs the queue's pending members, in the queue's queue
+    /// order, instead of the loop's own bound specs. Queue membership never
     /// mutates the specs themselves — they stay standalone (`loop_id: None`)
-    /// so the same pool can be run by different loops over time.
+    /// so the same queue can be run by different loops over time.
     ///
-    /// A pool run is *live* (R6): the "next pending" spec is re-queried from
-    /// the pool at every spec boundary via
-    /// [`Database::pool_next_pending_spec_id`], never off a list captured at
-    /// launch. That's what lets `pool_add_spec`/`pool_reorder` calls made
+    /// A queue run is *live* (R6): the "next pending" spec is re-queried from
+    /// the queue at every spec boundary via
+    /// [`Database::queue_next_pending_spec_id`], never off a list captured at
+    /// launch. That's what lets `queue_add_spec`/`queue_reorder` calls made
     /// while the run is in flight actually change what runs next — the run
     /// ends only when a pick finds no pending member left. A bound run (no
-    /// `pool_id`) keeps the pre-pool behavior below: its spec list is fixed
+    /// `queue_id`) keeps the pre-queue behavior below: its spec list is fixed
     /// at launch.
     ///
     /// `workdir_override`, when set, wins over `loop.workdir` for this run
     /// only — the loop's own `workdir` is left untouched.
     ///
-    /// Without `pool_id`: identical to the pre-pool behavior (bound specs,
+    /// Without `queue_id`: identical to the pre-queue behavior (bound specs,
     /// `loop.workdir`).
     ///
     /// Equivalent to a fresh (non-resumed) dispatch — see
@@ -228,17 +228,17 @@ impl LoopEngine {
     pub async fn run_loop(
         &self,
         loop_id: String,
-        pool_id: Option<String>,
+        queue_id: Option<String>,
         workdir_override: Option<String>,
     ) -> Result<()> {
-        self.run_loop_dispatch(loop_id, pool_id, workdir_override, false)
+        self.run_loop_dispatch(loop_id, queue_id, workdir_override, false)
             .await
     }
 
     /// Core of [`Self::run_loop`], plus the one bit `run_loop`'s public
     /// signature can't carry: whether this call is *resuming* an
     /// already-in-flight run ([`Self::resume_background`], the sole path
-    /// behind `loop_continue` and interrupted-pool/autorun resumption) or a
+    /// behind `loop_continue` and interrupted-queue/autorun resumption) or a
     /// fresh dispatch (`loop_run`, including relaunching a `paused` loop
     /// directly, and the loop's initial launch).
     ///
@@ -254,7 +254,7 @@ impl LoopEngine {
     async fn run_loop_dispatch(
         &self,
         loop_id: String,
-        pool_id: Option<String>,
+        queue_id: Option<String>,
         workdir_override: Option<String>,
         is_resume: bool,
     ) -> Result<()> {
@@ -270,7 +270,7 @@ impl LoopEngine {
         // untouched and record no run, so monitoring never sees a false
         // `completed` over a backlog the caller simply failed to point this
         // launch at (the 2026-07-14T14:16:31Z incident).
-        if let Some(message) = self.empty_launch_check(&loop_id, pool_id.as_deref())? {
+        if let Some(message) = self.empty_launch_check(&loop_id, queue_id.as_deref())? {
             return Err(EmptySpecSetError(message).into());
         }
 
@@ -284,7 +284,7 @@ impl LoopEngine {
         // of the atomic claim finds the loop already `Running` and returns a
         // silent no-op rather than starting a duplicate run that would
         // supersede the winner's in-flight node the moment it reached the same
-        // node. It touches nothing (no status flip, no pool context, no
+        // node. It touches nothing (no status flip, no queue context, no
         // notification), leaving the loop exactly as the winning dispatch left it.
         if !self.db.claim_loop_for_run(&loop_id, chrono::Utc::now())? {
             tracing::info!(
@@ -294,16 +294,16 @@ impl LoopEngine {
             );
             return Ok(());
         }
-        // Persist which pool (if any) this run is drawing from *before* the
+        // Persist which queue (if any) this run is drawing from *before* the
         // first spec executes, so an interruption (quota failure, daemon
         // crash) leaves behind the context every resume path needs — a
         // resumed run must never fall back to the loop's own (often empty)
         // bound specs. `None` for a bound-spec run, overwriting whatever a
         // previous run against this loop may have left behind.
         self.db
-            .set_loop_active_run_pool(&loop_id, pool_id.as_deref())?;
+            .set_loop_active_run_queue(&loop_id, queue_id.as_deref())?;
 
-        // The run's `workdir` param wins over `loop.workdir` — a pool run can
+        // The run's `workdir` param wins over `loop.workdir` — a queue run can
         // point the same loop's graph at a different checkout without
         // mutating the loop itself.
         let workdir = workdir_override.unwrap_or_else(|| lp.workdir.clone());
@@ -312,14 +312,14 @@ impl LoopEngine {
         // `loop_run`, a cron/watch trigger) and a resume (`loop_continue`,
         // autorun's auto-reset-and-resume) alike — every path that reaches
         // this function is a run actually starting to execute.
-        let (done, total_specs) = self.spec_progress(&loop_id, pool_id.as_deref())?;
+        let (done, total_specs) = self.spec_progress(&loop_id, queue_id.as_deref())?;
         // "Resumed" vs "Started": a resume of an in-flight run (autorun /
         // loop_continue), or any dispatch where prior specs already completed,
         // shouldn't read as the loop starting over from scratch. The first
         // spec this dispatch will work is surfaced so the toast says what's
         // next, not just a count.
         let resumed = is_resume || done > 0;
-        let first_pending = self.first_pending_spec_name(&loop_id, pool_id.as_deref())?;
+        let first_pending = self.first_pending_spec_name(&loop_id, queue_id.as_deref())?;
         self.notification_service.notify_loop_started(
             &lp.name,
             total_specs,
@@ -334,9 +334,9 @@ impl LoopEngine {
         // see `render_completion_hook_prompt`.
         let mut completed_specs: Vec<(String, String)> = Vec::new();
 
-        match &pool_id {
-            Some(pool_id) => {
-                // R3 (B18): a pool member can be left `running` with no live
+        match &queue_id {
+            Some(queue_id) => {
+                // R3 (B18): a queue member can be left `running` with no live
                 // node run behind it by a path G2 boot reconcile never
                 // touches (reconcile only reconciles a loop that was itself
                 // `Running` at boot — see `reconcile_orphaned_loops`). Surface
@@ -348,33 +348,33 @@ impl LoopEngine {
                 // Auto-resetting would risk yanking a spec out from under a
                 // dispatch that's still actively working it. Recovery stays
                 // the documented manual path: `loop_reset` (see
-                // `pool_has_incomplete_members`'s own guard below, which
+                // `queue_has_incomplete_members`'s own guard below, which
                 // leaves the loop `running` rather than completing out from
                 // under a member stuck like this).
                 for spec_id in self
                     .db
-                    .pool_stale_running_members(pool_id, crate::system::boot_id().as_deref())?
+                    .queue_stale_running_members(queue_id, crate::system::boot_id().as_deref())?
                 {
                     tracing::warn!(
-                        "Loop '{}' pool run against '{}': member spec '{}' is 'running' with no \
+                        "Loop '{}' queue run against '{}': member spec '{}' is 'running' with no \
                          live node run in this daemon's lifetime; leaving it as-is. Reset it via \
                          loop_reset to resume if it's genuinely stuck.",
                         loop_id,
-                        pool_id,
+                        queue_id,
                         spec_id
                     );
                 }
                 // B35: When resuming (retry_current_node), re-dispatch the
                 // spec that was already `running` before falling through to
-                // the pending-picker. Without this, pool_next_pending_spec_id
+                // the pending-picker. Without this, queue_next_pending_spec_id
                 // skips the running spec (it only picks `pending`) and the
                 // loop advances to the next queue member, stranding the
                 // original spec in `running` with no active run.
                 if is_resume {
-                    if let Some(running_spec_id) = self.db.pool_running_spec_id(pool_id)? {
+                    if let Some(running_spec_id) = self.db.queue_running_spec_id(queue_id)? {
                         if let Some(spec) = self.db.get_loop_spec(&running_spec_id)? {
                             match self
-                                .run_spec(&lp, &spec, &workdir, is_resume, Some(pool_id.as_str()))
+                                .run_spec(&lp, &spec, &workdir, is_resume, Some(queue_id.as_str()))
                                 .await?
                             {
                                 SpecExecutionOutcome::Completed { summary } => {
@@ -400,10 +400,10 @@ impl LoopEngine {
                     }
                     // Live pick: fresh query, not a frozen list. Only ever
                     // returns a spec whose status is `pending` (defense in
-                    // depth — even if the pool's stored order were ever
+                    // depth — even if the queue's stored order were ever
                     // corrupted to place a running/completed member where a
                     // pending one belongs, this filter still won't pick it).
-                    let Some(spec_id) = self.db.pool_next_pending_spec_id(pool_id)? else {
+                    let Some(spec_id) = self.db.queue_next_pending_spec_id(queue_id)? else {
                         break;
                     };
                     let Some(spec) = self.db.get_loop_spec(&spec_id)? else {
@@ -411,7 +411,7 @@ impl LoopEngine {
                     };
 
                     match self
-                        .run_spec(&lp, &spec, &workdir, is_resume, Some(pool_id.as_str()))
+                        .run_spec(&lp, &spec, &workdir, is_resume, Some(queue_id.as_str()))
                         .await?
                     {
                         SpecExecutionOutcome::Completed { summary } => {
@@ -457,37 +457,37 @@ impl LoopEngine {
             }
         }
 
-        // A pool run's live-pick loop above only ever breaks when no
+        // A queue run's live-pick loop above only ever breaks when no
         // `pending` member remains — but a member can still be stuck
         // `running`/`failed` from a prior interrupted run that was never
-        // reset. That isn't a genuinely finished pool, so the loop must not
+        // reset. That isn't a genuinely finished queue, so the loop must not
         // be marked `completed` out from under it (it would silently strand
         // those members forever, exactly the false-completion this guards
         // against).
-        if let Some(pool_id) = &pool_id {
-            if self.db.pool_has_incomplete_members(pool_id)? {
+        if let Some(queue_id) = &queue_id {
+            if self.db.queue_has_incomplete_members(queue_id)? {
                 tracing::warn!(
-                    "Loop '{}' pool run against '{}' found no pending member to pick, but the \
-                     pool still has incomplete (non completed/skipped) member(s); leaving the \
+                    "Loop '{}' queue run against '{}' found no pending member to pick, but the \
+                     queue still has incomplete (non completed/skipped) member(s); leaving the \
                      loop as-is rather than marking it completed. Reset the stuck member(s) via \
                      loop_reset to resume.",
                     loop_id,
-                    pool_id
+                    queue_id
                 );
                 return Ok(());
             }
         }
 
-        // The run is genuinely finished, but keep `active_run_pool_id` as
+        // The run is genuinely finished, but keep `active_run_queue_id` as
         // last-run context rather than clearing it (B31): a finished
-        // pool-driven loop with no bound specs of its own would otherwise
+        // queue-driven loop with no bound specs of its own would otherwise
         // lose the only link back to the queue it ran, so `loop list` /
         // `loop info` render a misleading `0/0` instead of its real `n/n`
         // (`loop_progress` in `daemon/loop_cli.rs` reads this field). B8's
         // anti-pollution guarantee is unaffected: every launch path
         // re-persists this field before the first spec runs (the
-        // unconditional `set_loop_active_run_pool` above), so a later fresh
-        // `loop_run` against a different pool — or a bound-spec run (`None`)
+        // unconditional `set_loop_active_run_queue` above), so a later fresh
+        // `loop_run` against a different queue — or a bound-spec run (`None`)
         // — overwrites this value rather than inheriting it.
         self.db.update_loop_status(
             &loop_id,
@@ -495,11 +495,11 @@ impl LoopEngine {
             None,
             Some(chrono::Utc::now()),
         )?;
-        let (done, total) = self.spec_progress(&loop_id, pool_id.as_deref())?;
+        let (done, total) = self.spec_progress(&loop_id, queue_id.as_deref())?;
         // (B17) This dispatch's own completed-spec count is what makes a
         // completion "real": a run that never actually executed a spec this
         // dispatch (every bound spec was already completed/skipped, or —
-        // resuming a pool — the last pending member got skipped out from
+        // resuming a queue — the last pending member got skipped out from
         // under it) still legitimately transitions to `Completed`, but must
         // never fire `on_completed` for work it didn't do.
         let executed_any_spec = !completed_specs.is_empty();
@@ -625,7 +625,7 @@ impl LoopEngine {
     }
 
     /// (B17) `Ok(Some(message))` if launching `loop_id` (optionally against
-    /// `pool_id`) would find no effective spec to run — `message` is the
+    /// `queue_id`) would find no effective spec to run — `message` is the
     /// actionable, human/LLM-readable error to surface. `Ok(None)` means the
     /// launch may proceed.
     ///
@@ -637,26 +637,26 @@ impl LoopEngine {
     /// check from `run_loop_dispatch` itself.
     ///
     /// Emptiness is defined per launch mode:
-    /// - Bound specs (`pool_id` is `None`): the loop has *zero* specs bound
+    /// - Bound specs (`queue_id` is `None`): the loop has *zero* specs bound
     ///   to it at all — mirrors the incident exactly (a loop whose specs all
-    ///   live in a pool has no bound specs). Deliberately not "every bound
+    ///   live in a queue has no bound specs). Deliberately not "every bound
     ///   spec is already completed/skipped" — a loop's own bound specs
     ///   belong to it 1:1, so if they're all done the loop genuinely is
     ///   finished (see the zero-execution completion path in
     ///   `run_loop_dispatch`, which still completes but never fires the
     ///   hook).
-    /// - A pool (`pool_id` is `Some`): the pool has no `pending` member *and*
+    /// - A queue (`queue_id` is `Some`): the queue has no `pending` member *and*
     ///   no other non-terminal (`running`/`failed`) member left either — i.e.
-    ///   [`Database::pool_has_incomplete_members`] is false. Unlike bound
-    ///   specs, a pool is a shared queue another loop or a stale relaunch can
+    ///   [`Database::queue_has_incomplete_members`] is false. Unlike bound
+    ///   specs, a queue is a shared queue another loop or a stale relaunch can
     ///   easily point at by mistake, so "every member already done" is
     ///   treated as an error here rather than a silent, do-nothing
-    ///   completion (regression (b): a pool run where every member is
+    ///   completion (regression (b): a queue run where every member is
     ///   already completed).
     pub fn empty_launch_check(
         &self,
         loop_id: &str,
-        pool_id: Option<&str>,
+        queue_id: Option<&str>,
     ) -> Result<Option<String>> {
         let Some(lp) = self.db.get_loop(loop_id)? else {
             // Not-found is handled by the caller (`run_loop_dispatch` bails
@@ -665,40 +665,40 @@ impl LoopEngine {
             return Ok(None);
         };
 
-        let is_empty = match pool_id {
-            Some(pool_id) => !self.db.pool_has_incomplete_members(pool_id)?,
+        let is_empty = match queue_id {
+            Some(queue_id) => !self.db.queue_has_incomplete_members(queue_id)?,
             None => self.db.list_loop_specs(loop_id)?.is_empty(),
         };
         if !is_empty {
             return Ok(None);
         }
 
-        Ok(Some(self.empty_spec_set_message(&lp, pool_id)?))
+        Ok(Some(self.empty_spec_set_message(&lp, queue_id)?))
     }
 
     /// Build the actionable error text for [`Self::empty_launch_check`].
     ///
-    /// Pool membership doesn't record which loop(s) normally draw from it
-    /// (pool specs stay standalone — see [`Self::run_loop`]'s doc), so the
-    /// one concrete, discoverable link back to "which pool should this loop
-    /// use?" is the loop's own [`crate::domain::loops::Loop::active_run_pool_id`]
-    /// — the pool its last real run drew from. This is exactly requirement 3's
-    /// guard rail: a pool-less relaunch of a loop that was last pool-driven
-    /// names that pool so a recovery agent can retry correctly instead of
-    /// the launch silently discarding the pool context.
+    /// Queue membership doesn't record which loop(s) normally draw from it
+    /// (queue specs stay standalone — see [`Self::run_loop`]'s doc), so the
+    /// one concrete, discoverable link back to "which queue should this loop
+    /// use?" is the loop's own [`crate::domain::loops::Loop::active_run_queue_id`]
+    /// — the queue its last real run drew from. This is exactly requirement 3's
+    /// guard rail: a queue-less relaunch of a loop that was last queue-driven
+    /// names that queue so a recovery agent can retry correctly instead of
+    /// the launch silently discarding the queue context.
     fn empty_spec_set_message(
         &self,
         lp: &crate::domain::loops::Loop,
-        pool_id: Option<&str>,
+        queue_id: Option<&str>,
     ) -> Result<String> {
-        match pool_id {
-            Some(pool_id) => {
-                let total = self.db.list_pool_member_spec_ids(pool_id)?.len();
+        match queue_id {
+            Some(queue_id) => {
+                let total = self.db.list_queue_member_spec_ids(queue_id)?.len();
                 Ok(format!(
                     "Loop '{}' has no specs to run: queue '{}' has {} member(s), none pending \
                      (all already completed/skipped, or the queue is empty). Add pending specs \
                      to the queue, or pass a different queue_id.",
-                    lp.name, pool_id, total
+                    lp.name, queue_id, total
                 ))
             }
             None => {
@@ -707,11 +707,11 @@ impl LoopEngine {
                      given.",
                     lp.name
                 );
-                match &lp.active_run_pool_id {
-                    Some(last_pool) => {
+                match &lp.active_run_queue_id {
+                    Some(last_queue) => {
                         message.push_str(&format!(
-                            " Its last run drew from queue '{last_pool}' — pass queue_id: \
-                             \"{last_pool}\" to relaunch against it."
+                            " Its last run drew from queue '{last_queue}' — pass queue_id: \
+                             \"{last_queue}\" to relaunch against it."
                         ));
                     }
                     None => {
@@ -723,11 +723,11 @@ impl LoopEngine {
         }
     }
 
-    /// Resume `loop_id` in the background using whatever run context (pool
-    /// or bound-spec) it last persisted via [`Database::set_loop_active_run_pool`].
+    /// Resume `loop_id` in the background using whatever run context (queue
+    /// or bound-spec) it last persisted via [`Database::set_loop_active_run_queue`].
     /// The one path every "continue where this loop left off" entry point —
     /// the scheduler's autorun auto-reset-and-resume, `loop_continue` — must
-    /// go through, so a pool run is never silently swapped for the loop's own
+    /// go through, so a queue run is never silently swapped for the loop's own
     /// (typically empty) bound specs.
     ///
     /// This is the *only* entry point allowed to carry `is_resume = true`
@@ -737,15 +737,15 @@ impl LoopEngine {
     /// [`Self::start_background_run`] instead and always gets a fresh
     /// baseline.
     pub fn resume_background(self: Arc<Self>, loop_id: String) {
-        let pool_id = self
+        let queue_id = self
             .db
             .get_loop(&loop_id)
             .ok()
             .flatten()
-            .and_then(|lp| lp.active_run_pool_id);
+            .and_then(|lp| lp.active_run_queue_id);
         tokio::spawn(async move {
             if let Err(error) = self
-                .run_loop_dispatch(loop_id.clone(), pool_id, None, true)
+                .run_loop_dispatch(loop_id.clone(), queue_id, None, true)
                 .await
             {
                 if error.downcast_ref::<EmptySpecSetError>().is_some() {
@@ -772,7 +772,7 @@ impl LoopEngine {
         spec: &LoopSpec,
         workdir: &str,
         is_resume: bool,
-        pool_id: Option<&str>,
+        queue_id: Option<&str>,
     ) -> Result<SpecExecutionOutcome> {
         let spec_details = self
             .db
@@ -837,7 +837,7 @@ impl LoopEngine {
         //   silently reused because status alone couldn't distinguish "same
         //   attempt, paused" from "different, abandoned attempt".
         // - `spec.status == Running` — this spec itself has already started
-        //   (as opposed to a pending/failed spec a resumed pool/loop run is
+        //   (as opposed to a pending/failed spec a resumed queue/loop run is
         //   only now reaching for the first time, which must capture fresh
         //   like any other new entry).
         //
@@ -877,15 +877,15 @@ impl LoopEngine {
         let mut resumable_sessions: HashMap<String, String> = HashMap::new();
 
         // RS3: the context group this spec belongs to within the running
-        // queue, if any. Only pool/queue runs carry a group (a loop's own
-        // bound specs never do — `pool_id` is `None` there), so ungrouped and
+        // queue, if any. Only queue/queue runs carry a group (a loop's own
+        // bound specs never do — `queue_id` is `None` there), so ungrouped and
         // non-queue specs never cross-resume. This is the ONE deliberate
         // exception to RS2's "first visit is cold" rule: the first visit of a
         // grouped spec to a node resumes the session captured by the previous
         // successfully-completed grouped sibling on that same node (see the
         // seed below and [`Database::group_session_for_node`]).
-        let spec_group = match pool_id {
-            Some(pid) => self.db.pool_member_group(pid, &spec.id)?,
+        let spec_group = match queue_id {
+            Some(pid) => self.db.queue_member_group(pid, &spec.id)?,
             None => None,
         };
 
@@ -980,7 +980,7 @@ impl LoopEngine {
                     // (map already populated) keep RS2's in-dispatch session and
                     // never re-consult the group.
                     if resume_candidate.is_none() {
-                        if let (Some(group), Some(pid)) = (spec_group.as_deref(), pool_id) {
+                        if let (Some(group), Some(pid)) = (spec_group.as_deref(), queue_id) {
                             resume_candidate = self.db.group_session_for_node(
                                 pid,
                                 group,
@@ -1191,7 +1191,7 @@ impl LoopEngine {
                             None,
                             Some(chrono::Utc::now()),
                         )?;
-                        self.notify_spec_completed(lp, spec, pool_id)?;
+                        self.notify_spec_completed(lp, spec, queue_id)?;
                         return Ok(SpecExecutionOutcome::Completed {
                             summary: final_execution.summary,
                         });
@@ -1295,7 +1295,7 @@ impl LoopEngine {
                         None,
                         Some(chrono::Utc::now()),
                     )?;
-                    self.notify_spec_completed(lp, spec, pool_id)?;
+                    self.notify_spec_completed(lp, spec, queue_id)?;
                     return Ok(SpecExecutionOutcome::Completed {
                         summary: final_execution.summary,
                     });
@@ -1767,13 +1767,13 @@ impl LoopEngine {
     }
 
     /// `(done, total)` specs for `loop_id`'s current run — the loop's bound
-    /// specs, or `pool_id`'s members when this run is drawing from a pool.
+    /// specs, or `queue_id`'s members when this run is drawing from a queue.
     /// `done` counts specs already `completed`; skipped/pending/running/failed
     /// specs count toward `total` but not `done`.
-    fn spec_progress(&self, loop_id: &str, pool_id: Option<&str>) -> Result<(usize, usize)> {
-        match pool_id {
-            Some(pool_id) => {
-                let ids = self.db.list_pool_member_spec_ids(pool_id)?;
+    fn spec_progress(&self, loop_id: &str, queue_id: Option<&str>) -> Result<(usize, usize)> {
+        match queue_id {
+            Some(queue_id) => {
+                let ids = self.db.list_queue_member_spec_ids(queue_id)?;
                 let mut done = 0;
                 for id in &ids {
                     if let Some(spec) = self.db.get_loop_spec(id)? {
@@ -1803,10 +1803,10 @@ impl LoopEngine {
         &self,
         lp: &crate::domain::loops::Loop,
         spec: &LoopSpec,
-        pool_id: Option<&str>,
+        queue_id: Option<&str>,
     ) -> Result<()> {
-        let (done, total) = self.spec_progress(&lp.id, pool_id)?;
-        let next_pending = self.first_pending_spec_name(&lp.id, pool_id)?;
+        let (done, total) = self.spec_progress(&lp.id, queue_id)?;
+        let next_pending = self.first_pending_spec_name(&lp.id, queue_id)?;
         self.notification_service.notify_spec_completed(
             &lp.name,
             &spec.name,
@@ -1817,17 +1817,17 @@ impl LoopEngine {
         Ok(())
     }
 
-    /// Name of the next spec this run will work: the pool's next pending
-    /// member for a pool run, else the loop's first `running`-or-`pending`
+    /// Name of the next spec this run will work: the queue's next pending
+    /// member for a queue run, else the loop's first `running`-or-`pending`
     /// bound spec in position order. `None` when nothing is left to do.
     fn first_pending_spec_name(
         &self,
         loop_id: &str,
-        pool_id: Option<&str>,
+        queue_id: Option<&str>,
     ) -> Result<Option<String>> {
-        match pool_id {
-            Some(pool_id) => {
-                let Some(spec_id) = self.db.pool_next_pending_spec_id(pool_id)? else {
+        match queue_id {
+            Some(queue_id) => {
+                let Some(spec_id) = self.db.queue_next_pending_spec_id(queue_id)? else {
                     return Ok(None);
                 };
                 Ok(self.db.get_loop_spec(&spec_id)?.map(|spec| spec.name))
@@ -3937,7 +3937,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         };
         let spec = crate::domain::loops::LoopSpec {
@@ -4128,7 +4128,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         };
         let spec = crate::domain::loops::LoopSpec {
@@ -5060,7 +5060,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         };
         let spec = LoopSpec {
@@ -5230,7 +5230,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         };
         let spec = LoopSpec {
@@ -6280,11 +6280,11 @@ echo done
 
     /// Build a loop with a single loop-level agent node backed by the argv-echo
     /// `resume-cli` (set-at-spawn capture + resume-by-id), queue `member_specs`
-    /// into `pool-1`, run the pool, and hand back the argv log path plus the db.
+    /// into `queue-1`, run the queue, and hand back the argv log path plus the db.
     /// Each grouped member shares the one loop-level node id `node-impl`, which
     /// is exactly what a warm-context queue looks like: several small specs
     /// draining one loop graph.
-    async fn run_grouped_pool(
+    async fn run_grouped_queue(
         member_specs: &[(&str, Option<&str>)],
     ) -> (Arc<Database>, std::path::PathBuf) {
         let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
@@ -6304,9 +6304,9 @@ echo done
             db.insert_loop_spec(&standalone_spec(spec_id, (position as i64) + 1))
                 .unwrap();
         }
-        insert_pool_with_grouped_members(&db, "pool-1", member_specs);
+        insert_queue_with_grouped_members(&db, "queue-1", member_specs);
 
-        // Loop-level agent node: every pool member with no graph of its own
+        // Loop-level agent node: every queue member with no graph of its own
         // drains this shared node, so grouped siblings share the node id.
         db.insert_loop_node(&LoopNode {
             id: "node-impl".to_string(),
@@ -6322,7 +6322,7 @@ echo done
 
         let guard = HomeGuard::set(home.path());
         engine
-            .run_loop(loop_id.clone(), Some("pool-1".to_string()), None)
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
             .await
             .unwrap();
         drop(guard);
@@ -6347,7 +6347,7 @@ echo done
         // spec-b in the same group resumes it on its first node run and records
         // the SAME session id — the ONE exception to RS2's "first visit cold".
         let (db, argv_file) =
-            run_grouped_pool(&[("spec-a", Some("ctx")), ("spec-b", Some("ctx"))]).await;
+            run_grouped_queue(&[("spec-a", Some("ctx")), ("spec-b", Some("ctx"))]).await;
 
         assert_eq!(
             db.get_loop_spec("spec-a").unwrap().unwrap().status,
@@ -6376,7 +6376,7 @@ echo done
     async fn ungrouped_specs_never_cross_resume() {
         // RS7: with no group, each spec cold-starts — spec-b mints its OWN
         // set-at-spawn session and never touches spec-a's.
-        let (db, argv_file) = run_grouped_pool(&[("spec-a", None), ("spec-b", None)]).await;
+        let (db, argv_file) = run_grouped_queue(&[("spec-a", None), ("spec-b", None)]).await;
 
         let sid_a = impl_session(&db, "spec-a").expect("spec-a captures a session");
         let sid_b = impl_session(&db, "spec-b").expect("spec-b captures its own session");
@@ -6420,9 +6420,9 @@ echo done
         spec_2.description = Some("SPEC-2-MARKER: rag ingestion pipeline".to_string());
         db.insert_loop_spec(&spec_1).unwrap();
         db.insert_loop_spec(&spec_2).unwrap();
-        insert_pool_with_grouped_members(
+        insert_queue_with_grouped_members(
             &db,
-            "pool-1",
+            "queue-1",
             &[("rag-1", Some("rag")), ("rag-2", Some("rag"))],
         );
 
@@ -6442,7 +6442,7 @@ echo done
 
         let guard = HomeGuard::set(home.path());
         engine
-            .run_loop(loop_id.clone(), Some("pool-1".to_string()), None)
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
             .await
             .unwrap();
         drop(guard);
@@ -6507,9 +6507,9 @@ echo done
         spec_2.description = Some("DAEMON-SPEC-2: watchdog heartbeat timeout".to_string());
         db.insert_loop_spec(&spec_1).unwrap();
         db.insert_loop_spec(&spec_2).unwrap();
-        insert_pool_with_grouped_members(
+        insert_queue_with_grouped_members(
             &db,
-            "pool-1",
+            "queue-1",
             &[("daemon-1", Some("daemon")), ("daemon-2", Some("daemon"))],
         );
 
@@ -6527,7 +6527,7 @@ echo done
 
         let guard = HomeGuard::set(home.path());
         engine
-            .run_loop(loop_id.clone(), Some("pool-1".to_string()), None)
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
             .await
             .unwrap();
         drop(guard);
@@ -7447,9 +7447,9 @@ echo done
         assert_eq!(spec.status, LoopSpecStatus::Failed);
     }
 
-    // ── R5: `loop_run` with a pool ──────────────────────────────────────
+    // ── R5: `loop_run` with a queue ──────────────────────────────────────
 
-    /// A loop with no bound specs — the pool's own standalone specs supply
+    /// A loop with no bound specs — the queue's own standalone specs supply
     /// the work instead. Distinct from [`loop_fixture`], which always seeds
     /// one bound spec.
     fn bare_loop_fixture() -> Result<(TempDir, Arc<Database>, LoopEngine, String)> {
@@ -7469,7 +7469,7 @@ echo done
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         };
         db.insert_loop(&lp)?;
@@ -7481,8 +7481,8 @@ echo done
         ))
     }
 
-    /// A standalone spec (`loop_id: None`), the shape pool members take —
-    /// pool membership never binds the spec to a loop.
+    /// A standalone spec (`loop_id: None`), the shape queue members take —
+    /// queue membership never binds the spec to a loop.
     fn standalone_spec(id: &str, position: i64) -> LoopSpec {
         LoopSpec {
             id: id.to_string(),
@@ -7504,41 +7504,41 @@ echo done
         }
     }
 
-    fn insert_pool_with_members(db: &Database, pool_id: &str, member_ids: &[&str]) {
-        db.insert_pool(&crate::domain::pools::Pool {
-            id: pool_id.to_string(),
-            name: pool_id.to_string(),
+    fn insert_queue_with_members(db: &Database, queue_id: &str, member_ids: &[&str]) {
+        db.insert_queue(&crate::domain::queues::Queue {
+            id: queue_id.to_string(),
+            name: queue_id.to_string(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
         for spec_id in member_ids {
-            db.append_pool_member(pool_id, spec_id, None).unwrap();
+            db.append_queue_member(queue_id, spec_id, None).unwrap();
         }
     }
 
-    /// RS3 variant of [`insert_pool_with_members`]: each member is `(spec_id,
+    /// RS3 variant of [`insert_queue_with_members`]: each member is `(spec_id,
     /// group_name)`, so a test can queue grouped and ungrouped members side by
     /// side.
-    fn insert_pool_with_grouped_members(
+    fn insert_queue_with_grouped_members(
         db: &Database,
-        pool_id: &str,
+        queue_id: &str,
         members: &[(&str, Option<&str>)],
     ) {
-        db.insert_pool(&crate::domain::pools::Pool {
-            id: pool_id.to_string(),
-            name: pool_id.to_string(),
+        db.insert_queue(&crate::domain::queues::Queue {
+            id: queue_id.to_string(),
+            name: queue_id.to_string(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
         for (spec_id, group) in members {
-            db.append_pool_member(pool_id, spec_id, *group).unwrap();
+            db.append_queue_member(queue_id, spec_id, *group).unwrap();
         }
     }
 
     #[tokio::test]
-    async fn loop_engine_pool_run_walks_loop_graph_across_pool_specs_in_queue_order() {
-        // Two standalone specs, queued into the pool in the *opposite* order
-        // of their `position` field — proving the pool's queue order drives
+    async fn loop_engine_queue_run_walks_loop_graph_across_queue_specs_in_queue_order() {
+        // Two standalone specs, queued into the queue in the *opposite* order
+        // of their `position` field — proving the queue's queue order drives
         // execution, not the spec's own position. Each pass through the
         // shared loop-level check node commits to the workdir's git repo, so
         // the spec that captures the pre-commit HEAD ran first.
@@ -7546,12 +7546,12 @@ echo done
         init_git_repo(dir.path());
         let initial_head = git_head(dir.path());
 
-        let spec_a = standalone_spec("pool-spec-a", 1);
-        let spec_b = standalone_spec("pool-spec-b", 2);
+        let spec_a = standalone_spec("queue-spec-a", 1);
+        let spec_b = standalone_spec("queue-spec-b", 2);
         db.insert_loop_spec(&spec_a).unwrap();
         db.insert_loop_spec(&spec_b).unwrap();
         // Queue order: b, then a — the reverse of position order.
-        insert_pool_with_members(&db, "pool-1", &[&spec_b.id, &spec_a.id]);
+        insert_queue_with_members(&db, "queue-1", &[&spec_b.id, &spec_a.id]);
 
         db.insert_loop_node(&LoopNode {
             id: "loop-check".to_string(),
@@ -7569,7 +7569,7 @@ echo done
         .unwrap();
 
         engine
-            .run_loop(loop_id.clone(), Some("pool-1".to_string()), None)
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
             .await
             .unwrap();
 
@@ -7595,7 +7595,7 @@ echo done
         );
     }
 
-    /// B18, end to end: the real incident. A pool-driven run's in-flight
+    /// B18, end to end: the real incident. A queue-driven run's in-flight
     /// member is left `running` by a daemon restart — a dangling node run
     /// with no live process behind it — while another member sits `pending`
     /// right behind it in the queue. G2 boot reconcile must reset the
@@ -7607,17 +7607,17 @@ echo done
     /// the next queued member, which is exactly how it got orphaned in the
     /// 2026-07-14 incident.
     #[tokio::test]
-    async fn loop_engine_restart_recovery_runs_interrupted_pool_spec_first() {
+    async fn loop_engine_restart_recovery_runs_interrupted_queue_spec_first() {
         let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
         init_git_repo(dir.path());
         let initial_head = git_head(dir.path());
 
-        let mut interrupted = standalone_spec("pool-interrupted", 1);
+        let mut interrupted = standalone_spec("queue-interrupted", 1);
         interrupted.status = LoopSpecStatus::Running;
-        let next = standalone_spec("pool-next", 2);
+        let next = standalone_spec("queue-next", 2);
         db.insert_loop_spec(&interrupted).unwrap();
         db.insert_loop_spec(&next).unwrap();
-        insert_pool_with_members(&db, "pool-1", &[&interrupted.id, &next.id]);
+        insert_queue_with_members(&db, "queue-1", &[&interrupted.id, &next.id]);
 
         db.update_loop_status(
             &loop_id,
@@ -7626,7 +7626,7 @@ echo done
             None,
         )
         .unwrap();
-        db.set_loop_active_run_pool(&loop_id, Some("pool-1"))
+        db.set_loop_active_run_queue(&loop_id, Some("queue-1"))
             .unwrap();
 
         db.insert_loop_node(&LoopNode {
@@ -7676,11 +7676,11 @@ echo done
         );
 
         // `loop_continue { retry_current_node }`: resume with the loop's
-        // persisted pool context, same as `resume_background`. The loop is left
+        // persisted queue context, same as `resume_background`. The loop is left
         // `Paused` (as reconcile set it) — the dispatch's own atomic claim (B42)
         // owns the flip to `Running`, so no caller pre-flips it anymore.
         engine
-            .run_loop_dispatch(loop_id.clone(), Some("pool-1".to_string()), None, true)
+            .run_loop_dispatch(loop_id.clone(), Some("queue-1".to_string()), None, true)
             .await
             .unwrap();
 
@@ -7729,7 +7729,7 @@ echo done
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         };
         db.insert_loop(&lp).unwrap();
@@ -7771,10 +7771,10 @@ echo done
     }
 
     #[tokio::test]
-    async fn loop_engine_legacy_run_without_pool_id_only_touches_bound_specs() {
-        // A standalone spec exists in the DB (e.g. pool backlog) but isn't
-        // added to any pool and isn't bound to this loop. Calling run_loop
-        // without pool_id must behave exactly as before pools existed: only
+    async fn loop_engine_legacy_run_without_queue_id_only_touches_bound_specs() {
+        // A standalone spec exists in the DB (e.g. queue backlog) but isn't
+        // added to any queue and isn't bound to this loop. Calling run_loop
+        // without queue_id must behave exactly as before queues existed: only
         // the loop's own bound specs are touched.
         let (_dir, db, engine, loop_id, bound_spec_id) = loop_fixture().unwrap();
         let untouched = standalone_spec("untouched-standalone", 99);
@@ -7811,15 +7811,15 @@ echo done
     }
 
     #[tokio::test]
-    async fn loop_engine_pool_run_skips_already_completed_members() {
+    async fn loop_engine_queue_run_skips_already_completed_members() {
         let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
 
-        let mut done = standalone_spec("pool-done", 1);
+        let mut done = standalone_spec("queue-done", 1);
         done.status = LoopSpecStatus::Completed;
-        let pending = standalone_spec("pool-pending", 2);
+        let pending = standalone_spec("queue-pending", 2);
         db.insert_loop_spec(&done).unwrap();
         db.insert_loop_spec(&pending).unwrap();
-        insert_pool_with_members(&db, "pool-1", &[&done.id, &pending.id]);
+        insert_queue_with_members(&db, "queue-1", &[&done.id, &pending.id]);
 
         db.insert_loop_node(&LoopNode {
             id: "loop-check".to_string(),
@@ -7837,7 +7837,7 @@ echo done
         .unwrap();
 
         engine
-            .run_loop(loop_id.clone(), Some("pool-1".to_string()), None)
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
             .await
             .unwrap();
 
@@ -7854,12 +7854,12 @@ echo done
     }
 
     #[tokio::test]
-    async fn loop_engine_pool_run_retains_context_on_genuine_completion_for_progress() {
+    async fn loop_engine_queue_run_retains_context_on_genuine_completion_for_progress() {
         let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
 
-        let spec = standalone_spec("pool-spec", 1);
+        let spec = standalone_spec("queue-spec", 1);
         db.insert_loop_spec(&spec).unwrap();
-        insert_pool_with_members(&db, "pool-1", &[&spec.id]);
+        insert_queue_with_members(&db, "queue-1", &[&spec.id]);
 
         db.insert_loop_node(&LoopNode {
             id: "loop-check".to_string(),
@@ -7877,53 +7877,53 @@ echo done
         .unwrap();
 
         engine
-            .run_loop(loop_id.clone(), Some("pool-1".to_string()), None)
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
             .await
             .unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         assert_eq!(lp.status, LoopStatus::Completed);
-        // B31: a genuinely finished pool run keeps its `active_run_pool_id`
+        // B31: a genuinely finished queue run keeps its `active_run_queue_id`
         // as last-run context so `loop list` / `loop info` can still render
         // its real progress instead of a misleading `0/0`. B8's
         // anti-pollution guarantee is upheld elsewhere: every launch path
         // re-persists this field before the first spec runs, so a later
-        // fresh `loop_run` against a different pool overwrites it.
+        // fresh `loop_run` against a different queue overwrites it.
         assert_eq!(
-            lp.active_run_pool_id.as_deref(),
-            Some("pool-1"),
-            "a genuinely finished pool run must keep the run context so its queue progress \
+            lp.active_run_queue_id.as_deref(),
+            Some("queue-1"),
+            "a genuinely finished queue run must keep the run context so its queue progress \
              stays queryable"
         );
         // The progress the CLI/MCP surfaces (mirrored by `loop_progress` in
         // `daemon/loop_cli.rs`) is a real `1/1`, not `0/0`.
         assert_eq!(
             engine
-                .spec_progress(&loop_id, lp.active_run_pool_id.as_deref())
+                .spec_progress(&loop_id, lp.active_run_queue_id.as_deref())
                 .unwrap(),
             (1, 1),
-            "completed pool loop must report n/n progress, not 0/0"
+            "completed queue loop must report n/n progress, not 0/0"
         );
     }
 
-    /// If `pool_next_pending_spec_id` finds no `pending` member to pick, but a
+    /// If `queue_next_pending_spec_id` finds no `pending` member to pick, but a
     /// member is nonetheless left non-terminal (e.g. `running`, from a crash
-    /// mid-spec that never got reset), the pool isn't genuinely finished —
+    /// mid-spec that never got reset), the queue isn't genuinely finished —
     /// the loop must not be marked `completed` out from under it. This is
-    /// the guard that keeps a resumed pool run from repeating the incident's
-    /// false-completion (17 of 20 pool specs still pending, loop marked
+    /// the guard that keeps a resumed queue run from repeating the incident's
+    /// false-completion (17 of 20 queue specs still pending, loop marked
     /// completed anyway).
     #[tokio::test]
-    async fn loop_engine_pool_run_does_not_complete_loop_while_member_left_running() {
+    async fn loop_engine_queue_run_does_not_complete_loop_while_member_left_running() {
         let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
 
-        let mut stuck = standalone_spec("pool-stuck", 1);
+        let mut stuck = standalone_spec("queue-stuck", 1);
         stuck.status = LoopSpecStatus::Running;
         db.insert_loop_spec(&stuck).unwrap();
-        insert_pool_with_members(&db, "pool-1", &[&stuck.id]);
+        insert_queue_with_members(&db, "queue-1", &[&stuck.id]);
 
         engine
-            .run_loop(loop_id.clone(), Some("pool-1".to_string()), None)
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
             .await
             .unwrap();
 
@@ -7931,16 +7931,16 @@ echo done
         assert_eq!(
             lp.status,
             LoopStatus::Running,
-            "must not be marked completed while a pool member is still non-terminal"
+            "must not be marked completed while a queue member is still non-terminal"
         );
         assert_eq!(
-            lp.active_run_pool_id.as_deref(),
-            Some("pool-1"),
-            "the run context must survive so a later resume still knows the pool"
+            lp.active_run_queue_id.as_deref(),
+            Some("queue-1"),
+            "the run context must survive so a later resume still knows the queue"
         );
     }
 
-    // ── R6: live pools — append and reorder while running ────────────────
+    // ── R6: live queues — append and reorder while running ────────────────
 
     async fn wait_for_file(path: &std::path::Path) {
         for _ in 0..500 {
@@ -7997,9 +7997,9 @@ echo done
     }
 
     #[tokio::test]
-    async fn loop_engine_pool_run_picks_up_spec_appended_mid_run() {
-        // A spec appended to the pool while the run is in flight must still
-        // get executed before the run ends: the engine re-queries the pool
+    async fn loop_engine_queue_run_picks_up_spec_appended_mid_run() {
+        // A spec appended to the queue while the run is in flight must still
+        // get executed before the run ends: the engine re-queries the queue
         // for its next pending member at each spec boundary instead of
         // iterating a list frozen at launch.
         let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
@@ -8007,13 +8007,13 @@ echo done
         let go_marker = dir.path().join("go.marker");
         let order_log = dir.path().join("order.log");
 
-        let spec_a = standalone_spec("pool-spec-a", 1);
-        let spec_b = standalone_spec("pool-spec-b", 2);
+        let spec_a = standalone_spec("queue-spec-a", 1);
+        let spec_b = standalone_spec("queue-spec-b", 2);
         db.insert_loop_spec(&spec_a).unwrap();
         db.insert_loop_spec(&spec_b).unwrap();
-        // spec_b exists in the DB but is NOT yet in the pool — it's appended
+        // spec_b exists in the DB but is NOT yet in the queue — it's appended
         // below, while spec_a is mid-run.
-        insert_pool_with_members(&db, "pool-1", &[&spec_a.id]);
+        insert_queue_with_members(&db, "queue-1", &[&spec_a.id]);
 
         db.insert_loop_node(&touch_gate_node(
             "node-a",
@@ -8029,14 +8029,14 @@ echo done
         let run_loop_id = loop_id.clone();
         let handle = tokio::spawn(async move {
             run_engine
-                .run_loop(run_loop_id, Some("pool-1".to_string()), None)
+                .run_loop(run_loop_id, Some("queue-1".to_string()), None)
                 .await
         });
 
         wait_for_file(&started_marker).await;
-        // spec_a is mid-run (blocked on the gate). Append spec_b to the pool
+        // spec_a is mid-run (blocked on the gate). Append spec_b to the queue
         // now, while the run is in flight.
-        db.append_pool_member("pool-1", &spec_b.id, None).unwrap();
+        db.append_queue_member("queue-1", &spec_b.id, None).unwrap();
         std::fs::write(&go_marker, "").unwrap();
 
         handle.await.unwrap().unwrap();
@@ -8055,8 +8055,8 @@ echo done
     }
 
     #[tokio::test]
-    async fn loop_engine_pool_run_reorder_changes_pick_order_mid_run() {
-        // Reordering the pool's PENDING members while a run is in flight
+    async fn loop_engine_queue_run_reorder_changes_pick_order_mid_run() {
+        // Reordering the queue's PENDING members while a run is in flight
         // must change which one the engine picks next — proving the pick is
         // a live, fresh query, not a list captured at launch.
         let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
@@ -8064,14 +8064,14 @@ echo done
         let go_marker = dir.path().join("go.marker");
         let order_log = dir.path().join("order.log");
 
-        let spec_a = standalone_spec("pool-spec-a", 1);
-        let spec_b = standalone_spec("pool-spec-b", 2);
-        let spec_c = standalone_spec("pool-spec-c", 3);
+        let spec_a = standalone_spec("queue-spec-a", 1);
+        let spec_b = standalone_spec("queue-spec-b", 2);
+        let spec_c = standalone_spec("queue-spec-c", 3);
         db.insert_loop_spec(&spec_a).unwrap();
         db.insert_loop_spec(&spec_b).unwrap();
         db.insert_loop_spec(&spec_c).unwrap();
         // Queue order at launch: a, b, c.
-        insert_pool_with_members(&db, "pool-1", &[&spec_a.id, &spec_b.id, &spec_c.id]);
+        insert_queue_with_members(&db, "queue-1", &[&spec_a.id, &spec_b.id, &spec_c.id]);
 
         db.insert_loop_node(&touch_gate_node(
             "node-a",
@@ -8089,14 +8089,14 @@ echo done
         let run_loop_id = loop_id.clone();
         let handle = tokio::spawn(async move {
             run_engine
-                .run_loop(run_loop_id, Some("pool-1".to_string()), None)
+                .run_loop(run_loop_id, Some("queue-1".to_string()), None)
                 .await
         });
 
         wait_for_file(&started_marker).await;
         // spec_a is mid-run. Swap the two PENDING members' order: c before b.
-        db.reorder_pool_members(
-            "pool-1",
+        db.reorder_queue_members(
+            "queue-1",
             &[spec_a.id.clone(), spec_c.id.clone(), spec_b.id.clone()],
         )
         .unwrap();
@@ -8117,18 +8117,18 @@ echo done
     }
 
     #[tokio::test]
-    async fn loop_engine_pool_run_ends_when_no_pending_members_remain() {
+    async fn loop_engine_queue_run_ends_when_no_pending_members_remain() {
         // Sanity check underpinning both tests above: with no gating at all,
-        // a pool run with N pending members ends after exactly N specs run,
+        // a queue run with N pending members ends after exactly N specs run,
         // and picks up an appended spec before completing.
         let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
         let order_log = dir.path().join("order.log");
 
-        let spec_a = standalone_spec("pool-spec-a", 1);
-        let spec_b = standalone_spec("pool-spec-b", 2);
+        let spec_a = standalone_spec("queue-spec-a", 1);
+        let spec_b = standalone_spec("queue-spec-b", 2);
         db.insert_loop_spec(&spec_a).unwrap();
         db.insert_loop_spec(&spec_b).unwrap();
-        insert_pool_with_members(&db, "pool-1", &[&spec_a.id, &spec_b.id]);
+        insert_queue_with_members(&db, "queue-1", &[&spec_a.id, &spec_b.id]);
 
         db.insert_loop_node(&record_node("node-a", &spec_a.id, &order_log, "spec-a"))
             .unwrap();
@@ -8136,13 +8136,13 @@ echo done
             .unwrap();
 
         engine
-            .run_loop(loop_id.clone(), Some("pool-1".to_string()), None)
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
             .await
             .unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         assert_eq!(lp.status, LoopStatus::Completed);
-        assert!(db.pool_next_pending_spec_id("pool-1").unwrap().is_none());
+        assert!(db.queue_next_pending_spec_id("queue-1").unwrap().is_none());
 
         let order = std::fs::read_to_string(&order_log).unwrap();
         assert_eq!(order.lines().collect::<Vec<_>>(), vec!["spec-a", "spec-b"]);
@@ -8219,7 +8219,7 @@ echo done
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         };
         let spec = LoopSpec {
@@ -9499,11 +9499,11 @@ echo done
 
     // ── B17: empty effective spec set is a launch error, not a completion ──
 
-    /// The core incident: a loop with zero bound specs and no `pool_id`
+    /// The core incident: a loop with zero bound specs and no `queue_id`
     /// given must refuse to launch — not silently transition to
     /// `Completed`. Status must stay untouched and no run recorded.
     #[tokio::test]
-    async fn loop_engine_zero_bound_specs_and_no_pool_is_a_launch_error() {
+    async fn loop_engine_zero_bound_specs_and_no_queue_is_a_launch_error() {
         let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
 
         let error = engine
@@ -9527,64 +9527,64 @@ echo done
         );
     }
 
-    /// (Requirement 3) When the loop's last run was pool-driven and a fresh
-    /// `loop_run` arrives without `pool_id` and finds zero bound specs, the
-    /// error must name the last pool so a recovery agent can retry
-    /// correctly instead of silently discarding the pool context.
+    /// (Requirement 3) When the loop's last run was queue-driven and a fresh
+    /// `loop_run` arrives without `queue_id` and finds zero bound specs, the
+    /// error must name the last queue so a recovery agent can retry
+    /// correctly instead of silently discarding the queue context.
     #[tokio::test]
-    async fn loop_engine_pool_less_relaunch_after_pool_run_names_last_pool() {
+    async fn loop_engine_queue_less_relaunch_after_queue_run_names_last_queue() {
         let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
 
-        // Simulate the incident: a pool-driven run left interrupted (daemon
-        // crash, quota failure) — `active_run_pool_id` stays persisted
+        // Simulate the incident: a queue-driven run left interrupted (daemon
+        // crash, quota failure) — `active_run_queue_id` stays persisted
         // (it's only ever cleared on a *genuine* completion) with pending
-        // pool members still queued behind it.
-        let pending = standalone_spec("pool-pending", 1);
+        // queue members still queued behind it.
+        let pending = standalone_spec("queue-pending", 1);
         db.insert_loop_spec(&pending).unwrap();
-        insert_pool_with_members(&db, "pool-1", &[&pending.id]);
-        db.set_loop_active_run_pool(&loop_id, Some("pool-1"))
+        insert_queue_with_members(&db, "queue-1", &[&pending.id]);
+        db.set_loop_active_run_queue(&loop_id, Some("queue-1"))
             .unwrap();
 
         // The recovery agent's mistake: relaunch directly (the loop's own
-        // bound specs are still empty — every spec lives in the pool)
-        // without passing `pool_id` back.
+        // bound specs are still empty — every spec lives in the queue)
+        // without passing `queue_id` back.
         let error = engine
             .run_loop(loop_id.clone(), None, None)
             .await
             .unwrap_err();
         assert!(
-            error.to_string().contains("pool-1"),
-            "error must name the last pool so a recovery agent can retry correctly: {error}"
+            error.to_string().contains("queue-1"),
+            "error must name the last queue so a recovery agent can retry correctly: {error}"
         );
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         assert_eq!(
             lp.status,
             LoopStatus::Draft,
-            "the failed pool-less relaunch must not touch the loop's status"
+            "the failed queue-less relaunch must not touch the loop's status"
         );
         assert_eq!(
-            lp.active_run_pool_id.as_deref(),
-            Some("pool-1"),
-            "the pool context must not be silently discarded by the failed relaunch"
+            lp.active_run_queue_id.as_deref(),
+            Some("queue-1"),
+            "the queue context must not be silently discarded by the failed relaunch"
         );
     }
 
-    /// (Requirement 4b) A pool run where every member is already completed
+    /// (Requirement 4b) A queue run where every member is already completed
     /// must be treated as the same empty-set error, not a fresh completed
-    /// run — a pool is shared/reusable, so "nothing pending" is far more
-    /// likely a stale/incorrect pool_id than a genuine finish.
+    /// run — a queue is shared/reusable, so "nothing pending" is far more
+    /// likely a stale/incorrect queue_id than a genuine finish.
     #[tokio::test]
-    async fn loop_engine_pool_run_with_all_members_completed_is_a_launch_error() {
+    async fn loop_engine_queue_run_with_all_members_completed_is_a_launch_error() {
         let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
 
-        let mut done = standalone_spec("pool-done", 1);
+        let mut done = standalone_spec("queue-done", 1);
         done.status = LoopSpecStatus::Completed;
         db.insert_loop_spec(&done).unwrap();
-        insert_pool_with_members(&db, "pool-1", &[&done.id]);
+        insert_queue_with_members(&db, "queue-1", &[&done.id]);
 
         let error = engine
-            .run_loop(loop_id.clone(), Some("pool-1".to_string()), None)
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
             .await
             .unwrap_err();
         assert!(
@@ -9596,22 +9596,22 @@ echo done
         assert_eq!(
             lp.status,
             LoopStatus::Draft,
-            "an empty pool launch must leave the loop's status untouched"
+            "an empty queue launch must leave the loop's status untouched"
         );
     }
 
-    /// (Requirement 4c) A normal pool run — real pending members — still
+    /// (Requirement 4c) A normal queue run — real pending members — still
     /// completes and fires the `on_completed` hook exactly once; the B17
     /// guard must not interfere with a genuine completion.
     #[tokio::test]
-    async fn loop_engine_normal_pool_run_still_completes_and_fires_hook_once() {
+    async fn loop_engine_normal_queue_run_still_completes_and_fires_hook_once() {
         let fake_home = setup_test_cli_home();
         let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
         let marker = dir.path().join("hook_fired.marker");
 
-        let spec = standalone_spec("pool-spec", 1);
+        let spec = standalone_spec("queue-spec", 1);
         db.insert_loop_spec(&spec).unwrap();
-        insert_pool_with_members(&db, "pool-1", &[&spec.id]);
+        insert_queue_with_members(&db, "queue-1", &[&spec.id]);
 
         db.insert_loop_node(&LoopNode {
             id: "loop-check".to_string(),
@@ -9640,7 +9640,7 @@ echo done
 
         let _home = HomeGuard::set(fake_home.path());
         let result = engine
-            .run_loop(loop_id.clone(), Some("pool-1".to_string()), None)
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
             .await;
         drop(_home);
         drop(fake_home);
@@ -9723,7 +9723,7 @@ echo done
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         };
         let completed_specs = vec![
@@ -9761,7 +9761,7 @@ echo done
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         };
 
@@ -11071,17 +11071,17 @@ echo done
         );
     }
 
-    /// Pool-run compatibility: a pool member spec whose own graph contains
-    /// an ensemble must run end to end through a pool dispatch exactly like
+    /// Queue-run compatibility: a queue member spec whose own graph contains
+    /// an ensemble must run end to end through a queue dispatch exactly like
     /// any other spec — the ensemble's join routing onward is what lets the
-    /// spec (and therefore the pool) reach completion.
+    /// spec (and therefore the queue) reach completion.
     #[tokio::test]
-    async fn ensemble_runs_end_to_end_through_a_pool_dispatch() {
+    async fn ensemble_runs_end_to_end_through_a_queue_dispatch() {
         let dir = tempdir().unwrap();
         let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
         let lp = crate::domain::loops::Loop {
             archived: false,
-            id: "wf-pool-ensemble".to_string(),
+            id: "wf-queue-ensemble".to_string(),
             name: "Loop".to_string(),
             description: None,
             workdir: dir.path().to_string_lossy().to_string(),
@@ -11093,15 +11093,15 @@ echo done
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         };
         db.insert_loop(&lp).unwrap();
         let engine = LoopEngine::new(Arc::clone(&db), Arc::new(DefaultNotificationService));
 
-        let spec = standalone_spec("pool-ensemble-spec", 1);
+        let spec = standalone_spec("queue-ensemble-spec", 1);
         db.insert_loop_spec(&spec).unwrap();
-        insert_pool_with_members(&db, "pool-1", &[&spec.id]);
+        insert_queue_with_members(&db, "queue-1", &[&spec.id]);
 
         let fake_home = setup_multi_cli_home(&[
             (
@@ -11135,7 +11135,7 @@ echo done
 
         let _home = HomeGuard::set(fake_home.path());
         engine
-            .run_loop(lp.id.clone(), Some("pool-1".to_string()), None)
+            .run_loop(lp.id.clone(), Some("queue-1".to_string()), None)
             .await
             .unwrap();
         drop(_home);
@@ -11143,9 +11143,9 @@ echo done
         let lp = db.get_loop(&lp.id).unwrap().unwrap();
         assert_eq!(lp.status, LoopStatus::Completed);
         assert_eq!(
-            db.pool_next_pending_spec_id("pool-1").unwrap(),
+            db.queue_next_pending_spec_id("queue-1").unwrap(),
             None,
-            "the ensemble-bearing spec must have been fully consumed by the pool run"
+            "the ensemble-bearing spec must have been fully consumed by the queue run"
         );
     }
 

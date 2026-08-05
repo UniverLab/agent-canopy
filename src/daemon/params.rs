@@ -767,51 +767,6 @@ pub struct QueueReorderParams {
     pub spec_ids: Vec<String>,
 }
 
-// DEPRECATED: back-compat params for the `pool_*` tool aliases. Prefer the
-// `Queue*Params` structs above and the `queue_*` tools. Kept so existing
-// callers passing `pool_id` keep working; both feed the same shared helpers.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct PoolCreateParams {
-    /// Human-readable pool name.
-    pub name: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct PoolAddSpecParams {
-    /// Existing pool ID.
-    pub pool_id: String,
-    /// Existing spec ID to append to the end of the pool's queue.
-    pub spec_id: String,
-    /// Optional context group (RS3). Specs sharing a group in the same queue
-    /// reuse one warm harness session. Omit for an ungrouped member.
-    #[serde(default)]
-    pub group: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct PoolListParams {
-    /// Existing pool ID. Omit to list every pool (summary only, no members).
-    pub pool_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct PoolRemoveSpecParams {
-    /// Existing pool ID.
-    pub pool_id: String,
-    /// Spec ID to remove from the pool.
-    pub spec_id: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct PoolReorderParams {
-    /// Existing pool ID.
-    pub pool_id: String,
-    /// Full list of spec IDs currently in the pool, in the desired final
-    /// order. Must be a total permutation of the pool's current members —
-    /// every spec id exactly once.
-    pub spec_ids: Vec<String>,
-}
-
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LoopGetParams {
     /// Loop ID.
@@ -900,12 +855,8 @@ pub struct LoopRunParams {
     pub loop_id: String,
     /// Optional queue ID. When set, the loop runs the queue's pending specs (in
     /// queue order) through the loop's graph instead of its own bound specs.
-    /// Queue membership is unaffected — specs stay standalone. Wins over the
-    /// deprecated `pool_id` if both are set.
+    /// Queue membership is unaffected — specs stay standalone.
     pub queue_id: Option<String>,
-    /// DEPRECATED: use `queue_id` instead. Kept for back-compat; `queue_id`
-    /// takes precedence when both are provided.
-    pub pool_id: Option<String>,
     /// Optional absolute workdir override for this run only. Wins over the
     /// loop's own `workdir`; the loop's `workdir` is left unchanged.
     pub workdir: Option<String>,

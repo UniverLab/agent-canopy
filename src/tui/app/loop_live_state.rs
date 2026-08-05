@@ -28,7 +28,7 @@ pub(crate) struct LoopLiveState {
     pub autorun_at: Option<DateTime<Utc>>,
 
     // ── Spec queue ──────────────────────────────────────────────
-    /// Ordered specs: pool members for a pool run, bound specs otherwise.
+    /// Ordered specs: queue members for a queue run, bound specs otherwise.
     pub spec_queue: Vec<SpecQueueEntry>,
     pub done_count: usize,
     pub total_count: usize,
@@ -290,11 +290,11 @@ pub(crate) fn resolve_node_run_info(db: &Database, spec_id: &str, node_id: &str)
 
 // ── Internal helpers ──────────────────────────────────────────────────
 
-/// Build the ordered spec queue from either the active pool's members or
+/// Build the ordered spec queue from either the active queue's members or
 /// the loop's bound specs.
 fn build_spec_queue(db: &Database, lp: &crate::domain::loops::Loop) -> Vec<SpecQueueEntry> {
-    let spec_ids = if let Some(ref pool_id) = lp.active_run_pool_id {
-        db.list_pool_member_spec_ids(pool_id).unwrap_or_default()
+    let spec_ids = if let Some(ref queue_id) = lp.active_run_queue_id {
+        db.list_queue_member_spec_ids(queue_id).unwrap_or_default()
     } else {
         db.list_loop_specs(&lp.id)
             .unwrap_or_default()
@@ -355,7 +355,7 @@ fn resolve_effective_graph(
                 return (spec_detail.nodes.clone(), spec_detail.edges.clone());
             }
         }
-        // Fallback: try direct DB lookup (pool specs not in details).
+        // Fallback: try direct DB lookup (queue specs not in details).
         if let Ok(Some(detail)) = db.get_loop_spec_details(spec_id) {
             if !detail.nodes.is_empty() {
                 return (detail.nodes, detail.edges);
@@ -449,7 +449,7 @@ mod tests {
         Loop, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind, LoopNodeRun, LoopRunStatus,
         LoopSpec, LoopSpecStatus, LoopStatus,
     };
-    use crate::domain::pools::Pool;
+    use crate::domain::queues::Queue;
     use chrono::Utc;
     use serde_json::json;
     use tempfile::NamedTempFile;
@@ -476,7 +476,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         }
     }
@@ -626,23 +626,23 @@ mod tests {
     }
 
     #[test]
-    fn pool_run_queue_uses_pool_member_order() {
+    fn queue_run_queue_uses_queue_member_order() {
         let db = test_db();
         let lp = make_loop("lp1", LoopStatus::Running);
 
-        // Create a pool and add specs to it.
-        let pool = Pool {
-            id: "pool1".to_string(),
-            name: "Test Pool".to_string(),
+        // Create a queue and add specs to it.
+        let queue = Queue {
+            id: "queue1".to_string(),
+            name: "Test Queue".to_string(),
             created_at: Utc::now(),
         };
-        db.insert_pool(&pool).unwrap();
+        db.insert_queue(&queue).unwrap();
 
-        // Specs are NOT bound to the loop (loop_id = None) — they're pool members.
+        // Specs are NOT bound to the loop (loop_id = None) — they're queue members.
         let ps1 = LoopSpec {
             id: "ps1".to_string(),
             loop_id: None,
-            name: "Pool Spec 1".to_string(),
+            name: "Queue Spec 1".to_string(),
             description: None,
             position: 1,
             parallelizable: false,
@@ -658,7 +658,7 @@ mod tests {
         let ps2 = LoopSpec {
             id: "ps2".to_string(),
             loop_id: None,
-            name: "Pool Spec 2".to_string(),
+            name: "Queue Spec 2".to_string(),
             description: None,
             position: 2,
             parallelizable: false,
@@ -674,21 +674,21 @@ mod tests {
         db.insert_loop_spec(&ps1).unwrap();
         db.insert_loop_spec(&ps2).unwrap();
 
-        db.append_pool_member("pool1", "ps1", None).unwrap();
-        db.append_pool_member("pool1", "ps2", None).unwrap();
+        db.append_queue_member("queue1", "ps1", None).unwrap();
+        db.append_queue_member("queue1", "ps2", None).unwrap();
 
-        // Set the loop's active pool.
-        let mut lp_with_pool = lp.clone();
-        lp_with_pool.active_run_pool_id = Some("pool1".to_string());
+        // Set the loop's active queue.
+        let mut lp_with_queue = lp.clone();
+        lp_with_queue.active_run_queue_id = Some("queue1".to_string());
         db.update_loop_details(
             &lp.id,
             Some(&lp.name),
             None,
-            lp_with_pool.active_run_pool_id.as_deref(),
+            lp_with_queue.active_run_queue_id.as_deref(),
         )
         .unwrap();
 
-        let details = details_from_loop(&db, &lp_with_pool);
+        let details = details_from_loop(&db, &lp_with_queue);
         let state = assemble_loop_live_state(&db, &details).unwrap();
 
         assert_eq!(state.spec_queue.len(), 2);

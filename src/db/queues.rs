@@ -5,77 +5,78 @@ use std::io::{Error as IoError, ErrorKind};
 
 use crate::db::Database;
 use crate::domain::loops::LoopSpecStatus;
-use crate::domain::pools::{Pool, PoolDetails};
+use crate::domain::queues::{Queue, QueueDetails};
 
 impl Database {
-    pub fn insert_pool(&self, pool: &Pool) -> Result<()> {
+    pub fn insert_queue(&self, queue: &Queue) -> Result<()> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         conn.execute(
-            "INSERT INTO pools (id, name, created_at) VALUES (?1, ?2, ?3)",
-            params![&pool.id, &pool.name, pool.created_at.timestamp()],
+            "INSERT INTO queues (id, name, created_at) VALUES (?1, ?2, ?3)",
+            params![&queue.id, &queue.name, queue.created_at.timestamp()],
         )?;
         Ok(())
     }
 
-    pub fn get_pool(&self, pool_id: &str) -> Result<Option<Pool>> {
+    pub fn get_queue(&self, queue_id: &str) -> Result<Option<Queue>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
-        let mut stmt = conn.prepare("SELECT id, name, created_at FROM pools WHERE id = ?1")?;
-        stmt.query_row(params![pool_id], map_pool_row)
+        let mut stmt = conn.prepare("SELECT id, name, created_at FROM queues WHERE id = ?1")?;
+        stmt.query_row(params![queue_id], map_queue_row)
             .optional()
             .map_err(Into::into)
     }
 
-    pub fn list_pools(&self) -> Result<Vec<Pool>> {
+    pub fn list_queues(&self) -> Result<Vec<Queue>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt =
-            conn.prepare("SELECT id, name, created_at FROM pools ORDER BY created_at ASC")?;
-        let rows = stmt.query_map([], map_pool_row)?;
+            conn.prepare("SELECT id, name, created_at FROM queues ORDER BY created_at ASC")?;
+        let rows = stmt.query_map([], map_queue_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
 
-    /// Spec ids belonging to `pool_id`, in queue order.
-    pub fn list_pool_member_spec_ids(&self, pool_id: &str) -> Result<Vec<String>> {
+    /// Spec ids belonging to `queue_id`, in queue order.
+    pub fn list_queue_member_spec_ids(&self, queue_id: &str) -> Result<Vec<String>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
-        let mut stmt = conn
-            .prepare("SELECT spec_id FROM pool_members WHERE pool_id = ?1 ORDER BY position ASC")?;
-        let rows = stmt.query_map(params![pool_id], |row| row.get::<_, String>(0))?;
+        let mut stmt = conn.prepare(
+            "SELECT spec_id FROM queue_members WHERE queue_id = ?1 ORDER BY position ASC",
+        )?;
+        let rows = stmt.query_map(params![queue_id], |row| row.get::<_, String>(0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
 
-    pub fn pool_has_member(&self, pool_id: &str, spec_id: &str) -> Result<bool> {
+    pub fn queue_has_member(&self, queue_id: &str, spec_id: &str) -> Result<bool> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pool_members WHERE pool_id = ?1 AND spec_id = ?2",
-            params![pool_id, spec_id],
+            "SELECT COUNT(*) FROM queue_members WHERE queue_id = ?1 AND spec_id = ?2",
+            params![queue_id, spec_id],
             |row| row.get(0),
         )?;
         Ok(count > 0)
     }
 
-    /// Append `spec_id` to the end of `pool_id`'s queue: one past the
-    /// highest existing position, or 1 for an empty pool. `group_name` (RS3)
+    /// Append `spec_id` to the end of `queue_id`'s queue: one past the
+    /// highest existing position, or 1 for an empty queue. `group_name` (RS3)
     /// is the optional context group the member joins — `None` for an
     /// ungrouped member, which never cross-resumes another spec's session.
-    pub fn append_pool_member(
+    pub fn append_queue_member(
         &self,
-        pool_id: &str,
+        queue_id: &str,
         spec_id: &str,
         group_name: Option<&str>,
     ) -> Result<()> {
@@ -84,27 +85,27 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let next_position: i64 = conn.query_row(
-            "SELECT COALESCE(MAX(position), 0) + 1 FROM pool_members WHERE pool_id = ?1",
-            params![pool_id],
+            "SELECT COALESCE(MAX(position), 0) + 1 FROM queue_members WHERE queue_id = ?1",
+            params![queue_id],
             |row| row.get(0),
         )?;
         conn.execute(
-            "INSERT INTO pool_members (pool_id, spec_id, position, group_name) VALUES (?1, ?2, ?3, ?4)",
-            params![pool_id, spec_id, next_position, group_name],
+            "INSERT INTO queue_members (queue_id, spec_id, position, group_name) VALUES (?1, ?2, ?3, ?4)",
+            params![queue_id, spec_id, next_position, group_name],
         )?;
         Ok(())
     }
 
-    /// The RS3 context group `spec_id` belongs to within `pool_id`, or `None`
+    /// The RS3 context group `spec_id` belongs to within `queue_id`, or `None`
     /// if the spec is ungrouped or not a member.
-    pub fn pool_member_group(&self, pool_id: &str, spec_id: &str) -> Result<Option<String>> {
+    pub fn queue_member_group(&self, queue_id: &str, spec_id: &str) -> Result<Option<String>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         conn.query_row(
-            "SELECT group_name FROM pool_members WHERE pool_id = ?1 AND spec_id = ?2",
-            params![pool_id, spec_id],
+            "SELECT group_name FROM queue_members WHERE queue_id = ?1 AND spec_id = ?2",
+            params![queue_id, spec_id],
             |row| row.get::<_, Option<String>>(0),
         )
         .optional()
@@ -112,17 +113,20 @@ impl Database {
         .map_err(Into::into)
     }
 
-    /// `(spec_id, group_name)` for every member of `pool_id`, in queue order —
-    /// the group-aware companion to [`Self::list_pool_member_spec_ids`].
-    pub fn list_pool_member_groups(&self, pool_id: &str) -> Result<Vec<(String, Option<String>)>> {
+    /// `(spec_id, group_name)` for every member of `queue_id`, in queue order —
+    /// the group-aware companion to [`Self::list_queue_member_spec_ids`].
+    pub fn list_queue_member_groups(
+        &self,
+        queue_id: &str,
+    ) -> Result<Vec<(String, Option<String>)>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT spec_id, group_name FROM pool_members WHERE pool_id = ?1 ORDER BY position ASC",
+            "SELECT spec_id, group_name FROM queue_members WHERE queue_id = ?1 ORDER BY position ASC",
         )?;
-        let rows = stmt.query_map(params![pool_id], |row| {
+        let rows = stmt.query_map(params![queue_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -145,7 +149,7 @@ impl Database {
     /// over — they neither taint the chain nor supply a session.
     pub fn group_session_for_node(
         &self,
-        pool_id: &str,
+        queue_id: &str,
         group_name: &str,
         spec_id: &str,
         node_id: &str,
@@ -159,18 +163,18 @@ impl Database {
         let predecessor: Option<(String, String)> = conn
             .query_row(
                 "SELECT pm.spec_id, ls.status
-                 FROM pool_members pm
+                 FROM queue_members pm
                  JOIN loop_specs ls ON ls.id = pm.spec_id
-                 WHERE pm.pool_id = ?1 AND pm.group_name = ?2
+                 WHERE pm.queue_id = ?1 AND pm.group_name = ?2
                    AND pm.position < (
-                       SELECT position FROM pool_members
-                       WHERE pool_id = ?1 AND spec_id = ?3
+                       SELECT position FROM queue_members
+                       WHERE queue_id = ?1 AND spec_id = ?3
                    )
                    AND ls.status IN (?4, ?5)
                  ORDER BY pm.position DESC
                  LIMIT 1",
                 params![
-                    pool_id,
+                    queue_id,
                     group_name,
                     spec_id,
                     LoopSpecStatus::Completed.as_str(),
@@ -209,7 +213,7 @@ impl Database {
     /// `node_id` by a *different* grouped sibling in the same queue.
     pub fn group_resume_source(
         &self,
-        pool_id: &str,
+        queue_id: &str,
         spec_id: &str,
         node_id: &str,
         session_id: &str,
@@ -220,16 +224,16 @@ impl Database {
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         conn.query_row(
             "SELECT pm.group_name
-             FROM pool_members pm
-             WHERE pm.pool_id = ?1 AND pm.spec_id = ?2 AND pm.group_name IS NOT NULL
+             FROM queue_members pm
+             WHERE pm.queue_id = ?1 AND pm.spec_id = ?2 AND pm.group_name IS NOT NULL
                AND EXISTS (
-                   SELECT 1 FROM pool_members sib
+                   SELECT 1 FROM queue_members sib
                    JOIN loop_runs lr ON lr.spec_id = sib.spec_id
-                   WHERE sib.pool_id = ?1 AND sib.group_name = pm.group_name
+                   WHERE sib.queue_id = ?1 AND sib.group_name = pm.group_name
                      AND sib.spec_id != ?2
                      AND lr.node_id = ?3 AND lr.session_id = ?4
                )",
-            params![pool_id, spec_id, node_id, session_id],
+            params![queue_id, spec_id, node_id, session_id],
             |row| row.get::<_, Option<String>>(0),
         )
         .optional()
@@ -237,24 +241,24 @@ impl Database {
         .map_err(Into::into)
     }
 
-    pub fn remove_pool_member(&self, pool_id: &str, spec_id: &str) -> Result<bool> {
+    pub fn remove_queue_member(&self, queue_id: &str, spec_id: &str) -> Result<bool> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let rows = conn.execute(
-            "DELETE FROM pool_members WHERE pool_id = ?1 AND spec_id = ?2",
-            params![pool_id, spec_id],
+            "DELETE FROM queue_members WHERE queue_id = ?1 AND spec_id = ?2",
+            params![queue_id, spec_id],
         )?;
         Ok(rows > 0)
     }
 
-    /// Replace `pool_id`'s membership with `order`, positioned 1..=N in the
+    /// Replace `queue_id`'s membership with `order`, positioned 1..=N in the
     /// given sequence. Callers must first validate that `order` is a total
-    /// permutation of the pool's current members — this rebuilds the rows
+    /// permutation of the queue's current members — this rebuilds the rows
     /// unconditionally, so an unvalidated `order` would silently drop or
     /// duplicate membership.
-    pub fn reorder_pool_members(&self, pool_id: &str, order: &[String]) -> Result<()> {
+    pub fn reorder_queue_members(&self, queue_id: &str, order: &[String]) -> Result<()> {
         let conn = self
             .conn
             .lock()
@@ -266,8 +270,8 @@ impl Database {
             std::collections::HashMap::new();
         {
             let mut stmt =
-                conn.prepare("SELECT spec_id, group_name FROM pool_members WHERE pool_id = ?1")?;
-            let rows = stmt.query_map(params![pool_id], |row| {
+                conn.prepare("SELECT spec_id, group_name FROM queue_members WHERE queue_id = ?1")?;
+            let rows = stmt.query_map(params![queue_id], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
             })?;
             for row in rows {
@@ -277,78 +281,78 @@ impl Database {
         }
 
         conn.execute(
-            "DELETE FROM pool_members WHERE pool_id = ?1",
-            params![pool_id],
+            "DELETE FROM queue_members WHERE queue_id = ?1",
+            params![queue_id],
         )?;
         for (index, spec_id) in order.iter().enumerate() {
             let group_name = groups.get(spec_id).cloned().flatten();
             conn.execute(
-                "INSERT INTO pool_members (pool_id, spec_id, position, group_name) VALUES (?1, ?2, ?3, ?4)",
-                params![pool_id, spec_id, (index as i64) + 1, group_name],
+                "INSERT INTO queue_members (queue_id, spec_id, position, group_name) VALUES (?1, ?2, ?3, ?4)",
+                params![queue_id, spec_id, (index as i64) + 1, group_name],
             )?;
         }
         Ok(())
     }
 
-    /// The pool's first PENDING member, in queue order — queried fresh on
+    /// The queue's first PENDING member, in queue order — queried fresh on
     /// every call rather than off a list frozen at run start. This is what
-    /// lets a live pool run pick up `pool_add_spec`/`pool_reorder` calls
+    /// lets a live queue run pick up `queue_add_spec`/`queue_reorder` calls
     /// made while the run is in flight: the engine calls this again at every
     /// spec boundary instead of iterating a `Vec` captured once.
-    pub fn pool_next_pending_spec_id(&self, pool_id: &str) -> Result<Option<String>> {
+    pub fn queue_next_pending_spec_id(&self, queue_id: &str) -> Result<Option<String>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         conn.query_row(
-            "SELECT pm.spec_id FROM pool_members pm
+            "SELECT pm.spec_id FROM queue_members pm
              JOIN loop_specs ls ON ls.id = pm.spec_id
-             WHERE pm.pool_id = ?1 AND ls.status = ?2
+             WHERE pm.queue_id = ?1 AND ls.status = ?2
              ORDER BY pm.position ASC LIMIT 1",
-            params![pool_id, LoopSpecStatus::Pending.as_str()],
+            params![queue_id, LoopSpecStatus::Pending.as_str()],
             |row| row.get::<_, String>(0),
         )
         .optional()
         .map_err(Into::into)
     }
 
-    /// The pool's first RUNNING member, in queue order — used by
+    /// The queue's first RUNNING member, in queue order — used by
     /// `retry_current_node` to re-dispatch the same spec that was paused on,
     /// rather than falling through to the next pending member.
-    pub fn pool_running_spec_id(&self, pool_id: &str) -> Result<Option<String>> {
+    pub fn queue_running_spec_id(&self, queue_id: &str) -> Result<Option<String>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         conn.query_row(
-            "SELECT pm.spec_id FROM pool_members pm
+            "SELECT pm.spec_id FROM queue_members pm
              JOIN loop_specs ls ON ls.id = pm.spec_id
-             WHERE pm.pool_id = ?1 AND ls.status = ?2
+             WHERE pm.queue_id = ?1 AND ls.status = ?2
              ORDER BY pm.position ASC LIMIT 1",
-            params![pool_id, LoopSpecStatus::Running.as_str()],
+            params![queue_id, LoopSpecStatus::Running.as_str()],
             |row| row.get::<_, String>(0),
         )
         .optional()
         .map_err(Into::into)
     }
 
-    /// Whether `pool_id` still has a member that isn't `completed`/`skipped`
+    /// Whether `queue_id` still has a member that isn't `completed`/`skipped`
     /// (i.e. `pending` or stuck `running`). Used by the loop engine as a
-    /// guard against marking a pool run's loop `completed` when
-    /// [`Self::pool_next_pending_spec_id`] finds no `pending` member to pick
+    /// guard against marking a queue run's loop `completed` when
+    /// [`Self::queue_next_pending_spec_id`] finds no `pending` member to pick
     /// next but a member is nonetheless left non-terminal — e.g. `running`
     /// because a previous run crashed mid-spec and hasn't been reset yet.
-    pub fn pool_has_incomplete_members(&self, pool_id: &str) -> Result<bool> {
+    pub fn queue_has_incomplete_members(&self, queue_id: &str) -> Result<bool> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pool_members pm
+            "SELECT COUNT(*) FROM queue_members pm
              JOIN loop_specs ls ON ls.id = pm.spec_id
-             WHERE pm.pool_id = ?1 AND ls.status NOT IN (?2, ?3)",
+             WHERE pm.queue_id = ?1 AND ls.status NOT IN (?2, ?3)",
             params![
-                pool_id,
+                queue_id,
                 LoopSpecStatus::Completed.as_str(),
                 LoopSpecStatus::Skipped.as_str()
             ],
@@ -357,21 +361,21 @@ impl Database {
         Ok(count > 0)
     }
 
-    /// Pool members left `running` with no live node run behind them in this
+    /// Queue members left `running` with no live node run behind them in this
     /// daemon's lifetime — a safety net for status left stuck `running` by a
     /// path other than G2 boot reconcile (which only ever reconciles a loop
     /// that was itself `Running` at boot; a member corrupted to `running` by
     /// some other route, or belonging to a loop reconcile didn't touch,
     /// would otherwise stay silently invisible to
-    /// [`Self::pool_next_pending_spec_id`] forever). "Live in this daemon's
+    /// [`Self::queue_next_pending_spec_id`] forever). "Live in this daemon's
     /// lifetime" means a `loop_runs` row for the spec that is still
     /// `running` *and* stamped with the current process's boot id — matching
     /// [`Database::reconcile_orphaned_loops`]'s own liveness test. Returned
     /// in queue order; callers must log why before recovering one (R3: no
     /// spec status may silently exclude a member from selection).
-    pub fn pool_stale_running_members(
+    pub fn queue_stale_running_members(
         &self,
-        pool_id: &str,
+        queue_id: &str,
         current_boot_id: Option<&str>,
     ) -> Result<Vec<String>> {
         let conn = self
@@ -379,9 +383,9 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT pm.spec_id FROM pool_members pm
+            "SELECT pm.spec_id FROM queue_members pm
              JOIN loop_specs ls ON ls.id = pm.spec_id
-             WHERE pm.pool_id = ?1 AND ls.status = ?2
+             WHERE pm.queue_id = ?1 AND ls.status = ?2
              AND NOT EXISTS (
                  SELECT 1 FROM loop_runs lr
                  WHERE lr.spec_id = pm.spec_id AND lr.status = 'running' AND lr.boot_id = ?3
@@ -389,18 +393,18 @@ impl Database {
              ORDER BY pm.position ASC",
         )?;
         let rows = stmt.query_map(
-            params![pool_id, LoopSpecStatus::Running.as_str(), current_boot_id],
+            params![queue_id, LoopSpecStatus::Running.as_str(), current_boot_id],
             |row| row.get::<_, String>(0),
         )?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
 
-    pub fn get_pool_details(&self, pool_id: &str) -> Result<Option<PoolDetails>> {
-        let Some(pool) = self.get_pool(pool_id)? else {
+    pub fn get_queue_details(&self, queue_id: &str) -> Result<Option<QueueDetails>> {
+        let Some(queue) = self.get_queue(queue_id)? else {
             return Ok(None);
         };
-        let member_pairs = self.list_pool_member_groups(pool_id)?;
+        let member_pairs = self.list_queue_member_groups(queue_id)?;
         let member_groups = member_pairs
             .iter()
             .cloned()
@@ -410,16 +414,16 @@ impl Database {
             .filter_map(|(spec_id, _)| self.get_loop_spec(&spec_id).transpose())
             .collect::<Result<Vec<_>>>()?;
 
-        Ok(Some(PoolDetails {
-            pool,
+        Ok(Some(QueueDetails {
+            queue,
             members,
             member_groups,
         }))
     }
 }
 
-fn map_pool_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pool> {
-    Ok(Pool {
+fn map_queue_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Queue> {
+    Ok(Queue {
         id: row.get(0)?,
         name: row.get(1)?,
         created_at: from_timestamp(row.get(2)?)?,
@@ -442,7 +446,7 @@ fn from_timestamp(value: i64) -> rusqlite::Result<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::pools::Pool;
+    use crate::domain::queues::Queue;
     use chrono::Utc;
     use tempfile::tempdir;
 
@@ -451,71 +455,71 @@ mod tests {
         Database::new(&dir.path().join("test.db")).unwrap()
     }
 
-    fn sample_pool(id: &str) -> Pool {
-        Pool {
+    fn sample_queue(id: &str) -> Queue {
+        Queue {
             id: id.to_string(),
-            name: format!("Pool {id}"),
+            name: format!("Queue {id}"),
             created_at: Utc::now(),
         }
     }
 
     #[test]
-    fn insert_and_get_pool() {
+    fn insert_and_get_queue() {
         let db = test_db();
-        let pool = sample_pool("pool1");
-        db.insert_pool(&pool).unwrap();
+        let queue = sample_queue("queue1");
+        db.insert_queue(&queue).unwrap();
 
-        let retrieved = db.get_pool("pool1").unwrap();
+        let retrieved = db.get_queue("queue1").unwrap();
         assert!(retrieved.is_some());
         let retrieved = retrieved.unwrap();
-        assert_eq!(retrieved.id, "pool1");
-        assert_eq!(retrieved.name, "Pool pool1");
+        assert_eq!(retrieved.id, "queue1");
+        assert_eq!(retrieved.name, "Queue queue1");
     }
 
     #[test]
-    fn get_pool_not_found() {
+    fn get_queue_not_found() {
         let db = test_db();
-        let result = db.get_pool("nonexistent").unwrap();
+        let result = db.get_queue("nonexistent").unwrap();
         assert!(result.is_none());
     }
 
     #[test]
-    fn list_pools_empty() {
+    fn list_queues_empty() {
         let db = test_db();
-        let pools = db.list_pools().unwrap();
-        assert!(pools.is_empty());
+        let queues = db.list_queues().unwrap();
+        assert!(queues.is_empty());
     }
 
     #[test]
-    fn list_pools_with_pools() {
+    fn list_queues_with_queues() {
         let db = test_db();
-        let pool1 = sample_pool("pool1");
-        let pool2 = sample_pool("pool2");
-        db.insert_pool(&pool1).unwrap();
-        db.insert_pool(&pool2).unwrap();
+        let queue1 = sample_queue("queue1");
+        let queue2 = sample_queue("queue2");
+        db.insert_queue(&queue1).unwrap();
+        db.insert_queue(&queue2).unwrap();
 
-        let pools = db.list_pools().unwrap();
-        assert_eq!(pools.len(), 2);
+        let queues = db.list_queues().unwrap();
+        assert_eq!(queues.len(), 2);
     }
 
     #[test]
-    fn list_pool_member_spec_ids_empty() {
+    fn list_queue_member_spec_ids_empty() {
         let db = test_db();
-        let members = db.list_pool_member_spec_ids("nonexistent").unwrap();
+        let members = db.list_queue_member_spec_ids("nonexistent").unwrap();
         assert!(members.is_empty());
     }
 
     #[test]
-    fn pool_has_member_false() {
+    fn queue_has_member_false() {
         let db = test_db();
-        let has = db.pool_has_member("nonexistent", "spec1").unwrap();
+        let has = db.queue_has_member("nonexistent", "spec1").unwrap();
         assert!(!has);
     }
 
     #[test]
-    fn pool_member_group_none() {
+    fn queue_member_group_none() {
         let db = test_db();
-        let group = db.pool_member_group("nonexistent", "spec1").unwrap();
+        let group = db.queue_member_group("nonexistent", "spec1").unwrap();
         assert!(group.is_none());
     }
 }

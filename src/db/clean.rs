@@ -162,7 +162,7 @@ impl Database {
     /// deleting `loops` cascades through `loop_specs` (loop-bound only) /
     /// `loop_nodes` / `loop_edges` / `loop_runs` /
     /// `loop_completion_hook_runs` / `ensembles` / `ensemble_members` /
-    /// `pool_members`; deleting `interactive_sessions` cascades through
+    /// `queue_members`; deleting `interactive_sessions` cascades through
     /// `seed_sessions`; deleting `intelligence_nodes` cascades through
     /// `intelligence_edges`. Those follow-on rows are therefore never
     /// deleted by an explicit statement here — issuing one *after* the
@@ -211,7 +211,7 @@ impl Database {
         )?;
         // CASCADEs to loop-bound loop_specs, which CASCADEs further to
         // loop_nodes / loop_edges / ensembles / ensemble_members /
-        // pool_members / loop_runs; loop_completion_hook_runs CASCADEs
+        // queue_members / loop_runs; loop_completion_hook_runs CASCADEs
         // directly off loop_id. Standalone specs (loop_id IS NULL) are
         // untouched, matching count_hard_cascade.
         tx.execute("DELETE FROM loops WHERE workdir = ?1", params![workdir])?;
@@ -484,8 +484,8 @@ fn count_hard_cascade(
             params![workdir],
             |row| row.get(0),
         )?;
-    let pool_members: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM pool_members
+    let queue_members: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM queue_members
               WHERE spec_id IN (
                   SELECT id FROM loop_specs WHERE loop_id IN (SELECT id FROM loops WHERE workdir = ?1)
               )",
@@ -523,7 +523,7 @@ fn count_hard_cascade(
         loop_completion_hook_runs,
         ensembles,
         ensemble_members,
-        pool_members,
+        queue_members,
         seed_sessions,
         intelligence_edges,
     })
@@ -693,7 +693,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         }
     }
@@ -1093,7 +1093,7 @@ mod tests {
             "loop_completion_hook_runs",
             "ensembles",
             "ensemble_members",
-            "pool_members",
+            "queue_members",
             "seed_sessions",
             "intelligence_edges",
         ];
@@ -1117,7 +1117,7 @@ mod tests {
                 "loop_completion_hook_runs" => counts.loop_completion_hook_runs = 1,
                 "ensembles" => counts.ensembles = 1,
                 "ensemble_members" => counts.ensemble_members = 1,
-                "pool_members" => counts.pool_members = 1,
+                "queue_members" => counts.queue_members = 1,
                 "seed_sessions" => counts.seed_sessions = 1,
                 "intelligence_edges" => counts.intelligence_edges = 1,
                 _ => unreachable!(),
@@ -1183,9 +1183,9 @@ mod tests {
     }
 
     #[test]
-    fn cascade_delete_orphan_project_preserves_other_projects_pool_members() {
+    fn cascade_delete_orphan_project_preserves_other_projects_queue_members() {
         let db = test_db();
-        let workdir = "/proj-pool";
+        let workdir = "/proj-queue";
         db.upsert_project(&make_project("hash-p", workdir)).unwrap();
         db.insert_loop(&make_loop("loop-p", workdir, LoopStatus::Completed))
             .unwrap();
@@ -1225,27 +1225,28 @@ mod tests {
             completed_via_at: None,
         })
         .unwrap();
-        let pool = crate::domain::pools::Pool {
-            id: "pool-1".to_string(),
+        let queue = crate::domain::queues::Queue {
+            id: "queue-1".to_string(),
             name: "p1".to_string(),
             created_at: chrono::Utc::now(),
         };
-        db.insert_pool(&pool).unwrap();
-        db.append_pool_member(&pool.id, doomed_spec_id, None)
+        db.insert_queue(&queue).unwrap();
+        db.append_queue_member(&queue.id, doomed_spec_id, None)
             .unwrap();
-        db.append_pool_member(&pool.id, safe_spec_id, None).unwrap();
+        db.append_queue_member(&queue.id, safe_spec_id, None)
+            .unwrap();
 
         db.cascade_delete_orphan_project("hash-p", workdir).unwrap();
 
-        // Pool itself remains (shared, not project-owned).
-        assert!(db.get_pool(&pool.id).unwrap().is_some());
+        // Queue itself remains (shared, not project-owned).
+        assert!(db.get_queue(&queue.id).unwrap().is_some());
         // The doomed spec is gone (loop-bound → CASCADE).
         assert!(db.get_loop_spec(doomed_spec_id).unwrap().is_none());
-        // The standalone spec survives, and so does its pool membership.
+        // The standalone spec survives, and so does its queue membership.
         assert!(db.get_loop_spec(safe_spec_id).unwrap().is_some());
-        assert!(db.pool_has_member(&pool.id, safe_spec_id).unwrap());
-        // The pool membership that pointed at the doomed spec is gone.
-        assert!(!db.pool_has_member(&pool.id, doomed_spec_id).unwrap());
+        assert!(db.queue_has_member(&queue.id, safe_spec_id).unwrap());
+        // The queue membership that pointed at the doomed spec is gone.
+        assert!(!db.queue_has_member(&queue.id, doomed_spec_id).unwrap());
     }
 
     #[test]

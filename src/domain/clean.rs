@@ -58,7 +58,7 @@ pub struct ProjectDependentCounts {
 /// actually deletes (sessions, prompts, scheduled sends, sync state) plus
 /// every row that is auto-cascade-deleted by SQLite's FK rules when the
 /// owning loop / interactive_session / intelligence_node is removed (the
-/// `loop_*` / `ensemble_*` / `pool_members` / `seed_sessions` /
+/// `loop_*` / `ensemble_*` / `queue_members` / `seed_sessions` /
 /// `intelligence_edges` rows). Surfaced in the pre-delete prompt so the
 /// reader sees the entire blast radius, not just the rows the cascade
 /// driver issues a `DELETE` for.
@@ -84,7 +84,7 @@ pub struct HardCascadeCounts {
     pub loop_completion_hook_runs: i64,
     pub ensembles: i64,
     pub ensemble_members: i64,
-    pub pool_members: i64,
+    pub queue_members: i64,
     pub seed_sessions: i64,
     pub intelligence_edges: i64,
 }
@@ -107,7 +107,7 @@ impl HardCascadeCounts {
             && self.loop_completion_hook_runs == 0
             && self.ensembles == 0
             && self.ensemble_members == 0
-            && self.pool_members == 0
+            && self.queue_members == 0
             && self.seed_sessions == 0
             && self.intelligence_edges == 0
     }
@@ -863,7 +863,7 @@ mod tests {
             loop_completion_hook_runs: 0,
             ensembles: 0,
             ensemble_members: 0,
-            pool_members: 0,
+            queue_members: 0,
             seed_sessions: 0,
             intelligence_edges: 0,
         };

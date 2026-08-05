@@ -85,8 +85,6 @@ stdio. Connect any MCP-capable AI CLI with `canopy mcp`.
 | `queue_remove_spec` | Remove a spec from a queue |
 | `queue_reorder` | Full replacement of a queue's order |
 
-The former `pool_*` tool names (`pool_create`, `pool_add_spec`, `pool_list`, `pool_remove_spec`, `pool_reorder`) still resolve as deprecated aliases of the `queue_*` tools above.
-
 ## Node blueprints (3)
 
 | Tool | Description |

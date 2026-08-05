@@ -1,7 +1,14 @@
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+
+/// Bumped whenever a migration changes table/column names in a way that an
+/// older binary's `CREATE TABLE IF NOT EXISTS` / `ADD COLUMN IF NOT EXISTS`
+/// guards can't detect (they'd silently recreate the old names as empty
+/// rather than erroring) — see `check_schema_version`. Version 2 is the
+/// legacy queue-table rename (see `migrate_legacy_queue_schema`).
+const SCHEMA_VERSION: i64 = 2;
 
 /// Thread-safe `SQLite` database wrapper.
 ///
@@ -33,11 +40,137 @@ impl Database {
         Ok(db)
     }
 
+    /// Refuses to open a database stamped with a schema version newer than
+    /// this binary knows about. Without this, an older binary meeting a
+    /// renamed/restructured schema would pass every `IF NOT EXISTS` guard
+    /// (the old names it looks for are simply gone) and start up believing
+    /// every table is empty — silent data loss from its perspective. A
+    /// missing `schema_version` row (pre-dates this check, or a brand new
+    /// database) is not a mismatch; every migration below is still
+    /// self-guarding for that case.
+    fn check_schema_version(conn: &Connection) -> Result<()> {
+        let daemon_state_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'daemon_state'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !daemon_state_exists {
+            return Ok(());
+        }
+
+        let stored: Option<i64> = conn
+            .query_row(
+                "SELECT value FROM daemon_state WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|v| v.parse::<i64>().ok());
+
+        if let Some(stored) = stored {
+            if stored > SCHEMA_VERSION {
+                anyhow::bail!(
+                    "Database schema version {stored} is newer than this build of canopy (v{}) supports (schema version {SCHEMA_VERSION}). Upgrade canopy before opening this database.",
+                    env!("CARGO_PKG_VERSION")
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn set_schema_version(conn: &Connection) -> Result<()> {
+        conn.execute(
+            "INSERT INTO daemon_state (key, value) VALUES ('schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [SCHEMA_VERSION.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Renames the previous-generation queue tables and columns (retired
+    /// names recorded only as literal SQL below, since renaming requires
+    /// naming what's being renamed) to their current equivalents. Guarded on
+    /// the old primary table's existence, so it's a no-op on both a fresh
+    /// database (never had it) and an already-migrated one (already renamed
+    /// away) — safe to run on every startup. Must run before the `CREATE
+    /// TABLE IF NOT EXISTS` batch below, which would otherwise create empty
+    /// `queues`/`queue_members` tables first and make the rename fail with
+    /// "table already exists".
+    fn migrate_legacy_queue_schema(conn: &Connection) -> Result<()> {
+        let legacy_schema_present: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'pools'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !legacy_schema_present {
+            return Ok(());
+        }
+
+        let legacy_active_run_alias_present: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loops') WHERE name = 'active_run_pool_id'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        let legacy_template_column_present: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loops') WHERE name = 'spec_pool'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+
+        let mut migration_sql = String::from(
+            "PRAGMA legacy_alter_table = OFF;
+             BEGIN TRANSACTION;
+             ALTER TABLE pools RENAME TO queues;
+             ALTER TABLE pool_members RENAME TO queue_members;
+             ALTER TABLE queue_members RENAME COLUMN pool_id TO queue_id;
+             DROP INDEX IF EXISTS idx_pool_members_position;
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_members_position
+                 ON queue_members(queue_id, position);
+            ",
+        );
+        if legacy_active_run_alias_present {
+            migration_sql.push_str(
+                "ALTER TABLE loops RENAME COLUMN active_run_pool_id TO active_run_queue_id;\n",
+            );
+        }
+        if legacy_template_column_present {
+            migration_sql.push_str("ALTER TABLE loops RENAME COLUMN spec_pool TO spec_queue;\n");
+        }
+        migration_sql.push_str("COMMIT;");
+
+        conn.execute_batch(&migration_sql)
+            .map_err(|e| anyhow::anyhow!("legacy queue schema migration failed: {e}"))?;
+
+        let fk_violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .map_err(|e| anyhow::anyhow!("legacy queue schema migration failed: {e}"))?;
+        if fk_violations > 0 {
+            anyhow::bail!(
+                "legacy queue schema migration failed: {fk_violations} foreign key violation(s) detected after migration"
+            );
+        }
+
+        Ok(())
+    }
+
     fn init(&self) -> Result<()> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
+        Self::check_schema_version(&conn)?;
+        Self::migrate_legacy_queue_schema(&conn)?;
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS agents (
@@ -213,8 +346,8 @@ impl Database {
                 started_at INTEGER,
                 completed_at INTEGER,
                 autorun_at INTEGER,
-                spec_pool TEXT,
-                active_run_pool_id TEXT,
+                spec_queue TEXT,
+                active_run_queue_id TEXT,
                 on_completed TEXT,
                 auto_continue_at INTEGER,
                 auto_continue_action TEXT
@@ -373,22 +506,22 @@ impl Database {
                 created_at INTEGER NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS pools (
+            CREATE TABLE IF NOT EXISTS queues (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS pool_members (
-                pool_id TEXT NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
+            CREATE TABLE IF NOT EXISTS queue_members (
+                queue_id TEXT NOT NULL REFERENCES queues(id) ON DELETE CASCADE,
                 spec_id TEXT NOT NULL REFERENCES loop_specs(id) ON DELETE CASCADE,
                 position INTEGER NOT NULL,
                 group_name TEXT,
-                PRIMARY KEY (pool_id, spec_id)
+                PRIMARY KEY (queue_id, spec_id)
             );
 
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_pool_members_position
-                ON pool_members(pool_id, position);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_members_position
+                ON queue_members(queue_id, position);
 
             CREATE TABLE IF NOT EXISTS seed_sessions (
                 session_id TEXT PRIMARY KEY,
@@ -605,19 +738,19 @@ impl Database {
             }
         }
 
-        // `spec_pool` (7f2efdf) was an unused template model, retired in favor
-        // of the `pools`/`pool_members` tables below. Kept only so pre-R4
+        // `spec_queue` (7f2efdf) was an unused template model, retired in favor
+        // of the `queues`/`queue_members` tables below. Kept only so pre-R4
         // databases that already have the column don't need a destructive
         // migration; current code never reads or writes it.
-        let has_spec_pool: bool = conn
+        let has_spec_queue: bool = conn
             .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('loops') WHERE name = 'spec_pool'",
+                "SELECT COUNT(*) FROM pragma_table_info('loops') WHERE name = 'spec_queue'",
                 [],
                 |row| Ok(row.get::<_, i32>(0)? > 0),
             )
             .unwrap_or(false);
-        if !has_spec_pool {
-            conn.execute("ALTER TABLE loops ADD COLUMN spec_pool TEXT", [])
+        if !has_spec_queue {
+            conn.execute("ALTER TABLE loops ADD COLUMN spec_queue TEXT", [])
                 .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
         }
 
@@ -774,20 +907,20 @@ impl Database {
         )
         .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
 
-        // `active_run_pool_id` persists which pool (if any) a loop's current/
+        // `active_run_queue_id` persists which queue (if any) a loop's current/
         // last run drew from, so an interrupted run (quota failure, daemon
-        // crash) can be resumed against the same pool by every resume path
+        // crash) can be resumed against the same queue by every resume path
         // (scheduled autorun, `loop_reset`) instead of falling back to the
         // loop's own bound specs. Older databases predate the column.
-        let has_active_run_pool_id: bool = conn
+        let has_active_run_queue_id: bool = conn
             .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('loops') WHERE name = 'active_run_pool_id'",
+                "SELECT COUNT(*) FROM pragma_table_info('loops') WHERE name = 'active_run_queue_id'",
                 [],
                 |row| Ok(row.get::<_, i32>(0)? > 0),
             )
             .unwrap_or(false);
-        if !has_active_run_pool_id {
-            conn.execute("ALTER TABLE loops ADD COLUMN active_run_pool_id TEXT", [])
+        if !has_active_run_queue_id {
+            conn.execute("ALTER TABLE loops ADD COLUMN active_run_queue_id TEXT", [])
                 .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
         }
 
@@ -891,13 +1024,13 @@ impl Database {
         // legacy member is ungrouped and never cross-resumes). Additive.
         let has_group_name: bool = conn
             .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('pool_members') WHERE name = 'group_name'",
+                "SELECT COUNT(*) FROM pragma_table_info('queue_members') WHERE name = 'group_name'",
                 [],
                 |row| Ok(row.get::<_, i32>(0)? > 0),
             )
             .unwrap_or(false);
         if !has_group_name {
-            conn.execute("ALTER TABLE pool_members ADD COLUMN group_name TEXT", [])
+            conn.execute("ALTER TABLE queue_members ADD COLUMN group_name TEXT", [])
                 .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
         }
 
@@ -957,6 +1090,8 @@ impl Database {
             .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
         }
 
+        Self::set_schema_version(&conn)?;
+
         Ok(())
     }
 }
@@ -972,8 +1107,8 @@ pub mod health;
 pub mod intelligence;
 pub mod last_prompts;
 pub mod loops;
-pub mod pools;
 pub mod project;
+pub mod queues;
 pub mod run;
 pub mod scheduled_sends;
 pub mod seeds;

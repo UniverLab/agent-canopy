@@ -321,7 +321,7 @@ fn cascade_count(c: &clean::HardCascadeCounts) -> i64 {
         + c.loop_completion_hook_runs
         + c.ensembles
         + c.ensemble_members
-        + c.pool_members
+        + c.queue_members
         + c.seed_sessions
         + c.intelligence_edges
 }
@@ -358,7 +358,7 @@ fn print_hard_cascade_plan(plan: &HardCascadePlan, dry_run: bool) {
         for t in &plan.targets {
             let c = &t.counts;
             println!(
-                "   {} ({})  missing: {}\n     [{} loop(s), {} interactive session(s), {} terminal session(s),\n      {} last prompt(s), {} scheduled send(s), {} failed send(s),\n      {} sync message(s), {} sync lock(s), {} intelligence node(s)]\n     + cascade: [{} loop_spec(s), {} loop_node(s), {} loop_edge(s),\n                 {} loop_run(s), {} completion_hook_run(s),\n                 {} ensemble(s), {} ensemble_member(s), {} pool_member(s),\n                 {} seed_session(s), {} intelligence_edge(s)]",
+                "   {} ({})  missing: {}\n     [{} loop(s), {} interactive session(s), {} terminal session(s),\n      {} last prompt(s), {} scheduled send(s), {} failed send(s),\n      {} sync message(s), {} sync lock(s), {} intelligence node(s)]\n     + cascade: [{} loop_spec(s), {} loop_node(s), {} loop_edge(s),\n                 {} loop_run(s), {} completion_hook_run(s),\n                 {} ensemble(s), {} ensemble_member(s), {} queue_member(s),\n                 {} seed_session(s), {} intelligence_edge(s)]",
                 t.name,
                 t.hash,
                 t.missing_path,
@@ -378,7 +378,7 @@ fn print_hard_cascade_plan(plan: &HardCascadePlan, dry_run: bool) {
                 c.loop_completion_hook_runs,
                 c.ensembles,
                 c.ensemble_members,
-                c.pool_members,
+                c.queue_members,
                 c.seed_sessions,
                 c.intelligence_edges,
             );
@@ -1450,7 +1450,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         }
     }

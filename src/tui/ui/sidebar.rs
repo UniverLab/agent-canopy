@@ -1805,7 +1805,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         })
         .unwrap();
@@ -1934,17 +1934,17 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         }
     }
 
-    /// Records one node run against `loop_id` via a pool-driven spec — the
+    /// Records one node run against `loop_id` via a queue-driven spec — the
     /// spec's own `loop_id` is `None` (never bound to this loop, so
     /// `list_loop_specs(loop_id)` stays empty, exactly like a queue-driven
     /// run), but `loop_runs.loop_id` is set, which is what the sidebar's
     /// last-run query reads.
-    fn seed_pool_driven_run(
+    fn seed_queue_driven_run(
         db: &crate::db::Database,
         loop_id: &str,
         started_at: chrono::DateTime<chrono::Utc>,
@@ -2006,7 +2006,7 @@ mod tests {
     fn queue_driven_loop_shows_last_run_time_not_zero_zero() {
         let started_at = chrono::Utc::now() - chrono::Duration::minutes(2);
         let text = render_automation_text_for(&bare_loop("q1", LoopStatus::Draft), |db| {
-            seed_pool_driven_run(db, "q1", started_at, None);
+            seed_queue_driven_run(db, "q1", started_at, None);
         });
         assert!(
             !text.contains("0/0"),
@@ -2144,7 +2144,7 @@ mod tests {
     fn running_loop_shows_running_not_a_relative_time() {
         let started_at = chrono::Utc::now() - chrono::Duration::minutes(2);
         let text = render_automation_text_for(&bare_loop("run1", LoopStatus::Running), |db| {
-            seed_pool_driven_run(db, "run1", started_at, None);
+            seed_queue_driven_run(db, "run1", started_at, None);
         });
         assert!(
             text.contains("running"),
@@ -2156,7 +2156,7 @@ mod tests {
     fn blocked_indicator_still_renders_for_paused_loop_with_blocker() {
         let started_at = chrono::Utc::now() - chrono::Duration::minutes(5);
         let text = render_automation_text_for(&bare_loop("blocked1", LoopStatus::Paused), |db| {
-            seed_pool_driven_run(
+            seed_queue_driven_run(
                 db,
                 "blocked1",
                 started_at,

@@ -31,7 +31,7 @@ impl Database {
         let (trigger_type, trigger_config) = encode_loop_trigger(lp.trigger.as_ref())?;
         let on_completed = encode_loop_completion_hook(lp.on_completed.as_ref())?;
         conn.execute(
-            "INSERT INTO loops (id, name, description, workdir, status, trigger_type, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action, archived)
+            "INSERT INTO loops (id, name, description, workdir, status, trigger_type, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 &lp.id,
@@ -45,7 +45,7 @@ impl Database {
                 lp.started_at.map(|value| value.timestamp()),
                 lp.completed_at.map(|value| value.timestamp()),
                 lp.autorun_at.map(|value| value.timestamp()),
-                &lp.active_run_pool_id,
+                &lp.active_run_queue_id,
                 on_completed,
                 lp.auto_continue_at.map(|value| value.timestamp()),
                 &lp.auto_continue_action,
@@ -90,7 +90,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action, archived
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived
              FROM loops WHERE autorun_at IS NOT NULL",
         )?;
         let rows = stmt.query_map([], map_loop_row)?;
@@ -145,7 +145,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action, archived
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived
              FROM loops WHERE auto_continue_at IS NOT NULL",
         )?;
         let rows = stmt.query_map([], map_loop_row)?;
@@ -204,7 +204,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action, archived
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived
              FROM loops WHERE trigger_type = ?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![trigger_type], map_loop_row)?;
@@ -249,7 +249,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action, archived
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived
              FROM loops WHERE id = ?1",
         )?;
 
@@ -278,12 +278,12 @@ impl Database {
         };
         let sql = if workdir.is_some() {
             format!(
-                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action, archived
+                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived
                  FROM loops WHERE workdir = ?1{archived_clause} ORDER BY created_at DESC"
             )
         } else {
             format!(
-                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action, archived
+                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived
                  FROM loops WHERE 1=1{archived_clause} ORDER BY created_at DESC"
             )
         };
@@ -421,20 +421,20 @@ impl Database {
         Ok(rows > 0)
     }
 
-    /// Persist (or, with `None`, clear) the pool a run against `loop_id` is
+    /// Persist (or, with `None`, clear) the queue a run against `loop_id` is
     /// currently drawing from. Called once when a run starts — including a
-    /// resumed run, so a failed pool run that gets auto-reset-and-relaunched
-    /// re-persists the same pool rather than losing it — and cleared again
+    /// resumed run, so a failed queue run that gets auto-reset-and-relaunched
+    /// re-persists the same queue rather than losing it — and cleared again
     /// only when a run finishes genuinely. See
-    /// [`crate::domain::loops::Loop::active_run_pool_id`].
-    pub fn set_loop_active_run_pool(&self, loop_id: &str, pool_id: Option<&str>) -> Result<bool> {
+    /// [`crate::domain::loops::Loop::active_run_queue_id`].
+    pub fn set_loop_active_run_queue(&self, loop_id: &str, queue_id: Option<&str>) -> Result<bool> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let rows = conn.execute(
-            "UPDATE loops SET active_run_pool_id = ?1 WHERE id = ?2",
-            params![pool_id, loop_id],
+            "UPDATE loops SET active_run_queue_id = ?1 WHERE id = ?2",
+            params![queue_id, loop_id],
         )?;
         Ok(rows > 0)
     }
@@ -535,9 +535,9 @@ impl Database {
     /// scheduler's auto-reset-and-resume of a `failed` loop on autorun, so
     /// there is exactly one place that knows how to unstick a loop.
     ///
-    /// When the loop's last run was against a pool (`active_run_pool_id` is
-    /// set), the pool's *members* are what actually need resetting — the
-    /// loop's own bound specs are typically empty for a pool run — so they're
+    /// When the loop's last run was against a queue (`active_run_queue_id` is
+    /// set), the queue's *members* are what actually need resetting — the
+    /// loop's own bound specs are typically empty for a queue run — so they're
     /// folded into the same eligible set as the loop's bound specs, both for
     /// validating an explicit `specs` list and for the "every non-completed"
     /// default. This is the one reset implementation both `loop_reset` and
@@ -552,15 +552,15 @@ impl Database {
         }
 
         let bound_specs = self.list_loop_specs(loop_id)?;
-        let pool_specs: Vec<LoopSpec> = match &lp.active_run_pool_id {
-            Some(pool_id) => self
-                .list_pool_member_spec_ids(pool_id)?
+        let queue_specs: Vec<LoopSpec> = match &lp.active_run_queue_id {
+            Some(queue_id) => self
+                .list_queue_member_spec_ids(queue_id)?
                 .into_iter()
                 .filter_map(|spec_id| self.get_loop_spec(&spec_id).transpose())
                 .collect::<Result<Vec<_>>>()?,
             None => Vec::new(),
         };
-        let eligible_specs: Vec<&LoopSpec> = bound_specs.iter().chain(pool_specs.iter()).collect();
+        let eligible_specs: Vec<&LoopSpec> = bound_specs.iter().chain(queue_specs.iter()).collect();
 
         let valid_ids: std::collections::HashSet<&str> =
             eligible_specs.iter().map(|spec| spec.id.as_str()).collect();
@@ -670,7 +670,7 @@ impl Database {
 
     /// A single spec's own graph (nodes/edges), resolved by spec id alone —
     /// independent of whether the spec is bound to a loop (`loop_specs.loop_id`)
-    /// or a standalone pool member. Lets the loop engine drive a pool spec
+    /// or a standalone queue member. Lets the loop engine drive a queue spec
     /// through the same lookup path as a bound spec (see `loop_engine::run`).
     pub fn get_loop_spec_details(&self, spec_id: &str) -> Result<Option<LoopSpecDetails>> {
         let Some(spec) = self.get_loop_spec(spec_id)? else {
@@ -1215,10 +1215,10 @@ impl Database {
 
     /// All node runs recorded against `loop_id`, regardless of whether the
     /// spec they belong to is bound (`loop_specs.loop_id`) or was picked up
-    /// live from a pool (pool members always keep `loop_id: None` on their
+    /// live from a queue (queue members always keep `loop_id: None` on their
     /// own row — see `LoopEngine::run_loop`). `loop_runs.loop_id` is set on
     /// every insert either way, so this is the only reliable way to find a
-    /// pool-driven loop's current/recent activity without a pool id in hand.
+    /// queue-driven loop's current/recent activity without a queue id in hand.
     pub fn list_loop_runs_for_loop(&self, loop_id: &str) -> Result<Vec<LoopNodeRun>> {
         let conn = self
             .conn
@@ -1491,13 +1491,13 @@ impl Database {
     /// No loop run survives the process that spawned it, so any loop still
     /// `Running` at startup was interrupted mid-execution by the previous
     /// daemon. Pause it, mark its dangling node runs as failed/interrupted,
-    /// and reset its in-flight spec (loop-bound or pool member — either way
+    /// and reset its in-flight spec (loop-bound or queue member — either way
     /// `run.spec_id` names it) from `running` back to `pending`, all in one
     /// transaction so there is no window where the loop is recoverable but
     /// the spec is not (B18). A spec's completed work is preserved by the
     /// worktree/commits, not by its status, so restarting it from its entry
     /// node on resume is safe — and required: leaving it `running` made it
-    /// invisible to pool selection (`pool_next_pending_spec_id` only ever
+    /// invisible to queue selection (`queue_next_pending_spec_id` only ever
     /// picks a `pending` member), permanently orphaning it. `loop_continue`
     /// alone is enough to resume it (no `loop_pause` detour needed).
     /// Idempotent: a loop already `Paused` isn't touched by a later call.
@@ -1510,7 +1510,7 @@ impl Database {
 
         let orphaned: Vec<Loop> = {
             let mut stmt = tx.prepare(
-                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action, archived
+                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived
                  FROM loops WHERE status = ?1",
             )?;
             let rows = stmt.query_map(params![LoopStatus::Running.as_str()], map_loop_row)?;
@@ -1635,14 +1635,14 @@ impl Database {
         Ok(orphaned.len())
     }
 
-    /// Reset pool-member specs stuck `running` with no active node run in
+    /// Reset queue-member specs stuck `running` with no active node run in
     /// this daemon's lifetime back to `pending`. Covers the gap between
     /// `reconcile_orphaned_loops` (which only touches loops that were
-    /// themselves `Running` at boot) and a pool member left `running` by a
+    /// themselves `Running` at boot) and a queue member left `running` by a
     /// path that paused the loop without resetting the spec (e.g. a
     /// BLOCKER-reported spec that was never cleaned up). Called at server
     /// startup after `reconcile_orphaned_loops`.
-    pub fn reconcile_stranded_pool_specs(&self) -> Result<usize> {
+    pub fn reconcile_stranded_queue_specs(&self) -> Result<usize> {
         let conn = self
             .conn
             .lock()
@@ -1651,8 +1651,8 @@ impl Database {
 
         let paused_loops: Vec<(String, String)> = {
             let mut stmt = tx.prepare(
-                "SELECT id, active_run_pool_id FROM loops
-                 WHERE status = ?1 AND active_run_pool_id IS NOT NULL",
+                "SELECT id, active_run_queue_id FROM loops
+                 WHERE status = ?1 AND active_run_queue_id IS NOT NULL",
             )?;
             let rows = stmt.query_map(params![LoopStatus::Paused.as_str()], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -1664,12 +1664,12 @@ impl Database {
         let boot_id = crate::system::boot_id();
         let current_boot_id = boot_id.as_deref();
 
-        for (loop_id, pool_id) in &paused_loops {
+        for (loop_id, queue_id) in &paused_loops {
             let stranded_specs: Vec<String> = {
                 let mut stmt = tx.prepare(
-                    "SELECT pm.spec_id FROM pool_members pm
+                    "SELECT pm.spec_id FROM queue_members pm
                      JOIN loop_specs ls ON ls.id = pm.spec_id
-                     WHERE pm.pool_id = ?1 AND ls.status = ?2
+                     WHERE pm.queue_id = ?1 AND ls.status = ?2
                      AND NOT EXISTS (
                          SELECT 1 FROM loop_runs lr
                          WHERE lr.spec_id = pm.spec_id
@@ -1679,7 +1679,7 @@ impl Database {
                      ORDER BY pm.position ASC",
                 )?;
                 let rows = stmt.query_map(
-                    params![pool_id, LoopSpecStatus::Running.as_str(), current_boot_id],
+                    params![queue_id, LoopSpecStatus::Running.as_str(), current_boot_id],
                     |row| row.get::<_, String>(0),
                 )?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -1687,7 +1687,7 @@ impl Database {
 
             for spec_id in &stranded_specs {
                 tracing::warn!(
-                    "Reconciling stranded pool spec '{}' in loop '{}': \
+                    "Reconciling stranded queue spec '{}' in loop '{}': \
                      was 'running' with no active node run in this daemon's \
                      lifetime; resetting to pending.",
                     spec_id,
@@ -1755,7 +1755,7 @@ impl Database {
                                 );
                                 if quarantine_worktree(&workdir, &message) {
                                     tracing::warn!(
-                                        "Reconciling stranded pool spec '{}' in loop '{}': worktree had uncommitted changes left by the interrupted run; quarantined with `git stash` ({}). Recover with `git stash list` / `git stash pop` in {}.",
+                                        "Reconciling stranded queue spec '{}' in loop '{}': worktree had uncommitted changes left by the interrupted run; quarantined with `git stash` ({}). Recover with `git stash list` / `git stash pop` in {}.",
                                         spec_id,
                                         loop_id,
                                         message,
@@ -1869,7 +1869,7 @@ fn map_loop_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Loop> {
             .get::<_, Option<i64>>(9)?
             .map(from_timestamp)
             .transpose()?,
-        active_run_pool_id: row.get(10)?,
+        active_run_queue_id: row.get(10)?,
         on_completed: row
             .get::<_, Option<String>>(11)?
             .as_deref()
@@ -2139,7 +2139,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         }
     }

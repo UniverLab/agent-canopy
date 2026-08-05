@@ -221,9 +221,7 @@ bound specs:
 | `queue_remove_spec` | Remove a spec from a queue |
 | `queue_reorder` | Full replacement of a queue's order |
 
-Pass a queue to `loop_run` via `queue_id` (the deprecated `pool_id`
-still works). The former `pool_*` tool names remain as deprecated
-back-compat aliases of the `queue_*` tools above.
+Pass a queue to `loop_run` via `queue_id`.
 
 Queue membership is unaffected by `loop_run` — specs stay standalone.
 The `loop info` CLI and `loop_get` MCP tool show queue-driven progress
