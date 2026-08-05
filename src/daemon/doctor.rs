@@ -217,6 +217,15 @@ pub(crate) async fn run_doctor() -> Result<()> {
         }
     }
 
+    // ── Legacy/new data layout split ────────────────────────────────
+    // `usage.toml` and `cache/` migrations defer deleting their legacy
+    // counterpart while a daemon may still be using it (see
+    // `usage_stats::migrate_legacy_json` / `models_db::migrate_legacy_caches`),
+    // so a lingering split is expected during that window — but it's the
+    // one thing an operator can actually observe from outside, and
+    // otherwise has no way to explain.
+    report_layout_split(&canopy_dir, state_pid, &mut issues);
+
     // ── Service Unit ──────────────────────────────────────────────
     // A unit that exists but points at a deleted/stale binary makes
     // systemd/launchd retry-loop the daemon forever with nothing on the
@@ -774,6 +783,62 @@ fn binary_version(path: &Path) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+/// Report a lingering legacy/new split for the data-layout migrations in
+/// `usage_stats` and `models_db`: `usage.json` next to `usage.toml`, or a
+/// legacy `models_cache.json` / `models_native_<cli>.json` next to their
+/// `cache/` counterparts. Both migrations defer deleting the legacy side
+/// while `state_pid` shows a daemon may still be using it, so this line is
+/// what lets an operator tell that expected, self-clearing wait apart from
+/// a migration that's actually stuck.
+fn report_layout_split(canopy_dir: &Path, state_pid: Option<u32>, issues: &mut Vec<String>) {
+    let usage_split =
+        canopy_dir.join("usage.json").exists() && canopy_dir.join("usage.toml").exists();
+
+    let legacy_native_caches: Vec<String> = std::fs::read_dir(canopy_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| {
+                    let name = entry.file_name().to_str()?.to_string();
+                    (name.starts_with("models_native_") && name.ends_with(".json")).then_some(name)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let legacy_catalog_cache = canopy_dir.join("models_cache.json").exists();
+    let cache_split = legacy_catalog_cache || !legacy_native_caches.is_empty();
+
+    if !usage_split && !cache_split {
+        return;
+    }
+
+    println!(" \x1b[33m⚠\x1b[0m Legacy/new data layout split detected:");
+    if usage_split {
+        println!("     usage.json (legacy) and usage.toml (current) both exist");
+    }
+    if legacy_catalog_cache {
+        println!(
+            "     models_cache.json (legacy) and cache/models_catalog.json (current) both exist"
+        );
+    }
+    for name in &legacy_native_caches {
+        println!("     {name} (legacy) and cache/{name} (current) both exist");
+    }
+
+    if let Some(pid) = state_pid {
+        println!(
+            "     a canopy daemon (PID: {pid}) is running, so cleanup of the legacy file(s) is deferred until it stops"
+        );
+        issues.push(
+            "Legacy/new data layout split detected, deferred because a daemon is running — it will clean up on a future run once no daemon is live.".to_string(),
+        );
+    } else {
+        issues.push(
+            "Legacy/new data layout split detected with no daemon running — re-run any canopy command to clean up the legacy file(s).".to_string(),
+        );
+    }
+}
+
 /// Report on the systemd/launchd service unit, if any: its path, the binary
 /// it names, and whether that binary is the problem. Running the daemon by
 /// hand instead of via a unit is legitimate, so no unit at all is a neutral
@@ -1028,6 +1093,46 @@ mod tests {
             assert_eq!(manager, "launchd");
             assert!(path.ends_with("Library/LaunchAgents/com.canopy.plist"));
         }
+    }
+
+    #[test]
+    fn report_layout_split_silent_when_fully_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("usage.toml"), "[counts]\n").unwrap();
+        let mut issues = Vec::new();
+        report_layout_split(dir.path(), None, &mut issues);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn report_layout_split_flags_usage_split_and_defers_with_live_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("usage.json"), r#"{"counts":{}}"#).unwrap();
+        std::fs::write(dir.path().join("usage.toml"), "[counts]\n").unwrap();
+        let mut issues = Vec::new();
+        report_layout_split(dir.path(), Some(4242), &mut issues);
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].contains("deferred"));
+    }
+
+    #[test]
+    fn report_layout_split_flags_cache_split_without_a_running_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("cache")).unwrap();
+        std::fs::write(
+            dir.path().join("cache").join("models_native_claude.json"),
+            "{}",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("models_native_claude.json"), "{}").unwrap();
+        let mut issues = Vec::new();
+        report_layout_split(dir.path(), None, &mut issues);
+        assert_eq!(issues.len(), 1);
+        assert!(
+            issues[0].contains("no daemon running"),
+            "issue was: {}",
+            issues[0]
+        );
     }
 
     /// `run_doctor` reads `$HOME` (via `dirs::home_dir()`, transitively
@@ -1373,6 +1478,57 @@ mod tests {
         assert!(result.is_ok());
         assert!(output.contains("Model 'some-unknown-model-9000' is not supported"));
         assert!(output.contains("select a supported embedding model"));
+    }
+
+    /// The dialog symptom from the usage-stats/model-cache layout migration
+    /// spec is only observable from outside as a lingering legacy/new
+    /// split — doctor must name it explicitly rather than leave an operator
+    /// unable to explain it.
+    #[tokio::test]
+    #[ignore]
+    async fn run_doctor_reports_legacy_new_layout_split() {
+        let home = tempfile::tempdir().unwrap();
+        let canopy_dir = home.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+
+        // Both usage files present, as left behind by a deferred migration.
+        std::fs::write(canopy_dir.join("usage.json"), r#"{"counts":{"kiro":2}}"#).unwrap();
+        std::fs::write(canopy_dir.join("usage.toml"), "[counts]\nkiro = 1\n").unwrap();
+        // Same split for the model catalog cache.
+        std::fs::create_dir_all(canopy_dir.join("cache")).unwrap();
+        std::fs::write(
+            canopy_dir.join("cache").join("models_catalog.json"),
+            r#"{"fresh":true}"#,
+        )
+        .unwrap();
+        std::fs::write(canopy_dir.join("models_cache.json"), r#"{"stale":true}"#).unwrap();
+
+        let (result, output) = run_doctor_captured(home.path()).await;
+
+        assert!(result.is_ok());
+        assert!(
+            output.contains("Legacy/new data layout split detected"),
+            "doctor output missing layout-split line:\n{output}"
+        );
+        assert!(output.contains("usage.json"));
+        assert!(output.contains("models_cache.json"));
+    }
+
+    /// No split, no daemon: doctor must stay quiet about layout migration —
+    /// this is the common, already-migrated case and must not cost a line
+    /// of noise or a false "unexplainable" issue.
+    #[tokio::test]
+    #[ignore]
+    async fn run_doctor_says_nothing_about_layout_split_when_fully_migrated() {
+        let home = tempfile::tempdir().unwrap();
+        let canopy_dir = home.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        std::fs::write(canopy_dir.join("usage.toml"), "[counts]\nkiro = 1\n").unwrap();
+
+        let (result, output) = run_doctor_captured(home.path()).await;
+
+        assert!(result.is_ok());
+        assert!(!output.contains("Legacy/new data layout split"));
     }
 
     /// A local embeddings model configured on a binary built WITHOUT the

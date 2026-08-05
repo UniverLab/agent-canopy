@@ -160,13 +160,20 @@ fn cache_path() -> Option<PathBuf> {
 /// needed: a same-filesystem `rename` is atomic, so a crash mid-migration
 /// leaves the file readable at exactly one of the two paths, never neither.
 /// Never touches `~/.canopy/models/` (the embedding model download cache).
-pub fn migrate_legacy_caches(canopy_dir: &Path) {
+///
+/// Once a legacy path's new-layout counterpart exists, `move_if_absent`
+/// defers deleting the legacy leftover while `other_instance_may_be_running`
+/// is `true` (see its doc comment) — a still-running old binary's daemon
+/// has been observed recreating a legacy cache file after this migration
+/// already moved it once.
+pub fn migrate_legacy_caches(canopy_dir: &Path, other_instance_may_be_running: bool) {
     let cache_dir = canopy_dir.join(CACHE_DIR);
 
     move_if_absent(
         &canopy_dir.join("models_cache.json"),
         &cache_dir.join("models_catalog.json"),
         &cache_dir,
+        other_instance_may_be_running,
     );
 
     let Ok(entries) = std::fs::read_dir(canopy_dir) else {
@@ -184,16 +191,44 @@ pub fn migrate_legacy_caches(canopy_dir: &Path) {
         // Unwrap is safe: `is_legacy_native_cache` only matches when
         // `file_name()` returned `Some`.
         let file_name = path.file_name().unwrap();
-        move_if_absent(&path, &cache_dir.join(file_name), &cache_dir);
+        move_if_absent(
+            &path,
+            &cache_dir.join(file_name),
+            &cache_dir,
+            other_instance_may_be_running,
+        );
     }
 }
 
 /// Move `old_path` to `new_path` (creating `parent` first) unless `new_path`
 /// already exists, in which case any leftover `old_path` — e.g. from a crash
-/// between a prior migration's rename and cleanup — is removed instead.
-fn move_if_absent(old_path: &Path, new_path: &Path, parent: &Path) {
+/// between a prior migration's rename and cleanup, or an older binary's
+/// still-running daemon recreating the legacy cache file after migration —
+/// is removed instead, but only while `other_instance_may_be_running` is
+/// `false`.
+///
+/// The caller (`ensure_data_dir` in `main.rs`) computes
+/// `other_instance_may_be_running` once via
+/// `daemon::process::other_instance_may_be_running` before calling in,
+/// rather than this module reaching for daemon detection itself: this
+/// `domain` module is also compiled standalone (see
+/// `examples/rag_search.rs`) without the `daemon` module available. As with
+/// `usage_stats::migrate_legacy_json`, "an old reader of the legacy path
+/// may still exist" is assumed by default: this project rebuilds and
+/// re-runs from source while the previously installed binary's daemon and
+/// TUI are still live and writing to the paths this migration moves. The
+/// deferred removal is retried on every later call (i.e. every startup)
+/// once the caller reports no such process.
+fn move_if_absent(
+    old_path: &Path,
+    new_path: &Path,
+    parent: &Path,
+    other_instance_may_be_running: bool,
+) {
     if new_path.exists() {
-        let _ = std::fs::remove_file(old_path);
+        if !other_instance_may_be_running {
+            let _ = std::fs::remove_file(old_path);
+        }
         return;
     }
     if !old_path.exists() {
@@ -634,7 +669,7 @@ mod tests {
         )
         .unwrap();
 
-        migrate_legacy_caches(dir.path());
+        migrate_legacy_caches(dir.path(), false);
 
         assert!(!dir.path().join("models_cache.json").exists());
         assert!(!dir.path().join("models_native_opencode.json").exists());
@@ -663,7 +698,7 @@ mod tests {
         std::fs::write(models_dir.join("some-embedding-file.onnx"), b"not a cache").unwrap();
         std::fs::write(dir.path().join("models_cache.json"), "{}").unwrap();
 
-        migrate_legacy_caches(dir.path());
+        migrate_legacy_caches(dir.path(), false);
 
         // The embedding download tree is untouched: still present, and
         // nothing from it leaked into the new cache dir.
@@ -681,7 +716,7 @@ mod tests {
         // rename and its cleanup must not clobber the already-migrated copy.
         std::fs::write(dir.path().join("models_cache.json"), r#"{"stale":true}"#).unwrap();
 
-        migrate_legacy_caches(dir.path());
+        migrate_legacy_caches(dir.path(), false);
 
         assert!(!dir.path().join("models_cache.json").exists());
         assert_eq!(
@@ -693,8 +728,55 @@ mod tests {
     #[test]
     fn migrate_noop_on_fresh_install() {
         let dir = tempfile::TempDir::new().unwrap();
-        migrate_legacy_caches(dir.path());
+        migrate_legacy_caches(dir.path(), false);
         assert!(!dir.path().join("cache").exists());
+    }
+
+    // ── deferred deletion while a daemon may be running ─────────────────
+
+    #[test]
+    fn migrate_defers_deletion_of_leftover_legacy_cache_when_daemon_running() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache_dir = dir.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join("models_catalog.json"), r#"{"fresh":true}"#).unwrap();
+        // As if an older binary's still-running daemon recreated the
+        // legacy cache file after a prior migration already moved it once
+        // (the observed real-world scenario this spec is about).
+        std::fs::write(dir.path().join("models_cache.json"), r#"{"stale":true}"#).unwrap();
+
+        migrate_legacy_caches(dir.path(), true);
+
+        assert!(
+            dir.path().join("models_cache.json").exists(),
+            "must not delete a legacy cache file a live daemon might still be using"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cache_dir.join("models_catalog.json")).unwrap(),
+            r#"{"fresh":true}"#
+        );
+    }
+
+    #[test]
+    fn migrate_cleans_up_deferred_legacy_cache_once_daemon_stops() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache_dir = dir.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join("models_catalog.json"), r#"{"fresh":true}"#).unwrap();
+        std::fs::write(dir.path().join("models_cache.json"), r#"{"stale":true}"#).unwrap();
+
+        migrate_legacy_caches(dir.path(), true);
+        assert!(
+            dir.path().join("models_cache.json").exists(),
+            "deletion should be deferred first"
+        );
+
+        migrate_legacy_caches(dir.path(), false);
+
+        assert!(
+            !dir.path().join("models_cache.json").exists(),
+            "deferred cleanup must run on a later, quieter run"
+        );
     }
 
     fn catalog(ids: &[(&str, &str)], age: Duration) -> ModelCatalog {

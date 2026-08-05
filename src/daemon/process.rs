@@ -188,6 +188,21 @@ pub(crate) fn read_pid(data_dir: &std::path::Path) -> Option<u32> {
         .and_then(|s| s.trim().parse().ok())
 }
 
+/// Whether a canopy daemon may currently be reading or writing files under
+/// `data_dir` — in particular, a pre-migration legacy path a data-layout
+/// change moved.
+///
+/// Source trees here get rebuilt and re-run while the previously installed
+/// binary's daemon (and TUI) are still live: "an old reader of the legacy
+/// path may still exist" is the default assumption for any migration in
+/// this project, not an edge case to special-case away. Callers doing a
+/// one-time file-layout migration must check this before deleting a legacy
+/// path, and defer the deletion (retrying on a later, quieter run) rather
+/// than skip it forever.
+pub(crate) fn other_instance_may_be_running(data_dir: &std::path::Path) -> bool {
+    read_pid(data_dir).is_some_and(is_process_running)
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn is_systemd_available() -> bool {
     std::process::Command::new("systemctl")
@@ -703,6 +718,32 @@ mod tests {
             !is_process_running(4294967294),
             "nonexistent high PID should not be reported as running"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn other_instance_may_be_running_true_when_pid_file_names_live_process() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("daemon.pid"),
+            std::process::id().to_string(),
+        )
+        .expect("write pid");
+        assert!(other_instance_may_be_running(dir.path()));
+    }
+
+    #[test]
+    fn other_instance_may_be_running_false_when_no_pid_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(!other_instance_may_be_running(dir.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn other_instance_may_be_running_false_for_stale_pid_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("daemon.pid"), "999999999").expect("write pid");
+        assert!(!other_instance_may_be_running(dir.path()));
     }
 
     #[cfg(unix)]

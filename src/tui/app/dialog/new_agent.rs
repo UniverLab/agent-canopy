@@ -1934,4 +1934,45 @@ mod tests {
         assert!(NewTaskMode::Interactive == NewTaskMode::Interactive);
         assert!(NewTaskMode::Interactive != NewTaskMode::Resume);
     }
+
+    // ── ordering survives a deferred usage.json/usage.toml split ────
+    //
+    // Reproduces the dialog symptom from the usage-stats migration spec:
+    // a still-running older binary keeps writing counts to the legacy
+    // `usage.json` after migration created `usage.toml`. The dialog's
+    // ordering must reflect those counts, not silently fall back to
+    // default order because it only ever looked at `usage.toml`.
+    #[test]
+    fn sort_clis_by_usage_reflects_counts_across_a_deferred_legacy_split() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut stale_toml = crate::domain::usage_stats::CliUsage::default();
+        stale_toml.record("codex");
+        stale_toml.save(dir.path()).unwrap();
+
+        // The still-running old binary's daemon keeps appending to the
+        // legacy path after migration, so it ends up newer and with higher
+        // counts than the migrated usage.toml snapshot.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let mut fresher_legacy = crate::domain::usage_stats::CliUsage::default();
+        fresher_legacy.record("claude");
+        fresher_legacy.record("claude");
+        fresher_legacy.record("claude");
+        std::fs::write(
+            dir.path().join("usage.json"),
+            serde_json::to_string_pretty(&fresher_legacy).unwrap(),
+        )
+        .unwrap();
+
+        let usage = crate::domain::usage_stats::CliUsage::load(dir.path());
+        let pairs = vec![(Cli::new("codex"), None), (Cli::new("claude"), None)];
+
+        let (sorted, _) = NewAgentDialog::sort_clis_by_usage(pairs, &usage);
+
+        assert_eq!(
+            sorted[0].as_str(),
+            "claude",
+            "the newer legacy counts must win the ordering, not the stale usage.toml snapshot"
+        );
+    }
 }

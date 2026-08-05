@@ -241,8 +241,15 @@ pub(crate) fn ensure_data_dir() -> Result<std::path::PathBuf> {
     // hand-inspectable files, a named `cache/` dir for program-managed
     // caches). Idempotent and cheap once migrated, so it's safe to run on
     // every call rather than gating it behind a first-run flag.
-    domain::usage_stats::migrate_legacy_json(&data_dir);
-    domain::models_db::migrate_legacy_caches(&data_dir);
+    //
+    // Both migrations defer deleting a legacy path while another canopy
+    // process may still be using it: this source tree gets rebuilt and
+    // re-run while the previously installed binary's daemon (and TUI) are
+    // still live, so "an old reader of the legacy path still exists" is the
+    // default assumption here, not an edge case.
+    let other_instance_may_be_running = daemon::process::other_instance_may_be_running(&data_dir);
+    domain::usage_stats::migrate_legacy_json(&data_dir, other_instance_may_be_running);
+    domain::models_db::migrate_legacy_caches(&data_dir, other_instance_may_be_running);
     Ok(data_dir)
 }
 
