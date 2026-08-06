@@ -366,15 +366,18 @@ impl App {
 
     // ── Navigation ──────────────────────────────────────────────
     //
-    // The sidebar is one flat vertical ring for arrow-key purposes: pinned
-    // RAG (top) → Live → Automation → Knowledge (bottom), wrapping around.
-    // Inside Knowledge, once a project is entered (`project_focus.is_some()`)
-    // arrows instead navigate the active tab's list exclusively — they never
-    // change tabs (functional requirement 4).
+    // Arrows never change the active sidebar tab (Live / Automation /
+    // Knowledge) — they navigate that tab's own list exclusively, wrapping
+    // at both ends. The one exception is the pinned RAG summary above the
+    // tab bar: backing off the first item of whichever tab is active moves
+    // up to RAG (when it has anything to show), and moving off RAG returns
+    // to the first item of that same tab. Inside Knowledge, once a project
+    // is entered (`project_focus.is_some()`) arrows navigate that project's
+    // active tab list under the same rule (functional requirement 4).
 
     pub fn select_next(&mut self) {
         if self.agents_rag_focused {
-            self.leave_rag_focus(true);
+            self.leave_rag_focus();
             self.reset_log_scroll();
             return;
         }
@@ -393,7 +396,7 @@ impl App {
 
     pub fn select_prev(&mut self) {
         if self.agents_rag_focused {
-            self.leave_rag_focus(false);
+            self.leave_rag_focus();
             self.reset_log_scroll();
             return;
         }
@@ -441,33 +444,48 @@ impl App {
             .collect()
     }
 
+    /// Arrows never change the active tab (decisions 1–2): running off
+    /// either end of `Live`'s own list wraps within it. The one exception is
+    /// backing off the first item, which instead focuses the pinned RAG
+    /// summary above the tab bar when it has anything to show (decision 3);
+    /// with nothing to show there, that end wraps to the last item too.
     fn navigate_live(&mut self, forward: bool) {
         let indices = self.live_indices();
         if indices.is_empty() {
-            self.cross_layer(SidebarLayer::Live, forward);
             return;
         }
         let current = indices.iter().position(|&i| i == self.selected);
-        let next_pos = match current {
-            Some(pos) if forward && pos + 1 < indices.len() => Some(pos + 1),
-            Some(pos) if !forward && pos > 0 => Some(pos - 1),
-            Some(_) => None,
-            None => Some(0),
+        let Some(pos) = current else {
+            let prev = self.selected;
+            self.selected = indices[0];
+            self.update_agent_section_focus_on_change(prev);
+            return;
         };
-        match next_pos {
-            Some(pos) => {
-                let prev = self.selected;
-                self.selected = indices[pos];
-                self.update_agent_section_focus_on_change(prev);
+        let next_pos = if forward {
+            if pos + 1 < indices.len() {
+                pos + 1
+            } else {
+                0
             }
-            None => self.cross_layer(SidebarLayer::Live, forward),
-        }
+        } else if pos > 0 {
+            pos - 1
+        } else if self.rag_info.has_rag_activity() {
+            self.enter_rag_focus();
+            return;
+        } else {
+            indices.len() - 1
+        };
+        let prev = self.selected;
+        self.selected = indices[next_pos];
+        self.update_agent_section_focus_on_change(prev);
     }
 
     /// Automation is one flat ring for arrow-key purposes, agents rendered
     /// above loops: `[agent, agent, …, loop, loop, …]`. Running off either
-    /// true end crosses to the next/previous layer (`cross_layer`) instead
-    /// of bouncing between the two sub-lists.
+    /// end wraps within that same flat list (decisions 1–2), except backing
+    /// off the very first item, which focuses the pinned RAG summary when it
+    /// has anything to show (decision 3) and otherwise wraps to the last
+    /// entry like any other tab.
     fn navigate_automation(&mut self, forward: bool) {
         let agent_indices = self.automation_agent_indices();
         let loop_ids: Vec<String> = self
@@ -477,7 +495,6 @@ impl App {
             .collect();
         let total = agent_indices.len() + loop_ids.len();
         if total == 0 {
-            self.cross_layer(SidebarLayer::Automation, forward);
             return;
         }
 
@@ -489,15 +506,22 @@ impl App {
                 .and_then(|id| loop_ids.iter().position(|v| v == id))
                 .map(|pos| agent_indices.len() + pos),
         };
-        let next_pos = match current {
+        let target_pos = match current {
             Some(pos) if forward && pos + 1 < total => Some(pos + 1),
-            Some(pos) if !forward && pos > 0 => Some(pos - 1),
+            Some(_) if forward => Some(0),
+            Some(pos) if pos > 0 => Some(pos - 1),
             Some(_) => None,
             None => Some(if forward { 0 } else { total - 1 }),
         };
-        let Some(pos) = next_pos else {
-            self.cross_layer(SidebarLayer::Automation, forward);
-            return;
+        let pos = match target_pos {
+            Some(pos) => pos,
+            None => {
+                if self.rag_info.has_rag_activity() {
+                    self.enter_rag_focus();
+                    return;
+                }
+                total - 1
+            }
         };
 
         if pos < agent_indices.len() {
@@ -514,21 +538,15 @@ impl App {
 
     fn navigate_projects_next(&mut self) {
         if self.projects.is_empty() {
-            self.cross_layer(SidebarLayer::Knowledge, true);
             return;
         }
         let next = self.selected_project + 1;
-        if next < self.projects.len() {
-            self.selected_project = next;
-            self.refresh_loops_selection();
-            return;
-        }
-        self.cross_layer(SidebarLayer::Knowledge, true);
+        self.selected_project = if next < self.projects.len() { next } else { 0 };
+        self.refresh_loops_selection();
     }
 
     fn navigate_projects_prev(&mut self) {
         if self.projects.is_empty() {
-            self.cross_layer(SidebarLayer::Knowledge, false);
             return;
         }
         if self.selected_project > 0 {
@@ -536,40 +554,18 @@ impl App {
             self.refresh_loops_selection();
             return;
         }
-        self.cross_layer(SidebarLayer::Knowledge, false);
-    }
-
-    /// Ran off the end of `from`'s list: move to the next/previous layer in
-    /// ring order (RAG → Live → Automation → Knowledge → RAG…), skipping a
-    /// layer if it has nothing to select, and landing on the RAG pinned
-    /// summary when it has activity.
-    fn cross_layer(&mut self, from: SidebarLayer, forward: bool) {
-        let ring = [
-            SidebarLayer::Live,
-            SidebarLayer::Automation,
-            SidebarLayer::Knowledge,
-        ];
-        let start = ring.iter().position(|&l| l == from).unwrap_or(0);
-        let len = ring.len();
-        for step in 1..=len {
-            let idx = if forward {
-                (start + step) % len
-            } else {
-                (start + len - step) % len
-            };
-            if self.enter_layer(ring[idx], forward) {
-                return;
-            }
-        }
-        // Nothing navigable anywhere else — try RAG, else stay put.
         if self.rag_info.has_rag_activity() {
             self.enter_rag_focus();
+            return;
         }
+        self.selected_project = self.projects.len() - 1;
+        self.refresh_loops_selection();
     }
 
     /// Try focusing the first/last navigable item of `layer`. Returns
     /// `false` (and touches nothing) if `layer` has nothing to select, so
-    /// `cross_layer` can keep looking.
+    /// callers that walk multiple layers (`focus_sidebar_from_edge`,
+    /// `cycle_sidebar_layer`) can keep looking.
     fn enter_layer(&mut self, layer: SidebarLayer, forward: bool) -> bool {
         match layer {
             SidebarLayer::Live => {
@@ -641,25 +637,13 @@ impl App {
         self.agents_rag_focused = true;
     }
 
-    /// Leaving the pinned RAG summary: land on the layer nearest it (`Live`
-    /// going forward, `Knowledge` wrapping around going backward), else stay
-    /// on RAG if nothing else is navigable.
-    fn leave_rag_focus(&mut self, forward: bool) {
+    /// Leaving the pinned RAG summary: entering RAG focus never touches
+    /// `sidebar_layer` (decision 1 — arrows never change tabs), so leaving it
+    /// always returns to the first item of whichever tab was active when RAG
+    /// was entered (decision 3), regardless of direction.
+    fn leave_rag_focus(&mut self) {
         self.agents_rag_focused = false;
-        let start = if forward {
-            SidebarLayer::Automation
-        } else {
-            SidebarLayer::Knowledge
-        };
-        // Try the immediate neighbor first (Live going forward, Knowledge
-        // going backward), then fall back through the ring.
-        if forward && self.enter_layer(SidebarLayer::Live, true) {
-            return;
-        }
-        if !forward && self.enter_layer(SidebarLayer::Knowledge, false) {
-            return;
-        }
-        self.cross_layer(start, forward);
+        self.enter_layer(self.sidebar_layer, true);
     }
 
     /// Move a project's active `ProjectTab` list selection. Arrows never
@@ -1443,7 +1427,8 @@ impl App {
 
     /// Entry point for arrow-down/up from the `Home` screen: focus the
     /// nearest navigable edge of the sidebar ring (RAG → Live → Automation →
-    /// Knowledge), mirroring `cross_layer`'s ring order.
+    /// Knowledge). Distinct from in-sidebar arrow navigation, which never
+    /// crosses tabs once focus is inside one.
     pub(crate) fn focus_sidebar_from_edge(&mut self, from_top: bool) {
         if from_top {
             if self.rag_info.has_rag_activity() {
@@ -4085,54 +4070,184 @@ mod tests {
     }
 
     #[test]
-    fn select_next_crosses_live_automation_knowledge_then_wraps() {
+    fn select_prev_on_first_live_item_does_not_select_automation() {
+        // Regression: standing on the first Live item and pressing "up"
+        // used to fall through to the last Automation entry (the old
+        // flat-ring `cross_layer` behavior, back when background agents
+        // lived in Live before tabs existed). Arrows must now stay inside
+        // the active tab — with a populated Automation tab present, "up"
+        // must not land there.
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.agents = vec![
+            AgentEntry::Group(0),
+            AgentEntry::Group(1),
+            AgentEntry::Agent(bg_agent("bg-1")),
+        ];
+        app.sidebar_layer = SidebarLayer::Live;
+        app.automation_kind = AutomationKind::Agent;
+        app.selected = 0;
+
+        app.select_prev();
+
+        assert_eq!(app.sidebar_layer, SidebarLayer::Live);
+        assert_ne!(
+            app.selected, 2,
+            "must not land on the Automation agent entry"
+        );
+    }
+
+    #[test]
+    fn navigate_live_wraps_at_both_ends() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.agents = vec![AgentEntry::Group(0), AgentEntry::Group(1)];
+        app.sidebar_layer = SidebarLayer::Live;
+        app.selected = 0;
+
+        // Backward off the first item wraps to the last (no RAG activity to
+        // divert to).
+        app.select_prev();
+        assert_eq!(app.sidebar_layer, SidebarLayer::Live);
+        assert_eq!(app.selected, 1);
+
+        // Forward off the last item wraps back to the first.
+        app.select_next();
+        assert_eq!(app.sidebar_layer, SidebarLayer::Live);
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn navigate_automation_wraps_at_both_ends() {
         use crate::domain::loops::LoopStatus;
 
         let db = test_db();
-        db.upsert_project(&make_project("hash0", "/tmp/proj0"))
-            .unwrap();
         db.insert_loop(&make_loop("l-active", "Active Loop", LoopStatus::Running))
             .unwrap();
-
         let data_dir = tempdir().expect("create data dir");
         let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
-        app.agents = vec![AgentEntry::Agent(crate::domain::models::Agent {
-            id: "bg-1".to_string(),
-            prompt: String::new(),
-            trigger: None,
-            cli: crate::domain::models::Cli::new("claude"),
-            model: None,
-            working_dir: None,
-            enabled: true,
-            enable_at: None,
-            created_at: chrono::Utc::now(),
-            log_path: "/tmp/bg-1.log".to_string(),
-            timeout_minutes: 15,
-            expires_at: None,
-            last_run_at: None,
-            last_run_ok: None,
-            last_triggered_at: None,
-            trigger_count: 0,
-        })];
+        app.agents = vec![AgentEntry::Agent(bg_agent("bg-1"))];
         app.sidebar_layer = SidebarLayer::Automation;
         app.automation_kind = AutomationKind::Agent;
         app.selected = 0;
 
-        // Automation's agent sub-list has one entry, so the next press
-        // crosses into the loop sub-list before leaving the layer.
-        app.select_next();
+        // Backward off the first entry (the agent) wraps to the last (the
+        // loop) instead of leaving Automation.
+        app.select_prev();
+        assert_eq!(app.sidebar_layer, SidebarLayer::Automation);
         assert_eq!(app.automation_kind, AutomationKind::Loop);
         assert_eq!(app.selected_loop_id.as_deref(), Some("l-active"));
 
-        // Automation is exhausted — cross into Knowledge (the only project).
-        app.select_next();
-        assert_eq!(app.sidebar_layer, SidebarLayer::Knowledge);
-        assert_eq!(app.selected_project, 0);
-
-        // Knowledge is exhausted too — wrap back to the top of the ring.
+        // Forward off the last entry (the loop) wraps back to the first
+        // (the agent).
         app.select_next();
         assert_eq!(app.sidebar_layer, SidebarLayer::Automation);
         assert_eq!(app.automation_kind, AutomationKind::Agent);
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn navigate_projects_wraps_at_both_ends() {
+        let db = test_db();
+        db.upsert_project(&make_project("hash0", "/tmp/proj0"))
+            .unwrap();
+        db.upsert_project(&make_project("hash1", "/tmp/proj1"))
+            .unwrap();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.sidebar_layer = SidebarLayer::Knowledge;
+        app.selected_project = 0;
+
+        // Backward off the first project wraps to the last.
+        app.select_prev();
+        assert_eq!(app.sidebar_layer, SidebarLayer::Knowledge);
+        assert_eq!(app.selected_project, 1);
+
+        // Forward off the last project wraps back to the first.
+        app.select_next();
+        assert_eq!(app.sidebar_layer, SidebarLayer::Knowledge);
+        assert_eq!(app.selected_project, 0);
+    }
+
+    #[test]
+    fn rag_reachable_upward_from_live_first_item_returns_to_live() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.agents = vec![AgentEntry::Group(0), AgentEntry::Group(1)];
+        app.sidebar_layer = SidebarLayer::Live;
+        app.selected = 0;
+        app.rag_info = crate::db::project::RagInfoSummary {
+            total_chunks: 5,
+            ..Default::default()
+        };
+
+        app.select_prev();
+        assert!(app.agents_rag_focused);
+        assert_eq!(
+            app.sidebar_layer,
+            SidebarLayer::Live,
+            "entering RAG focus must not change the active tab"
+        );
+
+        app.select_next();
+        assert!(!app.agents_rag_focused);
+        assert_eq!(app.sidebar_layer, SidebarLayer::Live);
+        assert_eq!(
+            app.selected, 0,
+            "leaving RAG lands on the first item of the tab it came from"
+        );
+    }
+
+    #[test]
+    fn rag_reachable_upward_from_automation_first_item_returns_to_automation() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.agents = vec![AgentEntry::Agent(bg_agent("bg-1"))];
+        app.sidebar_layer = SidebarLayer::Automation;
+        app.automation_kind = AutomationKind::Agent;
+        app.selected = 0;
+        app.rag_info = crate::db::project::RagInfoSummary {
+            total_chunks: 5,
+            ..Default::default()
+        };
+
+        app.select_prev();
+        assert!(app.agents_rag_focused);
+        assert_eq!(app.sidebar_layer, SidebarLayer::Automation);
+
+        app.select_next();
+        assert!(!app.agents_rag_focused);
+        assert_eq!(app.sidebar_layer, SidebarLayer::Automation);
+        assert_eq!(app.automation_kind, AutomationKind::Agent);
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn rag_reachable_upward_from_knowledge_first_item_returns_to_knowledge() {
+        let db = test_db();
+        db.upsert_project(&make_project("hash0", "/tmp/proj0"))
+            .unwrap();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.sidebar_layer = SidebarLayer::Knowledge;
+        app.selected_project = 0;
+        app.rag_info = crate::db::project::RagInfoSummary {
+            total_chunks: 5,
+            ..Default::default()
+        };
+
+        app.select_prev();
+        assert!(app.agents_rag_focused);
+        assert_eq!(app.sidebar_layer, SidebarLayer::Knowledge);
+
+        app.select_next();
+        assert!(!app.agents_rag_focused);
+        assert_eq!(app.sidebar_layer, SidebarLayer::Knowledge);
+        assert_eq!(app.selected_project, 0);
     }
 
     #[test]
