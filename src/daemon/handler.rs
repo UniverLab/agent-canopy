@@ -708,7 +708,9 @@ fn config_has_agent_harness(map: &serde_json::Map<String, serde_json::Value>) ->
 /// carries it silently runs on the bare fallback template instead — the
 /// defect this allowlist exists to catch. `commit_rights` (B37) is accepted
 /// on every kind since the engine checks it uniformly regardless of which
-/// node in the graph actually moves HEAD.
+/// node in the graph actually moves HEAD. `require_report` (boolean, default
+/// `false`) exists because a harness can exit 0 having done nothing — see
+/// `agent_finished_execution` in `loop_engine.rs`.
 const AGENT_CONFIG_KEYS: &[&str] = &[
     "platform",
     "cli",
@@ -718,6 +720,7 @@ const AGENT_CONFIG_KEYS: &[&str] = &[
     "resume_prompt",
     "prompt_template",
     "prompt_preset",
+    "require_report",
     "commit_rights",
 ];
 /// Every config key a `check` node is read for — see `execute_check_node`.
@@ -7823,6 +7826,26 @@ mod tests {
             &serde_json::json!({ "command": "true", "commit_rights": true })
         )
         .is_ok());
+    }
+
+    /// `require_report` is an agent-only key (unlike `commit_rights`, which
+    /// is engine-checked on every kind) — accepted on `agent`, rejected as
+    /// unrecognized everywhere else, since only an agent node's process exit
+    /// can be judged against a self-report.
+    #[test]
+    fn validate_node_config_accepts_require_report_on_agent_only() {
+        assert!(validate_node_config(
+            LoopNodeKind::Agent,
+            &serde_json::json!({ "platform": "claude", "require_report": true })
+        )
+        .is_ok());
+
+        let check_error = validate_node_config(
+            LoopNodeKind::Check,
+            &serde_json::json!({ "command": "true", "require_report": true }),
+        )
+        .unwrap_err();
+        assert!(check_error.contains("require_report"), "{check_error}");
     }
 
     /// Neither `prompt_template` nor `prompt_preset` is still a VALID agent

@@ -1902,6 +1902,13 @@ fn merge_attempt_marker(output: &Value, attempt: u32, is_crash: bool) -> Value {
 /// B26, by ensemble members ([`LoopEngine::execute_ensemble`]) — both use the
 /// identical rule so a crashed member is retried exactly like a lone node and
 /// only counts as failed for the join once its retries are exhausted.
+///
+/// Also never an infra crash: a `require_report` downgrade (marked
+/// `failure_kind: "no_report"` by [`agent_finished_execution`]). Same
+/// reasoning as `no_output` — the process ran to completion, exited 0, and
+/// simply never called `loop_complete_node`; retrying would reproduce the
+/// identical silent result up to the retry budget before finally reaching the
+/// fail edge the node opted into by setting the flag in the first place.
 fn is_infra_crash(
     node: &LoopNode,
     execution: &NodeExecution,
@@ -1921,9 +1928,12 @@ fn is_infra_crash(
         .get("no_output")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let no_report =
+        execution.output.get("failure_kind").and_then(Value::as_str) == Some("no_report");
     !self_reported
         && !permanent
         && !no_output
+        && !no_report
         && node.kind == LoopNodeKind::Agent
         && execution.status == LoopRunStatus::Fail
         && (chrono::Utc::now() - run.started_at).num_seconds() < crash_max_secs as i64
@@ -2330,13 +2340,20 @@ async fn execute_agent_node(
             // failure)? Fall back to a cold start whose result the node uses.
             // A resumed run that did real work and then failed (slow, or a
             // timeout) is a genuine fail and routes normally — never redone.
+            // A `require_report` downgrade (`failure_kind: "no_report"`) is
+            // excluded the same way `is_infra_crash` excludes it: the process
+            // ran to completion and exited 0, so it never "crashed at spawn"
+            // — it must route down the fail edge, not get silently redone.
             let (_, crash_max_secs, _) = read_infra_config(node);
             let elapsed = run
                 .as_ref()
                 .map(|r| (chrono::Utc::now() - r.started_at).num_seconds())
                 .unwrap_or(i64::MAX);
-            let resume_failed_at_spawn =
-                execution.status == LoopRunStatus::Fail && elapsed < crash_max_secs as i64;
+            let no_report =
+                execution.output.get("failure_kind").and_then(Value::as_str) == Some("no_report");
+            let resume_failed_at_spawn = execution.status == LoopRunStatus::Fail
+                && elapsed < crash_max_secs as i64
+                && !no_report;
             if !resume_failed_at_spawn {
                 return Ok(execution);
             }
@@ -2651,9 +2668,25 @@ async fn run_agent_process(
             exit_code,
             stdout,
             stderr,
-        }) => Ok(agent_finished_execution(
-            node, cli, model, exit_code, &stdout, &stderr,
-        )),
+        }) => {
+            // The self-report tool call (if any) lands on the run row over
+            // MCP while the process is still alive, so by the time it has
+            // exited and `wait` has returned here, the row already carries
+            // its final word — reusing `self_reported_execution`'s own
+            // "did it self-report" check (`run.status != Running`) rather
+            // than re-deriving it.
+            let run = db.get_loop_run(run_id)?;
+            let self_reported = self_reported_execution(run.as_ref(), node).is_some();
+            Ok(agent_finished_execution(
+                node,
+                cli,
+                model,
+                exit_code,
+                &stdout,
+                &stderr,
+                self_reported,
+            ))
+        }
     }
 }
 
@@ -2678,6 +2711,27 @@ async fn run_agent_process(
 /// An agent that exits 0 with real stdout keeps passing exactly as before —
 /// this only changes the empty-stdout case, which used to be an
 /// unconditional `Pass`.
+///
+/// `self_reported` — whether this run's row already carries a
+/// `loop_complete_node`/`loop_report_blocker` verdict — decides two more
+/// things unrelated to `zero_exit_no_output`:
+///
+/// - `unreported: true` is stamped on the output whenever it's `false`,
+///   whatever the verdict ends up being. This is unconditional (not gated on
+///   `require_report`) so a resilience node downstream can always tell "the
+///   harness ran and chose not to report" apart from "the harness never ran",
+///   without any config of its own.
+/// - When the node opts in with `require_report: true` in its config, an
+///   otherwise-passing run (exit 0, real stdout) that never self-reported is
+///   downgraded to `Fail` with `failure_kind: "no_report"`. This is the hole
+///   `zero_exit_no_output` doesn't cover: codex, copilot and antigravity have
+///   all been observed exiting 0 with non-empty stdout — including the
+///   model's own success sentinel — while every tool call they attempted was
+///   refused or unavailable and nothing was actually done. Self-reporting
+///   always wins regardless of this flag: this function only ever runs for
+///   the *unreported* branch (see the `self_reported_execution` check at
+///   this function's call sites), so there is no case here where an explicit
+///   `graph_complete_node` verdict could be overridden.
 fn agent_finished_execution(
     node: &LoopNode,
     cli: &Cli,
@@ -2685,6 +2739,7 @@ fn agent_finished_execution(
     exit_code: i32,
     stdout: &str,
     stderr: &str,
+    self_reported: bool,
 ) -> NodeExecution {
     // Only the exit-0 + empty-stdout combination is the new failure shape
     // (a process that ran to completion and said nothing). A nonzero exit
@@ -2693,7 +2748,16 @@ fn agent_finished_execution(
     // must NOT pick up the `no_output` marker or this fix would silently
     // stop retrying every plain crash that happens not to log to stdout.
     let zero_exit_no_output = exit_code == 0 && stdout.is_empty();
-    let status = if exit_code == 0 && !zero_exit_no_output {
+    let exit_says_pass = exit_code == 0 && !zero_exit_no_output;
+
+    let require_report = node
+        .config
+        .get("require_report")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let no_report_override = require_report && !self_reported && exit_says_pass;
+
+    let status = if exit_says_pass && !no_report_override {
         LoopRunStatus::Pass
     } else {
         LoopRunStatus::Fail
@@ -2719,9 +2783,27 @@ fn agent_finished_execution(
             map.insert("error".to_string(), Value::String(reason));
         }
     }
+    if !self_reported {
+        if let Value::Object(map) = &mut output {
+            map.insert("unreported".to_string(), Value::Bool(true));
+        }
+    }
+    if no_report_override {
+        if let Value::Object(map) = &mut output {
+            map.insert(
+                "failure_kind".to_string(),
+                Value::String("no_report".to_string()),
+            );
+        }
+    }
     NodeExecution {
         status,
-        summary: if zero_exit_no_output {
+        summary: if no_report_override {
+            format!(
+                "Agent node '{}' exited 0 but never called loop_complete_node (require_report).",
+                node.name
+            )
+        } else if zero_exit_no_output {
             format!(
                 "Agent node '{}' produced no output (exit code 0).",
                 node.name
@@ -6755,6 +6837,166 @@ echo done
         assert!(
             !is_infra_crash(&node, &reported, &run.unwrap(), 0, 3, 60),
             "a self-reported fail must never be classified as an infra crash"
+        );
+    }
+
+    // ── require_report: the four corners ─────────────────────────────────
+    //
+    // `require_report` crossed with "did it self-report" — unit-tested
+    // directly against `agent_finished_execution` (rather than through a
+    // live process) exactly like `self_reported_fail_is_not_reclassified_as_
+    // no_output` above: `self_reported` is a plain bool parameter here, so
+    // the corner is exercised precisely without needing a fake CLI that can
+    // actually call `loop_complete_node` mid-run.
+
+    /// Regression pin: `require_report` absent (defaults to `false`) must
+    /// leave today's verdict exactly as it is — an exit-0, real-stdout,
+    /// never-self-reported run still passes — while `unreported: true` is
+    /// still stamped so a resilience node can see the run never called
+    /// `loop_complete_node`, with no config of its own.
+    #[test]
+    fn agent_finished_execution_require_report_absent_unreported_stays_pass() {
+        let cli = Cli::new("test-cli");
+        let node = sample_agent_node();
+        let execution = agent_finished_execution(&node, &cli, None, 0, "all done", "", false);
+
+        assert_eq!(
+            execution.status,
+            LoopRunStatus::Pass,
+            "require_report absent must not change today's verdict"
+        );
+        assert_eq!(
+            execution.output.get("unreported").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(execution.output.get("failure_kind").is_none());
+    }
+
+    /// `require_report` absent + a self-reported run: unaffected, and no
+    /// `unreported` stamp — the run did report, after all.
+    #[test]
+    fn agent_finished_execution_require_report_absent_self_reported_no_stamp() {
+        let cli = Cli::new("test-cli");
+        let node = sample_agent_node();
+        let execution = agent_finished_execution(&node, &cli, None, 0, "all done", "", true);
+
+        assert_eq!(execution.status, LoopRunStatus::Pass);
+        assert!(
+            execution.output.get("unreported").is_none(),
+            "a self-reported run must not be marked unreported"
+        );
+        assert!(execution.output.get("failure_kind").is_none());
+    }
+
+    /// The exact hole this spec closes: `require_report: true`, exit 0, real
+    /// (non-empty) stdout — codex/copilot/antigravity have all been observed
+    /// exiting 0 with real stdout, including the model's own success
+    /// sentinel, while every tool call was refused/unavailable and nothing
+    /// was actually done. `zero_exit_no_output` doesn't catch this (stdout
+    /// isn't empty); `require_report` does, and must fail with the fixed
+    /// `failure_kind: "no_report"` string, not prose.
+    #[test]
+    fn agent_finished_execution_require_report_true_unreported_fails_as_no_report() {
+        let cli = Cli::new("test-cli");
+        let mut node = sample_agent_node();
+        node.config = serde_json::json!({ "require_report": true });
+        let execution = agent_finished_execution(&node, &cli, None, 0, "looks done", "", false);
+
+        assert_eq!(
+            execution.status,
+            LoopRunStatus::Fail,
+            "require_report must fail an exit-0 run that never self-reported"
+        );
+        assert_eq!(
+            execution.output.get("unreported").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            execution.output.get("failure_kind").and_then(Value::as_str),
+            Some("no_report")
+        );
+        assert_eq!(
+            execution.output.get("exit_code").and_then(Value::as_i64),
+            Some(0),
+            "the exit code itself is untouched — only the verdict is"
+        );
+    }
+
+    /// `require_report: true` with a self-report present: the self-report
+    /// wins exactly as today — `require_report` never overrides an explicit
+    /// `graph_complete_node` verdict, pass or fail.
+    #[test]
+    fn agent_finished_execution_require_report_true_self_reported_is_not_overridden() {
+        let cli = Cli::new("test-cli");
+        let mut node = sample_agent_node();
+        node.config = serde_json::json!({ "require_report": true });
+        let execution = agent_finished_execution(&node, &cli, None, 0, "looks done", "", true);
+
+        assert_eq!(
+            execution.status,
+            LoopRunStatus::Pass,
+            "require_report must never override a self-reported result"
+        );
+        assert!(execution.output.get("unreported").is_none());
+        assert!(execution.output.get("failure_kind").is_none());
+    }
+
+    /// End-to-end (real spawned process, not a fabricated `NodeExecution`):
+    /// a script that exits 0 and prints real stdout, on a node configured
+    /// with `require_report: true`, must fail — and must never be swept into
+    /// infra-crash retry, since the process ran to completion and exited 0;
+    /// nothing here "crashed".
+    #[tokio::test]
+    async fn run_agent_process_require_report_true_no_self_report_is_fail_not_pass() {
+        let (dir, db) = test_db();
+        let cli = Cli::new("test-cli");
+        let script = write_member_script(dir.path(), "silent.sh", "printf 'Done!'\nexit 0");
+        let strategy = sample_strategy(&script);
+        let mut node = sample_agent_node();
+        node.config = serde_json::json!({ "require_report": true });
+
+        let execution = run_agent_process(
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            execution.status,
+            LoopRunStatus::Fail,
+            "exit 0 with real stdout but no self-report must fail when require_report is set"
+        );
+        assert_eq!(
+            execution.output.get("stdout").and_then(Value::as_str),
+            Some("Done!")
+        );
+        assert_eq!(
+            execution.output.get("unreported").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            execution.output.get("failure_kind").and_then(Value::as_str),
+            Some("no_report")
+        );
+
+        let run = LoopNodeRun {
+            id: "run-test".to_string(),
+            loop_id: "loop1".to_string(),
+            spec_id: "spec1".to_string(),
+            node_id: node.id.clone(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        };
+        assert!(
+            !is_infra_crash(&node, &execution, &run, 0, 3, 60),
+            "a require_report no-report failure must not be retried as an infra crash"
         );
     }
 
@@ -10994,6 +11236,71 @@ echo done
                 .unwrap()
                 .contains("Unsupported model mimo-auto"),
             "the member's stderr must be surfaced in the stored output"
+        );
+    }
+
+    /// The ensemble-member corner: `require_report` is judged per member,
+    /// exactly like the sequential path, so a quorum counts a silent member
+    /// the same way a lone node's fail edge would. Both members exit 0 with
+    /// REAL stdout (unlike the no-output member above) — the shape
+    /// `zero_exit_no_output` cannot catch — and neither self-reports, so with
+    /// `require_report: true` on the ensemble's shared member config, both
+    /// must still fail the quorum, deterministically on the first attempt
+    /// (never infra-retried).
+    #[tokio::test]
+    async fn ensemble_member_require_report_true_without_self_report_counts_as_fail() {
+        let (dir, db, engine, _loop_id, spec_id) = loop_fixture().unwrap();
+        let fake_home = setup_multi_cli_home(&[
+            (
+                "member-silent-1",
+                &write_member_script(dir.path(), "silent1.sh", "printf 'looks done'\nexit 0"),
+            ),
+            (
+                "member-silent-2",
+                &write_member_script(dir.path(), "silent2.sh", "printf 'also done'\nexit 0"),
+            ),
+        ]);
+        insert_infra_ensemble(
+            &db,
+            &spec_id,
+            &[
+                ("m-silent-1", "member-silent-1"),
+                ("m-silent-2", "member-silent-2"),
+            ],
+            1,
+            Some(1),
+            &serde_json::json!({ "infra_backoff_seconds": 0, "require_report": true }),
+        );
+
+        let _home = HomeGuard::set(fake_home.path());
+        engine
+            .run_loop("wf-test".to_string(), None, None)
+            .await
+            .unwrap();
+        drop(_home);
+
+        let join = join_run(&db, &spec_id, "join1");
+        assert_eq!(
+            join.status,
+            LoopRunStatus::Fail,
+            "require_report members that exit 0 with real stdout but never self-report must fail the join"
+        );
+        assert_eq!(join.output.as_ref().unwrap()["passed"], 0);
+
+        let runs = member_runs(&db, &spec_id, "m-silent-1");
+        assert_eq!(
+            runs.len(),
+            1,
+            "a require_report no-report member must resolve on the first attempt, never infra-retried"
+        );
+        assert_eq!(runs[0].status, LoopRunStatus::Fail);
+        assert_eq!(
+            runs[0].output.as_ref().unwrap()["unreported"],
+            serde_json::Value::Bool(true)
+        );
+        assert_eq!(
+            runs[0].output.as_ref().unwrap()["failure_kind"],
+            serde_json::Value::String("no_report".to_string())
         );
     }
 

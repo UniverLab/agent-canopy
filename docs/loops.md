@@ -147,6 +147,33 @@ attributed to a single member, and the quorum fails as a whole.
 Non-git workdirs are unaffected, as is any node that edits files
 without committing — the normal case.
 
+## Self-report requirement
+
+A harness can exit 0 having done nothing: every tool call refused,
+a quota exhausted, a provider outage — the process still ends cleanly
+and the loop engine sees a clean exit code. By default that is
+recorded as `Pass` if the process also produced output, exactly as it
+always has. Set `require_report: true` in an agent node's config to
+close that gap for a node whose graph depends on being able to tell:
+
+```
+require_report: true
+```
+
+With the flag set, an agent run that exits 0 but never calls
+`loop_complete_node` itself is recorded as a deterministic **fail**
+(`failure_kind: "no_report"`) and routes down the node's `fail` edge —
+it is never retried as an infra crash, since nothing actually crashed.
+An explicit self-report always wins regardless of this flag, pass or
+fail; `require_report` only judges the case where none was ever made.
+
+Whether or not the flag is set, every agent run that finishes without
+calling `loop_complete_node` carries `"unreported": true` in its output
+— this is unconditional, so a resilience node downstream can always
+tell "the harness ran and chose not to report" apart from "the harness
+never ran," without needing `require_report` itself. Ensemble members
+are judged individually, exactly like a lone node.
+
 ## Lifecycle
 
 Create → run → (pause / continue) → complete. `loop_continue`
