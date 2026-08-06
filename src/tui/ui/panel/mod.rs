@@ -11,7 +11,7 @@ use ratatui::Frame;
 use super::theme::Theme;
 use super::{
     truncate_str, truncate_str_keep_tail, INTERACTIVE_COLOR, KIND_ROUTER, STATUS_DISABLED,
-    STATUS_FAIL, STATUS_OK, STATUS_RUNNING,
+    STATUS_FAIL, STATUS_INTERRUPTED, STATUS_OK, STATUS_RUNNING,
 };
 use crate::tui::agent::ScreenSnapshot;
 use crate::tui::app::types::{AgentEntry, App, Focus, ProjectTab, SidebarLayer};

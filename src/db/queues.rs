@@ -294,11 +294,20 @@ impl Database {
         Ok(())
     }
 
-    /// The queue's first PENDING member, in queue order — queried fresh on
+    /// The queue's first runnable member, in queue order — queried fresh on
     /// every call rather than off a list frozen at run start. This is what
     /// lets a live queue run pick up `queue_add_spec`/`queue_reorder` calls
     /// made while the run is in flight: the engine calls this again at every
     /// spec boundary instead of iterating a `Vec` captured once.
+    ///
+    /// `Pending` and `Interrupted` are equally runnable and picked in the
+    /// same position order: an `Interrupted` spec was cut short by something
+    /// external, not a failure of the work, and must be exactly as visible
+    /// to selection as a fresh `Pending` one — reconciliation setting a spec
+    /// to `Interrupted` instead of resetting it to `Pending` must not
+    /// resurrect the orphaning bug this function's own reconciliation
+    /// callers exist to prevent (leaving a spec in a status selection can't
+    /// see, permanently stranding it).
     pub fn queue_next_pending_spec_id(&self, queue_id: &str) -> Result<Option<String>> {
         let conn = self
             .conn
@@ -307,9 +316,13 @@ impl Database {
         conn.query_row(
             "SELECT pm.spec_id FROM queue_members pm
              JOIN loop_specs ls ON ls.id = pm.spec_id
-             WHERE pm.queue_id = ?1 AND ls.status = ?2
+             WHERE pm.queue_id = ?1 AND ls.status IN (?2, ?3)
              ORDER BY pm.position ASC LIMIT 1",
-            params![queue_id, LoopSpecStatus::Pending.as_str()],
+            params![
+                queue_id,
+                LoopSpecStatus::Pending.as_str(),
+                LoopSpecStatus::Interrupted.as_str()
+            ],
             |row| row.get::<_, String>(0),
         )
         .optional()

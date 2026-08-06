@@ -1490,16 +1490,21 @@ impl Database {
     /// No loop run survives the process that spawned it, so any loop still
     /// `Running` at startup was interrupted mid-execution by the previous
     /// daemon. Pause it, mark its dangling node runs as failed/interrupted,
-    /// and reset its in-flight spec (loop-bound or queue member — either way
-    /// `run.spec_id` names it) from `running` back to `pending`, all in one
+    /// and mark its in-flight spec (loop-bound or queue member — either way
+    /// `run.spec_id` names it) `Interrupted` (not `Pending` — the run was cut
+    /// short by something external, not a failure of the work), all in one
     /// transaction so there is no window where the loop is recoverable but
-    /// the spec is not (B18). A spec's completed work is preserved by the
-    /// worktree/commits, not by its status, so restarting it from its entry
-    /// node on resume is safe — and required: leaving it `running` made it
-    /// invisible to queue selection (`queue_next_pending_spec_id` only ever
-    /// picks a `pending` member), permanently orphaning it. `loop_continue`
-    /// alone is enough to resume it (no `loop_pause` detour needed).
-    /// Idempotent: a loop already `Paused` isn't touched by a later call.
+    /// the spec is not (B18). The engine never touches git here — no more
+    /// `git stash` — so any uncommitted work the interrupted run left behind
+    /// stays exactly where it is; restarting the spec from its entry node on
+    /// resume finds it there, and its node prompt says so. Leaving the spec
+    /// `running` made it invisible to queue selection
+    /// (`queue_next_pending_spec_id` only ever picks a `pending` or
+    /// `interrupted` member), permanently orphaning it — `Interrupted` is
+    /// just as selectable as `Pending`, so this still can't happen.
+    /// `loop_continue` alone is enough to resume it (no `loop_pause` detour
+    /// needed). Idempotent: a loop already `Paused` isn't touched by a later
+    /// call.
     ///
     /// Daemon-lifecycle recovery only — **never** call this from anything
     /// other than the daemon's own startup path. On 2026-08-03, `canopy
@@ -1561,7 +1566,7 @@ impl Database {
             }
             for run in &dangling_runs {
                 tracing::warn!(
-                    "Reconciling orphaned loop '{}': was running node '{}' (spec '{}') when the daemon last stopped; pausing loop, marking its run as interrupted, and resetting the spec to pending.",
+                    "Reconciling orphaned loop '{}': was running node '{}' (spec '{}') when the daemon last stopped; pausing loop, marking its run as interrupted, and marking the spec interrupted.",
                     lp.id,
                     run.node_id,
                     run.spec_id
@@ -1589,44 +1594,10 @@ impl Database {
                         );
                     }
                 }
-                // B36: read the spec's baseline before the reset below clears
-                // it — it's the bound that tells us which uncommitted changes
-                // are attributable to this interrupted run. Without it there
-                // is no reliable way to tell "left behind by this run" from
-                // "already here for some other reason", so quarantine is
-                // skipped rather than guessed at.
-                let spec_start_head: Option<String> = tx
-                    .query_row(
-                        "SELECT spec_start_head FROM loop_specs WHERE id = ?1",
-                        params![run.spec_id],
-                        |row| row.get::<_, Option<String>>(0),
-                    )
-                    .optional()?
-                    .flatten();
-                let quarantine = spec_start_head.and_then(|_| {
-                    let message = format!(
-                        "canopy-interrupted: loop={} spec={} node={} run={}",
-                        lp.id, run.spec_id, run.node_id, run.id
-                    );
-                    quarantine_worktree(&lp.workdir, &message).then_some(message)
-                });
-                let mut output = serde_json::json!({
+                let output = serde_json::json!({
                     "interrupted": true,
                     "reason": "daemon restarted while this node was running"
                 });
-                if let Some(message) = &quarantine {
-                    tracing::warn!(
-                        "Reconciling orphaned loop '{}': worktree had uncommitted changes left by the interrupted run; quarantined with `git stash` ({}). Recover with `git stash list` / `git stash pop` in {}.",
-                        lp.id,
-                        message,
-                        lp.workdir
-                    );
-                    output["quarantine"] = serde_json::json!({
-                        "stashed": true,
-                        "message": message,
-                        "recover_hint": "git stash list / git stash pop",
-                    });
-                }
 
                 let now = Utc::now();
                 tx.execute(
@@ -1640,16 +1611,22 @@ impl Database {
                         run.id,
                     ],
                 )?;
-                // B18: same reset `reset_loop_spec_status` performs (status,
-                // started_at, completed_at, spec_start_head all cleared) —
-                // done inline here, against `tx`, rather than by calling that
-                // method, since it would try to re-lock `self.conn` and
-                // deadlock against the lock already held above.
+                // The engine never touches git (no more `git stash`): the
+                // partial work an interrupted run left in the workdir stays
+                // exactly where it is. Marking the spec `Interrupted` (not
+                // reset to `Pending`) is what used to be the stash's job —
+                // it's what tells the next pickup's rendered prompt to say
+                // "a previous attempt exists, continue it" instead of
+                // silently starting fresh. `spec_start_head` is still
+                // cleared: the next attempt captures its own fresh baseline
+                // (`run_spec` only reuses a persisted baseline for a
+                // same-attempt resume of a `Running` spec, which an
+                // `Interrupted` pickup is not).
                 tx.execute(
                     "UPDATE loop_specs
                      SET status = ?1, started_at = NULL, completed_at = NULL, spec_start_head = NULL
                      WHERE id = ?2",
-                    params![LoopSpecStatus::Pending.as_str(), run.spec_id],
+                    params![LoopSpecStatus::Interrupted.as_str(), run.spec_id],
                 )?;
             }
             tx.execute(
@@ -1716,7 +1693,7 @@ impl Database {
                 tracing::warn!(
                     "Reconciling stranded queue spec '{}' in loop '{}': \
                      was 'running' with no active node run in this daemon's \
-                     lifetime; resetting to pending.",
+                     lifetime; checking for evidence it was genuinely interrupted.",
                     spec_id,
                     loop_id
                 );
@@ -1727,11 +1704,11 @@ impl Database {
                 // boot (e.g. the daemon died before a graceful path like
                 // `loop_report_blocker` could finalize it). Identify it from
                 // recorded facts only — a boot id that isn't this one, or a
-                // pid that's no longer alive — mark it distinctly as
-                // interrupted (never as a plain node failure), and quarantine
-                // any uncommitted worktree changes it may have left, bounded
-                // by the spec's own `spec_start_head` so unrelated dirt is
-                // never swept in.
+                // pid that's no longer alive — and mark it distinctly as
+                // interrupted (never as a plain node failure). The engine
+                // never touches git: no quarantine, no `git stash` — the
+                // interrupted run's worktree changes are left exactly as
+                // they were.
                 let stale_run: Option<(String, Option<i64>, Option<String>)> = tx
                     .query_row(
                         "SELECT id, pid, boot_id FROM loop_runs
@@ -1742,6 +1719,12 @@ impl Database {
                     )
                     .optional()?;
 
+                // Only evidence of a genuinely interrupted run (a stale-boot
+                // or dead-pid `loop_runs` row) earns `Interrupted` instead of
+                // a plain reset to `Pending` — a spec stuck `running` with no
+                // run row behind it at all has no such evidence, so it's
+                // reset exactly as before.
+                let mut interrupted = false;
                 if let Some((run_id, pid, run_boot_id)) = stale_run {
                     let boot_mismatch = match (run_boot_id.as_deref(), current_boot_id) {
                         (Some(a), Some(b)) => a != b,
@@ -1753,49 +1736,11 @@ impl Database {
                         .unwrap_or(false);
 
                     if boot_mismatch || pid_dead {
-                        let spec_start_head: Option<String> = tx
-                            .query_row(
-                                "SELECT spec_start_head FROM loop_specs WHERE id = ?1",
-                                params![spec_id],
-                                |row| row.get::<_, Option<String>>(0),
-                            )
-                            .optional()?
-                            .flatten();
-
-                        let mut output = serde_json::json!({
+                        interrupted = true;
+                        let output = serde_json::json!({
                             "interrupted": true,
                             "reason": "daemon restarted or its process died while this node was running"
                         });
-
-                        if spec_start_head.is_some() {
-                            let workdir: Option<String> = tx
-                                .query_row(
-                                    "SELECT workdir FROM loops WHERE id = ?1",
-                                    params![loop_id],
-                                    |row| row.get(0),
-                                )
-                                .optional()?;
-                            if let Some(workdir) = workdir {
-                                let message = format!(
-                                    "canopy-interrupted: loop={} spec={} run={}",
-                                    loop_id, spec_id, run_id
-                                );
-                                if quarantine_worktree(&workdir, &message) {
-                                    tracing::warn!(
-                                        "Reconciling stranded queue spec '{}' in loop '{}': worktree had uncommitted changes left by the interrupted run; quarantined with `git stash` ({}). Recover with `git stash list` / `git stash pop` in {}.",
-                                        spec_id,
-                                        loop_id,
-                                        message,
-                                        workdir
-                                    );
-                                    output["quarantine"] = serde_json::json!({
-                                        "stashed": true,
-                                        "message": message,
-                                        "recover_hint": "git stash list / git stash pop",
-                                    });
-                                }
-                            }
-                        }
 
                         tx.execute(
                             "UPDATE loop_runs
@@ -1811,12 +1756,17 @@ impl Database {
                     }
                 }
 
+                let new_status = if interrupted {
+                    LoopSpecStatus::Interrupted
+                } else {
+                    LoopSpecStatus::Pending
+                };
                 tx.execute(
                     "UPDATE loop_specs
                      SET status = ?1, started_at = NULL, completed_at = NULL,
                          spec_start_head = NULL
                      WHERE id = ?2",
-                    params![LoopSpecStatus::Pending.as_str(), spec_id],
+                    params![new_status.as_str(), spec_id],
                 )?;
                 reset_count += 1;
             }
@@ -2039,33 +1989,6 @@ fn active_loop_run_for_spec_locked(
     )?;
     stmt.query_row(params![spec_id], map_loop_run_row)
         .optional()
-}
-
-/// Stash any uncommitted changes in `workdir` so they survive an interrupted
-/// run as SUSPECT rather than being silently overwritten or blamed on
-/// whatever runs next (B36). There is no reliable way to tell a truncated
-/// write from a complete-but-uncommitted one, so this never reverts,
-/// checks out, or deletes anything — only `git stash push -u`, recoverable
-/// with tools the operator already knows (`git stash list` / `git stash
-/// pop`). Returns `false` (nothing quarantined) for anything short of a
-/// definite "yes, there are uncommitted changes here" — not a git repo,
-/// `git` unavailable, a clean tree — so reconciliation never fails just
-/// because a worktree is unusual.
-fn quarantine_worktree(workdir: &str, message: &str) -> bool {
-    let Ok(status) = std::process::Command::new("git")
-        .args(["-C", workdir, "status", "--porcelain"])
-        .output()
-    else {
-        return false;
-    };
-    if !status.status.success() || status.stdout.is_empty() {
-        return false;
-    }
-    std::process::Command::new("git")
-        .args(["-C", workdir, "stash", "push", "-u", "-m", message])
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
 }
 
 fn map_loop_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoopNodeRun> {

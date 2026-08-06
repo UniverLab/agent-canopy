@@ -30,6 +30,10 @@ pub(crate) const STATUS_RUNNING_DIM: Color = Color::Rgb(74, 102, 77);
 pub(crate) const STATUS_RUNNING_BRIGHT: Color = Color::Rgb(129, 230, 133);
 pub(crate) const STATUS_OK: Color = Color::Rgb(66, 165, 245);
 pub(crate) const STATUS_FAIL: Color = Color::Rgb(229, 57, 53);
+/// A spec cut short by something external (daemon restart, crash) rather
+/// than a failure of the work — distinct from [`STATUS_FAIL`] so the marker
+/// strip never reads an interruption as the agent's own doing.
+pub(crate) const STATUS_INTERRUPTED: Color = Color::Rgb(255, 179, 0);
 pub(crate) const STATUS_WAIT_ON: Color = Color::Rgb(255, 255, 0);
 pub(crate) const STATUS_WAIT_OFF: Color = Color::Rgb(30, 30, 30);
 /// Tag color for a [`crate::domain::loops::LoopNodeKind::Router`] node's

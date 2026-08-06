@@ -1326,22 +1326,23 @@ mod stdio_startup_reconciliation_tests {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
-    fn git_stash_list(path: &std::path::Path) -> String {
+    fn git_is_clean(path: &std::path::Path) -> bool {
         let output = std::process::Command::new("git")
-            .args(["stash", "list"])
+            .args(["status", "--porcelain"])
             .current_dir(path)
             .output()
-            .expect("git stash list failed to run");
-        String::from_utf8_lossy(&output.stdout).to_string()
+            .expect("git status failed to run");
+        output.stdout.is_empty()
     }
 
     /// Seeds a `Running` loop with a dangling `running` node run over a dirty
     /// git worktree — exactly the shape `reconcile_orphaned_loops` (called
-    /// from a real daemon boot) would pause, interrupt, and quarantine via
-    /// `git stash`. Returns the loop id, run id, and the workdir (kept alive
-    /// for the caller via the returned `TempDir`). `suffix` distinguishes
-    /// multiple graphs seeded into the same database (each gets its own
-    /// tempdir workdir, so two calls never collide on ids or worktree).
+    /// from a real daemon boot) would pause, interrupt, and mark `Interrupted`
+    /// without touching git. Returns the loop id, run id, and the workdir
+    /// (kept alive for the caller via the returned `TempDir`). `suffix`
+    /// distinguishes multiple graphs seeded into the same database (each
+    /// gets its own tempdir workdir, so two calls never collide on ids or
+    /// worktree).
     fn seed_running_loop_with_dirty_worktree(
         db: &Database,
         suffix: &str,
@@ -1445,8 +1446,8 @@ mod stdio_startup_reconciliation_tests {
             "stdio startup must not mark the run interrupted"
         );
         assert!(
-            git_stash_list(dir.path()).is_empty(),
-            "stdio startup must not quarantine the worktree"
+            !git_is_clean(dir.path()),
+            "stdio startup must not touch the worktree's uncommitted changes"
         );
     }
 
@@ -1479,8 +1480,8 @@ mod stdio_startup_reconciliation_tests {
                 "stdio startup must not mark graph '{loop_id}''s run interrupted"
             );
             assert!(
-                git_stash_list(dir.path()).is_empty(),
-                "stdio startup must not quarantine graph '{loop_id}''s worktree"
+                !git_is_clean(dir.path()),
+                "stdio startup must not touch graph '{loop_id}''s uncommitted changes"
             );
         }
     }

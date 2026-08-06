@@ -417,10 +417,11 @@ impl LoopEngine {
                         return Ok(());
                     }
                     // Live pick: fresh query, not a frozen list. Only ever
-                    // returns a spec whose status is `pending` (defense in
-                    // depth — even if the queue's stored order were ever
-                    // corrupted to place a running/completed member where a
-                    // pending one belongs, this filter still won't pick it).
+                    // returns a spec whose status is `pending` or
+                    // `interrupted` (defense in depth — even if the queue's
+                    // stored order were ever corrupted to place a
+                    // running/completed member where a runnable one belongs,
+                    // this filter still won't pick it).
                     let Some(spec_id) = self.db.queue_next_pending_spec_id(queue_id)? else {
                         break;
                     };
@@ -1881,8 +1882,9 @@ impl LoopEngine {
     }
 
     /// Name of the next spec this run will work: the queue's next pending
-    /// member for a queue run, else the loop's first `running`-or-`pending`
-    /// bound spec in position order. `None` when nothing is left to do.
+    /// member for a queue run, else the loop's first
+    /// `running`-or-`pending`-or-`interrupted` bound spec in position order.
+    /// `None` when nothing is left to do.
     fn first_pending_spec_name(
         &self,
         loop_id: &str,
@@ -1901,9 +1903,12 @@ impl LoopEngine {
                     .iter()
                     .find(|spec| spec.status == LoopSpecStatus::Running)
                     .or_else(|| {
-                        specs
-                            .iter()
-                            .find(|spec| spec.status == LoopSpecStatus::Pending)
+                        specs.iter().find(|spec| {
+                            matches!(
+                                spec.status,
+                                LoopSpecStatus::Pending | LoopSpecStatus::Interrupted
+                            )
+                        })
                     });
                 Ok(next.map(|spec| spec.name.clone()))
             }
@@ -3751,6 +3756,22 @@ fn render_agent_prompt(
         .replace("{{node_id}}", &node.id)
         .replace("{{previous_feedback}}", &previous_feedback);
 
+    // A spec picked up in `Interrupted` status has a previous attempt's
+    // partial work sitting in `workdir` — the engine no longer `git stash`es
+    // it away, so it's exactly where that attempt left it. This agent has no
+    // memory of that attempt (it's a cold start, a fresh process/session),
+    // so the prompt has to say so explicitly: the work was cut short by
+    // something external (a daemon restart, a crash), not set aside for
+    // being wrong, and the right move is to inspect what's there and
+    // continue it rather than redo it from scratch.
+    let continuation_notice = if spec.status == LoopSpecStatus::Interrupted {
+        format!(
+            "\n# [CONTINUATION]\nA previous attempt at this spec was interrupted by something external — a daemon restart, a machine crash, or an unrelated process — not by any problem with the work itself. The working tree at {workdir} may already hold that attempt's partial progress, left exactly as it was. Before doing anything else, run `git status` and `git diff` there to see what already exists, and continue from it rather than starting over. (If {workdir} is not a git repository, inspect it directly instead — the same partial work may still be present.)\n"
+        )
+    } else {
+        String::new()
+    };
+
     // `run_id` (not just `node_id`) must round-trip through the report tools
     // (B12): a node can be retried, so more than one run can exist for the
     // same `node_id` over a spec's lifetime. Without the exact run_id, a
@@ -3759,11 +3780,12 @@ fn render_agent_prompt(
     // otherwise be matched to "whatever's currently active for this node_id"
     // and silently corrupt a newer, unrelated run.
     format!(
-        "# [LOOP CONTEXT]\n<loop>\n  <name>{}</name>\n  <spec>{}</spec>\n  <node>{}</node>\n  <workdir>{}</workdir>\n</loop>\n\n# [SPEC]\n{}\n\n# [PREVIOUS FEEDBACK]\n{}\n\n# [REPORTING]\nWhen you finish this node, call loop_complete_node with run_id=\"{}\", node_id=\"{}\", status=\"pass\"|\"fail\", a concise summary, and your output.\nIf you are blocked and need human intervention, call loop_report_blocker with run_id=\"{}\", node_id=\"{}\" and the blocker description.\n",
+        "# [LOOP CONTEXT]\n<loop>\n  <name>{}</name>\n  <spec>{}</spec>\n  <node>{}</node>\n  <workdir>{}</workdir>\n</loop>\n{}\n# [SPEC]\n{}\n\n# [PREVIOUS FEEDBACK]\n{}\n\n# [REPORTING]\nWhen you finish this node, call loop_complete_node with run_id=\"{}\", node_id=\"{}\", status=\"pass\"|\"fail\", a concise summary, and your output.\nIf you are blocked and need human intervention, call loop_report_blocker with run_id=\"{}\", node_id=\"{}\" and the blocker description.\n",
         lp.name,
         spec.name,
         node.name,
         workdir,
+        continuation_notice,
         prompt,
         previous_feedback,
         run_id,
@@ -5261,6 +5283,86 @@ mod tests {
         assert!(prompt.contains("run_id=\"run-1\""));
         assert!(prompt.contains("Do the thing"));
         assert!(prompt.contains("\"feedback\": \"ok\""));
+    }
+
+    /// A spec picked up `Interrupted` gets an explicit continuation notice
+    /// in its cold-start prompt — the agent has no memory of the previous
+    /// attempt, so the prompt is the only thing that can tell it partial
+    /// work exists in the workdir and should be continued, not redone. A
+    /// `Pending` spec (any other status reaching a cold start) gets no such
+    /// notice — nothing was interrupted, there is nothing to continue.
+    #[test]
+    fn render_agent_prompt_adds_continuation_notice_only_when_spec_interrupted() {
+        let lp = crate::domain::loops::Loop {
+            archived: false,
+            id: "wf".to_string(),
+            name: "Loop".to_string(),
+            description: None,
+            workdir: "/tmp/project".to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        };
+        let mut spec = LoopSpec {
+            id: "spec".to_string(),
+            loop_id: Some("wf".to_string()),
+            name: "Spec".to_string(),
+            description: Some("Do the thing".to_string()),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        let node = LoopNode {
+            id: "node-1".to_string(),
+            spec_id: Some("spec".to_string()),
+            loop_id: None,
+            name: "Agent".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+
+        let pending_prompt = render_agent_prompt(
+            &lp,
+            &spec,
+            &node,
+            "{{spec_content}}",
+            None,
+            &lp.workdir,
+            "run-1",
+        );
+        assert!(!pending_prompt.contains("[CONTINUATION]"));
+
+        spec.status = LoopSpecStatus::Interrupted;
+        let interrupted_prompt = render_agent_prompt(
+            &lp,
+            &spec,
+            &node,
+            "{{spec_content}}",
+            None,
+            &lp.workdir,
+            "run-1",
+        );
+        assert!(interrupted_prompt.contains("[CONTINUATION]"));
+        assert!(interrupted_prompt.contains("interrupted"));
+        assert!(interrupted_prompt.contains("git status"));
+        assert!(interrupted_prompt.contains("git diff"));
+        assert!(interrupted_prompt.contains(&lp.workdir));
     }
 
     fn agent_node_with_config(config: Value) -> LoopNode {
@@ -7914,14 +8016,15 @@ echo done
     /// B18, end to end: the real incident. A queue-driven run's in-flight
     /// member is left `running` by a daemon restart — a dangling node run
     /// with no live process behind it — while another member sits `pending`
-    /// right behind it in the queue. G2 boot reconcile must reset the
-    /// in-flight member back to `pending` in the same pass it interrupts the
-    /// dangling run, and the resumed dispatch (what `loop_continue`'s
-    /// `retry_current_node` triggers via `resume_background`, simulated here
-    /// by calling `run_loop_dispatch` directly with `is_resume: true`) must
-    /// pick the interrupted member up FIRST — never skip straight past it to
-    /// the next queued member, which is exactly how it got orphaned in the
-    /// 2026-07-14 incident.
+    /// right behind it in the queue. G2 boot reconcile must mark the
+    /// in-flight member `Interrupted` (not `Pending` — the run was cut short
+    /// by something external, not a failure of the work) in the same pass it
+    /// interrupts the dangling run, and the resumed dispatch (what
+    /// `loop_continue`'s `retry_current_node` triggers via
+    /// `resume_background`, simulated here by calling `run_loop_dispatch`
+    /// directly with `is_resume: true`) must pick the interrupted member up
+    /// FIRST — never skip straight past it to the next queued member, which
+    /// is exactly how it got orphaned in the 2026-07-14 incident.
     #[tokio::test]
     async fn loop_engine_restart_recovery_runs_interrupted_queue_spec_first() {
         let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
@@ -7988,8 +8091,8 @@ echo done
         let interrupted_after_reconcile = db.get_loop_spec(&interrupted.id).unwrap().unwrap();
         assert_eq!(
             interrupted_after_reconcile.status,
-            LoopSpecStatus::Pending,
-            "reconcile must reset the in-flight member back to pending, not leave it running"
+            LoopSpecStatus::Interrupted,
+            "reconcile must mark the in-flight member interrupted, not leave it running"
         );
 
         // `loop_continue { retry_current_node }`: resume with the loop's

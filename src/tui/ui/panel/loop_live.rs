@@ -16,7 +16,8 @@ use ratatui::Frame;
 
 use super::super::theme::Theme;
 use super::{
-    compact_cwd, truncate_str, KIND_ROUTER, STATUS_DISABLED, STATUS_FAIL, STATUS_OK, STATUS_RUNNING,
+    compact_cwd, truncate_str, KIND_ROUTER, STATUS_DISABLED, STATUS_FAIL, STATUS_INTERRUPTED,
+    STATUS_OK, STATUS_RUNNING,
 };
 use crate::domain::loops::{
     LoopEdgeCondition, LoopNode, LoopNodeKind, LoopRunStatus, LoopSpecStatus, LoopStatus,
@@ -230,6 +231,7 @@ fn spec_chip(
         LoopSpecStatus::Completed => ("✓", STATUS_OK),
         LoopSpecStatus::Failed => ("✗", STATUS_FAIL),
         LoopSpecStatus::Skipped => ("⊘", STATUS_DISABLED),
+        LoopSpecStatus::Interrupted => ("⚑", STATUS_INTERRUPTED),
     }
 }
 
@@ -376,6 +378,7 @@ fn spec_status_label(status: LoopSpecStatus) -> &'static str {
         LoopSpecStatus::Completed => "completed",
         LoopSpecStatus::Failed => "failed",
         LoopSpecStatus::Skipped => "skipped",
+        LoopSpecStatus::Interrupted => "interrupted",
     }
 }
 

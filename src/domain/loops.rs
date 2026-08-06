@@ -196,6 +196,15 @@ pub enum LoopSpecStatus {
     Completed,
     Failed,
     Skipped,
+    /// The run working this spec was cut short by something external to the
+    /// spec — a daemon restart, a machine crash, an unrelated process dying —
+    /// not by the work itself failing. Set only by reconciliation, in place
+    /// of the `git stash` it used to run: the working tree is left exactly
+    /// as the interrupted attempt left it, and the spec is picked up again
+    /// like any other runnable spec (queue selection treats this exactly
+    /// like `Pending`), with its node prompt telling the agent a prior
+    /// attempt exists so it continues rather than restarts.
+    Interrupted,
 }
 
 impl LoopSpecStatus {
@@ -206,15 +215,22 @@ impl LoopSpecStatus {
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Skipped => "skipped",
+            Self::Interrupted => "interrupted",
         }
     }
 
+    /// Infallible: an unrecognized value (e.g. a status written by a newer
+    /// binary that a caller on an older binary doesn't know) must never be
+    /// silently read as `Completed` — that would let stale/incoming work
+    /// skip execution entirely. Falling back to `Pending` is the safe
+    /// choice: worst case, a spec re-runs a step it didn't need to.
     pub fn from_str(value: &str) -> Self {
         match value {
             "running" => Self::Running,
             "completed" => Self::Completed,
             "failed" => Self::Failed,
             "skipped" => Self::Skipped,
+            "interrupted" => Self::Interrupted,
             _ => Self::Pending,
         }
     }
@@ -1005,6 +1021,7 @@ Task:
         assert_eq!(LoopSpecStatus::Completed.as_str(), "completed");
         assert_eq!(LoopSpecStatus::Failed.as_str(), "failed");
         assert_eq!(LoopSpecStatus::Skipped.as_str(), "skipped");
+        assert_eq!(LoopSpecStatus::Interrupted.as_str(), "interrupted");
     }
 
     #[test]
@@ -1016,6 +1033,13 @@ Task:
         );
         assert_eq!(LoopSpecStatus::from_str("failed"), LoopSpecStatus::Failed);
         assert_eq!(LoopSpecStatus::from_str("skipped"), LoopSpecStatus::Skipped);
+        assert_eq!(
+            LoopSpecStatus::from_str("interrupted"),
+            LoopSpecStatus::Interrupted
+        );
+        // An unknown status (e.g. written by a newer binary) must never
+        // silently read as `Completed` — that would skip work that hasn't
+        // actually run. `Pending` is the only safe fallback.
         assert_eq!(LoopSpecStatus::from_str("invalid"), LoopSpecStatus::Pending);
     }
 
@@ -1797,6 +1821,7 @@ In Scope:
             LoopSpecStatus::Completed,
             LoopSpecStatus::Failed,
             LoopSpecStatus::Skipped,
+            LoopSpecStatus::Interrupted,
         ];
         for s in statuses {
             let s_str = s.as_str();
@@ -1828,6 +1853,7 @@ In Scope:
             LoopSpecStatus::Completed,
             LoopSpecStatus::Failed,
             LoopSpecStatus::Skipped,
+            LoopSpecStatus::Interrupted,
         ] {
             assert_eq!(s.as_str(), s.as_str().to_lowercase());
         }
@@ -2133,6 +2159,7 @@ In Scope:
             LoopSpecStatus::Completed,
             LoopSpecStatus::Failed,
             LoopSpecStatus::Skipped,
+            LoopSpecStatus::Interrupted,
         ];
         for i in 0..all.len() {
             for j in (i + 1)..all.len() {
@@ -2478,6 +2505,7 @@ In Scope:
             LoopSpecStatus::Completed,
             LoopSpecStatus::Failed,
             LoopSpecStatus::Skipped,
+            LoopSpecStatus::Interrupted,
         ];
         for s in statuses {
             let json = serde_json::to_string(&s).unwrap();
@@ -2495,6 +2523,10 @@ In Scope:
         assert_eq!(
             serde_json::to_string(&LoopSpecStatus::Skipped).unwrap(),
             "\"skipped\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LoopSpecStatus::Interrupted).unwrap(),
+            "\"interrupted\""
         );
     }
 

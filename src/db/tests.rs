@@ -1239,24 +1239,28 @@ fn reconcile_orphaned_loops_pauses_running_loop_and_interrupts_its_run() {
         Some(&serde_json::json!(true))
     );
 
-    // Test 2 (B18): the spec is reset back to `pending` in the same pass —
-    // its completed work is preserved by the worktree/commits, not by its
-    // status, and leaving it `running` would make it invisible to queue
-    // selection (`queue_next_pending_spec_id` only ever picks `pending`).
+    // Test 2 (B18): the spec is marked `interrupted` in the same pass — not
+    // reset to `pending`, since the run was cut short by something external,
+    // not a failure of the work. Its completed work is preserved by the
+    // worktree/commits, not by its status, and leaving it `running` would
+    // make it invisible to queue selection (`queue_next_pending_spec_id`
+    // picks `pending` and `interrupted` alike).
     let spec_after = db.get_loop_spec(&spec.id).unwrap().unwrap();
-    assert_eq!(spec_after.status, LoopSpecStatus::Pending);
+    assert_eq!(spec_after.status, LoopSpecStatus::Interrupted);
     assert_eq!(spec_after.started_at, None);
     assert_eq!(spec_after.spec_start_head, None);
 }
 
 /// B18: the real incident — a queue-driven run's in-flight member (a
 /// standalone spec, `loop_id: None`, never bound to the loop that's
-/// currently running it) must be reset to `pending` exactly like a
+/// currently running it) must be marked `interrupted` exactly like a
 /// loop-bound spec is. Left `running`, it would be invisible to
-/// `queue_next_pending_spec_id` (which only ever picks `pending` members)
-/// forever — the orphan this whole fix exists to prevent.
+/// `queue_next_pending_spec_id` forever — the orphan this whole fix exists
+/// to prevent — and `queue_next_pending_spec_id` must pick an `interrupted`
+/// member right back up, in the same position, exactly as it would a
+/// `pending` one.
 #[test]
-fn reconcile_orphaned_loops_resets_queue_member_spec_to_pending() {
+fn reconcile_orphaned_loops_marks_queue_member_spec_interrupted() {
     let db = test_db();
     let data_dir = tempdir().unwrap();
     let mut lp = sample_loop("wf-orphan-queue");
@@ -1300,8 +1304,9 @@ fn reconcile_orphaned_loops_resets_queue_member_spec_to_pending() {
     let lp_after = db.get_loop(&lp.id).unwrap().unwrap();
     assert_eq!(lp_after.status, LoopStatus::Paused);
     let spec_after = db.get_loop_spec(&spec.id).unwrap().unwrap();
-    assert_eq!(spec_after.status, LoopSpecStatus::Pending);
-    // The queue's live pick can now find it again.
+    assert_eq!(spec_after.status, LoopSpecStatus::Interrupted);
+    // The queue's live pick can now find it again, exactly as it would a
+    // `pending` member.
     assert_eq!(
         db.queue_next_pending_spec_id("queue-1").unwrap().as_deref(),
         Some(spec.id.as_str())
@@ -4231,6 +4236,52 @@ fn set_spec_admin_status_propagates_to_queue_selection() {
     );
 }
 
+/// `Interrupted` must be exactly as selectable as `Pending` — a spec cut
+/// short by an external event (daemon restart, crash) is not less runnable
+/// than a spec that never started, and queue order between the two statuses
+/// is preserved (position, not status, decides who goes first).
+#[test]
+fn queue_next_pending_spec_id_picks_interrupted_spec_in_position_order() {
+    let db = test_db();
+    let queue = Queue {
+        id: "queue-interrupted".to_string(),
+        name: "queue-interrupted".to_string(),
+        created_at: Utc::now(),
+    };
+    db.insert_queue(&queue).unwrap();
+
+    let mut ahead = sample_loop_spec("unused", "spec-ahead-completed", 1);
+    ahead.loop_id = None;
+    ahead.status = LoopSpecStatus::Completed;
+    db.insert_loop_spec(&ahead).unwrap();
+    db.append_queue_member("queue-interrupted", &ahead.id, None)
+        .unwrap();
+
+    let mut interrupted = sample_loop_spec("unused", "spec-interrupted", 2);
+    interrupted.loop_id = None;
+    interrupted.status = LoopSpecStatus::Interrupted;
+    db.insert_loop_spec(&interrupted).unwrap();
+    db.append_queue_member("queue-interrupted", &interrupted.id, None)
+        .unwrap();
+
+    let mut pending = sample_loop_spec("unused", "spec-pending-after", 3);
+    pending.loop_id = None;
+    pending.status = LoopSpecStatus::Pending;
+    db.insert_loop_spec(&pending).unwrap();
+    db.append_queue_member("queue-interrupted", &pending.id, None)
+        .unwrap();
+
+    // Position 2 (`interrupted`) is picked before position 3 (`pending`) —
+    // selection follows queue order, not a preference between the two
+    // equally-runnable statuses.
+    assert_eq!(
+        db.queue_next_pending_spec_id("queue-interrupted")
+            .unwrap()
+            .as_deref(),
+        Some(interrupted.id.as_str())
+    );
+}
+
 #[test]
 fn queue_running_spec_id_returns_first_running_member() {
     let db = test_db();
@@ -4391,7 +4442,7 @@ fn reconcile_stranded_queue_specs_is_idempotent() {
     );
 }
 
-// ── B36: interrupted-run quarantine ──────────────────────────────────────
+// ── B36: interrupted-run marking (no git stash) ──────────────────────────
 
 fn init_git_repo(path: &std::path::Path) {
     let run = |args: &[&str]| {
@@ -4433,17 +4484,8 @@ fn git_is_clean(path: &std::path::Path) -> bool {
     output.stdout.is_empty()
 }
 
-fn git_stash_list(path: &std::path::Path) -> String {
-    let output = std::process::Command::new("git")
-        .args(["stash", "list"])
-        .current_dir(path)
-        .output()
-        .expect("git stash list failed to run");
-    String::from_utf8_lossy(&output.stdout).to_string()
-}
-
 #[test]
-fn reconcile_orphaned_loops_quarantines_dirty_worktree_of_interrupted_run() {
+fn reconcile_orphaned_loops_marks_interrupted_and_leaves_dirty_worktree_untouched() {
     let dir = tempdir().unwrap();
     init_git_repo(dir.path());
     let head = git_head(dir.path());
@@ -4453,122 +4495,15 @@ fn reconcile_orphaned_loops_quarantines_dirty_worktree_of_interrupted_run() {
 
     let db = test_db();
     let data_dir = tempdir().unwrap();
-    let mut lp = sample_loop("wf-orphan-quarantine-dirty");
+    let mut lp = sample_loop("wf-orphan-interrupted-dirty");
     lp.status = LoopStatus::Running;
     lp.workdir = dir.path().to_string_lossy().to_string();
-    let mut spec = sample_loop_spec(&lp.id, "spec-orphan-quarantine-dirty", 1);
+    let mut spec = sample_loop_spec(&lp.id, "spec-orphan-interrupted-dirty", 1);
     spec.status = LoopSpecStatus::Running;
     spec.spec_start_head = Some(head);
-    let node = sample_loop_node(&spec.id, "node-orphan-quarantine-dirty", 1);
+    let node = sample_loop_node(&spec.id, "node-orphan-interrupted-dirty", 1);
     let run = LoopNodeRun {
-        id: "run-orphan-quarantine-dirty".to_string(),
-        loop_id: lp.id.clone(),
-        spec_id: spec.id.clone(),
-        node_id: node.id.clone(),
-        status: LoopRunStatus::Running,
-        input: None,
-        output: None,
-        started_at: Utc::now(),
-        completed_at: None,
-        iteration: 1,
-        pid: None,
-        boot_id: None,
-        session_id: None,
-    };
-
-    db.insert_loop(&lp).unwrap();
-    db.insert_loop_spec(&spec).unwrap();
-    db.insert_loop_node(&node).unwrap();
-    db.insert_loop_run(&run).unwrap();
-
-    assert_eq!(db.reconcile_orphaned_loops(data_dir.path()).unwrap(), 1);
-
-    assert!(
-        git_is_clean(dir.path()),
-        "uncommitted changes must be stashed, leaving the worktree clean"
-    );
-    assert!(
-        git_stash_list(dir.path()).contains(&run.id),
-        "the stash message must identify the interrupted run"
-    );
-
-    let run_after = db.get_loop_run(&run.id).unwrap().unwrap();
-    let output = run_after.output.as_ref().expect("output recorded");
-    assert_eq!(output.get("interrupted"), Some(&serde_json::json!(true)));
-    let quarantine = output.get("quarantine").expect("quarantine info recorded");
-    assert_eq!(quarantine.get("stashed"), Some(&serde_json::json!(true)));
-}
-
-#[test]
-fn reconcile_orphaned_loops_leaves_clean_worktree_unstashed() {
-    let dir = tempdir().unwrap();
-    init_git_repo(dir.path());
-    let head = git_head(dir.path());
-    assert!(git_is_clean(dir.path()));
-
-    let db = test_db();
-    let data_dir = tempdir().unwrap();
-    let mut lp = sample_loop("wf-orphan-quarantine-clean");
-    lp.status = LoopStatus::Running;
-    lp.workdir = dir.path().to_string_lossy().to_string();
-    let mut spec = sample_loop_spec(&lp.id, "spec-orphan-quarantine-clean", 1);
-    spec.status = LoopSpecStatus::Running;
-    spec.spec_start_head = Some(head);
-    let node = sample_loop_node(&spec.id, "node-orphan-quarantine-clean", 1);
-    let run = LoopNodeRun {
-        id: "run-orphan-quarantine-clean".to_string(),
-        loop_id: lp.id.clone(),
-        spec_id: spec.id.clone(),
-        node_id: node.id.clone(),
-        status: LoopRunStatus::Running,
-        input: None,
-        output: None,
-        started_at: Utc::now(),
-        completed_at: None,
-        iteration: 1,
-        pid: None,
-        boot_id: None,
-        session_id: None,
-    };
-
-    db.insert_loop(&lp).unwrap();
-    db.insert_loop_spec(&spec).unwrap();
-    db.insert_loop_node(&node).unwrap();
-    db.insert_loop_run(&run).unwrap();
-
-    assert_eq!(db.reconcile_orphaned_loops(data_dir.path()).unwrap(), 1);
-
-    assert!(git_stash_list(dir.path()).is_empty(), "nothing to stash");
-
-    let run_after = db.get_loop_run(&run.id).unwrap().unwrap();
-    let output = run_after.output.as_ref().expect("output recorded");
-    assert_eq!(output.get("interrupted"), Some(&serde_json::json!(true)));
-    assert!(
-        output.get("quarantine").is_none(),
-        "a clean worktree must not claim a quarantine happened"
-    );
-}
-
-#[test]
-fn reconcile_orphaned_loops_skips_quarantine_when_spec_start_head_unestablished() {
-    let dir = tempdir().unwrap();
-    init_git_repo(dir.path());
-    // Left dirty, but the spec never recorded a `spec_start_head` (e.g. the
-    // workdir wasn't a git repo when the spec started) — there is no bound
-    // to attribute these changes to this run, so nothing may be quarantined.
-    std::fs::write(dir.path().join("truncated.rs"), "fn broken(").unwrap();
-
-    let db = test_db();
-    let data_dir = tempdir().unwrap();
-    let mut lp = sample_loop("wf-orphan-quarantine-no-head");
-    lp.status = LoopStatus::Running;
-    lp.workdir = dir.path().to_string_lossy().to_string();
-    let mut spec = sample_loop_spec(&lp.id, "spec-orphan-quarantine-no-head", 1);
-    spec.status = LoopSpecStatus::Running;
-    spec.spec_start_head = None;
-    let node = sample_loop_node(&spec.id, "node-orphan-quarantine-no-head", 1);
-    let run = LoopNodeRun {
-        id: "run-orphan-quarantine-no-head".to_string(),
+        id: "run-orphan-interrupted-dirty".to_string(),
         loop_id: lp.id.clone(),
         spec_id: spec.id.clone(),
         node_id: node.id.clone(),
@@ -4592,33 +4527,44 @@ fn reconcile_orphaned_loops_skips_quarantine_when_spec_start_head_unestablished(
 
     assert!(
         !git_is_clean(dir.path()),
-        "with no spec_start_head bound, uncommitted changes must be left exactly as found"
+        "the engine must never touch git — uncommitted changes stay exactly as the interrupted run left them"
     );
-    assert!(git_stash_list(dir.path()).is_empty());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("truncated.rs")).unwrap(),
+        "fn broken(",
+        "the partial write itself must be untouched, not just 'still dirty'"
+    );
 
     let run_after = db.get_loop_run(&run.id).unwrap().unwrap();
     let output = run_after.output.as_ref().expect("output recorded");
-    assert!(output.get("quarantine").is_none());
+    assert_eq!(output.get("interrupted"), Some(&serde_json::json!(true)));
+    assert!(
+        output.get("quarantine").is_none(),
+        "there is no quarantine mechanism left to report"
+    );
+
+    let spec_after = db.get_loop_spec(&spec.id).unwrap().unwrap();
+    assert_eq!(spec_after.status, LoopSpecStatus::Interrupted);
 }
 
 #[test]
-fn reconcile_orphaned_loops_quarantine_is_idempotent_across_two_passes() {
+fn reconcile_orphaned_loops_marks_interrupted_for_clean_worktree_too() {
     let dir = tempdir().unwrap();
     init_git_repo(dir.path());
     let head = git_head(dir.path());
-    std::fs::write(dir.path().join("truncated.rs"), "fn broken(").unwrap();
+    assert!(git_is_clean(dir.path()));
 
     let db = test_db();
     let data_dir = tempdir().unwrap();
-    let mut lp = sample_loop("wf-orphan-quarantine-idempotent");
+    let mut lp = sample_loop("wf-orphan-interrupted-clean");
     lp.status = LoopStatus::Running;
     lp.workdir = dir.path().to_string_lossy().to_string();
-    let mut spec = sample_loop_spec(&lp.id, "spec-orphan-quarantine-idempotent", 1);
+    let mut spec = sample_loop_spec(&lp.id, "spec-orphan-interrupted-clean", 1);
     spec.status = LoopSpecStatus::Running;
     spec.spec_start_head = Some(head);
-    let node = sample_loop_node(&spec.id, "node-orphan-quarantine-idempotent", 1);
+    let node = sample_loop_node(&spec.id, "node-orphan-interrupted-clean", 1);
     let run = LoopNodeRun {
-        id: "run-orphan-quarantine-idempotent".to_string(),
+        id: "run-orphan-interrupted-clean".to_string(),
         loop_id: lp.id.clone(),
         spec_id: spec.id.clone(),
         node_id: node.id.clone(),
@@ -4639,34 +4585,147 @@ fn reconcile_orphaned_loops_quarantine_is_idempotent_across_two_passes() {
     db.insert_loop_run(&run).unwrap();
 
     assert_eq!(db.reconcile_orphaned_loops(data_dir.path()).unwrap(), 1);
-    let stash_after_first = git_stash_list(dir.path());
-    assert_eq!(stash_after_first.lines().count(), 1);
 
-    // Second pass: the loop is already `Paused`, so it's not even a
-    // candidate — nothing should be stashed again.
-    assert_eq!(db.reconcile_orphaned_loops(data_dir.path()).unwrap(), 0);
-    let stash_after_second = git_stash_list(dir.path());
+    assert!(git_is_clean(dir.path()), "still nothing to touch");
+
+    let run_after = db.get_loop_run(&run.id).unwrap().unwrap();
+    let output = run_after.output.as_ref().expect("output recorded");
+    assert_eq!(output.get("interrupted"), Some(&serde_json::json!(true)));
+    assert!(output.get("quarantine").is_none());
+
+    let spec_after = db.get_loop_spec(&spec.id).unwrap().unwrap();
     assert_eq!(
-        stash_after_first, stash_after_second,
-        "a second pass must not stash again"
+        spec_after.status,
+        LoopSpecStatus::Interrupted,
+        "a spec becomes interrupted regardless of whether the worktree happened to be dirty"
     );
 }
 
+/// The engine must not require git at all: a scratch workdir that was never
+/// `git init`ed still gets the spec marked `Interrupted`, with whatever
+/// partial work it holds left completely alone.
 #[test]
-fn reconcile_stranded_queue_specs_marks_stale_running_run_interrupted_and_quarantines() {
+fn reconcile_orphaned_loops_marks_interrupted_in_non_git_workdir() {
+    let dir = tempdir().unwrap();
+    // Deliberately no `init_git_repo` — this workdir is not a repository.
+    std::fs::write(dir.path().join("truncated.rs"), "fn broken(").unwrap();
+
+    let db = test_db();
+    let data_dir = tempdir().unwrap();
+    let mut lp = sample_loop("wf-orphan-interrupted-no-git");
+    lp.status = LoopStatus::Running;
+    lp.workdir = dir.path().to_string_lossy().to_string();
+    let mut spec = sample_loop_spec(&lp.id, "spec-orphan-interrupted-no-git", 1);
+    spec.status = LoopSpecStatus::Running;
+    spec.spec_start_head = None;
+    let node = sample_loop_node(&spec.id, "node-orphan-interrupted-no-git", 1);
+    let run = LoopNodeRun {
+        id: "run-orphan-interrupted-no-git".to_string(),
+        loop_id: lp.id.clone(),
+        spec_id: spec.id.clone(),
+        node_id: node.id.clone(),
+        status: LoopRunStatus::Running,
+        input: None,
+        output: None,
+        started_at: Utc::now(),
+        completed_at: None,
+        iteration: 1,
+        pid: None,
+        boot_id: None,
+        session_id: None,
+    };
+
+    db.insert_loop(&lp).unwrap();
+    db.insert_loop_spec(&spec).unwrap();
+    db.insert_loop_node(&node).unwrap();
+    db.insert_loop_run(&run).unwrap();
+
+    assert_eq!(db.reconcile_orphaned_loops(data_dir.path()).unwrap(), 1);
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("truncated.rs")).unwrap(),
+        "fn broken(",
+        "partial work in a non-git workdir must be left exactly as found"
+    );
+
+    let run_after = db.get_loop_run(&run.id).unwrap().unwrap();
+    let output = run_after.output.as_ref().expect("output recorded");
+    assert_eq!(output.get("interrupted"), Some(&serde_json::json!(true)));
+    assert!(output.get("quarantine").is_none());
+
+    let spec_after = db.get_loop_spec(&spec.id).unwrap().unwrap();
+    assert_eq!(spec_after.status, LoopSpecStatus::Interrupted);
+}
+
+#[test]
+fn reconcile_orphaned_loops_interrupted_marking_is_idempotent_across_two_passes() {
     let dir = tempdir().unwrap();
     init_git_repo(dir.path());
     let head = git_head(dir.path());
     std::fs::write(dir.path().join("truncated.rs"), "fn broken(").unwrap();
 
     let db = test_db();
-    let mut lp = sample_loop("wf-stranded-quarantine");
+    let data_dir = tempdir().unwrap();
+    let mut lp = sample_loop("wf-orphan-interrupted-idempotent");
+    lp.status = LoopStatus::Running;
+    lp.workdir = dir.path().to_string_lossy().to_string();
+    let mut spec = sample_loop_spec(&lp.id, "spec-orphan-interrupted-idempotent", 1);
+    spec.status = LoopSpecStatus::Running;
+    spec.spec_start_head = Some(head);
+    let node = sample_loop_node(&spec.id, "node-orphan-interrupted-idempotent", 1);
+    let run = LoopNodeRun {
+        id: "run-orphan-interrupted-idempotent".to_string(),
+        loop_id: lp.id.clone(),
+        spec_id: spec.id.clone(),
+        node_id: node.id.clone(),
+        status: LoopRunStatus::Running,
+        input: None,
+        output: None,
+        started_at: Utc::now(),
+        completed_at: None,
+        iteration: 1,
+        pid: None,
+        boot_id: None,
+        session_id: None,
+    };
+
+    db.insert_loop(&lp).unwrap();
+    db.insert_loop_spec(&spec).unwrap();
+    db.insert_loop_node(&node).unwrap();
+    db.insert_loop_run(&run).unwrap();
+
+    assert_eq!(db.reconcile_orphaned_loops(data_dir.path()).unwrap(), 1);
+    let spec_after_first = db.get_loop_spec(&spec.id).unwrap().unwrap();
+    assert_eq!(spec_after_first.status, LoopSpecStatus::Interrupted);
+
+    // Second pass: the loop is already `Paused`, so it's not even a
+    // candidate — nothing should change again, and the worktree stays
+    // exactly as it was after the first pass.
+    assert_eq!(db.reconcile_orphaned_loops(data_dir.path()).unwrap(), 0);
+    let spec_after_second = db.get_loop_spec(&spec.id).unwrap().unwrap();
+    assert_eq!(spec_after_second.status, LoopSpecStatus::Interrupted);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("truncated.rs")).unwrap(),
+        "fn broken(",
+        "a second pass must not touch the worktree"
+    );
+}
+
+#[test]
+fn reconcile_stranded_queue_specs_marks_spec_interrupted_and_leaves_worktree_untouched() {
+    let dir = tempdir().unwrap();
+    init_git_repo(dir.path());
+    let head = git_head(dir.path());
+    std::fs::write(dir.path().join("truncated.rs"), "fn broken(").unwrap();
+
+    let db = test_db();
+    let mut lp = sample_loop("wf-stranded-interrupted");
     lp.status = LoopStatus::Paused;
     lp.workdir = dir.path().to_string_lossy().to_string();
     lp.active_run_queue_id = Some("queue-1".to_string());
     db.insert_loop(&lp).unwrap();
 
-    let mut spec = sample_loop_spec("unused", "spec-stranded-quarantine", 1);
+    let mut spec = sample_loop_spec("unused", "spec-stranded-interrupted", 1);
     spec.loop_id = None;
     spec.status = LoopSpecStatus::Running;
     spec.spec_start_head = Some(head);
@@ -4680,13 +4739,13 @@ fn reconcile_stranded_queue_specs_marks_stale_running_run_interrupted_and_quaran
     .unwrap();
     db.append_queue_member("queue-1", &spec.id, None).unwrap();
 
-    let node = sample_loop_node(&spec.id, "node-stranded-quarantine", 1);
+    let node = sample_loop_node(&spec.id, "node-stranded-interrupted", 1);
     db.insert_loop_node(&node).unwrap();
     // A `loop_runs` row left `running` by a daemon that died before a
     // graceful path (e.g. `loop_report_blocker`) could finalize it — its
     // boot id is stale, proving it from a recorded fact rather than content.
     db.insert_loop_run(&LoopNodeRun {
-        id: "run-stranded-quarantine".to_string(),
+        id: "run-stranded-interrupted".to_string(),
         loop_id: lp.id,
         spec_id: spec.id.clone(),
         node_id: node.id,
@@ -4704,20 +4763,29 @@ fn reconcile_stranded_queue_specs_marks_stale_running_run_interrupted_and_quaran
 
     assert_eq!(db.reconcile_stranded_queue_specs().unwrap(), 1);
 
-    assert!(git_is_clean(dir.path()));
-    assert!(git_stash_list(dir.path()).contains("run-stranded-quarantine"));
+    assert!(
+        !git_is_clean(dir.path()),
+        "the engine must never touch git here either"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("truncated.rs")).unwrap(),
+        "fn broken("
+    );
 
-    let run_after = db.get_loop_run("run-stranded-quarantine").unwrap().unwrap();
+    let run_after = db
+        .get_loop_run("run-stranded-interrupted")
+        .unwrap()
+        .unwrap();
     assert_ne!(run_after.status, LoopRunStatus::Running);
     let output = run_after.output.as_ref().expect("output recorded");
     assert_eq!(output.get("interrupted"), Some(&serde_json::json!(true)));
-    assert_eq!(
-        output.get("quarantine").and_then(|q| q.get("stashed")),
-        Some(&serde_json::json!(true))
-    );
+    assert!(output.get("quarantine").is_none());
 
+    // The key behaviour change (B36 → this spec): a genuinely interrupted
+    // spec is marked `Interrupted`, not silently reset to `Pending` — it
+    // used to be indistinguishable from a spec that never started.
     let spec_after = db.get_loop_spec(&spec.id).unwrap().unwrap();
-    assert_eq!(spec_after.status, LoopSpecStatus::Pending);
+    assert_eq!(spec_after.status, LoopSpecStatus::Interrupted);
 }
 
 #[test]
@@ -4779,7 +4847,6 @@ fn reconcile_stranded_queue_specs_leaves_worktree_untouched_for_healthy_run() {
         !git_is_clean(dir.path()),
         "a healthy run's worktree changes must never be touched"
     );
-    assert!(git_stash_list(dir.path()).is_empty());
 
     let run_after = db.get_loop_run("run-stranded-healthy").unwrap().unwrap();
     assert_eq!(run_after.status, LoopRunStatus::Running);

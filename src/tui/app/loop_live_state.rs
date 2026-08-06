@@ -115,14 +115,18 @@ pub(crate) fn assemble_loop_live_state(
         .count();
     let total_count = spec_queue.len();
 
-    // Current spec: first Running, else first Pending.
+    // Current spec: first Running, else first Pending/Interrupted (equally
+    // runnable — see `Database::queue_next_pending_spec_id`).
     let current_spec_id = spec_queue
         .iter()
         .find(|e| e.status == LoopSpecStatus::Running)
         .or_else(|| {
-            spec_queue
-                .iter()
-                .find(|e| e.status == LoopSpecStatus::Pending)
+            spec_queue.iter().find(|e| {
+                matches!(
+                    e.status,
+                    LoopSpecStatus::Pending | LoopSpecStatus::Interrupted
+                )
+            })
         })
         .map(|e| e.spec_id.clone());
 

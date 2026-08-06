@@ -661,8 +661,10 @@ fn validate_spec_status(status: &str) -> Result<LoopSpecStatus, String> {
         "completed" => Ok(LoopSpecStatus::Completed),
         "failed" => Ok(LoopSpecStatus::Failed),
         "skipped" => Ok(LoopSpecStatus::Skipped),
+        "interrupted" => Ok(LoopSpecStatus::Interrupted),
         _ => Err(
-            "Spec status must be one of: pending, running, completed, failed, skipped.".to_string(),
+            "Spec status must be one of: pending, running, completed, failed, skipped, interrupted."
+                .to_string(),
         ),
     }
 }
@@ -1845,7 +1847,7 @@ fn build_loop_summary_json(db: &Database, lp: &Loop) -> Result<serde_json::Value
         .find(|spec| {
             matches!(
                 spec.status,
-                LoopSpecStatus::Running | LoopSpecStatus::Pending
+                LoopSpecStatus::Running | LoopSpecStatus::Pending | LoopSpecStatus::Interrupted
             )
         })
         .map(|spec| build_spec_run_info(db, &spec))
@@ -7706,6 +7708,31 @@ mod tests {
         assert_eq!(done.status, LoopSpecStatus::Completed);
     }
 
+    /// `Interrupted` is treated like any other non-completed status: a plain
+    /// `loop_reset` (no explicit `specs`) returns it to `pending`, same as it
+    /// would `failed` — an interruption isn't the special case here, only
+    /// `completed` is (preserved unless named explicitly).
+    #[test]
+    fn loop_reset_resets_interrupted_spec_to_pending() {
+        let (_dir, db, loop_id) = loop_reset_fixture(LoopStatus::Failed);
+        db.insert_loop_spec(&spec_with_status(
+            &loop_id,
+            "spec-interrupted",
+            1,
+            LoopSpecStatus::Interrupted,
+        ))
+        .unwrap();
+
+        let result = perform_loop_reset(&db, &loop_id, None).unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+
+        let specs = db.list_loop_specs(&loop_id).unwrap();
+        let interrupted = specs.iter().find(|s| s.id == "spec-interrupted").unwrap();
+        assert_eq!(interrupted.status, LoopSpecStatus::Pending);
+        assert!(interrupted.started_at.is_none());
+        assert!(interrupted.completed_at.is_none());
+    }
+
     #[test]
     fn loop_reset_with_explicit_specs_resets_completed_spec_too() {
         let (_dir, db, loop_id) = loop_reset_fixture(LoopStatus::Failed);
@@ -10450,6 +10477,10 @@ mod tests {
             validate_spec_status("skipped").unwrap(),
             LoopSpecStatus::Skipped
         );
+        assert_eq!(
+            validate_spec_status("interrupted").unwrap(),
+            LoopSpecStatus::Interrupted
+        );
     }
 
     #[test]
@@ -11011,6 +11042,7 @@ mod tests {
             LoopSpecStatus::Completed,
             LoopSpecStatus::Failed,
             LoopSpecStatus::Skipped,
+            LoopSpecStatus::Interrupted,
         ] {
             let s = status.as_str();
             assert_eq!(LoopSpecStatus::from_str(s), status);
@@ -12102,6 +12134,10 @@ mod additional_tests {
         assert!(matches!(
             validate_spec_status("skipped").unwrap(),
             LoopSpecStatus::Skipped
+        ));
+        assert!(matches!(
+            validate_spec_status("interrupted").unwrap(),
+            LoopSpecStatus::Interrupted
         ));
     }
 
@@ -13588,6 +13624,7 @@ mod coverage_tests {
             LoopSpecStatus::Completed,
             LoopSpecStatus::Failed,
             LoopSpecStatus::Skipped,
+            LoopSpecStatus::Interrupted,
         ] {
             let mut spec = standalone_spec("s");
             spec.status = status;

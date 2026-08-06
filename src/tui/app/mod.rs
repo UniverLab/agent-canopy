@@ -2330,10 +2330,12 @@ impl App {
                     .iter()
                     .position(|spec| spec.spec.status == LoopSpecStatus::Running)
                     .or_else(|| {
-                        details
-                            .specs
-                            .iter()
-                            .position(|spec| spec.spec.status == LoopSpecStatus::Pending)
+                        details.specs.iter().position(|spec| {
+                            matches!(
+                                spec.spec.status,
+                                LoopSpecStatus::Pending | LoopSpecStatus::Interrupted
+                            )
+                        })
                     })
             })
             .unwrap_or(0)

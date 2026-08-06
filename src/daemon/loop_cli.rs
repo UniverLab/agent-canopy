@@ -636,19 +636,16 @@ fn commit_rights_note(output: Option<&serde_json::Value>) -> String {
 
 /// The `loop info` annotation for a run cut short by a daemon restart/kill
 /// (B36), or an empty string for every other run — pairs with the distinct
-/// icon `run_status_icon` already gives it. Also surfaces the recovery hint
-/// when uncommitted changes were quarantined via `git stash`, so a `fail`
-/// here never reads as the node's own doing.
+/// icon `run_status_icon` already gives it, so a `fail` here never reads as
+/// the node's own doing. The engine never touches git on this path, so
+/// there's nothing to point the operator at recovering — the spec's own
+/// `interrupted` status (visible via `loop_info`'s spec listing) is what
+/// says the worktree still holds the interrupted attempt's partial work.
 fn interrupted_note(output: Option<&serde_json::Value>) -> String {
     if !is_interrupted(output) {
         return String::new();
     }
-    match output.and_then(|o| o.get("quarantine")) {
-        Some(q) if q.get("stashed").and_then(|v| v.as_bool()) == Some(true) => {
-            "  \x1b[33m(interrupted — worktree changes quarantined, recover with `git stash pop`)\x1b[0m".to_string()
-        }
-        _ => "  \x1b[33m(interrupted — not a node failure)\x1b[0m".to_string(),
-    }
+    "  \x1b[33m(interrupted — not a node failure)\x1b[0m".to_string()
 }
 
 /// Count of specs that have reached a final `completed` state, alongside the
@@ -684,14 +681,22 @@ fn loop_progress(db: &Database, lp: &Loop, bound_specs: &[LoopSpec]) -> Result<(
 }
 
 /// The spec a loop is actively working through: the one currently `running`,
-/// or else the next `pending` one in position order. Mirrors
+/// or else the next `pending`/`interrupted` one (equally runnable — see
+/// `queue_next_pending_spec_id`) in position order. Mirrors
 /// `build_loop_summary_json` in `daemon/handler.rs` so the CLI and MCP report
 /// the same "current spec" for a given loop.
 fn current_spec(specs: &[LoopSpec]) -> Option<&LoopSpec> {
     specs
         .iter()
         .find(|s| s.status == LoopSpecStatus::Running)
-        .or_else(|| specs.iter().find(|s| s.status == LoopSpecStatus::Pending))
+        .or_else(|| {
+            specs.iter().find(|s| {
+                matches!(
+                    s.status,
+                    LoopSpecStatus::Pending | LoopSpecStatus::Interrupted
+                )
+            })
+        })
 }
 
 /// Name of the spec a loop is actively working through, for both bound-spec
@@ -806,6 +811,7 @@ fn spec_status_icon(status: LoopSpecStatus) -> &'static str {
         LoopSpecStatus::Failed => "\x1b[31m✗\x1b[0m",
         LoopSpecStatus::Skipped => "\x1b[90m⊘\x1b[0m",
         LoopSpecStatus::Pending => "\x1b[90m●\x1b[0m",
+        LoopSpecStatus::Interrupted => "\x1b[33m⚑\x1b[0m",
     }
 }
 
@@ -1478,6 +1484,7 @@ mod tests {
             LoopSpecStatus::Failed,
             LoopSpecStatus::Skipped,
             LoopSpecStatus::Pending,
+            LoopSpecStatus::Interrupted,
         ];
         let icons: std::collections::HashSet<&str> =
             statuses.iter().map(|s| spec_status_icon(*s)).collect();
@@ -1538,23 +1545,11 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_note_renders_with_quarantine() {
-        let output = Some(serde_json::json!({
-            "interrupted": true,
-            "quarantine": {"stashed": true}
-        }));
-        let note = interrupted_note(output.as_ref());
-        assert!(note.contains("interrupted"));
-        assert!(note.contains("quarantined"));
-        assert!(note.contains("git stash pop"));
-    }
-
-    #[test]
-    fn interrupted_note_renders_without_quarantine() {
+    fn interrupted_note_renders_for_interrupted_run() {
         let output = Some(serde_json::json!({"interrupted": true}));
         let note = interrupted_note(output.as_ref());
         assert!(note.contains("interrupted"));
-        assert!(!note.contains("quarantined"));
+        assert!(!note.contains("git stash"));
     }
 
     #[test]
