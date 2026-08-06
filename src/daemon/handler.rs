@@ -7127,6 +7127,48 @@ mod tests {
         assert!(props.contains_key("node_data"));
     }
 
+    /// Regression guard for the class of bug where a nested-object parameter
+    /// is advertised as a bare `$ref` into `$defs` with no sibling `type` at
+    /// the property level. A client that builds tool arguments from a
+    /// shallow read of the property schema (never resolving `$ref`) sees no
+    /// declared type there and falls back to sending the value as a string.
+    /// This has already happened twice — `loop_add_node.config` and
+    /// `intelligence_upsert.node_data` — so this test walks every
+    /// registered tool's whole surface instead of asserting on one tool.
+    #[test]
+    fn every_tool_property_self_declares_its_type() {
+        let tools = TaskTriggerHandler::tool_router().list_all();
+        let mut violations = Vec::new();
+
+        for tool in &tools {
+            let Some(properties) = tool
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+            else {
+                continue;
+            };
+
+            for (prop_name, prop_schema) in properties {
+                // A `$ref` with a sibling `type` counts via `has_type`;
+                // a bare `$ref` with no sibling `type` does not, which is
+                // exactly the shape this guard rejects.
+                let has_type = prop_schema.get("type").is_some();
+                let has_combinator =
+                    prop_schema.get("anyOf").is_some() || prop_schema.get("oneOf").is_some();
+                if !has_type && !has_combinator {
+                    violations.push(format!("{}.{prop_name}", tool.name));
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "properties with no declared type at the property level — a client that doesn't \
+             resolve $ref can't tell these apart from an untyped string parameter: {violations:?}"
+        );
+    }
+
     #[test]
     fn validate_ensemble_members_rejects_below_minimum() {
         let members = vec![ensemble_member_params("claude")];

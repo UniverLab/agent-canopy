@@ -429,4 +429,82 @@ mod tests {
         assert!(obj.contains_key("title"));
         assert!(obj.contains_key("relations"));
     }
+
+    #[test]
+    fn node_data_advertises_inline_object_schema_not_bare_ref() {
+        // Agents that build tool arguments from a shallow read of the
+        // property schema (never resolving `$ref`) need `node_data` to
+        // self-declare its type. A bare `{"$ref": ...}` with no sibling
+        // `type` is exactly what caused this parameter to be sent as a
+        // JSON-encoded string instead of an object.
+        let root = root_schema_value::<IntelligenceUpsertParams>();
+        let node_data = root
+            .get("properties")
+            .and_then(|p| p.get("node_data"))
+            .expect("node_data property present");
+
+        assert!(
+            node_data.get("$ref").is_none(),
+            "node_data should be inlined, not a bare $ref: {node_data}"
+        );
+        assert_eq!(
+            node_data.get("type").and_then(Value::as_str),
+            Some("object"),
+            "node_data should declare type object: {node_data}"
+        );
+        assert!(
+            node_data
+                .get("properties")
+                .and_then(Value::as_object)
+                .is_some(),
+            "node_data's properties should be readable without resolving a $ref: {node_data}"
+        );
+    }
+
+    #[test]
+    fn metadata_fields_declare_a_type() {
+        let intel_root = root_schema_value::<IntelligenceUpsertParams>();
+        let node_data_metadata = intel_root
+            .get("properties")
+            .and_then(|p| p.get("node_data"))
+            .and_then(|n| n.get("properties"))
+            .and_then(|p| p.get("metadata"))
+            .expect("node_data.metadata property present");
+        assert!(
+            node_data_metadata.get("type").is_some(),
+            "IntelligenceNodeParams.metadata should declare a type: {node_data_metadata}"
+        );
+
+        let broadcast_root = root_schema_value::<crate::daemon::params::SyncBroadcastParams>();
+        let broadcast_metadata = broadcast_root
+            .get("properties")
+            .and_then(|p| p.get("metadata"))
+            .expect("metadata property present");
+        assert!(
+            broadcast_metadata.get("type").is_some(),
+            "SyncBroadcastParams.metadata should declare a type: {broadcast_metadata}"
+        );
+    }
+
+    #[test]
+    fn stringified_node_data_error_names_parameter_and_expected_shape() {
+        let value = serde_json::json!({
+            "node_data": "{\"kind\":\"fact\",\"title\":\"t\",\"body\":\"b\"}",
+        });
+
+        let message = message_of(deserialize_params::<IntelligenceUpsertParams>(&value));
+
+        assert!(
+            message.contains("node_data"),
+            "message should name the parameter `node_data`: {message}"
+        );
+        assert!(
+            message.contains("expected shape"),
+            "message should describe the expected object shape: {message}"
+        );
+        assert!(
+            message.contains("string"),
+            "message should say a string was received where an object was expected: {message}"
+        );
+    }
 }

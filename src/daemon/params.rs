@@ -179,6 +179,8 @@ pub struct SyncBroadcastParams {
     /// Human-readable message.
     pub message: String,
     /// Optional JSON metadata.
+    #[serde(default)]
+    #[schemars(schema_with = "arbitrary_json_value_schema")]
     pub metadata: Option<serde_json::Value>,
 }
 
@@ -210,7 +212,25 @@ pub struct IntelligenceRelationParams {
     pub weight: Option<f64>,
 }
 
+/// Schema for a field that accepts any well-formed JSON value. Plain
+/// `serde_json::Value` fields otherwise emit an untyped `{}` schema — list
+/// every JSON Schema primitive explicitly so a shallow schema reader (and
+/// the registered-tool schema regression guard) can see this parameter has
+/// a declared type, without narrowing what it actually accepts.
+fn arbitrary_json_value_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["object", "array", "string", "number", "boolean", "null"],
+    })
+}
+
+// `#[schemars(inline)]` makes every use site of this type emit its full
+// object schema in place instead of a bare `$ref` into `$defs`. Without it,
+// `IntelligenceUpsertParams.node_data` advertises only `{"$ref": "..."}`
+// with no sibling `type`, which is indistinguishable from an untyped
+// parameter to a client that doesn't resolve `$ref` — that client then
+// falls back to sending the object as a JSON-encoded string.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[schemars(inline)]
 pub struct IntelligenceNodeParams {
     /// Optional stable node ID. If omitted, a new UUID is generated.
     pub id: Option<String>,
@@ -221,6 +241,8 @@ pub struct IntelligenceNodeParams {
     /// Main body/content of the node.
     pub body: String,
     /// Optional structured metadata.
+    #[serde(default)]
+    #[schemars(schema_with = "arbitrary_json_value_schema")]
     pub metadata: Option<serde_json::Value>,
     /// Optional project hash this node belongs to.
     pub project_hash: Option<String>,
