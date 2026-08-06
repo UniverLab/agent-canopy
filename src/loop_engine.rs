@@ -7851,6 +7851,7 @@ echo done
     #[tokio::test]
     async fn loop_engine_restart_recovery_runs_interrupted_queue_spec_first() {
         let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+        let data_dir = tempdir().unwrap();
         init_git_repo(dir.path());
         let initial_head = git_head(dir.path());
 
@@ -7907,7 +7908,7 @@ echo done
         .unwrap();
 
         // G2 boot reconcile.
-        assert_eq!(db.reconcile_orphaned_loops().unwrap(), 1);
+        assert_eq!(db.reconcile_orphaned_loops(data_dir.path()).unwrap(), 1);
         let lp_after_reconcile = db.get_loop(&loop_id).unwrap().unwrap();
         assert_eq!(lp_after_reconcile.status, LoopStatus::Paused);
         let interrupted_after_reconcile = db.get_loop_spec(&interrupted.id).unwrap().unwrap();

@@ -1501,7 +1501,35 @@ impl Database {
     /// picks a `pending` member), permanently orphaning it. `loop_continue`
     /// alone is enough to resume it (no `loop_pause` detour needed).
     /// Idempotent: a loop already `Paused` isn't touched by a later call.
-    pub fn reconcile_orphaned_loops(&self) -> Result<usize> {
+    ///
+    /// Daemon-lifecycle recovery only — **never** call this from anything
+    /// other than the daemon's own startup path. On 2026-08-03, `canopy
+    /// bridge`'s embedded stdio fallback (spawned when the reachability probe
+    /// to a live daemon lost a race under concurrent load) ran this via
+    /// `run_stdio_server`'s startup sequence: a short-lived helper process
+    /// declared a graph the *live* daemon owned "orphaned", SIGKILLed its
+    /// node's process group, `git stash`ed the workdir, and paused the graph
+    /// — four times, silently, before it was noticed. The doc comment above
+    /// only holds for the process that actually owns the daemon's lifecycle;
+    /// it is false for any other process that happens to open the same
+    /// database. `run_stdio_server` must never call this again. `data_dir`
+    /// is used for the ownership gate below, which is the second line of
+    /// defence against exactly that mistake, not a substitute for keeping
+    /// the caller list to one entry.
+    pub fn reconcile_orphaned_loops(&self, data_dir: &std::path::Path) -> Result<usize> {
+        // Ownership gate: if the on-disk pid file names a *live* process
+        // that isn't us, some other process owns the daemon lifecycle right
+        // now and this call has no business touching graph state — signal
+        // nothing, pause nothing, quarantine nothing. Belt and braces with
+        // keeping `run_stdio_server` from calling this at all: that removes
+        // the caller, this makes the function itself safe to call by
+        // mistake.
+        if let Some(pid) = crate::daemon::process::read_pid(data_dir) {
+            if pid != std::process::id() && crate::daemon::process::is_process_running(pid) {
+                return Ok(0);
+            }
+        }
+
         let conn = self
             .conn
             .lock()

@@ -1190,6 +1190,7 @@ fn loop_spec_start_head_persists_through_reread() {
 #[test]
 fn reconcile_orphaned_loops_pauses_running_loop_and_interrupts_its_run() {
     let db = test_db();
+    let data_dir = tempdir().unwrap();
     let mut lp = sample_loop("wf-orphan");
     lp.status = LoopStatus::Running;
     let mut spec = sample_loop_spec(&lp.id, "spec-orphan", 1);
@@ -1222,7 +1223,7 @@ fn reconcile_orphaned_loops_pauses_running_loop_and_interrupts_its_run() {
     db.set_loop_spec_start_head(&spec.id, Some("deadbeef"))
         .unwrap();
 
-    let reconciled = db.reconcile_orphaned_loops().unwrap();
+    let reconciled = db.reconcile_orphaned_loops(data_dir.path()).unwrap();
     assert_eq!(reconciled, 1);
 
     // Test 1: the loop is paused, and its dangling run is no longer `running`.
@@ -1257,6 +1258,7 @@ fn reconcile_orphaned_loops_pauses_running_loop_and_interrupts_its_run() {
 #[test]
 fn reconcile_orphaned_loops_resets_queue_member_spec_to_pending() {
     let db = test_db();
+    let data_dir = tempdir().unwrap();
     let mut lp = sample_loop("wf-orphan-queue");
     lp.status = LoopStatus::Running;
     lp.active_run_queue_id = Some("queue-1".to_string());
@@ -1293,7 +1295,7 @@ fn reconcile_orphaned_loops_resets_queue_member_spec_to_pending() {
     })
     .unwrap();
 
-    assert_eq!(db.reconcile_orphaned_loops().unwrap(), 1);
+    assert_eq!(db.reconcile_orphaned_loops(data_dir.path()).unwrap(), 1);
 
     let lp_after = db.get_loop(&lp.id).unwrap().unwrap();
     assert_eq!(lp_after.status, LoopStatus::Paused);
@@ -1364,6 +1366,7 @@ fn queue_stale_running_members_flags_only_the_member_with_no_live_run() {
 #[test]
 fn reconcile_orphaned_loops_is_idempotent() {
     let db = test_db();
+    let data_dir = tempdir().unwrap();
     let mut lp = sample_loop("wf-orphan-idempotent");
     lp.status = LoopStatus::Running;
     let mut spec = sample_loop_spec(&lp.id, "spec-orphan-idempotent", 1);
@@ -1390,14 +1393,14 @@ fn reconcile_orphaned_loops_is_idempotent() {
     db.insert_loop_node(&node).unwrap();
     db.insert_loop_run(&run).unwrap();
 
-    let first_pass = db.reconcile_orphaned_loops().unwrap();
+    let first_pass = db.reconcile_orphaned_loops(data_dir.path()).unwrap();
     assert_eq!(first_pass, 1);
     let lp_after_first = db.get_loop(&lp.id).unwrap().unwrap();
     let run_after_first = db.get_loop_run(&run.id).unwrap().unwrap();
 
     // Test 3: a second reconcile pass finds nothing left to reconcile, and
     // leaves the already-paused loop/run untouched.
-    let second_pass = db.reconcile_orphaned_loops().unwrap();
+    let second_pass = db.reconcile_orphaned_loops(data_dir.path()).unwrap();
     assert_eq!(second_pass, 0);
     let lp_after_second = db.get_loop(&lp.id).unwrap().unwrap();
     let run_after_second = db.get_loop_run(&run.id).unwrap().unwrap();
@@ -1420,6 +1423,7 @@ async fn reconcile_orphaned_loops_kills_survivor_pid_from_same_boot() {
     };
 
     let db = test_db();
+    let data_dir = tempdir().unwrap();
     let mut lp = sample_loop("wf-orphan-survivor");
     lp.status = LoopStatus::Running;
     let mut spec = sample_loop_spec(&lp.id, "spec-orphan-survivor", 1);
@@ -1462,7 +1466,7 @@ async fn reconcile_orphaned_loops_kills_survivor_pid_from_same_boot() {
     db.insert_loop_node(&node).unwrap();
     db.insert_loop_run(&run).unwrap();
 
-    assert_eq!(db.reconcile_orphaned_loops().unwrap(), 1);
+    assert_eq!(db.reconcile_orphaned_loops(data_dir.path()).unwrap(), 1);
 
     // The kill is fired via a detached task (see
     // `terminate_process_group_async`); poll briefly for the SIGTERM to
@@ -1489,6 +1493,7 @@ async fn reconcile_orphaned_loops_kills_survivor_pid_from_same_boot() {
 #[test]
 fn reconcile_orphaned_loops_skips_kill_for_mismatched_boot_id() {
     let db = test_db();
+    let data_dir = tempdir().unwrap();
     let mut lp = sample_loop("wf-orphan-stale-boot");
     lp.status = LoopStatus::Running;
     let mut spec = sample_loop_spec(&lp.id, "spec-orphan-stale-boot", 1);
@@ -1520,7 +1525,7 @@ fn reconcile_orphaned_loops_skips_kill_for_mismatched_boot_id() {
     // Must not panic or error even though pid 1 is a real (unkillable by
     // us) process — the boot_id mismatch must short-circuit before any
     // signal is ever attempted.
-    assert_eq!(db.reconcile_orphaned_loops().unwrap(), 1);
+    assert_eq!(db.reconcile_orphaned_loops(data_dir.path()).unwrap(), 1);
     let run_after = db.get_loop_run(&run.id).unwrap().unwrap();
     assert_ne!(run_after.status, LoopRunStatus::Running);
 }
@@ -1528,15 +1533,101 @@ fn reconcile_orphaned_loops_skips_kill_for_mismatched_boot_id() {
 #[test]
 fn reconcile_orphaned_loops_leaves_completed_loop_untouched() {
     let db = test_db();
+    let data_dir = tempdir().unwrap();
     let mut lp = sample_loop("wf-completed");
     lp.status = LoopStatus::Completed;
     db.insert_loop(&lp).unwrap();
 
     // Test 4: a `Completed` loop is not reconciled.
-    let reconciled = db.reconcile_orphaned_loops().unwrap();
+    let reconciled = db.reconcile_orphaned_loops(data_dir.path()).unwrap();
     assert_eq!(reconciled, 0);
     let lp_after = db.get_loop(&lp.id).unwrap().unwrap();
     assert_eq!(lp_after.status, LoopStatus::Completed);
+}
+
+/// The ownership gate (second line of defence, alongside never calling this
+/// from `run_stdio_server` at all — see the doc comment on
+/// `reconcile_orphaned_loops`): when the on-disk `daemon.pid` names a *live*
+/// process that isn't this one, some other process owns the daemon
+/// lifecycle right now, and this call must not touch graph state at all —
+/// no signal, no pause, no interrupted-run marking.
+#[tokio::test]
+async fn reconcile_orphaned_loops_skips_everything_when_foreign_daemon_pid_is_live() {
+    let Some(current_boot_id) = crate::system::boot_id() else {
+        return;
+    };
+
+    let data_dir = tempdir().unwrap();
+    // Stand in for "a live daemon other than us": a real, still-running
+    // process whose pid is guaranteed not to equal this test process's own.
+    let mut foreign_daemon = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn stand-in foreign daemon process");
+    std::fs::write(
+        data_dir.path().join("daemon.pid"),
+        foreign_daemon.id().to_string(),
+    )
+    .unwrap();
+
+    let db = test_db();
+    let mut lp = sample_loop("wf-foreign-daemon-owned");
+    lp.status = LoopStatus::Running;
+    let mut spec = sample_loop_spec(&lp.id, "spec-foreign-daemon-owned", 1);
+    spec.status = LoopSpecStatus::Running;
+    let node = sample_loop_node(&spec.id, "node-foreign-daemon-owned", 1);
+    // A pid/boot_id that WOULD be killed if the gate failed to short-circuit
+    // (same boot, matching the same-boot kill precondition tested elsewhere).
+    let run = LoopNodeRun {
+        id: "run-foreign-daemon-owned".to_string(),
+        loop_id: lp.id.clone(),
+        spec_id: spec.id.clone(),
+        node_id: node.id.clone(),
+        status: LoopRunStatus::Running,
+        input: None,
+        output: None,
+        started_at: Utc::now(),
+        completed_at: None,
+        iteration: 1,
+        pid: Some(foreign_daemon.id() as i64),
+        boot_id: Some(current_boot_id),
+        session_id: None,
+    };
+
+    db.insert_loop(&lp).unwrap();
+    db.insert_loop_spec(&spec).unwrap();
+    db.insert_loop_node(&node).unwrap();
+    db.insert_loop_run(&run).unwrap();
+
+    let reconciled = db.reconcile_orphaned_loops(data_dir.path()).unwrap();
+    assert_eq!(
+        reconciled, 0,
+        "must not report any loop reconciled while a foreign live daemon owns the pid file"
+    );
+
+    let lp_after = db.get_loop(&lp.id).unwrap().unwrap();
+    assert_eq!(
+        lp_after.status,
+        LoopStatus::Running,
+        "the graph must be left exactly as found, not paused"
+    );
+    let run_after = db.get_loop_run(&run.id).unwrap().unwrap();
+    assert_eq!(
+        run_after.status,
+        LoopRunStatus::Running,
+        "the run must not be reported as interrupted by a restart that never happened"
+    );
+
+    // The pid named in the "foreign daemon" run must never have been
+    // signaled — prove it's still alive rather than merely unreaped.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        foreign_daemon.try_wait().unwrap(),
+        None,
+        "the gate must never signal the pid it protects"
+    );
+    let _ = foreign_daemon.kill();
+    let _ = foreign_daemon.wait();
 }
 
 fn loop_with_trigger(id: &str, trigger: Option<Trigger>) -> Loop {
@@ -4361,6 +4452,7 @@ fn reconcile_orphaned_loops_quarantines_dirty_worktree_of_interrupted_run() {
     assert!(!git_is_clean(dir.path()));
 
     let db = test_db();
+    let data_dir = tempdir().unwrap();
     let mut lp = sample_loop("wf-orphan-quarantine-dirty");
     lp.status = LoopStatus::Running;
     lp.workdir = dir.path().to_string_lossy().to_string();
@@ -4389,7 +4481,7 @@ fn reconcile_orphaned_loops_quarantines_dirty_worktree_of_interrupted_run() {
     db.insert_loop_node(&node).unwrap();
     db.insert_loop_run(&run).unwrap();
 
-    assert_eq!(db.reconcile_orphaned_loops().unwrap(), 1);
+    assert_eq!(db.reconcile_orphaned_loops(data_dir.path()).unwrap(), 1);
 
     assert!(
         git_is_clean(dir.path()),
@@ -4415,6 +4507,7 @@ fn reconcile_orphaned_loops_leaves_clean_worktree_unstashed() {
     assert!(git_is_clean(dir.path()));
 
     let db = test_db();
+    let data_dir = tempdir().unwrap();
     let mut lp = sample_loop("wf-orphan-quarantine-clean");
     lp.status = LoopStatus::Running;
     lp.workdir = dir.path().to_string_lossy().to_string();
@@ -4443,7 +4536,7 @@ fn reconcile_orphaned_loops_leaves_clean_worktree_unstashed() {
     db.insert_loop_node(&node).unwrap();
     db.insert_loop_run(&run).unwrap();
 
-    assert_eq!(db.reconcile_orphaned_loops().unwrap(), 1);
+    assert_eq!(db.reconcile_orphaned_loops(data_dir.path()).unwrap(), 1);
 
     assert!(git_stash_list(dir.path()).is_empty(), "nothing to stash");
 
@@ -4466,6 +4559,7 @@ fn reconcile_orphaned_loops_skips_quarantine_when_spec_start_head_unestablished(
     std::fs::write(dir.path().join("truncated.rs"), "fn broken(").unwrap();
 
     let db = test_db();
+    let data_dir = tempdir().unwrap();
     let mut lp = sample_loop("wf-orphan-quarantine-no-head");
     lp.status = LoopStatus::Running;
     lp.workdir = dir.path().to_string_lossy().to_string();
@@ -4494,7 +4588,7 @@ fn reconcile_orphaned_loops_skips_quarantine_when_spec_start_head_unestablished(
     db.insert_loop_node(&node).unwrap();
     db.insert_loop_run(&run).unwrap();
 
-    assert_eq!(db.reconcile_orphaned_loops().unwrap(), 1);
+    assert_eq!(db.reconcile_orphaned_loops(data_dir.path()).unwrap(), 1);
 
     assert!(
         !git_is_clean(dir.path()),
@@ -4515,6 +4609,7 @@ fn reconcile_orphaned_loops_quarantine_is_idempotent_across_two_passes() {
     std::fs::write(dir.path().join("truncated.rs"), "fn broken(").unwrap();
 
     let db = test_db();
+    let data_dir = tempdir().unwrap();
     let mut lp = sample_loop("wf-orphan-quarantine-idempotent");
     lp.status = LoopStatus::Running;
     lp.workdir = dir.path().to_string_lossy().to_string();
@@ -4543,13 +4638,13 @@ fn reconcile_orphaned_loops_quarantine_is_idempotent_across_two_passes() {
     db.insert_loop_node(&node).unwrap();
     db.insert_loop_run(&run).unwrap();
 
-    assert_eq!(db.reconcile_orphaned_loops().unwrap(), 1);
+    assert_eq!(db.reconcile_orphaned_loops(data_dir.path()).unwrap(), 1);
     let stash_after_first = git_stash_list(dir.path());
     assert_eq!(stash_after_first.lines().count(), 1);
 
     // Second pass: the loop is already `Paused`, so it's not even a
     // candidate — nothing should be stashed again.
-    assert_eq!(db.reconcile_orphaned_loops().unwrap(), 0);
+    assert_eq!(db.reconcile_orphaned_loops(data_dir.path()).unwrap(), 0);
     let stash_after_second = git_stash_list(dir.path());
     assert_eq!(
         stash_after_first, stash_after_second,
