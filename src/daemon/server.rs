@@ -175,7 +175,7 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
     scheduler_cancel.cancel();
     health_routine_cancel.cancel();
     watcher_engine.stop_all().await;
-    terminate_owned_running_node_processes(&db).await;
+    terminate_all_running_node_processes_at_shutdown(&db).await;
     remove_pid_file(&data_dir);
     crate::domain::notification::clear_notifications_on_exit();
     tracing::info!("Daemon stopped");
@@ -207,16 +207,24 @@ async fn log_mcp_error_responses(
     response
 }
 
-/// Terminate every loop node run's process this boot still owns (B12), so a
-/// graceful shutdown never leaves a `mimo run`/check process behind the way
-/// an abandoned timeout used to. `SIGTERM`s every owned process up front,
-/// waits out a single shared grace period, then `SIGKILL`s survivors —
-/// awaited inline (unlike the detached `terminate_process_group_async` used
-/// elsewhere) because the daemon process is about to exit, so a detached
-/// grace-kill task would never get to fire, and a *sequential*
-/// terminate-and-wait per process would multiply the shutdown delay by the
-/// number of processes instead of bounding it by one grace period total.
-async fn terminate_owned_running_node_processes(db: &Database) {
+/// Terminate every loop node run's process on the machine (B12), so a
+/// graceful daemon shutdown never leaves a `mimo run`/check process behind
+/// the way an abandoned timeout used to. Correct only because it is called
+/// exactly once, at daemon shutdown, from the sole process that ever holds
+/// the daemon lock (`acquire_daemon_lock` in [`run_http_server`]) — at that
+/// point every `Running` node run in the database genuinely is this
+/// process's own, so scanning all of them needs no ownership filter. Any
+/// caller without that guarantee (a bridge, an embedded stdio server, a CLI
+/// subcommand) must never call this; see the module-level invariant that
+/// only the daemon lifecycle process may act on graphs globally.
+/// `SIGTERM`s every process up front, waits out a single shared grace
+/// period, then `SIGKILL`s survivors — awaited inline (unlike the detached
+/// `terminate_process_group_async` used elsewhere) because the daemon
+/// process is about to exit, so a detached grace-kill task would never get
+/// to fire, and a *sequential* terminate-and-wait per process would
+/// multiply the shutdown delay by the number of processes instead of
+/// bounding it by one grace period total.
+async fn terminate_all_running_node_processes_at_shutdown(db: &Database) {
     let Ok(runs) = db.list_all_running_loop_runs() else {
         return;
     };
@@ -1327,8 +1335,13 @@ mod stdio_startup_reconciliation_tests {
     /// git worktree — exactly the shape `reconcile_orphaned_loops` (called
     /// from a real daemon boot) would pause, interrupt, and quarantine via
     /// `git stash`. Returns the loop id, run id, and the workdir (kept alive
-    /// for the caller via the returned `TempDir`).
-    fn seed_running_loop_with_dirty_worktree(db: &Database) -> (String, String, tempfile::TempDir) {
+    /// for the caller via the returned `TempDir`). `suffix` distinguishes
+    /// multiple graphs seeded into the same database (each gets its own
+    /// tempdir workdir, so two calls never collide on ids or worktree).
+    fn seed_running_loop_with_dirty_worktree(
+        db: &Database,
+        suffix: &str,
+    ) -> (String, String, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         init_git_repo(dir.path());
         let head = git_head(dir.path());
@@ -1336,8 +1349,8 @@ mod stdio_startup_reconciliation_tests {
 
         let lp = Loop {
             archived: false,
-            id: "wf-stdio-startup".to_string(),
-            name: "Stdio startup test loop".to_string(),
+            id: format!("wf-stdio-startup-{suffix}"),
+            name: format!("Stdio startup test loop {suffix}"),
             description: None,
             workdir: dir.path().to_string_lossy().to_string(),
             status: LoopStatus::Running,
@@ -1352,7 +1365,7 @@ mod stdio_startup_reconciliation_tests {
             on_completed: None,
         };
         let spec = LoopSpec {
-            id: "spec-stdio-startup".to_string(),
+            id: format!("spec-stdio-startup-{suffix}"),
             loop_id: Some(lp.id.clone()),
             name: "Spec".to_string(),
             description: None,
@@ -1368,7 +1381,7 @@ mod stdio_startup_reconciliation_tests {
             completed_via_at: None,
         };
         let node = LoopNode {
-            id: "node-stdio-startup".to_string(),
+            id: format!("node-stdio-startup-{suffix}"),
             spec_id: Some(spec.id.clone()),
             loop_id: None,
             name: "Node".to_string(),
@@ -1378,7 +1391,7 @@ mod stdio_startup_reconciliation_tests {
             created_at: chrono::Utc::now(),
         };
         let run = LoopNodeRun {
-            id: "run-stdio-startup".to_string(),
+            id: format!("run-stdio-startup-{suffix}"),
             loop_id: lp.id.clone(),
             spec_id: spec.id.clone(),
             node_id: node.id.clone(),
@@ -1410,7 +1423,7 @@ mod stdio_startup_reconciliation_tests {
     #[tokio::test]
     async fn stdio_startup_never_reconciles_running_graph() {
         let db = Arc::new(test_db());
-        let (loop_id, run_id, dir) = seed_running_loop_with_dirty_worktree(&db);
+        let (loop_id, run_id, dir) = seed_running_loop_with_dirty_worktree(&db, "solo");
         let data_dir = tempdir().unwrap();
 
         let _startup = stdio_server_startup(Arc::clone(&db), data_dir.path()).await;
@@ -1431,5 +1444,40 @@ mod stdio_startup_reconciliation_tests {
             git_stash_list(dir.path()).is_empty(),
             "stdio startup must not quarantine the worktree"
         );
+    }
+
+    /// Concurrency invariant, not just the single-graph regression above:
+    /// two graphs in two different workdirs are both `Running` when a third
+    /// process (a `canopy bridge` embedded-stdio fallback) runs the stdio
+    /// server's startup path. Neither graph's status, run, or worktree may
+    /// be touched — graph B's presence must not change what happens to
+    /// graph A, and vice versa.
+    #[tokio::test]
+    async fn stdio_startup_leaves_two_concurrent_graphs_in_different_workdirs_untouched() {
+        let db = Arc::new(test_db());
+        let (loop_a, run_a, dir_a) = seed_running_loop_with_dirty_worktree(&db, "a");
+        let (loop_b, run_b, dir_b) = seed_running_loop_with_dirty_worktree(&db, "b");
+        let data_dir = tempdir().unwrap();
+
+        let _startup = stdio_server_startup(Arc::clone(&db), data_dir.path()).await;
+
+        for (loop_id, run_id, dir) in [(&loop_a, &run_a, &dir_a), (&loop_b, &run_b, &dir_b)] {
+            let lp_after = db.get_loop(loop_id).unwrap().unwrap();
+            assert_eq!(
+                lp_after.status,
+                LoopStatus::Running,
+                "stdio startup must not pause graph '{loop_id}' just because another graph is also live"
+            );
+            let run_after = db.get_loop_run(run_id).unwrap().unwrap();
+            assert_eq!(
+                run_after.status,
+                LoopRunStatus::Running,
+                "stdio startup must not mark graph '{loop_id}''s run interrupted"
+            );
+            assert!(
+                git_stash_list(dir.path()).is_empty(),
+                "stdio startup must not quarantine graph '{loop_id}''s worktree"
+            );
+        }
     }
 }

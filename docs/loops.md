@@ -186,6 +186,22 @@ auto-resumes (useful for quota-limited loops that fail and need to
 wait before retrying). Call it again with `at` omitted to cancel a
 pending schedule.
 
+## Concurrency
+
+Running many loops at once, against different working directories, is
+a supported capability — not an accident of the implementation. Start,
+run, pause, resume, or finish one loop, and no other loop's status,
+specs, node runs, or worktree are affected. There is no cap on how
+many loops can run concurrently, and nothing needs to be configured to
+enable it: it is the default behavior of the daemon.
+
+The one boundary: **two loops must not share a workdir.** Two loops
+racing to commit, check out, or edit files in the same working tree
+will fight over it — the engine does nothing to make that safe, and
+doing so is deliberately out of scope. Point concurrent loops at
+different working directories (or at worktrees of the same repo) and
+they run independently with no coordination required from you.
+
 ## `on_completed` hook
 
 A loop can carry one optional `on_completed` hook: an agent-node-style

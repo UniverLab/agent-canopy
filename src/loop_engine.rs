@@ -12245,4 +12245,396 @@ echo done
             );
         }
     }
+
+    /// Concurrency invariant: starting, pausing, resuming, and finishing one
+    /// graph must never change any observable state of another graph in a
+    /// different workdir sharing the same database. Graph A is seeded
+    /// mid-run and never driven again — its persisted rows are the baseline.
+    /// Graph B is driven through a full, real start → pause → resume →
+    /// finish cycle via the same `LoopEngine` a shared daemon would use, and
+    /// graph A's loop/spec/run rows must be byte-identical (via their
+    /// serialized JSON) before and after.
+    #[tokio::test]
+    async fn graph_b_full_lifecycle_never_touches_graph_a_in_a_different_workdir() {
+        let db_dir = tempdir().unwrap();
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let db = Arc::new(Database::new(&db_dir.path().join("shared.db")).unwrap());
+
+        // Graph A: seeded as mid-run and left alone for the rest of the test.
+        let loop_a = crate::domain::loops::Loop {
+            archived: false,
+            id: "wf-graph-a".to_string(),
+            name: "Graph A".to_string(),
+            description: None,
+            workdir: dir_a.path().to_string_lossy().to_string(),
+            status: LoopStatus::Running,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: Some(chrono::Utc::now()),
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        };
+        let spec_a = LoopSpec {
+            id: "spec-graph-a".to_string(),
+            loop_id: Some(loop_a.id.clone()),
+            name: "Spec A".to_string(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Running,
+            started_at: Some(chrono::Utc::now()),
+            completed_at: None,
+            spec_start_head: Some("deadbeef".to_string()),
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        let node_a = LoopNode {
+            id: "node-graph-a".to_string(),
+            spec_id: Some(spec_a.id.clone()),
+            loop_id: None,
+            name: "Node A".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "true", "success_condition": "exit_code_0"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+        let run_a = LoopNodeRun {
+            id: "run-graph-a".to_string(),
+            loop_id: loop_a.id.clone(),
+            spec_id: spec_a.id.clone(),
+            node_id: node_a.id.clone(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        };
+        db.insert_loop(&loop_a).unwrap();
+        db.insert_loop_spec(&spec_a).unwrap();
+        db.insert_loop_node(&node_a).unwrap();
+        db.insert_loop_run(&run_a).unwrap();
+
+        let snapshot = |db: &Database| {
+            (
+                serde_json::to_value(db.get_loop(&loop_a.id).unwrap().unwrap()).unwrap(),
+                serde_json::to_value(db.get_loop_spec(&spec_a.id).unwrap().unwrap()).unwrap(),
+                serde_json::to_value(db.get_loop_run(&run_a.id).unwrap().unwrap()).unwrap(),
+            )
+        };
+        let snapshot_before = snapshot(&db);
+
+        // Graph B: a real loop in a different workdir, driven through its
+        // full lifecycle by the engine.
+        let loop_b = crate::domain::loops::Loop {
+            archived: false,
+            id: "wf-graph-b".to_string(),
+            name: "Graph B".to_string(),
+            description: None,
+            workdir: dir_b.path().to_string_lossy().to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        };
+        let spec_b = LoopSpec {
+            id: "spec-graph-b".to_string(),
+            loop_id: Some(loop_b.id.clone()),
+            name: "Spec B".to_string(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        db.insert_loop(&loop_b).unwrap();
+        db.insert_loop_spec(&spec_b).unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-graph-b".to_string(),
+            spec_id: Some(spec_b.id.clone()),
+            loop_id: None,
+            name: "Node B".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "sleep 0.3 && true",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let engine = Arc::new(LoopEngine::new(
+            Arc::clone(&db),
+            Arc::new(DefaultNotificationService),
+        ));
+
+        // Start graph B in the background.
+        let dispatch_engine = Arc::clone(&engine);
+        let loop_b_id = loop_b.id.clone();
+        let dispatch =
+            tokio::spawn(async move { dispatch_engine.run_loop(loop_b_id, None, None).await });
+
+        // Poll (never a fixed sleep) until graph B's node run is actually
+        // recorded `Running` before pausing it, to avoid a flaky race
+        // against process spawn.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if !db
+                .list_running_loop_runs(&loop_b.id)
+                .unwrap_or_default()
+                .is_empty()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "graph B's node run never started"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // A snapshot mid-run of graph B confirms graph A is unaffected by
+        // graph B's mere presence as `Running`, not just by its start/end.
+        assert_eq!(
+            snapshot(&db),
+            snapshot_before,
+            "graph A must be untouched while graph B is starting"
+        );
+
+        // Pause graph B.
+        assert!(engine.request_pause(&loop_b.id).unwrap());
+        dispatch.await.unwrap().unwrap();
+        assert_eq!(
+            db.get_loop(&loop_b.id).unwrap().unwrap().status,
+            LoopStatus::Paused,
+            "graph B must actually have paused for this test to be meaningful"
+        );
+        assert_eq!(
+            snapshot(&db),
+            snapshot_before,
+            "graph A must be untouched by graph B pausing"
+        );
+
+        // Resume graph B — relaunching a paused loop directly is a
+        // supported, documented entry point of `run_loop`.
+        engine
+            .run_loop(loop_b.id.clone(), None, None)
+            .await
+            .unwrap();
+
+        let loop_b_after = db.get_loop(&loop_b.id).unwrap().unwrap();
+        assert_eq!(
+            loop_b_after.status,
+            LoopStatus::Completed,
+            "graph B must have finished its lifecycle for this test to be meaningful"
+        );
+
+        assert_eq!(
+            snapshot(&db),
+            snapshot_before,
+            "graph A's persisted state must be byte-identical after graph B's full \
+             start/pause/resume/finish lifecycle"
+        );
+    }
+
+    /// A graph's node run must never be signalled by a process that did not
+    /// launch it (no pid, no boot id recorded here — the shape a crashed
+    /// prior boot leaves behind). Pausing graph B — whose own running node
+    /// carries a real pid — must leave graph A's running node run row
+    /// completely untouched, even though both rows describe a `Running`
+    /// node run at the same instant. Asserted on the persisted run row
+    /// (not the daemon log), per the invariant that the 2026-08-03 incident
+    /// was invisible in the daemon's own log.
+    #[tokio::test]
+    async fn pausing_graph_b_never_signals_or_mutates_graph_a_run() {
+        let db_dir = tempdir().unwrap();
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let db = Arc::new(Database::new(&db_dir.path().join("shared.db")).unwrap());
+
+        let loop_a = crate::domain::loops::Loop {
+            archived: false,
+            id: "wf-signal-a".to_string(),
+            name: "Graph A".to_string(),
+            description: None,
+            workdir: dir_a.path().to_string_lossy().to_string(),
+            status: LoopStatus::Running,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: Some(chrono::Utc::now()),
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        };
+        let spec_a = LoopSpec {
+            id: "spec-signal-a".to_string(),
+            loop_id: Some(loop_a.id.clone()),
+            name: "Spec A".to_string(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Running,
+            started_at: Some(chrono::Utc::now()),
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        let node_a = LoopNode {
+            id: "node-signal-a".to_string(),
+            spec_id: Some(spec_a.id.clone()),
+            loop_id: None,
+            name: "Node A".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "true", "success_condition": "exit_code_0"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+        // A "running" node run with no pid of its own — never a process this
+        // test spawns, so any attempt to signal it would be a no-op at best
+        // and a wrong-process kill at worst; the assertion below is on the
+        // row, not on process survival.
+        let run_a = LoopNodeRun {
+            id: "run-signal-a".to_string(),
+            loop_id: loop_a.id.clone(),
+            spec_id: spec_a.id.clone(),
+            node_id: node_a.id.clone(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        };
+        db.insert_loop(&loop_a).unwrap();
+        db.insert_loop_spec(&spec_a).unwrap();
+        db.insert_loop_node(&node_a).unwrap();
+        db.insert_loop_run(&run_a).unwrap();
+        let run_a_before =
+            serde_json::to_value(db.get_loop_run(&run_a.id).unwrap().unwrap()).unwrap();
+
+        let loop_b = crate::domain::loops::Loop {
+            archived: false,
+            id: "wf-signal-b".to_string(),
+            name: "Graph B".to_string(),
+            description: None,
+            workdir: dir_b.path().to_string_lossy().to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        };
+        let spec_b = LoopSpec {
+            id: "spec-signal-b".to_string(),
+            loop_id: Some(loop_b.id.clone()),
+            name: "Spec B".to_string(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        db.insert_loop(&loop_b).unwrap();
+        db.insert_loop_spec(&spec_b).unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-signal-b".to_string(),
+            spec_id: Some(spec_b.id.clone()),
+            loop_id: None,
+            name: "Node B".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "sleep 0.3 && true",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let engine = Arc::new(LoopEngine::new(
+            Arc::clone(&db),
+            Arc::new(DefaultNotificationService),
+        ));
+        let dispatch_engine = Arc::clone(&engine);
+        let loop_b_id = loop_b.id.clone();
+        let dispatch =
+            tokio::spawn(async move { dispatch_engine.run_loop(loop_b_id, None, None).await });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if !db
+                .list_running_loop_runs(&loop_b.id)
+                .unwrap_or_default()
+                .is_empty()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "graph B's node run never started"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert!(engine.request_pause(&loop_b.id).unwrap());
+        dispatch.await.unwrap().unwrap();
+
+        let b_runs = db.list_loop_runs_for_spec(&spec_b.id).unwrap();
+        assert_eq!(
+            b_runs.len(),
+            1,
+            "graph B's node must have been signalled and finalized"
+        );
+        assert_eq!(b_runs[0].status, LoopRunStatus::Fail);
+
+        let run_a_after =
+            serde_json::to_value(db.get_loop_run(&run_a.id).unwrap().unwrap()).unwrap();
+        assert_eq!(
+            run_a_after, run_a_before,
+            "graph A's node run must never be signalled or mutated by graph B's pause"
+        );
+    }
 }
