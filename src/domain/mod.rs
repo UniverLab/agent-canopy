@@ -20,6 +20,7 @@ pub mod project;
 pub mod prompts;
 pub mod queues;
 pub mod quota_reset;
+pub mod registry_baseline;
 pub mod seeds;
 pub mod sync;
 pub mod usage_stats;
