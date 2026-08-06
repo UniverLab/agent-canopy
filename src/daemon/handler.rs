@@ -1177,6 +1177,54 @@ fn loop_run_status_guard(loop_id: &str, status: LoopStatus) -> Result<(), String
     }
 }
 
+/// Ground truth for "is this loop actually busy right now": any `loop_runs`
+/// row still `running` under it, regardless of what the loop's own `status`
+/// column says. Status and a run's lifetime are independent — a sibling
+/// node's `loop_report_blocker` can flip status to `paused` while a
+/// different node under the same loop keeps executing — so `loop_run` and
+/// [`Database::reset_loop`] both consult this (the latter internally, since
+/// the scheduler's autorun also calls it directly) instead of trusting
+/// status alone. One indexed query (`idx_loop_runs_loop_started`) at
+/// dispatch time.
+///
+/// Returns the first still-`running` row found — an actionable pointer for a
+/// human operator (wait or kill), not an exhaustive list.
+fn find_in_flight_run(db: &Database, loop_id: &str) -> Result<Option<LoopNodeRun>, String> {
+    Ok(db
+        .list_running_loop_runs(loop_id)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .next())
+}
+
+/// The actionable refusal text for a `loop_run`/`loop_reset` call blocked by
+/// [`find_in_flight_run`] (or [`Database::reset_loop`]'s own equivalent
+/// check): names the node and run still executing, and since when, because
+/// the caller's next decision is to wait for it or terminate it.
+fn in_flight_run_error(
+    loop_id: &str,
+    run_id: &str,
+    node_name: &str,
+    started_at: chrono::DateTime<chrono::Utc>,
+) -> String {
+    format!(
+        "Loop '{loop_id}' has node '{node_name}' (run '{run_id}') still executing, running \
+         since {} — wait for it to finish, or terminate it, before retrying.",
+        started_at.to_rfc3339()
+    )
+}
+
+/// `node_id`'s display name, falling back to the raw id if the node row is
+/// somehow gone (e.g. deleted out from under a still-running attempt) — used
+/// to build [`in_flight_run_error`]'s message from a bare `LoopNodeRun`.
+fn node_name_for_error(db: &Database, node_id: &str) -> Result<String, String> {
+    Ok(db
+        .get_loop_node(node_id)
+        .map_err(|e| e.to_string())?
+        .map(|node| node.name)
+        .unwrap_or_else(|| node_id.to_string()))
+}
+
 /// Validate every ensemble (F1) reachable by a `loop_run` call — the loop's
 /// own top-level graph, plus the own graph of every spec that could actually
 /// run (the loop's bound specs, and a queue's members when `queue_id` is
@@ -1247,9 +1295,14 @@ fn perform_loop_reset(
         LoopResetOutcome::NotFound => {
             return Ok(error_result(&format!("Loop '{loop_id}' not found.")));
         }
-        LoopResetOutcome::Running => {
-            return Ok(error_result(&format!(
-                "Loop '{loop_id}' is running; call loop_pause first, then loop_reset."
+        LoopResetOutcome::InFlight {
+            run_id,
+            node_id,
+            started_at,
+        } => {
+            let node_name = node_name_for_error(db, &node_id).map_err(internal_error)?;
+            return Ok(error_result(&in_flight_run_error(
+                loop_id, &run_id, &node_name, started_at,
             )));
         }
         LoopResetOutcome::InvalidSpec(id) => {
@@ -5628,6 +5681,22 @@ impl TaskTriggerHandler {
             return Ok(error_result(&message));
         }
 
+        // A dispatch is refused while any run of this loop is still
+        // `running`, whatever the loop's own status says — see
+        // `find_in_flight_run`. This is what a `paused`-but-still-executing
+        // loop (a sibling node's blocker report flipped status without
+        // terminating this run) must hit instead of launching a second,
+        // racing dispatch.
+        if let Some(run) = find_in_flight_run(&self.db, &params.loop_id).map_err(internal_error)? {
+            let node_name = node_name_for_error(&self.db, &run.node_id).map_err(internal_error)?;
+            return Ok(error_result(&in_flight_run_error(
+                &params.loop_id,
+                &run.id,
+                &node_name,
+                run.started_at,
+            )));
+        }
+
         let queue_id = params
             .queue_id
             .as_deref()
@@ -7174,20 +7243,20 @@ mod tests {
         build_ensemble_unit, build_get_tools_response, build_id_result, build_json_result,
         build_loop_completion_hook, build_loop_trigger, build_loop_update_response,
         build_node_update_response, build_spec_update_response, effective_member_prompt,
-        handle_retry_current_node, handle_skip_next_spec, header_str, json_value_kind_name,
-        loop_details_json, loop_run_status_guard, loop_trigger_json, member_node_config,
-        missing_sync_identity_error, node_copy_note, perform_loop_reset, plan_ensemble_copy,
-        plan_node_copy, rag_result_json, resolve_graph_target, resolve_node_kind_and_config,
-        resolve_reported_run, spec_summary_json, unknown_config_keys, validate_absolute_dir,
-        validate_at_least_one_bool, validate_blueprint_exists, validate_edge_condition,
-        validate_edge_condition_with_route, validate_ensemble_members, validate_node_config,
-        validate_node_kind, validate_node_not_ensemble_owned, validate_non_empty,
-        validate_not_join_kind, validate_queue_exists, validate_queue_member_removable,
-        validate_queue_not_consumed, validate_queue_reorder, validate_queue_reorder_locking,
-        validate_route_edge_target, validate_spec_deletable, validate_spec_exists,
-        validate_spec_set_status_target, validate_spec_status, validate_spec_workdir,
-        BuiltEnsembleUnit, EnsembleMemberParams, EnsembleUnitSpec, TaskTriggerHandler,
-        MISSING_SYNC_IDENTITY_MESSAGE,
+        find_in_flight_run, handle_retry_current_node, handle_skip_next_spec, header_str,
+        in_flight_run_error, json_value_kind_name, loop_details_json, loop_run_status_guard,
+        loop_trigger_json, member_node_config, missing_sync_identity_error, node_copy_note,
+        node_name_for_error, perform_loop_reset, plan_ensemble_copy, plan_node_copy,
+        rag_result_json, resolve_graph_target, resolve_node_kind_and_config, resolve_reported_run,
+        spec_summary_json, unknown_config_keys, validate_absolute_dir, validate_at_least_one_bool,
+        validate_blueprint_exists, validate_edge_condition, validate_edge_condition_with_route,
+        validate_ensemble_members, validate_node_config, validate_node_kind,
+        validate_node_not_ensemble_owned, validate_non_empty, validate_not_join_kind,
+        validate_queue_exists, validate_queue_member_removable, validate_queue_not_consumed,
+        validate_queue_reorder, validate_queue_reorder_locking, validate_route_edge_target,
+        validate_spec_deletable, validate_spec_exists, validate_spec_set_status_target,
+        validate_spec_status, validate_spec_workdir, BuiltEnsembleUnit, EnsembleMemberParams,
+        EnsembleUnitSpec, TaskTriggerHandler, MISSING_SYNC_IDENTITY_MESSAGE,
     };
     use crate::daemon::params::{
         LoopCompletionHookParams, LoopCopyEnsembleParams, LoopCopyNodeParams,
@@ -7739,18 +7808,83 @@ mod tests {
         assert_eq!(pending.status, LoopSpecStatus::Pending);
     }
 
+    /// A `Running`-status loop with no actual in-flight run is now
+    /// resettable — the old status-only guard would have refused this
+    /// (status alone said "running"), but the ground truth is the
+    /// `loop_runs` table, and here it has nothing running under this loop.
+    /// This is the intended flip side of
+    /// `loop_reset_rejects_loop_with_in_flight_run_even_when_status_is_paused`:
+    /// status and a run's lifetime are independent in both directions.
     #[test]
-    fn loop_reset_rejects_running_loop_with_actionable_error() {
+    fn loop_reset_allows_running_status_loop_with_no_in_flight_run() {
         let (_dir, db, loop_id) = loop_reset_fixture(LoopStatus::Running);
+
+        let result = perform_loop_reset(&db, &loop_id, None).unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Draft);
+    }
+
+    /// The ground truth is the `loop_runs` table, not `lp.status` — a loop
+    /// left `paused` by a sibling node's blocker report while a *different*
+    /// node keeps executing must still refuse the reset, naming the node and
+    /// run still in flight so the caller can wait or kill it deliberately
+    /// (the 2026-08-05 incident this guards against: a reset silently killed
+    /// and reset the still-running node's spec, and its late completion
+    /// routed an edge and failed the loop out from under the fresh dispatch
+    /// the reset then launched).
+    #[test]
+    fn loop_reset_rejects_loop_with_in_flight_run_even_when_status_is_paused() {
+        let (_dir, db, loop_id) = loop_reset_fixture(LoopStatus::Paused);
+        db.insert_loop_spec(&spec_with_status(
+            &loop_id,
+            "spec-a",
+            1,
+            LoopSpecStatus::Running,
+        ))
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-resilience".to_string(),
+            spec_id: Some("spec-a".to_string()),
+            loop_id: None,
+            name: "resilience".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "sleep 30"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_run(&LoopNodeRun {
+            id: "run-live".to_string(),
+            loop_id: loop_id.clone(),
+            spec_id: "spec-a".to_string(),
+            node_id: "node-resilience".to_string(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        })
+        .unwrap();
 
         let result = perform_loop_reset(&db, &loop_id, None).unwrap();
         assert!(result.is_error.unwrap_or(false));
         let text = format!("{:?}", result.content);
-        assert!(text.contains("loop_pause"), "{text}");
+        assert!(text.contains("resilience"), "{text}");
+        assert!(text.contains("run-live"), "{text}");
 
-        // Status untouched.
+        // Nothing touched: status, spec, and the run row all untouched.
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
-        assert_eq!(lp.status, LoopStatus::Running);
+        assert_eq!(lp.status, LoopStatus::Paused);
+        let spec = db.get_loop_spec("spec-a").unwrap().unwrap();
+        assert_eq!(spec.status, LoopSpecStatus::Running);
+        let run = db.get_loop_run("run-live").unwrap().unwrap();
+        assert_eq!(run.status, LoopRunStatus::Running);
     }
 
     #[test]
@@ -7791,6 +7925,68 @@ mod tests {
     fn loop_run_status_guard_accepts_draft_and_paused_loops() {
         assert!(loop_run_status_guard("loop-1", LoopStatus::Draft).is_ok());
         assert!(loop_run_status_guard("loop-1", LoopStatus::Paused).is_ok());
+    }
+
+    // ── find_in_flight_run: loop_run's dispatch guard ────────────────────
+
+    #[test]
+    fn find_in_flight_run_none_when_nothing_running() {
+        let (_dir, db, loop_id) = loop_reset_fixture(LoopStatus::Paused);
+        assert!(find_in_flight_run(&db, &loop_id).unwrap().is_none());
+    }
+
+    /// `loop_run` must refuse a duplicate dispatch while a node executes,
+    /// regardless of the loop's own status — a `paused` loop can still have
+    /// a live run when a sibling node's blocker report flipped status
+    /// without terminating it (see `loop_reset_rejects_loop_with_in_flight_run_even_when_status_is_paused`
+    /// for the same ground truth on the reset side).
+    #[test]
+    fn find_in_flight_run_finds_running_row_regardless_of_loop_status() {
+        let (_dir, db, loop_id) = loop_reset_fixture(LoopStatus::Paused);
+        db.insert_loop_spec(&spec_with_status(
+            &loop_id,
+            "spec-a",
+            1,
+            LoopSpecStatus::Running,
+        ))
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-resilience".to_string(),
+            spec_id: Some("spec-a".to_string()),
+            loop_id: None,
+            name: "resilience".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "sleep 30"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_run(&LoopNodeRun {
+            id: "run-live".to_string(),
+            loop_id: loop_id.clone(),
+            spec_id: "spec-a".to_string(),
+            node_id: "node-resilience".to_string(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        })
+        .unwrap();
+
+        let run = find_in_flight_run(&db, &loop_id)
+            .unwrap()
+            .expect("the still-running row must be found even though status is paused");
+        assert_eq!(run.id, "run-live");
+
+        let node_name = node_name_for_error(&db, &run.node_id).unwrap();
+        let message = in_flight_run_error(&loop_id, &run.id, &node_name, run.started_at);
+        assert!(message.contains("resilience"), "{message}");
+        assert!(message.contains("run-live"), "{message}");
     }
 
     #[test]

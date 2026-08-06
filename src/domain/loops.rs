@@ -144,9 +144,16 @@ impl LoopStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoopResetOutcome {
     NotFound,
-    /// A `running` loop must be paused first — resetting underneath a live
-    /// run would corrupt its in-flight state.
-    Running,
+    /// A node run is still `running` under this loop, regardless of what the
+    /// loop's own `status` column says — resetting underneath it would
+    /// corrupt its in-flight state (or race a stale completion against the
+    /// dispatch the reset launches). Named so the caller's next move is an
+    /// informed wait or a deliberate kill, not a blind retry.
+    InFlight {
+        run_id: String,
+        node_id: String,
+        started_at: DateTime<Utc>,
+    },
     /// One of the explicitly requested `specs` doesn't belong to this loop.
     InvalidSpec(String),
     Reset {
@@ -2034,9 +2041,25 @@ In Scope:
     }
 
     #[test]
-    fn loop_reset_outcome_running() {
-        let a = LoopResetOutcome::Running;
-        assert!(matches!(a, LoopResetOutcome::Running));
+    fn loop_reset_outcome_in_flight_carries_run_info() {
+        let started_at = chrono::Utc::now();
+        let a = LoopResetOutcome::InFlight {
+            run_id: "run-1".to_string(),
+            node_id: "node-1".to_string(),
+            started_at,
+        };
+        match a {
+            LoopResetOutcome::InFlight {
+                run_id,
+                node_id,
+                started_at: at,
+            } => {
+                assert_eq!(run_id, "run-1");
+                assert_eq!(node_id, "node-1");
+                assert_eq!(at, started_at);
+            }
+            _ => panic!("expected InFlight"),
+        }
     }
 
     #[test]
@@ -2060,10 +2083,14 @@ In Scope:
     #[test]
     fn loop_reset_outcome_variants_are_distinct() {
         let not_found = LoopResetOutcome::NotFound;
-        let running = LoopResetOutcome::Running;
+        let in_flight = LoopResetOutcome::InFlight {
+            run_id: "run-1".to_string(),
+            node_id: "node-1".to_string(),
+            started_at: chrono::Utc::now(),
+        };
         let invalid = LoopResetOutcome::InvalidSpec("x".to_string());
         let reset = LoopResetOutcome::Reset { spec_count: 0 };
-        assert_ne!(format!("{not_found:?}"), format!("{running:?}"));
+        assert_ne!(format!("{not_found:?}"), format!("{in_flight:?}"));
         assert_ne!(format!("{invalid:?}"), format!("{reset:?}"));
     }
 
@@ -2662,7 +2689,11 @@ In Scope:
     fn loop_reset_outcome_is_clone() {
         let outcomes = [
             LoopResetOutcome::NotFound,
-            LoopResetOutcome::Running,
+            LoopResetOutcome::InFlight {
+                run_id: "run-1".to_string(),
+                node_id: "node-1".to_string(),
+                started_at: chrono::Utc::now(),
+            },
             LoopResetOutcome::InvalidSpec("x".to_string()),
             LoopResetOutcome::Reset { spec_count: 3 },
         ];

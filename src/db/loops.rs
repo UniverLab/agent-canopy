@@ -547,8 +547,23 @@ impl Database {
             return Ok(LoopResetOutcome::NotFound);
         };
 
-        if lp.status == LoopStatus::Running {
-            return Ok(LoopResetOutcome::Running);
+        // Ground truth for "is this loop actually busy right now" is the
+        // `loop_runs` table, not `lp.status` — a sibling node's
+        // `loop_report_blocker` can flip status to `paused` while a
+        // different node under the same loop keeps executing (status and a
+        // run's lifetime are independent). Resetting underneath that live
+        // run is exactly what corrupted the 2026-08-05 incident: the reset
+        // killed-and-reset the run's spec while its `execute_node` future
+        // was still in flight, so its late completion routed an edge and
+        // failed the loop out from under the fresh dispatch this reset then
+        // launched. Refuse outright instead — the caller's next move is an
+        // informed wait or a deliberate kill, not a race.
+        if let Some(run) = self.list_running_loop_runs(loop_id)?.into_iter().next() {
+            return Ok(LoopResetOutcome::InFlight {
+                run_id: run.id,
+                node_id: run.node_id,
+                started_at: run.started_at,
+            });
         }
 
         let bound_specs = self.list_loop_specs(loop_id)?;
@@ -581,29 +596,13 @@ impl Database {
                 .collect(),
         };
 
+        // No spec being reset can have a live `running` node-run row left:
+        // the guard above already confirmed zero `running` rows exist
+        // anywhere under this loop, and every eligible spec's runs are
+        // recorded under this same `loop_id` (bound or drawn live from a
+        // queue — see `list_loop_runs_for_loop`), so there is nothing left
+        // to terminate here.
         for spec_id in &target_ids {
-            // B12: a spec being reset can still have a `running` node-run row
-            // left over from an interrupted attempt — the loop itself is
-            // already non-`Running` here (the guard above refuses otherwise),
-            // but that doesn't mean every spec's last run was cleanly
-            // finalized (e.g. the loop failed on a *different* spec, or the
-            // daemon crashed mid-node). Kill its process, if it still has
-            // one, before wiping the spec back to `pending`, so a fresh run
-            // never races a still-alive leftover in the same workdir.
-            if let Some(stale) = self.get_active_loop_run_for_spec(spec_id)? {
-                if let Some(pid) = stale.pid {
-                    crate::daemon::process::terminate_process_group_async(
-                        pid,
-                        crate::daemon::process::KILL_GRACE,
-                    );
-                }
-                self.update_loop_run_result(
-                    &stale.id,
-                    LoopRunStatus::Fail,
-                    Some(&serde_json::json!({ "terminated": true, "reason": "spec reset" })),
-                    Some(Utc::now()),
-                )?;
-            }
             self.reset_loop_spec_status(spec_id)?;
         }
         self.reset_loop_status(loop_id)?;

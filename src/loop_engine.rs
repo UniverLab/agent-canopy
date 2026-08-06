@@ -70,12 +70,15 @@ enum SpecExecutionOutcome {
     },
     Paused,
     Failed(String),
-    /// This spec's in-flight node run was terminated because a newer attempt at
-    /// the same node superseded it (B42). Pure engine bookkeeping, not a node
-    /// failure: the dispatch that owned the superseded run stops silently —
-    /// it routes down no edge, fails nothing, and completes nothing. The newer
-    /// attempt (or, for a duplicate resume, the dispatch that won the loop
-    /// claim) is what now drives the loop.
+    /// This spec's in-flight node run was terminated out from under this
+    /// dispatch by the engine itself — a newer attempt at the same node
+    /// (B42), a concurrent `loop_reset`, `loop_pause`, iteration-budget
+    /// exhaustion, or `fail_loop`'s own sweep — see
+    /// `run_was_terminated_out_of_band`. Pure engine bookkeeping, not a node
+    /// failure: the dispatch that owned the run stops silently — it routes
+    /// down no edge, fails nothing, and completes nothing. Whatever
+    /// terminated it (a newer attempt, or the dispatch that won the loop
+    /// claim after a reset) is what now drives the loop.
     Superseded,
 }
 
@@ -166,7 +169,7 @@ impl LoopEngine {
                     tracing::error!("Loop '{}' launch refused: {error:#}", loop_id);
                 } else {
                     tracing::error!("Loop '{}' failed to run: {error:#}", loop_id);
-                    let _ = self.fail_loop(&loop_id, None, &error.to_string());
+                    let _ = self.fail_loop(&loop_id, None, None, &error.to_string());
                 }
             }
         });
@@ -286,7 +289,17 @@ impl LoopEngine {
         // supersede the winner's in-flight node the moment it reached the same
         // node. It touches nothing (no status flip, no queue context, no
         // notification), leaving the loop exactly as the winning dispatch left it.
-        if !self.db.claim_loop_for_run(&loop_id, chrono::Utc::now())? {
+        // Captured once, right at the claim, as this dispatch's own
+        // generation marker — `claim_loop_for_run` persists it as the loop's
+        // `started_at`, so a LATER re-fetch of that column tells this exact
+        // dispatch (not just any dispatch) whether it's still the current
+        // one. `fail_loop` compares against it before acting, so a stale
+        // dispatch's late failure can never flip status or sweep runs out
+        // from under whichever fresher dispatch has since claimed the loop
+        // (the 2026-08-05 incident: a reset + relaunch raced a still-live
+        // dispatch, and the loser's late `Fail` took the winner down with it).
+        let claimed_at = chrono::Utc::now();
+        if !self.db.claim_loop_for_run(&loop_id, claimed_at)? {
             tracing::info!(
                 "Loop '{}' is already running; this launch is a duplicate and was refused \
                  (another dispatch owns the run).",
@@ -387,7 +400,12 @@ impl LoopEngine {
                                     return Ok(())
                                 }
                                 SpecExecutionOutcome::Failed(summary) => {
-                                    self.fail_loop(&loop_id, Some(&spec.name), &summary)?;
+                                    self.fail_loop(
+                                        &loop_id,
+                                        Some(claimed_at),
+                                        Some(&spec.name),
+                                        &summary,
+                                    )?;
                                     return Ok(());
                                 }
                             }
@@ -422,7 +440,7 @@ impl LoopEngine {
                             return Ok(())
                         }
                         SpecExecutionOutcome::Failed(summary) => {
-                            self.fail_loop(&loop_id, Some(&spec.name), &summary)?;
+                            self.fail_loop(&loop_id, Some(claimed_at), Some(&spec.name), &summary)?;
                             return Ok(());
                         }
                     }
@@ -449,7 +467,7 @@ impl LoopEngine {
                             return Ok(())
                         }
                         SpecExecutionOutcome::Failed(summary) => {
-                            self.fail_loop(&loop_id, Some(&spec.name), &summary)?;
+                            self.fail_loop(&loop_id, Some(claimed_at), Some(&spec.name), &summary)?;
                             return Ok(());
                         }
                     }
@@ -752,7 +770,7 @@ impl LoopEngine {
                     tracing::error!("Loop '{}' launch refused: {error:#}", loop_id);
                 } else {
                     tracing::error!("Loop '{}' failed to run: {error:#}", loop_id);
-                    let _ = self.fail_loop(&loop_id, None, &error.to_string());
+                    let _ = self.fail_loop(&loop_id, None, None, &error.to_string());
                 }
             }
         });
@@ -1108,16 +1126,21 @@ impl LoopEngine {
                         "node run completed"
                     );
 
-                    // B42: a newer attempt at this node terminated this run out
-                    // from under us (see `terminate_run`/`SUPERSEDE_REASON`).
-                    // That is engine bookkeeping — the run's `Fail` row is a
-                    // reclaim, not a node failure — so this dispatch stops here:
-                    // it evaluates NO edge (never the fail edge to a resilience
-                    // node), fails nothing, and leaves the loop to whichever
-                    // dispatch now owns it. Checked before any routing so the
-                    // supersede can never be routed as a fail (the runaway that
-                    // manufactured a resilience run per killed implementer).
-                    if run_was_superseded(&run) {
+                    // B42/2026-08-05: something terminated this run out from
+                    // under us — a newer attempt at this node, a concurrent
+                    // `loop_reset`, `loop_pause`, or budget/`fail_loop`
+                    // sweep (see `run_was_terminated_out_of_band`). That is
+                    // engine bookkeeping, not a node failure — so this
+                    // dispatch stops here: it evaluates NO edge (never the
+                    // fail edge to a resilience node), fails nothing, and
+                    // leaves the loop to whichever dispatch now owns it.
+                    // Checked before any routing so the termination can
+                    // never be routed as a fail (the runaway that
+                    // manufactured a resilience run per killed implementer,
+                    // and the incident where a stale dispatch's late
+                    // completion failed a loop out from under a healthy
+                    // sibling dispatch).
+                    if run_was_terminated_out_of_band(&run) {
                         return Ok(SpecExecutionOutcome::Superseded);
                     }
 
@@ -1724,14 +1747,54 @@ impl LoopEngine {
             .is_some_and(|lp| lp.status == LoopStatus::Paused))
     }
 
-    fn fail_loop(&self, loop_id: &str, spec_name: Option<&str>, summary: &str) -> Result<()> {
+    /// Fail `loop_id`, sweeping every run still `running` under it — but
+    /// only when `dispatch_started_at` (this call's claimed generation, from
+    /// `run_loop_dispatch`'s own atomic claim) still matches the loop's
+    /// current `started_at`. A mismatch means a newer dispatch has since
+    /// claimed the loop (a reset + relaunch raced this one), so this call is
+    /// itself the stale one: it must not flip status out from under the
+    /// fresher dispatch, and — critically — must not sweep `list_running_loop_runs`,
+    /// which would otherwise terminate that fresher dispatch's entirely
+    /// healthy runs (the 2026-08-05 incident this guards against). `None`
+    /// skips the check (the two catch-all call sites in
+    /// `start_background_run`/`resume_background` have no captured
+    /// generation to compare, since the error they're reacting to already
+    /// unwound out of `run_loop_dispatch`'s scope) — decision-4's broadened
+    /// `run_was_terminated_out_of_band` check is what keeps a stale run's
+    /// completion from reaching either of those paths in the first place.
+    fn fail_loop(
+        &self,
+        loop_id: &str,
+        dispatch_started_at: Option<chrono::DateTime<chrono::Utc>>,
+        spec_name: Option<&str>,
+        summary: &str,
+    ) -> Result<()> {
+        if let Some(expected) = dispatch_started_at {
+            let current_started_at = self.db.get_loop(loop_id)?.and_then(|lp| lp.started_at);
+            let still_current =
+                current_started_at.is_some_and(|at| at.timestamp() == expected.timestamp());
+            if !still_current {
+                tracing::info!(
+                    "Loop '{}' failure from a stale dispatch (claimed at {}) ignored — a newer \
+                     dispatch has since taken over; this attempt's own run row already records \
+                     its own outcome.",
+                    loop_id,
+                    expected.to_rfc3339()
+                );
+                return Ok(());
+            }
+        }
+
         self.db
             .update_loop_status(loop_id, LoopStatus::Failed, None, Some(chrono::Utc::now()))?;
         // B12 catch-all: whatever hard-error path got us here (a node
         // timeout already kills its own process before bubbling up, but a
         // DB error or any other error class reaching this point wouldn't
         // have), make sure nothing is left running under this now-failed
-        // loop.
+        // loop. Safe to sweep every run still `running` under `loop_id`
+        // unscoped: the generation check above already established that no
+        // newer dispatch has claimed the loop since this one did, so
+        // anything still `running` here can only belong to this dispatch.
         for run in self.db.list_running_loop_runs(loop_id).unwrap_or_default() {
             self.terminate_run(&run, "loop run failed");
         }
@@ -3458,24 +3521,35 @@ fn cursor_label(cursor: &SpecCursor, ensembles: &[EnsembleDetails]) -> String {
 }
 
 /// Reason recorded on a node run terminated because a newer attempt at the
-/// same node superseded it (B42). Unlike every other termination reason, a
-/// superseded run is pure engine bookkeeping rather than a node failure: the
-/// dispatch that owned it must recognise the marker and stop silently, routing
-/// it down no edge (see [`run_was_superseded`] and its use in
-/// [`LoopEngine::run_spec`]).
+/// same node superseded it (B42). One of several reasons
+/// [`run_was_terminated_out_of_band`] recognises — see that function's doc
+/// for why every one of them is treated identically.
 const SUPERSEDE_REASON: &str = "superseded by a new attempt at this node";
 
-/// Whether `run` was terminated by the supersede path ([`SUPERSEDE_REASON`]) —
-/// i.e. its `Fail` row is a newer attempt reclaiming the node, not a real node
-/// failure. Recognised by the exact `{ "terminated": true, "reason": … }`
-/// marker [`terminate_run_row`] writes, so a genuine agent output that merely
-/// mentions the phrase can never be mistaken for one.
-fn run_was_superseded(run: &LoopNodeRun) -> bool {
+/// Whether `run` was terminated by the engine out from under the dispatch
+/// that owned it — a same-node supersede ([`SUPERSEDE_REASON`], B42), a
+/// concurrent `loop_reset`, `loop_pause`, iteration-budget exhaustion, or
+/// `fail_loop`'s own sweep — rather than a genuine node outcome (a clean
+/// exit, or a self-report via `loop_complete_node`). Every one of those
+/// paths is pure engine bookkeeping, not a node failure: the dispatch that
+/// owned the run must recognise it and stop silently here, routing down no
+/// edge, failing nothing, and completing nothing (see its use in
+/// [`LoopEngine::run_spec`]) — exactly what let a stale dispatch's late
+/// completion route a fail edge and take down a healthy sibling dispatch on
+/// 2026-08-05.
+///
+/// Recognised by the `{ "terminated": true, "reason": … }` marker every one
+/// of those paths writes via [`terminate_run_row`] (or, for `loop_reset`,
+/// the identically-shaped write in [`crate::db::Database::reset_loop`]) —
+/// matched on the `terminated` key alone, not a specific reason string, so
+/// nothing that terminates a run out-of-band can be missed here. A genuine
+/// agent output can never be mistaken for one: self-reports never set this
+/// key.
+fn run_was_terminated_out_of_band(run: &LoopNodeRun) -> bool {
     let Some(output) = run.output.as_ref() else {
         return false;
     };
     output.get("terminated").and_then(Value::as_bool) == Some(true)
-        && output.get("reason").and_then(Value::as_str) == Some(SUPERSEDE_REASON)
 }
 
 /// Best-effort termination (B12) of `run`'s OS process, if it still has one
@@ -8717,7 +8791,7 @@ echo done
         let superseded = db.get_loop_run(&superseded_run_id).unwrap().unwrap();
         assert_eq!(superseded.status, LoopRunStatus::Fail);
         assert!(
-            run_was_superseded(&superseded),
+            run_was_terminated_out_of_band(&superseded),
             "the run must carry the supersede marker"
         );
 
@@ -8737,6 +8811,219 @@ echo done
         assert_eq!(lp.status, LoopStatus::Running);
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
         assert_eq!(spec.status, LoopSpecStatus::Running);
+    }
+
+    /// The same mechanism, generalized (2026-08-05): a run terminated
+    /// out-of-band for ANY reason — not just a same-node supersede — must be
+    /// recognized and traverse no edge. `loop_reset` marks a run it kills
+    /// with reason `"spec reset"`, not `SUPERSEDE_REASON`; before the fix
+    /// this reason mismatch meant a spec reset out from under an executing
+    /// node let its late completion route the fail edge anyway.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_terminated_for_any_out_of_band_reason_also_traverses_no_edge() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "implement".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "implement".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "sleep 30",
+                "success_condition": "exit_code_0",
+                "timeout_seconds": 60,
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "resilience".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "resilience".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf DIAGNOSED",
+                "success_condition": "exit_code_0",
+            }),
+            position: 2,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "edge-fail".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "implement".to_string(),
+            to_node: "resilience".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Fail,
+        })
+        .unwrap();
+
+        let engine = Arc::new(engine);
+        let dispatch = {
+            let engine = Arc::clone(&engine);
+            let loop_id = loop_id.clone();
+            tokio::spawn(async move { engine.run_loop(loop_id, None, None).await })
+        };
+
+        // Terminate the live run exactly as `Database::reset_loop` does when
+        // it finds an in-flight run for a spec being reset: same
+        // `{ "terminated": true, "reason": … }` shape, but a different
+        // reason than the same-node supersede path uses.
+        let terminated_run_id = loop {
+            if let Some(run) = db.get_active_loop_run_for_node("implement").unwrap() {
+                if run.pid.is_some() {
+                    terminate_run_row(&db, &run, "spec reset");
+                    break run.id;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+
+        dispatch.await.unwrap().unwrap();
+
+        let terminated = db.get_loop_run(&terminated_run_id).unwrap().unwrap();
+        assert_eq!(terminated.status, LoopRunStatus::Fail);
+        assert!(run_was_terminated_out_of_band(&terminated));
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        assert!(
+            runs.iter().all(|r| r.node_id != "resilience"),
+            "an out-of-band termination for any reason must not route down the fail edge"
+        );
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Running);
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(spec.status, LoopSpecStatus::Running);
+    }
+
+    // ── fail_loop: scoped to the dispatch generation that failed ─────────
+
+    /// `fail_loop`'s sweep must never terminate a sibling dispatch's healthy
+    /// run — the exact way the 2026-08-05 incident took down a fresh,
+    /// correct dispatch that had claimed the loop 64 seconds after the one
+    /// that eventually failed. Simulates the race directly: dispatch A
+    /// claims, a reset + relaunch (dispatch B) claims again with a later
+    /// timestamp and starts its own run, and only then does dispatch A's
+    /// late failure arrive carrying its now-stale claim.
+    #[tokio::test]
+    async fn fail_loop_from_stale_dispatch_never_touches_a_newer_dispatchs_runs() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-a".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "node-a".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "true"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let claim_a = chrono::Utc::now();
+        assert!(db.claim_loop_for_run(&loop_id, claim_a).unwrap());
+
+        // A reset + relaunch out from under dispatch A: status drops out of
+        // `running` (what `Database::reset_loop` does), then dispatch B
+        // claims again with a strictly later timestamp.
+        db.update_loop_status(&loop_id, LoopStatus::Draft, None, None)
+            .unwrap();
+        let claim_b = claim_a + chrono::Duration::seconds(5);
+        assert!(db.claim_loop_for_run(&loop_id, claim_b).unwrap());
+
+        // Dispatch B's own healthy, in-flight run.
+        db.insert_loop_run(&LoopNodeRun {
+            id: "run-b".to_string(),
+            loop_id: loop_id.clone(),
+            spec_id,
+            node_id: "node-a".to_string(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        })
+        .unwrap();
+
+        // Dispatch A's late failure, carrying its now-stale claim.
+        engine
+            .fail_loop(
+                &loop_id,
+                Some(claim_a),
+                Some("spec"),
+                "dispatch A's late failure",
+            )
+            .unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(
+            lp.status,
+            LoopStatus::Running,
+            "a stale dispatch's failure must not flip status out from under the current dispatch"
+        );
+        let run_b = db.get_loop_run("run-b").unwrap().unwrap();
+        assert_eq!(
+            run_b.status,
+            LoopRunStatus::Running,
+            "a stale dispatch's fail_loop sweep must never touch a newer dispatch's run"
+        );
+    }
+
+    /// The ordinary, single-dispatch case is unchanged: when
+    /// `dispatch_started_at` still matches the loop's current claim,
+    /// `fail_loop` flips status and sweeps exactly as before.
+    #[tokio::test]
+    async fn fail_loop_from_current_dispatch_still_flips_status_and_sweeps() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-a".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "node-a".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "true"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let claim = chrono::Utc::now();
+        assert!(db.claim_loop_for_run(&loop_id, claim).unwrap());
+        db.insert_loop_run(&LoopNodeRun {
+            id: "run-a".to_string(),
+            loop_id: loop_id.clone(),
+            spec_id,
+            node_id: "node-a".to_string(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        })
+        .unwrap();
+
+        engine
+            .fail_loop(&loop_id, Some(claim), Some("spec"), "genuine failure")
+            .unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Failed);
+        let run = db.get_loop_run("run-a").unwrap().unwrap();
+        assert_eq!(run.status, LoopRunStatus::Fail);
     }
 
     /// A second launch against a loop that already has an in-flight run must be

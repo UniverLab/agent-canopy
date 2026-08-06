@@ -997,8 +997,12 @@ mod hang_repro {
         .await
         .expect("loop_reset must respond promptly against a running loop")
         .unwrap();
+        // The ground truth is the `loop_runs` table, not loop status (see
+        // `Database::reset_loop`'s `InFlight` guard) — the refusal now names
+        // the node and run still executing rather than just pointing at
+        // `loop_pause`.
         assert!(
-            reset_result.contains("running") && reset_result.contains("loop_pause"),
+            reset_result.contains("sleep") && reset_result.contains("still executing"),
             "expected fast-fail error, got: {reset_result}"
         );
 
