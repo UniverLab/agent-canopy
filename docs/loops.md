@@ -275,16 +275,120 @@ by reconstructing what ran from the run history.
 | Stage | Tools |
 |---|---|
 | Authoring | `loop_create`, `loop_update`, `loop_add_spec`, `loop_update_spec`, `loop_add_node`, `loop_update_node`, `loop_add_edge`, `loop_update_edge`, `loop_add_ensemble`, `loop_update_ensemble` |
+| Sharing | `loop_export`, `loop_import` |
 | Inspection | `loop_get`, `loop_list` |
 | Runtime | `loop_run`, `loop_reset`, `loop_schedule_autorun`, `loop_pause`, `loop_continue`, `loop_complete_node`, `loop_report_blocker` |
 
 Loops can be authored programmatically by agents through these tools,
 or edited in the [TUI loop editor](tui.md) with inline JSON config
 validation. The `canopy loop` CLI subcommands mirror the runtime tools
-from the terminal: `list`/`info` are read-only inspection, and
-`run`/`pause`/`continue`/`reset`/`autorun` delegate the matching MCP
-tool to the daemon — a second way to drive a loop when an MCP client
-can't reach it. See the [CLI reference](cli-reference.md#loop-control).
+from the terminal: `list`/`info`/`export` are read-only inspection, and
+`import`/`run`/`pause`/`continue`/`reset`/`autorun` delegate the
+matching MCP tool to the daemon — a second way to drive a loop when an
+MCP client can't reach it. See the
+[CLI reference](cli-reference.md#loop-control).
+
+## Export and import
+
+A loop's design — its name, description, nodes, edges, and ensembles —
+can leave one machine as a single JSON file and be recreated on
+another. Sharing a loop becomes sending a file, not narrating the
+`loop_add_node`/`loop_add_edge`/`loop_add_ensemble` calls that built
+it, and the file is also a diff: review a change to a loop, or keep
+one in a repo next to the code it operates on.
+
+```
+canopy loop export <loop_id> [--output <path>] [--with-models]
+canopy loop import <path> [--workdir <dir>] [--name <name>]
+```
+
+`export` writes to `--output`, or to stdout (so it can be piped) when
+omitted. `import` always creates a **new** loop — it never updates,
+merges, or overwrites an existing one; `--workdir` defaults to the
+current directory, and `--name` overrides the file's own name. If the
+resolved name is already taken in the target workdir, import still
+succeeds under a numeric suffix (`"My Loop (2)"`) and reports which
+name it used. The same two operations exist as MCP tools,
+`loop_export { loop_id, with_models? }` and
+`loop_import { document, workdir?, name? }`, so a loop is drivable end
+to end through MCP as well as the CLI.
+
+What the file **excludes** is deliberate: no ids (edges reference
+nodes by `name`, which is what makes the file reviewable and
+hand-editable — node names must therefore be unique within an exported
+loop, or export refuses with the names it found), no `workdir`, no
+specs, and no run/status state. A loop file is a shape and a set of
+instructions, not somebody else's backlog or history.
+
+`platform`/`model` are stripped from every agent node and ensemble
+member by default, for the same reason a [node blueprint](#node-blueprints)
+never carries one: a shared design pinned to a harness or model the
+recipient doesn't have is broken on arrival, and one pinned to a model
+they do have is worse, since it silently spends their quota on someone
+else's choice. Pass `--with-models` (`with_models: true` over MCP) only
+when exporting your own loop to restore later on your own machine.
+`import`'s response always lists every agent node left without a
+platform, so there's exactly one thing to check before running an
+imported loop: `nodes_missing_platform` in the MCP response, or the
+same list printed by the CLI.
+
+An [ensemble](#ensembles) round-trips as one ensemble — not as its
+expanded member/quorum nodes — via its own `ensembles` array entry.
+
+Here is a complete, hand-writable example: an implementer, a 2-model
+ensemble of reviewers, and a committer the quorum routes to on pass.
+
+```json
+{
+  "format_version": 1,
+  "name": "implement-and-review",
+  "description": "Implement a spec, get two model opinions, then commit.",
+  "nodes": [
+    {
+      "name": "implementer",
+      "kind": "agent",
+      "position": 1,
+      "config": {
+        "prompt_template": "Implement: {{spec_content}}",
+        "timeout_minutes": 30
+      }
+    },
+    {
+      "name": "committer",
+      "kind": "agent",
+      "position": 4,
+      "config": {
+        "prompt_template": "Review the feedback and commit if satisfied.",
+        "commit_rights": true,
+        "timeout_minutes": 15
+      }
+    }
+  ],
+  "edges": [],
+  "ensembles": [
+    {
+      "name": "reviewers",
+      "prompt_template": "Review this diff for correctness: {{previous_feedback}}",
+      "entry_from_node": "implementer",
+      "entry_condition": "always",
+      "on_pass_to": "committer",
+      "min_pass": 2,
+      "timeout_minutes": 20,
+      "members": [
+        {},
+        {}
+      ]
+    }
+  ]
+}
+```
+
+Note what is absent: no `id` anywhere, no `platform`/`model` on
+`implementer`/`committer`/the ensemble's members (this file was
+exported without `--with-models` — `import` will report all three as
+`nodes_missing_platform`), and the ensemble's own member/quorum nodes
+never appear in `nodes` — only its `entry_from_node`/`on_pass_to`
+(both plain node names) and its `members` array do.
 
 ## Node blueprints
 

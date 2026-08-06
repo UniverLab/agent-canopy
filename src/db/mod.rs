@@ -1106,6 +1106,7 @@ pub mod group;
 pub mod health;
 pub mod intelligence;
 pub mod last_prompts;
+pub mod loop_transfer;
 pub mod loops;
 pub mod project;
 pub mod queues;

@@ -5197,6 +5197,134 @@ impl TaskTriggerHandler {
     }
 
     #[tool(
+        name = "loop_export",
+        description = "Export a loop's design — name, description, nodes, edges, and ensembles — as a portable JSON document, so it can be shared as a file and recreated elsewhere with loop_import. Never includes ids, workdir, specs, or run/status state. platform/model are stripped from every agent node/ensemble member by default; pass with_models: true to keep them (only when exporting your own loop to restore later on your own machine)."
+    )]
+    async fn loop_export(
+        &self,
+        Parameters(params): Parameters<LoopExportParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let loop_id = params.loop_id.trim();
+        let Some(lp) = self.db.get_loop(loop_id).map_err(internal_error)? else {
+            return Ok(error_result(&format!("Loop '{loop_id}' not found.")));
+        };
+        let with_models = params.with_models.unwrap_or(false);
+
+        let graph_nodes = self
+            .db
+            .list_loop_nodes_for_loop(loop_id)
+            .map_err(internal_error)?;
+        let graph_edges = self
+            .db
+            .list_loop_edges_for_loop(loop_id)
+            .map_err(internal_error)?;
+        let ensembles = self
+            .db
+            .list_ensembles_for_loop(loop_id)
+            .map_err(internal_error)?;
+
+        let document = match crate::domain::loop_transfer::build_export_document(
+            &lp,
+            &graph_nodes,
+            &graph_edges,
+            &ensembles,
+            with_models,
+        ) {
+            Ok(document) => document,
+            Err(e) => return Ok(error_result(&e)),
+        };
+
+        Ok(build_json_result(
+            &serde_json::to_value(&document).map_err(internal_error)?,
+        ))
+    }
+
+    #[tool(
+        name = "loop_import",
+        description = "Create a new loop from an exported document (the object loop_export returns). Always creates a new loop — never updates or overwrites an existing one; if the name is already taken in workdir, a numeric suffix is applied and the response says which name was used. Validates the document exactly as loop_add_node/loop_add_edge/loop_add_ensemble would, all-or-nothing: nothing is written if any part is rejected. The response lists every agent node left without a platform (the document strips it by default) so the caller knows what to fill in before running the loop."
+    )]
+    async fn loop_import(
+        &self,
+        Parameters(params): Parameters<LoopImportParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let workdir = params.workdir.trim();
+        if let Err(e) = validate_non_empty(workdir, "Loop workdir") {
+            return Ok(error_result(&e));
+        }
+        if let Err(e) = validate_absolute_dir(workdir) {
+            return Ok(error_result(&e));
+        }
+
+        let document =
+            match crate::domain::loop_transfer::parse_export_document_value(&params.document) {
+                Ok(document) => document,
+                Err(e) => return Ok(error_result(&e)),
+            };
+
+        let desired_name = params
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(document.name.trim());
+        if let Err(e) = validate_non_empty(desired_name, "Loop name") {
+            return Ok(error_result(&e));
+        }
+
+        let loop_id = uuid::Uuid::new_v4().to_string();
+        let plan = match crate::domain::loop_transfer::build_import_plan(&document, &loop_id) {
+            Ok(plan) => plan,
+            Err(e) => return Ok(error_result(&e)),
+        };
+        let missing_platform = crate::domain::loop_transfer::agent_nodes_missing_platform(&plan);
+
+        let existing_names: Vec<String> = self
+            .db
+            .list_loops(Some(workdir), true)
+            .map_err(internal_error)?
+            .into_iter()
+            .map(|lp| lp.name)
+            .collect();
+        let final_name =
+            crate::domain::loop_transfer::resolve_unique_loop_name(&existing_names, desired_name);
+
+        let lp = Loop {
+            archived: false,
+            id: loop_id.clone(),
+            name: final_name.clone(),
+            description: document
+                .description
+                .clone()
+                .filter(|value| !value.trim().is_empty()),
+            workdir: workdir.to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        };
+
+        self.db
+            .import_loop_graph(&lp, &plan)
+            .map_err(internal_error)?;
+        if let Err(error) = self.db.register_project_path(std::path::Path::new(workdir)) {
+            tracing::debug!("Could not register imported loop's project at {workdir}: {error}");
+        }
+        self.activate_loop_trigger(&lp).await;
+
+        Ok(build_json_result(&serde_json::json!({
+            "loop_id": lp.id,
+            "name": lp.name,
+            "nodes_missing_platform": missing_platform,
+        })))
+    }
+
+    #[tool(
         name = "loop_audit_node_configs",
         description = "Scan every loop node in the database for a config key its kind will never read (e.g. 'prompt' on an agent node, which the engine silently ignores in favor of 'prompt_template'). Write-time validation (loop_add_node/loop_update_node) rejects this going forward; this tool finds nodes that predate it and are still silently degraded."
     )]
@@ -14342,6 +14470,486 @@ mod endpoint_tests {
             .unwrap();
         assert!(is_err(&bad_workdir));
         assert!(text(&bad_workdir).contains("absolute") || text(&bad_workdir).contains("exist"));
+    }
+
+    fn check_node_config(command: &str) -> serde_json::Map<String, serde_json::Value> {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "command".to_string(),
+            serde_json::Value::String(command.to_string()),
+        );
+        map
+    }
+
+    /// Builds a loop with implementer -> gate -> committer (agent, check,
+    /// agent), returning the loop id and each node's id in graph order.
+    async fn build_simple_loop(
+        handler: &TaskTriggerHandler,
+        workdir: &str,
+        loop_name: &str,
+    ) -> (String, String, String, String) {
+        let created = handler
+            .loop_create(Parameters(LoopCreateParams {
+                name: loop_name.to_string(),
+                description: Some("A shareable design".to_string()),
+                workdir: workdir.to_string(),
+                trigger: None,
+            }))
+            .await
+            .unwrap();
+        let loop_id = extract_id(&created, "loop_id");
+
+        let n1 = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: None,
+                loop_id: Some(loop_id.clone()),
+                name: "implementer".to_string(),
+                kind: Some("agent".to_string()),
+                config: Some(agent_node_config("claude")),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        let n1_id = extract_id(&n1, "node_id");
+
+        let n2 = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: None,
+                loop_id: Some(loop_id.clone()),
+                name: "gate".to_string(),
+                kind: Some("check".to_string()),
+                config: Some(check_node_config("cargo test")),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        let n2_id = extract_id(&n2, "node_id");
+
+        let n3 = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: None,
+                loop_id: Some(loop_id.clone()),
+                name: "committer".to_string(),
+                kind: Some("agent".to_string()),
+                config: Some(agent_node_config("claude")),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        let n3_id = extract_id(&n3, "node_id");
+
+        for (from, to, condition) in [(&n1_id, &n2_id, "always"), (&n2_id, &n3_id, "pass")] {
+            let edge = handler
+                .loop_add_edge(Parameters(LoopAddEdgeParams {
+                    spec_id: None,
+                    loop_id: Some(loop_id.clone()),
+                    from_node: from.clone(),
+                    to_node: to.clone(),
+                    condition: condition.to_string(),
+                    route: None,
+                }))
+                .await
+                .unwrap();
+            assert!(!is_err(&edge), "{}", text(&edge));
+        }
+
+        (loop_id, n1_id, n2_id, n3_id)
+    }
+
+    #[tokio::test]
+    async fn loop_export_returns_error_for_unknown_loop() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let result = handler
+            .loop_export(Parameters(LoopExportParams {
+                loop_id: "missing".to_string(),
+                with_models: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&result));
+        assert!(text(&result).contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn loop_export_strips_platform_by_default_and_keeps_it_with_with_models() {
+        let (dir, _db, handler) = endpoint_test_handler();
+        let workdir = dir.path().to_string_lossy().to_string();
+        let (loop_id, ..) = build_simple_loop(&handler, &workdir, "Export Loop").await;
+
+        let stripped = handler
+            .loop_export(Parameters(LoopExportParams {
+                loop_id: loop_id.clone(),
+                with_models: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&stripped), "{}", text(&stripped));
+        let doc: serde_json::Value = serde_json::from_str(&raw_text(&stripped)).unwrap();
+        assert_eq!(doc["format_version"], 1);
+        let implementer = doc["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["name"] == "implementer")
+            .unwrap();
+        assert!(implementer["config"].get("platform").is_none());
+
+        let with_models = handler
+            .loop_export(Parameters(LoopExportParams {
+                loop_id,
+                with_models: Some(true),
+            }))
+            .await
+            .unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&raw_text(&with_models)).unwrap();
+        let implementer = doc["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["name"] == "implementer")
+            .unwrap();
+        assert_eq!(implementer["config"]["platform"], "claude");
+    }
+
+    /// Decision 2's enforced consequence: `loop_add_node` doesn't itself
+    /// forbid two nodes sharing a name, so export must catch it — naming
+    /// the offending node(s) rather than producing an ambiguous file.
+    #[tokio::test]
+    async fn loop_export_rejects_duplicate_node_names() {
+        let (dir, _db, handler) = endpoint_test_handler();
+        let workdir = dir.path().to_string_lossy().to_string();
+        let created = handler
+            .loop_create(Parameters(LoopCreateParams {
+                name: "Dup Loop".to_string(),
+                description: None,
+                workdir,
+                trigger: None,
+            }))
+            .await
+            .unwrap();
+        let loop_id = extract_id(&created, "loop_id");
+        for _ in 0..2 {
+            handler
+                .loop_add_node(Parameters(LoopAddNodeParams {
+                    spec_id: None,
+                    loop_id: Some(loop_id.clone()),
+                    name: "dup".to_string(),
+                    kind: Some("check".to_string()),
+                    config: Some(check_node_config("true")),
+                    blueprint: None,
+                    config_overrides: None,
+                }))
+                .await
+                .unwrap();
+        }
+
+        let result = handler
+            .loop_export(Parameters(LoopExportParams {
+                loop_id,
+                with_models: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&result));
+        assert!(text(&result).contains("dup"));
+        assert!(text(&result).to_lowercase().contains("duplicate"));
+    }
+
+    #[tokio::test]
+    async fn loop_import_creates_new_loop_and_reports_missing_platform() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let workdir = dir.path().to_string_lossy().to_string();
+        let (source_loop_id, ..) = build_simple_loop(&handler, &workdir, "Source Loop").await;
+
+        let exported = handler
+            .loop_export(Parameters(LoopExportParams {
+                loop_id: source_loop_id,
+                with_models: None,
+            }))
+            .await
+            .unwrap();
+        let document: serde_json::Value = serde_json::from_str(&raw_text(&exported)).unwrap();
+
+        let imported = handler
+            .loop_import(Parameters(LoopImportParams {
+                document,
+                workdir: workdir.clone(),
+                name: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&imported), "{}", text(&imported));
+        let body: serde_json::Value = serde_json::from_str(&raw_text(&imported)).unwrap();
+        // The source loop itself is still named "Source Loop" in this same
+        // workdir, so decision 4's collision handling suffixes the import.
+        assert_eq!(body["name"], "Source Loop (2)");
+        let new_loop_id = body["loop_id"].as_str().unwrap().to_string();
+        assert_ne!(new_loop_id, "");
+
+        let missing: Vec<&str> = body["nodes_missing_platform"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(missing.contains(&"implementer"));
+        assert!(missing.contains(&"committer"));
+
+        let nodes = db.list_loop_nodes_for_loop(&new_loop_id).unwrap();
+        assert_eq!(nodes.len(), 3);
+        let edges = db.list_loop_edges_for_loop(&new_loop_id).unwrap();
+        assert_eq!(edges.len(), 2);
+        // Import always creates a new loop, never touching the source.
+        assert_eq!(db.list_loops(Some(&workdir), true).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn loop_import_name_param_overrides_document_name() {
+        let (dir, _db, handler) = endpoint_test_handler();
+        let workdir = dir.path().to_string_lossy().to_string();
+        let (source_loop_id, ..) = build_simple_loop(&handler, &workdir, "Source Loop").await;
+        let exported = handler
+            .loop_export(Parameters(LoopExportParams {
+                loop_id: source_loop_id,
+                with_models: None,
+            }))
+            .await
+            .unwrap();
+        let document: serde_json::Value = serde_json::from_str(&raw_text(&exported)).unwrap();
+
+        let imported = handler
+            .loop_import(Parameters(LoopImportParams {
+                document,
+                workdir,
+                name: Some("Custom Name".to_string()),
+            }))
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&raw_text(&imported)).unwrap();
+        assert_eq!(body["name"], "Custom Name");
+    }
+
+    /// Decision 4: import never overwrites — a name collision in the target
+    /// workdir gets a numeric suffix instead of a refusal or an overwrite.
+    #[tokio::test]
+    async fn loop_import_dedupes_colliding_name_with_numeric_suffix() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let workdir = dir.path().to_string_lossy().to_string();
+        let (source_loop_id, ..) = build_simple_loop(&handler, &workdir, "Source Loop").await;
+        let exported = handler
+            .loop_export(Parameters(LoopExportParams {
+                loop_id: source_loop_id,
+                with_models: None,
+            }))
+            .await
+            .unwrap();
+        let document: serde_json::Value = serde_json::from_str(&raw_text(&exported)).unwrap();
+
+        let first = handler
+            .loop_import(Parameters(LoopImportParams {
+                document: document.clone(),
+                workdir: workdir.clone(),
+                name: Some("Collide".to_string()),
+            }))
+            .await
+            .unwrap();
+        let first_body: serde_json::Value = serde_json::from_str(&raw_text(&first)).unwrap();
+        assert_eq!(first_body["name"], "Collide");
+
+        let second = handler
+            .loop_import(Parameters(LoopImportParams {
+                document,
+                workdir: workdir.clone(),
+                name: Some("Collide".to_string()),
+            }))
+            .await
+            .unwrap();
+        let second_body: serde_json::Value = serde_json::from_str(&raw_text(&second)).unwrap();
+        assert_eq!(second_body["name"], "Collide (2)");
+        assert_ne!(second_body["loop_id"], first_body["loop_id"]);
+        assert_eq!(db.list_loops(Some(&workdir), true).unwrap().len(), 3);
+    }
+
+    /// Decision 5's all-or-nothing guarantee: a document whose edge names a
+    /// nonexistent node is rejected before anything is written.
+    #[tokio::test]
+    async fn loop_import_rejects_bad_edge_reference_and_writes_nothing() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let workdir = dir.path().to_string_lossy().to_string();
+        let document = serde_json::json!({
+            "format_version": 1,
+            "name": "Broken Loop",
+            "nodes": [
+                {"name": "only", "kind": "check", "position": 1, "config": {"command": "true"}}
+            ],
+            "edges": [
+                {"from_node": "only", "to_node": "ghost", "condition": "always"}
+            ],
+            "ensembles": []
+        });
+
+        let result = handler
+            .loop_import(Parameters(LoopImportParams {
+                document,
+                workdir: workdir.clone(),
+                name: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&result));
+        assert!(text(&result).contains("ghost"));
+        assert!(db.list_loops(Some(&workdir), true).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn loop_import_rejects_missing_format_version() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let workdir = dir.path().to_string_lossy().to_string();
+        let document = serde_json::json!({
+            "name": "No Version",
+            "nodes": [],
+            "edges": [],
+            "ensembles": []
+        });
+
+        let result = handler
+            .loop_import(Parameters(LoopImportParams {
+                document,
+                workdir: workdir.clone(),
+                name: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&result));
+        assert!(text(&result).contains("format_version"));
+        assert!(db.list_loops(Some(&workdir), true).unwrap().is_empty());
+    }
+
+    /// Requirement 5, exercised end to end through the MCP surface: export,
+    /// import, export again — identical document except the name — for a
+    /// loop that includes an ensemble, which must survive as an ensemble
+    /// rather than expanded member nodes.
+    #[tokio::test]
+    async fn loop_export_import_round_trip_with_models_preserves_ensemble() {
+        let (dir, _db, handler) = endpoint_test_handler();
+        let workdir = dir.path().to_string_lossy().to_string();
+
+        let created = handler
+            .loop_create(Parameters(LoopCreateParams {
+                name: "Ensemble Loop".to_string(),
+                description: Some("Has an ensemble".to_string()),
+                workdir: workdir.clone(),
+                trigger: None,
+            }))
+            .await
+            .unwrap();
+        let loop_id = extract_id(&created, "loop_id");
+
+        let kickoff = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: None,
+                loop_id: Some(loop_id.clone()),
+                name: "kickoff".to_string(),
+                kind: Some("check".to_string()),
+                config: Some(check_node_config("true")),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        let kickoff_id = extract_id(&kickoff, "node_id");
+
+        let downstream = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: None,
+                loop_id: Some(loop_id.clone()),
+                name: "downstream".to_string(),
+                kind: Some("agent".to_string()),
+                config: Some(agent_node_config("claude")),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        let downstream_id = extract_id(&downstream, "node_id");
+
+        let ensemble = handler
+            .loop_add_ensemble(Parameters(LoopAddEnsembleParams {
+                spec_id: None,
+                loop_id: Some(loop_id.clone()),
+                name: "Proposers".to_string(),
+                prompt_template: Some("draft it".to_string()),
+                blueprint: None,
+                members: Some(vec![
+                    EnsembleMemberParams {
+                        platform: "openrouter".to_string(),
+                        model: Some("model-a".to_string()),
+                        prompt_override: None,
+                    },
+                    EnsembleMemberParams {
+                        platform: "openrouter".to_string(),
+                        model: Some("model-b".to_string()),
+                        prompt_override: None,
+                    },
+                ]),
+                condition: "always".to_string(),
+                from_node: kickoff_id.clone(),
+                on_pass_to: downstream_id.clone(),
+                on_fail_to: None,
+                min_pass: None,
+                timeout_minutes: None,
+                straggler_timeout_minutes: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&ensemble), "{}", text(&ensemble));
+
+        let first_export = handler
+            .loop_export(Parameters(LoopExportParams {
+                loop_id,
+                with_models: Some(true),
+            }))
+            .await
+            .unwrap();
+        let first_doc: serde_json::Value = serde_json::from_str(&raw_text(&first_export)).unwrap();
+        assert_eq!(first_doc["ensembles"].as_array().unwrap().len(), 1);
+        // The plain node list must exclude the ensemble's member/join nodes.
+        assert_eq!(first_doc["nodes"].as_array().unwrap().len(), 2);
+
+        let imported = handler
+            .loop_import(Parameters(LoopImportParams {
+                document: first_doc.clone(),
+                workdir: workdir.clone(),
+                name: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&imported), "{}", text(&imported));
+        let imported_body: serde_json::Value = serde_json::from_str(&raw_text(&imported)).unwrap();
+        let new_loop_id = imported_body["loop_id"].as_str().unwrap().to_string();
+        assert_eq!(imported_body["name"], "Ensemble Loop (2)");
+        // Every member carried its platform/model through with_models — no
+        // node should be flagged.
+        assert!(imported_body["nodes_missing_platform"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        let second_export = handler
+            .loop_export(Parameters(LoopExportParams {
+                loop_id: new_loop_id,
+                with_models: Some(true),
+            }))
+            .await
+            .unwrap();
+        let mut second_doc: serde_json::Value =
+            serde_json::from_str(&raw_text(&second_export)).unwrap();
+        // Identical except the name (decision 4 renamed it on collision).
+        second_doc["name"] = first_doc["name"].clone();
+        assert_eq!(first_doc, second_doc);
     }
 
     #[tokio::test]

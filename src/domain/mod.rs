@@ -11,6 +11,7 @@ pub mod cli_strategy;
 pub mod db_health;
 pub mod db_paths;
 pub mod gamification;
+pub mod loop_transfer;
 pub mod loops;
 pub mod models;
 pub mod models_db;

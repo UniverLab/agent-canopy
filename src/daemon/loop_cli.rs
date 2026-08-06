@@ -1,19 +1,20 @@
 //! CLI handlers for `canopy loop` subcommands.
 //!
-//! `list`/`info` are read-only: mirror `canopy rag report` (see
+//! `list`/`info`/`export` are read-only: mirror `canopy rag report` (see
 //! `rag_cli.rs`) in spirit — a terminal view onto state that previously
 //! required querying the database directly. Every other
-//! subcommand (`run`/`pause`/`continue`/`reset`/`autorun`) changes loop
-//! state, so it resolves the target loop against that same local database
-//! (exactly as `list`/`info` already do — see [`resolve_loop`]) but then
-//! delegates the actual mutation to the daemon's MCP tool of the same name
-//! via `daemon::cli_daemon::call_tool`, never touching the database itself.
-//! This is the second surface for the operations `loop_run`/`loop_pause`/
-//! `loop_continue`/`loop_reset`/`loop_schedule_autorun` already expose over
-//! MCP — for when an MCP client can't reach them but the daemon and its
-//! database still can.
+//! subcommand (`import`/`run`/`pause`/`continue`/`reset`/`autorun`) changes
+//! loop state, so it resolves the target loop (or, for `import`, has
+//! nothing yet to resolve) against that same local database (exactly as
+//! `list`/`info` already do — see [`resolve_loop`]) but then delegates the
+//! actual mutation to the daemon's MCP tool of the same name via
+//! `daemon::cli_daemon::call_tool`, never touching the database itself.
+//! This is the second surface for the operations `loop_import`/`loop_run`/
+//! `loop_pause`/`loop_continue`/`loop_reset`/`loop_schedule_autorun` already
+//! expose over MCP — for when an MCP client can't reach them but the daemon
+//! and its database still can.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use clap::Subcommand;
 
@@ -36,6 +37,34 @@ pub(crate) enum LoopAction {
     Info {
         /// Full loop id, an unambiguous id prefix, or the exact loop name.
         id_or_name: String,
+    },
+    /// Export a loop's design (name, description, nodes, edges, ensembles)
+    /// as a portable JSON document, so it can be shared as a file and
+    /// recreated elsewhere with `import`.
+    Export {
+        /// Full loop id, an unambiguous id prefix, or the exact loop name.
+        id_or_name: String,
+        /// Write the exported JSON to this path instead of stdout.
+        #[arg(long)]
+        output: Option<String>,
+        /// Include each agent node's/ensemble member's platform/model in the
+        /// exported file. Omit for a shareable design that never pins the
+        /// recipient to a harness or model they may not have.
+        #[arg(long = "with-models")]
+        with_models: bool,
+    },
+    /// Create a new loop from an exported document — never overwrites an
+    /// existing loop.
+    Import {
+        /// Path to an exported loop JSON file.
+        path: String,
+        /// Absolute workdir for the new loop. Defaults to the current
+        /// directory.
+        #[arg(long)]
+        workdir: Option<String>,
+        /// Loop name to use instead of the file's own name.
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Run a loop in the background, spec by spec.
     Run {
@@ -107,6 +136,16 @@ pub(crate) async fn handle_loop_action(
     match action {
         LoopAction::List { workdir } => handle_loop_list(&db, workdir.as_deref()),
         LoopAction::Info { id_or_name } => handle_loop_info(&db, &id_or_name),
+        LoopAction::Export {
+            id_or_name,
+            output,
+            with_models,
+        } => handle_loop_export(&db, &id_or_name, output.as_deref(), with_models),
+        LoopAction::Import {
+            path,
+            workdir,
+            name,
+        } => handle_loop_import(port_override, &path, workdir, name),
         LoopAction::Run {
             id_or_name,
             queue,
@@ -255,6 +294,79 @@ fn confirm_reset(loop_name: &str) -> Result<bool> {
     .with_help_message("y: reset, n/Esc: abort")
     .prompt()
     .map_err(|err| anyhow!("{err}"))
+}
+
+/// Read-only, like `list`/`info` — reads the local database directly rather
+/// than round-tripping through the daemon, so exporting a loop never
+/// requires the daemon to be running.
+fn handle_loop_export(
+    db: &Database,
+    id_or_name: &str,
+    output: Option<&str>,
+    with_models: bool,
+) -> Result<()> {
+    let loops = db.list_loops(None, true)?;
+    let lp = resolve_loop(&loops, id_or_name)?;
+
+    let graph_nodes = db.list_loop_nodes_for_loop(&lp.id)?;
+    let graph_edges = db.list_loop_edges_for_loop(&lp.id)?;
+    let ensembles = db.list_ensembles_for_loop(&lp.id)?;
+    let document = crate::domain::loop_transfer::build_export_document(
+        lp,
+        &graph_nodes,
+        &graph_edges,
+        &ensembles,
+        with_models,
+    )
+    .map_err(|e| anyhow!(e))?;
+    let json = serde_json::to_string_pretty(&document)?;
+
+    match output {
+        Some(path) => {
+            std::fs::write(path, format!("{json}\n"))
+                .with_context(|| format!("could not write '{path}'"))?;
+            println!("Exported loop '{}' to {path}.", lp.name);
+        }
+        None => println!("{json}"),
+    }
+    Ok(())
+}
+
+/// Import creates a new loop, which needs the daemon's own side effects
+/// (project path registration, trigger activation) — so unlike `export`
+/// this delegates to the daemon's `loop_import` MCP tool rather than
+/// writing to the database directly (see module doc: every mutation goes
+/// through the daemon).
+fn handle_loop_import(
+    port_override: Option<u16>,
+    path: &str,
+    workdir: Option<String>,
+    name: Option<String>,
+) -> Result<()> {
+    let raw = std::fs::read_to_string(path).with_context(|| format!("could not read '{path}'"))?;
+    // Validated locally first so a malformed file (bad JSON, missing
+    // format_version) fails fast with a clear message instead of a round
+    // trip to the daemon — `loop_import` re-validates it anyway (decision
+    // 5), so this is a UX nicety, not the source of truth.
+    let document = crate::domain::loop_transfer::parse_export_document_str(&raw)
+        .map_err(|e| anyhow!("'{path}': {e}"))?;
+    let document = serde_json::to_value(&document)?;
+
+    let workdir = match workdir {
+        Some(workdir) => workdir,
+        None => std::env::current_dir()
+            .context("could not determine the current directory")?
+            .to_string_lossy()
+            .to_string(),
+    };
+
+    let mut args = serde_json::json!({ "document": document, "workdir": workdir });
+    if let Some(name) = name {
+        args["name"] = serde_json::json!(name);
+    }
+
+    println!("{}", call_tool(port_override, "loop_import", &args)?);
+    Ok(())
 }
 
 fn handle_loop_autorun(
@@ -845,6 +957,85 @@ mod tests {
         match cli.action {
             LoopAction::Pause { id_or_name } => assert_eq!(id_or_name, "my-loop"),
             other => panic!("expected Pause, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn export_parses_output_and_with_models() {
+        let cli = TestCli::try_parse_from(["test", "export", "my-loop"]).expect("should parse");
+        match cli.action {
+            LoopAction::Export {
+                id_or_name,
+                output,
+                with_models,
+            } => {
+                assert_eq!(id_or_name, "my-loop");
+                assert!(output.is_none());
+                assert!(!with_models);
+            }
+            other => panic!("expected Export, got {other:?}"),
+        }
+
+        let cli = TestCli::try_parse_from([
+            "test",
+            "export",
+            "my-loop",
+            "--output",
+            "loop.json",
+            "--with-models",
+        ])
+        .expect("should parse");
+        match cli.action {
+            LoopAction::Export {
+                id_or_name,
+                output,
+                with_models,
+            } => {
+                assert_eq!(id_or_name, "my-loop");
+                assert_eq!(output.as_deref(), Some("loop.json"));
+                assert!(with_models);
+            }
+            other => panic!("expected Export, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_parses_workdir_and_name() {
+        let cli = TestCli::try_parse_from(["test", "import", "loop.json"]).expect("should parse");
+        match cli.action {
+            LoopAction::Import {
+                path,
+                workdir,
+                name,
+            } => {
+                assert_eq!(path, "loop.json");
+                assert!(workdir.is_none());
+                assert!(name.is_none());
+            }
+            other => panic!("expected Import, got {other:?}"),
+        }
+
+        let cli = TestCli::try_parse_from([
+            "test",
+            "import",
+            "loop.json",
+            "--workdir",
+            "/tmp/proj",
+            "--name",
+            "New Name",
+        ])
+        .expect("should parse");
+        match cli.action {
+            LoopAction::Import {
+                path,
+                workdir,
+                name,
+            } => {
+                assert_eq!(path, "loop.json");
+                assert_eq!(workdir.as_deref(), Some("/tmp/proj"));
+                assert_eq!(name.as_deref(), Some("New Name"));
+            }
+            other => panic!("expected Import, got {other:?}"),
         }
     }
 
@@ -1622,6 +1813,130 @@ mod tests {
 
         let calls = fake.recorded_calls();
         assert!(calls[0]["arguments"].get("specs").is_none());
+    }
+
+    /// Export is read-only and must work without any daemon listening —
+    /// mirroring `list`/`info`, it reads the local database directly.
+    #[test]
+    fn handle_loop_export_writes_document_to_output_path_without_a_daemon() {
+        let (dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Draft);
+        db.insert_loop_node(&crate::domain::loops::LoopNode {
+            id: "n1".to_string(),
+            spec_id: None,
+            loop_id: Some("loop-1".to_string()),
+            name: "implementer".to_string(),
+            kind: crate::domain::loops::LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "claude", "prompt_template": "go"}),
+            position: 1,
+            created_at: Utc::now(),
+        })
+        .unwrap();
+
+        let out_path = dir.path().join("export.json");
+        handle_loop_export(&db, "loop-1", Some(out_path.to_str().unwrap()), false)
+            .expect("export should succeed");
+
+        let raw = std::fs::read_to_string(&out_path).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(doc["format_version"], 1);
+        assert_eq!(doc["name"], "my-loop");
+        assert!(doc["nodes"][0]["config"].get("platform").is_none());
+    }
+
+    #[test]
+    fn handle_loop_export_with_models_keeps_platform() {
+        let (dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Draft);
+        db.insert_loop_node(&crate::domain::loops::LoopNode {
+            id: "n1".to_string(),
+            spec_id: None,
+            loop_id: Some("loop-1".to_string()),
+            name: "implementer".to_string(),
+            kind: crate::domain::loops::LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "claude", "prompt_template": "go"}),
+            position: 1,
+            created_at: Utc::now(),
+        })
+        .unwrap();
+
+        let out_path = dir.path().join("export.json");
+        handle_loop_export(&db, "loop-1", Some(out_path.to_str().unwrap()), true)
+            .expect("export should succeed");
+
+        let raw = std::fs::read_to_string(&out_path).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(doc["nodes"][0]["config"]["platform"], "claude");
+    }
+
+    #[test]
+    fn handle_loop_export_rejects_unknown_loop_before_touching_disk() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Draft);
+        let err = handle_loop_export(&db, "missing", None, false).unwrap_err();
+        assert!(err.to_string().contains("No loop matches"));
+    }
+
+    /// Import delegates to the daemon's `loop_import` MCP tool — unlike
+    /// export, it has state-changing side effects (project registration,
+    /// trigger activation) that only the running daemon can perform.
+    #[test]
+    fn handle_loop_import_sends_document_workdir_and_name_to_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("loop.json");
+        std::fs::write(
+            &file_path,
+            serde_json::json!({
+                "format_version": 1,
+                "name": "Shared Loop",
+                "nodes": [],
+                "edges": [],
+                "ensembles": []
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let fake = spawn_fake_daemon(serde_json::json!({
+            "content": [{"type": "text", "text": "{\"loop_id\": \"new-1\", \"name\": \"Shared Loop\", \"nodes_missing_platform\": []}"}],
+            "isError": false
+        }));
+        let port: u16 = fake.port.parse().unwrap();
+
+        handle_loop_import(
+            Some(port),
+            file_path.to_str().unwrap(),
+            Some("/tmp/target".to_string()),
+            Some("Custom Name".to_string()),
+        )
+        .expect("import should succeed");
+
+        let calls = fake.recorded_calls();
+        assert_eq!(calls[0]["name"], "loop_import");
+        assert_eq!(calls[0]["arguments"]["workdir"], "/tmp/target");
+        assert_eq!(calls[0]["arguments"]["name"], "Custom Name");
+        assert_eq!(calls[0]["arguments"]["document"]["name"], "Shared Loop");
+    }
+
+    #[test]
+    fn handle_loop_import_rejects_missing_format_version_before_touching_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("loop.json");
+        std::fs::write(
+            &file_path,
+            serde_json::json!({"name": "x", "nodes": [], "edges": [], "ensembles": []}).to_string(),
+        )
+        .unwrap();
+
+        // No fake daemon spawned — a request that reaches the network at
+        // all would fail differently (connection refused).
+        let err =
+            handle_loop_import(Some(65535), file_path.to_str().unwrap(), None, None).unwrap_err();
+        assert!(err.to_string().contains("format_version"));
+    }
+
+    #[test]
+    fn handle_loop_import_rejects_unreadable_path() {
+        let err =
+            handle_loop_import(Some(65535), "/nonexistent/loop.json", None, None).unwrap_err();
+        assert!(err.to_string().contains("could not read"));
     }
 
     #[test]

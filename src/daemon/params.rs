@@ -796,6 +796,29 @@ pub struct LoopGetParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopExportParams {
+    /// Loop ID to export.
+    pub loop_id: String,
+    /// Include each agent node's/ensemble member's `platform`/`model` in the
+    /// document. Defaults to `false` — a shared design should never pin the
+    /// recipient to a harness or model they may not have; use `true` only
+    /// when exporting your own loop to restore later on your own machine.
+    #[serde(default)]
+    pub with_models: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopImportParams {
+    /// The exported loop document (the object `loop_export` returns).
+    #[schemars(schema_with = "arbitrary_json_value_schema")]
+    pub document: serde_json::Value,
+    /// Absolute workdir for the new loop.
+    pub workdir: String,
+    /// Loop name to use instead of the document's own `name`.
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LoopNodeRunsListParams {
     /// Loop ID whose node runs to list.
     pub loop_id: String,
