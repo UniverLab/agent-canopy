@@ -9,7 +9,7 @@ pub(crate) const KILL_GRACE: std::time::Duration = std::time::Duration::from_sec
 /// Advisory singleton lock held for the lifetime of a running daemon.
 ///
 /// The lock is acquired via `flock(2)` on a dedicated `daemon.lock` file
-/// (never on `background_agents.db`, which the TUI opens directly as a
+/// (never on the database file itself, which the TUI opens directly as a
 /// co-equal writer). Holding the `File` open keeps the OS-level flock in
 /// place; dropping this guard — including implicitly when the process exits
 /// or crashes — closes the fd and the kernel releases the lock immediately.

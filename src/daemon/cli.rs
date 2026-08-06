@@ -15,6 +15,7 @@ use crate::daemon::health_routine;
 use crate::daemon::service_install;
 use crate::db::Database;
 use crate::domain::db_health::DbHealthOutcome;
+use crate::domain::db_paths::database_path;
 
 #[derive(Subcommand)]
 pub(crate) enum DaemonAction {
@@ -61,11 +62,11 @@ pub(crate) async fn handle_daemon_action(
 /// always used before it also needed this to check who holds the port.
 ///
 /// Gated on the db file already existing: `Database::new` creates and
-/// seeds a fresh `background_agents.db` as a side effect when the path is
-/// missing, and a read-only status/stop check must not do that on a
-/// machine that has never started the daemon.
+/// seeds a fresh database as a side effect when the path is missing, and a
+/// read-only status/stop check must not do that on a machine that has
+/// never started the daemon.
 pub(crate) fn configured_port(data_dir: &std::path::Path) -> u16 {
-    let db_path = data_dir.join("background_agents.db");
+    let db_path = database_path(data_dir);
     db_path
         .exists()
         .then(|| Database::new(&db_path).ok())
@@ -290,7 +291,7 @@ fn handle_status(data_dir: &std::path::Path) -> Result<()> {
         DaemonState::Running { pid } => pid,
     };
 
-    let Ok(db) = Database::new(&data_dir.join("background_agents.db")) else {
+    let Ok(db) = Database::new(&database_path(data_dir)) else {
         println!("Daemon: RUNNING (PID: {pid})");
         return Ok(());
     };
@@ -362,7 +363,7 @@ fn handle_install_service(port_override: Option<u16>) -> Result<()> {
 /// coordination with a running daemon process — it just opens the same
 /// database file directly, the way `doctor` and `daemon status` already do.
 fn handle_health_check(data_dir: &std::path::Path) -> Result<()> {
-    let db_path = data_dir.join(health_routine::DB_FILE_NAME);
+    let db_path = database_path(data_dir);
     if !db_path.exists() {
         println!(
             "No database found at {} — nothing to check.",
@@ -370,7 +371,7 @@ fn handle_health_check(data_dir: &std::path::Path) -> Result<()> {
         );
         return Ok(());
     }
-    let backup_path = data_dir.join(health_routine::BACKUP_FILE_NAME);
+    let backup_path = health_routine::backup_path(data_dir);
     let db = Database::new(&db_path)?;
 
     println!("Running database health check...");

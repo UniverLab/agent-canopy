@@ -4,7 +4,7 @@
 //! Every one of these reaches the exact same MCP tool the daemon already
 //! exposes over its streamable-HTTP endpoint — the same interface
 //! `canopy bridge` and the TUI use (`tui::mcp_client::call_daemon_tool`) —
-//! rather than opening `background_agents.db` and reimplementing the
+//! rather than opening the database directly and reimplementing the
 //! engine's state transitions in the CLI. That second path is the exact
 //! failure mode this module exists to avoid: a CLI write must delegate to
 //! the daemon, never race or duplicate it.

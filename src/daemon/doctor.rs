@@ -8,6 +8,7 @@ use crate::daemon::process::{
     DaemonState,
 };
 use crate::db::Database;
+use crate::domain::db_paths::database_path;
 
 /// Print doctor's "verified" line — the ✓ glyph reserved for a check that
 /// actually exercised the capability it reports on (opened the database,
@@ -36,7 +37,7 @@ pub(crate) async fn run_doctor() -> Result<()> {
 
     let home = dirs::home_dir().context("No home directory")?;
     let canopy_dir = home.join(".canopy");
-    let db_path = canopy_dir.join("background_agents.db");
+    let db_path = database_path(&canopy_dir);
 
     let mut issues: Vec<String> = Vec::new();
 
@@ -353,9 +354,9 @@ pub(crate) async fn run_doctor() -> Result<()> {
                     crate::rag::embedding_client::EmbeddingProvider::Local,
                 ) {
                     // Only open the DB if it already exists — doctor is a
-                    // passive diagnostic and must not create
-                    // background_agents.db as a side effect on a machine
-                    // that's never run setup.
+                    // passive diagnostic and must not create the database
+                    // as a side effect on a machine that's never run
+                    // setup.
                     let acquisition = db_path
                         .exists()
                         .then(|| Database::new(&db_path).ok())

@@ -32,18 +32,12 @@ use crate::application::ports::StateRepository;
 use crate::db::health::integrity_check_file;
 use crate::db::Database;
 use crate::domain::db_health::{is_due, DbHealthOutcome, DbHealthStatus, STATE_KEY};
-
-/// The live database's file name — matches the literal every other live
-/// daemon code path uses (`daemon::server`, `tui::mod`, `daemon::doctor`).
-/// Deliberately not shared via a common constant (decision 7 in the
-/// health-routine spec, and out of scope: `daemon::spec_cli`'s separate
-/// wrong-path bug already shows what happens when a fifth site resolves
-/// this name its own way — the fix there is a different spec, not a shared
-/// constant introduced by this one).
-pub const DB_FILE_NAME: &str = "background_agents.db";
+use crate::domain::db_paths::{database_path, DB_FILE_NAME};
 
 /// Where the single verified backup lives, under the canopy data directory.
-pub const BACKUP_FILE_NAME: &str = "background_agents.db.backup";
+pub fn backup_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(format!("{DB_FILE_NAME}.backup"))
+}
 
 const TEMP_SUFFIX: &str = ".tmp";
 
@@ -131,8 +125,8 @@ impl HealthRoutine {
         }
 
         let db = Arc::clone(&self.db);
-        let db_path = self.data_dir.join(DB_FILE_NAME);
-        let backup_path = self.data_dir.join(BACKUP_FILE_NAME);
+        let db_path = database_path(&self.data_dir);
+        let backup_path = backup_path(&self.data_dir);
         let new_status = match tokio::task::spawn_blocking(move || {
             run_health_check(&db, &db_path, &backup_path)
         })
@@ -382,12 +376,12 @@ mod tests {
     #[test]
     fn run_health_check_passes_on_a_healthy_database_and_writes_a_verified_backup() {
         let dir = tempdir().unwrap();
-        let db_path = dir.path().join(DB_FILE_NAME);
+        let db_path = database_path(dir.path());
         let db = Database::new(&db_path).unwrap();
         db.insert_terminal_session("t1", "t1", "bash", "/tmp")
             .unwrap();
 
-        let backup_path = dir.path().join(BACKUP_FILE_NAME);
+        let backup_path = backup_path(dir.path());
         let status = run_health_check(&db, &db_path, &backup_path);
 
         assert_eq!(status.outcome, Some(DbHealthOutcome::Passed));
@@ -408,7 +402,7 @@ mod tests {
     #[test]
     fn run_health_check_skips_backup_when_integrity_check_fails() {
         let dir = tempdir().unwrap();
-        let db_path = dir.path().join(DB_FILE_NAME);
+        let db_path = database_path(dir.path());
         {
             let db = Database::new(&db_path).unwrap();
             db.insert_terminal_session("t1", "t1", "bash", "/tmp")
@@ -427,7 +421,7 @@ mod tests {
         std::fs::write(&db_path, &bytes).unwrap();
 
         let db = Database::new(&db_path).unwrap();
-        let backup_path = dir.path().join(BACKUP_FILE_NAME);
+        let backup_path = backup_path(dir.path());
         let status = run_health_check(&db, &db_path, &backup_path);
 
         assert_eq!(status.outcome, Some(DbHealthOutcome::IntegrityFailed));
@@ -443,12 +437,12 @@ mod tests {
     #[test]
     fn finalize_backup_leaves_previous_backup_untouched_when_new_backup_fails_verification() {
         let dir = tempdir().unwrap();
-        let db_path = dir.path().join(DB_FILE_NAME);
+        let db_path = database_path(dir.path());
         let db = Database::new(&db_path).unwrap();
         db.insert_terminal_session("t1", "t1", "bash", "/tmp")
             .unwrap();
 
-        let backup_path = dir.path().join(BACKUP_FILE_NAME);
+        let backup_path = backup_path(dir.path());
         // Seed a previous good backup.
         db.backup_into(&backup_path).unwrap();
         let previous_backup_bytes = std::fs::read(&backup_path).unwrap();
@@ -499,12 +493,12 @@ mod tests {
     #[test]
     fn interrupted_backup_leaves_previous_backup_intact_and_the_next_run_recovers() {
         let dir = tempdir().unwrap();
-        let db_path = dir.path().join(DB_FILE_NAME);
+        let db_path = database_path(dir.path());
         let db = Database::new(&db_path).unwrap();
         db.insert_terminal_session("t1", "t1", "bash", "/tmp")
             .unwrap();
 
-        let backup_path = dir.path().join(BACKUP_FILE_NAME);
+        let backup_path = backup_path(dir.path());
         db.backup_into(&backup_path).unwrap();
         let previous_backup_bytes = std::fs::read(&backup_path).unwrap();
 
@@ -533,7 +527,7 @@ mod tests {
     #[tokio::test]
     async fn maybe_run_records_a_skip_without_running_when_the_daemon_is_busy() {
         let dir = tempdir().unwrap();
-        let db_path = dir.path().join(DB_FILE_NAME);
+        let db_path = database_path(dir.path());
         let db = Arc::new(Database::new(&db_path).unwrap());
         db.insert_loop(&make_running_loop("loop-1")).unwrap();
 
@@ -547,13 +541,13 @@ mod tests {
         );
         assert!(status.last_skip_at.is_some());
         assert!(status.last_skip_reason.unwrap().contains("running"));
-        assert!(!dir.path().join(BACKUP_FILE_NAME).exists());
+        assert!(!backup_path(dir.path()).exists());
     }
 
     #[tokio::test]
     async fn maybe_run_runs_and_records_a_pass_when_idle() {
         let dir = tempdir().unwrap();
-        let db_path = dir.path().join(DB_FILE_NAME);
+        let db_path = database_path(dir.path());
         let db = Arc::new(Database::new(&db_path).unwrap());
 
         let routine = HealthRoutine::new(Arc::clone(&db), dir.path().to_path_buf());
@@ -562,7 +556,7 @@ mod tests {
         let status = load_status(&db);
         assert_eq!(status.outcome, Some(DbHealthOutcome::Passed));
         assert!(status.last_run_at.is_some());
-        assert!(dir.path().join(BACKUP_FILE_NAME).exists());
+        assert!(backup_path(dir.path()).exists());
     }
 
     // ── is_due gating inside maybe_run ──────────────────────────────────
@@ -570,7 +564,7 @@ mod tests {
     #[tokio::test]
     async fn maybe_run_does_nothing_when_not_yet_due() {
         let dir = tempdir().unwrap();
-        let db_path = dir.path().join(DB_FILE_NAME);
+        let db_path = database_path(dir.path());
         let db = Arc::new(Database::new(&db_path).unwrap());
         save_status(
             &db,
@@ -586,7 +580,7 @@ mod tests {
         routine.maybe_run().await;
 
         assert!(
-            !dir.path().join(BACKUP_FILE_NAME).exists(),
+            !backup_path(dir.path()).exists(),
             "must not run again immediately after a fresh pass"
         );
     }

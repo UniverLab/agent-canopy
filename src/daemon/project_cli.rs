@@ -10,6 +10,7 @@ use clap::Subcommand;
 
 use crate::db::project::{resolve_remap_path, RemapOutcome};
 use crate::db::Database;
+use crate::domain::db_paths::database_path;
 use crate::domain::project::RemapKind;
 
 #[derive(Subcommand)]
@@ -49,7 +50,7 @@ async fn handle_remap(
     force: bool,
 ) -> Result<()> {
     let data_dir = crate::ensure_data_dir()?;
-    let db = Database::new(&data_dir.join("background_agents.db"))?;
+    let db = Database::new(&database_path(&data_dir))?;
 
     let resolved = resolve_remap_path(new_path, force)?;
 

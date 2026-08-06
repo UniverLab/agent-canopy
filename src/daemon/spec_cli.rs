@@ -3,9 +3,9 @@
 //! Every subcommand here changes state (a spec's status, or the backlog
 //! itself), so each one delegates to the daemon's MCP tool of the same
 //! purpose (`spec_set_status`, `spec_create`, `queue_add_spec`) via
-//! `daemon::cli_daemon::call_tool` rather than writing to
-//! `background_agents.db` directly — see `loop_cli.rs` for the same
-//! pattern applied to loop state.
+//! `daemon::cli_daemon::call_tool` rather than writing to the database
+//! directly — see `loop_cli.rs` for the same pattern applied to loop
+//! state.
 
 use anyhow::{anyhow, Result};
 use clap::Subcommand;

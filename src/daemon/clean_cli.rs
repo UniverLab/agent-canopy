@@ -21,6 +21,7 @@ use crate::domain::canopy_config::CanopyConfig;
 use crate::domain::clean::{
     self, CleanPlan, FileCandidate, HardCascadeCandidate, HardCascadePlan, ProjectCandidate,
 };
+use crate::domain::db_paths::database_path;
 
 pub async fn handle_clean_action(
     dry_run: bool,
@@ -31,7 +32,7 @@ pub async fn handle_clean_action(
     stop_daemon: bool,
 ) -> Result<()> {
     let data_dir = crate::ensure_data_dir()?;
-    let db_path = data_dir.join("background_agents.db");
+    let db_path = database_path(&data_dir);
     let db = Database::new(&db_path)?;
     let config = CanopyConfig::load(&data_dir);
     let retention_days = older_than.unwrap_or(config.clean.retention_days);

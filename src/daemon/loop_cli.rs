@@ -2,7 +2,7 @@
 //!
 //! `list`/`info` are read-only: mirror `canopy rag report` (see
 //! `rag_cli.rs`) in spirit — a terminal view onto state that previously
-//! required querying `background_agents.db` directly. Every other
+//! required querying the database directly. Every other
 //! subcommand (`run`/`pause`/`continue`/`reset`/`autorun`) changes loop
 //! state, so it resolves the target loop against that same local database
 //! (exactly as `list`/`info` already do — see [`resolve_loop`]) but then
@@ -19,6 +19,7 @@ use clap::Subcommand;
 
 use crate::daemon::cli_daemon::call_tool;
 use crate::db::Database;
+use crate::domain::db_paths::database_path;
 use crate::domain::loops::{
     Loop, LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus,
 };
@@ -101,7 +102,7 @@ pub(crate) async fn handle_loop_action(
     port_override: Option<u16>,
 ) -> Result<()> {
     let data_dir = crate::ensure_data_dir()?;
-    let db = Database::new(&data_dir.join("background_agents.db"))?;
+    let db = Database::new(&database_path(&data_dir))?;
 
     match action {
         LoopAction::List { workdir } => handle_loop_list(&db, workdir.as_deref()),

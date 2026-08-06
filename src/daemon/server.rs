@@ -11,6 +11,7 @@ use crate::daemon::process::{
 };
 use crate::daemon::TaskTriggerHandler;
 use crate::db::Database;
+use crate::domain::db_paths::database_path;
 use crate::executor::Executor;
 use crate::loop_engine::LoopEngine;
 use crate::rag::ingestion::IngestionManager;
@@ -26,7 +27,7 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
     let port = crate::resolve_port(port_override);
     let data_dir = crate::ensure_data_dir()?;
     let _daemon_lock = acquire_daemon_lock(&data_dir)?;
-    let db = Arc::new(Database::new(&data_dir.join("background_agents.db"))?);
+    let db = Arc::new(Database::new(&database_path(&data_dir))?);
     if let Err(e) = crate::domain::prompts::seed_builtin_prompt_presets(&data_dir) {
         tracing::warn!("Could not seed builtin prompt presets: {e}");
     }
@@ -254,7 +255,7 @@ pub(crate) async fn run_stdio_server() -> Result<()> {
     tracing::info!("Starting in stdio MCP transport mode");
 
     let data_dir = crate::ensure_data_dir()?;
-    let db = Arc::new(Database::new(&data_dir.join("background_agents.db"))?);
+    let db = Arc::new(Database::new(&database_path(&data_dir))?);
     if let Err(e) = crate::domain::prompts::seed_builtin_prompt_presets(&data_dir) {
         tracing::warn!("Could not seed builtin prompt presets: {e}");
     }

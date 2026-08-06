@@ -20,6 +20,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::application::ports::StateRepository;
 use crate::db::Database;
+use crate::domain::db_paths::database_path;
 use crate::shared::sync_identity::{
     CANOPY_AGENT_ID_ENV, CANOPY_AGENT_ID_HEADER, CANOPY_CLIENT_NAME_ENV, CANOPY_CLIENT_NAME_HEADER,
     CANOPY_SEED_ID_ENV, CANOPY_SEED_ID_HEADER, CANOPY_WORKDIR_ENV,
@@ -151,7 +152,7 @@ fn register_standalone_session(agent_id: &str, workdir: &str) {
     // real session's codename (e.g. "boletus") instead of the bare, collidable
     // literal "standalone".
     let result = crate::ensure_data_dir()
-        .and_then(|data_dir| Database::new(&data_dir.join("background_agents.db")))
+        .and_then(|data_dir| Database::new(&database_path(&data_dir)))
         .and_then(|db| {
             db.insert_interactive_session(
                 agent_id,
@@ -173,7 +174,7 @@ fn register_standalone_session(agent_id: &str, workdir: &str) {
 fn finish_standalone_session(agent_id: &str, success: bool) {
     let exit_code = if success { 0 } else { 1 };
     let result = crate::ensure_data_dir()
-        .and_then(|data_dir| Database::new(&data_dir.join("background_agents.db")))
+        .and_then(|data_dir| Database::new(&database_path(&data_dir)))
         .and_then(|db| db.finish_interactive_session(agent_id, exit_code));
 
     if let Err(err) = result {
@@ -496,9 +497,9 @@ fn resolve_workdir(workdir_arg: Option<PathBuf>) -> Result<String> {
 /// Shared with the state-changing `canopy loop`/`canopy spec` subcommands
 /// (`daemon::cli_daemon`) so every CLI path that talks to the daemon's MCP
 /// endpoint resolves the port the same way the bridge does — reading the
-/// daemon's own reported port from `background_agents.db` rather than
-/// assuming the default, which is what makes this resolution survive a
-/// stale process squatting on 7755.
+/// daemon's own reported port from the database rather than assuming the
+/// default, which is what makes this resolution survive a stale process
+/// squatting on 7755.
 pub(crate) fn resolve_bridge_port(port_arg: Option<u16>) -> u16 {
     if let Some(port) = port_arg {
         return port;
@@ -518,7 +519,7 @@ pub(crate) fn resolve_bridge_port(port_arg: Option<u16>) -> u16 {
 }
 
 fn read_port_from_state(data_dir: &Path) -> Option<u16> {
-    let db_path = data_dir.join("background_agents.db");
+    let db_path = database_path(data_dir);
     let db = Database::new(&db_path).ok()?;
     let port_str = db.get_state("port").ok()??;
     port_str.trim().parse::<u16>().ok()

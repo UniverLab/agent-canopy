@@ -154,7 +154,7 @@ fn modified_time(path: &Path) -> Option<std::time::SystemTime> {
 fn has_other_canopy_state(canopy_dir: &Path) -> bool {
     [
         "config.toml",
-        "background_agents.db",
+        crate::domain::db_paths::DB_FILE_NAME,
         "cli_config.json",
         "daemon.pid",
     ]

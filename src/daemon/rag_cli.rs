@@ -5,6 +5,7 @@ use clap::Subcommand;
 
 use crate::application::ports::StateRepository;
 use crate::db::Database;
+use crate::domain::db_paths::database_path;
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum RagAction {
@@ -46,7 +47,7 @@ pub(crate) enum ModelAction {
 
 pub(crate) async fn handle_rag_action(action: RagAction) -> Result<()> {
     let data_dir = crate::ensure_data_dir()?;
-    let db = Database::new(&data_dir.join("background_agents.db"))?;
+    let db = Database::new(&database_path(&data_dir))?;
 
     match action {
         RagAction::AutoIndex {

@@ -9,6 +9,7 @@ pub mod clean;
 pub mod cli_config;
 pub mod cli_strategy;
 pub mod db_health;
+pub mod db_paths;
 pub mod gamification;
 pub mod loops;
 pub mod models;
