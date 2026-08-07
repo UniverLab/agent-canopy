@@ -1302,6 +1302,18 @@ impl LoopEngine {
                         status = ?final_execution.status,
                         "no outgoing edge matched; spec terminating"
                     );
+                    if final_execution.status == LoopRunStatus::Fail {
+                        if let Some(terminal_run_id) = run_id.as_deref() {
+                            let node_name = nodes_by_id
+                                .get(from_node_id.as_str())
+                                .map_or(from_node_id.as_str(), |node| node.name.as_str());
+                            self.record_terminal_blocker(
+                                terminal_run_id,
+                                node_name,
+                                &final_execution,
+                            )?;
+                        }
+                    }
                 }
             }
 
@@ -1335,6 +1347,43 @@ impl LoopEngine {
                 }
             }
         }
+    }
+
+    /// A spec that terminates because a FAILING node had no outgoing edge
+    /// leaves no blocker anywhere a human can see unless something writes
+    /// one — see the module-level defect this closes. Writes a derived
+    /// blocker onto the terminating run's `output.blocker`, the exact key
+    /// `loop_run_blocker` (daemon/handler.rs) already reads for `loop_list`
+    /// and `loop_get`'s `blocked`/`blocker` fields, so no reader needs to
+    /// change. Never invoked for a PASSING termination (the normal, correct
+    /// end of a spec — see `Check committed`) and never overwrites a
+    /// blocker `loop_report_blocker` already recorded, since that text is
+    /// more specific than anything derived here.
+    fn record_terminal_blocker(
+        &self,
+        run_id: &str,
+        node_name: &str,
+        final_execution: &NodeExecution,
+    ) -> anyhow::Result<()> {
+        if final_execution.output.get("blocker").is_some() {
+            return Ok(());
+        }
+        let blocker = format!(
+            "Spec terminated: node '{}' ended '{}' with no outgoing edge for that status. {}",
+            node_name,
+            final_execution.status.as_str(),
+            final_execution.summary,
+        );
+        let mut output = final_execution.output.clone();
+        match output.as_object_mut() {
+            Some(map) => {
+                map.insert("blocker".to_string(), Value::String(blocker));
+            }
+            None => output = serde_json::json!({ "blocker": blocker }),
+        }
+        self.db
+            .update_loop_run_result(run_id, final_execution.status, Some(&output), None)?;
+        Ok(())
     }
 
     /// Run an ensemble's members concurrently (F1), wait for every one of
@@ -9003,6 +9052,149 @@ echo done
         assert_eq!(lp.status, LoopStatus::Running);
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
         assert_eq!(spec.status, LoopSpecStatus::Running);
+    }
+
+    // ── terminal blocker: dead-ending on a failing node must self-explain ──
+
+    /// The defect this closes (2026-08-06, loop 824de730): a spec that dies
+    /// because a FAILING node has no outgoing edge left NOTHING visible
+    /// beyond a log line — no blocker anywhere `loop_list`/the TUI could
+    /// show. The engine must now derive one, naming the node and what it
+    /// reported, onto the terminating run's `output.blocker` — the exact
+    /// key `loop_run_blocker` (daemon/handler.rs) already reads.
+    #[tokio::test]
+    async fn terminal_fail_node_with_no_outgoing_edge_records_a_derived_blocker() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "dead-end".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "dead-end".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "exit 1",
+                "success_condition": "exit_code_0",
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        // No outgoing edge from "dead-end" for either status: the spec
+        // dead-ends right here.
+
+        engine.run_loop(loop_id, None, None).await.unwrap();
+
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(spec.status, LoopSpecStatus::Failed);
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, LoopRunStatus::Fail);
+        let blocker = runs[0]
+            .output
+            .as_ref()
+            .and_then(|output| output.get("blocker"))
+            .and_then(Value::as_str)
+            .expect("a failing dead-end must record a blocker");
+        assert!(blocker.contains("dead-end"), "blocker: {blocker}");
+    }
+
+    /// The mirror image: a PASSING dead-end (no outgoing edge for `Pass`)
+    /// is the normal, correct end of a spec — exactly what `Check
+    /// committed` does on every successful spec — and must record no
+    /// blocker at all. Getting this wrong would mark every healthy spec as
+    /// blocked.
+    #[tokio::test]
+    async fn terminal_pass_node_with_no_outgoing_edge_records_no_blocker() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "check-committed".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "check-committed".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "exit 0",
+                "success_condition": "exit_code_0",
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id, None, None).await.unwrap();
+
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(spec.status, LoopSpecStatus::Completed);
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, LoopRunStatus::Pass);
+        assert!(
+            runs[0]
+                .output
+                .as_ref()
+                .is_none_or(|output| output.get("blocker").is_none()),
+            "a passing dead-end must never record a blocker"
+        );
+    }
+
+    /// A blocker already written by `loop_report_blocker` is more specific
+    /// than anything the engine can synthesise — `record_terminal_blocker`
+    /// must never overwrite it.
+    #[tokio::test]
+    async fn record_terminal_blocker_preserves_an_existing_blocker() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "node".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        let run_id = "run-with-existing-blocker".to_string();
+        let existing_output = serde_json::json!({ "blocker": "human already reported this" });
+        db.insert_loop_run(&LoopNodeRun {
+            id: run_id.clone(),
+            loop_id,
+            spec_id,
+            node_id: "node".to_string(),
+            status: LoopRunStatus::Fail,
+            input: None,
+            output: Some(existing_output.clone()),
+            started_at: chrono::Utc::now(),
+            completed_at: Some(chrono::Utc::now()),
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        })
+        .unwrap();
+
+        let final_execution = NodeExecution {
+            status: LoopRunStatus::Fail,
+            output: existing_output,
+            summary: "whatever the node reported".to_string(),
+        };
+        engine
+            .record_terminal_blocker(&run_id, "node", &final_execution)
+            .unwrap();
+
+        let run = db.get_loop_run(&run_id).unwrap().unwrap();
+        let blocker = run
+            .output
+            .as_ref()
+            .and_then(|output| output.get("blocker"))
+            .and_then(Value::as_str)
+            .unwrap();
+        assert_eq!(blocker, "human already reported this");
     }
 
     // ── fail_loop: scoped to the dispatch generation that failed ─────────

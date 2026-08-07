@@ -1842,12 +1842,20 @@ fn build_spec_run_info(db: &Database, spec: &LoopSpec) -> Result<SpecRunInfo, Mc
 
 fn build_loop_summary_json(db: &Database, lp: &Loop) -> Result<serde_json::Value, McpError> {
     let specs = db.list_loop_specs(&lp.id).map_err(internal_error)?;
+    // `Failed` is included so a spec that dead-ended on a failing node with
+    // no outgoing edge still surfaces here — dispatch stops on the first
+    // `Failed` spec (never advances past it), so it's always the earliest
+    // non-terminal spec in position order and `find` still picks it over
+    // any untouched `Pending` spec that was never reached.
     let current_spec = specs
         .into_iter()
         .find(|spec| {
             matches!(
                 spec.status,
-                LoopSpecStatus::Running | LoopSpecStatus::Pending | LoopSpecStatus::Interrupted
+                LoopSpecStatus::Running
+                    | LoopSpecStatus::Pending
+                    | LoopSpecStatus::Interrupted
+                    | LoopSpecStatus::Failed
             )
         })
         .map(|spec| build_spec_run_info(db, &spec))
@@ -16869,6 +16877,65 @@ mod endpoint_tests {
             db.get_loop(&lp.id).unwrap().unwrap().status,
             LoopStatus::Paused
         );
+    }
+
+    /// The defect this closes (2026-08-06, loop 824de730): a spec that dies
+    /// because a FAILING node has no outgoing edge left no blocker anywhere
+    /// a human could see from `loop_list` — the engine now derives one onto
+    /// the terminating run (`LoopEngine::record_terminal_blocker`), and
+    /// `loop_list` picks it up through the unchanged `loop_run_blocker`
+    /// read path, with no MCP-side change required.
+    #[tokio::test]
+    async fn loop_list_reports_blocked_for_a_spec_that_dead_ends_on_a_failing_node() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        db.insert_loop_node(&LoopNode {
+            id: "dead-end".to_string(),
+            spec_id: Some(spec.id.clone()),
+            loop_id: None,
+            name: "dead-end".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "exit 1",
+                "success_condition": "exit_code_0",
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        // No outgoing edge from "dead-end" for either status — the spec
+        // terminates right there.
+
+        handler
+            .loop_engine
+            .run_loop(lp.id.clone(), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.get_loop_spec(&spec.id).unwrap().unwrap().status,
+            LoopSpecStatus::Failed
+        );
+
+        let listed = handler
+            .loop_list(Parameters(LoopListParams {
+                workdir: None,
+                include_archived: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&listed), "{}", text(&listed));
+        let value: serde_json::Value = serde_json::from_str(&raw_text(&listed)).unwrap();
+        let entry = value
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["id"] == lp.id)
+            .expect("loop must appear in loop_list");
+        assert_eq!(entry["blocked"], serde_json::json!(true));
+        let blocker = entry["blocker"].as_str().expect("blocker must be a string");
+        assert!(blocker.contains("dead-end"), "blocker: {blocker}");
     }
 
     // ── loop_copy_node / loop_copy_ensemble ───────────────────────
