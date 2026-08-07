@@ -207,13 +207,56 @@ const MODEL_PROVIDERS: &[(&str, &str)] = &[
     ("alibaba", "Alibaba"),
 ];
 
-/// Newest models listed per provider in `agent_models`.
+/// Cap on how many models are shown per provider in `agent_models` before
+/// `full: true` is required to see the rest — *not* a "newest N" guarantee:
+/// ordering is source-dependent (see [`format_models_for_providers`], which
+/// sorts by release date, and [`format_native_models`], which preserves
+/// whatever order the CLI itself enumerated in, e.g. alphabetical for
+/// opencode-go). Anything this cap cuts is reported via [`ModelTruncation`].
 const MODELS_PER_PROVIDER: usize = 8;
 
 /// Cap on how many providers a single (platform-scoped) listing renders, so a
 /// universal-gateway platform mapped to many providers still can't blow past
 /// MCP result size limits: at most `MAX_PROVIDERS * MODELS_PER_PROVIDER` lines.
+/// Bypassed by `full: true`; anything it cuts is reported via
+/// [`ModelTruncation`].
 const MAX_PROVIDERS: usize = 12;
+
+/// What a `format_*_models` call left out, so the caller can render an honest
+/// notice instead of silently dropping ids that exist. Both fields empty
+/// means nothing was cut.
+#[derive(Default, Debug, PartialEq)]
+pub(crate) struct ModelTruncation {
+    /// Providers whose own model list was cut by [`MODELS_PER_PROVIDER`]:
+    /// (display name, shown, total).
+    per_provider: Vec<(String, usize, usize)>,
+    /// Providers dropped entirely by [`MAX_PROVIDERS`]: (shown, total).
+    providers: Option<(usize, usize)>,
+}
+
+impl ModelTruncation {
+    fn is_empty(&self) -> bool {
+        self.per_provider.is_empty() && self.providers.is_none()
+    }
+
+    /// Render as a footer-voice notice, or `None` if nothing was cut.
+    pub(crate) fn notice(&self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut lines = Vec::new();
+        for (display, shown, total) in &self.per_provider {
+            lines.push(format!("  {display}: showing {shown} of {total} models"));
+        }
+        if let Some((shown, total)) = self.providers {
+            lines.push(format!("  showing {shown} of {total} providers"));
+        }
+        Some(format!(
+            "Truncated (pass `full: true` to see everything):\n{}",
+            lines.join("\n")
+        ))
+    }
+}
 
 /// Human-readable name for a provider slug — the curated display name when we
 /// have one, otherwise a title-cased fallback so platform-native providers
@@ -234,37 +277,44 @@ fn provider_display(slug: &str) -> String {
         .join(" ")
 }
 
-/// Format the cached models.dev catalog: newest models per major provider.
-pub(crate) fn format_catalog_models(catalog: &crate::domain::models_db::ModelCatalog) -> String {
+/// Format the cached models.dev catalog: models per major provider, source
+/// order (release-date descending when dates are present), bounded by
+/// [`MAX_PROVIDERS`] x [`MODELS_PER_PROVIDER`] unless `full` is true.
+pub(crate) fn format_catalog_models(
+    catalog: &crate::domain::models_db::ModelCatalog,
+    full: bool,
+) -> (String, ModelTruncation) {
     let providers: Vec<(&str, String)> = MODEL_PROVIDERS
         .iter()
         .map(|(slug, display)| (*slug, (*display).to_string()))
         .collect();
-    format_models_for_providers(catalog, &providers)
+    format_models_for_providers(catalog, &providers, full)
 }
 
 /// Format only the models available to `provider_slugs` (a platform's mapped
-/// providers), newest-first per provider, bounded by [`MAX_PROVIDERS`].
+/// providers), source order (release-date descending when dates are present),
+/// bounded by [`MAX_PROVIDERS`] x [`MODELS_PER_PROVIDER`] unless `full` is true.
 pub(crate) fn format_platform_models(
     catalog: &crate::domain::models_db::ModelCatalog,
     provider_slugs: &[&str],
-) -> String {
+    full: bool,
+) -> (String, ModelTruncation) {
     let providers: Vec<(&str, String)> = provider_slugs
         .iter()
         .map(|slug| (*slug, provider_display(slug)))
         .collect();
-    format_models_for_providers(catalog, &providers)
+    format_models_for_providers(catalog, &providers, full)
 }
 
 /// Format a platform's native enumeration (e.g. `opencode models`): the ids are
 /// already the literal, passable strings the CLI accepts (`opencode/big-pickle`),
 /// so they are rendered verbatim — never re-derived — grouped by their provider
 /// prefix (the segment before the first `/`) for readability and bounded by the
-/// same [`MAX_PROVIDERS`] x [`MODELS_PER_PROVIDER`] caps as the models.dev path.
-/// The id is always the first token on the line; the parenthetical is only a
-/// human label, so a caller copying the id verbatim always succeeds.
-pub(crate) fn format_native_models(ids: &[String]) -> String {
-    // Group by provider prefix, preserving first-seen order.
+/// same [`MAX_PROVIDERS`] x [`MODELS_PER_PROVIDER`] caps as the models.dev path
+/// unless `full` is true. The id is always the first token on the line; the
+/// parenthetical is only a human label, so a caller copying the id verbatim
+/// always succeeds.
+pub(crate) fn format_native_models(ids: &[String], full: bool) -> (String, ModelTruncation) {
     let mut groups: Vec<(String, Vec<&String>)> = Vec::new();
     for id in ids {
         let provider = id.split_once('/').map(|(p, _)| p).unwrap_or("");
@@ -274,39 +324,76 @@ pub(crate) fn format_native_models(ids: &[String]) -> String {
         }
     }
 
-    groups
+    let mut truncation = ModelTruncation::default();
+    let total_providers = groups.len();
+    let providers_to_show = if full {
+        total_providers
+    } else {
+        total_providers.min(MAX_PROVIDERS)
+    };
+
+    if !full && total_providers > MAX_PROVIDERS {
+        truncation.providers = Some((providers_to_show, total_providers));
+    }
+
+    let sections: Vec<String> = groups
         .iter()
-        .take(MAX_PROVIDERS)
+        .take(providers_to_show)
         .map(|(provider, models)| {
             let display = if provider.is_empty() {
                 "native".to_string()
             } else {
                 provider_display(provider)
             };
+            let total_models = models.len();
+            let models_to_show = if full {
+                total_models
+            } else {
+                total_models.min(MODELS_PER_PROVIDER)
+            };
+
+            if !full && total_models > MODELS_PER_PROVIDER {
+                truncation
+                    .per_provider
+                    .push((display.clone(), models_to_show, total_models));
+            }
+
             models
                 .iter()
-                .take(MODELS_PER_PROVIDER)
+                .take(models_to_show)
                 .map(|id| format!("  {id}  ({display})"))
                 .collect::<Vec<_>>()
                 .join("\n")
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+
+    (sections.join("\n"), truncation)
 }
 
-/// Shared renderer: newest [`MODELS_PER_PROVIDER`] models for each listed
-/// provider that has any, skipping empty providers, capped at [`MAX_PROVIDERS`]
-/// non-empty providers.
+/// Shared renderer: source order (release-date descending when dates are
+/// present) models for each listed provider that has any, skipping empty
+/// providers, capped at [`MAX_PROVIDERS`] non-empty providers x
+/// [`MODELS_PER_PROVIDER`] models unless `full` is true.
 fn format_models_for_providers(
     catalog: &crate::domain::models_db::ModelCatalog,
     providers: &[(&str, String)],
-) -> String {
+    full: bool,
+) -> (String, ModelTruncation) {
     let mut sections = Vec::new();
+    let mut truncation = ModelTruncation::default();
 
-    for (slug, display) in providers {
-        if sections.len() >= MAX_PROVIDERS {
-            break;
-        }
+    let total_providers = providers.len();
+    let providers_to_show = if full {
+        total_providers
+    } else {
+        total_providers.min(MAX_PROVIDERS)
+    };
+
+    if !full && total_providers > MAX_PROVIDERS {
+        truncation.providers = Some((providers_to_show, total_providers));
+    }
+
+    for (slug, display) in providers.iter().take(providers_to_show) {
         let mut models: Vec<_> = catalog
             .models
             .iter()
@@ -315,19 +402,31 @@ fn format_models_for_providers(
         if models.is_empty() {
             continue;
         }
-        // ISO release dates sort lexically; undated models go last.
         models.sort_by(|a, b| b.release_date.cmp(&a.release_date));
+
+        let total_models = models.len();
+        let models_to_show = if full {
+            total_models
+        } else {
+            total_models.min(MODELS_PER_PROVIDER)
+        };
+
+        if !full && total_models > MODELS_PER_PROVIDER {
+            truncation
+                .per_provider
+                .push((display.clone(), models_to_show, total_models));
+        }
 
         let lines = models
             .iter()
-            .take(MODELS_PER_PROVIDER)
+            .take(models_to_show)
             .map(|m| format!("  {}  ({display})", m.id))
             .collect::<Vec<_>>()
             .join("\n");
         sections.push(lines);
     }
 
-    sections.join("\n")
+    (sections.join("\n"), truncation)
 }
 
 #[cfg(test)]
@@ -681,7 +780,7 @@ mod formatting_unit_tests {
             models: vec![],
             fetched_at: SystemTime::now(),
         };
-        let out = format_catalog_models(&catalog);
+        let (out, _) = format_catalog_models(&catalog, false);
         assert!(out.is_empty());
     }
 
@@ -708,7 +807,7 @@ mod formatting_unit_tests {
             ],
             fetched_at: SystemTime::now(),
         };
-        let out = format_catalog_models(&catalog);
+        let (out, _) = format_catalog_models(&catalog, false);
         assert!(out.contains("claude-opus-4-8"));
         assert!(out.contains("claude-sonnet-4-6"));
         assert!(out.contains("(Anthropic)"));
@@ -728,7 +827,7 @@ mod formatting_unit_tests {
             }],
             fetched_at: SystemTime::now(),
         };
-        let out = format_catalog_models(&catalog);
+        let (out, _) = format_catalog_models(&catalog, false);
         // anthropic is listed first in MODEL_PROVIDERS but has no models → skipped
         assert!(out.contains("gpt-4"));
         assert!(out.contains("(OpenAI)"));
@@ -757,7 +856,7 @@ mod formatting_unit_tests {
             ],
             fetched_at: SystemTime::now(),
         };
-        let out = format_catalog_models(&catalog);
+        let (out, _) = format_catalog_models(&catalog, false);
         let new_pos = out.find("new-model").unwrap();
         let old_pos = out.find("old-model").unwrap();
         assert!(new_pos < old_pos, "newer model should appear first");
@@ -780,10 +879,14 @@ mod formatting_unit_tests {
             models,
             fetched_at: SystemTime::now(),
         };
-        let out = format_catalog_models(&catalog);
-        // Only MODELS_PER_PROVIDER (8) should appear
+        let (out, truncation) = format_catalog_models(&catalog, false);
         let anthropic_lines = out.lines().filter(|l| l.contains("Anthropic")).count();
-        assert!(anthropic_lines <= MODELS_PER_PROVIDER);
+        assert_eq!(anthropic_lines, MODELS_PER_PROVIDER);
+        assert_eq!(truncation.per_provider.len(), 1);
+        assert_eq!(
+            truncation.per_provider[0],
+            ("Anthropic".to_string(), MODELS_PER_PROVIDER, 20)
+        );
     }
 
     // ── format_platform_models ───────────────────────────────────────
@@ -802,7 +905,7 @@ mod formatting_unit_tests {
             }],
             fetched_at: SystemTime::now(),
         };
-        let out = format_platform_models(&catalog, &["my-custom"]);
+        let (out, _) = format_platform_models(&catalog, &["my-custom"], false);
         assert!(out.contains("my-model"));
         assert!(out.contains("(My Custom)"));
     }
@@ -825,26 +928,26 @@ mod formatting_unit_tests {
             fetched_at: SystemTime::now(),
         };
         let slugs: Vec<&str> = (0..15)
-            .map(|i| {
-                // Leak a small string so we get &str; fine for tests
-                Box::leak(format!("provider-{i}").into_boxed_str()) as &str
-            })
+            .map(|i| Box::leak(format!("provider-{i}").into_boxed_str()) as &str)
             .collect();
-        // Should not panic; bounded by MAX_PROVIDERS
-        let _ = format_platform_models(&catalog, &slugs);
+        let (_, truncation) = format_platform_models(&catalog, &slugs, false);
+        assert!(truncation.providers.is_some());
+        assert_eq!(truncation.providers.unwrap(), (MAX_PROVIDERS, 15));
     }
 
     // ── format_native_models edge cases ──────────────────────────────
 
     #[test]
     fn native_models_empty() {
-        assert_eq!(format_native_models(&[]), "");
+        let (out, truncation) = format_native_models(&[], false);
+        assert_eq!(out, "");
+        assert!(truncation.is_empty());
     }
 
     #[test]
     fn native_models_no_slash() {
         let ids = vec!["bare-model-id".to_string()];
-        let out = format_native_models(&ids);
+        let (out, _) = format_native_models(&ids, false);
         assert!(out.contains("bare-model-id"));
         assert!(out.contains("(native)"));
     }
@@ -856,7 +959,7 @@ mod formatting_unit_tests {
             "openai/gpt-b".to_string(),
             "anthropic/claude-c".to_string(),
         ];
-        let out = format_native_models(&ids);
+        let (out, _) = format_native_models(&ids, false);
         let a_pos = out.find("claude-a").unwrap();
         let b_pos = out.find("gpt-b").unwrap();
         let c_pos = out.find("claude-c").unwrap();
@@ -867,17 +970,24 @@ mod formatting_unit_tests {
     #[test]
     fn native_models_many_providers_capped() {
         let ids: Vec<String> = (0..30).map(|i| format!("prov{i}/model-{i}")).collect();
-        let out = format_native_models(&ids);
+        let (out, truncation) = format_native_models(&ids, false);
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines.len() <= MAX_PROVIDERS * MODELS_PER_PROVIDER);
+        assert!(truncation.providers.is_some());
+        assert_eq!(truncation.providers.unwrap(), (MAX_PROVIDERS, 30));
     }
 
     #[test]
     fn native_models_many_models_per_provider_capped() {
         let ids: Vec<String> = (0..30).map(|i| format!("anthropic/model-{i}")).collect();
-        let out = format_native_models(&ids);
+        let (out, truncation) = format_native_models(&ids, false);
         let anthropic_lines = out.lines().filter(|l| l.contains("Anthropic")).count();
-        assert!(anthropic_lines <= MODELS_PER_PROVIDER);
+        assert_eq!(anthropic_lines, MODELS_PER_PROVIDER);
+        assert_eq!(truncation.per_provider.len(), 1);
+        assert_eq!(
+            truncation.per_provider[0],
+            ("Anthropic".to_string(), MODELS_PER_PROVIDER, 30)
+        );
     }
 
     // ── format_log_output edge cases ─────────────────────────────────
@@ -916,7 +1026,7 @@ mod model_listing_tests {
             "opencode/mimo-v2.5-free".to_string(),
             "opencode-go/glm-5.2".to_string(),
         ];
-        let out = format_native_models(&ids);
+        let (out, _) = format_native_models(&ids, false);
         // The passable id is the first token on each line, prefix intact.
         for want in &ids {
             assert!(
@@ -940,7 +1050,7 @@ mod model_listing_tests {
             models: vec![entry("anthropic", "claude-opus-4-8")],
             fetched_at: SystemTime::now(),
         };
-        let out = format_platform_models(&catalog, &["anthropic"]);
+        let (out, _) = format_platform_models(&catalog, &["anthropic"], false);
         assert!(out.contains("claude-opus-4-8"));
         assert!(
             !out.contains("anthropic/claude-opus-4-8"),
@@ -955,7 +1065,26 @@ mod model_listing_tests {
             .map(|i| format!("nvidia/model-{i}"))
             .chain((0..50).map(|i| format!("opencode/zen-{i}")))
             .collect();
-        let out = format_native_models(&ids);
+        let (out, truncation) = format_native_models(&ids, false);
         assert!(out.lines().count() <= MAX_PROVIDERS * MODELS_PER_PROVIDER);
+        assert!(truncation.notice().is_some());
+    }
+
+    #[test]
+    fn native_listing_full_bypasses_caps() {
+        let ids: Vec<String> = (0..50).map(|i| format!("nvidia/model-{i}")).collect();
+        let (out, truncation) = format_native_models(&ids, true);
+        assert_eq!(out.lines().count(), 50);
+        assert!(truncation.notice().is_none());
+    }
+
+    #[test]
+    fn no_truncation_notice_when_nothing_cut() {
+        let catalog = ModelCatalog {
+            models: vec![entry("anthropic", "claude-opus-4-8")],
+            fetched_at: SystemTime::now(),
+        };
+        let (_, truncation) = format_platform_models(&catalog, &["anthropic"], false);
+        assert!(truncation.notice().is_none());
     }
 }

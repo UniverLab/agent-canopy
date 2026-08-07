@@ -167,6 +167,30 @@ fn resolve_binary_with_path(binary: &str, path: &str) -> Result<PathBuf> {
 }
 
 impl CliStrategy {
+    /// Build a strategy straight from a registry [`CliConfig`] entry — the
+    /// one place that lists every field this struct mirrors from it, so
+    /// [`super::models::Cli::strategy`] and anything else that needs a
+    /// strategy from a resolved config (e.g. the platform probe) can never
+    /// drift apart by hand-copying the field list twice.
+    ///
+    /// [`CliConfig`]: super::cli_config::CliConfig
+    pub fn from_cli_config(cli_config: &super::cli_config::CliConfig) -> Self {
+        Self {
+            binary: cli_config.binary.clone(),
+            headless_mode: cli_config.headless_mode.clone(),
+            model_flag: cli_config.model_flag.clone(),
+            supports_working_dir: cli_config.supports_working_dir,
+            working_dir_flag: cli_config.working_dir_flag.clone(),
+            env_vars: cli_config.env_vars.clone(),
+            prompt_via_stdin: cli_config.prompt_via_stdin,
+            session_id_set_flag: cli_config.session_id_set_flag.clone(),
+            session_list_cmd: cli_config.session_list_cmd.clone(),
+            session_list_format_args: cli_config.session_list_format_args.clone(),
+            session_id_pattern: cli_config.session_id_pattern.clone(),
+            session_resume_cmd: cli_config.session_resume_cmd.clone(),
+        }
+    }
+
     /// Return a copy of this strategy with `prompt_via_stdin` forced to
     /// `true`. Used by the loop engine when the composed prompt exceeds
     /// the OS argv size limit — delivering via stdin avoids E2BIG

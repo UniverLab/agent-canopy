@@ -167,6 +167,7 @@ mod ensemble_graph {
                 position: 0,
                 platform: "claude".to_string(),
                 model: None,
+                prompt_override: None,
             },
             EnsembleMember {
                 ensemble_id: "ens1".to_string(),
@@ -174,6 +175,7 @@ mod ensemble_graph {
                 position: 1,
                 platform: "codex".to_string(),
                 model: None,
+                prompt_override: None,
             },
         ];
         let details = vec![EnsembleDetails { ensemble, members }];

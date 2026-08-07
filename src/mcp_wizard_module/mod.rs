@@ -722,10 +722,23 @@ const DEFAULT_TERM_WIDTH: usize = 120;
 /// layout grows a column per platform, so past a handful of platforms it
 /// wraps and misaligns; the card view scales to any number of platforms.
 fn print_mcp_table(detected: &[&Platform], all_configs: &PlatformConfigs) {
-    print!("{}", render_mcp_table(detected, all_configs));
+    let term_width = ratatui::crossterm::terminal::size()
+        .map(|(w, _)| w as usize)
+        .unwrap_or(DEFAULT_TERM_WIDTH);
+    print!("{}", render_mcp_table(detected, all_configs, term_width));
 }
 
-fn render_mcp_table(detected: &[&Platform], all_configs: &PlatformConfigs) -> String {
+/// `term_width` is passed in rather than read here so the layout choice is a
+/// function of its arguments alone. Reading the real terminal inside made the
+/// tests depend on the width of whatever terminal happened to run them: the
+/// eight-platform case needs 159 columns, so it rendered as cards under a
+/// narrow terminal and as a matrix under a wide one, and the assertion that
+/// no line exceeds 120 columns failed only on wide terminals.
+fn render_mcp_table(
+    detected: &[&Platform],
+    all_configs: &PlatformConfigs,
+    term_width: usize,
+) -> String {
     let all_servers = collect_all_server_names(all_configs);
     if all_servers.is_empty() {
         return "  \x1b[90mNo MCP servers configured.\x1b[0m\n\n".to_string();
@@ -745,9 +758,6 @@ fn render_mcp_table(detected: &[&Platform], all_configs: &PlatformConfigs) -> St
         .max(4);
 
     let matrix_width = 2 + name_col + detected.len() * (plat_col + 2);
-    let term_width = ratatui::crossterm::terminal::size()
-        .map(|(w, _)| w as usize)
-        .unwrap_or(DEFAULT_TERM_WIDTH);
 
     if matrix_width > term_width.max(DEFAULT_TERM_WIDTH) {
         render_mcp_cards(&all_servers, detected, all_configs, name_col)
@@ -881,7 +891,7 @@ mod tests {
             all_configs.insert(platform.name.clone(), servers);
         }
 
-        let rendered = render_mcp_table(&detected, &all_configs);
+        let rendered = render_mcp_table(&detected, &all_configs, DEFAULT_TERM_WIDTH);
 
         for line in rendered.lines() {
             let visible_len = strip_ansi(line).chars().count();
@@ -931,7 +941,7 @@ mod tests {
         all_configs.insert("cursor".to_string(), cursor_servers);
         all_configs.insert("claude".to_string(), BTreeMap::new());
 
-        let rendered = render_mcp_table(&detected, &all_configs);
+        let rendered = render_mcp_table(&detected, &all_configs, DEFAULT_TERM_WIDTH);
         assert!(rendered.contains("Server"));
         assert!(rendered.contains('✓'));
         assert!(rendered.contains('✗'));
@@ -1473,7 +1483,7 @@ mod tests {
     fn render_mcp_table_empty_message() {
         let detected: Vec<&Platform> = vec![];
         let configs: PlatformConfigs = BTreeMap::new();
-        let rendered = render_mcp_table(&detected, &configs);
+        let rendered = render_mcp_table(&detected, &configs, DEFAULT_TERM_WIDTH);
         assert!(rendered.contains("No MCP servers configured."));
     }
 
@@ -1488,7 +1498,7 @@ mod tests {
         servers.insert("slack".to_string(), serde_json::json!({}));
         configs.insert("cursor".to_string(), servers);
 
-        let rendered = render_mcp_table(&detected, &configs);
+        let rendered = render_mcp_table(&detected, &configs, DEFAULT_TERM_WIDTH);
         assert!(rendered.contains("github"));
         assert!(rendered.contains("slack"));
     }
@@ -1503,7 +1513,7 @@ mod tests {
         servers.insert("github".to_string(), serde_json::json!({}));
         configs.insert("cursor".to_string(), servers);
 
-        let rendered = render_mcp_table(&detected, &configs);
+        let rendered = render_mcp_table(&detected, &configs, DEFAULT_TERM_WIDTH);
         assert!(rendered.contains('✓'));
     }
 

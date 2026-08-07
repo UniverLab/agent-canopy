@@ -16,6 +16,13 @@ use serde::{Deserialize, Serialize};
 const MAX_ENTRIES: usize = 500;
 const MAX_SCROLLBACK_LINES: usize = 2000;
 
+/// Bump this when the on-disk shape or meaning of `scrollback` changes.
+/// `load_history` discards any stored scrollback whose `version` doesn't
+/// match, so pre-fix files (which accumulated overlapping snapshots — see
+/// `update_scrollback`) never get replayed. `commands` is untouched by the
+/// bump since it was never affected by the corruption.
+const HISTORY_FORMAT_VERSION: u32 = 2;
+
 // ── Data model ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,12 +33,24 @@ pub struct CommandEntry {
     pub count: u32,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SessionHistory {
     #[serde(default)]
     pub commands: Vec<CommandEntry>,
     #[serde(default)]
     pub scrollback: Vec<String>,
+    #[serde(default)]
+    version: u32,
+}
+
+impl Default for SessionHistory {
+    fn default() -> Self {
+        Self {
+            commands: Vec::new(),
+            scrollback: Vec::new(),
+            version: HISTORY_FORMAT_VERSION,
+        }
+    }
 }
 
 impl SessionHistory {
@@ -67,26 +86,33 @@ impl SessionHistory {
                 .sort_by_key(|entry| std::cmp::Reverse(entry.last_run));
             self.commands.truncate(MAX_ENTRIES);
         }
-        if self.scrollback.len() > MAX_SCROLLBACK_LINES {
-            self.scrollback
-                .drain(0..self.scrollback.len() - MAX_SCROLLBACK_LINES);
-        }
     }
 
-    /// Update the scrollback buffer with new lines from the terminal.
+    /// Replace the stored scrollback with a fresh snapshot of the terminal's
+    /// recent history.
+    ///
+    /// This must overwrite, not append: callers pass the *whole* tail they
+    /// want persisted (e.g. `agent.last_lines(2000)`) once per session close.
+    /// The old implementation appended on every close and only trimmed once
+    /// the buffer ballooned past `MAX_SCROLLBACK_LINES * 2`, so re-closing
+    /// the same session glued another overlapping snapshot onto the ones
+    /// already stored — a session closed ten times ended up with an
+    /// arbitrary 2000-line slice spliced across up to ten separate runs.
+    /// Replacing makes the stored snapshot always reflect exactly the most
+    /// recent close, and caps the file size regardless of how many times a
+    /// session is opened and closed.
     pub fn update_scrollback(&mut self, lines: &[String]) {
-        self.scrollback.extend_from_slice(lines);
-        if self.scrollback.len() > MAX_SCROLLBACK_LINES * 2 {
-            self.scrollback
-                .drain(0..self.scrollback.len() - MAX_SCROLLBACK_LINES);
-        }
+        self.scrollback = lines.to_vec();
         self.enforce_scrollback_limit();
     }
 
+    /// The single place scrollback length is capped — the old code trimmed
+    /// in three different spots (`enforce_limit`, `update_scrollback`, and
+    /// this function), two of which disagreed about the limit.
     fn enforce_scrollback_limit(&mut self) {
         if self.scrollback.len() > MAX_SCROLLBACK_LINES {
-            self.scrollback
-                .drain(0..self.scrollback.len() - MAX_SCROLLBACK_LINES);
+            let excess = self.scrollback.len() - MAX_SCROLLBACK_LINES;
+            self.scrollback.drain(0..excess);
         }
     }
 
@@ -212,12 +238,24 @@ fn history_path(data_dir: &Path, session_name: &str) -> PathBuf {
 }
 
 /// Load a session's history from disk.
+///
+/// Files written before `HISTORY_FORMAT_VERSION` (or missing the field
+/// entirely, which `serde(default)` reads as 0) may hold scrollback
+/// corrupted by the old accumulate-forever bug in `update_scrollback`.
+/// There's no reliable way to de-duplicate that after the fact, so on a
+/// version mismatch the scrollback is discarded outright — `commands` is a
+/// separate, never-corrupted field and is always preserved.
 pub fn load_history(data_dir: &Path, session_name: &str) -> SessionHistory {
     let path = history_path(data_dir, session_name);
-    match fs::read_to_string(&path) {
+    let mut history = match fs::read_to_string(&path) {
         Ok(content) => toml::from_str(&content).unwrap_or_default(),
         Err(_) => SessionHistory::default(),
+    };
+    if history.version != HISTORY_FORMAT_VERSION {
+        history.scrollback.clear();
+        history.version = HISTORY_FORMAT_VERSION;
     }
+    history
 }
 
 /// Save a session's history to disk.
@@ -1040,18 +1078,108 @@ mod tests {
 
     #[test]
     fn scrollback_enforce_limit() {
+        // Scrollback capping now happens only through `update_scrollback` —
+        // `enforce_limit` (the commands LRU) no longer touches it.
         let mut hist = SessionHistory::default();
-        for _ in 0..3000 {
-            hist.scrollback.push("line".to_string());
-        }
-        hist.enforce_limit();
+        let lines: Vec<String> = (0..3000).map(|_| "line".to_string()).collect();
+        hist.update_scrollback(&lines);
         assert!(hist.scrollback.len() <= MAX_SCROLLBACK_LINES);
+    }
+
+    #[test]
+    fn enforce_limit_does_not_touch_scrollback() {
+        let mut hist = SessionHistory {
+            commands: Vec::new(),
+            scrollback: vec!["kept".to_string(); 3000],
+            version: HISTORY_FORMAT_VERSION,
+        };
+        for i in 0..600 {
+            hist.record(&format!("cmd-{i}"), "/tmp");
+        }
+        assert_eq!(hist.scrollback.len(), 3000);
+    }
+
+    #[test]
+    fn update_scrollback_replaces_not_appends() {
+        // Simulates closing the same terminal session repeatedly: each
+        // close hands over the full current tail, not a delta, so the
+        // second call must replace the first snapshot instead of gluing
+        // onto it.
+        let mut hist = SessionHistory::default();
+        hist.update_scrollback(&["line1".to_string(), "line2".to_string()]);
+        assert_eq!(hist.scrollback, vec!["line1", "line2"]);
+
+        hist.update_scrollback(&["line3".to_string()]);
+        assert_eq!(hist.scrollback, vec!["line3"]);
+    }
+
+    #[test]
+    fn update_scrollback_repeated_close_does_not_grow_unbounded() {
+        // A session closed ten times must not store ten overlapping copies —
+        // the file stays bounded regardless of how many times it's opened
+        // and closed.
+        let mut hist = SessionHistory::default();
+        let snapshot: Vec<String> = (0..2000).map(|i| format!("line {i}")).collect();
+        for _ in 0..10 {
+            hist.update_scrollback(&snapshot);
+        }
+        assert_eq!(hist.scrollback.len(), MAX_SCROLLBACK_LINES);
+        assert_eq!(hist.scrollback, snapshot);
     }
 
     #[test]
     fn record_whitespace_only_ignored() {
         let mut hist = SessionHistory::default();
         hist.record("  \t  ", "/tmp");
+        assert!(hist.commands.is_empty());
+    }
+
+    // ── Format migration (corrupted pre-fix files) ─────────────────
+
+    #[test]
+    fn load_history_discards_scrollback_from_unversioned_file_but_keeps_commands() {
+        // Simulates a pre-fix history.toml: no `version` field (serde
+        // defaults it to 0) and scrollback accumulated across many closes.
+        // Loading it must not carry that corruption forward.
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let raw = r#"
+[[commands]]
+cmd = "cargo build"
+cwd = "/tmp"
+last_run = "2024-01-01T00:00:00Z"
+count = 3
+
+scrollback = ["demo --help", "demo --help", "demo --help"]
+"#;
+        let dir = data_dir.path().join("terminals").join("caolinita");
+        fs::create_dir_all(&dir).expect("create session dir");
+        fs::write(dir.join("history.toml"), raw).expect("write fixture");
+
+        let hist = load_history(data_dir.path(), "caolinita");
+        assert!(
+            hist.scrollback.is_empty(),
+            "corrupted scrollback must be discarded on load"
+        );
+        assert_eq!(hist.commands.len(), 1);
+        assert_eq!(hist.commands[0].cmd, "cargo build");
+    }
+
+    #[test]
+    fn load_history_preserves_scrollback_already_at_current_version() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let mut hist = SessionHistory::default();
+        hist.update_scrollback(&["fresh line".to_string()]);
+        save_history(data_dir.path(), "session", &hist);
+
+        let reloaded = load_history(data_dir.path(), "session");
+        assert_eq!(reloaded.scrollback, vec!["fresh line"]);
+    }
+
+    #[test]
+    fn load_history_missing_file_returns_default_at_current_version() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let hist = load_history(data_dir.path(), "never-existed");
+        assert!(hist.scrollback.is_empty());
         assert!(hist.commands.is_empty());
     }
 }

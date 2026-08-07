@@ -12,69 +12,160 @@
 
 use std::path::{Path, PathBuf};
 
-const IMPLEMENTER_PRESET: &str = "You are a careful Rust implementer working in this repository.
+/// The tag vocabulary every builtin preset below is built from, mirroring
+/// the `# [NAME]: Description` header + XML-tag convention Canopy's own
+/// prompt builder emits (see `tui::app::dialog::prompt`'s
+/// `append_instruction_section` and its `push_xml_item`/`build_xml_block`
+/// helpers) — a header line, an outer tag, and one indented `<item_tag>`
+/// block per item. Defined once here, and referenced by all three presets
+/// below, so the four sections every preset shares — role, procedure, what
+/// it may use, what it must never do — can't drift into three
+/// slightly-different dialects.
+struct Section {
+    header: &'static str,
+    tag: &'static str,
+    item_tag: &'static str,
+}
 
-FIRST, verify the premise of the spec against the actual code: read the relevant files before changing anything. If the premise is wrong — it describes something that isn't true of the current code, or asks for a change that doesn't actually apply — stop and report exactly why instead of forcing a change to fit a wrong premise.
+const ROLE: Section = Section {
+    header: "# [ROLE]: Who You Are\n",
+    tag: "role",
+    item_tag: "",
+};
+const PROCEDURE: Section = Section {
+    header: "# [INSTRUCTIONS]: Execution Logic\n",
+    tag: "instruction_set",
+    item_tag: "instruction",
+};
+const ALLOWED: Section = Section {
+    header: "# [ALLOWED]: What You May Use\n",
+    tag: "allowed",
+    item_tag: "item",
+};
+const PROHIBITED: Section = Section {
+    header: "# [PROHIBITED]: Never Do This\n",
+    tag: "prohibited",
+    item_tag: "rule",
+};
 
-Otherwise, implement exactly this spec, nothing more and nothing less:
+/// Render a single-block section: a header line followed by `content`
+/// wrapped directly in `section.tag`, with no per-item indentation. Used
+/// only for [`ROLE`], which is always one short paragraph rather than a
+/// list.
+fn wrapped_section(section: &Section, content: &str) -> String {
+    format!(
+        "{}<{}>\n{}\n</{}>\n\n",
+        section.header, section.tag, content, section.tag
+    )
+}
 
-{{spec_content}}
+/// Render a list section: a header line, an outer `section.tag`, and one
+/// `section.item_tag` block per entry in `items` — the same
+/// header-then-indented-items shape [`push_xml_item`]/[`build_xml_block`] in
+/// `tui::app::dialog::prompt` produce. Used for every preset section except
+/// [`ROLE`].
+fn itemized_section(section: &Section, items: &[&str]) -> String {
+    let mut out = String::new();
+    out.push_str(section.header);
+    out.push_str(&format!("<{}>\n", section.tag));
+    for item in items {
+        out.push_str(&format!("  <{}>\n", section.item_tag));
+        for line in item.lines() {
+            if line.is_empty() {
+                out.push('\n');
+            } else {
+                out.push_str("    ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out.push_str(&format!("  </{}>\n\n", section.item_tag));
+    }
+    out.push_str(&format!("</{}>\n\n", section.tag));
+    out
+}
 
-Previous feedback (if any): {{previous_feedback}}
-If it reads \"(none)\", this is a fresh implementation. Otherwise, address every point of the feedback as part of your changes.
+fn implementer_preset() -> String {
+    let mut out = wrapped_section(
+        &ROLE,
+        "You are a careful Rust implementer working in this repository.",
+    );
+    out.push_str(&itemized_section(&PROCEDURE, &[
+        "FIRST, verify the premise of the spec against the actual code: read the relevant files before changing anything. If the premise is wrong — it describes something that isn't true of the current code, or asks for a change that doesn't actually apply — stop and report exactly why instead of forcing a change to fit a wrong premise.",
+        "Otherwise, implement exactly this spec, nothing more and nothing less:\n\n{{spec_content}}",
+        "Previous feedback (if any): {{previous_feedback}}\nIf it reads \"(none)\", this is a fresh implementation. Otherwise, address every point of the feedback as part of your changes.",
+        "Before reporting, run the checks relevant to what you changed (formatter, linter, tests) locally — never assume they pass without running them.",
+        "If you are genuinely blocked — missing credentials, an unresolvable conflict, a decision only a human can make — make the final line of your report start with \"BLOCKER:\" followed by a one-paragraph explanation of exactly why.",
+    ]));
+    out.push_str(&itemized_section(&ALLOWED, &[
+        "Reading any file in the repository, and running local checks (formatter, linter, tests) to verify your work.",
+    ]));
+    out.push_str(&itemized_section(&PROHIBITED, &[
+        "Committing your changes under any circumstances — a separate reviewer step reviews your diff and commits it.",
+    ]));
+    out
+}
 
-Before reporting, run the checks relevant to what you changed (formatter, linter, tests) locally — never assume they pass without running them.
+fn reviewer_preset() -> String {
+    let mut out = wrapped_section(&ROLE, "You are the reviewer and committer for this loop.");
+    out.push_str(&itemized_section(&PROCEDURE, &[
+        "Review the current diff strictly against this spec — nothing else:\n\n{{spec_content}}",
+        "If the diff correctly and completely implements the spec, make EXACTLY ONE commit covering ONLY this spec's work. Use a concise, descriptive commit message with NO trailers of any kind (no Co-Authored-By, no issue references, no generated-by footers).",
+        "If the worktree has no changes at all, FAIL and say so explicitly — do not treat \"nothing changed\" as success.",
+        "If the diff is wrong, incomplete, or diverges from the spec, FAIL with a specific, actionable list of what's wrong so the implementer can address it directly — vague feedback is not acceptable.",
+    ]));
+    out.push_str(&itemized_section(&ALLOWED, &[
+        "Reading the current diff and this spec, and making exactly one commit when the spec is fully satisfied.",
+    ]));
+    out.push_str(&itemized_section(
+        &PROHIBITED,
+        &[
+            "Pushing, under any circumstances.",
+            "Committing an empty diff.",
+        ],
+    ));
+    out
+}
 
-Do NOT commit your changes under any circumstances. A separate reviewer step reviews your diff and commits it.
-
-If you are genuinely blocked — missing credentials, an unresolvable conflict, a decision only a human can make — make the final line of your report start with \"BLOCKER:\" followed by a one-paragraph explanation of exactly why.
-";
-
-const REVIEWER_PRESET: &str = "You are the reviewer and committer for this loop.
-
-Review the current diff strictly against this spec — nothing else:
-
-{{spec_content}}
-
-If the diff correctly and completely implements the spec, make EXACTLY ONE commit covering ONLY this spec's work. Use a concise, descriptive commit message with NO trailers of any kind (no Co-Authored-By, no issue references, no generated-by footers). NEVER push.
-
-If the worktree has no changes at all, FAIL and say so explicitly — do not commit an empty diff, and do not treat \"nothing changed\" as success.
-
-If the diff is wrong, incomplete, or diverges from the spec, FAIL with a specific, actionable list of what's wrong so the implementer can address it directly — vague feedback is not acceptable.
-";
-
-const RESILIENCE_PRESET: &str = "# ROLE
-You are the on-call medic for this loop. A node just failed or reported a blocker. Your only job is to diagnose why and route to the right next step — you do not fix the underlying work yourself.
-
-# HOW
-Read the failure/blocker context below (`{{previous_feedback}}`) and pick exactly ONE diagnosis:
-
-- QUOTA — the failure is a rate limit, quota exhaustion, or \"try again later\" from the platform/API itself. Action: no code changes are needed; report QUOTA and that the node should be retried once quota resets.
-- GLITCH — the failure is a transient infrastructure hiccup (network blip, spurious timeout, a flaky check unrelated to the spec) with no sign of a real defect. Action: report GLITCH and recommend a plain retry of the same node.
-- OTHER — the failure reflects a genuine problem with the work itself (wrong code, an unmet spec, a missing dependency, a decision only a human can make). Action: report OTHER with a precise, actionable explanation of what's wrong so a human or the next agent can address it.
-
-State your diagnosis and its one action clearly in your report; do not hedge between diagnoses.
-
-# YES (allowed)
-- Reading files, logs, git history, and process/job status.
-- Checking scheduling/queue state (e.g. `git status`, `git log`, `ps`, reading CI/log output).
-- Reporting your diagnosis and recommended action via loop_complete_node / loop_report_blocker.
-
-# NO (forbidden)
-- Writing code, or editing any file or config.
-- Building or testing the project.
-- Committing anything.
-- Attempting to verify or finish the spec's actual work — that is not your job here.
-";
+fn resilience_preset() -> String {
+    let mut out = wrapped_section(
+        &ROLE,
+        "You are the on-call medic for this loop. A node just failed or reported a blocker. Your only job is to diagnose why and route to the right next step — you do not fix the underlying work yourself.",
+    );
+    out.push_str(&itemized_section(&PROCEDURE, &[
+        "Read the failure/blocker context below (`{{previous_feedback}}`) and pick exactly ONE diagnosis: QUOTA, GLITCH, or OTHER.",
+        "QUOTA — the failure is a rate limit, quota exhaustion, or \"try again later\" from the platform/API itself. Action: no code changes are needed; report QUOTA and that the node should be retried once quota resets.",
+        "GLITCH — the failure is a transient infrastructure hiccup (network blip, spurious timeout, a flaky check unrelated to the spec) with no sign of a real defect. Action: report GLITCH and recommend a plain retry of the same node.",
+        "OTHER — the failure reflects a genuine problem with the work itself (wrong code, an unmet spec, a missing dependency, a decision only a human can make). Action: report OTHER with a precise, actionable explanation of what's wrong so a human or the next agent can address it.",
+        "State your diagnosis and its one action clearly in your report; do not hedge between diagnoses.",
+    ]));
+    out.push_str(&itemized_section(&ALLOWED, &[
+        "Reading files, logs, git history, and process/job status.",
+        "Checking scheduling/queue state (e.g. `git status`, `git log`, `ps`, reading CI/log output).",
+        "Reporting your diagnosis and recommended action via loop_complete_node / loop_report_blocker.",
+    ]));
+    out.push_str(&itemized_section(
+        &PROHIBITED,
+        &[
+            "Writing code, or editing any file or config.",
+            "Building or testing the project.",
+            "Committing anything.",
+            "Attempting to verify or finish the spec's actual work — that is not your job here.",
+        ],
+    ));
+    out
+}
 
 /// `(name, content)` for every builtin prompt preset — the single source
 /// both [`seed_builtin_prompt_presets`] writes to disk and
-/// [`resolve_prompt_preset`] falls back to.
-pub fn builtin_prompt_preset_specs() -> Vec<(&'static str, &'static str)> {
+/// [`resolve_prompt_preset`] falls back to. Content is built (not a
+/// hardcoded `&'static str`) so all three presets render through the same
+/// [`Section`] vocabulary above.
+pub fn builtin_prompt_preset_specs() -> Vec<(&'static str, String)> {
     vec![
-        ("implementer", IMPLEMENTER_PRESET),
-        ("reviewer", REVIEWER_PRESET),
-        ("resilience", RESILIENCE_PRESET),
+        ("implementer", implementer_preset()),
+        ("reviewer", reviewer_preset()),
+        ("resilience", resilience_preset()),
     ]
 }
 
@@ -132,7 +223,7 @@ pub fn resolve_prompt_preset(prompts_dir: &Path, name: &str) -> String {
             let fallback = builtin_prompt_preset_specs()
                 .into_iter()
                 .find(|(preset_name, _)| *preset_name == name)
-                .map(|(_, content)| content.to_string())
+                .map(|(_, content)| content)
                 .unwrap_or_default();
             tracing::warn!(
                 preset = name,
@@ -159,7 +250,7 @@ mod tests {
         let implementer_path = prompts_dir(canopy_dir).join("implementer.md");
         assert_eq!(
             std::fs::read_to_string(&implementer_path).unwrap(),
-            IMPLEMENTER_PRESET
+            implementer_preset()
         );
 
         // Simulate a user edit, then reseed (as a second daemon startup would).
@@ -200,7 +291,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let prompts = prompts_dir(dir.path()); // never seeded/created
 
-        assert_eq!(resolve_prompt_preset(&prompts, "reviewer"), REVIEWER_PRESET);
+        assert_eq!(
+            resolve_prompt_preset(&prompts, "reviewer"),
+            reviewer_preset()
+        );
     }
 
     #[test]
@@ -275,5 +369,104 @@ mod tests {
             content.contains("{{previous_feedback}}"),
             "resilience preset must contain {{{{previous_feedback}}}} placeholder"
         );
+    }
+
+    /// Asserts `needle` (a placeholder) appears strictly between the open
+    /// and close tags of `outer_tag` — i.e. inside that section, not
+    /// floating before/after it.
+    fn assert_inside_tag(content: &str, needle: &str, outer_tag: &str) {
+        let open = format!("<{outer_tag}>");
+        let close = format!("</{outer_tag}>");
+        let open_at = content
+            .find(&open)
+            .unwrap_or_else(|| panic!("missing <{outer_tag}> in: {content}"));
+        let close_at = content
+            .find(&close)
+            .unwrap_or_else(|| panic!("missing </{outer_tag}> in: {content}"));
+        let needle_at = content
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing {needle} in: {content}"));
+        assert!(
+            needle_at > open_at && needle_at < close_at,
+            "{needle} must sit inside <{outer_tag}>...</{outer_tag}>, not floating between sections"
+        );
+    }
+
+    #[test]
+    fn implementer_preset_placeholders_resolve_inside_the_procedure_section() {
+        let content = implementer_preset();
+        assert_inside_tag(&content, "{{spec_content}}", "instruction_set");
+        assert_inside_tag(&content, "{{previous_feedback}}", "instruction_set");
+        assert_inside_tag(&content, "(none)", "instruction_set");
+    }
+
+    #[test]
+    fn reviewer_preset_placeholder_resolves_inside_the_procedure_section() {
+        let content = reviewer_preset();
+        assert_inside_tag(&content, "{{spec_content}}", "instruction_set");
+    }
+
+    #[test]
+    fn resilience_preset_placeholder_resolves_inside_the_procedure_section() {
+        let content = resilience_preset();
+        assert_inside_tag(&content, "{{previous_feedback}}", "instruction_set");
+    }
+
+    #[test]
+    fn all_three_builtin_presets_share_the_same_section_skeleton() {
+        for (name, content) in builtin_prompt_preset_specs() {
+            for tag in [ROLE.tag, PROCEDURE.tag, ALLOWED.tag, PROHIBITED.tag] {
+                assert!(
+                    content.contains(&format!("<{tag}>")) && content.contains(&format!("</{tag}>")),
+                    "preset '{name}' is missing the shared <{tag}> section"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_prompt_preset_returns_an_untagged_pre_migration_file_unchanged() {
+        let dir = tempdir().unwrap();
+        let prompts = prompts_dir(dir.path());
+        std::fs::create_dir_all(&prompts).unwrap();
+        let old_style = "You are the reviewer and committer for this loop.\n\n\
+             Review the current diff strictly against this spec — nothing else:\n\n{{spec_content}}\n";
+        std::fs::write(prompts.join("reviewer.md"), old_style).unwrap();
+
+        let resolved = resolve_prompt_preset(&prompts, "reviewer");
+        assert_eq!(resolved, old_style);
+        // No tags in this file at all — `resolve_prompt_preset` must not
+        // require them to work, and the placeholder must still be present
+        // for the node prompt renderer's plain `.replace()` to find.
+        assert!(!resolved.contains('<'));
+        assert!(resolved.contains("{{spec_content}}"));
+    }
+
+    #[test]
+    fn seeding_leaves_an_old_untagged_installation_mixed_with_new_tagged_defaults() {
+        let dir = tempdir().unwrap();
+        let canopy_dir = dir.path();
+        let prompts = prompts_dir(canopy_dir);
+        std::fs::create_dir_all(&prompts).unwrap();
+        // Simulate an existing installation: an operator-edited reviewer.md
+        // in the pre-tagged format, predating this change.
+        let old_style = "You are the reviewer and committer for this loop.\n{{spec_content}}\n";
+        std::fs::write(prompts.join("reviewer.md"), old_style).unwrap();
+
+        // A daemon startup on the new binary reseeds missing files only.
+        seed_builtin_prompt_presets(canopy_dir).unwrap();
+
+        // The old file is untouched...
+        assert_eq!(
+            resolve_prompt_preset(&prompts, "reviewer"),
+            old_style,
+            "an edited file predating this change must not be overwritten"
+        );
+        // ...while a preset with no file on disk gets the new tagged form.
+        assert_eq!(
+            resolve_prompt_preset(&prompts, "implementer"),
+            implementer_preset()
+        );
+        assert!(resolve_prompt_preset(&prompts, "implementer").contains("<role>"));
     }
 }

@@ -288,7 +288,7 @@ fn submit_direct_passthrough(app: &mut App, idx: usize) {
     reset_warp_input(&mut app.terminal_agents[idx]);
 }
 
-fn submit_warp_input(app: &mut App, idx: usize) {
+pub(super) fn submit_warp_input(app: &mut App, idx: usize) {
     let captured = input_text(&app.terminal_agents[idx]);
     write_line_to_pty(&app.terminal_agents[idx], &captured);
     record_terminal_command(app, idx, captured.trim());

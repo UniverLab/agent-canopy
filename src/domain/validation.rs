@@ -139,7 +139,7 @@ pub fn validate_ensembles_in_graph(
             if !has_edge(
                 &ensemble.entry_from_node,
                 &member.node_id,
-                ensemble.entry_condition,
+                ensemble.entry_condition.clone(),
             ) {
                 return Err(format!(
                     "{label}'s member '{}' has no entry edge from '{}'.",

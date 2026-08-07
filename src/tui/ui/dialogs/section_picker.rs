@@ -262,13 +262,37 @@ pub(crate) fn draw_section_picker_modal(
                 },
             );
         }
-        SectionPickerMode::ProjectPicker { selected, entries } => {
-            let height = (entries.len() as u16 + 5).min(16);
-            let area = centered_rect(60, height.max(6), frame.area());
+        SectionPickerMode::ProjectPicker {
+            selected,
+            entries,
+            filter,
+            scroll,
+        } => {
+            let filtered = crate::tui::app::dialog::SimplePromptDialog::filtered_project_indices(
+                entries, filter,
+            );
+            let visible_rows =
+                crate::tui::app::dialog::SimplePromptDialog::project_picker_visible_rows(
+                    filtered.len(),
+                );
+            let height = crate::tui::app::dialog::SimplePromptDialog::project_picker_box_height(
+                filtered.len(),
+            );
+            let area = centered_rect(60, height, frame.area());
             frame.render_widget(Clear, area);
 
+            let title = if filtered.len() > visible_rows {
+                format!(
+                    " Project Context ({}/{}) ",
+                    selected.saturating_add(1),
+                    filtered.len()
+                )
+            } else {
+                " Project Context ".to_string()
+            };
+
             let block = Block::default()
-                .title(" Project Context ")
+                .title(title)
                 .borders(crate::tui::ui::borders_for(theme))
                 .border_style(Style::default().fg(accent))
                 .style(Style::default().bg(Color::Rgb(10, 20, 30)));
@@ -276,6 +300,23 @@ pub(crate) fn draw_section_picker_modal(
             let inner = block.inner(area);
             frame.render_widget(block, area);
 
+            let mut filter_display = filter.clone();
+            filter_display.push('│');
+            let filter_line = Line::from(vec![
+                Span::styled("  🔍 ", Style::default().fg(theme.dim_text)),
+                Span::styled(filter_display, Style::default().fg(theme.header_color)),
+            ]);
+            frame.render_widget(
+                Paragraph::new(filter_line),
+                ratatui::layout::Rect {
+                    x: inner.x,
+                    y: inner.y,
+                    width: inner.width,
+                    height: 1,
+                },
+            );
+
+            let list_y = inner.y + 1;
             if entries.is_empty() {
                 let msg = Line::from(vec![Span::styled(
                     "  No registered projects found",
@@ -285,16 +326,34 @@ pub(crate) fn draw_section_picker_modal(
                     Paragraph::new(msg),
                     ratatui::layout::Rect {
                         x: inner.x,
-                        y: inner.y,
+                        y: list_y,
+                        width: inner.width,
+                        height: 1,
+                    },
+                );
+            } else if filtered.is_empty() {
+                let msg = Line::from(vec![Span::styled(
+                    "  no projects match",
+                    Style::default().fg(Color::DarkGray),
+                )]);
+                frame.render_widget(
+                    Paragraph::new(msg),
+                    ratatui::layout::Rect {
+                        x: inner.x,
+                        y: list_y,
                         width: inner.width,
                         height: 1,
                     },
                 );
             } else {
-                for (y_pos, (i, entry)) in (inner.y..).zip(entries.iter().enumerate()) {
+                let visible = filtered.iter().enumerate().skip(*scroll).take(visible_rows);
+                for (y_pos, (i, &idx)) in (list_y..).zip(visible) {
                     if y_pos >= inner.y + inner.height.saturating_sub(1) {
                         break;
                     }
+                    let Some(entry) = entries.get(idx) else {
+                        continue;
+                    };
                     let is_selected = i == *selected;
                     let style = if is_selected {
                         Style::default()
@@ -321,6 +380,8 @@ pub(crate) fn draw_section_picker_modal(
             let hint = Line::from(vec![
                 Span::styled("↑↓ ", Style::default().fg(theme.dim_text)),
                 Span::styled("select  ", Style::default().fg(Color::White)),
+                Span::styled("type ", Style::default().fg(theme.dim_text)),
+                Span::styled("filter  ", Style::default().fg(Color::White)),
                 Span::styled("Enter ", Style::default().fg(theme.dim_text)),
                 Span::styled("add  ", Style::default().fg(Color::White)),
                 Span::styled("Esc ", Style::default().fg(theme.dim_text)),
@@ -690,6 +751,8 @@ mod tests {
                 &SectionPickerMode::ProjectPicker {
                     selected: 0,
                     entries,
+                    filter: String::new(),
+                    scroll: 0,
                 },
                 &theme,
             );
@@ -716,6 +779,8 @@ mod tests {
                 &SectionPickerMode::ProjectPicker {
                     selected: 0,
                     entries: vec![],
+                    filter: String::new(),
+                    scroll: 0,
                 },
                 &theme,
             );
@@ -723,6 +788,103 @@ mod tests {
         assert!(
             text.contains("No registered projects"),
             "Should show empty message: {text}"
+        );
+    }
+
+    #[test]
+    fn draw_project_picker_shows_filter_text() {
+        let app = make_app_with_prompt_dialog();
+        let theme = Theme::classic();
+        let entries = vec![crate::tui::app::dialog::ProjectPickerEntry {
+            name: "My Project".to_string(),
+            hash: "abc123".to_string(),
+            path: "/tmp/myproject".to_string(),
+        }];
+        let text = render_to_text(80, 24, |frame, _area| {
+            draw_section_picker_modal(
+                frame,
+                &app,
+                Color::Cyan,
+                &SectionPickerMode::ProjectPicker {
+                    selected: 0,
+                    entries,
+                    filter: "myp".to_string(),
+                    scroll: 0,
+                },
+                &theme,
+            );
+        });
+        assert!(text.contains("myp"), "Should show filter text: {text}");
+    }
+
+    #[test]
+    fn draw_project_picker_filter_matches_nothing() {
+        let app = make_app_with_prompt_dialog();
+        let theme = Theme::classic();
+        let entries = vec![crate::tui::app::dialog::ProjectPickerEntry {
+            name: "My Project".to_string(),
+            hash: "abc123".to_string(),
+            path: "/tmp/myproject".to_string(),
+        }];
+        let text = render_to_text(80, 24, |frame, _area| {
+            draw_section_picker_modal(
+                frame,
+                &app,
+                Color::Cyan,
+                &SectionPickerMode::ProjectPicker {
+                    selected: 0,
+                    entries,
+                    filter: "zzz".to_string(),
+                    scroll: 0,
+                },
+                &theme,
+            );
+        });
+        assert!(
+            text.contains("no projects match"),
+            "Should show no-match message: {text}"
+        );
+    }
+
+    #[test]
+    fn draw_project_picker_scrolled_selection_stays_visible() {
+        let app = make_app_with_prompt_dialog();
+        let theme = Theme::classic();
+        let entries: Vec<_> = (0..20)
+            .map(|i| crate::tui::app::dialog::ProjectPickerEntry {
+                name: format!("proj{i}"),
+                hash: format!("h{i}"),
+                path: format!("/proj{i}"),
+            })
+            .collect();
+        let visible_rows =
+            crate::tui::app::dialog::SimplePromptDialog::project_picker_visible_rows(20);
+        let scroll = 20 - visible_rows;
+        let text = render_to_text(80, 24, |frame, _area| {
+            draw_section_picker_modal(
+                frame,
+                &app,
+                Color::Cyan,
+                &SectionPickerMode::ProjectPicker {
+                    selected: 19,
+                    entries: entries.clone(),
+                    filter: String::new(),
+                    scroll,
+                },
+                &theme,
+            );
+        });
+        assert!(
+            text.contains("proj19"),
+            "Last entry must stay visible when scrolled: {text}"
+        );
+        assert!(
+            !text.contains("proj0 "),
+            "First entry should have scrolled out of view: {text}"
+        );
+        assert!(
+            text.contains("(20/20)"),
+            "Should show a scroll position indicator: {text}"
         );
     }
 

@@ -80,9 +80,103 @@ impl Project {
     }
 }
 
+/// Whether remapping a project onto a new path keeps the project's own
+/// registry row (nothing was there yet) or folds its dependents into a
+/// project that's already registered at that path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemapKind {
+    /// No project is registered at the new path: the project row itself is
+    /// updated in place (new hash, new path), keeping its identity.
+    Move,
+    /// A project already exists at the new path: dependents are reassigned
+    /// to that project and the stale (old-path) project row is removed.
+    Merge,
+}
+
+impl RemapKind {
+    /// Decide the kind from a single fact: does a project already exist at
+    /// the destination path? Pure — the caller gathers `target_exists` via a
+    /// DB lookup.
+    pub fn decide(target_exists: bool) -> Self {
+        if target_exists {
+            Self::Merge
+        } else {
+            Self::Move
+        }
+    }
+}
+
+/// Per-table row counts a project remap re-keys — every table (besides
+/// `projects` itself) whose own column holds this project's workdir path or
+/// hash. Mirrors [`crate::domain::clean::HardCascadeCounts`]'s shape/purpose,
+/// but for rows a remap updates rather than deletes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RemapCounts {
+    pub interactive_sessions: i64,
+    pub terminal_sessions: i64,
+    pub loops: i64,
+    pub loop_specs: i64,
+    pub sync_messages: i64,
+    pub sync_locks: i64,
+    pub last_prompts: i64,
+    pub scheduled_sends: i64,
+    pub failed_scheduled_sends: i64,
+    pub agents: i64,
+    pub intelligence_nodes: i64,
+}
+
+impl RemapCounts {
+    pub fn total(&self) -> i64 {
+        self.interactive_sessions
+            + self.terminal_sessions
+            + self.loops
+            + self.loop_specs
+            + self.sync_messages
+            + self.sync_locks
+            + self.last_prompts
+            + self.scheduled_sends
+            + self.failed_scheduled_sends
+            + self.agents
+            + self.intelligence_nodes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remap_kind_decides_move_when_no_target() {
+        assert_eq!(RemapKind::decide(false), RemapKind::Move);
+    }
+
+    #[test]
+    fn remap_kind_decides_merge_when_target_exists() {
+        assert_eq!(RemapKind::decide(true), RemapKind::Merge);
+    }
+
+    #[test]
+    fn remap_counts_total_sums_every_field() {
+        let counts = RemapCounts {
+            interactive_sessions: 1,
+            terminal_sessions: 2,
+            loops: 3,
+            loop_specs: 4,
+            sync_messages: 5,
+            sync_locks: 6,
+            last_prompts: 7,
+            scheduled_sends: 8,
+            failed_scheduled_sends: 9,
+            agents: 10,
+            intelligence_nodes: 11,
+        };
+        assert_eq!(counts.total(), 66);
+    }
+
+    #[test]
+    fn remap_counts_total_zero_when_default() {
+        assert_eq!(RemapCounts::default().total(), 0);
+    }
 
     #[test]
     fn workdir_hash_is_8_hex_chars() {

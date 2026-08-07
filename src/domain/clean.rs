@@ -58,7 +58,7 @@ pub struct ProjectDependentCounts {
 /// actually deletes (sessions, prompts, scheduled sends, sync state) plus
 /// every row that is auto-cascade-deleted by SQLite's FK rules when the
 /// owning loop / interactive_session / intelligence_node is removed (the
-/// `loop_*` / `ensemble_*` / `pool_members` / `seed_sessions` /
+/// `loop_*` / `ensemble_*` / `queue_members` / `seed_sessions` /
 /// `intelligence_edges` rows). Surfaced in the pre-delete prompt so the
 /// reader sees the entire blast radius, not just the rows the cascade
 /// driver issues a `DELETE` for.
@@ -84,7 +84,7 @@ pub struct HardCascadeCounts {
     pub loop_completion_hook_runs: i64,
     pub ensembles: i64,
     pub ensemble_members: i64,
-    pub pool_members: i64,
+    pub queue_members: i64,
     pub seed_sessions: i64,
     pub intelligence_edges: i64,
 }
@@ -107,7 +107,7 @@ impl HardCascadeCounts {
             && self.loop_completion_hook_runs == 0
             && self.ensembles == 0
             && self.ensemble_members == 0
-            && self.pool_members == 0
+            && self.queue_members == 0
             && self.seed_sessions == 0
             && self.intelligence_edges == 0
     }
@@ -225,7 +225,12 @@ pub struct CleanPlan {
 }
 
 impl CleanPlan {
-    /// Total bytes reclaimed by every file/dir in the plan.
+    /// Total filesystem bytes reclaimed by every file/dir in the plan. This
+    /// is *only* the log/terminal/RAG-residue candidates — it says nothing
+    /// about database rows, which free pages inside the `.db` file without
+    /// shrinking it (see [`should_reclaim`] and `Database::reclaim_space`).
+    /// Reported separately from [`Self::deleted_row_count`] so a row count
+    /// never gets read as a byte count.
     pub fn reclaimed_bytes(&self) -> u64 {
         self.log_files
             .iter()
@@ -233,6 +238,13 @@ impl CleanPlan {
             .chain(self.rag_residue_files.iter())
             .map(|f| f.size_bytes)
             .sum()
+    }
+
+    /// Database rows this plan removes (currently just `interactive_sessions`
+    /// — soft mode's only row-level deletion; `--hard`'s cascade counts are
+    /// tracked separately in [`HardCascadeTarget::counts`]).
+    pub fn deleted_row_count(&self) -> usize {
+        self.session_ids.len()
     }
 
     /// Whether the plan deletes anything at all (orphaned-project *reports*
@@ -243,6 +255,20 @@ impl CleanPlan {
             && self.terminal_dirs.is_empty()
             && self.rag_residue_files.is_empty()
     }
+}
+
+/// Minimum number of database rows a clean run must have removed before
+/// `canopy clean` bothers reclaiming space with a `VACUUM`. A full `VACUUM`
+/// rewrites the entire database file and takes an exclusive lock, so
+/// running it after deleting a handful of rows would cost far more than it
+/// gives back.
+pub const RECLAIM_ROW_THRESHOLD: usize = 50;
+
+/// Whether a clean run deleted enough database rows to justify reclaiming
+/// space. Pure function over the row count so both the real run and
+/// `--dry-run`'s projection agree on the same threshold.
+pub fn should_reclaim(rows_deleted: usize) -> bool {
+    rows_deleted >= RECLAIM_ROW_THRESHOLD
 }
 
 /// Cutoff timestamp (unix seconds): a row/file whose age is strictly older
@@ -837,7 +863,7 @@ mod tests {
             loop_completion_hook_runs: 0,
             ensembles: 0,
             ensemble_members: 0,
-            pool_members: 0,
+            queue_members: 0,
             seed_sessions: 0,
             intelligence_edges: 0,
         };
@@ -1117,6 +1143,43 @@ mod tests {
         assert_eq!(plan.targets[0].hash, "target");
         assert_eq!(plan.skips.len(), 1);
         assert_eq!(plan.skips[0].hash, "skip");
+    }
+
+    // ── should_reclaim / deleted_row_count ─────────────────────────────
+
+    #[test]
+    fn should_reclaim_false_below_threshold() {
+        assert!(!should_reclaim(RECLAIM_ROW_THRESHOLD - 1));
+    }
+
+    #[test]
+    fn should_reclaim_true_at_and_above_threshold() {
+        assert!(should_reclaim(RECLAIM_ROW_THRESHOLD));
+        assert!(should_reclaim(RECLAIM_ROW_THRESHOLD + 1));
+        assert!(should_reclaim(957));
+    }
+
+    #[test]
+    fn should_reclaim_false_for_zero() {
+        assert!(!should_reclaim(0));
+    }
+
+    #[test]
+    fn deleted_row_count_reflects_session_ids_only() {
+        let plan = CleanPlan {
+            session_ids: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            log_files: vec![FileCandidate {
+                path: PathBuf::from("/a.log"),
+                key: "a".to_string(),
+                mtime: 0,
+                size_bytes: 999,
+            }],
+            terminal_dirs: vec![],
+            rag_residue_files: vec![],
+            orphaned_projects: vec![],
+        };
+        // Bytes from log_files must never leak into the row count.
+        assert_eq!(plan.deleted_row_count(), 3);
     }
 
     // ── is_rag_residue_name ────────────────────────────────────────────

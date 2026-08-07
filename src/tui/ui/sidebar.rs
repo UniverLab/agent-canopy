@@ -266,17 +266,21 @@ const SIDEBAR_TABS: [SidebarLayer; 3] = [
 /// than it buys, since the tab's own body shows the items anyway.
 fn tab_cell_text(label: &str, width: usize) -> String {
     let text = truncate_str(label, width);
-    let pad = width.saturating_sub(text.chars().count()) / 2;
-    format!("{}{text}", " ".repeat(pad))
+    let slack = width.saturating_sub(text.chars().count());
+    let left_pad = slack / 2;
+    let right_pad = slack - left_pad;
+    format!("{}{text}{}", " ".repeat(left_pad), " ".repeat(right_pad))
 }
 
 /// Draws the sidebar's `Live / Automation / Knowledge` tab strip: one cell
 /// per tab, each an equal share of `area.width` (the last cell absorbs the
 /// rounding remainder so the three always cover the full row exactly — no
 /// gap for the background paint underneath to show through). The active
-/// tab's cell is filled with `theme.header_color`; inactive cells are
-/// dimmed text on the sidebar background. Registers each cell's hit box in
-/// `sidebar_tab_click_map` for mouse clicks.
+/// tab's label renders in `theme.header_color` and bold, over the default
+/// background; inactive cells are dimmed text with no modifier. Registers
+/// each cell's hit box in `sidebar_tab_click_map` for mouse clicks — the
+/// hit box always spans the full cell width, regardless of the label's
+/// centring.
 fn draw_sidebar_tab_bar(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     if area.height == 0 || area.width == 0 {
         return;
@@ -295,22 +299,17 @@ fn draw_sidebar_tab_bar(frame: &mut Frame, area: Rect, app: &mut App, theme: &Th
 
         let active = app.sidebar_layer == layer;
         let text = tab_cell_text(layer_label(layer), width as usize);
-        let (fg, bg) = if active {
-            (Color::Black, theme.header_color)
+        let (fg, modifier) = if active {
+            (theme.header_color, Modifier::BOLD)
         } else {
-            (theme.dim_text, Color::Reset)
-        };
-        let modifier = if active {
-            Modifier::BOLD
-        } else {
-            Modifier::empty()
+            (theme.dim_text, Modifier::empty())
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 text,
                 Style::default().fg(fg).add_modifier(modifier),
             )))
-            .style(Style::default().bg(bg)),
+            .style(Style::default().bg(Color::Reset)),
             Rect::new(x, area.y, width, 1),
         );
         app.sidebar_tab_click_map
@@ -512,7 +511,7 @@ fn draw_automation_body(
     background_indices: &[usize],
     theme: &Theme,
 ) {
-    let loop_count = app.active_loops().len();
+    let loop_count = app.sidebar_loops().len();
     let demands = [
         card_list_demand(background_indices.len()),
         card_list_demand(loop_count),
@@ -534,10 +533,20 @@ fn draw_automation_body(
         );
     }
     if let Some(sub) = take_top(&mut remaining, alloc[1]) {
+        // The archived count is always shown here — even while browsing the
+        // main list — so the archive is never an invisible state; see the
+        // F4-archive spec's "always-visible count" requirement.
+        let title = if app.loop_view_archived {
+            format!(" archived loops ({}) ", app.archived_loop_count)
+        } else if app.archived_loop_count > 0 {
+            format!(" loops · {} archived ", app.archived_loop_count)
+        } else {
+            " loops ".to_string()
+        };
         render_titled_panel(
             frame,
             sub,
-            " loops ",
+            &title,
             Style::default().fg(theme.dim_text),
             automation_border_style(app, AutomationKind::Loop, theme),
             theme,
@@ -790,15 +799,21 @@ fn draw_project_loop_card(
 
 // ── Automation layer: loops sub-list ────────────────────────────────
 
-/// Status icon shown on an active loop's card: running takes priority, then
-/// blocked (a paused loop whose latest run recorded a `loop_report_blocker`
-/// description), then plain paused, then draft.
-fn loop_status_icon(lp: &Loop, meta: LoopSidebarMeta, theme: &Theme) -> (&'static str, Color) {
+/// Status icon shown on a loop's card. Every one of the five statuses gets
+/// its own icon/color pair so a listed loop is identifiable at a glance
+/// without hiding any of them (running/paused/draft/failed/completed are
+/// listed side by side now that the sidebar no longer filters by status);
+/// `blocked` is a `Paused` sub-state (its latest run recorded a
+/// `loop_report_blocker` description) that borrows `Failed`'s color to flag
+/// it needs the same attention, distinguished from `Failed` by icon.
+fn loop_status_icon(lp: &Loop, meta: &LoopSidebarMeta, theme: &Theme) -> (&'static str, Color) {
     match lp.status {
         LoopStatus::Running => ("▶", STATUS_RUNNING),
         LoopStatus::Paused if meta.blocked => ("⛔", STATUS_FAIL),
         LoopStatus::Paused => ("⏸", Color::Yellow),
-        LoopStatus::Draft | LoopStatus::Completed | LoopStatus::Failed => ("·", theme.dim_text),
+        LoopStatus::Draft => ("○", theme.dim_text),
+        LoopStatus::Completed => ("✓", STATUS_OK),
+        LoopStatus::Failed => ("✗", STATUS_FAIL),
     }
 }
 
@@ -807,7 +822,7 @@ fn draw_active_loop_card(
     area: Rect,
     selected: bool,
     lp: &Loop,
-    meta: LoopSidebarMeta,
+    meta: &LoopSidebarMeta,
     panel_focused: bool,
     theme: &Theme,
 ) {
@@ -833,11 +848,19 @@ fn draw_active_loop_card(
         Rect::new(area.x, area.y, area.width, 1),
     );
 
-    let progress = format!("{}/{} specs", meta.done, meta.total);
+    let last_run_style = if lp.status == LoopStatus::Running {
+        Style::default().fg(STATUS_RUNNING)
+    } else {
+        meta_style
+    };
+    let last_run_text = match &meta.autorun_label {
+        Some(autorun) => format!("{} · {autorun}", meta.last_run_label),
+        None => meta.last_run_label.clone(),
+    };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            truncate_str(&progress, area.width as usize),
-            meta_style,
+            truncate_str(&last_run_text, area.width as usize),
+            last_run_style,
         )))
         .style(Style::default().bg(bg)),
         Rect::new(area.x, area.y + 1, area.width, 1),
@@ -853,11 +876,11 @@ fn draw_active_loop_card(
 }
 
 fn draw_automation_loops_list(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
-    let loops = app.active_loops();
+    let loops = app.sidebar_loops();
     if loops.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "No active loops",
+                "No loops",
                 Style::default().fg(Color::DarkGray),
             ))),
             area,
@@ -888,7 +911,7 @@ fn draw_automation_loops_list(frame: &mut Frame, area: Rect, app: &mut App, them
             let meta = app
                 .loop_sidebar_meta
                 .get(&lp.id)
-                .copied()
+                .cloned()
                 .unwrap_or_default();
             (lp.id.clone(), lp.clone(), meta)
         })
@@ -900,7 +923,7 @@ fn draw_automation_loops_list(frame: &mut Frame, area: Rect, app: &mut App, them
         }
         let card_area = Rect::new(area.x, y, area.width, 3);
         let selected = app.selected_loop_id.as_deref() == Some(id.as_str());
-        draw_active_loop_card(frame, card_area, selected, lp, *meta, panel_focused, theme);
+        draw_active_loop_card(frame, card_area, selected, lp, meta, panel_focused, theme);
         app.automation_loop_click_map.push((id.clone(), y, y + 3));
         y += row_h;
     }
@@ -1033,13 +1056,31 @@ fn labeled_kv_line(label: &'static str, value: &str, theme: &Theme) -> Line<'sta
 }
 
 fn rag_status_line(app: &App, theme: &Theme) -> Line<'static> {
-    use crate::rag::status::{compute_rag_model_status, RagModelStatus};
+    use crate::rag::status::{compute_rag_status, RagModelStatus};
 
-    match compute_rag_model_status(
+    match compute_rag_status(
+        &app.rag_embeddings_model,
         app.rag_paused,
         app.rag_model_loaded,
         app.rag_info.processing_items,
+        app.rag_acquisition_state.clone(),
     ) {
+        RagModelStatus::Unavailable(_) => Line::from(Span::styled(
+            " ✗ unavailable ",
+            Style::default().fg(Color::Red),
+        )),
+        RagModelStatus::DownloadFailed(_) => Line::from(Span::styled(
+            " ✗ download failed ",
+            Style::default().fg(Color::Red),
+        )),
+        RagModelStatus::Downloading { .. } => Line::from(Span::styled(
+            " ⬇ downloading ",
+            Style::default().fg(Color::Yellow),
+        )),
+        RagModelStatus::Preparing { .. } => Line::from(Span::styled(
+            " ⚙ preparing ",
+            Style::default().fg(Color::Yellow),
+        )),
         RagModelStatus::Paused => Line::from(Span::styled(
             " ⏸ paused ",
             Style::default().fg(Color::Yellow),
@@ -1305,17 +1346,25 @@ fn agent_card_meta<'a>(agent: &'a AgentEntry, app: &'a App, theme: &Theme) -> Ag
     }
 }
 
-/// Status color for an interactive/terminal session card. Blue is reserved
-/// for background agents (see `agent_status` in `panel/details.rs`) — a PTY
-/// is either alive (green) or dead (red). A running session pulses between
+/// Status color for an interactive/terminal session card. A PTY is either
+/// alive (green) or dead — and dead now splits into two: a session that
+/// exited 0 reads as successful (`STATUS_OK`, blue), any other exit code
+/// reads as failed (`STATUS_FAIL`, red). A running session pulses between
 /// dim and bright green while it's registering activity (see
 /// `ACTIVITY_IDLE_THRESHOLD_MS` and `pulse_active` — never blank, B21) and
 /// holds solid green — "healthy, available" — once output has been quiet
-/// for a while. Any exit, clean or not, means the PTY is dead: red.
+/// for a while.
+///
+/// "Exit 0 means success" is scoped to *this* rendering decision only. It's
+/// a safe read for a user-ended interactive session, but it is not a
+/// general-purpose success signal — this project has been bitten before by
+/// CLIs that print an error and still exit 0. Do not lift this assumption
+/// into exit-code handling elsewhere without re-litigating it there.
 fn session_status_color(status: &AgentStatus, pulsing: bool, animation_tick: u32) -> Color {
     match status {
         AgentStatus::Running if pulsing => pulse_active(animation_tick),
         AgentStatus::Running => STATUS_RUNNING,
+        AgentStatus::Exited(0) => STATUS_OK,
         AgentStatus::Exited(_) => STATUS_FAIL,
     }
 }
@@ -1743,6 +1792,7 @@ mod tests {
             .unwrap();
         }
         db.insert_loop(&Loop {
+            archived: false,
             id: "wf-probe".to_string(),
             name: "Probe Loop".to_string(),
             description: None,
@@ -1755,7 +1805,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         })
         .unwrap();
@@ -1764,7 +1814,7 @@ mod tests {
         let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
         app.sidebar_layer = active_layer;
         assert!(
-            !app.active_loops().is_empty(),
+            !app.sidebar_loops().is_empty(),
             "loop should be loaded from db"
         );
 
@@ -1777,7 +1827,12 @@ mod tests {
             })
             .unwrap();
 
-        let buffer = terminal.backend().buffer().clone();
+        buffer_to_text(terminal.backend().buffer())
+    }
+
+    /// Flattens a rendered `TestBackend` buffer into a plain string (row by
+    /// row, no trailing per-cell styling) for substring assertions.
+    fn buffer_to_text(buffer: &ratatui::buffer::Buffer) -> String {
         let mut text = String::new();
         for y in 0..buffer.area.height {
             for x in 0..buffer.area.width {
@@ -1822,6 +1877,296 @@ mod tests {
         let text =
             render_sidebar_text_on_tab(1, 45, 40, &Theme::classic(), SidebarLayer::Automation);
         assert!(text.contains("Probe Loop"), "expected loop name visible");
+    }
+
+    // ── Last-run sidebar meta (replaces the old done/total spec count) ──
+
+    /// Builds an App around a caller-supplied `Loop` plus whatever the `seed`
+    /// closure inserts into the same DB, renders the Automation tab into a
+    /// TestBackend, and returns the screen text. Unlike
+    /// `render_sidebar_text_on_tab` (a fixed `Running`, spec-less "Probe
+    /// Loop"), this lets each last-run test control the loop's status and
+    /// `loop_runs` history directly.
+    fn render_automation_text_for(
+        lp: &crate::domain::loops::Loop,
+        seed: impl FnOnce(&crate::db::Database),
+    ) -> String {
+        use crate::db::Database;
+        use crate::tui::app::App;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        db.insert_loop(lp).unwrap();
+        seed(&db);
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
+        app.sidebar_layer = SidebarLayer::Automation;
+
+        let backend = TestBackend::new(50, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_sidebar(frame, area, &mut app, &Theme::classic());
+            })
+            .unwrap();
+
+        buffer_to_text(terminal.backend().buffer())
+    }
+
+    fn bare_loop(id: &str, status: LoopStatus) -> Loop {
+        Loop {
+            archived: false,
+            id: id.to_string(),
+            name: format!("Loop {id}"),
+            description: None,
+            workdir: "/tmp/probe".to_string(),
+            status,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        }
+    }
+
+    /// Records one node run against `loop_id` via a queue-driven spec — the
+    /// spec's own `loop_id` is `None` (never bound to this loop, so
+    /// `list_loop_specs(loop_id)` stays empty, exactly like a queue-driven
+    /// run), but `loop_runs.loop_id` is set, which is what the sidebar's
+    /// last-run query reads.
+    fn seed_queue_driven_run(
+        db: &crate::db::Database,
+        loop_id: &str,
+        started_at: chrono::DateTime<chrono::Utc>,
+        output: Option<serde_json::Value>,
+    ) {
+        use crate::domain::loops::{
+            LoopNode, LoopNodeKind, LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus,
+        };
+
+        let spec_id = format!("{loop_id}-spec");
+        let node_id = format!("{loop_id}-node");
+        db.insert_loop_spec(&LoopSpec {
+            id: spec_id.clone(),
+            loop_id: None,
+            name: "queued spec".to_string(),
+            description: None,
+            position: 0,
+            parallelizable: false,
+            status: LoopSpecStatus::Completed,
+            started_at: Some(started_at),
+            completed_at: Some(started_at),
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: node_id.clone(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "node".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 0,
+            created_at: started_at,
+        })
+        .unwrap();
+        db.insert_loop_run(&LoopNodeRun {
+            id: format!("{loop_id}-run"),
+            loop_id: loop_id.to_string(),
+            spec_id,
+            node_id,
+            status: LoopRunStatus::Pass,
+            input: None,
+            output,
+            started_at,
+            completed_at: Some(started_at),
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn queue_driven_loop_shows_last_run_time_not_zero_zero() {
+        let started_at = chrono::Utc::now() - chrono::Duration::minutes(2);
+        let text = render_automation_text_for(&bare_loop("q1", LoopStatus::Draft), |db| {
+            seed_queue_driven_run(db, "q1", started_at, None);
+        });
+        assert!(
+            !text.contains("0/0"),
+            "queue-driven loop must not fall back to the old done/total count: {text}"
+        );
+        assert!(
+            text.contains("2m"),
+            "expected the last run's relative time (2m) in the sidebar: {text}"
+        );
+    }
+
+    #[test]
+    fn never_run_loop_shows_plainly_not_blank_or_zero() {
+        let text = render_automation_text_for(&bare_loop("never1", LoopStatus::Draft), |_db| {});
+        assert!(
+            !text.contains("0/0"),
+            "a never-run loop must not show a misleading zero: {text}"
+        );
+        assert!(
+            text.contains("never"),
+            "a never-run loop must say so plainly: {text}"
+        );
+    }
+
+    /// Scans row `y` for the first cell matching one of `loop_status_icon`'s
+    /// glyphs, returning its `(symbol, fg color)` — used to check that every
+    /// status renders a visually distinct card without depending on the
+    /// inner panel's exact border offset.
+    fn status_icon_cell(buffer: &ratatui::buffer::Buffer, y: u16) -> (String, Color) {
+        for x in 0..buffer.area.width {
+            let cell = &buffer[(x, y)];
+            if matches!(cell.symbol(), "▶" | "⏸" | "⛔" | "○" | "✓" | "✗") {
+                return (cell.symbol().to_string(), cell.fg);
+            }
+        }
+        panic!("no status icon glyph found in row {y}");
+    }
+
+    #[test]
+    fn sidebar_lists_every_status_ordered_by_recency_and_visually_distinguishable() {
+        use crate::db::Database;
+        use crate::tui::app::App;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+
+        // Staggered `created_at`, oldest first, so recency ordering is
+        // unambiguous once sorted (none of these loops have run, so
+        // `last_activity` falls back to `created_at`).
+        let base = chrono::Utc::now() - chrono::Duration::hours(10);
+        let mut draft = bare_loop("s-draft", LoopStatus::Draft);
+        draft.created_at = base;
+        db.insert_loop(&draft).unwrap();
+
+        let mut failed = bare_loop("s-failed", LoopStatus::Failed);
+        failed.created_at = base + chrono::Duration::minutes(10);
+        failed.autorun_at = Some(chrono::Utc::now() + chrono::Duration::minutes(20));
+        db.insert_loop(&failed).unwrap();
+
+        let mut completed = bare_loop("s-completed", LoopStatus::Completed);
+        completed.created_at = base + chrono::Duration::minutes(20);
+        db.insert_loop(&completed).unwrap();
+
+        let mut paused = bare_loop("s-paused", LoopStatus::Paused);
+        paused.created_at = base + chrono::Duration::minutes(30);
+        db.insert_loop(&paused).unwrap();
+
+        let mut running = bare_loop("s-running", LoopStatus::Running);
+        running.created_at = base + chrono::Duration::minutes(40);
+        db.insert_loop(&running).unwrap();
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
+        app.sidebar_layer = SidebarLayer::Automation;
+        app.automation_kind = AutomationKind::Loop;
+
+        let theme = Theme::classic();
+        let backend = TestBackend::new(50, 60);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_sidebar(frame, area, &mut app, &theme);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text = buffer_to_text(&buffer);
+
+        for name in [
+            "Loop s-draft",
+            "Loop s-failed",
+            "Loop s-completed",
+            "Loop s-paused",
+            "Loop s-running",
+        ] {
+            assert!(text.contains(name), "expected {name} listed: {text}");
+        }
+
+        let click_map = app.automation_loop_click_map.clone();
+        let ids: Vec<&str> = click_map.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "s-running",
+                "s-paused",
+                "s-completed",
+                "s-failed",
+                "s-draft",
+            ],
+            "every status must be listed, ordered by last activity most recent first"
+        );
+
+        let icons: Vec<(String, Color)> = click_map
+            .iter()
+            .map(|(_, y_start, _)| status_icon_cell(&buffer, *y_start))
+            .collect();
+        let unique: std::collections::HashSet<_> = icons.iter().cloned().collect();
+        assert_eq!(
+            unique.len(),
+            icons.len(),
+            "each of the five statuses must render a distinct icon/color pair: {icons:?}"
+        );
+
+        assert!(
+            text.contains("resumes"),
+            "a pending autorun must be visible on its loop's sidebar entry: {text}"
+        );
+    }
+
+    #[test]
+    fn running_loop_shows_running_not_a_relative_time() {
+        let started_at = chrono::Utc::now() - chrono::Duration::minutes(2);
+        let text = render_automation_text_for(&bare_loop("run1", LoopStatus::Running), |db| {
+            seed_queue_driven_run(db, "run1", started_at, None);
+        });
+        assert!(
+            text.contains("running"),
+            "an actively-running loop must say 'running', not its stale last-run time: {text}"
+        );
+    }
+
+    #[test]
+    fn blocked_indicator_still_renders_for_paused_loop_with_blocker() {
+        let started_at = chrono::Utc::now() - chrono::Duration::minutes(5);
+        let text = render_automation_text_for(&bare_loop("blocked1", LoopStatus::Paused), |db| {
+            seed_queue_driven_run(
+                db,
+                "blocked1",
+                started_at,
+                Some(serde_json::json!({"blocker": "waiting on human input"})),
+            );
+        });
+        assert!(
+            text.contains('⛔'),
+            "a paused loop with a reported blocker must still show the blocked icon: {text}"
+        );
     }
 
     #[test]
@@ -2041,14 +2386,111 @@ mod tests {
     }
 
     #[test]
-    fn exit_clean_or_not_is_dead_pty_red() {
+    fn exit_clean_is_success_blue_regardless_of_activity() {
         assert_eq!(
             session_status_color(&AgentStatus::Exited(0), true, 0),
-            STATUS_FAIL
+            STATUS_OK
         );
         assert_eq!(
             session_status_color(&AgentStatus::Exited(0), false, 0),
+            STATUS_OK
+        );
+    }
+
+    #[test]
+    fn exit_nonzero_is_failure_red_regardless_of_activity() {
+        assert_eq!(
+            session_status_color(&AgentStatus::Exited(7), true, 0),
             STATUS_FAIL
+        );
+        assert_eq!(
+            session_status_color(&AgentStatus::Exited(7), false, 0),
+            STATUS_FAIL
+        );
+    }
+
+    #[test]
+    fn exited_0_and_exited_1_sidebar_cards_render_different_colors() {
+        // The point of the fix is contrast: a clean exit and a failed exit
+        // sitting side by side must be visually distinguishable, not just
+        // individually "correct" in isolation.
+        use crate::db::Database;
+        use crate::tui::agent::InteractiveAgent;
+        use crate::tui::app::App;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
+
+        let mut ok_agent = InteractiveAgent::spawn_terminal(
+            "cat",
+            "/tmp",
+            80,
+            24,
+            Some("ok-exit"),
+            &[],
+            ratatui::style::Color::White,
+        )
+        .expect("spawn ok-exit agent");
+        ok_agent.status = AgentStatus::Exited(0);
+        app.interactive_agents.push(ok_agent);
+
+        let mut fail_agent = InteractiveAgent::spawn_terminal(
+            "cat",
+            "/tmp",
+            80,
+            24,
+            Some("fail-exit"),
+            &[],
+            ratatui::style::Color::White,
+        )
+        .expect("spawn fail-exit agent");
+        fail_agent.status = AgentStatus::Exited(1);
+        app.interactive_agents.push(fail_agent);
+
+        app.agents.push(AgentEntry::Interactive(0));
+        app.agents.push(AgentEntry::Interactive(1));
+
+        let theme = Theme::classic();
+        let backend = TestBackend::new(50, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_sidebar(frame, area, &mut app, &theme);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text = buffer_to_text(&buffer);
+
+        // Scan the row containing each agent's name for the "▌" status
+        // gutter glyph, wherever the card's left border happens to sit.
+        let gutter_color_for = |name: &str| -> Color {
+            let y = text
+                .lines()
+                .position(|line| line.contains(name))
+                .unwrap_or_else(|| panic!("expected {name} listed: {text}"));
+            for x in 0..buffer.area.width {
+                let cell = &buffer[(x, y as u16)];
+                if cell.symbol() == "▌" {
+                    return cell.fg;
+                }
+            }
+            panic!("no status gutter glyph found on {name}'s row");
+        };
+
+        let ok_color = gutter_color_for("ok-exit");
+        let fail_color = gutter_color_for("fail-exit");
+        assert_eq!(ok_color, STATUS_OK, "clean exit must render success blue");
+        assert_eq!(fail_color, STATUS_FAIL, "failed exit must render fail red");
+        assert_ne!(
+            ok_color, fail_color,
+            "clean and failed exits must be visually distinguishable"
         );
     }
 
@@ -2106,9 +2548,14 @@ mod tests {
             pty_session_status_color(false, &AgentStatus::Running, false, true, 0),
             STATUS_RUNNING
         );
-        // Exited stays red regardless of signals.
+        // Exited status ignores the pulsing signal either way, but now
+        // depends on the exit code: clean exit is blue, not red.
         assert_eq!(
             pty_session_status_color(false, &AgentStatus::Exited(0), true, false, 0),
+            STATUS_OK
+        );
+        assert_eq!(
+            pty_session_status_color(false, &AgentStatus::Exited(1), true, false, 0),
             STATUS_FAIL
         );
     }
@@ -2122,10 +2569,14 @@ mod tests {
 
     #[test]
     fn tab_cell_text_centers_the_label_when_there_is_room() {
-        // 20 columns, 10-char label → 5 columns of padding each side, but
-        // only the leading half is materialized (the cell's own background
-        // covers the trailing half).
-        assert_eq!(tab_cell_text("Automation", 20), "     Automation");
+        // 20 columns, 10-char label → 5 columns of padding on each side.
+        assert_eq!(tab_cell_text("Automation", 20), "     Automation     ");
+    }
+
+    #[test]
+    fn tab_cell_text_odd_slack_gives_the_extra_column_to_the_right() {
+        // 11 columns, 4-char label ("Live") → 7 slack columns, split 3/4.
+        assert_eq!(tab_cell_text("Live", 11), "   Live    ");
     }
 
     #[test]
@@ -2184,6 +2635,61 @@ mod tests {
         assert_eq!(last_col_end - first_col, 33);
         for pair in app.sidebar_tab_click_map.windows(2) {
             assert_eq!(pair[0].3, pair[1].2, "cells must be contiguous");
+        }
+    }
+
+    #[test]
+    fn draw_sidebar_tab_bar_marks_the_active_tab_with_accent_bold_and_no_fill() {
+        use crate::db::Database;
+        use crate::tui::app::App;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::sync::Arc;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
+        app.sidebar_layer = SidebarLayer::Live;
+
+        let theme = Theme::classic();
+        let backend = TestBackend::new(33, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_sidebar(frame, area, &mut app, &theme);
+            })
+            .unwrap();
+
+        let (_, row, start, end) = app.sidebar_tab_click_map[0];
+        let buffer = terminal.backend().buffer().clone();
+        let mut saw_accent_glyph = false;
+        for x in start..end {
+            let cell = &buffer[(x, row)];
+            assert_eq!(
+                cell.bg,
+                Color::Reset,
+                "active tab cell must not fill its background"
+            );
+            if cell.symbol() != " " {
+                assert_eq!(cell.fg, theme.header_color);
+                assert!(cell.modifier.contains(Modifier::BOLD));
+                saw_accent_glyph = true;
+            }
+        }
+        assert!(saw_accent_glyph, "expected the active label to be drawn");
+
+        let (_, row, start, end) = app.sidebar_tab_click_map[1];
+        for x in start..end {
+            let cell = &buffer[(x, row)];
+            assert_eq!(cell.bg, Color::Reset);
+            if cell.symbol() != " " {
+                assert_eq!(cell.fg, theme.dim_text);
+                assert!(!cell.modifier.contains(Modifier::BOLD));
+            }
         }
     }
 
@@ -2552,5 +3058,45 @@ mod tests {
                 draw_sidebar(frame, frame.area(), &mut app, &Theme::modern());
             })
             .unwrap();
+    }
+
+    #[test]
+    fn rag_status_line_shows_downloading_not_ready_even_when_loaded_flag_is_stale() {
+        use crate::db::Database;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
+        app.rag_embeddings_model = "text-embedding-3-small".to_string();
+        app.rag_model_loaded = true;
+        app.rag_acquisition_state =
+            Some(crate::rag::status::AcquisitionState::Downloading { started_at: 0 });
+
+        let theme = Theme::classic();
+        let line = rag_status_line(&app, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("downloading"), "got: {text:?}");
+    }
+
+    #[test]
+    fn rag_status_line_shows_download_failed() {
+        use crate::db::Database;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).unwrap();
+        app.rag_embeddings_model = "text-embedding-3-small".to_string();
+        app.rag_acquisition_state = Some(crate::rag::status::AcquisitionState::Failed {
+            reason: "boom".to_string(),
+        });
+
+        let theme = Theme::classic();
+        let line = rag_status_line(&app, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("download failed"), "got: {text:?}");
     }
 }

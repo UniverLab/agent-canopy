@@ -8,7 +8,7 @@ use crate::setup_module::registry_fetch::{fetch_registry, print_banner};
 use crate::setup_module::sync_and_skills::{run_essential_skills_step, run_sync_step};
 use crate::setup_module::PlatformWithCli;
 use anyhow::{Context, Result};
-use inquire::{Confirm, MultiSelect, Select};
+use inquire::{Confirm, CustomType, MultiSelect, Select};
 use std::io::{self, Write};
 
 pub fn run_setup(force_skills: bool) -> Result<()> {
@@ -105,7 +105,39 @@ pub fn run_setup(force_skills: bool) -> Result<()> {
         .prompt()
         .map_err(|e| anyhow::anyhow!("RAG selection cancelled: {}", e))?;
 
-    let (embeddings_model, similarity_threshold, rag_personal_dirs) = if use_rag {
+    let rag_capable = crate::rag::embedding_client::provider_available(
+        crate::rag::embedding_client::EmbeddingProvider::Local,
+    );
+
+    let (embeddings_model, similarity_threshold, rag_personal_dirs, rag_max_file_mb) = if use_rag
+        && !rag_capable
+    {
+        // This build has no way to serve any model the wizard can currently
+        // offer — every option in `select_local_embeddings_model` is a local
+        // (fastembed/ONNX) model. Refuse to offer them rather than saving a
+        // config that `canopy doctor` and `rag_search` will only later
+        // discover cannot actually run.
+        println!();
+        println!("  \x1b[31m✗  This canopy build cannot run local embedding models.\x1b[0m");
+        println!(
+            "  \x1b[90m{}\x1b[0m",
+            crate::rag::embedding_client::LOCAL_EMBEDDINGS_UNAVAILABLE_REASON
+        );
+        println!(
+            "  \x1b[90mRAG will stay disabled. Install a build with local-embeddings, or\x1b[0m"
+        );
+        println!("  \x1b[90mconfigure a cloud embeddings model manually in config.toml.\x1b[0m");
+        println!();
+        wiz.add(
+            "\x1b[33m⚠\x1b[0m RAG: disabled — build lacks local-embeddings support".to_string(),
+        );
+        (
+            String::new(),
+            existing_config.similarity_threshold,
+            Vec::new(),
+            existing_config.rag_max_file_mb,
+        )
+    } else if use_rag {
         // ── Select local embedding model ──────────────────────────
         wiz.render()?;
         let embeddings_model = select_local_embeddings_model(&existing_config.embeddings_model)?;
@@ -136,17 +168,32 @@ pub fn run_setup(force_skills: bool) -> Result<()> {
             embeddings_model
         ));
 
-        // ── Download / warm-up the model ──────────────────────────
+        // ── Model acquisition ─────────────────────────────────────────
+        // Setup never downloads the model itself — it only checks whether
+        // one's already cached, so this returns immediately either way. If
+        // it isn't cached, the daemon's background acquisition loop (see
+        // `IngestionManager::ensure_configured_model_acquired`) picks it up
+        // once it (re)starts below, so a multi-hundred-MB download never
+        // blocks this wizard.
         wiz.render()?;
         #[cfg(feature = "local-embeddings")]
-        {
+        let model_already_cached = {
             let model_cache_dir = canopy_dir.join("models");
-            download_local_model_for_setup(&embeddings_model, &model_cache_dir)?;
+            crate::rag::embedding_client::is_local_model_cached(&embeddings_model, &model_cache_dir)
+                .unwrap_or(false)
+        };
+        #[cfg(not(feature = "local-embeddings"))]
+        let model_already_cached = false;
+        if model_already_cached {
+            wiz.add(format!(
+                "\x1b[32m✓\x1b[0m Model ready: {embeddings_model} (already cached)"
+            ));
+        } else {
+            wiz.add(
+                "\x1b[33m⬇\x1b[0m Model will download in the background — indexing begins once it's ready"
+                    .to_string(),
+            );
         }
-        wiz.add(format!(
-            "\x1b[32m✓\x1b[0m Model ready: {}",
-            embeddings_model
-        ));
 
         // Chunk-merge similarity threshold: internal tuning knob with no
         // user-observable effect in its valid range, so it is not prompted.
@@ -187,13 +234,26 @@ pub fn run_setup(force_skills: bool) -> Result<()> {
             rag_personal_dirs.join(", ")
         ));
 
-        (embeddings_model, similarity_threshold, rag_personal_dirs)
+        // ── Per-file indexing size limit ─────────────────────────────
+        wiz.render()?;
+        let rag_max_file_mb = select_rag_max_file_mb(existing_config.rag_max_file_mb)?;
+        wiz.add(format!(
+            "\x1b[32m✓\x1b[0m Indexing size limit: {rag_max_file_mb} MB per file"
+        ));
+
+        (
+            embeddings_model,
+            similarity_threshold,
+            rag_personal_dirs,
+            rag_max_file_mb,
+        )
     } else {
         wiz.add("\x1b[90m–\x1b[0m RAG: disabled".to_string());
         (
             String::new(),
             existing_config.similarity_threshold,
             Vec::new(),
+            existing_config.rag_max_file_mb,
         )
     };
 
@@ -252,6 +312,7 @@ pub fn run_setup(force_skills: bool) -> Result<()> {
     config.embeddings_model = embeddings_model;
     config.similarity_threshold = similarity_threshold;
     config.rag_personal_dirs = rag_personal_dirs;
+    config.rag_max_file_mb = rag_max_file_mb;
     let config_step = match config.save(&canopy_dir) {
         Ok(_) => format!(
             "\x1b[32m✓\x1b[0m Config: {} CLI(s) saved to config.toml",
@@ -360,40 +421,72 @@ fn theme_choice_to_config_value(selected: &str) -> String {
     }
 }
 
+/// Prompt for the per-file indexing size cap, in MB, with the currently
+/// configured value (or the 10 MB default on first run) preselected. Rejects
+/// out-of-range input inline via the same `validate_rag_max_file_mb` doctor
+/// and ingestion both defer to, so the wizard can't save a value neither of
+/// them would actually honor.
+fn select_rag_max_file_mb(current: u32) -> Result<u32> {
+    use inquire::validator::Validation;
+
+    CustomType::<u32>::new("Per-file indexing size limit (MB):")
+        .with_default(current)
+        .with_help_message(&format!(
+            "Files larger than this are skipped during indexing | ceiling: {} MB",
+            crate::domain::canopy_config::RAG_MAX_FILE_MB_CEILING
+        ))
+        .with_validator(|mb: &u32| {
+            Ok(
+                match crate::domain::canopy_config::validate_rag_max_file_mb(*mb) {
+                    Ok(()) => Validation::Valid,
+                    Err(reason) => Validation::Invalid(reason.into()),
+                },
+            )
+        })
+        .prompt()
+        .map_err(|e| anyhow::anyhow!("Indexing size limit selection cancelled: {}", e))
+}
+
+/// Human-readable label (name, dimensions, approximate download size) for a
+/// supported local model id. The set of ids offered is derived from
+/// `embedding_client::LOCAL_MODEL_IDS` — the same single source of truth
+/// `model_id_to_fastembed` maps from — instead of a second hand-maintained
+/// id list, so the wizard can no longer drift out of step with which models
+/// are actually supported. Only the descriptive text lives here; coverage
+/// against `LOCAL_MODEL_IDS` is asserted by
+/// `every_local_model_id_has_a_label` below.
+fn local_model_label(id: &str) -> &'static str {
+    match id {
+        "baai/bge-small-en-v1.5" => {
+            "BGE Small EN v1.5     (local · 384d · ~130 MB)  — fast, great for English"
+        }
+        "baai/bge-base-en-v1.5" => {
+            "BGE Base EN v1.5      (local · 768d · ~430 MB)  — balanced, English"
+        }
+        "baai/bge-large-en-v1.5" => {
+            "BGE Large EN v1.5     (local · 1024d · ~1.3 GB) — best quality, English"
+        }
+        "intfloat/multilingual-e5-small" => {
+            "Multilingual E5 Small (local · 384d · ~480 MB)  — fast, multilingual"
+        }
+        "intfloat/multilingual-e5-base" => {
+            "Multilingual E5 Base  (local · 768d · ~1.1 GB)  — balanced, multilingual"
+        }
+        "intfloat/multilingual-e5-large" => {
+            "Multilingual E5 Large (local · 1024d · ~2.2 GB) — best quality, multilingual"
+        }
+        // Unreached in practice — every id in LOCAL_MODEL_IDS is covered
+        // above, and every_local_model_id_has_a_label fails the build if a
+        // new one is added here without it.
+        _ => "(unlabeled model)",
+    }
+}
+
 fn select_local_embeddings_model(current: &str) -> Result<String> {
-    const LOCAL_MODELS: &[(&str, &str)] = &[
-        (
-            "baai/bge-small-en-v1.5",
-            "BGE Small EN v1.5     (local · 384d · ~130 MB)  — fast, great for English",
-        ),
-        (
-            "baai/bge-base-en-v1.5",
-            "BGE Base EN v1.5      (local · 768d · ~430 MB)  — balanced, English",
-        ),
-        (
-            "baai/bge-large-en-v1.5",
-            "BGE Large EN v1.5     (local · 1024d · ~1.3 GB) — best quality, English",
-        ),
-        (
-            "intfloat/multilingual-e5-small",
-            "Multilingual E5 Small (local · 384d · ~480 MB)  — fast, multilingual",
-        ),
-        (
-            "intfloat/multilingual-e5-base",
-            "Multilingual E5 Base  (local · 768d · ~1.1 GB)  — balanced, multilingual",
-        ),
-        (
-            "intfloat/multilingual-e5-large",
-            "Multilingual E5 Large (local · 1024d · ~2.2 GB) — best quality, multilingual",
-        ),
-    ];
+    let ids = crate::rag::embedding_client::LOCAL_MODEL_IDS;
+    let options: Vec<&str> = ids.iter().map(|id| local_model_label(id)).collect();
 
-    let options: Vec<&str> = LOCAL_MODELS.iter().map(|(_, label)| *label).collect();
-
-    let start = LOCAL_MODELS
-        .iter()
-        .position(|(id, _)| *id == current)
-        .unwrap_or(0);
+    let start = ids.iter().position(|id| *id == current).unwrap_or(0);
 
     let selected = Select::new("Embeddings model (local, no API key required):", options)
         .with_starting_cursor(start)
@@ -403,20 +496,10 @@ fn select_local_embeddings_model(current: &str) -> Result<String> {
         .prompt()
         .map_err(|e| anyhow::anyhow!("Embeddings model selection cancelled: {}", e))?;
 
-    LOCAL_MODELS
-        .iter()
-        .find(|(_, label)| *label == selected)
-        .map(|(id, _)| id.to_string())
+    ids.iter()
+        .find(|id| local_model_label(id) == selected)
+        .map(|id| id.to_string())
         .ok_or_else(|| anyhow::anyhow!("Unknown embeddings model selection"))
-}
-
-#[cfg(feature = "local-embeddings")]
-fn download_local_model_for_setup(model_id: &str, cache_dir: &std::path::Path) -> Result<()> {
-    println!("  \x1b[90mDownloading model to ~/.canopy/models/ (only needed once)…\x1b[0m");
-    println!();
-    crate::rag::embedding_client::download_local_model(model_id, cache_dir)?;
-    println!();
-    Ok(())
 }
 
 /// Interactively pick one or more directories for personal RAG indexing.
@@ -457,6 +540,35 @@ fn pick_multiple_directories(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every id the wizard could offer (derived from `LOCAL_MODEL_IDS`) must
+    /// have a real label, not the id-echoing fallback arm in
+    /// `local_model_label` — that fallback exists only so a missing label
+    /// can't panic mid-setup; this test is what actually catches it.
+    #[test]
+    fn every_local_model_id_has_a_label() {
+        for id in crate::rag::embedding_client::LOCAL_MODEL_IDS {
+            assert_ne!(
+                local_model_label(id),
+                *id,
+                "missing a descriptive label for '{id}'"
+            );
+        }
+    }
+
+    #[test]
+    fn local_model_labels_are_unique() {
+        let ids = crate::rag::embedding_client::LOCAL_MODEL_IDS;
+        let mut labels: Vec<&str> = ids.iter().map(|id| local_model_label(id)).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(
+            labels.len(),
+            ids.len(),
+            "two ids resolved to the same label — select_local_embeddings_model \
+             maps the chosen label back to an id and needs them distinct"
+        );
+    }
 
     #[test]
     fn theme_choice_writes_modern_for_the_modern_menu_label() {

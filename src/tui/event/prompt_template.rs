@@ -233,8 +233,8 @@ fn handle_section_picker_key(
             handle_skills_picker_key(dialog, *selected, entries.len(), code);
             Ok(true)
         }
-        SectionPickerMode::ProjectPicker { selected, entries } => {
-            handle_project_picker_key(dialog, *selected, entries.len(), code);
+        SectionPickerMode::ProjectPicker { .. } => {
+            handle_project_picker_key(dialog, code);
             Ok(true)
         }
         SectionPickerMode::PresetPicker { .. } => {
@@ -334,6 +334,8 @@ fn open_project_picker(dialog: &mut SimplePromptDialog, db: &Database) -> Result
     dialog.picker_mode = SectionPickerMode::ProjectPicker {
         selected: 0,
         entries,
+        filter: String::new(),
+        scroll: 0,
     };
     Ok(())
 }
@@ -532,42 +534,98 @@ fn confirm_preset_picker_selection(dialog: &mut SimplePromptDialog) {
     }
 }
 
-fn handle_project_picker_key(
-    dialog: &mut SimplePromptDialog,
-    selected: usize,
-    count: usize,
-    code: KeyCode,
-) {
+/// Indices into the Project picker's `entries` that currently pass its typed
+/// filter, or `Vec::new()` if `dialog.picker_mode` isn't `ProjectPicker`.
+fn project_filtered_indices(dialog: &SimplePromptDialog) -> Vec<usize> {
+    let SectionPickerMode::ProjectPicker {
+        entries, filter, ..
+    } = &dialog.picker_mode
+    else {
+        return Vec::new();
+    };
+    SimplePromptDialog::filtered_project_indices(entries, filter)
+}
+
+fn handle_project_picker_key(dialog: &mut SimplePromptDialog, code: KeyCode) {
     match code {
         KeyCode::Esc => dialog.picker_mode = SectionPickerMode::None,
-        KeyCode::Up if selected > 0 => set_project_picker_selection(dialog, selected - 1),
-        KeyCode::Down if selected + 1 < count => set_project_picker_selection(dialog, selected + 1),
+        KeyCode::Up => move_project_picker(dialog, false),
+        KeyCode::Down => move_project_picker(dialog, true),
         KeyCode::Enter | KeyCode::Tab => confirm_project_picker_selection(dialog),
+        KeyCode::Backspace => pop_project_picker_filter(dialog),
+        KeyCode::Char(c) => push_project_picker_filter(dialog, c),
         _ => {}
     }
 }
 
-fn set_project_picker_selection(dialog: &mut SimplePromptDialog, selected: usize) {
+/// Move the highlighted row up/down within the filtered list, wrapping at
+/// both ends, then slides `scroll` (via `clamp_scroll`) so the new selection
+/// is always drawn — including right after a wraparound jump.
+fn move_project_picker(dialog: &mut SimplePromptDialog, forward: bool) {
+    let filtered_len = project_filtered_indices(dialog).len();
+    if filtered_len == 0 {
+        return;
+    }
+    let SectionPickerMode::ProjectPicker {
+        selected, scroll, ..
+    } = &mut dialog.picker_mode
+    else {
+        return;
+    };
+    *selected = if forward {
+        (*selected + 1) % filtered_len
+    } else {
+        selected.checked_sub(1).unwrap_or(filtered_len - 1)
+    };
+    let visible_rows = SimplePromptDialog::project_picker_visible_rows(filtered_len);
+    *scroll = SimplePromptDialog::clamp_scroll(*selected, *scroll, visible_rows);
+}
+
+fn push_project_picker_filter(dialog: &mut SimplePromptDialog, c: char) {
     if let SectionPickerMode::ProjectPicker {
-        selected: current, ..
+        filter,
+        selected,
+        scroll,
+        ..
     } = &mut dialog.picker_mode
     {
-        *current = selected;
+        filter.push(c);
+        *selected = 0;
+        *scroll = 0;
+    }
+}
+
+fn pop_project_picker_filter(dialog: &mut SimplePromptDialog) {
+    if let SectionPickerMode::ProjectPicker {
+        filter,
+        selected,
+        scroll,
+        ..
+    } = &mut dialog.picker_mode
+    {
+        filter.pop();
+        *selected = 0;
+        *scroll = 0;
     }
 }
 
 fn confirm_project_picker_selection(dialog: &mut SimplePromptDialog) {
-    let SectionPickerMode::ProjectPicker { entries, selected } =
-        std::mem::replace(&mut dialog.picker_mode, SectionPickerMode::None)
+    let filtered = project_filtered_indices(dialog);
+    let SectionPickerMode::ProjectPicker {
+        selected, entries, ..
+    } = &dialog.picker_mode
     else {
         return;
     };
+    let project = filtered
+        .get(*selected)
+        .and_then(|&idx| entries.get(idx))
+        .cloned();
 
-    let Some(project) = entries.get(selected) else {
-        return;
-    };
-
-    dialog.add_section_with_content("project_context", project.path.clone());
+    dialog.picker_mode = SectionPickerMode::None;
+    if let Some(project) = project {
+        dialog.add_section_with_content("project_context", project.path);
+    }
 }
 
 fn handle_at_picker_key(
@@ -2313,27 +2371,54 @@ mod picker_navigation_tests {
         assert_eq!(dialog.picker_mode, SectionPickerMode::None);
     }
 
+    fn make_project_entries(names: &[&str]) -> Vec<ProjectPickerEntry> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| ProjectPickerEntry {
+                hash: format!("h{i}"),
+                name: name.to_string(),
+                path: format!("/{name}"),
+            })
+            .collect()
+    }
+
     #[test]
     fn project_picker_navigation() {
         let mut dialog = SimplePromptDialog::new();
         dialog.picker_mode = SectionPickerMode::ProjectPicker {
             selected: 0,
-            entries: vec![
-                ProjectPickerEntry {
-                    hash: "h1".into(),
-                    name: "p1".into(),
-                    path: "/p1".into(),
-                },
-                ProjectPickerEntry {
-                    hash: "h2".into(),
-                    name: "p2".into(),
-                    path: "/p2".into(),
-                },
-            ],
+            entries: make_project_entries(&["p1", "p2"]),
+            filter: String::new(),
+            scroll: 0,
         };
-        handle_project_picker_key(&mut dialog, 0, 2, KeyCode::Down);
+        handle_project_picker_key(&mut dialog, KeyCode::Down);
         if let SectionPickerMode::ProjectPicker { selected, .. } = &dialog.picker_mode {
             assert_eq!(*selected, 1);
+        } else {
+            panic!("expected ProjectPicker");
+        }
+    }
+
+    #[test]
+    fn project_picker_navigation_wraps_at_both_ends() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.picker_mode = SectionPickerMode::ProjectPicker {
+            selected: 0,
+            entries: make_project_entries(&["p1", "p2", "p3"]),
+            filter: String::new(),
+            scroll: 0,
+        };
+        handle_project_picker_key(&mut dialog, KeyCode::Up);
+        if let SectionPickerMode::ProjectPicker { selected, .. } = &dialog.picker_mode {
+            assert_eq!(*selected, 2, "Up from index 0 wraps to the last entry");
+        } else {
+            panic!("expected ProjectPicker");
+        }
+
+        handle_project_picker_key(&mut dialog, KeyCode::Down);
+        if let SectionPickerMode::ProjectPicker { selected, .. } = &dialog.picker_mode {
+            assert_eq!(*selected, 0, "Down from the last entry wraps to index 0");
         } else {
             panic!("expected ProjectPicker");
         }
@@ -2344,14 +2429,123 @@ mod picker_navigation_tests {
         let mut dialog = SimplePromptDialog::new();
         dialog.picker_mode = SectionPickerMode::ProjectPicker {
             selected: 0,
-            entries: vec![ProjectPickerEntry {
-                hash: "h1".into(),
-                name: "p1".into(),
-                path: "/p1".into(),
-            }],
+            entries: make_project_entries(&["p1"]),
+            filter: String::new(),
+            scroll: 0,
         };
-        handle_project_picker_key(&mut dialog, 0, 1, KeyCode::Esc);
+        handle_project_picker_key(&mut dialog, KeyCode::Esc);
         assert_eq!(dialog.picker_mode, SectionPickerMode::None);
+    }
+
+    #[test]
+    fn project_picker_typing_filters_and_resets_selection() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.picker_mode = SectionPickerMode::ProjectPicker {
+            selected: 1,
+            entries: make_project_entries(&["alpha", "beta", "gamma"]),
+            filter: String::new(),
+            scroll: 2,
+        };
+        handle_project_picker_key(&mut dialog, KeyCode::Char('g'));
+        let SectionPickerMode::ProjectPicker {
+            filter,
+            selected,
+            scroll,
+            ..
+        } = &dialog.picker_mode
+        else {
+            panic!("expected ProjectPicker");
+        };
+        assert_eq!(filter, "g");
+        assert_eq!(*selected, 0);
+        assert_eq!(*scroll, 0);
+        assert_eq!(project_filtered_indices(&dialog), vec![2]);
+    }
+
+    #[test]
+    fn project_picker_backspace_removes_last_filter_char_and_refilters() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.picker_mode = SectionPickerMode::ProjectPicker {
+            selected: 0,
+            entries: make_project_entries(&["alpha", "beta"]),
+            filter: "al".to_string(),
+            scroll: 0,
+        };
+        handle_project_picker_key(&mut dialog, KeyCode::Backspace);
+        let SectionPickerMode::ProjectPicker { filter, .. } = &dialog.picker_mode else {
+            panic!("expected ProjectPicker");
+        };
+        assert_eq!(filter, "a");
+        assert_eq!(project_filtered_indices(&dialog), vec![0, 1]);
+    }
+
+    #[test]
+    fn project_picker_filter_matching_nothing_yields_empty_filtered_list() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.picker_mode = SectionPickerMode::ProjectPicker {
+            selected: 0,
+            entries: make_project_entries(&["alpha", "beta"]),
+            filter: "zzz".to_string(),
+            scroll: 0,
+        };
+        assert!(project_filtered_indices(&dialog).is_empty());
+        // Navigation is a no-op against an empty filtered list.
+        handle_project_picker_key(&mut dialog, KeyCode::Down);
+        let SectionPickerMode::ProjectPicker { selected, .. } = &dialog.picker_mode else {
+            panic!("expected ProjectPicker");
+        };
+        assert_eq!(*selected, 0);
+    }
+
+    #[test]
+    fn project_picker_enter_confirms_highlighted_filtered_entry() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.picker_mode = SectionPickerMode::ProjectPicker {
+            selected: 0,
+            entries: make_project_entries(&["alpha", "beta", "gamma"]),
+            filter: "a".to_string(),
+            scroll: 0,
+        };
+        // filter "a" matches alpha(0), beta(1), gamma(2) — move to beta.
+        handle_project_picker_key(&mut dialog, KeyCode::Down);
+        handle_project_picker_key(&mut dialog, KeyCode::Enter);
+        assert_eq!(dialog.picker_mode, SectionPickerMode::None);
+        assert!(
+            dialog
+                .sections
+                .values()
+                .any(|content| content.contains("/beta")),
+            "confirming should insert the highlighted (filtered) entry's path"
+        );
+    }
+
+    #[test]
+    fn project_picker_scroll_follows_selection_past_visible_window() {
+        let names: Vec<String> = (0..20).map(|i| format!("proj{i}")).collect();
+        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut dialog = SimplePromptDialog::new();
+        dialog.picker_mode = SectionPickerMode::ProjectPicker {
+            selected: 0,
+            entries: make_project_entries(&name_refs),
+            filter: String::new(),
+            scroll: 0,
+        };
+        for _ in 0..19 {
+            handle_project_picker_key(&mut dialog, KeyCode::Down);
+        }
+        let SectionPickerMode::ProjectPicker {
+            selected, scroll, ..
+        } = &dialog.picker_mode
+        else {
+            panic!("expected ProjectPicker");
+        };
+        assert_eq!(*selected, 19);
+        let visible_rows = SimplePromptDialog::project_picker_visible_rows(20);
+        assert!(
+            *selected < scroll + visible_rows && *selected >= *scroll,
+            "selected entry {selected} must stay within the visible window [{scroll}, {})",
+            scroll + visible_rows
+        );
     }
 
     #[test]

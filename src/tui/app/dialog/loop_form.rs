@@ -322,6 +322,7 @@ mod tests {
 
     fn sample_loop(id: &str, trigger: Option<Trigger>) -> Loop {
         Loop {
+            archived: false,
             id: id.to_string(),
             name: "Nightly review".to_string(),
             description: Some("Review the queue".to_string()),
@@ -334,7 +335,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         }
     }
@@ -483,7 +484,7 @@ mod tests {
 
         assert!(app.loop_form_dialog.is_none());
         assert_eq!(fake.request_count(), 0);
-        assert!(db.list_loops(None).unwrap().is_empty());
+        assert!(db.list_loops(None, true).unwrap().is_empty());
     }
 
     #[test]

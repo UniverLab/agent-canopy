@@ -4,15 +4,18 @@ use clap::Subcommand;
 
 use crate::application::ports::{AgentRepository, StateRepository};
 use crate::daemon::process::{
-    is_process_running, kill_port_occupant, print_last_n_lines, read_pid, remove_pid_file,
-    send_signal,
+    diagnose_daemon, is_process_running, kill_port_occupant, print_last_n_lines, read_pid,
+    remove_pid_file, resolve_port_pid, send_signal, service_manager_facts, DaemonState,
 };
 
 #[cfg(target_os = "linux")]
 use crate::daemon::process::{is_service_enabled, is_systemd_available};
 
+use crate::daemon::health_routine;
 use crate::daemon::service_install;
 use crate::db::Database;
+use crate::domain::db_health::DbHealthOutcome;
+use crate::domain::db_paths::database_path;
 
 #[derive(Subcommand)]
 pub(crate) enum DaemonAction {
@@ -30,6 +33,9 @@ pub(crate) enum DaemonAction {
     InstallService,
     /// Remove the daemon system service.
     UninstallService,
+    /// Run the daily database integrity check and backup routine now,
+    /// instead of waiting for the daemon to find an idle moment.
+    HealthCheck,
 }
 
 pub(crate) async fn handle_daemon_action(
@@ -46,7 +52,28 @@ pub(crate) async fn handle_daemon_action(
         DaemonAction::Logs => handle_logs(&data_dir),
         DaemonAction::InstallService => handle_install_service(port_override),
         DaemonAction::UninstallService => handle_uninstall_service(),
+        DaemonAction::HealthCheck => handle_health_check(&data_dir),
     }
+}
+
+/// The port a running daemon last recorded itself on, falling back to
+/// `resolve_port(None)` (env var or default) when the database doesn't
+/// exist yet or has no `port` state — the same fallback `handle_status`
+/// always used before it also needed this to check who holds the port.
+///
+/// Gated on the db file already existing: `Database::new` creates and
+/// seeds a fresh database as a side effect when the path is missing, and a
+/// read-only status/stop check must not do that on a machine that has
+/// never started the daemon.
+pub(crate) fn configured_port(data_dir: &std::path::Path) -> u16 {
+    let db_path = database_path(data_dir);
+    db_path
+        .exists()
+        .then(|| Database::new(&db_path).ok())
+        .flatten()
+        .and_then(|db| db.get_state("port").ok().flatten())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| crate::resolve_port(None))
 }
 
 async fn handle_start(data_dir: &std::path::Path, port_override: Option<u16>) -> Result<()> {
@@ -60,6 +87,27 @@ async fn handle_start(data_dir: &std::path::Path, port_override: Option<u16>) ->
 
     let exe = std::env::current_exe()?;
     let port = crate::resolve_port(port_override);
+
+    // The PID-file check above can miss a daemon that's alive and well but
+    // whose PID this invocation doesn't know about yet — e.g. a stale or
+    // missing PID file right after `canopy daemon install`. Killing
+    // whatever holds the port unconditionally and forking a fresh detached
+    // `canopy serve` on top of it is exactly how an untracked orphan that
+    // the unit can never supersede gets created: the fork wins the race for
+    // the port, and every subsequent restart of the managed unit fails to
+    // bind. If the current occupant is already the service manager's own
+    // process, leave it alone instead of replacing it.
+    if let Some(manager) = service_manager_facts() {
+        if let Some(pid) = resolve_port_pid(port) {
+            if manager.pid == Some(pid) {
+                println!(
+                    "Daemon is already running under {} (PID: {pid})",
+                    manager.name
+                );
+                return Ok(());
+            }
+        }
+    }
 
     kill_port_occupant(port);
 
@@ -153,31 +201,61 @@ fn install_service_if_needed(_exe: &std::path::Path, _port: u16) {
 }
 
 async fn handle_stop(data_dir: &std::path::Path) -> Result<()> {
-    let Some(pid) = read_pid(data_dir) else {
-        println!("Daemon is not running (no PID file)");
-        return Ok(());
-    };
+    let port = configured_port(data_dir);
 
-    if !is_process_running(pid) {
-        println!("Daemon is not running (stale PID file)");
+    // Signal whichever PIDs are actually alive among the PID file and the
+    // port's real occupant — not just the PID file. An orphaned `canopy
+    // serve` that outlived its unit (or was never tracked by one) can hold
+    // the port with a stale, missing, or simply different PID file; without
+    // checking the port directly, `daemon stop` can never clear it and the
+    // only fix is hunting the PID down by hand.
+    let mut targets: Vec<u32> = Vec::new();
+    if let Some(pid) = read_pid(data_dir).filter(|&p| is_process_running(p)) {
+        targets.push(pid);
+    }
+    if let Some(pid) = resolve_port_pid(port).filter(|&p| is_process_running(p)) {
+        if !targets.contains(&pid) {
+            targets.push(pid);
+        }
+    }
+
+    if targets.is_empty() {
+        println!("Daemon is not running");
         remove_pid_file(data_dir);
         return Ok(());
     }
 
-    send_signal(pid);
-    println!("Sent stop signal to daemon (PID: {pid})");
+    for &pid in &targets {
+        send_signal(pid);
+    }
+    let pid_list = targets
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("Sent stop signal to daemon (PID: {pid_list})");
 
     for _ in 0..20 {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        if !is_process_running(pid) {
+        if targets.iter().all(|&p| !is_process_running(p)) {
             break;
         }
     }
 
     remove_pid_file(data_dir);
 
-    if is_process_running(pid) {
-        eprintln!("Warning: daemon (PID: {pid}) did not stop within 5 seconds");
+    let still_alive: Vec<u32> = targets
+        .iter()
+        .copied()
+        .filter(|&p| is_process_running(p))
+        .collect();
+    if !still_alive.is_empty() {
+        let list = still_alive
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!("Warning: daemon (PID: {list}) did not stop within 5 seconds");
     } else {
         println!("Daemon stopped");
     }
@@ -186,24 +264,38 @@ async fn handle_stop(data_dir: &std::path::Path) -> Result<()> {
 }
 
 fn handle_status(data_dir: &std::path::Path) -> Result<()> {
-    let pid_info = read_pid(data_dir);
+    let raw_pid = read_pid(data_dir);
+    let state_pid = raw_pid.filter(|&p| is_process_running(p));
+    let port = configured_port(data_dir);
+    let port_pid = resolve_port_pid(port);
+    let manager = service_manager_facts();
 
-    if !pid_info.map(is_process_running).unwrap_or(false) {
-        println!("Daemon: STOPPED");
-        if pid_info.is_some() {
-            remove_pid_file(data_dir);
+    let pid = match diagnose_daemon(state_pid, port_pid, manager.as_ref()) {
+        DaemonState::Stopped => {
+            println!("Daemon: STOPPED");
+            if raw_pid.is_some() {
+                remove_pid_file(data_dir);
+            }
+            return Ok(());
         }
-        return Ok(());
-    }
+        DaemonState::Discrepancy(d) => {
+            // Never print RUNNING here — a healthy version string from a
+            // process that isn't the one the service manager actually owns
+            // is exactly the lie this command exists to stop telling.
+            println!("Daemon: INCONSISTENT");
+            for line in d.describe() {
+                println!("  {line}");
+            }
+            return Ok(());
+        }
+        DaemonState::Running { pid } => pid,
+    };
 
-    let pid = pid_info.expect("pid checked above");
-
-    let Ok(db) = Database::new(&data_dir.join("background_agents.db")) else {
+    let Ok(db) = Database::new(&database_path(data_dir)) else {
         println!("Daemon: RUNNING (PID: {pid})");
         return Ok(());
     };
 
-    let port = db.get_state("port")?.unwrap_or_else(|| "7755".to_string());
     let version = db
         .get_state("version")?
         .unwrap_or_else(|| "unknown".to_string());
@@ -260,6 +352,78 @@ fn handle_install_service(port_override: Option<u16>) -> Result<()> {
             Err(e)
         }
     }
+}
+
+/// Run the health routine immediately, bypassing the daemon's idle/24h-due
+/// gate (`HealthRoutine::maybe_run`) entirely — that gate exists so the
+/// *automatic* daily run never fights the daemon for attention, not to stop
+/// an operator who explicitly asked for a check right now. Safe to run
+/// alongside a live daemon: `VACUUM INTO` (decision 4 in the health-routine
+/// spec) takes a read snapshot and never blocks writers, so this needs no
+/// coordination with a running daemon process — it just opens the same
+/// database file directly, the way `doctor` and `daemon status` already do.
+fn handle_health_check(data_dir: &std::path::Path) -> Result<()> {
+    let db_path = database_path(data_dir);
+    if !db_path.exists() {
+        println!(
+            "No database found at {} — nothing to check.",
+            db_path.display()
+        );
+        return Ok(());
+    }
+    let backup_path = health_routine::backup_path(data_dir);
+    let db = Database::new(&db_path)?;
+
+    println!("Running database health check...");
+    let status = health_routine::run_health_check(&db, &db_path, &backup_path);
+    health_routine::save_status(&db, &status)?;
+
+    match status.outcome {
+        Some(DbHealthOutcome::Passed) => {
+            println!("\x1b[32m✓\x1b[0m integrity_check: ok");
+            println!(
+                "\x1b[32m✓\x1b[0m Backup written and verified: {}",
+                status.backup_path.unwrap_or_default()
+            );
+        }
+        Some(DbHealthOutcome::IntegrityFailed) => {
+            println!(
+                "\x1b[31m✗\x1b[0m integrity_check failed: {}",
+                status.integrity_result.unwrap_or_default()
+            );
+            println!("No backup was attempted — a backup from a corrupt source would overwrite the last good one.");
+        }
+        Some(DbHealthOutcome::BackupVerificationFailed) => {
+            println!("\x1b[32m✓\x1b[0m integrity_check: ok");
+            println!(
+                "\x1b[31m✗\x1b[0m The new backup failed its own verification and was discarded."
+            );
+            if let Some(path) = &status.backup_path {
+                println!("Previous backup left in place: {path}");
+            }
+        }
+        Some(DbHealthOutcome::BackupSkippedInsufficientDiskSpace) => {
+            println!("\x1b[32m✓\x1b[0m integrity_check: ok");
+            println!("\x1b[33m⚠\x1b[0m Backup skipped — not enough free disk space.");
+            if let Some(path) = &status.backup_path {
+                println!("Previous backup left in place: {path}");
+            }
+        }
+        None => println!("\x1b[31m✗\x1b[0m Health check did not complete."),
+    }
+
+    if !status.foreign_key_violations.is_empty() {
+        println!(
+            "\x1b[33m⚠\x1b[0m foreign_key_check found {} violation(s):",
+            status.foreign_key_violations.len()
+        );
+        for violation in &status.foreign_key_violations {
+            println!("    {violation}");
+        }
+        println!("Not fatal — run 'canopy clean' to resolve orphaned rows.");
+    }
+
+    Ok(())
 }
 
 fn handle_uninstall_service() -> Result<()> {

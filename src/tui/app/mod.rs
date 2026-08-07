@@ -38,10 +38,11 @@ pub mod utils;
 pub(crate) use session_resume::build_resumed_session_args;
 pub use terminal_search::TerminalSearch;
 pub(crate) use types::ContextTransferSource;
+pub(crate) use types::LoopLiveFocus;
 pub use types::{
     AgentEntry, AgentSectionFocus, App, AutomationKind, Focus, ProjectTab, SidebarLayer,
 };
-use types::{LoopSidebarMeta, RagTransferModal};
+use types::{LoopSidebarMeta, RagTransferModal, SidebarStepMemory};
 
 impl App {
     pub fn new(db: Arc<Database>, data_dir: &Path) -> Result<Self> {
@@ -77,6 +78,7 @@ impl App {
             focus: Focus::Home,
             sidebar_layer: SidebarLayer::Live,
             automation_kind: AutomationKind::Agent,
+            sidebar_step_memory: SidebarStepMemory::default(),
             project_focus: None,
             selected_project_history: 0,
             project_history_cache: HashMap::new(),
@@ -90,7 +92,9 @@ impl App {
             pending_launch_dialog: None,
             quit_confirm: false,
             delete_project_confirm: false,
-            delete_loop_confirm: false,
+            archive_loop_confirm: false,
+            permanent_delete_loop_confirm: false,
+            loop_reset_confirm: false,
             sidebar_brain: None,
             home_brain: None,
             sidebar_click_map: Vec::new(),
@@ -106,6 +110,9 @@ impl App {
             project_tab_row_click_map: Vec::new(),
             sidebar_tab_click_map: Vec::new(),
             loops: Vec::new(),
+            archived_loops: Vec::new(),
+            archived_loop_count: 0,
+            loop_view_archived: false,
             selected_loop_id: None,
             loop_details: None,
             loop_runs: Vec::new(),
@@ -117,6 +124,16 @@ impl App {
             loop_live_state: None,
             loop_graph_follow: true,
             loop_graph_selected_node: None,
+            loop_live_focus: LoopLiveFocus::Graph,
+            loop_spec_strip_selected: None,
+            loop_spec_strip_scroll: 0,
+            loop_spec_strip_capacity: 0,
+            loop_spec_strip_click_map: Vec::new(),
+            loop_autorun_dialog: None,
+            loop_action_pending: false,
+            loop_action_rx: None,
+            loop_action_message: None,
+            loop_action_message_at: std::time::Instant::now() - std::time::Duration::from_secs(999),
             backlog_specs: Vec::new(),
             selected_backlog: 0,
             global_rag_queue: Vec::new(),
@@ -177,6 +194,8 @@ impl App {
             playground_project_hash: None,
             rag_paused: false,
             rag_model_loaded: false,
+            rag_embeddings_model: canopy_config.embeddings_model.clone(),
+            rag_acquisition_state: None,
             agents_rag_focused: false,
             sync_scroll_offset: 0,
             last_sync_area: None,
@@ -229,6 +248,8 @@ impl App {
         self.resize_interactive_agents();
         self.poll_playground_search();
         self.refresh_playground_search()?;
+        self.poll_loop_action();
+        self.dismiss_loop_action_message();
         if let Some(dialog) = self.simple_prompt_dialog.as_mut() {
             dialog.tick_at_picker();
         }
@@ -353,15 +374,18 @@ impl App {
 
     // ── Navigation ──────────────────────────────────────────────
     //
-    // The sidebar is one flat vertical ring for arrow-key purposes: pinned
-    // RAG (top) → Live → Automation → Knowledge (bottom), wrapping around.
-    // Inside Knowledge, once a project is entered (`project_focus.is_some()`)
-    // arrows instead navigate the active tab's list exclusively — they never
-    // change tabs (functional requirement 4).
+    // Arrows never change the active sidebar tab (Live / Automation /
+    // Knowledge) — they navigate that tab's own list exclusively, wrapping
+    // at both ends. The one exception is the pinned RAG summary above the
+    // tab bar: backing off the first item of whichever tab is active moves
+    // up to RAG (when it has anything to show), and moving off RAG returns
+    // to the first item of that same tab. Inside Knowledge, once a project
+    // is entered (`project_focus.is_some()`) arrows navigate that project's
+    // active tab list under the same rule (functional requirement 4).
 
     pub fn select_next(&mut self) {
         if self.agents_rag_focused {
-            self.leave_rag_focus(true);
+            self.leave_rag_focus();
             self.reset_log_scroll();
             return;
         }
@@ -380,7 +404,7 @@ impl App {
 
     pub fn select_prev(&mut self) {
         if self.agents_rag_focused {
-            self.leave_rag_focus(false);
+            self.leave_rag_focus();
             self.reset_log_scroll();
             return;
         }
@@ -428,43 +452,57 @@ impl App {
             .collect()
     }
 
+    /// Arrows never change the active tab (decisions 1–2): running off
+    /// either end of `Live`'s own list wraps within it. The one exception is
+    /// backing off the first item, which instead focuses the pinned RAG
+    /// summary above the tab bar when it has anything to show (decision 3);
+    /// with nothing to show there, that end wraps to the last item too.
     fn navigate_live(&mut self, forward: bool) {
         let indices = self.live_indices();
         if indices.is_empty() {
-            self.cross_layer(SidebarLayer::Live, forward);
             return;
         }
         let current = indices.iter().position(|&i| i == self.selected);
-        let next_pos = match current {
-            Some(pos) if forward && pos + 1 < indices.len() => Some(pos + 1),
-            Some(pos) if !forward && pos > 0 => Some(pos - 1),
-            Some(_) => None,
-            None => Some(0),
+        let Some(pos) = current else {
+            let prev = self.selected;
+            self.selected = indices[0];
+            self.update_agent_section_focus_on_change(prev);
+            return;
         };
-        match next_pos {
-            Some(pos) => {
-                let prev = self.selected;
-                self.selected = indices[pos];
-                self.update_agent_section_focus_on_change(prev);
+        let next_pos = if forward {
+            if pos + 1 < indices.len() {
+                pos + 1
+            } else {
+                0
             }
-            None => self.cross_layer(SidebarLayer::Live, forward),
-        }
+        } else if pos > 0 {
+            pos - 1
+        } else if self.rag_info.has_rag_activity() {
+            self.enter_rag_focus();
+            return;
+        } else {
+            indices.len() - 1
+        };
+        let prev = self.selected;
+        self.selected = indices[next_pos];
+        self.update_agent_section_focus_on_change(prev);
     }
 
     /// Automation is one flat ring for arrow-key purposes, agents rendered
     /// above loops: `[agent, agent, …, loop, loop, …]`. Running off either
-    /// true end crosses to the next/previous layer (`cross_layer`) instead
-    /// of bouncing between the two sub-lists.
+    /// end wraps within that same flat list (decisions 1–2), except backing
+    /// off the very first item, which focuses the pinned RAG summary when it
+    /// has anything to show (decision 3) and otherwise wraps to the last
+    /// entry like any other tab.
     fn navigate_automation(&mut self, forward: bool) {
         let agent_indices = self.automation_agent_indices();
         let loop_ids: Vec<String> = self
-            .active_loops()
+            .sidebar_loops()
             .into_iter()
             .map(|lp| lp.id.clone())
             .collect();
         let total = agent_indices.len() + loop_ids.len();
         if total == 0 {
-            self.cross_layer(SidebarLayer::Automation, forward);
             return;
         }
 
@@ -476,15 +514,22 @@ impl App {
                 .and_then(|id| loop_ids.iter().position(|v| v == id))
                 .map(|pos| agent_indices.len() + pos),
         };
-        let next_pos = match current {
+        let target_pos = match current {
             Some(pos) if forward && pos + 1 < total => Some(pos + 1),
-            Some(pos) if !forward && pos > 0 => Some(pos - 1),
+            Some(_) if forward => Some(0),
+            Some(pos) if pos > 0 => Some(pos - 1),
             Some(_) => None,
             None => Some(if forward { 0 } else { total - 1 }),
         };
-        let Some(pos) = next_pos else {
-            self.cross_layer(SidebarLayer::Automation, forward);
-            return;
+        let pos = match target_pos {
+            Some(pos) => pos,
+            None => {
+                if self.rag_info.has_rag_activity() {
+                    self.enter_rag_focus();
+                    return;
+                }
+                total - 1
+            }
         };
 
         if pos < agent_indices.len() {
@@ -501,21 +546,15 @@ impl App {
 
     fn navigate_projects_next(&mut self) {
         if self.projects.is_empty() {
-            self.cross_layer(SidebarLayer::Knowledge, true);
             return;
         }
         let next = self.selected_project + 1;
-        if next < self.projects.len() {
-            self.selected_project = next;
-            self.refresh_loops_selection();
-            return;
-        }
-        self.cross_layer(SidebarLayer::Knowledge, true);
+        self.selected_project = if next < self.projects.len() { next } else { 0 };
+        self.refresh_loops_selection();
     }
 
     fn navigate_projects_prev(&mut self) {
         if self.projects.is_empty() {
-            self.cross_layer(SidebarLayer::Knowledge, false);
             return;
         }
         if self.selected_project > 0 {
@@ -523,40 +562,18 @@ impl App {
             self.refresh_loops_selection();
             return;
         }
-        self.cross_layer(SidebarLayer::Knowledge, false);
-    }
-
-    /// Ran off the end of `from`'s list: move to the next/previous layer in
-    /// ring order (RAG → Live → Automation → Knowledge → RAG…), skipping a
-    /// layer if it has nothing to select, and landing on the RAG pinned
-    /// summary when it has activity.
-    fn cross_layer(&mut self, from: SidebarLayer, forward: bool) {
-        let ring = [
-            SidebarLayer::Live,
-            SidebarLayer::Automation,
-            SidebarLayer::Knowledge,
-        ];
-        let start = ring.iter().position(|&l| l == from).unwrap_or(0);
-        let len = ring.len();
-        for step in 1..=len {
-            let idx = if forward {
-                (start + step) % len
-            } else {
-                (start + len - step) % len
-            };
-            if self.enter_layer(ring[idx], forward) {
-                return;
-            }
-        }
-        // Nothing navigable anywhere else — try RAG, else stay put.
         if self.rag_info.has_rag_activity() {
             self.enter_rag_focus();
+            return;
         }
+        self.selected_project = self.projects.len() - 1;
+        self.refresh_loops_selection();
     }
 
     /// Try focusing the first/last navigable item of `layer`. Returns
     /// `false` (and touches nothing) if `layer` has nothing to select, so
-    /// `cross_layer` can keep looking.
+    /// callers that walk multiple layers (`focus_sidebar_from_edge`,
+    /// `cycle_sidebar_layer`) can keep looking.
     fn enter_layer(&mut self, layer: SidebarLayer, forward: bool) -> bool {
         match layer {
             SidebarLayer::Live => {
@@ -577,7 +594,7 @@ impl App {
             SidebarLayer::Automation => {
                 let agent_indices = self.automation_agent_indices();
                 let loop_ids: Vec<String> = self
-                    .active_loops()
+                    .sidebar_loops()
                     .into_iter()
                     .map(|lp| lp.id.clone())
                     .collect();
@@ -628,25 +645,13 @@ impl App {
         self.agents_rag_focused = true;
     }
 
-    /// Leaving the pinned RAG summary: land on the layer nearest it (`Live`
-    /// going forward, `Knowledge` wrapping around going backward), else stay
-    /// on RAG if nothing else is navigable.
-    fn leave_rag_focus(&mut self, forward: bool) {
+    /// Leaving the pinned RAG summary: entering RAG focus never touches
+    /// `sidebar_layer` (decision 1 — arrows never change tabs), so leaving it
+    /// always returns to the first item of whichever tab was active when RAG
+    /// was entered (decision 3), regardless of direction.
+    fn leave_rag_focus(&mut self) {
         self.agents_rag_focused = false;
-        let start = if forward {
-            SidebarLayer::Automation
-        } else {
-            SidebarLayer::Knowledge
-        };
-        // Try the immediate neighbor first (Live going forward, Knowledge
-        // going backward), then fall back through the ring.
-        if forward && self.enter_layer(SidebarLayer::Live, true) {
-            return;
-        }
-        if !forward && self.enter_layer(SidebarLayer::Knowledge, false) {
-            return;
-        }
-        self.cross_layer(start, forward);
+        self.enter_layer(self.sidebar_layer, true);
     }
 
     /// Move a project's active `ProjectTab` list selection. Arrows never
@@ -793,7 +798,7 @@ impl App {
     /// (functional requirement 3).
     fn refresh_project_preview_cache(&mut self) {
         let running_workdirs: HashSet<String> = self
-            .active_loops()
+            .sidebar_loops()
             .iter()
             .filter(|lp| lp.status == LoopStatus::Running)
             .map(|lp| lp.workdir.clone())
@@ -813,7 +818,7 @@ impl App {
                 .unwrap_or(0);
             let last_activity = self
                 .db
-                .list_loops(Some(project.path.as_str()))
+                .list_loops(Some(project.path.as_str()), true)
                 .ok()
                 .and_then(|loops| loops.iter().map(|lp| lp.created_at.timestamp()).max());
             cache.insert(
@@ -895,27 +900,46 @@ impl App {
     }
 
     fn refresh_loops(&mut self) -> Result<()> {
-        self.loops = self.db.list_loops(None)?;
+        self.loops = self.db.list_loops(None, false)?;
+        self.archived_loop_count = self.db.count_archived_loops().unwrap_or(0) as usize;
+        if self.loop_view_archived {
+            self.archived_loops = self.db.list_loops(None, true)?;
+            self.archived_loops.retain(|lp| lp.archived);
+        } else {
+            self.archived_loops.clear();
+        }
         self.refresh_loop_sidebar_meta();
         self.refresh_loops_selection();
         Ok(())
     }
 
-    /// Recompute the sidebar's per-loop spec progress ("done/total") and
-    /// blocked status (a `Paused` loop whose latest run recorded a
-    /// `loop_report_blocker` description). One `list_loop_specs` +, for
-    /// paused loops, one `list_loop_runs_for_loop` query per loop — bounded
-    /// by the (typically small) number of loops, run on the existing
-    /// refresh cadence rather than a dedicated poller.
+    /// Recompute the sidebar's per-loop "last activity" (see
+    /// [`LoopSidebarMeta`]) and blocked status (a `Paused` loop whose latest
+    /// run recorded a `loop_report_blocker` description). One
+    /// `list_loop_last_run_times` query for every loop's last-run time, plus,
+    /// for paused loops only, one `list_loop_runs_for_loop` query — bounded
+    /// by the (typically small) number of loops, run on the existing refresh
+    /// cadence rather than a dedicated poller.
+    ///
+    /// Deliberately reads `loop_runs` rather than `list_loop_specs`: a
+    /// queue-driven loop's specs live on the queue, not on the loop's own
+    /// `loop_specs` rows, so that query is always empty for it. `loop_runs`
+    /// is populated regardless of how the spec was bound.
     fn refresh_loop_sidebar_meta(&mut self) {
+        let last_run_times = self.db.list_loop_last_run_times().unwrap_or_default();
         let mut meta = HashMap::new();
         for lp in &self.loops {
-            let specs = self.db.list_loop_specs(&lp.id).unwrap_or_default();
-            let total = specs.len();
-            let done = specs
-                .iter()
-                .filter(|spec| spec.status == LoopSpecStatus::Completed)
-                .count();
+            let running = lp.status == LoopStatus::Running;
+            let last_run_at = last_run_times.get(&lp.id).copied();
+            let last_activity = last_run_at.unwrap_or(lp.created_at);
+            let last_run_label = if running {
+                "running".to_string()
+            } else {
+                match last_run_at {
+                    Some(at) => utils::relative_time_compact(&at),
+                    None => "never".to_string(),
+                }
+            };
             let blocked = lp.status == LoopStatus::Paused
                 && self
                     .db
@@ -923,33 +947,47 @@ impl App {
                     .ok()
                     .and_then(|runs| runs.last().and_then(|run| run.output.clone()))
                     .is_some_and(|output| output.get("blocker").is_some());
+            let autorun_label = lp
+                .autorun_at
+                .map(|at| format!("resumes {}", utils::relative_time_until_compact(&at)));
             meta.insert(
                 lp.id.clone(),
                 LoopSidebarMeta {
-                    done,
-                    total,
+                    last_activity,
+                    last_run_label,
                     blocked,
+                    autorun_label,
                 },
             );
         }
         self.loop_sidebar_meta = meta;
     }
 
-    /// Non-terminal loops (`Draft`/`Running`/`Paused`) for the sidebar's
-    /// `Loops` section, with running loops sorted first, then paused
-    /// (including blocked), then draft — ties broken by the existing
-    /// `created_at DESC` order from `list_loops`.
-    pub fn active_loops(&self) -> Vec<&crate::domain::loops::Loop> {
-        let mut loops: Vec<&crate::domain::loops::Loop> = self
-            .loops
-            .iter()
-            .filter(|lp| !matches!(lp.status, LoopStatus::Completed | LoopStatus::Failed))
-            .collect();
-        loops.sort_by_key(|lp| match lp.status {
-            LoopStatus::Running => 0,
-            LoopStatus::Paused => 1,
-            LoopStatus::Draft => 2,
-            LoopStatus::Completed | LoopStatus::Failed => 3,
+    /// Every loop for the sidebar's `Loops` section, ordered by last
+    /// activity (most recent first) with **no filtering by status** — a
+    /// loop that reaches a terminal state stays listed so the operator can
+    /// see it failed/completed and act on it (selection and F4's
+    /// confirmation flow reach every loop regardless of status). Ties
+    /// broken by the existing `created_at DESC` order from `list_loops`,
+    /// since the sort is stable.
+    ///
+    /// `last_activity` is precomputed by [`Self::refresh_loop_sidebar_meta`]
+    /// on the refresh cadence, not queried here, so listing every loop adds
+    /// no per-tick database work.
+    pub fn sidebar_loops(&self) -> Vec<&crate::domain::loops::Loop> {
+        if self.loop_view_archived {
+            let mut loops: Vec<&crate::domain::loops::Loop> = self.archived_loops.iter().collect();
+            loops.sort_by_key(|lp| std::cmp::Reverse(lp.created_at));
+            return loops;
+        }
+        let mut loops: Vec<&crate::domain::loops::Loop> = self.loops.iter().collect();
+        loops.sort_by_key(|lp| {
+            std::cmp::Reverse(
+                self.loop_sidebar_meta
+                    .get(&lp.id)
+                    .map(|meta| meta.last_activity)
+                    .unwrap_or(lp.created_at),
+            )
         });
         loops
     }
@@ -965,6 +1003,9 @@ impl App {
             self.loop_live_state = None;
             self.loop_graph_follow = true;
             self.loop_graph_selected_node = None;
+            self.loop_live_focus = LoopLiveFocus::Graph;
+            self.loop_spec_strip_selected = None;
+            self.loop_spec_strip_scroll = 0;
             return;
         }
 
@@ -987,6 +1028,9 @@ impl App {
             self.loop_selected_node = 0;
             self.loop_graph_follow = true;
             self.loop_graph_selected_node = None;
+            self.loop_live_focus = LoopLiveFocus::Graph;
+            self.loop_spec_strip_selected = None;
+            self.loop_spec_strip_scroll = 0;
         } else {
             self.clamp_loop_selection();
         }
@@ -1015,6 +1059,19 @@ impl App {
             if !still_present {
                 self.loop_graph_follow = true;
                 self.loop_graph_selected_node = None;
+            }
+        }
+
+        // Same rule for the spec marker strip's manual selection: a spec
+        // that's dropped out of the (possibly just-advanced) queue can't
+        // stay highlighted.
+        if let Some(selected) = self.loop_spec_strip_selected.as_deref() {
+            let still_present = self
+                .loop_live_state
+                .as_ref()
+                .is_some_and(|state| state.spec_queue.iter().any(|e| e.spec_id == selected));
+            if !still_present {
+                self.loop_spec_strip_selected = None;
             }
         }
     }
@@ -1051,6 +1108,70 @@ impl App {
         self.loop_graph_selected_node = None;
     }
 
+    /// Toggle plain-arrow-key ownership between the graph and the spec
+    /// marker strip. The two are otherwise independent: switching focus
+    /// never touches `loop_graph_follow` or the strip's own selection.
+    pub fn loop_live_toggle_focus(&mut self) {
+        self.loop_live_focus = match self.loop_live_focus {
+            LoopLiveFocus::Graph => LoopLiveFocus::SpecStrip,
+            LoopLiveFocus::SpecStrip => LoopLiveFocus::Graph,
+        };
+    }
+
+    /// Move the marker strip's selection to the next/previous spec in queue
+    /// order, entering manual selection. Never touches `loop_graph_follow` —
+    /// selecting a spec by hand in the strip is independent of the graph's
+    /// own follow/manual state. No-op when there's no live state or queue.
+    pub fn loop_spec_strip_move_selection(&mut self, forward: bool) {
+        let ids: Vec<String> = match self.loop_live_state.as_ref() {
+            Some(state) if !state.spec_queue.is_empty() => {
+                state.spec_queue.iter().map(|e| e.spec_id.clone()).collect()
+            }
+            _ => return,
+        };
+
+        let current = self.loop_spec_strip_selected.clone();
+        let idx = current
+            .as_deref()
+            .and_then(|id| ids.iter().position(|n| n == id));
+        let next_idx = match idx {
+            // Nothing selected yet: land on the strip's first/last item
+            // rather than skipping past it as if index 0 were already
+            // selected (the graph's `loop_graph_move_highlight` can assume
+            // that, since auto-follow always has *some* node highlighted;
+            // the strip starts with no selection at all).
+            None => {
+                if forward {
+                    0
+                } else {
+                    ids.len() - 1
+                }
+            }
+            Some(idx) if forward => (idx + 1) % ids.len(),
+            Some(idx) => idx.checked_sub(1).unwrap_or(ids.len() - 1),
+        };
+        self.loop_spec_strip_selected = Some(ids[next_idx].clone());
+        self.loop_spec_strip_scroll = scroll_into_view(
+            self.loop_spec_strip_scroll,
+            next_idx,
+            self.loop_spec_strip_capacity,
+        );
+    }
+
+    /// Select a spec directly by id in the marker strip (mouse click path).
+    /// Ignored if the id isn't in the current queue.
+    pub fn loop_spec_strip_select(&mut self, spec_id: String) {
+        let exists = self
+            .loop_live_state
+            .as_ref()
+            .is_some_and(|state| state.spec_queue.iter().any(|e| e.spec_id == spec_id));
+        if !exists {
+            return;
+        }
+        self.loop_spec_strip_selected = Some(spec_id);
+        self.loop_live_focus = LoopLiveFocus::SpecStrip;
+    }
+
     /// The node id currently highlighted in the live loop view: the
     /// engine's current node while auto-following, else the manually
     /// selected node.
@@ -1077,6 +1198,7 @@ impl App {
                 started_at: state.current_node_started_at,
                 iteration: state.current_node_iteration,
                 output_tail: state.current_node_output_tail.clone(),
+                chosen_route: highlighted.and_then(|id| state.router_taken_routes.get(id).cloned()),
             };
         }
         let (Some(spec_id), Some(node_id)) = (state.current_spec_id.as_deref(), highlighted) else {
@@ -1093,6 +1215,8 @@ impl App {
             .map(|v| v == "1")
             .unwrap_or(false);
         self.rag_model_loaded = crate::rag::status::is_model_loaded(&self.db);
+        self.rag_acquisition_state =
+            crate::rag::status::read_acquisition_state(&self.db, &self.rag_embeddings_model);
 
         let (queued, processing) = self
             .db
@@ -1141,12 +1265,20 @@ impl App {
     }
 
     pub fn visible_loops(&self) -> Vec<&crate::domain::loops::Loop> {
-        self.loops.iter().collect()
+        if self.loop_view_archived {
+            self.archived_loops.iter().collect()
+        } else {
+            self.loops.iter().collect()
+        }
     }
 
     pub fn selected_loop(&self) -> Option<&crate::domain::loops::Loop> {
         let selected_id = self.selected_loop_id.as_ref()?;
-        self.loops.iter().find(|lp| lp.id == *selected_id)
+        if self.loop_view_archived {
+            self.archived_loops.iter().find(|lp| lp.id == *selected_id)
+        } else {
+            self.loops.iter().find(|lp| lp.id == *selected_id)
+        }
     }
 
     pub fn selected_loop_spec(&self) -> Option<&crate::domain::loops::LoopSpecDetails> {
@@ -1184,7 +1316,39 @@ impl App {
         Ok(())
     }
 
-    pub fn delete_selected_loop(&mut self) -> Result<()> {
+    /// Archive the loop currently selected in the main (non-archived) view.
+    /// A no-op (not an error) when nothing is selected, the loop is already
+    /// archived, or it's still `running` (archiving is for work that's
+    /// finished with — pause it first).
+    pub fn archive_selected_loop(&mut self) -> Result<()> {
+        let Some(lp) = self.selected_loop() else {
+            return Ok(());
+        };
+        self.db.archive_loop(&lp.id)?;
+        self.refresh_loops()?;
+        self.refresh_projects()?;
+        self.refresh_rag_state()?;
+        Ok(())
+    }
+
+    /// Restore the loop currently selected in the archived view back to the
+    /// main list. A no-op when nothing is selected.
+    pub fn restore_selected_archived_loop(&mut self) -> Result<()> {
+        let Some(lp) = self.selected_loop() else {
+            return Ok(());
+        };
+        self.db.restore_loop(&lp.id)?;
+        self.refresh_loops()?;
+        self.refresh_projects()?;
+        self.refresh_rag_state()?;
+        Ok(())
+    }
+
+    /// Permanently delete the loop currently selected in the archived view —
+    /// the deliberate, separate act this spec keeps behind the archive: it
+    /// destroys the loop's row and, via `ON DELETE CASCADE`, its specs and
+    /// full run history. A no-op when nothing is selected.
+    pub fn permanent_delete_selected_archived_loop(&mut self) -> Result<()> {
         let Some(lp) = self.selected_loop() else {
             return Ok(());
         };
@@ -1193,6 +1357,15 @@ impl App {
         self.refresh_projects()?;
         self.refresh_rag_state()?;
         Ok(())
+    }
+
+    /// Toggle the Loops sidebar section between the main list and the
+    /// archive. Refreshes immediately so the archived list is populated the
+    /// moment it becomes visible (`refresh_loops` only loads
+    /// `archived_loops` while this flag is set).
+    pub fn toggle_loop_archive_view(&mut self) {
+        self.loop_view_archived = !self.loop_view_archived;
+        let _ = self.refresh_loops();
     }
 
     pub fn delete_selected_knowledge(&mut self) -> Result<()> {
@@ -1262,7 +1435,8 @@ impl App {
 
     /// Entry point for arrow-down/up from the `Home` screen: focus the
     /// nearest navigable edge of the sidebar ring (RAG → Live → Automation →
-    /// Knowledge), mirroring `cross_layer`'s ring order.
+    /// Knowledge). Distinct from in-sidebar arrow navigation, which never
+    /// crosses tabs once focus is inside one.
     pub(crate) fn focus_sidebar_from_edge(&mut self, from_top: bool) {
         if from_top {
             if self.rag_info.has_rag_activity() {
@@ -1329,16 +1503,107 @@ impl App {
     /// at the ends. Deliberately does NOT skip empty tabs the way F2 does:
     /// a directional key that silently jumps two cells because the one in
     /// between was empty reads as a bug, and the empty tab's own state is
-    /// worth seeing.
+    /// worth seeing. Now reachable from `Focus::Agent` too (not just
+    /// Home/Preview) when no split is active — see the guard in
+    /// `event::handle_global_key` — so a step away from a layer remembers
+    /// that layer's selection and a step back restores it instead of
+    /// re-landing on its edge item the way a fresh jump (click/F2) does.
     pub(crate) fn step_sidebar_tab(&mut self, forward: bool) {
         let ring = Self::SIDEBAR_TAB_RING;
         let idx = Self::sidebar_tab_index(self.sidebar_layer);
-        let next = if forward {
-            (idx + 1) % ring.len()
-        } else {
-            idx.checked_sub(1).unwrap_or(ring.len() - 1)
-        };
-        self.switch_sidebar_tab(ring[next]);
+        let next = step_ring_index(idx, ring.len(), forward);
+        self.remember_current_sidebar_selection();
+        let target = ring[next];
+        self.agents_rag_focused = false;
+        if !self.restore_remembered_sidebar_selection(target) {
+            self.switch_sidebar_tab(target);
+        }
+    }
+
+    /// Snapshot the outgoing sidebar layer's own selection into
+    /// `sidebar_step_memory` before `step_sidebar_tab` moves off it. `Live`
+    /// and Automation's agent sub-list share `selected` as their index
+    /// space, so leaving one and entering the other would otherwise
+    /// overwrite the value the departing layer needs back.
+    fn remember_current_sidebar_selection(&mut self) {
+        match self.sidebar_layer {
+            SidebarLayer::Live => {
+                self.sidebar_step_memory.live_selected = Some(self.selected);
+            }
+            SidebarLayer::Automation => {
+                self.sidebar_step_memory.automation_kind = Some(self.automation_kind);
+                match self.automation_kind {
+                    AutomationKind::Agent => {
+                        self.sidebar_step_memory.automation_selected = Some(self.selected);
+                    }
+                    AutomationKind::Loop => {
+                        self.sidebar_step_memory.automation_loop_id = self.selected_loop_id.clone();
+                    }
+                }
+            }
+            SidebarLayer::Knowledge => {
+                self.sidebar_step_memory.knowledge_selected = Some(self.selected_project);
+            }
+        }
+    }
+
+    /// Try to restore `layer`'s remembered selection (still valid against
+    /// current data); returns `false` if nothing was remembered or it no
+    /// longer applies, so the caller falls back to the edge-jump `enter_layer`
+    /// uses for a fresh jump.
+    fn restore_remembered_sidebar_selection(&mut self, layer: SidebarLayer) -> bool {
+        match layer {
+            SidebarLayer::Live => {
+                let Some(idx) = self.sidebar_step_memory.live_selected else {
+                    return false;
+                };
+                if !self.live_indices().contains(&idx) {
+                    return false;
+                }
+                self.sidebar_layer = SidebarLayer::Live;
+                self.selected = idx;
+                true
+            }
+            SidebarLayer::Automation => match self.sidebar_step_memory.automation_kind {
+                Some(AutomationKind::Agent) => {
+                    let Some(idx) = self.sidebar_step_memory.automation_selected else {
+                        return false;
+                    };
+                    if !self.automation_agent_indices().contains(&idx) {
+                        return false;
+                    }
+                    self.sidebar_layer = SidebarLayer::Automation;
+                    self.automation_kind = AutomationKind::Agent;
+                    self.selected = idx;
+                    true
+                }
+                Some(AutomationKind::Loop) => {
+                    let Some(id) = self.sidebar_step_memory.automation_loop_id.clone() else {
+                        return false;
+                    };
+                    if !self.sidebar_loops().iter().any(|lp| lp.id == id) {
+                        return false;
+                    }
+                    self.sidebar_layer = SidebarLayer::Automation;
+                    self.automation_kind = AutomationKind::Loop;
+                    self.selected_loop_id = Some(id);
+                    self.refresh_loops_selection();
+                    true
+                }
+                None => false,
+            },
+            SidebarLayer::Knowledge => {
+                let Some(idx) = self.sidebar_step_memory.knowledge_selected else {
+                    return false;
+                };
+                if idx >= self.projects.len() {
+                    return false;
+                }
+                self.sidebar_layer = SidebarLayer::Knowledge;
+                self.selected_project = idx;
+                true
+            }
+        }
     }
 
     /// Enter a highlighted project's Focus tab bar (functional requirement
@@ -1355,7 +1620,7 @@ impl App {
         self.project_focus = None;
     }
 
-    /// Tab/Shift+Tab or `]`/`[` inside a project's Focus tab bar.
+    /// Tab/Shift+Tab, `]`/`[`, or Shift+←/→ inside a project's Focus tab bar.
     pub(crate) fn cycle_project_tab(&mut self, forward: bool) {
         let Some(current) = self.project_focus else {
             return;
@@ -1364,12 +1629,7 @@ impl App {
             .iter()
             .position(|&t| t == current)
             .unwrap_or(0);
-        let len = ProjectTab::ALL.len();
-        let next = if forward {
-            (idx + 1) % len
-        } else {
-            idx.checked_sub(1).unwrap_or(len - 1)
-        };
+        let next = step_ring_index(idx, ProjectTab::ALL.len(), forward);
         self.enter_project_focus(ProjectTab::ALL[next]);
     }
 
@@ -1469,18 +1729,114 @@ impl App {
         let Some(node) = self.selected_loop_node() else {
             return Ok(());
         };
+        let dialog = self.build_editor_dialog_content(node);
+        self.loop_editor_dialog = Some(dialog);
+        self.focus = Focus::LoopEditorDialog;
+        Ok(())
+    }
 
-        let (title, help, buffer, mode) = self.build_editor_dialog_content(node);
+    /// Open the highlighted node's `Edges` dialog: its outgoing
+    /// `pass`/`fail`/`always` edges, retargetable/deletable in place. A
+    /// router's `route` edges stay under its `RouterRoutes` dialog instead
+    /// (see [`Self::build_edges_dialog`]'s filter).
+    pub fn open_loop_edges_dialog(&mut self) -> Result<()> {
+        let Some(node) = self.selected_loop_node() else {
+            return Ok(());
+        };
+        let dialog = self.build_edges_dialog(node);
+        self.loop_editor_dialog = Some(dialog);
+        self.focus = Focus::LoopEditorDialog;
+        Ok(())
+    }
 
-        self.loop_editor_dialog = Some(crate::tui::app::types::LoopEditorDialog::new(
+    fn build_edges_dialog(
+        &self,
+        node: &crate::domain::loops::LoopNode,
+    ) -> crate::tui::app::types::LoopEditorDialog {
+        let edges: Vec<crate::domain::loops::LoopEdge> = self
+            .router_existing_edges(node)
+            .into_iter()
+            .filter(|edge| edge.condition.route_label().is_none())
+            .collect();
+        let targets = self.router_candidate_targets(node);
+        crate::tui::app::types::LoopEditorDialog::new_edges(
             node.id.clone(),
             node.name.clone(),
-            title,
-            help,
-            buffer,
-            mode,
-        ));
-        self.focus = Focus::LoopEditorDialog;
+            format!(" Edges · {} ", node.name),
+            "↑↓ edge · ←→ retarget · Ctrl+D delete · Esc close".to_string(),
+            edges,
+            targets,
+        )
+    }
+
+    /// Retarget the `Edges` dialog's focused edge to the next/previous
+    /// candidate node — applied immediately through the same validated path
+    /// as the `loop_update_edge` MCP tool
+    /// ([`crate::daemon::handler::retarget_loop_edge`]), so a running loop
+    /// or a cross-graph target is rejected the same way it would be over
+    /// MCP, with the rejection shown as the dialog's error line.
+    pub fn retarget_focused_loop_edge(&mut self, forward: bool) -> Result<()> {
+        let Some(dialog) = self.loop_editor_dialog.as_ref() else {
+            return Ok(());
+        };
+        let Some(edge) = dialog.focused_edge() else {
+            return Ok(());
+        };
+        let edge_id = edge.id.clone();
+        let current_target = edge.to_node.clone();
+        let Some(next_target) = dialog.next_edge_target_candidate(forward) else {
+            return Ok(());
+        };
+        if next_target == current_target {
+            return Ok(());
+        }
+        match crate::daemon::handler::retarget_loop_edge(&self.db, &edge_id, &next_target) {
+            Ok(updated) => {
+                if let Some(dialog) = self.loop_editor_dialog.as_mut() {
+                    dialog.parse_error = None;
+                    if let Some(row) = dialog.edge_rows.get_mut(dialog.edge_row_index) {
+                        *row = updated;
+                    }
+                }
+                self.refresh_loops()?;
+            }
+            Err(message) => {
+                if let Some(dialog) = self.loop_editor_dialog.as_mut() {
+                    dialog.parse_error = Some(message);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete the `Edges` dialog's focused edge — through the same
+    /// validated path as the `loop_delete_edge` MCP tool
+    /// ([`crate::daemon::handler::delete_loop_edge_checked`]).
+    pub fn delete_focused_loop_edge(&mut self) -> Result<()> {
+        let Some(dialog) = self.loop_editor_dialog.as_ref() else {
+            return Ok(());
+        };
+        let Some(edge) = dialog.focused_edge() else {
+            return Ok(());
+        };
+        let edge_id = edge.id.clone();
+        match crate::daemon::handler::delete_loop_edge_checked(&self.db, &edge_id) {
+            Ok(_) => {
+                if let Some(dialog) = self.loop_editor_dialog.as_mut() {
+                    dialog.parse_error = None;
+                    dialog.edge_rows.retain(|edge| edge.id != edge_id);
+                    if dialog.edge_row_index >= dialog.edge_rows.len() {
+                        dialog.edge_row_index = dialog.edge_rows.len().saturating_sub(1);
+                    }
+                }
+                self.refresh_loops()?;
+            }
+            Err(message) => {
+                if let Some(dialog) = self.loop_editor_dialog.as_mut() {
+                    dialog.parse_error = Some(message);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1527,15 +1883,8 @@ impl App {
 
         // Pre-fill the editor with the copy's config (identical to the
         // source's) so the user can immediately adjust it.
-        let (title, help, buffer, mode) = self.build_editor_dialog_content(&copy);
-        self.loop_editor_dialog = Some(crate::tui::app::types::LoopEditorDialog::new(
-            copy.id.clone(),
-            copy.name,
-            title,
-            help,
-            buffer,
-            mode,
-        ));
+        let dialog = self.build_editor_dialog_content(&copy);
+        self.loop_editor_dialog = Some(dialog);
         self.focus = Focus::LoopEditorDialog;
         Ok(())
     }
@@ -1543,34 +1892,26 @@ impl App {
     fn build_editor_dialog_content(
         &self,
         node: &crate::domain::loops::LoopNode,
-    ) -> (
-        String,
-        String,
-        String,
-        crate::tui::app::types::LoopEditorMode,
-    ) {
-        if node.kind == LoopNodeKind::Agent {
-            self.build_agent_prompt_dialog(node)
-        } else {
-            self.build_node_config_dialog(node)
+    ) -> crate::tui::app::types::LoopEditorDialog {
+        match node.kind {
+            LoopNodeKind::Agent => self.build_agent_prompt_dialog(node),
+            LoopNodeKind::Router => self.build_router_routes_dialog(node),
+            _ => self.build_node_config_dialog(node),
         }
     }
 
     fn build_agent_prompt_dialog(
         &self,
         node: &crate::domain::loops::LoopNode,
-    ) -> (
-        String,
-        String,
-        String,
-        crate::tui::app::types::LoopEditorMode,
-    ) {
+    ) -> crate::tui::app::types::LoopEditorDialog {
         let prompt = node
             .config
             .get("prompt_template")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        (
+        crate::tui::app::types::LoopEditorDialog::new(
+            node.id.clone(),
+            node.name.clone(),
             format!(" Loop Prompt · {} ", node.name),
             "Ctrl+S save  ·  Enter newline  ·  Esc cancel".to_string(),
             prompt.to_string(),
@@ -1581,17 +1922,132 @@ impl App {
     fn build_node_config_dialog(
         &self,
         node: &crate::domain::loops::LoopNode,
-    ) -> (
-        String,
-        String,
-        String,
-        crate::tui::app::types::LoopEditorMode,
-    ) {
-        (
+    ) -> crate::tui::app::types::LoopEditorDialog {
+        crate::tui::app::types::LoopEditorDialog::new(
+            node.id.clone(),
+            node.name.clone(),
             format!(" Loop Config · {} ", node.name),
             "Ctrl+S save JSON  ·  Enter newline  ·  Esc cancel".to_string(),
             serde_json::to_string_pretty(&node.config).unwrap_or_default(),
             crate::tui::app::types::LoopEditorMode::NodeConfig,
+        )
+    }
+
+    /// Every other node in `node`'s graph — candidate targets a router
+    /// route can wire an edge to.
+    fn router_candidate_targets(
+        &self,
+        node: &crate::domain::loops::LoopNode,
+    ) -> Vec<(String, String)> {
+        let siblings = match (&node.spec_id, &node.loop_id) {
+            (Some(spec_id), _) => self.db.list_loop_nodes(spec_id).unwrap_or_default(),
+            (None, Some(loop_id)) => self
+                .db
+                .list_loop_nodes_for_loop(loop_id)
+                .unwrap_or_default(),
+            (None, None) => Vec::new(),
+        };
+        siblings
+            .into_iter()
+            .filter(|sibling| sibling.id != node.id)
+            .map(|sibling| (sibling.id, sibling.name))
+            .collect()
+    }
+
+    /// This router node's currently-persisted `route`-conditioned outgoing
+    /// edges, keyed by nothing in particular — callers match by route label
+    /// via [`crate::domain::loops::LoopEdgeCondition::route_label`].
+    fn router_existing_edges(
+        &self,
+        node: &crate::domain::loops::LoopNode,
+    ) -> Vec<crate::domain::loops::LoopEdge> {
+        let edges = match (&node.spec_id, &node.loop_id) {
+            (Some(spec_id), _) => self.db.list_loop_edges(spec_id).unwrap_or_default(),
+            (None, Some(loop_id)) => self
+                .db
+                .list_loop_edges_for_loop(loop_id)
+                .unwrap_or_default(),
+            (None, None) => Vec::new(),
+        };
+        edges
+            .into_iter()
+            .filter(|edge| edge.from_node == node.id)
+            .collect()
+    }
+
+    /// Best-effort extraction of a router node's declared routes + fallback
+    /// out of its raw `config` — used only to pre-fill the dialog. Shape
+    /// correctness is enforced on save by
+    /// [`crate::domain::loops::validate_router_routes`], not here.
+    fn parse_router_config(
+        config: &serde_json::Value,
+    ) -> (Vec<crate::domain::loops::RouterRoute>, String) {
+        let map = config.as_object();
+        let routes = map
+            .and_then(|m| m.get("routes"))
+            .and_then(serde_json::Value::as_array)
+            .map(|routes| {
+                routes
+                    .iter()
+                    .filter_map(serde_json::Value::as_object)
+                    .map(|obj| crate::domain::loops::RouterRoute {
+                        label: obj
+                            .get("label")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        description: obj
+                            .get("description")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let fallback = map
+            .and_then(|m| m.get("fallback"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        (routes, fallback)
+    }
+
+    fn build_router_routes_dialog(
+        &self,
+        node: &crate::domain::loops::LoopNode,
+    ) -> crate::tui::app::types::LoopEditorDialog {
+        let (parsed_routes, fallback) = Self::parse_router_config(&node.config);
+        let existing_edges = self.router_existing_edges(node);
+        let mut routes: Vec<crate::tui::app::types::RouterRouteDraft> = parsed_routes
+            .into_iter()
+            .map(|route| {
+                let target = existing_edges
+                    .iter()
+                    .find(|edge| edge.condition.route_label() == Some(route.label.as_str()))
+                    .map(|edge| edge.to_node.clone());
+                crate::tui::app::types::RouterRouteDraft {
+                    label: route.label,
+                    description: route.description,
+                    target_node_id: target,
+                }
+            })
+            .collect();
+        // A brand new router (empty `routes`) starts with the domain's
+        // minimum so the form is immediately shaped like a valid one.
+        while routes.len() < crate::domain::loops::ROUTER_MIN_ROUTES {
+            routes.push(crate::tui::app::types::RouterRouteDraft::default());
+        }
+        let targets = self.router_candidate_targets(node);
+        crate::tui::app::types::LoopEditorDialog::new_router_routes(
+            node.id.clone(),
+            node.name.clone(),
+            format!(" Router Routes · {} ", node.name),
+            "Tab field · ↑↓ route · ←→ target · Ctrl+N add · Ctrl+D delete · Ctrl+F fallback · Ctrl+S save · Esc cancel"
+                .to_string(),
+            routes,
+            fallback,
+            targets,
         )
     }
 
@@ -1609,7 +2065,28 @@ impl App {
             return Ok(());
         };
 
+        if matches!(
+            dialog.mode,
+            crate::tui::app::types::LoopEditorMode::RouterRoutes
+        ) {
+            return self.save_router_routes_dialog(dialog, &node);
+        }
+
         let updated_config = self.compute_updated_node_config(&dialog, &node)?;
+        // Same allowlist `loop_add_node`/`loop_update_node` enforce (see
+        // `daemon::handler::validate_node_config`) — a raw NodeConfig-mode
+        // edit is the one TUI path that can hand-write a config the engine
+        // will silently ignore (e.g. `prompt` instead of `prompt_template`),
+        // so it must be rejected here too, not just from the MCP tools.
+        if let Err(message) =
+            crate::daemon::handler::validate_node_config(node.kind, &updated_config)
+        {
+            let mut d = dialog.clone();
+            d.parse_error = Some(message);
+            self.loop_editor_dialog = Some(d);
+            self.focus = Focus::LoopEditorDialog;
+            return Err(anyhow::anyhow!("Invalid node config"));
+        }
         self.db.update_loop_node_details(
             &dialog.node_id,
             None,
@@ -1620,6 +2097,121 @@ impl App {
         self.focus = Focus::Preview;
         self.refresh_loops()?;
         Ok(())
+    }
+
+    /// Validate then persist a router's routes dialog: the declared
+    /// routes/fallback shape (into `node.config`) and each route's edge
+    /// wiring (as separate `route`-conditioned [`crate::domain::loops::LoopEdge`]s).
+    /// Both domain checks run against the *intended* state before anything
+    /// is written, so a rejected save never leaves a half-wired router.
+    fn save_router_routes_dialog(
+        &mut self,
+        dialog: crate::tui::app::types::LoopEditorDialog,
+        node: &crate::domain::loops::LoopNode,
+    ) -> Result<()> {
+        let routes: Vec<crate::domain::loops::RouterRoute> = dialog
+            .router_routes
+            .iter()
+            .map(|draft| crate::domain::loops::RouterRoute {
+                label: draft.label.trim().to_string(),
+                description: draft.description.trim().to_string(),
+            })
+            .collect();
+        let fallback = dialog.router_fallback.trim().to_string();
+
+        if let Err(message) = crate::domain::loops::validate_router_routes(&routes, &fallback) {
+            return self.reopen_router_dialog_with_error(dialog, message);
+        }
+
+        let intended_edges: Vec<crate::domain::loops::LoopEdge> = dialog
+            .router_routes
+            .iter()
+            .filter_map(|draft| {
+                let target = draft.target_node_id.clone()?;
+                Some(crate::domain::loops::LoopEdge {
+                    id: String::new(),
+                    spec_id: node.spec_id.clone(),
+                    loop_id: node.loop_id.clone(),
+                    from_node: node.id.clone(),
+                    to_node: target,
+                    condition: crate::domain::loops::LoopEdgeCondition::Route(
+                        draft.label.trim().to_string(),
+                    ),
+                })
+            })
+            .collect();
+        if let Err(message) =
+            crate::domain::loops::validate_router_route_coverage(&routes, &node.id, &intended_edges)
+        {
+            return self.reopen_router_dialog_with_error(dialog, message);
+        }
+
+        let config = serde_json::json!({
+            "routes": routes
+                .iter()
+                .map(|route| serde_json::json!({
+                    "label": route.label,
+                    "description": route.description,
+                }))
+                .collect::<Vec<_>>(),
+            "fallback": fallback,
+        });
+        self.db
+            .update_loop_node_details(&dialog.node_id, None, None, Some(&config), None)?;
+
+        let existing_edges = self.router_existing_edges(node);
+        for draft in &dialog.router_routes {
+            let label = draft.label.trim();
+            let existing = existing_edges
+                .iter()
+                .find(|edge| edge.condition.route_label() == Some(label));
+            match (&draft.target_node_id, existing) {
+                (Some(target), Some(edge)) if &edge.to_node != target => {
+                    crate::daemon::handler::retarget_loop_edge(&self.db, &edge.id, target)
+                        .map_err(anyhow::Error::msg)?;
+                }
+                (Some(target), None) => {
+                    self.db.insert_loop_edge(&crate::domain::loops::LoopEdge {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        spec_id: node.spec_id.clone(),
+                        loop_id: node.loop_id.clone(),
+                        from_node: node.id.clone(),
+                        to_node: target.clone(),
+                        condition: crate::domain::loops::LoopEdgeCondition::Route(
+                            label.to_string(),
+                        ),
+                    })?;
+                }
+                _ => {}
+            }
+        }
+        // A route dropped from the form (Ctrl+D) leaves its old edge naming
+        // a route the node no longer declares — drop the edge too so
+        // `validate_router_edges_declared` never has to catch it later.
+        for edge in &existing_edges {
+            let Some(label) = edge.condition.route_label() else {
+                continue;
+            };
+            if !routes.iter().any(|route| route.label == label) {
+                crate::daemon::handler::delete_loop_edge_checked(&self.db, &edge.id)
+                    .map_err(anyhow::Error::msg)?;
+            }
+        }
+
+        self.focus = Focus::Preview;
+        self.refresh_loops()?;
+        Ok(())
+    }
+
+    fn reopen_router_dialog_with_error(
+        &mut self,
+        mut dialog: crate::tui::app::types::LoopEditorDialog,
+        message: String,
+    ) -> Result<()> {
+        dialog.parse_error = Some(message);
+        self.loop_editor_dialog = Some(dialog);
+        self.focus = Focus::LoopEditorDialog;
+        Err(anyhow::anyhow!("Invalid router routes"))
     }
 
     fn compute_updated_node_config(
@@ -1642,6 +2234,18 @@ impl App {
                         Err(anyhow::anyhow!("Invalid JSON"))
                     }
                 }
+            }
+            // Router routes are saved through `save_router_routes_dialog`
+            // before this function is ever reached — see
+            // `save_loop_editor_dialog`'s mode check.
+            crate::tui::app::types::LoopEditorMode::RouterRoutes => unreachable!(
+                "RouterRoutes is handled by save_router_routes_dialog before this call"
+            ),
+            // Edges mode has no Ctrl+S save step — every retarget/delete
+            // applies immediately (see `handle_edges_key`), so this is
+            // never reached.
+            crate::tui::app::types::LoopEditorMode::Edges => {
+                unreachable!("Edges mode has no save step; mutations apply immediately")
             }
         }
     }
@@ -1847,10 +2451,12 @@ impl App {
                     .iter()
                     .position(|spec| spec.spec.status == LoopSpecStatus::Running)
                     .or_else(|| {
-                        details
-                            .specs
-                            .iter()
-                            .position(|spec| spec.spec.status == LoopSpecStatus::Pending)
+                        details.specs.iter().position(|spec| {
+                            matches!(
+                                spec.spec.status,
+                                LoopSpecStatus::Pending | LoopSpecStatus::Interrupted
+                            )
+                        })
                     })
             })
             .unwrap_or(0)
@@ -3024,6 +3630,33 @@ fn load_cli_usage() -> crate::domain::usage_stats::CliUsage {
     usage
 }
 
+/// Shared ring-stepping helper for both tab strips (sidebar layers and
+/// project tabs): move one position in `forward`'s direction, wrapping at
+/// either end.
+fn step_ring_index(idx: usize, len: usize, forward: bool) -> usize {
+    if forward {
+        (idx + 1) % len
+    } else {
+        idx.checked_sub(1).unwrap_or(len - 1)
+    }
+}
+
+/// Shift a scroll offset by the minimum amount needed to bring `idx` into
+/// `[offset, offset + capacity)` — used to keep the spec marker strip's
+/// keyboard-driven selection visible without jumping further than needed.
+fn scroll_into_view(offset: usize, idx: usize, capacity: usize) -> usize {
+    if capacity == 0 {
+        return 0;
+    }
+    if idx < offset {
+        idx
+    } else if idx >= offset + capacity {
+        idx + 1 - capacity
+    } else {
+        offset
+    }
+}
+
 fn calculate_log_hash(raw_log: &str) -> u64 {
     raw_log.bytes().enumerate().fold(0u64, |acc, (idx, byte)| {
         acc.wrapping_add((byte as u64).wrapping_mul(idx as u64 + 1))
@@ -3085,13 +3718,16 @@ mod tests {
         adaptive_change_score, adaptive_poll_interval_ms, blend_optional_f32, blend_optional_f64,
         build_resumed_session_args, calculate_log_hash, lerp_f32, lerp_u64, log_contains_error,
         log_contains_spawn, log_contains_success, process_is_alive, process_outlives_grace,
-        sample_from, should_resume_session, SystemSample,
+        sample_from, scroll_into_view, should_resume_session, step_ring_index, SystemSample,
     };
     use crate::db::session::InteractiveSession;
     use crate::db::Database;
+    use crate::domain::loops::{LoopSpecStatus, LoopStatus};
+    use crate::tui::app::loop_live_state::{LoopLiveState, SpecQueueEntry};
     use crate::tui::app::types::{
-        AgentEntry, App, AutomationKind, Focus, ProjectTab, SidebarLayer,
+        AgentEntry, App, AutomationKind, Focus, LoopLiveFocus, ProjectTab, SidebarLayer,
     };
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::{tempdir, NamedTempFile};
 
@@ -3391,6 +4027,7 @@ mod tests {
         status: crate::domain::loops::LoopStatus,
     ) -> crate::domain::loops::Loop {
         crate::domain::loops::Loop {
+            archived: false,
             id: id.to_string(),
             name: name.to_string(),
             description: None,
@@ -3403,7 +4040,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         }
     }
@@ -3432,27 +4069,45 @@ mod tests {
     }
 
     #[test]
-    fn active_loops_orders_running_before_paused_before_draft() {
+    fn sidebar_loops_orders_by_recency_across_all_statuses() {
         use crate::domain::loops::LoopStatus;
 
         let db = test_db();
-        db.insert_loop(&make_loop("l-draft", "Draft Loop", LoopStatus::Draft))
-            .unwrap();
-        db.insert_loop(&make_loop("l-done", "Done Loop", LoopStatus::Completed))
-            .unwrap();
-        db.insert_loop(&make_loop("l-paused", "Paused Loop", LoopStatus::Paused))
-            .unwrap();
-        db.insert_loop(&make_loop("l-running", "Running Loop", LoopStatus::Running))
-            .unwrap();
+        let base = chrono::Utc::now() - chrono::Duration::hours(10);
+
+        let mut draft = make_loop("l-draft", "Draft Loop", LoopStatus::Draft);
+        draft.created_at = base;
+        db.insert_loop(&draft).unwrap();
+
+        let mut failed = make_loop("l-failed", "Failed Loop", LoopStatus::Failed);
+        failed.created_at = base + chrono::Duration::minutes(10);
+        db.insert_loop(&failed).unwrap();
+
+        let mut done = make_loop("l-done", "Done Loop", LoopStatus::Completed);
+        done.created_at = base + chrono::Duration::minutes(20);
+        db.insert_loop(&done).unwrap();
+
+        let mut paused = make_loop("l-paused", "Paused Loop", LoopStatus::Paused);
+        paused.created_at = base + chrono::Duration::minutes(30);
+        db.insert_loop(&paused).unwrap();
+
+        let mut running = make_loop("l-running", "Running Loop", LoopStatus::Running);
+        running.created_at = base + chrono::Duration::minutes(40);
+        db.insert_loop(&running).unwrap();
 
         let data_dir = tempdir().expect("create data dir");
         let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
 
-        let ids: Vec<&str> = app.active_loops().iter().map(|lp| lp.id.as_str()).collect();
-        assert_eq!(ids, vec!["l-running", "l-paused", "l-draft"]);
-        assert!(
-            !ids.contains(&"l-done"),
-            "completed loops must not appear in active_loops"
+        let ids: Vec<&str> = app
+            .sidebar_loops()
+            .iter()
+            .map(|lp| lp.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["l-running", "l-paused", "l-done", "l-failed", "l-draft"],
+            "every loop must be listed regardless of status, ordered by last \
+             activity (created_at, since none of these have run) most recent first"
         );
     }
 
@@ -3538,54 +4193,184 @@ mod tests {
     }
 
     #[test]
-    fn select_next_crosses_live_automation_knowledge_then_wraps() {
+    fn select_prev_on_first_live_item_does_not_select_automation() {
+        // Regression: standing on the first Live item and pressing "up"
+        // used to fall through to the last Automation entry (the old
+        // flat-ring `cross_layer` behavior, back when background agents
+        // lived in Live before tabs existed). Arrows must now stay inside
+        // the active tab — with a populated Automation tab present, "up"
+        // must not land there.
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.agents = vec![
+            AgentEntry::Group(0),
+            AgentEntry::Group(1),
+            AgentEntry::Agent(bg_agent("bg-1")),
+        ];
+        app.sidebar_layer = SidebarLayer::Live;
+        app.automation_kind = AutomationKind::Agent;
+        app.selected = 0;
+
+        app.select_prev();
+
+        assert_eq!(app.sidebar_layer, SidebarLayer::Live);
+        assert_ne!(
+            app.selected, 2,
+            "must not land on the Automation agent entry"
+        );
+    }
+
+    #[test]
+    fn navigate_live_wraps_at_both_ends() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.agents = vec![AgentEntry::Group(0), AgentEntry::Group(1)];
+        app.sidebar_layer = SidebarLayer::Live;
+        app.selected = 0;
+
+        // Backward off the first item wraps to the last (no RAG activity to
+        // divert to).
+        app.select_prev();
+        assert_eq!(app.sidebar_layer, SidebarLayer::Live);
+        assert_eq!(app.selected, 1);
+
+        // Forward off the last item wraps back to the first.
+        app.select_next();
+        assert_eq!(app.sidebar_layer, SidebarLayer::Live);
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn navigate_automation_wraps_at_both_ends() {
         use crate::domain::loops::LoopStatus;
 
         let db = test_db();
-        db.upsert_project(&make_project("hash0", "/tmp/proj0"))
-            .unwrap();
         db.insert_loop(&make_loop("l-active", "Active Loop", LoopStatus::Running))
             .unwrap();
-
         let data_dir = tempdir().expect("create data dir");
         let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
-        app.agents = vec![AgentEntry::Agent(crate::domain::models::Agent {
-            id: "bg-1".to_string(),
-            prompt: String::new(),
-            trigger: None,
-            cli: crate::domain::models::Cli::new("claude"),
-            model: None,
-            working_dir: None,
-            enabled: true,
-            enable_at: None,
-            created_at: chrono::Utc::now(),
-            log_path: "/tmp/bg-1.log".to_string(),
-            timeout_minutes: 15,
-            expires_at: None,
-            last_run_at: None,
-            last_run_ok: None,
-            last_triggered_at: None,
-            trigger_count: 0,
-        })];
+        app.agents = vec![AgentEntry::Agent(bg_agent("bg-1"))];
         app.sidebar_layer = SidebarLayer::Automation;
         app.automation_kind = AutomationKind::Agent;
         app.selected = 0;
 
-        // Automation's agent sub-list has one entry, so the next press
-        // crosses into the loop sub-list before leaving the layer.
-        app.select_next();
+        // Backward off the first entry (the agent) wraps to the last (the
+        // loop) instead of leaving Automation.
+        app.select_prev();
+        assert_eq!(app.sidebar_layer, SidebarLayer::Automation);
         assert_eq!(app.automation_kind, AutomationKind::Loop);
         assert_eq!(app.selected_loop_id.as_deref(), Some("l-active"));
 
-        // Automation is exhausted — cross into Knowledge (the only project).
-        app.select_next();
-        assert_eq!(app.sidebar_layer, SidebarLayer::Knowledge);
-        assert_eq!(app.selected_project, 0);
-
-        // Knowledge is exhausted too — wrap back to the top of the ring.
+        // Forward off the last entry (the loop) wraps back to the first
+        // (the agent).
         app.select_next();
         assert_eq!(app.sidebar_layer, SidebarLayer::Automation);
         assert_eq!(app.automation_kind, AutomationKind::Agent);
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn navigate_projects_wraps_at_both_ends() {
+        let db = test_db();
+        db.upsert_project(&make_project("hash0", "/tmp/proj0"))
+            .unwrap();
+        db.upsert_project(&make_project("hash1", "/tmp/proj1"))
+            .unwrap();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.sidebar_layer = SidebarLayer::Knowledge;
+        app.selected_project = 0;
+
+        // Backward off the first project wraps to the last.
+        app.select_prev();
+        assert_eq!(app.sidebar_layer, SidebarLayer::Knowledge);
+        assert_eq!(app.selected_project, 1);
+
+        // Forward off the last project wraps back to the first.
+        app.select_next();
+        assert_eq!(app.sidebar_layer, SidebarLayer::Knowledge);
+        assert_eq!(app.selected_project, 0);
+    }
+
+    #[test]
+    fn rag_reachable_upward_from_live_first_item_returns_to_live() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.agents = vec![AgentEntry::Group(0), AgentEntry::Group(1)];
+        app.sidebar_layer = SidebarLayer::Live;
+        app.selected = 0;
+        app.rag_info = crate::db::project::RagInfoSummary {
+            total_chunks: 5,
+            ..Default::default()
+        };
+
+        app.select_prev();
+        assert!(app.agents_rag_focused);
+        assert_eq!(
+            app.sidebar_layer,
+            SidebarLayer::Live,
+            "entering RAG focus must not change the active tab"
+        );
+
+        app.select_next();
+        assert!(!app.agents_rag_focused);
+        assert_eq!(app.sidebar_layer, SidebarLayer::Live);
+        assert_eq!(
+            app.selected, 0,
+            "leaving RAG lands on the first item of the tab it came from"
+        );
+    }
+
+    #[test]
+    fn rag_reachable_upward_from_automation_first_item_returns_to_automation() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.agents = vec![AgentEntry::Agent(bg_agent("bg-1"))];
+        app.sidebar_layer = SidebarLayer::Automation;
+        app.automation_kind = AutomationKind::Agent;
+        app.selected = 0;
+        app.rag_info = crate::db::project::RagInfoSummary {
+            total_chunks: 5,
+            ..Default::default()
+        };
+
+        app.select_prev();
+        assert!(app.agents_rag_focused);
+        assert_eq!(app.sidebar_layer, SidebarLayer::Automation);
+
+        app.select_next();
+        assert!(!app.agents_rag_focused);
+        assert_eq!(app.sidebar_layer, SidebarLayer::Automation);
+        assert_eq!(app.automation_kind, AutomationKind::Agent);
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn rag_reachable_upward_from_knowledge_first_item_returns_to_knowledge() {
+        let db = test_db();
+        db.upsert_project(&make_project("hash0", "/tmp/proj0"))
+            .unwrap();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.sidebar_layer = SidebarLayer::Knowledge;
+        app.selected_project = 0;
+        app.rag_info = crate::db::project::RagInfoSummary {
+            total_chunks: 5,
+            ..Default::default()
+        };
+
+        app.select_prev();
+        assert!(app.agents_rag_focused);
+        assert_eq!(app.sidebar_layer, SidebarLayer::Knowledge);
+
+        app.select_next();
+        assert!(!app.agents_rag_focused);
+        assert_eq!(app.sidebar_layer, SidebarLayer::Knowledge);
+        assert_eq!(app.selected_project, 0);
     }
 
     #[test]
@@ -3619,6 +4404,18 @@ mod tests {
     }
 
     // ── Pure helper tests ────────────────────────────────────────
+
+    #[test]
+    fn step_ring_index_forward_wraps() {
+        assert_eq!(step_ring_index(0, 3, true), 1);
+        assert_eq!(step_ring_index(2, 3, true), 0);
+    }
+
+    #[test]
+    fn step_ring_index_backward_wraps() {
+        assert_eq!(step_ring_index(1, 3, false), 0);
+        assert_eq!(step_ring_index(0, 3, false), 2);
+    }
 
     #[test]
     fn calculate_log_hash_empty_string() {
@@ -4360,10 +5157,10 @@ mod tests {
         assert_eq!(app.log_scroll, 0);
     }
 
-    // ── active_loops filtering ───────────────────────────────────
+    // ── sidebar_loops: no status filtering ──────────────────────
 
     #[test]
-    fn active_loops_excludes_completed_and_failed() {
+    fn sidebar_loops_includes_every_status() {
         use crate::domain::loops::LoopStatus;
         let db = test_db();
         db.insert_loop(&make_loop("l1", "Running", LoopStatus::Running))
@@ -4379,12 +5176,23 @@ mod tests {
 
         let data_dir = tempdir().expect("create data dir");
         let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
-        let active: Vec<&str> = app.active_loops().iter().map(|lp| lp.id.as_str()).collect();
-        assert!(!active.contains(&"l4"));
-        assert!(!active.contains(&"l5"));
-        assert!(active.contains(&"l1"));
-        assert!(active.contains(&"l2"));
-        assert!(active.contains(&"l3"));
+        let listed: Vec<&str> = app
+            .sidebar_loops()
+            .iter()
+            .map(|lp| lp.id.as_str())
+            .collect();
+        assert!(
+            listed.contains(&"l4"),
+            "a completed loop must stay in the sidebar list"
+        );
+        assert!(
+            listed.contains(&"l5"),
+            "a failed loop must stay in the sidebar list"
+        );
+        assert!(listed.contains(&"l1"));
+        assert!(listed.contains(&"l2"));
+        assert!(listed.contains(&"l3"));
+        assert_eq!(listed.len(), 5, "no loop is dropped by status");
     }
 
     // ── Playground state tests ───────────────────────────────────
@@ -4504,11 +5312,11 @@ mod tests {
     // ── Additional navigation and state tests ───────────────────
 
     #[test]
-    fn active_loops_empty_when_no_loops() {
+    fn sidebar_loops_empty_when_no_loops() {
         let db = test_db();
         let data_dir = tempdir().expect("create data dir");
         let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
-        assert!(app.active_loops().is_empty());
+        assert!(app.sidebar_loops().is_empty());
     }
 
     #[test]
@@ -4545,6 +5353,91 @@ mod tests {
         app.sidebar_layer = SidebarLayer::Live;
         app.step_sidebar_tab(false);
         assert_eq!(app.sidebar_layer, SidebarLayer::Knowledge);
+    }
+
+    fn bg_agent(id: &str) -> crate::domain::models::Agent {
+        crate::domain::models::Agent {
+            id: id.to_string(),
+            prompt: String::new(),
+            trigger: None,
+            cli: crate::domain::models::Cli::new("claude"),
+            model: None,
+            working_dir: None,
+            enabled: true,
+            enable_at: None,
+            created_at: chrono::Utc::now(),
+            log_path: format!("/tmp/{id}.log"),
+            timeout_minutes: 15,
+            expires_at: None,
+            last_run_at: None,
+            last_run_ok: None,
+            last_triggered_at: None,
+            trigger_count: 0,
+        }
+    }
+
+    #[test]
+    fn step_sidebar_tab_restores_non_edge_selection_on_return() {
+        // Functional requirement 6: stepping away from a layer and back must
+        // not disturb what was selected there, unlike a fresh jump (F2,
+        // click), which deliberately always lands on the tab's edge item.
+        // `Live` and Automation's agent sub-list share `selected` as their
+        // index space, so this specifically exercises the case where
+        // leaving one for the other would otherwise clobber it.
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.agents = vec![
+            AgentEntry::Group(0),
+            AgentEntry::Group(1),
+            AgentEntry::Agent(bg_agent("bg-1")),
+        ];
+        app.sidebar_layer = SidebarLayer::Live;
+        app.selected = 1; // the second (non-edge) Live item
+
+        app.step_sidebar_tab(true);
+        assert_eq!(app.sidebar_layer, SidebarLayer::Automation);
+        assert_eq!(
+            app.selected, 2,
+            "a fresh jump into Automation lands on its edge item"
+        );
+
+        app.step_sidebar_tab(false);
+        assert_eq!(app.sidebar_layer, SidebarLayer::Live);
+        assert_eq!(
+            app.selected, 1,
+            "returning to Live must restore the remembered selection, not reset to its edge"
+        );
+    }
+
+    #[test]
+    fn step_sidebar_tab_falls_back_to_edge_when_remembered_selection_is_gone() {
+        // If the remembered index no longer belongs to the layer (e.g. the
+        // entry was removed while away), stepping back must not restore a
+        // stale/invalid index — it should behave like a fresh jump instead.
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.agents = vec![
+            AgentEntry::Group(0),
+            AgentEntry::Group(1),
+            AgentEntry::Agent(bg_agent("bg-1")),
+        ];
+        app.sidebar_layer = SidebarLayer::Live;
+        app.selected = 1;
+
+        app.step_sidebar_tab(true);
+        assert_eq!(app.sidebar_layer, SidebarLayer::Automation);
+
+        // The remembered Live index (1) is no longer a Live entry.
+        app.agents[1] = AgentEntry::Agent(bg_agent("bg-2"));
+
+        app.step_sidebar_tab(false);
+        assert_eq!(app.sidebar_layer, SidebarLayer::Live);
+        assert_eq!(
+            app.selected, 0,
+            "an invalidated memory falls back to the edge item"
+        );
     }
 
     #[test]
@@ -4669,6 +5562,126 @@ mod tests {
         assert!(info.output_tail.is_none());
     }
 
+    fn spec_queue_entry(id: &str, status: LoopSpecStatus) -> SpecQueueEntry {
+        SpecQueueEntry {
+            spec_id: id.to_string(),
+            spec_name: format!("Spec {id}"),
+            status,
+            failure_reason: None,
+        }
+    }
+
+    fn app_with_spec_queue(ids: &[&str]) -> App {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.loop_live_state = Some(LoopLiveState {
+            loop_id: "lp1".to_string(),
+            loop_name: "loop".to_string(),
+            loop_status: LoopStatus::Running,
+            workdir: "/tmp".to_string(),
+            trigger_type: "manual".to_string(),
+            schedule_expr: None,
+            watch_path: None,
+            autorun_at: None,
+            spec_queue: ids
+                .iter()
+                .map(|id| spec_queue_entry(id, LoopSpecStatus::Pending))
+                .collect(),
+            done_count: 0,
+            total_count: ids.len(),
+            current_spec_id: None,
+            effective_nodes: Vec::new(),
+            effective_edges: Vec::new(),
+            ensembles: Vec::new(),
+            router_taken_routes: HashMap::new(),
+            current_node_id: None,
+            current_node_status: None,
+            current_node_started_at: None,
+            current_node_iteration: None,
+            current_node_output_tail: None,
+        });
+        app
+    }
+
+    #[test]
+    fn loop_spec_strip_move_selection_cycles_through_queue_and_wraps() {
+        let mut app = app_with_spec_queue(&["s1", "s2", "s3"]);
+        assert!(app.loop_spec_strip_selected.is_none());
+
+        app.loop_spec_strip_move_selection(true);
+        assert_eq!(app.loop_spec_strip_selected.as_deref(), Some("s1"));
+        app.loop_spec_strip_move_selection(true);
+        assert_eq!(app.loop_spec_strip_selected.as_deref(), Some("s2"));
+        app.loop_spec_strip_move_selection(true);
+        assert_eq!(app.loop_spec_strip_selected.as_deref(), Some("s3"));
+        // Wraps back to the first spec.
+        app.loop_spec_strip_move_selection(true);
+        assert_eq!(app.loop_spec_strip_selected.as_deref(), Some("s1"));
+
+        // Backward wraps the other way.
+        app.loop_spec_strip_move_selection(false);
+        assert_eq!(app.loop_spec_strip_selected.as_deref(), Some("s3"));
+
+        // Selecting a spec by hand (the mouse click path) and then moving by
+        // keyboard from that point lands on the same spec a second keyboard
+        // move would — click and keyboard share one selection.
+        app.loop_spec_strip_select("s2".to_string());
+        assert_eq!(app.loop_spec_strip_selected.as_deref(), Some("s2"));
+        app.loop_spec_strip_move_selection(true);
+        assert_eq!(app.loop_spec_strip_selected.as_deref(), Some("s3"));
+    }
+
+    #[test]
+    fn loop_spec_strip_move_selection_never_touches_graph_follow() {
+        let mut app = app_with_spec_queue(&["s1", "s2"]);
+        assert!(app.loop_graph_follow);
+        app.loop_spec_strip_move_selection(true);
+        assert!(
+            app.loop_graph_follow,
+            "selecting a spec in the strip must not disturb the graph's own follow state"
+        );
+    }
+
+    #[test]
+    fn loop_spec_strip_select_ignores_unknown_spec_id() {
+        let mut app = app_with_spec_queue(&["s1", "s2"]);
+        app.loop_spec_strip_select("does-not-exist".to_string());
+        assert!(app.loop_spec_strip_selected.is_none());
+    }
+
+    #[test]
+    fn loop_spec_strip_select_focuses_the_strip() {
+        let mut app = app_with_spec_queue(&["s1", "s2"]);
+        assert_eq!(app.loop_live_focus, LoopLiveFocus::Graph);
+        app.loop_spec_strip_select("s1".to_string());
+        assert_eq!(app.loop_live_focus, LoopLiveFocus::SpecStrip);
+    }
+
+    #[test]
+    fn loop_live_toggle_focus_toggles_between_graph_and_spec_strip() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        assert_eq!(app.loop_live_focus, LoopLiveFocus::Graph);
+        app.loop_live_toggle_focus();
+        assert_eq!(app.loop_live_focus, LoopLiveFocus::SpecStrip);
+        app.loop_live_toggle_focus();
+        assert_eq!(app.loop_live_focus, LoopLiveFocus::Graph);
+    }
+
+    #[test]
+    fn scroll_into_view_only_moves_when_index_leaves_the_window() {
+        // Already visible: offset unchanged.
+        assert_eq!(scroll_into_view(2, 3, 4), 2);
+        // Before the window: jump so idx becomes the first visible.
+        assert_eq!(scroll_into_view(5, 1, 4), 1);
+        // At/after the window's far edge: shift the minimum amount needed.
+        assert_eq!(scroll_into_view(0, 4, 4), 1);
+        // Zero capacity never scrolls.
+        assert_eq!(scroll_into_view(5, 9, 0), 0);
+    }
+
     #[test]
     fn cancel_loop_editor_dialog() {
         let db = test_db();
@@ -4766,5 +5779,560 @@ mod tests {
         app.copied_at = std::time::Instant::now() - std::time::Duration::from_secs(5);
         app.dismiss_copied();
         assert!(!app.show_copied);
+    }
+
+    // ── Edges dialog (retarget/delete an ordinary edge) ───────────────
+
+    /// Seeds a `Draft` loop with three plain agent nodes `A -> B -> C`
+    /// (`pass` edges) — the fixture the `Edges` dialog tests in this
+    /// section start from. `A` has no incoming edge (the graph's entry
+    /// point); only `A -> B` is wired, so there's a spare target (`C`) to
+    /// retarget onto.
+    fn seed_plain_edge_loop(db: &Database) {
+        use crate::domain::loops::{
+            Loop, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind, LoopSpec,
+        };
+
+        db.insert_loop(&Loop {
+            archived: false,
+            id: "plp1".to_string(),
+            name: "plain loop".to_string(),
+            description: None,
+            workdir: "/tmp/plain-edge-test".to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        })
+        .unwrap();
+        db.insert_loop_spec(&LoopSpec {
+            id: "ps1".to_string(),
+            loop_id: Some("plp1".to_string()),
+            name: "spec one".to_string(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+        for (id, name, position) in [("node_a", "A", 0), ("node_b", "B", 1), ("node_c", "C", 2)] {
+            db.insert_loop_node(&LoopNode {
+                id: id.to_string(),
+                spec_id: Some("ps1".to_string()),
+                loop_id: None,
+                name: name.to_string(),
+                kind: LoopNodeKind::Agent,
+                config: serde_json::json!({}),
+                position,
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        }
+        db.insert_loop_edge(&LoopEdge {
+            id: "e_ab".to_string(),
+            spec_id: Some("ps1".to_string()),
+            loop_id: None,
+            from_node: "node_a".to_string(),
+            to_node: "node_b".to_string(),
+            condition: LoopEdgeCondition::Pass,
+        })
+        .unwrap();
+    }
+
+    fn app_on_plain_node(db: &Arc<Database>, data_dir: &std::path::Path, node_index: usize) -> App {
+        let mut app = App::new(Arc::clone(db), data_dir).expect("create app");
+        app.refresh_loops().expect("refresh loops");
+        app.loop_selected_spec = 0;
+        app.loop_selected_node = node_index;
+        app
+    }
+
+    #[test]
+    fn open_loop_edges_dialog_lists_the_nodes_outgoing_plain_edges() {
+        let db = test_db();
+        seed_plain_edge_loop(&db);
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = app_on_plain_node(&db, data_dir.path(), 0);
+
+        app.open_loop_edges_dialog().expect("open edges dialog");
+
+        let dialog = app.loop_editor_dialog.as_ref().expect("dialog opens");
+        assert!(matches!(
+            dialog.mode,
+            crate::tui::app::types::LoopEditorMode::Edges
+        ));
+        assert_eq!(dialog.edge_rows.len(), 1);
+        assert_eq!(dialog.edge_rows[0].to_node, "node_b");
+        assert!(
+            !dialog.edge_targets.iter().any(|(id, _)| id == "node_a"),
+            "candidate targets exclude the node itself"
+        );
+    }
+
+    #[test]
+    fn retarget_focused_loop_edge_changes_only_the_destination() {
+        let db = test_db();
+        seed_plain_edge_loop(&db);
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = app_on_plain_node(&db, data_dir.path(), 0);
+        app.open_loop_edges_dialog().expect("open edges dialog");
+
+        app.retarget_focused_loop_edge(true).expect("retarget");
+
+        let dialog = app.loop_editor_dialog.as_ref().expect("dialog still open");
+        assert!(dialog.parse_error.is_none(), "{:?}", dialog.parse_error);
+        assert_eq!(dialog.edge_rows[0].to_node, "node_c");
+        assert_eq!(
+            dialog.edge_rows[0].condition,
+            crate::domain::loops::LoopEdgeCondition::Pass,
+            "retargeting never touches the edge's condition"
+        );
+
+        let edge = db.get_loop_edge("e_ab").unwrap().unwrap();
+        assert_eq!(edge.to_node, "node_c");
+        assert_eq!(edge.from_node, "node_a");
+    }
+
+    #[test]
+    fn delete_focused_loop_edge_removes_it_from_the_db_and_the_dialog() {
+        let db = test_db();
+        seed_plain_edge_loop(&db);
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = app_on_plain_node(&db, data_dir.path(), 0);
+        app.open_loop_edges_dialog().expect("open edges dialog");
+
+        app.delete_focused_loop_edge().expect("delete edge");
+
+        let dialog = app.loop_editor_dialog.as_ref().expect("dialog still open");
+        assert!(dialog.edge_rows.is_empty());
+        assert!(db.get_loop_edge("e_ab").unwrap().is_none());
+    }
+
+    #[test]
+    fn retarget_focused_loop_edge_surfaces_the_running_loop_rejection() {
+        let db = test_db();
+        seed_plain_edge_loop(&db);
+        db.update_loop_status(
+            "plp1",
+            crate::domain::loops::LoopStatus::Running,
+            None,
+            None,
+        )
+        .unwrap();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = app_on_plain_node(&db, data_dir.path(), 0);
+        app.open_loop_edges_dialog().expect("open edges dialog");
+
+        app.retarget_focused_loop_edge(true)
+            .expect("call returns Ok");
+
+        let dialog = app.loop_editor_dialog.as_ref().expect("dialog still open");
+        let error = dialog.parse_error.as_deref().unwrap_or_default();
+        assert!(error.contains("running"), "{error}");
+        // Target unchanged in the db.
+        assert_eq!(db.get_loop_edge("e_ab").unwrap().unwrap().to_node, "node_b");
+    }
+
+    // ── Router routes dialog (open/pre-fill/save) ────────────────────
+
+    /// Seeds a `Draft` loop with one spec containing a 4-route router node
+    /// ("billing"/"technical"/"sales"/"escalation", fallback "escalation")
+    /// already wired to `billing`, plus three plain agent target nodes —
+    /// the fixture every router-dialog test in this section starts from.
+    fn seed_router_loop(db: &Database) {
+        use crate::domain::loops::{
+            Loop, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind, LoopSpec,
+        };
+
+        db.insert_loop(&Loop {
+            archived: false,
+            id: "rlp1".to_string(),
+            name: "router loop".to_string(),
+            description: None,
+            workdir: "/tmp/router-test".to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        })
+        .unwrap();
+        db.insert_loop_spec(&LoopSpec {
+            id: "rs1".to_string(),
+            loop_id: Some("rlp1".to_string()),
+            name: "spec one".to_string(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "router".to_string(),
+            spec_id: Some("rs1".to_string()),
+            loop_id: None,
+            name: "Classify".to_string(),
+            kind: LoopNodeKind::Router,
+            config: serde_json::json!({
+                "routes": [
+                    {"label": "billing", "description": "billing desc"},
+                    {"label": "technical", "description": "technical desc"},
+                    {"label": "sales", "description": "sales desc"},
+                    {"label": "escalation", "description": "escalation desc"},
+                ],
+                "fallback": "escalation",
+            }),
+            position: 0,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        for (id, name, position) in [
+            ("billing_agent", "Billing specialist", 1),
+            ("technical_agent", "Technical specialist", 2),
+            ("sales_agent", "Sales specialist", 3),
+        ] {
+            db.insert_loop_node(&LoopNode {
+                id: id.to_string(),
+                spec_id: Some("rs1".to_string()),
+                loop_id: None,
+                name: name.to_string(),
+                kind: LoopNodeKind::Agent,
+                config: serde_json::json!({}),
+                position,
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        }
+        db.insert_loop_edge(&LoopEdge {
+            id: "e_billing".to_string(),
+            spec_id: Some("rs1".to_string()),
+            loop_id: None,
+            from_node: "router".to_string(),
+            to_node: "billing_agent".to_string(),
+            condition: LoopEdgeCondition::Route("billing".to_string()),
+        })
+        .unwrap();
+    }
+
+    fn app_on_router_node(db: &Arc<Database>, data_dir: &std::path::Path) -> App {
+        let mut app = App::new(Arc::clone(db), data_dir).expect("create app");
+        app.refresh_loops().expect("refresh loops");
+        app.loop_selected_spec = 0;
+        app.loop_selected_node = 0; // "router" is position 0
+        assert_eq!(
+            app.selected_loop_node().map(|n| n.id.as_str()),
+            Some("router"),
+            "fixture invariant: router node must be selected"
+        );
+        app
+    }
+
+    #[test]
+    fn open_loop_editor_dialog_prefills_router_routes_fallback_and_existing_wiring() {
+        let db = test_db();
+        seed_router_loop(&db);
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = app_on_router_node(&db, data_dir.path());
+
+        app.open_loop_editor_dialog().expect("open editor");
+
+        let dialog = app.loop_editor_dialog.as_ref().expect("dialog opens");
+        assert!(matches!(
+            dialog.mode,
+            crate::tui::app::types::LoopEditorMode::RouterRoutes
+        ));
+        assert_eq!(dialog.router_routes.len(), 4);
+        assert_eq!(dialog.router_fallback, "escalation");
+
+        let billing = dialog
+            .router_routes
+            .iter()
+            .find(|r| r.label == "billing")
+            .expect("billing route present");
+        assert_eq!(billing.description, "billing desc");
+        assert_eq!(billing.target_node_id.as_deref(), Some("billing_agent"));
+
+        let technical = dialog
+            .router_routes
+            .iter()
+            .find(|r| r.label == "technical")
+            .expect("technical route present");
+        assert_eq!(
+            technical.target_node_id, None,
+            "not yet wired in the fixture"
+        );
+
+        // Candidate targets exclude the router itself.
+        assert!(!dialog.router_targets.iter().any(|(id, _)| id == "router"));
+        assert!(dialog
+            .router_targets
+            .iter()
+            .any(|(id, _)| id == "technical_agent"));
+    }
+
+    #[test]
+    fn save_router_routes_dialog_rejects_an_invalid_fallback_with_a_readable_message() {
+        let db = test_db();
+        seed_router_loop(&db);
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = app_on_router_node(&db, data_dir.path());
+        app.open_loop_editor_dialog().expect("open editor");
+
+        app.loop_editor_dialog.as_mut().unwrap().router_fallback = "not-a-route".to_string();
+
+        let result = app.save_loop_editor_dialog();
+        assert!(result.is_err(), "invalid fallback must not save");
+
+        let dialog = app
+            .loop_editor_dialog
+            .as_ref()
+            .expect("dialog stays open on validation failure");
+        let message = dialog.parse_error.as_deref().unwrap_or_default();
+        assert!(
+            message.contains("not-a-route"),
+            "error should be a readable, specific message: {message:?}"
+        );
+
+        // Nothing was written.
+        let node = db.get_loop_node("router").unwrap().unwrap();
+        assert_eq!(node.config["fallback"], "escalation");
+    }
+
+    #[test]
+    fn save_router_routes_dialog_rejects_partial_wiring_before_writing_anything() {
+        let db = test_db();
+        seed_router_loop(&db);
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = app_on_router_node(&db, data_dir.path());
+        app.open_loop_editor_dialog().expect("open editor");
+
+        // "billing" is already wired (from the fixture); leaving every other
+        // route unwired is a rejected half-wired state, not a valid save.
+        let result = app.save_loop_editor_dialog();
+        assert!(result.is_err());
+        assert!(app
+            .loop_editor_dialog
+            .as_ref()
+            .unwrap()
+            .parse_error
+            .is_some());
+
+        // The pre-existing edge is untouched.
+        let edges = db.list_loop_edges("rs1").unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].to_node, "billing_agent");
+    }
+
+    #[test]
+    fn save_router_routes_dialog_persists_config_and_wires_every_route() {
+        let db = test_db();
+        seed_router_loop(&db);
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = app_on_router_node(&db, data_dir.path());
+        app.open_loop_editor_dialog().expect("open editor");
+
+        {
+            let dialog = app.loop_editor_dialog.as_mut().unwrap();
+            for route in dialog.router_routes.iter_mut() {
+                route.target_node_id = Some(match route.label.as_str() {
+                    "billing" => "billing_agent".to_string(),
+                    "technical" => "technical_agent".to_string(),
+                    "sales" => "sales_agent".to_string(),
+                    "escalation" => "billing_agent".to_string(),
+                    other => panic!("unexpected route {other}"),
+                });
+            }
+        }
+
+        app.save_loop_editor_dialog().expect("save succeeds");
+
+        assert!(app.loop_editor_dialog.is_none(), "dialog closes on save");
+
+        let node = db.get_loop_node("router").unwrap().unwrap();
+        assert_eq!(node.config["fallback"], "escalation");
+        assert_eq!(node.config["routes"].as_array().unwrap().len(), 4);
+
+        let edges = db.list_loop_edges("rs1").unwrap();
+        assert_eq!(edges.len(), 4, "every route now has exactly one edge");
+        let by_route: HashMap<&str, &str> = edges
+            .iter()
+            .map(|e| {
+                (
+                    e.condition.route_label().expect("route edge"),
+                    e.to_node.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(by_route["billing"], "billing_agent");
+        assert_eq!(by_route["technical"], "technical_agent");
+        assert_eq!(by_route["sales"], "sales_agent");
+        assert_eq!(by_route["escalation"], "billing_agent");
+    }
+
+    #[test]
+    fn save_router_routes_dialog_drops_the_edge_of_a_removed_route() {
+        let db = test_db();
+        seed_router_loop(&db);
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = app_on_router_node(&db, data_dir.path());
+        app.open_loop_editor_dialog().expect("open editor");
+
+        {
+            let dialog = app.loop_editor_dialog.as_mut().unwrap();
+            // Drop "billing" — the one route the fixture already wired.
+            let idx = dialog
+                .router_routes
+                .iter()
+                .position(|r| r.label == "billing")
+                .unwrap();
+            dialog.router_route_index = idx;
+            dialog.router_remove_route();
+            // The remaining 3 routes must all be wired for this to be a
+            // valid, non-partial save.
+            for route in dialog.router_routes.iter_mut() {
+                route.target_node_id = Some("technical_agent".to_string());
+            }
+            dialog.router_fallback = "escalation".to_string();
+        }
+
+        app.save_loop_editor_dialog().expect("save succeeds");
+
+        let edges = db.list_loop_edges("rs1").unwrap();
+        assert_eq!(edges.len(), 3);
+        assert!(
+            !edges
+                .iter()
+                .any(|e| e.condition.route_label() == Some("billing")),
+            "the removed route's edge must not survive the save"
+        );
+    }
+
+    /// `NodeConfig` mode is the one TUI path that hand-writes a node's raw
+    /// config JSON (a `check` node here — agent nodes go through the
+    /// structured `AgentPrompt` mode instead), so it's the one that can
+    /// reintroduce the exact incident shape (a config key the engine will
+    /// never read) if left unvalidated. Saving must be rejected the same
+    /// way `loop_add_node`/`loop_update_node` reject it, and the bad config
+    /// must never reach the DB.
+    #[test]
+    fn save_loop_editor_dialog_rejects_unknown_config_key_in_node_config_mode() {
+        use crate::domain::loops::{Loop, LoopNode, LoopNodeKind, LoopSpec};
+
+        let db = test_db();
+        db.insert_loop(&Loop {
+            archived: false,
+            id: "clp1".to_string(),
+            name: "check loop".to_string(),
+            description: None,
+            workdir: "/tmp/check-test".to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        })
+        .unwrap();
+        db.insert_loop_spec(&LoopSpec {
+            id: "cs1".to_string(),
+            loop_id: Some("clp1".to_string()),
+            name: "spec one".to_string(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "check1".to_string(),
+            spec_id: Some("cs1".to_string()),
+            loop_id: None,
+            name: "Gate".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "true"}),
+            position: 0,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.refresh_loops().expect("refresh loops");
+        app.loop_selected_spec = 0;
+        app.loop_selected_node = 0;
+        assert_eq!(
+            app.selected_loop_node().map(|n| n.id.as_str()),
+            Some("check1"),
+            "fixture invariant: check node must be selected"
+        );
+
+        app.open_loop_editor_dialog().expect("open editor");
+        assert!(matches!(
+            app.loop_editor_dialog.as_ref().unwrap().mode,
+            crate::tui::app::types::LoopEditorMode::NodeConfig
+        ));
+        app.loop_editor_dialog.as_mut().unwrap().buffer =
+            serde_json::json!({"command": "true", "unexpected_field": true}).to_string();
+
+        let result = app.save_loop_editor_dialog();
+        assert!(result.is_err(), "an unrecognized config key must not save");
+
+        let dialog = app
+            .loop_editor_dialog
+            .as_ref()
+            .expect("dialog reopens with the error visible");
+        assert!(
+            dialog
+                .parse_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("unexpected_field"),
+            "{:?}",
+            dialog.parse_error
+        );
+
+        let stored = db.get_loop_node("check1").unwrap().unwrap();
+        assert_eq!(
+            stored.config,
+            serde_json::json!({"command": "true"}),
+            "the invalid config must never reach the DB"
+        );
     }
 }

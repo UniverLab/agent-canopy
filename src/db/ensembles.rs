@@ -1,5 +1,6 @@
-//! F1: DB layer for ensembles — a group of homogeneous agent-node members
-//! plus their quorum gate, persisted as one [`Ensemble`] row on top of ordinary
+//! F1: DB layer for ensembles — a group of agent-node members (each
+//! optionally carrying its own prompt override) plus their quorum gate,
+//! persisted as one [`Ensemble`] row on top of ordinary
 //! `loop_nodes`/`loop_edges` rows (see `src/domain/loops.rs` for why).
 
 use anyhow::{anyhow, Result};
@@ -10,7 +11,8 @@ use std::io::{Error as IoError, ErrorKind};
 use crate::db::Database;
 use crate::domain::blueprints::{builtin_ensemble_blueprint_specs, EnsembleBlueprint};
 use crate::domain::loops::{
-    Ensemble, EnsembleDetails, EnsembleMember, LoopEdge, LoopEdgeCondition, LoopNode,
+    Ensemble, EnsembleDetails, EnsembleMember, EnsembleMemberSpec, LoopEdge, LoopEdgeCondition,
+    LoopNode,
 };
 
 impl Database {
@@ -105,14 +107,15 @@ impl Database {
 
         for member in members {
             tx.execute(
-                "INSERT INTO ensemble_members (ensemble_id, node_id, position, platform, model)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO ensemble_members (ensemble_id, node_id, position, platform, model, prompt_override)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     &member.ensemble_id,
                     &member.node_id,
                     member.position,
                     &member.platform,
                     &member.model,
+                    &member.prompt_override,
                 ],
             )?;
         }
@@ -141,7 +144,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT ensemble_id, node_id, position, platform, model
+            "SELECT ensemble_id, node_id, position, platform, model, prompt_override
              FROM ensemble_members WHERE ensemble_id = ?1 ORDER BY position ASC",
         )?;
         let rows = stmt.query_map(params![ensemble_id], map_ensemble_member_row)?;
@@ -355,14 +358,15 @@ impl Database {
         }
 
         tx.execute(
-            "INSERT INTO ensemble_members (ensemble_id, node_id, position, platform, model)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO ensemble_members (ensemble_id, node_id, position, platform, model, prompt_override)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 &member.ensemble_id,
                 &member.node_id,
                 member.position,
                 &member.platform,
                 &member.model,
+                &member.prompt_override,
             ],
         )?;
 
@@ -378,25 +382,28 @@ impl Database {
         self.delete_loop_node(node_id)
     }
 
-    /// Update an existing member's `platform`/`model` in place — used by
-    /// `loop_update_ensemble` when the member count is unchanged (only the
-    /// platform/model at a given position changed). The caller separately
+    /// Update an existing member's `platform`/`model`/`prompt_override` in
+    /// place — used by `loop_update_ensemble` when the member count is
+    /// unchanged (only the fields at a given position changed). Always sets
+    /// `prompt_override` outright (never "leave unchanged") since a
+    /// replacement member list is always given in full. The caller separately
     /// updates the member node's own `config` via
     /// [`Self::update_loop_node_details`].
-    pub fn update_ensemble_member_platform(
+    pub fn update_ensemble_member(
         &self,
         ensemble_id: &str,
         node_id: &str,
         platform: &str,
         model: Option<&str>,
+        prompt_override: Option<&str>,
     ) -> Result<bool> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let rows = conn.execute(
-            "UPDATE ensemble_members SET platform = ?1, model = ?2 WHERE ensemble_id = ?3 AND node_id = ?4",
-            params![platform, model, ensemble_id, node_id],
+            "UPDATE ensemble_members SET platform = ?1, model = ?2, prompt_override = ?3 WHERE ensemble_id = ?4 AND node_id = ?5",
+            params![platform, model, prompt_override, ensemble_id, node_id],
         )?;
         Ok(rows > 0)
     }
@@ -420,7 +427,7 @@ impl Database {
     pub fn delete_loop_edges_from_node_with_condition(
         &self,
         node_id: &str,
-        condition: LoopEdgeCondition,
+        condition: &LoopEdgeCondition,
     ) -> Result<()> {
         let conn = self
             .conn
@@ -468,42 +475,162 @@ impl Database {
             .map_err(Into::into)
     }
 
-    /// Seed the builtin ensemble blueprints (currently just
-    /// "ensemble-proposers") if missing. Idempotent, mirroring
-    /// [`Self::seed_builtin_blueprints`] — safe to call on every daemon
-    /// startup.
-    pub fn seed_builtin_ensemble_blueprints(&self) -> Result<()> {
-        for (name, prompt_template, members, min_pass) in builtin_ensemble_blueprint_specs() {
-            if self.get_ensemble_blueprint_by_name(name)?.is_some() {
-                continue;
-            }
-            self.insert_ensemble_blueprint(&EnsembleBlueprint {
-                id: uuid::Uuid::new_v4().to_string(),
-                name: name.to_string(),
-                prompt_template: prompt_template.to_string(),
-                members: members
-                    .into_iter()
-                    .map(|(platform, model)| (platform.to_string(), model.map(str::to_string)))
-                    .collect(),
+    pub fn list_ensemble_blueprints(&self) -> Result<Vec<EnsembleBlueprint>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, prompt_template, members, min_pass, builtin, created_at
+             FROM ensemble_blueprints ORDER BY builtin DESC, name ASC",
+        )?;
+        let rows = stmt.query_map([], map_ensemble_blueprint_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Delete an ensemble blueprint by name. Mirrors
+    /// [`Self::delete_blueprint_by_name`]: callers own any builtin guard —
+    /// this performs none itself.
+    pub fn delete_ensemble_blueprint_by_name(&self, name: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "DELETE FROM ensemble_blueprints WHERE name = ?1",
+            params![name],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Overwrite a builtin ensemble blueprint row's `prompt_template`/
+    /// `members`/`min_pass` in place — the ensemble mirror of
+    /// [`Self::update_builtin_blueprint`], reconciling a stale builtin shape
+    /// (e.g. a hardcoded model identity from before this field was dropped)
+    /// with the current spec. Only ever called from
+    /// [`Self::seed_builtin_ensemble_blueprints`].
+    fn update_builtin_ensemble_blueprint(
+        &self,
+        id: &str,
+        prompt_template: &str,
+        members: &[EnsembleMemberSpec],
+        min_pass: Option<i64>,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        conn.execute(
+            "UPDATE ensemble_blueprints SET prompt_template = ?1, members = ?2, min_pass = ?3 WHERE id = ?4",
+            params![
+                prompt_template,
+                serde_json::to_string(members)?,
                 min_pass,
-                builtin: true,
-                created_at: Utc::now(),
-            })?;
+                id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Seed the builtin ensemble blueprints (currently just
+    /// "ensemble-proposers") and keep already-seeded builtin rows in sync
+    /// with the current `builtin_ensemble_blueprint_specs()` shape —
+    /// idempotent and safe on every daemon startup, mirroring
+    /// [`Self::seed_builtin_blueprints`]'s stale-name-delete /
+    /// drifted-config-overwrite / leave-custom-rows-alone behavior exactly.
+    pub fn seed_builtin_ensemble_blueprints(&self) -> Result<()> {
+        let specs = builtin_ensemble_blueprint_specs();
+        let current_names: std::collections::HashSet<&str> =
+            specs.iter().map(|(name, ..)| *name).collect();
+
+        for existing in self.list_ensemble_blueprints()? {
+            if existing.builtin && !current_names.contains(existing.name.as_str()) {
+                self.delete_ensemble_blueprint_by_name(&existing.name)?;
+            }
+        }
+
+        for (name, prompt_template, members, min_pass) in specs {
+            let members: Vec<EnsembleMemberSpec> = members
+                .into_iter()
+                .map(|(platform, model, prompt_override)| {
+                    (
+                        platform.to_string(),
+                        model.map(str::to_string),
+                        prompt_override.map(str::to_string),
+                    )
+                })
+                .collect();
+
+            match self.get_ensemble_blueprint_by_name(name)? {
+                Some(existing) if existing.builtin => {
+                    if existing.prompt_template != prompt_template
+                        || existing.members != members
+                        || existing.min_pass != min_pass
+                    {
+                        self.update_builtin_ensemble_blueprint(
+                            &existing.id,
+                            prompt_template,
+                            &members,
+                            min_pass,
+                        )?;
+                    }
+                }
+                // Name already claimed by a custom ensemble blueprint — leave it be.
+                Some(_) => {}
+                None => {
+                    self.insert_ensemble_blueprint(&EnsembleBlueprint {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        name: name.to_string(),
+                        prompt_template: prompt_template.to_string(),
+                        members,
+                        min_pass,
+                        builtin: true,
+                        created_at: Utc::now(),
+                    })?;
+                }
+            }
         }
         Ok(())
     }
 }
 
+/// Parse a blueprint row's stored `members` JSON, tolerating both the
+/// pre-prompt-override 2-element `[platform, model]` shape (rows seeded
+/// before this field existed — including a builtin blueprint from an older
+/// daemon) and the current 3-element `[platform, model, prompt_override]`
+/// shape, so an upgrade never needs a data migration for blueprints already
+/// in the DB.
+fn parse_ensemble_blueprint_members(
+    raw: &str,
+) -> Result<Vec<EnsembleMemberSpec>, serde_json::Error> {
+    let rows: Vec<serde_json::Value> = serde_json::from_str(raw)?;
+    Ok(rows
+        .into_iter()
+        .map(|entry| {
+            let platform = entry
+                .get(0)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let model = entry
+                .get(1)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let prompt_override = entry
+                .get(2)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            (platform, model, prompt_override)
+        })
+        .collect())
+}
+
 fn map_ensemble_blueprint_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EnsembleBlueprint> {
     let members_raw: String = row.get(3)?;
-    let members: Vec<(String, Option<String>)> =
-        serde_json::from_str(&members_raw).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                3,
-                rusqlite::types::Type::Text,
-                Box::new(error),
-            )
-        })?;
+    let members = parse_ensemble_blueprint_members(&members_raw).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(error))
+    })?;
     Ok(EnsembleBlueprint {
         id: row.get(0)?,
         name: row.get(1)?,
@@ -552,6 +679,7 @@ fn map_ensemble_member_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Ensemble
         position: row.get(2)?,
         platform: row.get(3)?,
         model: row.get(4)?,
+        prompt_override: row.get(5)?,
     })
 }
 
@@ -715,6 +843,7 @@ mod tests {
                 position: i as i64,
                 platform: "openrouter".to_string(),
                 model: Some(format!("model-{i}")),
+                prompt_override: None,
             })
             .collect();
 
@@ -877,6 +1006,7 @@ mod tests {
                 position: 0,
                 platform: "openrouter".to_string(),
                 model: None,
+                prompt_override: None,
             },
             EnsembleMember {
                 ensemble_id: "ens1".to_string(),
@@ -884,6 +1014,7 @@ mod tests {
                 position: 1,
                 platform: "claude".to_string(),
                 model: None,
+                prompt_override: None,
             },
         ];
         db.insert_ensemble_unit(&ensemble, &members, &member_nodes, &join_node, &edges)
@@ -1017,6 +1148,7 @@ mod tests {
             position: 0,
             platform: "openrouter".to_string(),
             model: None,
+            prompt_override: None,
         }];
         db.insert_ensemble_unit(&ensemble, &members, &member_nodes, &join_node, &edges)
             .unwrap();
@@ -1147,6 +1279,7 @@ mod tests {
                 position: i as i64,
                 platform: "openrouter".to_string(),
                 model: None,
+                prompt_override: None,
             })
             .collect();
         db.insert_ensemble_unit(&ensemble, &members, &member_nodes, &join_node, &edges)
@@ -1253,5 +1386,403 @@ mod tests {
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         let result = db.get_ensemble_blueprint_by_name("nonexistent").unwrap();
         assert!(result.is_none());
+    }
+
+    /// An installation whose `ensemble_blueprints` row still carries the old
+    /// hardcoded free-tier model identities must have them reconciled away
+    /// (to `None`) on the next startup reseed, and the reseed must be
+    /// idempotent.
+    #[test]
+    fn seed_builtin_ensemble_blueprints_migrates_hardcoded_model_identities() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+
+        db.delete_ensemble_blueprint_by_name("ensemble-proposers")
+            .unwrap();
+        db.insert_ensemble_blueprint(&EnsembleBlueprint {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "ensemble-proposers".to_string(),
+            prompt_template: "Draft it".to_string(),
+            members: vec![
+                (
+                    "openrouter".to_string(),
+                    Some("deepseek/deepseek-chat-v3.1:free".to_string()),
+                    None,
+                ),
+                (
+                    "openrouter".to_string(),
+                    Some("qwen/qwen3-coder:free".to_string()),
+                    None,
+                ),
+                (
+                    "openrouter".to_string(),
+                    Some("meta-llama/llama-3.3-70b-instruct:free".to_string()),
+                    None,
+                ),
+            ],
+            min_pass: None,
+            builtin: true,
+            created_at: Utc::now(),
+        })
+        .unwrap();
+
+        db.seed_builtin_ensemble_blueprints().unwrap();
+
+        let migrated = db
+            .get_ensemble_blueprint_by_name("ensemble-proposers")
+            .unwrap()
+            .unwrap();
+        assert_eq!(migrated.members.len(), 3);
+        for (platform, model, _) in &migrated.members {
+            assert_eq!(platform, "openrouter");
+            assert!(model.is_none(), "model identity must be reconciled away");
+        }
+
+        // Idempotent: a second reseed changes nothing further.
+        db.seed_builtin_ensemble_blueprints().unwrap();
+        let after_second = db
+            .get_ensemble_blueprint_by_name("ensemble-proposers")
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_second.members, migrated.members);
+    }
+
+    /// A custom ensemble blueprint that claims the builtin's name must never
+    /// be overwritten or deleted by the migration.
+    #[test]
+    fn seed_builtin_ensemble_blueprints_never_touches_a_custom_blueprint_with_a_builtin_name() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        db.delete_ensemble_blueprint_by_name("ensemble-proposers")
+            .unwrap();
+
+        let custom = EnsembleBlueprint {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "ensemble-proposers".to_string(),
+            prompt_template: "my own take".to_string(),
+            members: vec![("claude".to_string(), None, None)],
+            min_pass: Some(1),
+            builtin: false,
+            created_at: Utc::now(),
+        };
+        db.insert_ensemble_blueprint(&custom).unwrap();
+
+        db.seed_builtin_ensemble_blueprints().unwrap();
+
+        let fetched = db
+            .get_ensemble_blueprint_by_name("ensemble-proposers")
+            .unwrap()
+            .unwrap();
+        assert!(
+            !fetched.builtin,
+            "custom ensemble blueprint must stay custom"
+        );
+        assert_eq!(fetched.prompt_template, "my own take");
+    }
+
+    /// A member's `prompt_override` round-trips through `insert_ensemble_unit`
+    /// and `get_ensemble_details` — `Some` for a member that has one, `None`
+    /// for a member that doesn't (using the shared `prompt_template` exactly
+    /// as every ensemble did before this field existed).
+    #[test]
+    fn insert_ensemble_unit_round_trips_member_prompt_override() {
+        let db = test_db();
+        insert_spec(&db, "spec-1");
+        db.insert_loop_node(&LoopNode {
+            id: "kickoff".to_string(),
+            spec_id: Some("spec-1".to_string()),
+            loop_id: None,
+            name: "kickoff".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "true", "success_condition": "exit_code_0"}),
+            position: 1,
+            created_at: Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "arbiter".to_string(),
+            spec_id: Some("spec-1".to_string()),
+            loop_id: None,
+            name: "arbiter".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 10,
+            created_at: Utc::now(),
+        })
+        .unwrap();
+        let now = Utc::now();
+        let member_nodes = vec![
+            LoopNode {
+                id: "m1".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                name: "member-1".to_string(),
+                kind: LoopNodeKind::Agent,
+                config: serde_json::json!({"platform": "claude", "prompt_template": "review for security"}),
+                position: 2,
+                created_at: now,
+            },
+            LoopNode {
+                id: "m2".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                name: "member-2".to_string(),
+                kind: LoopNodeKind::Agent,
+                config: serde_json::json!({"platform": "claude", "prompt_template": "draft it"}),
+                position: 3,
+                created_at: now,
+            },
+        ];
+        let join_node = LoopNode {
+            id: "join1".to_string(),
+            spec_id: Some("spec-1".to_string()),
+            loop_id: None,
+            name: "quorum".to_string(),
+            kind: LoopNodeKind::Join,
+            config: serde_json::json!({"ensemble_id": "ens1"}),
+            position: 4,
+            created_at: now,
+        };
+        let edges = vec![
+            LoopEdge {
+                id: "kickoff->m1".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                from_node: "kickoff".to_string(),
+                to_node: "m1".to_string(),
+                condition: LoopEdgeCondition::Always,
+            },
+            LoopEdge {
+                id: "kickoff->m2".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                from_node: "kickoff".to_string(),
+                to_node: "m2".to_string(),
+                condition: LoopEdgeCondition::Always,
+            },
+            LoopEdge {
+                id: "m1->join1".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                from_node: "m1".to_string(),
+                to_node: "join1".to_string(),
+                condition: LoopEdgeCondition::Always,
+            },
+            LoopEdge {
+                id: "m2->join1".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                from_node: "m2".to_string(),
+                to_node: "join1".to_string(),
+                condition: LoopEdgeCondition::Always,
+            },
+            LoopEdge {
+                id: "join1->arbiter".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                from_node: "join1".to_string(),
+                to_node: "arbiter".to_string(),
+                condition: LoopEdgeCondition::Pass,
+            },
+        ];
+        let ensemble = Ensemble {
+            id: "ens1".to_string(),
+            spec_id: Some("spec-1".to_string()),
+            loop_id: None,
+            name: "Proposers".to_string(),
+            prompt_template: "draft it".to_string(),
+            join_node_id: "join1".to_string(),
+            entry_from_node: "kickoff".to_string(),
+            entry_condition: LoopEdgeCondition::Always,
+            min_pass: 2,
+            straggler_timeout_minutes: None,
+            timeout_minutes: 30,
+            on_pass_to: "arbiter".to_string(),
+            on_fail_to: None,
+            created_at: now,
+        };
+        let members = vec![
+            EnsembleMember {
+                ensemble_id: "ens1".to_string(),
+                node_id: "m1".to_string(),
+                position: 0,
+                platform: "claude".to_string(),
+                model: None,
+                prompt_override: Some("review for security".to_string()),
+            },
+            EnsembleMember {
+                ensemble_id: "ens1".to_string(),
+                node_id: "m2".to_string(),
+                position: 1,
+                platform: "claude".to_string(),
+                model: None,
+                prompt_override: None,
+            },
+        ];
+        db.insert_ensemble_unit(&ensemble, &members, &member_nodes, &join_node, &edges)
+            .unwrap();
+
+        let details = db.get_ensemble_details("ens1").unwrap().unwrap();
+        assert_eq!(
+            details.members[0].prompt_override.as_deref(),
+            Some("review for security")
+        );
+        assert_eq!(details.members[1].prompt_override, None);
+    }
+
+    /// `update_ensemble_member` (the renamed `update_ensemble_member_platform`)
+    /// sets `prompt_override` outright, in both directions: giving a member
+    /// that had none its own override, and clearing an existing override back
+    /// to `None` (the "use the shared prompt" state) — both are ordinary
+    /// `Some`/`None` writes, never a "leave unchanged" skip, since a
+    /// replacement member list is always given in full.
+    #[test]
+    fn update_ensemble_member_sets_and_clears_prompt_override() {
+        let db = test_db();
+        insert_spec(&db, "spec-1");
+        db.insert_loop_node(&LoopNode {
+            id: "kickoff".to_string(),
+            spec_id: Some("spec-1".to_string()),
+            loop_id: None,
+            name: "kickoff".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "true", "success_condition": "exit_code_0"}),
+            position: 1,
+            created_at: Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "arbiter".to_string(),
+            spec_id: Some("spec-1".to_string()),
+            loop_id: None,
+            name: "arbiter".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 10,
+            created_at: Utc::now(),
+        })
+        .unwrap();
+        let now = Utc::now();
+        let member_nodes = vec![LoopNode {
+            id: "m1".to_string(),
+            spec_id: Some("spec-1".to_string()),
+            loop_id: None,
+            name: "member-1".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "claude", "prompt_template": "draft it"}),
+            position: 2,
+            created_at: now,
+        }];
+        let join_node = LoopNode {
+            id: "join1".to_string(),
+            spec_id: Some("spec-1".to_string()),
+            loop_id: None,
+            name: "quorum".to_string(),
+            kind: LoopNodeKind::Join,
+            config: serde_json::json!({"ensemble_id": "ens1"}),
+            position: 3,
+            created_at: now,
+        };
+        let edges = vec![
+            LoopEdge {
+                id: "kickoff->m1".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                from_node: "kickoff".to_string(),
+                to_node: "m1".to_string(),
+                condition: LoopEdgeCondition::Always,
+            },
+            LoopEdge {
+                id: "m1->join1".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                from_node: "m1".to_string(),
+                to_node: "join1".to_string(),
+                condition: LoopEdgeCondition::Always,
+            },
+            LoopEdge {
+                id: "join1->arbiter".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                from_node: "join1".to_string(),
+                to_node: "arbiter".to_string(),
+                condition: LoopEdgeCondition::Pass,
+            },
+        ];
+        let ensemble = Ensemble {
+            id: "ens1".to_string(),
+            spec_id: Some("spec-1".to_string()),
+            loop_id: None,
+            name: "Solo".to_string(),
+            prompt_template: "draft it".to_string(),
+            join_node_id: "join1".to_string(),
+            entry_from_node: "kickoff".to_string(),
+            entry_condition: LoopEdgeCondition::Always,
+            min_pass: 1,
+            straggler_timeout_minutes: None,
+            timeout_minutes: 30,
+            on_pass_to: "arbiter".to_string(),
+            on_fail_to: None,
+            created_at: now,
+        };
+        let members = vec![EnsembleMember {
+            ensemble_id: "ens1".to_string(),
+            node_id: "m1".to_string(),
+            position: 0,
+            platform: "claude".to_string(),
+            model: None,
+            prompt_override: None,
+        }];
+        db.insert_ensemble_unit(&ensemble, &members, &member_nodes, &join_node, &edges)
+            .unwrap();
+
+        db.update_ensemble_member("ens1", "m1", "claude", None, Some("new angle"))
+            .unwrap();
+        let after_set = db.get_ensemble_details("ens1").unwrap().unwrap();
+        assert_eq!(
+            after_set.members[0].prompt_override.as_deref(),
+            Some("new angle")
+        );
+
+        db.update_ensemble_member("ens1", "m1", "claude", None, None)
+            .unwrap();
+        let after_clear = db.get_ensemble_details("ens1").unwrap().unwrap();
+        assert_eq!(after_clear.members[0].prompt_override, None);
+    }
+
+    /// A blueprint row seeded before `prompt_override` existed stores its
+    /// `members` JSON as 2-element `[platform, model]` arrays — an upgrade
+    /// must still be able to read that row back (as "no override for any
+    /// member") without a data migration, alongside the current 3-element
+    /// shape.
+    #[test]
+    fn parse_ensemble_blueprint_members_tolerates_legacy_two_element_rows() {
+        let legacy = r#"[["openrouter","deepseek/deepseek-chat-v3.1:free"],["claude",null]]"#;
+        let parsed = parse_ensemble_blueprint_members(legacy).unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                (
+                    "openrouter".to_string(),
+                    Some("deepseek/deepseek-chat-v3.1:free".to_string()),
+                    None
+                ),
+                ("claude".to_string(), None, None),
+            ]
+        );
+
+        let current = r#"[["openrouter","deepseek/deepseek-chat-v3.1:free","review it"],["claude",null,null]]"#;
+        let parsed = parse_ensemble_blueprint_members(current).unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                (
+                    "openrouter".to_string(),
+                    Some("deepseek/deepseek-chat-v3.1:free".to_string()),
+                    Some("review it".to_string())
+                ),
+                ("claude".to_string(), None, None),
+            ]
+        );
     }
 }

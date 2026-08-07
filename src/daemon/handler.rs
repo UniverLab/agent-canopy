@@ -8,7 +8,6 @@ use std::sync::Arc;
 use axum::http::request::Parts;
 use rmcp::handler::server::common::AsRequestContext;
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
 use rmcp::tool;
 use rmcp::tool_handler;
@@ -47,16 +46,19 @@ use crate::daemon::handler_helpers::{
 };
 use crate::daemon::helpers::{data_dir, error_result, notify_run_result, success_result};
 use crate::daemon::params::*;
+use crate::daemon::params_extract::Parameters;
 use crate::db::intelligence::IntelligenceNodeRecord;
 use crate::db::Database;
 use crate::domain::blueprints::{merge_blueprint_config, validate_blueprint_deletable, Blueprint};
 use crate::domain::loops::{
-    validate_spec_description_template, Ensemble, EnsembleMember, Loop, LoopDetails, LoopEdge,
-    LoopEdgeCondition, LoopNode, LoopNodeKind, LoopNodeRun, LoopResetOutcome, LoopRunStatus,
-    LoopSpec, LoopSpecStatus, LoopStatus, SpecAdminStatusOutcome,
+    validate_router_edges_declared, validate_router_route_coverage, validate_router_routes,
+    validate_spec_description_template, ArchiveLoopOutcome, Ensemble, EnsembleMember,
+    EnsembleMemberSpec, Loop, LoopDetails, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind,
+    LoopNodeRun, LoopResetOutcome, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus,
+    RouterRoute, SpecAdminStatusOutcome,
 };
 use crate::domain::models::{Agent, Trigger};
-use crate::domain::pools::{Pool, PoolDetails};
+use crate::domain::queues::{Queue, QueueDetails};
 use crate::domain::sync::{MessageKind, MissionImpact, WorkspaceStatus};
 use crate::domain::validation::validate_id;
 use crate::executor::Executor;
@@ -199,11 +201,11 @@ const DEFAULT_ENSEMBLE_MEMBER_TIMEOUT_MINUTES: i64 = 30;
 
 /// Validate a `loop_add_ensemble`/`loop_update_ensemble` member list: 2-8
 /// entries, each with a non-empty `platform`. Returns the normalized
-/// `(platform, model)` pairs in the caller's order — the order consolidation
-/// and resize diffs rely on.
+/// `(platform, model, prompt_override)` triples in the caller's order — the
+/// order consolidation and resize diffs rely on.
 fn validate_ensemble_members(
     members: &[EnsembleMemberParams],
-) -> Result<Vec<(String, Option<String>)>, String> {
+) -> Result<Vec<EnsembleMemberSpec>, String> {
     if members.len() < ENSEMBLE_MIN_MEMBERS || members.len() > ENSEMBLE_MAX_MEMBERS {
         return Err(format!(
             "An ensemble must have {ENSEMBLE_MIN_MEMBERS}-{ENSEMBLE_MAX_MEMBERS} members, got {}.",
@@ -223,24 +225,37 @@ fn validate_ensemble_members(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_string);
-            Ok((platform.to_string(), model))
+            let prompt_override = member
+                .prompt_override
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            Ok((platform.to_string(), model, prompt_override))
         })
         .collect()
 }
 
-/// Build a member agent node's `config` — the shared ensemble prompt plus
-/// this member's own platform/model, the same shape `validate_node_config`'s
-/// `Agent` arm expects.
+/// This member's effective prompt: its own `prompt_override` if it has one,
+/// else the ensemble's shared `prompt_template`.
+fn effective_member_prompt<'a>(prompt_override: Option<&'a str>, shared: &'a str) -> &'a str {
+    prompt_override.unwrap_or(shared)
+}
+
+/// Build a member agent node's `config` — its effective prompt (its own
+/// override, or the shared ensemble prompt) plus this member's own
+/// platform/model, the same shape `validate_node_config`'s `Agent` arm
+/// expects.
 fn member_node_config(
     platform: &str,
     model: Option<&str>,
-    prompt_template: &str,
+    effective_prompt: &str,
     timeout_minutes: i64,
 ) -> serde_json::Value {
     serde_json::json!({
         "platform": platform,
         "model": model,
-        "prompt_template": prompt_template,
+        "prompt_template": effective_prompt,
         "timeout_minutes": timeout_minutes,
     })
 }
@@ -254,7 +269,7 @@ struct EnsembleUnitSpec<'a> {
     loop_id: Option<String>,
     name: &'a str,
     prompt_template: &'a str,
-    members: &'a [(String, Option<String>)],
+    members: &'a [EnsembleMemberSpec],
     entry_from_node: &'a str,
     entry_condition: LoopEdgeCondition,
     on_pass_to: &'a str,
@@ -292,8 +307,10 @@ fn build_ensemble_unit(spec: &EnsembleUnitSpec) -> BuiltEnsembleUnit {
     let mut ensemble_members = Vec::with_capacity(spec.members.len());
     let mut edges = Vec::new();
 
-    for (index, (platform, model)) in spec.members.iter().enumerate() {
+    for (index, (platform, model, prompt_override)) in spec.members.iter().enumerate() {
         let node_id = uuid::Uuid::new_v4().to_string();
+        let effective_prompt =
+            effective_member_prompt(prompt_override.as_deref(), spec.prompt_template);
         member_nodes.push(LoopNode {
             id: node_id.clone(),
             spec_id: spec.spec_id.clone(),
@@ -303,7 +320,7 @@ fn build_ensemble_unit(spec: &EnsembleUnitSpec) -> BuiltEnsembleUnit {
             config: member_node_config(
                 platform,
                 model.as_deref(),
-                spec.prompt_template,
+                effective_prompt,
                 spec.timeout_minutes,
             ),
             position: next_position,
@@ -315,7 +332,7 @@ fn build_ensemble_unit(spec: &EnsembleUnitSpec) -> BuiltEnsembleUnit {
             loop_id: spec.loop_id.clone(),
             from_node: spec.entry_from_node.to_string(),
             to_node: node_id.clone(),
-            condition: spec.entry_condition,
+            condition: spec.entry_condition.clone(),
         });
         edges.push(LoopEdge {
             id: uuid::Uuid::new_v4().to_string(),
@@ -331,6 +348,7 @@ fn build_ensemble_unit(spec: &EnsembleUnitSpec) -> BuiltEnsembleUnit {
             position: index as i64,
             platform: platform.clone(),
             model: model.clone(),
+            prompt_override: prompt_override.clone(),
         });
         next_position += 1;
     }
@@ -373,7 +391,7 @@ fn build_ensemble_unit(spec: &EnsembleUnitSpec) -> BuiltEnsembleUnit {
         prompt_template: spec.prompt_template.to_string(),
         join_node_id,
         entry_from_node: spec.entry_from_node.to_string(),
-        entry_condition: spec.entry_condition,
+        entry_condition: spec.entry_condition.clone(),
         min_pass: spec.min_pass,
         straggler_timeout_minutes: spec.straggler_timeout_minutes,
         timeout_minutes: spec.timeout_minutes,
@@ -480,8 +498,8 @@ fn validate_position_conflict(
 /// Refuse to delete a spec that's still bound to a loop, with an actionable
 /// message pointing at the fix (detach it, or delete the loop instead).
 ///
-/// Note: a spec that's a member of a [`Pool`] can still be deleted — the
-/// `pool_members` row cascades away with it (see `pools` table). Pools are
+/// Note: a spec that's a member of a [`Queue`] can still be deleted — the
+/// `queue_members` row cascades away with it (see `queues` table). Queues are
 /// just queues over specs that already exist; they don't own them the way a
 /// loop owns its bound specs.
 fn validate_spec_deletable(spec: &LoopSpec) -> Result<(), String> {
@@ -534,9 +552,62 @@ fn validate_edge_condition(condition: &str) -> Result<LoopEdgeCondition, String>
         .ok_or_else(|| "Loop edge condition must be one of: pass, fail, always.".to_string())
 }
 
+/// [`validate_edge_condition`] plus `route` support for
+/// `loop_add_edge`/`loop_update_edge`: a `"route"` condition requires a
+/// non-empty `route` param naming the label. `pass`/`fail`/`always` are
+/// unaffected — delegated straight to [`validate_edge_condition`].
+fn validate_edge_condition_with_route(
+    condition: &str,
+    route: Option<&str>,
+) -> Result<LoopEdgeCondition, String> {
+    if condition.trim() == "route" {
+        let label = route
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                "Loop edge condition 'route' requires a non-empty 'route' label.".to_string()
+            })?;
+        return Ok(LoopEdgeCondition::Route(label.to_string()));
+    }
+    validate_edge_condition(condition)
+        .map_err(|_| "Loop edge condition must be one of: pass, fail, always, route.".to_string())
+}
+
+/// If `condition` is a `Route`, validate that its label names a route
+/// actually declared by the router node `from_node_id` — never accepted
+/// free-form. Every other condition is a no-op.
+fn validate_route_edge_target(
+    db: &Database,
+    from_node_id: &str,
+    condition: &LoopEdgeCondition,
+) -> Result<(), String> {
+    let Some(label) = condition.route_label() else {
+        return Ok(());
+    };
+    let from_node = validate_node_exists(db, from_node_id)?;
+    if from_node.kind != LoopNodeKind::Router {
+        return Err(format!(
+            "Edge condition 'route' requires from_node '{from_node_id}' to be a router node, not '{}'.",
+            from_node.kind.display_str()
+        ));
+    }
+    let (routes, _fallback) = parse_router_routes(&from_node.config)?;
+    if !routes.iter().any(|route| route.label == label) {
+        return Err(format!(
+            "Edge names undeclared route '{label}'. Router '{from_node_id}' declares: {}.",
+            routes
+                .iter()
+                .map(|route| route.label.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    Ok(())
+}
+
 fn validate_node_kind(kind: &str) -> Result<LoopNodeKind, String> {
     LoopNodeKind::from_str(kind.trim())
-        .ok_or_else(|| "Loop node kind must be one of: agent, check, gate.".to_string())
+        .ok_or_else(|| "Loop node kind must be one of: agent, check, gate, router.".to_string())
 }
 
 /// `loop_add_node`/`loop_update_node`'s `kind: "join"` guard — a quorum node is
@@ -553,9 +624,9 @@ fn validate_not_join_kind(kind: LoopNodeKind) -> Result<(), String> {
 }
 
 /// Refuse to edit a node directly with `loop_update_node`/`loop_add_edge` if
-/// it belongs to an ensemble (member or quorum) — F1's "individual member
-/// overrides are NOT supported in v1": the ensemble is homogeneous by
-/// design, so every edit to a member/quorum goes through
+/// it belongs to an ensemble (member or quorum) — a member's prompt/platform/
+/// model (including its optional `prompt_override`) and the quorum's own
+/// config are all owned by the ensemble unit, so every edit goes through
 /// `loop_update_ensemble`, never a direct node/edge tool.
 fn validate_node_not_ensemble_owned(db: &Database, node_id: &str) -> Result<(), String> {
     if let Some(details) = db
@@ -579,6 +650,156 @@ fn validate_node_not_ensemble_owned(db: &Database, node_id: &str) -> Result<(), 
     Ok(())
 }
 
+/// Resolve the [`LoopStatus`] (and id) of the loop that owns a spec-scoped or
+/// loop-scoped graph object. A node/edge always has exactly one of
+/// `spec_id`/`loop_id` set. `None` means the object belongs to a standalone
+/// spec not yet bound to any loop — nothing running to guard against.
+fn resolve_owning_loop_status(
+    db: &Database,
+    spec_id: Option<&str>,
+    loop_id: Option<&str>,
+) -> Result<Option<(String, LoopStatus)>, String> {
+    if let Some(loop_id) = loop_id {
+        let lp = db
+            .get_loop(loop_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Loop '{loop_id}' not found."))?;
+        return Ok(Some((lp.id, lp.status)));
+    }
+    if let Some(spec_id) = spec_id {
+        let spec = validate_spec_exists(db, spec_id)?;
+        if let Some(loop_id) = &spec.loop_id {
+            let lp = db
+                .get_loop(loop_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("Loop '{loop_id}' not found."))?;
+            return Ok(Some((lp.id, lp.status)));
+        }
+    }
+    Ok(None)
+}
+
+/// Reject a topology mutation (retargeting/deleting an edge, deleting a
+/// node) while the owning loop is `running`. Deliberately stricter than node
+/// CONFIG edits, which are safe because the graph is snapshotted per spec at
+/// `run_spec` — a config edit lands on the next spec. Topology is different:
+/// an edge retargeted or a node deleted mid-dispatch can send a live run to
+/// a node the engine never selected.
+fn validate_topology_mutation_allowed(
+    db: &Database,
+    spec_id: Option<&str>,
+    loop_id: Option<&str>,
+) -> Result<(), String> {
+    if let Some((loop_id, LoopStatus::Running)) = resolve_owning_loop_status(db, spec_id, loop_id)?
+    {
+        return Err(format!(
+            "Loop '{loop_id}' is running; call loop_pause first, then retry this topology change."
+        ));
+    }
+    Ok(())
+}
+
+/// `to_node` must exist in the same spec/loop graph as `edge` — a
+/// cross-graph retarget would leave the edge's `spec_id`/`loop_id` naming one
+/// graph while `to_node` lives in another.
+fn validate_edge_retarget_destination(
+    db: &Database,
+    edge: &LoopEdge,
+    to_node: &str,
+) -> Result<(), String> {
+    let nodes = if let Some(spec_id) = &edge.spec_id {
+        db.list_loop_nodes(spec_id).map_err(|e| e.to_string())?
+    } else if let Some(loop_id) = &edge.loop_id {
+        db.list_loop_nodes_for_loop(loop_id)
+            .map_err(|e| e.to_string())?
+    } else {
+        Vec::new()
+    };
+    if !nodes.iter().any(|n| n.id == to_node) {
+        return Err(format!(
+            "Node '{to_node}' does not belong to the same graph as edge '{}'; retargeting across specs/loops is not allowed.",
+            edge.id
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `node` is the computed entry point of its graph (spec-scoped or
+/// loop-scoped) — see [`crate::loop_engine::find_entry_node`]. A graph with
+/// no *confirmed* single entry (e.g. `find_entry_node` errors on multiple
+/// sources) never blocks deletion here; only a confirmed single entry does.
+fn validate_node_not_entry_point(db: &Database, node: &LoopNode) -> Result<(), String> {
+    let (nodes, edges) = if let Some(spec_id) = &node.spec_id {
+        (
+            db.list_loop_nodes(spec_id).map_err(|e| e.to_string())?,
+            db.list_loop_edges(spec_id).map_err(|e| e.to_string())?,
+        )
+    } else if let Some(loop_id) = &node.loop_id {
+        (
+            db.list_loop_nodes_for_loop(loop_id)
+                .map_err(|e| e.to_string())?,
+            db.list_loop_edges_for_loop(loop_id)
+                .map_err(|e| e.to_string())?,
+        )
+    } else {
+        return Ok(());
+    };
+    if let Ok(entry_id) = crate::loop_engine::find_entry_node(&nodes, &edges, "graph") {
+        if entry_id == node.id {
+            return Err(format!(
+                "Node '{}' is the entry point of its graph; deleting it would leave the graph \
+                 unable to run. Wire a different node as the entry first.",
+                node.id
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validated retarget of an existing edge's `to_node` — the shared path used
+/// by both the `loop_update_edge` MCP tool and the TUI's edge editor, so an
+/// ordinary `pass`/`fail` edge gets the same checks a router's route edges
+/// have always had.
+pub(crate) fn retarget_loop_edge(
+    db: &Database,
+    edge_id: &str,
+    to_node: &str,
+) -> Result<LoopEdge, String> {
+    let edge = validate_edge_exists(db, edge_id)?;
+    validate_topology_mutation_allowed(db, edge.spec_id.as_deref(), edge.loop_id.as_deref())?;
+    validate_node_not_ensemble_owned(db, &edge.from_node)?;
+    validate_node_not_ensemble_owned(db, to_node)?;
+    validate_edge_retarget_destination(db, &edge, to_node)?;
+    db.update_loop_edge_target(&edge.id, to_node)
+        .map_err(|e| e.to_string())?;
+    Ok(LoopEdge {
+        to_node: to_node.to_string(),
+        ..edge
+    })
+}
+
+/// Validated deletion of a single edge — the shared path used by both the
+/// `loop_delete_edge` MCP tool and the TUI's edge editor.
+pub(crate) fn delete_loop_edge_checked(db: &Database, edge_id: &str) -> Result<LoopEdge, String> {
+    let edge = validate_edge_exists(db, edge_id)?;
+    validate_topology_mutation_allowed(db, edge.spec_id.as_deref(), edge.loop_id.as_deref())?;
+    db.delete_loop_edge(&edge.id).map_err(|e| e.to_string())?;
+    Ok(edge)
+}
+
+/// Validated deletion of a node — cascades (at the DB layer, via `ON DELETE
+/// CASCADE` foreign keys on `loop_edges.from_node`/`to_node`) to every edge
+/// naming it. The shared path used by both the `loop_delete_node` MCP tool
+/// and the TUI's graph editor.
+pub(crate) fn delete_loop_node_checked(db: &Database, node_id: &str) -> Result<LoopNode, String> {
+    let node = validate_node_exists(db, node_id)?;
+    validate_topology_mutation_allowed(db, node.spec_id.as_deref(), node.loop_id.as_deref())?;
+    validate_node_not_ensemble_owned(db, &node.id)?;
+    validate_node_not_entry_point(db, &node)?;
+    db.delete_loop_node(&node.id).map_err(|e| e.to_string())?;
+    Ok(node)
+}
+
 /// Unlike [`LoopSpecStatus::from_str`] (infallible, defaults to `Pending`
 /// for callers that already trust the value came from the DB), a
 /// `spec_list` status filter comes from the caller — an unrecognized value
@@ -590,8 +811,10 @@ fn validate_spec_status(status: &str) -> Result<LoopSpecStatus, String> {
         "completed" => Ok(LoopSpecStatus::Completed),
         "failed" => Ok(LoopSpecStatus::Failed),
         "skipped" => Ok(LoopSpecStatus::Skipped),
+        "interrupted" => Ok(LoopSpecStatus::Interrupted),
         _ => Err(
-            "Spec status must be one of: pending, running, completed, failed, skipped.".to_string(),
+            "Spec status must be one of: pending, running, completed, failed, skipped, interrupted."
+                .to_string(),
         ),
     }
 }
@@ -616,19 +839,152 @@ fn json_value_kind_name(value: &serde_json::Value) -> &'static str {
     }
 }
 
+/// Whether an agent node's config names a harness — a non-empty `platform`
+/// or `cli` field. Shared by [`validate_node_config`]'s `Agent` arm (the
+/// general "this config can run" gate) and `resolve_node_kind_and_config`'s
+/// blueprint branch (which needs the same check before merge, to give a
+/// blueprint-specific error instead of the generic one).
+fn config_has_agent_harness(map: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let has_non_empty_str = |field: &str| {
+        map.get(field)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+    };
+    has_non_empty_str("platform") || has_non_empty_str("cli")
+}
+
+/// Every config key an `agent` node is actually read for — see
+/// `execute_agent_node`/`resolve_node_prompt_template` in `loop_engine.rs`.
+/// Notably absent: `prompt`. An agent's prompt is `prompt_template` (or
+/// `prompt_preset`); `prompt` is a plain node never reads, and a node that
+/// carries it silently runs on the bare fallback template instead — the
+/// defect this allowlist exists to catch. `commit_rights` (B37) is accepted
+/// on every kind since the engine checks it uniformly regardless of which
+/// node in the graph actually moves HEAD. `require_report` (boolean, default
+/// `false`) exists because a harness can exit 0 having done nothing — see
+/// `agent_finished_execution` in `loop_engine.rs`.
+const AGENT_CONFIG_KEYS: &[&str] = &[
+    "platform",
+    "cli",
+    "model",
+    "timeout_minutes",
+    "resume",
+    "resume_prompt",
+    "prompt_template",
+    "prompt_preset",
+    "require_report",
+    "commit_rights",
+];
+/// Every config key a `check` node is read for — see `execute_check_node`.
+const CHECK_CONFIG_KEYS: &[&str] = &[
+    "command",
+    "success_condition",
+    "timeout_seconds",
+    "commit_rights",
+];
+/// Every config key a `gate` node is read for — see `execute_gate_node`.
+const GATE_CONFIG_KEYS: &[&str] = &["evaluate", "value", "commit_rights"];
+/// Every config key a `router` node is read for — see `parse_router_routes`.
+const ROUTER_CONFIG_KEYS: &[&str] = &["routes", "fallback", "commit_rights"];
+
+/// The config keys a node's kind is actually read for, or `None` for `Join`
+/// (engine-managed — see `validate_node_config`'s `Join` arm — so there is
+/// no caller-supplied key to check against). Shared by
+/// [`validate_known_config_keys`] (write-time rejection) and
+/// [`unknown_config_keys`] (read-only detection of already-stored nodes via
+/// the `loop_audit_node_configs` tool), so the two can never name a
+/// different accepted set for the same kind.
+fn allowed_config_keys(kind: LoopNodeKind) -> Option<&'static [&'static str]> {
+    match kind {
+        LoopNodeKind::Agent => Some(AGENT_CONFIG_KEYS),
+        LoopNodeKind::Check => Some(CHECK_CONFIG_KEYS),
+        LoopNodeKind::Gate => Some(GATE_CONFIG_KEYS),
+        LoopNodeKind::Router => Some(ROUTER_CONFIG_KEYS),
+        LoopNodeKind::Join => None,
+    }
+}
+
+/// Every key in `map` that `kind` will never read, sorted. Empty for `Join`
+/// (see [`allowed_config_keys`]) and for a config that only carries
+/// recognized keys. Pure read-only classification — no error message, no
+/// early return — so it doubles as both [`validate_known_config_keys`]'s
+/// rejection check and `loop_audit_node_configs`'s detection query over
+/// nodes that predate this validation.
+fn unknown_config_keys(
+    kind: LoopNodeKind,
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<String> {
+    let Some(allowed) = allowed_config_keys(kind) else {
+        return Vec::new();
+    };
+    let mut unknown: Vec<String> = map
+        .keys()
+        .filter(|key| !allowed.contains(&key.as_str()))
+        .cloned()
+        .collect();
+    unknown.sort_unstable();
+    unknown
+}
+
+/// Reject any config key a node's kind will never read. This is what makes
+/// `{ "platform": "claude", "prompt": "..." }` on an agent node fail loudly
+/// at write time instead of being accepted, stored, and silently run on the
+/// bare fallback template (`resolve_node_prompt_template`'s default) — the
+/// exact incident this check exists to prevent. `prompt` on an agent node
+/// gets its own message naming `prompt_template` as the field that actually
+/// gets read; every other unrecognized key gets the generic message naming
+/// what the kind does accept.
+fn validate_known_config_keys(
+    kind: LoopNodeKind,
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let unknown = unknown_config_keys(kind, map);
+    let Some(bad_key) = unknown.first() else {
+        return Ok(());
+    };
+    // `allowed_config_keys` is `None` only for `Join`, for which
+    // `unknown_config_keys` always returns empty — so reaching here means
+    // it returned `Some`.
+    let allowed = allowed_config_keys(kind).expect("non-empty unknown keys implies Some(allowed)");
+    let mut accepted = allowed.to_vec();
+    accepted.sort_unstable();
+
+    if kind == LoopNodeKind::Agent && bad_key == "prompt" {
+        return Err(format!(
+            "Loop node config for kind 'agent' does not read a 'prompt' key; use 'prompt_template' (or 'prompt_preset') instead. Accepted keys: {}.",
+            accepted.join(", ")
+        ));
+    }
+    Err(format!(
+        "Loop node config for kind '{}' has unrecognized key '{bad_key}'. Accepted keys: {}.",
+        kind.as_str(),
+        accepted.join(", ")
+    ))
+}
+
 /// Validate that a loop node's config is a JSON object with the fields its
 /// kind needs at execution time. This exists because a double-encoded config
 /// (e.g. `"{\"platform\": \"mimo\"}"` instead of `{"platform": "mimo"}`) used
 /// to be accepted at creation time and only surfaced as an engine crash
 /// ("Agent node ... is missing a platform/cli") mid-run, long after the node
-/// was saved.
-fn validate_node_config(kind: LoopNodeKind, config: &serde_json::Value) -> Result<(), String> {
+/// was saved. It also rejects any key the node's kind will never read (see
+/// [`validate_known_config_keys`]) — the same "surfaced at write time, not
+/// run time" guarantee, for the case where the config shape is otherwise
+/// valid but carries a key like `prompt` that a typo or a wrong mental model
+/// (confusing it with the loop completion hook's own `prompt` field) put
+/// there instead of `prompt_template`.
+pub(crate) fn validate_node_config(
+    kind: LoopNodeKind,
+    config: &serde_json::Value,
+) -> Result<(), String> {
     let Some(map) = config.as_object() else {
         return Err(format!(
             "Loop node config must be a JSON object, not {}. Pass an object (e.g. {{\"platform\": \"claude\"}}) rather than a JSON-encoded string.",
             json_value_kind_name(config)
         ));
     };
+
+    validate_known_config_keys(kind, map)?;
 
     let has_non_empty_str = |field: &str| {
         map.get(field)
@@ -638,7 +994,7 @@ fn validate_node_config(kind: LoopNodeKind, config: &serde_json::Value) -> Resul
 
     match kind {
         LoopNodeKind::Agent => {
-            if !has_non_empty_str("platform") && !has_non_empty_str("cli") {
+            if !config_has_agent_harness(map) {
                 return Err(
                     "Loop node config for kind 'agent' must include a non-empty 'platform' (or 'cli') field.".to_string(),
                 );
@@ -668,9 +1024,59 @@ fn validate_node_config(kind: LoopNodeKind, config: &serde_json::Value) -> Resul
         // reach this arm anyway since `loop_add_node`/`loop_update_node`
         // refuse `kind: "join"` outright.
         LoopNodeKind::Join => {}
+        LoopNodeKind::Router => {
+            let (routes, fallback) = parse_router_routes(config)?;
+            validate_router_routes(&routes, &fallback)?;
+        }
     }
 
     Ok(())
+}
+
+/// Parse a router node's `config` into its declared routes + fallback
+/// label. Shared by [`validate_node_config`]'s config-shape check and by
+/// edge validation (`loop_add_edge`/`loop_update_edge`/`loop_update_node`),
+/// which need to check a route name against what a router actually
+/// declares.
+fn parse_router_routes(config: &serde_json::Value) -> Result<(Vec<RouterRoute>, String), String> {
+    let map = config.as_object().ok_or_else(|| {
+        format!(
+            "Loop node config must be a JSON object, not {}. Pass an object (e.g. {{\"routes\": [...]}}) rather than a JSON-encoded string.",
+            json_value_kind_name(config)
+        )
+    })?;
+    let routes_value = map.get("routes").ok_or_else(|| {
+        "Loop node config for kind 'router' must include a 'routes' array.".to_string()
+    })?;
+    let routes_array = routes_value
+        .as_array()
+        .ok_or_else(|| "Loop node config field 'routes' must be an array.".to_string())?;
+    let routes = routes_array
+        .iter()
+        .map(|entry| {
+            let obj = entry.as_object().ok_or_else(|| {
+                "Each router route must be an object with 'label' and 'description' fields."
+                    .to_string()
+            })?;
+            let label = obj
+                .get("label")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let description = obj
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            Ok(RouterRoute { label, description })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let fallback = map
+        .get("fallback")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Ok((routes, fallback))
 }
 
 /// Look up a blueprint by name, or an actionable error listing every
@@ -718,6 +1124,21 @@ fn resolve_node_kind_and_config(
             };
             let overrides = config_overrides.map(serde_json::Value::Object);
             let merged = merge_blueprint_config(&bp.config, overrides.as_ref());
+            // Blueprints intentionally carry no platform/cli (see
+            // `builtin_blueprint_specs`) — which harness runs a node is the
+            // caller's decision, supplied here via `config_overrides`, never
+            // a default this resolver falls back to. Catching the missing
+            // case here (rather than only via `validate_node_config`'s
+            // generic message) lets the error name the blueprint and say
+            // *why* the field is missing instead of just that it is.
+            if node_kind == LoopNodeKind::Agent {
+                let has_harness = merged.as_object().is_some_and(config_has_agent_harness);
+                if !has_harness {
+                    return Err(format!(
+                        "Blueprint '{blueprint_name}' intentionally does not provide a platform (or cli) — which harness runs a node is the caller's decision, not the blueprint's. Pass config_overrides with a non-empty 'platform' (and 'model' if that platform needs one) to select the harness."
+                    ));
+                }
+            }
             Ok((node_kind, merged))
         }
         None => {
@@ -733,27 +1154,27 @@ fn resolve_node_kind_and_config(
     }
 }
 
-fn validate_pool_exists(db: &Database, pool_id: &str) -> Result<Pool, String> {
-    db.get_pool(pool_id)
+fn validate_queue_exists(db: &Database, queue_id: &str) -> Result<Queue, String> {
+    db.get_queue(queue_id)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Queue '{pool_id}' not found."))
+        .ok_or_else(|| format!("Queue '{queue_id}' not found."))
 }
 
-/// Refuse to start a pool run when one of the pool's specs is already
-/// `running` under a different loop. A pool spec's own `loop_id` stays
-/// `None` (pool membership never binds it), so ownership is read off the
+/// Refuse to start a queue run when one of the queue's specs is already
+/// `running` under a different loop. A queue spec's own `loop_id` stays
+/// `None` (queue membership never binds it), so ownership is read off the
 /// spec's most recent `loop_runs` row instead — the loop that most recently
 /// touched the spec is the only one that could have set it `running`.
 ///
 /// This is a start-time check, not a lock: two `loop_run` calls issued in
 /// the same instant, before either has run a single node, can still race.
-fn validate_pool_not_consumed(
+fn validate_queue_not_consumed(
     db: &Database,
-    pool_id: &str,
+    queue_id: &str,
     requesting_loop_id: &str,
 ) -> Result<(), String> {
     for spec_id in db
-        .list_pool_member_spec_ids(pool_id)
+        .list_queue_member_spec_ids(queue_id)
         .map_err(|e| e.to_string())?
     {
         let Some(spec) = db.get_loop_spec(&spec_id).map_err(|e| e.to_string())? else {
@@ -770,7 +1191,7 @@ fn validate_pool_not_consumed(
         if owner_loop_id.as_deref() != Some(requesting_loop_id) {
             let owner = owner_loop_id.unwrap_or_else(|| "another loop".to_string());
             return Err(format!(
-                "Queue '{pool_id}' spec '{spec_id}' is already running under loop '{owner}'; wait for it to finish, or pause that loop, before starting a new run against this queue."
+                "Queue '{queue_id}' spec '{spec_id}' is already running under loop '{owner}'; wait for it to finish, or pause that loop, before starting a new run against this queue."
             ));
         }
     }
@@ -782,7 +1203,7 @@ fn validate_pool_not_consumed(
 /// reorder (a subset, or a list with an unrecognized id) so the operation is
 /// always "here is the whole new order," never a swap of two entries applied
 /// on top of unknown existing state.
-fn validate_pool_reorder(current: &[String], spec_ids: &[String]) -> Result<(), String> {
+fn validate_queue_reorder(current: &[String], spec_ids: &[String]) -> Result<(), String> {
     if spec_ids.len() != current.len() {
         return Err(format!(
             "Reorder must list all {} queue spec(s) exactly once; got {}.",
@@ -803,34 +1224,34 @@ fn validate_pool_reorder(current: &[String], spec_ids: &[String]) -> Result<(), 
     Ok(())
 }
 
-/// Live pools (R6): refuse to remove a pool member that is currently
-/// `running` — the tool-layer half of the same lock `pool_reorder` enforces
-/// via [`validate_pool_reorder_locking`]. A spec that isn't a pool member at
-/// all, or isn't found, is left for [`Database::remove_pool_member`]'s own
+/// Live queues (R6): refuse to remove a queue member that is currently
+/// `running` — the tool-layer half of the same lock `queue_reorder` enforces
+/// via [`validate_queue_reorder_locking`]. A spec that isn't a queue member at
+/// all, or isn't found, is left for [`Database::remove_queue_member`]'s own
 /// "no such spec" error — this only ever blocks a positive `running` match.
-fn validate_pool_member_removable(
+fn validate_queue_member_removable(
     db: &Database,
-    pool_id: &str,
+    queue_id: &str,
     spec_id: &str,
 ) -> Result<(), String> {
     if let Some(spec) = db.get_loop_spec(spec_id).map_err(|e| e.to_string())? {
         if spec.status == LoopSpecStatus::Running {
             return Err(format!(
-                "Spec '{spec_id}' is currently running and cannot be removed from queue '{pool_id}'; wait for it to finish, or pause the loop, first."
+                "Spec '{spec_id}' is currently running and cannot be removed from queue '{queue_id}'; wait for it to finish, or pause the loop, first."
             ));
         }
     }
     Ok(())
 }
 
-/// Live pools (R6): the currently running spec and every already-executed
-/// one (`completed`/`failed`/`skipped`) are immutable in the pool's order —
-/// only `pending` members may move. Call after [`validate_pool_reorder`] has
+/// Live queues (R6): the currently running spec and every already-executed
+/// one (`completed`/`failed`/`skipped`) are immutable in the queue's order —
+/// only `pending` members may move. Call after [`validate_queue_reorder`] has
 /// already confirmed `spec_ids` is a total permutation of `current`: under
 /// that guarantee, a locked member "doesn't move" iff it sits at the same
 /// index in both slices, since moving it necessarily displaces whatever now
 /// occupies its old slot.
-fn validate_pool_reorder_locking(
+fn validate_queue_reorder_locking(
     db: &Database,
     current: &[String],
     spec_ids: &[String],
@@ -854,10 +1275,10 @@ fn validate_pool_reorder_locking(
     Ok(())
 }
 
-fn pool_details_json(details: &PoolDetails) -> serde_json::Value {
+fn queue_details_json(details: &QueueDetails) -> serde_json::Value {
     serde_json::json!({
-        "id": details.pool.id,
-        "name": details.pool.name,
+        "id": details.queue.id,
+        "name": details.queue.name,
         "members": details
             .members
             .iter()
@@ -908,16 +1329,64 @@ fn loop_run_status_guard(loop_id: &str, status: LoopStatus) -> Result<(), String
     }
 }
 
+/// Ground truth for "is this loop actually busy right now": any `loop_runs`
+/// row still `running` under it, regardless of what the loop's own `status`
+/// column says. Status and a run's lifetime are independent — a sibling
+/// node's `loop_report_blocker` can flip status to `paused` while a
+/// different node under the same loop keeps executing — so `loop_run` and
+/// [`Database::reset_loop`] both consult this (the latter internally, since
+/// the scheduler's autorun also calls it directly) instead of trusting
+/// status alone. One indexed query (`idx_loop_runs_loop_started`) at
+/// dispatch time.
+///
+/// Returns the first still-`running` row found — an actionable pointer for a
+/// human operator (wait or kill), not an exhaustive list.
+fn find_in_flight_run(db: &Database, loop_id: &str) -> Result<Option<LoopNodeRun>, String> {
+    Ok(db
+        .list_running_loop_runs(loop_id)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .next())
+}
+
+/// The actionable refusal text for a `loop_run`/`loop_reset` call blocked by
+/// [`find_in_flight_run`] (or [`Database::reset_loop`]'s own equivalent
+/// check): names the node and run still executing, and since when, because
+/// the caller's next decision is to wait for it or terminate it.
+fn in_flight_run_error(
+    loop_id: &str,
+    run_id: &str,
+    node_name: &str,
+    started_at: chrono::DateTime<chrono::Utc>,
+) -> String {
+    format!(
+        "Loop '{loop_id}' has node '{node_name}' (run '{run_id}') still executing, running \
+         since {} — wait for it to finish, or terminate it, before retrying.",
+        started_at.to_rfc3339()
+    )
+}
+
+/// `node_id`'s display name, falling back to the raw id if the node row is
+/// somehow gone (e.g. deleted out from under a still-running attempt) — used
+/// to build [`in_flight_run_error`]'s message from a bare `LoopNodeRun`.
+fn node_name_for_error(db: &Database, node_id: &str) -> Result<String, String> {
+    Ok(db
+        .get_loop_node(node_id)
+        .map_err(|e| e.to_string())?
+        .map(|node| node.name)
+        .unwrap_or_else(|| node_id.to_string()))
+}
+
 /// Validate every ensemble (F1) reachable by a `loop_run` call — the loop's
 /// own top-level graph, plus the own graph of every spec that could actually
-/// run (the loop's bound specs, and a pool's members when `pool_id` is
+/// run (the loop's bound specs, and a queue's members when `queue_id` is
 /// given). A spec with no nodes of its own falls back to the loop-level
 /// graph at execution time (see `LoopEngine::run_spec`), so it's skipped
 /// here rather than double-validated.
 fn validate_loop_ensembles_for_run(
     db: &Database,
     loop_id: &str,
-    pool_id: Option<&str>,
+    queue_id: Option<&str>,
 ) -> Result<(), String> {
     let graph_nodes = db
         .list_loop_nodes_for_loop(loop_id)
@@ -940,9 +1409,9 @@ fn validate_loop_ensembles_for_run(
         .into_iter()
         .map(|spec| spec.id)
         .collect();
-    if let Some(pool_id) = pool_id {
+    if let Some(queue_id) = queue_id {
         spec_ids.extend(
-            db.list_pool_member_spec_ids(pool_id)
+            db.list_queue_member_spec_ids(queue_id)
                 .map_err(|e| e.to_string())?,
         );
     }
@@ -978,9 +1447,14 @@ fn perform_loop_reset(
         LoopResetOutcome::NotFound => {
             return Ok(error_result(&format!("Loop '{loop_id}' not found.")));
         }
-        LoopResetOutcome::Running => {
-            return Ok(error_result(&format!(
-                "Loop '{loop_id}' is running; call loop_pause first, then loop_reset."
+        LoopResetOutcome::InFlight {
+            run_id,
+            node_id,
+            started_at,
+        } => {
+            let node_name = node_name_for_error(db, &node_id).map_err(internal_error)?;
+            return Ok(error_result(&in_flight_run_error(
+                loop_id, &run_id, &node_name, started_at,
             )));
         }
         LoopResetOutcome::InvalidSpec(id) => {
@@ -1246,6 +1720,11 @@ fn plan_node_copy(db: &Database, params: &LoopCopyNodeParams) -> Result<NodeCopy
             Some(value) => validate_edge_condition(value)?,
             None => LoopEdgeCondition::Always,
         };
+        wiring.insert("entry_from_node".into(), serde_json::json!(from));
+        wiring.insert(
+            "entry_condition".into(),
+            serde_json::json!(condition.as_str()),
+        );
         edges.push(LoopEdge {
             id: uuid::Uuid::new_v4().to_string(),
             spec_id: spec_id.clone(),
@@ -1254,11 +1733,6 @@ fn plan_node_copy(db: &Database, params: &LoopCopyNodeParams) -> Result<NodeCopy
             to_node: new_id.clone(),
             condition,
         });
-        wiring.insert("entry_from_node".into(), serde_json::json!(from));
-        wiring.insert(
-            "entry_condition".into(),
-            serde_json::json!(condition.as_str()),
-        );
     }
     for (field, target_node, cond) in [
         ("on_pass_to", &params.on_pass_to, LoopEdgeCondition::Pass),
@@ -1362,12 +1836,18 @@ fn plan_ensemble_copy(
         .to_string();
 
     let members_replaced = params.members.is_some();
-    let members: Vec<(String, Option<String>)> = match &params.members {
+    let members: Vec<EnsembleMemberSpec> = match &params.members {
         Some(explicit) => validate_ensemble_members(explicit)?,
         None => details
             .members
             .iter()
-            .map(|m| (m.platform.clone(), m.model.clone()))
+            .map(|m| {
+                (
+                    m.platform.clone(),
+                    m.model.clone(),
+                    m.prompt_override.clone(),
+                )
+            })
             .collect(),
     };
 
@@ -1385,7 +1865,7 @@ fn plan_ensemble_copy(
         .filter(|s| !s.is_empty())
     {
         Some(value) => validate_edge_condition(value)?,
-        None => source.entry_condition,
+        None => source.entry_condition.clone(),
     };
     let on_pass_to = params
         .on_pass_to
@@ -1464,7 +1944,7 @@ fn plan_ensemble_copy(
         prompt_template: &prompt_template,
         members: &members,
         entry_from_node: &entry_from_node,
-        entry_condition,
+        entry_condition: entry_condition.clone(),
         on_pass_to: &on_pass_to,
         on_fail_to: on_fail_to.as_deref(),
         min_pass,
@@ -1512,12 +1992,20 @@ fn build_spec_run_info(db: &Database, spec: &LoopSpec) -> Result<SpecRunInfo, Mc
 
 fn build_loop_summary_json(db: &Database, lp: &Loop) -> Result<serde_json::Value, McpError> {
     let specs = db.list_loop_specs(&lp.id).map_err(internal_error)?;
+    // `Failed` is included so a spec that dead-ended on a failing node with
+    // no outgoing edge still surfaces here — dispatch stops on the first
+    // `Failed` spec (never advances past it), so it's always the earliest
+    // non-terminal spec in position order and `find` still picks it over
+    // any untouched `Pending` spec that was never reached.
     let current_spec = specs
         .into_iter()
         .find(|spec| {
             matches!(
                 spec.status,
-                LoopSpecStatus::Running | LoopSpecStatus::Pending
+                LoopSpecStatus::Running
+                    | LoopSpecStatus::Pending
+                    | LoopSpecStatus::Interrupted
+                    | LoopSpecStatus::Failed
             )
         })
         .map(|spec| build_spec_run_info(db, &spec))
@@ -1534,6 +2022,7 @@ fn build_loop_summary_json(db: &Database, lp: &Loop) -> Result<serde_json::Value
         "blocker": current_spec.and_then(|v| v.blocker),
         "created_at": lp.created_at.to_rfc3339(),
         "workdir": lp.workdir,
+        "archived": lp.archived,
     }))
 }
 
@@ -1718,6 +2207,42 @@ impl TaskTriggerHandler {
             Ok(_) => Ok(()),
             Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
+    }
+
+    /// Resolve the project hash a delete tool should scope itself to: an
+    /// explicit `provided` value always wins (the same override the read
+    /// tools allow), otherwise it's auto-detected from the caller's session
+    /// workdir. Returns `None` if neither is available.
+    fn effective_project_hash_for_delete(
+        &self,
+        parts: Option<&Parts>,
+        provided: Option<&str>,
+    ) -> Option<String> {
+        if let Some(project_hash) = provided {
+            return Some(project_hash.to_string());
+        }
+        let agent_id = self.resolve_sync_agent_id(parts).ok()?;
+        resolve_effective_project_hash(&self.db, None, &agent_id)
+    }
+
+    /// `Some(error result)` if `node` belongs to a project other than
+    /// `effective_project_hash`, `None` if deletion may proceed. Nodes
+    /// without a `project_hash` aren't project-scoped, so they're always in
+    /// scope.
+    fn check_intelligence_delete_scope(
+        &self,
+        node: &crate::db::intelligence::IntelligenceNodeRecord,
+        effective_project_hash: Option<&str>,
+    ) -> Option<CallToolResult> {
+        let node_project_hash = node.project_hash.as_deref()?;
+        if effective_project_hash == Some(node_project_hash) {
+            return None;
+        }
+        Some(error_result(&format!(
+            "Intelligence node '{}' belongs to project '{}', which is outside the caller's \
+             active project scope. Pass project_hash explicitly to operate on it anyway.",
+            node.id, node_project_hash
+        )))
     }
 
     /// Fetch knowledge for the context endpoint.
@@ -2177,13 +2702,14 @@ impl TaskTriggerHandler {
     /// List available AI models.
     #[tool(
         name = "agent_models",
-        description = "List AI models available for use with agents. Pass an optional `platform` (e.g. \"opencode\") to filter to the models that platform can reach; pass `refresh: true` to force a fresh fetch. Every returned model id is the literal string that platform's CLI accepts for its model field — for a universal gateway that is the provider-prefixed form (opencode/big-pickle), for claude the bare form (claude-opus-4-8) — so an id can be copied verbatim into the model field of agent_add or agent_watch. Includes cache provenance (source: cache|live|stale, fetched_at)."
+        description = "List AI models available for use with agents. Pass an optional `platform` (e.g. \"opencode\") to filter to the models that platform can reach; pass `refresh: true` to force a fresh fetch instead of serving a cache that's within its TTL (`canopy models refresh` does the same from the CLI, for one platform or all). Every returned model id is the literal string that platform's CLI accepts for its model field — for a universal gateway that is the provider-prefixed form (opencode/big-pickle), for claude the bare form (claude-opus-4-8) — so an id can be copied verbatim into the model field of agent_add or agent_watch. Includes cache provenance (source: cache|live|stale, fetched_at, age, and whether a refresh is due) — the TTL itself is configurable in config.toml under `[models]`."
     )]
     async fn task_models(
         &self,
         Parameters(params): Parameters<TaskModelsParams>,
     ) -> Result<CallToolResult, McpError> {
         let force_refresh = params.refresh.unwrap_or(false);
+        let full = params.full.unwrap_or(false);
 
         // Optional platform filter, validated against the platforms actually
         // configured in canopy (registry-driven) when that config is present.
@@ -2204,14 +2730,15 @@ impl TaskTriggerHandler {
             // when the registry gives us an enumeration command we use it and
             // skip models.dev entirely — never requiring it to be reachable.
             if let Some((binary, args)) = platform_enumeration_cmd(platform) {
-                return Ok(native_models_result(platform, binary, args, force_refresh).await);
+                return Ok(native_models_result(platform, binary, args, force_refresh, full).await);
             }
         }
 
         // models.dev-derived path: the all-providers listing, or a platform
         // without native enumeration (e.g. claude, whose bare ids are correct).
+        let ttl = configured_models().catalog_ttl();
         let load = tokio::task::spawn_blocking(move || {
-            crate::domain::models_db::load_catalog_with_source(force_refresh)
+            crate::domain::models_db::load_catalog_with_source(force_refresh, ttl)
         })
         .await
         .ok()
@@ -2220,13 +2747,13 @@ impl TaskTriggerHandler {
         let Some(load) = load else {
             return Ok(error_result(
                 "Model catalog unavailable: could not reach models.dev and no local \
-                 cache exists at ~/.canopy/models_cache.json. Omit the model field to \
+                 cache exists at ~/.canopy/cache/models_catalog.json. Omit the model field to \
                  use the CLI's default, or retry once network access is restored.",
             ));
         };
         let crate::domain::models_db::CatalogLoad { catalog, source } = load;
 
-        let listing = match platform {
+        let (listing, truncation) = match platform {
             Some(platform) => {
                 let providers = crate::domain::models_db::providers_for_cli(platform);
                 if providers.is_empty() {
@@ -2235,20 +2762,26 @@ impl TaskTriggerHandler {
                          Omit `platform` to list all providers.",
                     )));
                 }
-                format!(
-                    "Models available to platform '{platform}' (providers: {}):\n{}",
-                    providers.join(", "),
-                    format_platform_models(&catalog, providers)
+                let (formatted, trunc) = format_platform_models(&catalog, providers, full);
+                (
+                    format!(
+                        "Models available to platform '{platform}' (providers: {}):\n{formatted}",
+                        providers.join(", ")
+                    ),
+                    trunc,
                 )
             }
-            None => format!(
-                "Available models (use the model id as the model field):\n{}",
-                format_catalog_models(&catalog)
-            ),
+            None => {
+                let (formatted, trunc) = format_catalog_models(&catalog, full);
+                (
+                    format!("Available models (use the model id as the model field):\n{formatted}"),
+                    trunc,
+                )
+            }
         };
 
         Ok(CallToolResult::success(vec![Content::text(
-            model_result_footer(&listing, source, catalog.fetched_at),
+            model_result_footer(&listing, source, catalog.fetched_at, ttl, &truncation),
         )]))
     }
 
@@ -2796,6 +3329,122 @@ impl TaskTriggerHandler {
     }
 
     #[tool(
+        name = "intelligence_delete_node",
+        description = "Delete an intelligence node and every relation touching it, in one \
+         transaction (hard delete — the graph is meant to be able to forget). project_hash is \
+         auto-detected from the session workdir like the read tools; pass it explicitly to \
+         delete a node belonging to a different project. Returns a clear error, not a silent \
+         success, if the node does not exist."
+    )]
+    async fn intelligence_delete_node(
+        &self,
+        Parameters(params): Parameters<IntelligenceDeleteNodeParams>,
+        OptionalExtension(parts): OptionalExtension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_nursery(parts.as_ref())?;
+        if let Err(e) = validate_non_empty(&params.node_id, "node_id") {
+            return Ok(error_result(&e));
+        }
+
+        let effective_project_hash =
+            self.effective_project_hash_for_delete(parts.as_ref(), params.project_hash.as_deref());
+
+        let node = match self.db.get_intelligence_node(&params.node_id) {
+            Ok(Some(node)) => node,
+            Ok(None) => {
+                return Ok(error_result(&format!(
+                    "Intelligence node '{}' not found.",
+                    params.node_id
+                )))
+            }
+            Err(e) => return Err(McpError::internal_error(e.to_string(), None)),
+        };
+
+        if let Some(scope_error) =
+            self.check_intelligence_delete_scope(&node, effective_project_hash.as_deref())
+        {
+            return Ok(scope_error);
+        }
+
+        let relations_removed = match self.db.delete_intelligence_node(&params.node_id) {
+            Ok(Some(count)) => count,
+            Ok(None) => {
+                return Ok(error_result(&format!(
+                    "Intelligence node '{}' not found.",
+                    params.node_id
+                )))
+            }
+            Err(e) => return Err(McpError::internal_error(e.to_string(), None)),
+        };
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&serde_json::json!({
+                "deleted_node_id": params.node_id,
+                "relations_removed": relations_removed,
+            }))
+            .unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        name = "intelligence_delete_relation",
+        description = "Delete a single relation (edge) by ID, leaving both endpoint nodes \
+         intact. project_hash is auto-detected from the session workdir like the read tools; \
+         pass it explicitly to delete a relation touching a different project's nodes. Returns \
+         a clear error, not a silent success, if the relation does not exist."
+    )]
+    async fn intelligence_delete_relation(
+        &self,
+        Parameters(params): Parameters<IntelligenceDeleteRelationParams>,
+        OptionalExtension(parts): OptionalExtension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_nursery(parts.as_ref())?;
+
+        let effective_project_hash =
+            self.effective_project_hash_for_delete(parts.as_ref(), params.project_hash.as_deref());
+
+        let edge = match self.db.get_intelligence_edge(params.edge_id) {
+            Ok(Some(edge)) => edge,
+            Ok(None) => {
+                return Ok(error_result(&format!(
+                    "Intelligence relation '{}' not found.",
+                    params.edge_id
+                )))
+            }
+            Err(e) => return Err(McpError::internal_error(e.to_string(), None)),
+        };
+
+        for node_id in [&edge.from_node_id, &edge.to_node_id] {
+            if let Ok(Some(node)) = self.db.get_intelligence_node(node_id) {
+                if let Some(scope_error) =
+                    self.check_intelligence_delete_scope(&node, effective_project_hash.as_deref())
+                {
+                    return Ok(scope_error);
+                }
+            }
+        }
+
+        let removed = self
+            .db
+            .delete_intelligence_edge(params.edge_id)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        if !removed {
+            return Ok(error_result(&format!(
+                "Intelligence relation '{}' not found.",
+                params.edge_id
+            )));
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&serde_json::json!({
+                "deleted_edge_id": params.edge_id,
+            }))
+            .unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
         name = "get_identity",
         description = "Read the agent's own structured identity contract (identity.toml). \
          Returns the full TOML content including name, directives, and traits."
@@ -3055,6 +3704,7 @@ impl TaskTriggerHandler {
         };
 
         let lp = Loop {
+            archived: false,
             id: uuid::Uuid::new_v4().to_string(),
             name: name.to_string(),
             description: params.description.filter(|value| !value.trim().is_empty()),
@@ -3067,7 +3717,7 @@ impl TaskTriggerHandler {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         };
 
@@ -3751,6 +4401,32 @@ impl TaskTriggerHandler {
             if let Err(e) = validate_node_config(effective_kind, effective_config) {
                 return Ok(error_result(&e));
             }
+            // A router's routes must stay consistent with whatever edges
+            // already name them: no edge left pointing at a route that was
+            // just removed, and (once wiring has started) no declared route
+            // left without one — see `validate_router_route_coverage`.
+            if effective_kind == LoopNodeKind::Router {
+                let (routes, _fallback) = match parse_router_routes(effective_config) {
+                    Ok(parsed) => parsed,
+                    Err(e) => return Ok(error_result(&e)),
+                };
+                let edges = match (&node.spec_id, &node.loop_id) {
+                    (Some(spec_id), _) => {
+                        self.db.list_loop_edges(spec_id).map_err(internal_error)?
+                    }
+                    (_, Some(loop_id)) => self
+                        .db
+                        .list_loop_edges_for_loop(loop_id)
+                        .map_err(internal_error)?,
+                    (None, None) => Vec::new(),
+                };
+                if let Err(e) = validate_router_edges_declared(&routes, node_id, &edges) {
+                    return Ok(error_result(&e));
+                }
+                if let Err(e) = validate_router_route_coverage(&routes, node_id, &edges) {
+                    return Ok(error_result(&e));
+                }
+            }
         }
 
         self.db
@@ -3768,7 +4444,10 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<LoopAddEdgeParams>,
     ) -> Result<CallToolResult, McpError> {
-        let condition = match validate_edge_condition(params.condition.trim()) {
+        let condition = match validate_edge_condition_with_route(
+            params.condition.trim(),
+            params.route.as_deref(),
+        ) {
             Ok(c) => c,
             Err(e) => return Ok(error_result(&e)),
         };
@@ -3803,6 +4482,9 @@ impl TaskTriggerHandler {
         if let Err(e) = validate_node_not_ensemble_owned(&self.db, &params.to_node) {
             return Ok(error_result(&e));
         }
+        if let Err(e) = validate_route_edge_target(&self.db, &params.from_node, &condition) {
+            return Ok(error_result(&e));
+        }
 
         let (spec_id, loop_id) = match target {
             GraphTarget::Spec(spec_id) => (Some(spec_id), None),
@@ -3825,7 +4507,7 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "loop_update_edge",
-        description = "Update the routing condition of an existing loop edge."
+        description = "Update the routing condition and/or destination node of an existing loop edge. Omit to_node to leave the edge's target unchanged; provide it to retarget the edge in place (preserving its id and run history) instead of recreating it."
     )]
     async fn loop_update_edge(
         &self,
@@ -3841,29 +4523,78 @@ impl TaskTriggerHandler {
         if let Err(e) = validate_node_not_ensemble_owned(&self.db, &edge.to_node) {
             return Ok(error_result(&e));
         }
-        let condition = match validate_edge_condition(params.condition.trim()) {
+        let condition = match validate_edge_condition_with_route(
+            params.condition.trim(),
+            params.route.as_deref(),
+        ) {
             Ok(c) => c,
             Err(e) => return Ok(error_result(&e)),
         };
+        if let Err(e) = validate_route_edge_target(&self.db, &edge.from_node, &condition) {
+            return Ok(error_result(&e));
+        }
 
-        if edge.condition == condition {
+        let to_node = params
+            .to_node
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let target_changed = to_node.is_some_and(|value| value != edge.to_node);
+        if target_changed {
+            if let Err(e) = retarget_loop_edge(&self.db, &edge.id, to_node.unwrap()) {
+                return Ok(error_result(&e));
+            }
+        }
+
+        let condition_changed = edge.condition != condition;
+        if condition_changed {
+            self.db
+                .update_loop_edge_condition(&edge.id, &condition)
+                .map_err(internal_error)?;
+        }
+
+        if !condition_changed && !target_changed {
             return Ok(success_result(&format!(
-                "Loop edge '{}' already uses condition '{}'.",
+                "Loop edge '{}' already uses condition '{}' and target unchanged.",
                 edge.id,
                 condition.as_str()
             )));
         }
 
-        self.db
-            .update_loop_edge_condition(&edge.id, condition)
-            .map_err(internal_error)?;
-
         Ok(success_result(&format!("Loop edge '{}' updated.", edge.id)))
     }
 
     #[tool(
+        name = "loop_delete_edge",
+        description = "Delete a single loop edge by id. Rejected while the owning loop is running — pause it first."
+    )]
+    async fn loop_delete_edge(
+        &self,
+        Parameters(params): Parameters<LoopDeleteEdgeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match delete_loop_edge_checked(&self.db, params.edge_id.trim()) {
+            Ok(edge) => Ok(success_result(&format!("Loop edge '{}' deleted.", edge.id))),
+            Err(e) => Ok(error_result(&e)),
+        }
+    }
+
+    #[tool(
+        name = "loop_delete_node",
+        description = "Delete a loop node by id, cascading to every edge that names it as from_node or to_node. Rejected if the node is the graph's entry point, or while the owning loop is running — pause it first."
+    )]
+    async fn loop_delete_node(
+        &self,
+        Parameters(params): Parameters<LoopDeleteNodeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match delete_loop_node_checked(&self.db, params.node_id.trim()) {
+            Ok(node) => Ok(success_result(&format!("Loop node '{}' deleted.", node.id))),
+            Err(e) => Ok(error_result(&e)),
+        }
+    }
+
+    #[tool(
         name = "loop_add_ensemble",
-        description = "Create an ensemble in ONE call: N (2-8) parallel agent-node members sharing one prompt, plus the quorum that waits for all of them, consolidates their outputs, and routes onward. Members differ only by platform/model. (Formerly called 'fusion' — retired to avoid colliding with OpenRouter's fusion technology.)"
+        description = "Create an ensemble in ONE call: N (2-8) parallel agent-node members sharing one prompt by default, plus the quorum that waits for all of them, consolidates their outputs (attributed per member), and routes onward. Members differ by platform/model, and each may set its own prompt_override to review the same input from a different angle instead of sharing the template. (Formerly called 'fusion' — retired to avoid colliding with OpenRouter's fusion technology.)"
     )]
     async fn loop_add_ensemble(
         &self,
@@ -3913,7 +4644,7 @@ impl TaskTriggerHandler {
         };
         let prompt_template = prompt_template.as_str();
 
-        let members: Vec<(String, Option<String>)> = match &params.members {
+        let members: Vec<EnsembleMemberSpec> = match &params.members {
             Some(explicit) => match validate_ensemble_members(explicit) {
                 Ok(members) => members,
                 Err(e) => return Ok(error_result(&e)),
@@ -4165,7 +4896,7 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "loop_update_ensemble",
-        description = "Update an ensemble's shared prompt (propagated to every member), member list (platform/model — added/removed/replaced by position), quorum config (min_pass, straggler_timeout_minutes, timeout_minutes), and/or exit wiring (on_pass_to/on_fail_to) — all in one call, without touching individual member nodes directly."
+        description = "Update an ensemble's shared prompt (propagated to every member without its own prompt_override), member list (platform/model/prompt_override — added/removed/replaced by position), quorum config (min_pass, straggler_timeout_minutes, timeout_minutes), and/or exit wiring (on_pass_to/on_fail_to) — all in one call, without touching individual member nodes directly."
     )]
     async fn loop_update_ensemble(
         &self,
@@ -4230,21 +4961,25 @@ impl TaskTriggerHandler {
             let old_len = old_members.len();
             let new_len = members.len();
 
-            for (index, (platform, model)) in members.iter().enumerate().take(old_len.min(new_len))
+            for (index, (platform, model, prompt_override)) in
+                members.iter().enumerate().take(old_len.min(new_len))
             {
                 let existing = &old_members[index];
                 self.db
-                    .update_ensemble_member_platform(
+                    .update_ensemble_member(
                         ensemble_id,
                         &existing.node_id,
                         platform,
                         model.as_deref(),
+                        prompt_override.as_deref(),
                     )
                     .map_err(internal_error)?;
+                let effective_prompt =
+                    effective_member_prompt(prompt_override.as_deref(), prompt_template);
                 let config = member_node_config(
                     platform,
                     model.as_deref(),
-                    prompt_template,
+                    effective_prompt,
                     timeout_minutes,
                 );
                 self.db
@@ -4257,10 +4992,14 @@ impl TaskTriggerHandler {
                     .last()
                     .map(|node| node.position + 1)
                     .unwrap_or(1);
-                for (i, (platform, model)) in members[old_len..new_len].iter().enumerate() {
+                for (i, (platform, model, prompt_override)) in
+                    members[old_len..new_len].iter().enumerate()
+                {
                     let next_position = start_position + i as i64;
                     let next_member_position = old_len as i64 + i as i64;
                     let node_id = uuid::Uuid::new_v4().to_string();
+                    let effective_prompt =
+                        effective_member_prompt(prompt_override.as_deref(), prompt_template);
                     let node = LoopNode {
                         id: node_id.clone(),
                         spec_id: details.ensemble.spec_id.clone(),
@@ -4270,7 +5009,7 @@ impl TaskTriggerHandler {
                         config: member_node_config(
                             platform,
                             model.as_deref(),
-                            prompt_template,
+                            effective_prompt,
                             timeout_minutes,
                         ),
                         position: next_position,
@@ -4282,7 +5021,7 @@ impl TaskTriggerHandler {
                         loop_id: details.ensemble.loop_id.clone(),
                         from_node: details.ensemble.entry_from_node.clone(),
                         to_node: node_id.clone(),
-                        condition: details.ensemble.entry_condition,
+                        condition: details.ensemble.entry_condition.clone(),
                     };
                     let join_edge = LoopEdge {
                         id: uuid::Uuid::new_v4().to_string(),
@@ -4298,6 +5037,7 @@ impl TaskTriggerHandler {
                         position: next_member_position,
                         platform: platform.clone(),
                         model: model.clone(),
+                        prompt_override: prompt_override.clone(),
                     };
                     self.db
                         .add_ensemble_member(&member, &node, &entry_edge, &join_edge)
@@ -4320,7 +5060,9 @@ impl TaskTriggerHandler {
                 })?;
         } else if params.prompt_template.is_some() || params.timeout_minutes.is_some() {
             // Prompt and/or shared timeout changed without a member-list
-            // resize: propagate onto every existing member's config as-is.
+            // resize: propagate onto every existing member's config as-is,
+            // except a member with its own prompt_override keeps rendering
+            // that instead of the (possibly just-changed) shared prompt.
             let prompt_template = params
                 .prompt_template
                 .as_deref()
@@ -4329,10 +5071,12 @@ impl TaskTriggerHandler {
                 .timeout_minutes
                 .unwrap_or(details.ensemble.timeout_minutes);
             for member in &details.members {
+                let effective_prompt =
+                    effective_member_prompt(member.prompt_override.as_deref(), prompt_template);
                 let config = member_node_config(
                     &member.platform,
                     member.model.as_deref(),
-                    prompt_template,
+                    effective_prompt,
                     timeout_minutes,
                 );
                 self.db
@@ -4413,7 +5157,7 @@ impl TaskTriggerHandler {
                 self.db
                     .delete_loop_edges_from_node_with_condition(
                         &details.ensemble.join_node_id,
-                        LoopEdgeCondition::Pass,
+                        &LoopEdgeCondition::Pass,
                     )
                     .map_err(internal_error)?;
                 self.db
@@ -4432,7 +5176,7 @@ impl TaskTriggerHandler {
                 self.db
                     .delete_loop_edges_from_node_with_condition(
                         &details.ensemble.join_node_id,
-                        LoopEdgeCondition::Fail,
+                        &LoopEdgeCondition::Fail,
                     )
                     .map_err(internal_error)?;
                 if let Some(target) = on_fail_to
@@ -4480,15 +5224,7 @@ impl TaskTriggerHandler {
     // ---- Queue tools (Q1) --------------------------------------------------
     //
     // A "queue" is an ordered list of existing specs, decoupled from any one
-    // loop. The `queue_*` tools below are the primary surface; the `pool_*`
-    // tools further down are DEPRECATED thin aliases kept for back-compat.
-    // Both call the shared `do_queue_*` helpers so there is exactly one
-    // implementation and one place that routes: alias in, one handler out.
-    //
-    // NOTE: the DB/engine layer still speaks "pool" internally (the `pools`
-    // table, `insert_pool`, `list_pool_member_spec_ids`, `validate_pool_*`,
-    // etc.). That is deliberate — Q1 renames only the MCP/user surface, never
-    // the storage layer. The helpers keep `pool`-named DB calls unchanged.
+    // loop.
 
     async fn do_queue_create(&self, name: &str) -> Result<CallToolResult, McpError> {
         let name = name.trim();
@@ -4496,14 +5232,14 @@ impl TaskTriggerHandler {
             return Ok(error_result(&e));
         }
 
-        let pool = Pool {
+        let queue = Queue {
             id: uuid::Uuid::new_v4().to_string(),
             name: name.to_string(),
             created_at: chrono::Utc::now(),
         };
-        self.db.insert_pool(&pool).map_err(internal_error)?;
+        self.db.insert_queue(&queue).map_err(internal_error)?;
 
-        Ok(build_id_result(&pool.id, "queue_id"))
+        Ok(build_id_result(&queue.id, "queue_id"))
     }
 
     async fn do_queue_add_spec(
@@ -4513,7 +5249,7 @@ impl TaskTriggerHandler {
         group: Option<&str>,
     ) -> Result<CallToolResult, McpError> {
         let queue_id = queue_id.trim();
-        if let Err(e) = validate_pool_exists(&self.db, queue_id) {
+        if let Err(e) = validate_queue_exists(&self.db, queue_id) {
             return Ok(error_result(&e));
         }
         let spec_id = spec_id.trim();
@@ -4522,7 +5258,7 @@ impl TaskTriggerHandler {
         }
         let already_member = self
             .db
-            .pool_has_member(queue_id, spec_id)
+            .queue_has_member(queue_id, spec_id)
             .map_err(internal_error)?;
         if already_member {
             return Ok(error_result(&format!(
@@ -4534,7 +5270,7 @@ impl TaskTriggerHandler {
         let group = group.map(str::trim).filter(|g| !g.is_empty());
 
         self.db
-            .append_pool_member(queue_id, spec_id, group)
+            .append_queue_member(queue_id, spec_id, group)
             .map_err(internal_error)?;
 
         let group_note = group
@@ -4550,21 +5286,21 @@ impl TaskTriggerHandler {
 
         let body = match queue_id {
             Some(queue_id) => {
-                let details = match self.db.get_pool_details(queue_id) {
+                let details = match self.db.get_queue_details(queue_id) {
                     Ok(Some(details)) => details,
                     Ok(None) => return Ok(error_result(&format!("Queue '{queue_id}' not found."))),
                     Err(e) => return Err(internal_error(e.to_string())),
                 };
-                serde_json::json!({ "queue": pool_details_json(&details) })
+                serde_json::json!({ "queue": queue_details_json(&details) })
             }
             None => {
-                let pools = self.db.list_pools().map_err(internal_error)?;
+                let queues = self.db.list_queues().map_err(internal_error)?;
                 serde_json::json!({
-                    "queues": pools
+                    "queues": queues
                         .iter()
-                        .map(|pool| serde_json::json!({
-                            "id": pool.id,
-                            "name": pool.name,
+                        .map(|queue| serde_json::json!({
+                            "id": queue.id,
+                            "name": queue.name,
                         }))
                         .collect::<Vec<_>>(),
                 })
@@ -4582,16 +5318,16 @@ impl TaskTriggerHandler {
         spec_id: &str,
     ) -> Result<CallToolResult, McpError> {
         let queue_id = queue_id.trim();
-        if let Err(e) = validate_pool_exists(&self.db, queue_id) {
+        if let Err(e) = validate_queue_exists(&self.db, queue_id) {
             return Ok(error_result(&e));
         }
         let spec_id = spec_id.trim();
-        if let Err(e) = validate_pool_member_removable(&self.db, queue_id, spec_id) {
+        if let Err(e) = validate_queue_member_removable(&self.db, queue_id, spec_id) {
             return Ok(error_result(&e));
         }
         let removed = self
             .db
-            .remove_pool_member(queue_id, spec_id)
+            .remove_queue_member(queue_id, spec_id)
             .map_err(internal_error)?;
         if !removed {
             return Ok(error_result(&format!(
@@ -4610,22 +5346,22 @@ impl TaskTriggerHandler {
         spec_ids: &[String],
     ) -> Result<CallToolResult, McpError> {
         let queue_id = queue_id.trim();
-        if let Err(e) = validate_pool_exists(&self.db, queue_id) {
+        if let Err(e) = validate_queue_exists(&self.db, queue_id) {
             return Ok(error_result(&e));
         }
         let current = self
             .db
-            .list_pool_member_spec_ids(queue_id)
+            .list_queue_member_spec_ids(queue_id)
             .map_err(internal_error)?;
-        if let Err(e) = validate_pool_reorder(&current, spec_ids) {
+        if let Err(e) = validate_queue_reorder(&current, spec_ids) {
             return Ok(error_result(&e));
         }
-        if let Err(e) = validate_pool_reorder_locking(&self.db, &current, spec_ids) {
+        if let Err(e) = validate_queue_reorder_locking(&self.db, &current, spec_ids) {
             return Ok(error_result(&e));
         }
 
         self.db
-            .reorder_pool_members(queue_id, spec_ids)
+            .reorder_queue_members(queue_id, spec_ids)
             .map_err(internal_error)?;
 
         Ok(success_result(&format!("Queue '{queue_id}' reordered.")))
@@ -4690,64 +5426,6 @@ impl TaskTriggerHandler {
     }
 
     #[tool(
-        name = "pool_create",
-        description = "DEPRECATED: use queue_create instead. Create a queue: an ordered list of existing specs, decoupled from any one loop."
-    )]
-    async fn pool_create(
-        &self,
-        Parameters(params): Parameters<PoolCreateParams>,
-    ) -> Result<CallToolResult, McpError> {
-        self.do_queue_create(&params.name).await
-    }
-
-    #[tool(
-        name = "pool_add_spec",
-        description = "DEPRECATED: use queue_add_spec instead. Append an existing spec to the end of a queue."
-    )]
-    async fn pool_add_spec(
-        &self,
-        Parameters(params): Parameters<PoolAddSpecParams>,
-    ) -> Result<CallToolResult, McpError> {
-        self.do_queue_add_spec(&params.pool_id, &params.spec_id, params.group.as_deref())
-            .await
-    }
-
-    #[tool(
-        name = "pool_list",
-        description = "DEPRECATED: use queue_list instead. List a queue's ordered members, or every queue (summary only) if pool_id is omitted."
-    )]
-    async fn pool_list(
-        &self,
-        Parameters(params): Parameters<PoolListParams>,
-    ) -> Result<CallToolResult, McpError> {
-        self.do_queue_list(params.pool_id.as_deref()).await
-    }
-
-    #[tool(
-        name = "pool_remove_spec",
-        description = "DEPRECATED: use queue_remove_spec instead. Remove a spec from a queue."
-    )]
-    async fn pool_remove_spec(
-        &self,
-        Parameters(params): Parameters<PoolRemoveSpecParams>,
-    ) -> Result<CallToolResult, McpError> {
-        self.do_queue_remove_spec(&params.pool_id, &params.spec_id)
-            .await
-    }
-
-    #[tool(
-        name = "pool_reorder",
-        description = "DEPRECATED: use queue_reorder instead. Reorder a queue. `spec_ids` must list every queue member exactly once, in the desired order — a total replacement, not a partial swap."
-    )]
-    async fn pool_reorder(
-        &self,
-        Parameters(params): Parameters<PoolReorderParams>,
-    ) -> Result<CallToolResult, McpError> {
-        self.do_queue_reorder(&params.pool_id, &params.spec_ids)
-            .await
-    }
-
-    #[tool(
         name = "loop_get",
         description = "Return a loop with its ordered specs, nodes, and edges."
     )]
@@ -4775,6 +5453,182 @@ impl TaskTriggerHandler {
     }
 
     #[tool(
+        name = "loop_export",
+        description = "Export a loop's design — name, description, nodes, edges, and ensembles — as a portable JSON document, so it can be shared as a file and recreated elsewhere with loop_import. Never includes ids, workdir, specs, or run/status state. platform/model are stripped from every agent node/ensemble member by default; pass with_models: true to keep them (only when exporting your own loop to restore later on your own machine)."
+    )]
+    async fn loop_export(
+        &self,
+        Parameters(params): Parameters<LoopExportParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let loop_id = params.loop_id.trim();
+        let Some(lp) = self.db.get_loop(loop_id).map_err(internal_error)? else {
+            return Ok(error_result(&format!("Loop '{loop_id}' not found.")));
+        };
+        let with_models = params.with_models.unwrap_or(false);
+
+        let graph_nodes = self
+            .db
+            .list_loop_nodes_for_loop(loop_id)
+            .map_err(internal_error)?;
+        let graph_edges = self
+            .db
+            .list_loop_edges_for_loop(loop_id)
+            .map_err(internal_error)?;
+        let ensembles = self
+            .db
+            .list_ensembles_for_loop(loop_id)
+            .map_err(internal_error)?;
+
+        let document = match crate::domain::loop_transfer::build_export_document(
+            &lp,
+            &graph_nodes,
+            &graph_edges,
+            &ensembles,
+            with_models,
+        ) {
+            Ok(document) => document,
+            Err(e) => return Ok(error_result(&e)),
+        };
+
+        Ok(build_json_result(
+            &serde_json::to_value(&document).map_err(internal_error)?,
+        ))
+    }
+
+    #[tool(
+        name = "loop_import",
+        description = "Create a new loop from an exported document (the object loop_export returns). Always creates a new loop — never updates or overwrites an existing one; if the name is already taken in workdir, a numeric suffix is applied and the response says which name was used. Validates the document exactly as loop_add_node/loop_add_edge/loop_add_ensemble would, all-or-nothing: nothing is written if any part is rejected. The response lists every agent node left without a platform (the document strips it by default) so the caller knows what to fill in before running the loop."
+    )]
+    async fn loop_import(
+        &self,
+        Parameters(params): Parameters<LoopImportParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let workdir = params.workdir.trim();
+        if let Err(e) = validate_non_empty(workdir, "Loop workdir") {
+            return Ok(error_result(&e));
+        }
+        if let Err(e) = validate_absolute_dir(workdir) {
+            return Ok(error_result(&e));
+        }
+
+        let document =
+            match crate::domain::loop_transfer::parse_export_document_value(&params.document) {
+                Ok(document) => document,
+                Err(e) => return Ok(error_result(&e)),
+            };
+
+        let desired_name = params
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(document.name.trim());
+        if let Err(e) = validate_non_empty(desired_name, "Loop name") {
+            return Ok(error_result(&e));
+        }
+
+        let loop_id = uuid::Uuid::new_v4().to_string();
+        let plan = match crate::domain::loop_transfer::build_import_plan(&document, &loop_id) {
+            Ok(plan) => plan,
+            Err(e) => return Ok(error_result(&e)),
+        };
+        let missing_platform = crate::domain::loop_transfer::agent_nodes_missing_platform(&plan);
+
+        let existing_names: Vec<String> = self
+            .db
+            .list_loops(Some(workdir), true)
+            .map_err(internal_error)?
+            .into_iter()
+            .map(|lp| lp.name)
+            .collect();
+        let final_name =
+            crate::domain::loop_transfer::resolve_unique_loop_name(&existing_names, desired_name);
+
+        let lp = Loop {
+            archived: false,
+            id: loop_id.clone(),
+            name: final_name.clone(),
+            description: document
+                .description
+                .clone()
+                .filter(|value| !value.trim().is_empty()),
+            workdir: workdir.to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        };
+
+        self.db
+            .import_loop_graph(&lp, &plan)
+            .map_err(internal_error)?;
+        if let Err(error) = self.db.register_project_path(std::path::Path::new(workdir)) {
+            tracing::debug!("Could not register imported loop's project at {workdir}: {error}");
+        }
+        self.activate_loop_trigger(&lp).await;
+
+        Ok(build_json_result(&serde_json::json!({
+            "loop_id": lp.id,
+            "name": lp.name,
+            "nodes_missing_platform": missing_platform,
+        })))
+    }
+
+    #[tool(
+        name = "loop_audit_node_configs",
+        description = "Scan every loop node in the database for a config key its kind will never read (e.g. 'prompt' on an agent node, which the engine silently ignores in favor of 'prompt_template'). Write-time validation (loop_add_node/loop_update_node) rejects this going forward; this tool finds nodes that predate it and are still silently degraded."
+    )]
+    async fn loop_audit_node_configs(&self) -> Result<CallToolResult, McpError> {
+        let nodes = self.db.list_all_loop_nodes().map_err(internal_error)?;
+
+        let mut flagged = Vec::new();
+        for node in &nodes {
+            let Some(map) = node.config.as_object() else {
+                continue;
+            };
+            let unknown = unknown_config_keys(node.kind, map);
+            if unknown.is_empty() {
+                continue;
+            }
+            // A spec-scoped node's own row has no `loop_id` (only the spec
+            // does) — resolve it so a flagged node can be traced back to the
+            // loop that owns it without a second round-trip.
+            let loop_id = match &node.loop_id {
+                Some(loop_id) => Some(loop_id.clone()),
+                None => match &node.spec_id {
+                    Some(spec_id) => self
+                        .db
+                        .get_loop_spec(spec_id)
+                        .map_err(internal_error)?
+                        .and_then(|spec| spec.loop_id),
+                    None => None,
+                },
+            };
+            flagged.push(serde_json::json!({
+                "node_id": node.id,
+                "name": node.name,
+                "kind": node.kind.display_str(),
+                "spec_id": node.spec_id,
+                "loop_id": loop_id,
+                "unknown_keys": unknown,
+            }));
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&serde_json::json!({
+                "flagged_nodes": flagged,
+            }))
+            .unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
         name = "loop_list",
         description = "List loops, optionally filtered by workdir."
     )]
@@ -4784,7 +5638,10 @@ impl TaskTriggerHandler {
     ) -> Result<CallToolResult, McpError> {
         let loops = self
             .db
-            .list_loops(params.workdir.as_deref())
+            .list_loops(
+                params.workdir.as_deref(),
+                params.include_archived.unwrap_or(false),
+            )
             .map_err(internal_error)?;
 
         let out = build_loop_list_json(&self.db, &loops)?;
@@ -4795,8 +5652,218 @@ impl TaskTriggerHandler {
     }
 
     #[tool(
+        name = "loop_node_runs_list",
+        description = "List a loop's node run history — what `loop_get` omits (it only carries a loop's *bound* specs, empty for a queue-driven run). Defaults to the most recent runs first, so the run that failed a `failed` loop is normally the very first result without knowing any node id ahead of time. Narrow to one spec or node with `spec_id`/`node_id`. Output/input are omitted here since they can be large; fetch a specific run's full output with loop_node_run_get using its `id`."
+    )]
+    async fn loop_node_runs_list(
+        &self,
+        Parameters(params): Parameters<LoopNodeRunsListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if self
+            .db
+            .get_loop(&params.loop_id)
+            .map_err(internal_error)?
+            .is_none()
+        {
+            return Ok(error_result(&format!(
+                "Loop '{}' not found.",
+                params.loop_id
+            )));
+        }
+
+        let limit = params.limit.unwrap_or(20).clamp(1, 200) as i64;
+        let offset = params.offset.unwrap_or(0) as i64;
+
+        let runs = self
+            .db
+            .list_loop_node_runs(
+                &params.loop_id,
+                params.spec_id.as_deref(),
+                params.node_id.as_deref(),
+                limit,
+                offset,
+            )
+            .map_err(internal_error)?;
+
+        let out = runs
+            .iter()
+            .map(|run| loop_node_run_summary_json(&self.db, run))
+            .collect::<Vec<_>>();
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&serde_json::json!({
+                "loop_id": params.loop_id,
+                "limit": limit,
+                "offset": offset,
+                "runs": out,
+            }))
+            .unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        name = "loop_node_run_get",
+        description = "Fetch one node run's full stored input/output by run id (see loop_node_runs_list). This is the second step of failure diagnosis: list to find the offending run, then fetch its output here — the exact stderr/stdout/reported_output the engine recorded, including `infra_attempt`/`infra_crash` markers when present. Secret-shaped substrings (API keys, tokens, private key blocks) are redacted before the output crosses this boundary."
+    )]
+    async fn loop_node_run_get(
+        &self,
+        Parameters(params): Parameters<LoopNodeRunGetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let Some(run) = self
+            .db
+            .get_loop_run(&params.run_id)
+            .map_err(internal_error)?
+        else {
+            return Ok(error_result(&format!(
+                "Node run '{}' not found.",
+                params.run_id
+            )));
+        };
+        let node_name = self
+            .db
+            .get_loop_node(&run.node_id)
+            .map_err(internal_error)?
+            .map(|node| node.name);
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&loop_node_run_detail_json(&run, node_name.as_deref()))
+                .unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        name = "agent_probe",
+        description = "Actually invoke a configured platform headlessly with a trivial prompt and report whether a real, usable response comes back — the verdict is based on the response content, not the exit code, so a harness that prints its own error and exits 0 is reported broken rather than healthy. Omit `platform` to probe every platform configured in canopy (each with its own default model); pass `platform` alone to probe its default model, or `platform`+`model` together to validate the exact pair a loop node would use. On failure, reports the harness's own error text (redacted of secrets) so you learn *why* (missing API key vs. wrong model name vs. it never answered), not just that it failed. Spends real tokens/quota per platform probed — call this explicitly, never automatically or on a schedule."
+    )]
+    async fn agent_probe(
+        &self,
+        Parameters(params): Parameters<AgentProbeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if params.model.is_some() && params.platform.is_none() {
+            return Ok(error_result(
+                "`model` requires `platform` — omit both to probe every configured platform's \
+                 default model.",
+            ));
+        }
+
+        let Some(home) = dirs::home_dir() else {
+            return Err(internal_error("No home directory"));
+        };
+        let config = crate::domain::canopy_config::CanopyConfig::load(&home.join(".canopy"));
+
+        let targets: Vec<crate::daemon::probe::ProbeTarget> = match params.platform.as_deref() {
+            Some(platform) => vec![crate::daemon::probe::ProbeTarget {
+                platform: platform.to_string(),
+                model: params.model.clone(),
+            }],
+            None => config
+                .clis
+                .iter()
+                .map(|cli| crate::daemon::probe::ProbeTarget {
+                    platform: cli.name.clone(),
+                    model: None,
+                })
+                .collect(),
+        };
+
+        if targets.is_empty() {
+            return Ok(error_result(
+                "No platforms configured in canopy. Run 'canopy setup'.",
+            ));
+        }
+
+        let timeout_secs = clamp_probe_timeout(params.timeout_seconds);
+        let reports = crate::daemon::probe::probe_targets(
+            &config,
+            &targets,
+            None,
+            std::time::Duration::from_secs(timeout_secs),
+        )
+        .await;
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&serde_json::json!({
+                "timeout_seconds": timeout_secs,
+                "would_fail": reports.iter().filter(|r| !r.outcome.reachable()).count(),
+                "probes": reports.iter().map(|r| r.to_json()).collect::<Vec<_>>(),
+            }))
+            .unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        name = "loop_preflight",
+        description = "Probe every distinct platform+model pair a loop's agent nodes, ensemble members, and on_completed hook reference — before spending a real loop_run on a harness that's installed and configured but can't actually produce a response. A platform used by several nodes is probed once, not once per node; the result names every node/hook that references a failing pair. Verdict is based on response content, not exit code (see agent_probe). Spends real tokens/quota per distinct pair — call this explicitly before loop_run, never automatically."
+    )]
+    async fn loop_preflight(
+        &self,
+        Parameters(params): Parameters<LoopPreflightParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let details = match self.db.get_loop_details(&params.loop_id) {
+            Ok(Some(details)) => details,
+            Ok(None) => {
+                return Ok(error_result(&format!(
+                    "Loop '{}' not found.",
+                    params.loop_id
+                )))
+            }
+            Err(e) => return Err(internal_error(e.to_string())),
+        };
+
+        let loop_targets = crate::daemon::probe::distinct_targets_for_loop(&details);
+        if loop_targets.is_empty() {
+            return Ok(success_result(&format!(
+                "Loop '{}' has no agent nodes, ensemble members, or on_completed hook to probe.",
+                params.loop_id
+            )));
+        }
+
+        let Some(home) = dirs::home_dir() else {
+            return Err(internal_error("No home directory"));
+        };
+        let config = crate::domain::canopy_config::CanopyConfig::load(&home.join(".canopy"));
+
+        let timeout_secs = clamp_probe_timeout(params.timeout_seconds);
+        let targets: Vec<crate::daemon::probe::ProbeTarget> =
+            loop_targets.iter().map(|t| t.target.clone()).collect();
+        let reports = crate::daemon::probe::probe_targets(
+            &config,
+            &targets,
+            Some(&details.lp.workdir),
+            std::time::Duration::from_secs(timeout_secs),
+        )
+        .await;
+
+        let probes: Vec<serde_json::Value> = reports
+            .iter()
+            .zip(loop_targets.iter())
+            .map(|(report, loop_target)| {
+                let mut value = report.to_json();
+                if let serde_json::Value::Object(map) = &mut value {
+                    map.insert(
+                        "used_by".to_string(),
+                        serde_json::json!(loop_target.used_by),
+                    );
+                }
+                value
+            })
+            .collect();
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&serde_json::json!({
+                "loop_id": params.loop_id,
+                "timeout_seconds": timeout_secs,
+                "pairs_checked": reports.len(),
+                "would_fail": reports.iter().filter(|r| !r.outcome.reachable()).count(),
+                "probes": probes,
+            }))
+            .unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
         name = "loop_run",
-        description = "Run a loop in the background, spec by spec. With `queue_id`, runs the queue's pending specs (in queue order) through the loop's graph instead of the loop's own bound specs. (`pool_id` is a deprecated alias for `queue_id`; `queue_id` wins if both are set.) `workdir` overrides the loop's workdir for this run only."
+        description = "Run a loop in the background, spec by spec. With `queue_id`, runs the queue's pending specs (in queue order) through the loop's graph instead of the loop's own bound specs. `workdir` overrides the loop's workdir for this run only."
     )]
     async fn loop_run(
         &self,
@@ -4817,20 +5884,32 @@ impl TaskTriggerHandler {
             return Ok(error_result(&message));
         }
 
-        // `queue_id` is the current surface name; `pool_id` is the deprecated
-        // alias. Prefer `queue_id`, fall back to `pool_id`. Everything
-        // downstream (engine, db) keeps its internal `pool_id` naming.
-        let pool_id = params
+        // A dispatch is refused while any run of this loop is still
+        // `running`, whatever the loop's own status says — see
+        // `find_in_flight_run`. This is what a `paused`-but-still-executing
+        // loop (a sibling node's blocker report flipped status without
+        // terminating this run) must hit instead of launching a second,
+        // racing dispatch.
+        if let Some(run) = find_in_flight_run(&self.db, &params.loop_id).map_err(internal_error)? {
+            let node_name = node_name_for_error(&self.db, &run.node_id).map_err(internal_error)?;
+            return Ok(error_result(&in_flight_run_error(
+                &params.loop_id,
+                &run.id,
+                &node_name,
+                run.started_at,
+            )));
+        }
+
+        let queue_id = params
             .queue_id
             .as_deref()
-            .or(params.pool_id.as_deref())
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        if let Some(pool_id) = pool_id {
-            if let Err(e) = validate_pool_exists(&self.db, pool_id) {
+        if let Some(queue_id) = queue_id {
+            if let Err(e) = validate_queue_exists(&self.db, queue_id) {
                 return Ok(error_result(&e));
             }
-            if let Err(e) = validate_pool_not_consumed(&self.db, pool_id, &params.loop_id) {
+            if let Err(e) = validate_queue_not_consumed(&self.db, queue_id, &params.loop_id) {
                 return Ok(error_result(&e));
             }
         }
@@ -4846,7 +5925,7 @@ impl TaskTriggerHandler {
             }
         }
 
-        if let Err(e) = validate_loop_ensembles_for_run(&self.db, &params.loop_id, pool_id) {
+        if let Err(e) = validate_loop_ensembles_for_run(&self.db, &params.loop_id, queue_id) {
             return Ok(error_result(&e));
         }
 
@@ -4859,7 +5938,7 @@ impl TaskTriggerHandler {
         // `Running`, so every other launch path inherits it too.
         match self
             .loop_engine
-            .empty_launch_check(&params.loop_id, pool_id)
+            .empty_launch_check(&params.loop_id, queue_id)
         {
             Ok(Some(message)) => return Ok(error_result(&message)),
             Ok(None) => {}
@@ -4868,7 +5947,7 @@ impl TaskTriggerHandler {
 
         Arc::clone(&self.loop_engine).start_background_run(
             params.loop_id.clone(),
-            pool_id.map(str::to_string),
+            queue_id.map(str::to_string),
             workdir.map(str::to_string),
         );
         Ok(success_result(&format!(
@@ -4888,7 +5967,7 @@ impl TaskTriggerHandler {
     /// can never diverge in behavior.
     #[tool(
         name = "loop_reset",
-        description = "Reset a completed/failed loop back to pending so loop_run can relaunch it. Without `specs`, resets every non-completed spec, leaving already-completed ones untouched so loop_run resumes at the first pending spec. With `specs`, resets exactly those spec IDs, even if they were completed. If the loop's last run was against a pool, its pool members are what get reset (same semantics), since a pool run's own bound specs are typically empty. Rejects a `running` loop — call loop_pause first. Note: a `failed` loop with a pending loop_schedule_autorun resets and resumes itself automatically when the schedule fires — call this manually only to reset sooner, reset a `completed` loop, or reset specific spec IDs."
+        description = "Reset a completed/failed loop back to pending so loop_run can relaunch it. Without `specs`, resets every non-completed spec, leaving already-completed ones untouched so loop_run resumes at the first pending spec. With `specs`, resets exactly those spec IDs, even if they were completed. If the loop's last run was against a queue, its queue members are what get reset (same semantics), since a queue run's own bound specs are typically empty. Rejects a `running` loop — call loop_pause first. Note: a `failed` loop with a pending loop_schedule_autorun resets and resumes itself automatically when the schedule fires — call this manually only to reset sooner, reset a `completed` loop, or reset specific spec IDs."
     )]
     async fn loop_reset(
         &self,
@@ -4910,7 +5989,7 @@ impl TaskTriggerHandler {
     /// a human decision, made via `loop_reset` + `loop_run`.
     #[tool(
         name = "loop_schedule_autorun",
-        description = "Schedule a one-shot resume for a loop at a future ISO 8601 time, or cancel a pending one. When the scheduler reaches that time: a `failed` loop is auto-reset (same transition as loop_reset) and resumed — useful for a loop that failed on a quota to reschedule its own resumption at the exact reset time; a `completed` loop is left alone (the schedule is cleared but the loop is not re-run — use loop_reset + loop_run to re-run a finished loop); any other fireable status launches normally. If the loop's last run was against a pool, the resume targets that same pool (its pending members, in queue order) instead of the loop's own bound specs. The schedule always clears after firing (one-shot). Omit both `at` and `quota_reset_message` to cancel any pending autorun instead of scheduling one — valid regardless of the loop's current status, and a no-op (not an error) if nothing was scheduled. After a quota failure, prefer `quota_reset_message` (the raw CLI text, e.g. \"resets 1pm (America/Bogota)\") over computing `at` yourself — the engine parses the stated local time/timezone and converts it deterministically, avoiding scheduling errors from doing that arithmetic by hand."
+        description = "Schedule a one-shot resume for a loop at a future ISO 8601 time, or cancel a pending one. When the scheduler reaches that time: a `failed` loop is auto-reset (same transition as loop_reset) and resumed — useful for a loop that failed on a quota to reschedule its own resumption at the exact reset time; a `completed` loop is left alone (the schedule is cleared but the loop is not re-run — use loop_reset + loop_run to re-run a finished loop); any other fireable status launches normally. If the loop's last run was against a queue, the resume targets that same queue (its pending members, in queue order) instead of the loop's own bound specs. The schedule always clears after firing (one-shot). Omit both `at` and `quota_reset_message` to cancel any pending autorun instead of scheduling one — valid regardless of the loop's current status, and a no-op (not an error) if nothing was scheduled. After a quota failure, prefer `quota_reset_message` (the raw CLI text, e.g. \"resets 1pm (America/Bogota)\") over computing `at` yourself — the engine parses the stated local time/timezone and converts it deterministically, avoiding scheduling errors from doing that arithmetic by hand."
     )]
     async fn loop_schedule_autorun(
         &self,
@@ -5113,6 +6192,59 @@ impl TaskTriggerHandler {
     }
 
     #[tool(
+        name = "loop_archive",
+        description = "Archive a loop: it leaves the main loop_list/sidebar view but its row, specs, and full run history are untouched (never deleted, never moved to another table) and it can be restored with loop_restore at any time. Refuses a `running` loop — pause it first. Permanent deletion is a separate, deliberate act on an already-archived loop, not something F4/this tool does."
+    )]
+    async fn loop_archive(
+        &self,
+        Parameters(params): Parameters<LoopArchiveParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.db.archive_loop(&params.loop_id).map_err(internal_error)? {
+            ArchiveLoopOutcome::Archived => Ok(success_result(&format!(
+                "Loop '{}' archived. Its specs and run history are intact; restore it with loop_restore.",
+                params.loop_id
+            ))),
+            ArchiveLoopOutcome::AlreadyArchived => Ok(error_result(&format!(
+                "Loop '{}' is already archived.",
+                params.loop_id
+            ))),
+            ArchiveLoopOutcome::Running => Ok(error_result(&format!(
+                "Loop '{}' is running — pause it before archiving.",
+                params.loop_id
+            ))),
+            ArchiveLoopOutcome::NotFound => Ok(error_result(&format!(
+                "Loop '{}' not found.",
+                params.loop_id
+            ))),
+        }
+    }
+
+    #[tool(
+        name = "loop_restore",
+        description = "Restore an archived loop back to the main loop_list/sidebar view. The loop's row, specs, and run history were never touched by archiving, so this is a plain flag flip."
+    )]
+    async fn loop_restore(
+        &self,
+        Parameters(params): Parameters<LoopRestoreParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let restored = self
+            .db
+            .restore_loop(&params.loop_id)
+            .map_err(internal_error)?;
+        if restored {
+            Ok(success_result(&format!(
+                "Loop '{}' restored to the main list.",
+                params.loop_id
+            )))
+        } else {
+            Ok(error_result(&format!(
+                "Loop '{}' not found or not archived.",
+                params.loop_id
+            )))
+        }
+    }
+
+    #[tool(
         name = "loop_continue",
         description = "Continue a paused loop by retrying the current node or skipping to the next spec."
     )]
@@ -5149,8 +6281,8 @@ impl TaskTriggerHandler {
             }
         }
 
-        // Resume with the loop's persisted run context — a paused pool run
-        // must pick the same pool back up, not the loop's own bound specs.
+        // Resume with the loop's persisted run context — a paused queue run
+        // must pick the same queue back up, not the loop's own bound specs.
         // The flip to `Running` is NOT done here: the dispatch's own atomic
         // loop claim (B42) owns that transition, so this resume and any other
         // launch racing it converge on one guarded entry point instead of each
@@ -5344,6 +6476,68 @@ impl TaskTriggerHandler {
         }
     }
 
+    /// Point a project at a new workdir after its directory was renamed or
+    /// moved, keeping its sessions and history instead of orphaning them.
+    #[tool(
+        name = "project_remap",
+        description = "Remap a project whose directory was renamed or moved to its new path, \
+        re-keying its sessions/loops/history instead of losing them. MOVE if nothing is \
+        registered at the new path, MERGE (folding into it, removing the stale row) if a \
+        project already exists there. Refuses a new_path that doesn't exist unless force=true. \
+        Set dry_run=true to preview without changing anything."
+    )]
+    async fn project_remap(
+        &self,
+        Parameters(params): Parameters<ProjectRemapParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let new_path = std::path::Path::new(&params.new_path);
+        let resolved =
+            match crate::db::project::resolve_remap_path(new_path, params.force.unwrap_or(false)) {
+                Ok(resolved) => resolved,
+                Err(e) => return Ok(error_result(&e.to_string())),
+            };
+
+        let outcome = if params.dry_run.unwrap_or(false) {
+            self.db.remap_preview(&params.project_hash, &resolved)
+        } else {
+            self.db.remap_project(&params.project_hash, &resolved)
+        };
+
+        match outcome {
+            Ok(outcome) => {
+                let kind = match outcome.kind {
+                    crate::domain::project::RemapKind::Move => "move",
+                    crate::domain::project::RemapKind::Merge => "merge",
+                };
+                let out = serde_json::json!({
+                    "kind": kind,
+                    "dry_run": params.dry_run.unwrap_or(false),
+                    "old_hash": outcome.old_hash,
+                    "new_hash": outcome.new_hash,
+                    "new_path": outcome.new_path,
+                    "rows_moved": outcome.counts.total(),
+                    "counts": {
+                        "interactive_sessions": outcome.counts.interactive_sessions,
+                        "terminal_sessions": outcome.counts.terminal_sessions,
+                        "loops": outcome.counts.loops,
+                        "loop_specs": outcome.counts.loop_specs,
+                        "sync_messages": outcome.counts.sync_messages,
+                        "sync_locks": outcome.counts.sync_locks,
+                        "last_prompts": outcome.counts.last_prompts,
+                        "scheduled_sends": outcome.counts.scheduled_sends,
+                        "failed_scheduled_sends": outcome.counts.failed_scheduled_sends,
+                        "agents": outcome.counts.agents,
+                        "intelligence_nodes": outcome.counts.intelligence_nodes,
+                    },
+                });
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&out).unwrap_or_default(),
+                )]))
+            }
+            Err(e) => Ok(error_result(&e.to_string())),
+        }
+    }
+
     /// Full-text search over personal RAG chunks (LanceDB vector search). Rate-limited: 10/min per agent.
     #[tool(
         name = "rag_search",
@@ -5427,6 +6621,20 @@ impl TaskTriggerHandler {
     }
 }
 
+/// Resolve `agent_probe`/`loop_preflight`'s `timeout_seconds` param to an
+/// actual bound: the configured default when omitted, clamped to
+/// `[MIN_PROBE_TIMEOUT_SECS, MAX_PROBE_TIMEOUT_SECS]` otherwise — a probe is
+/// a liveness check, not a capability benchmark, so callers can't ask for an
+/// unbounded wait.
+fn clamp_probe_timeout(requested: Option<u64>) -> u64 {
+    requested
+        .unwrap_or(crate::daemon::probe::DEFAULT_PROBE_TIMEOUT_SECS)
+        .clamp(
+            crate::daemon::probe::MIN_PROBE_TIMEOUT_SECS,
+            crate::daemon::probe::MAX_PROBE_TIMEOUT_SECS,
+        )
+}
+
 /// Validate a requested `agent_models` platform against the CLIs actually
 /// configured in canopy (registry-driven, from `~/.canopy/config.toml`).
 /// Returns `Some(error_message)` if config exists and the platform isn't among
@@ -5470,10 +6678,18 @@ async fn native_models_result(
     binary: String,
     args: String,
     force_refresh: bool,
+    full: bool,
 ) -> CallToolResult {
     let platform_owned = platform.to_string();
+    let ttl = configured_models().native_ttl();
     let load = tokio::task::spawn_blocking(move || {
-        crate::domain::models_db::load_native_models(&platform_owned, &binary, &args, force_refresh)
+        crate::domain::models_db::load_native_models(
+            &platform_owned,
+            &binary,
+            &args,
+            force_refresh,
+            ttl,
+        )
     })
     .await
     .ok()
@@ -5487,35 +6703,68 @@ async fn native_models_result(
     };
     let crate::domain::models_db::NativeLoad { catalog, source } = load;
 
+    let (listing, truncation) = format_native_models(&catalog.ids, full);
     let listing = format!(
         "Models available to platform '{platform}' (enumerated from the CLI — ids are \
-         passable verbatim):\n{}",
-        format_native_models(&catalog.ids)
+         passable verbatim):\n{listing}"
     );
     CallToolResult::success(vec![Content::text(model_result_footer(
         &listing,
         source,
         catalog.fetched_at,
+        ttl,
+        &truncation,
     ))])
 }
 
+/// This daemon's `[models]` TTL configuration, read fresh from
+/// `~/.canopy/config.toml` on every call (like `rag_max_file_bytes`) so a
+/// config edit is picked up on the next `agent_models` call without
+/// restarting the daemon. Falls back to the compiled defaults when no home
+/// directory or config file can be found.
+fn configured_models() -> crate::domain::canopy_config::ModelsConfig {
+    dirs::home_dir()
+        .map(|home| crate::domain::canopy_config::CanopyConfig::load(&home.join(".canopy")).models)
+        .unwrap_or_default()
+}
+
 /// The shared provenance/footer block for `agent_models`, used by both the
-/// models.dev and native-enumeration paths.
+/// models.dev and native-enumeration paths. States the cache's age and
+/// whether a refresh is due, not just its timestamp — and when the source was
+/// unreachable, folds how stale the served cache is into that same notice.
 fn model_result_footer(
     listing: &str,
     source: crate::domain::models_db::CatalogSource,
     fetched_at: std::time::SystemTime,
+    ttl: std::time::Duration,
+    truncation: &crate::daemon::handler_formatting::ModelTruncation,
 ) -> String {
-    let stale_hint = if source == crate::domain::models_db::CatalogSource::Stale {
-        " (the source was unreachable — this cache may be out of date; retry with refresh: true)"
+    let age = fetched_at.elapsed().unwrap_or_default();
+    let age_str = format_duration_short(age);
+    let ttl_str = format_duration_short(ttl);
+    let refresh_due = age >= ttl;
+
+    let provenance_note = if source == crate::domain::models_db::CatalogSource::Stale {
+        format!(
+            " (source unreachable — serving a cache that is already {age_str} old, past \
+             the {ttl_str} refresh interval; retry with refresh: true once it's reachable)"
+        )
+    } else if refresh_due {
+        " (refresh due — pass refresh: true to update now)".to_string()
     } else {
-        ""
+        String::new()
     };
+
+    let truncation_notice = truncation
+        .notice()
+        .map(|n| format!("\n{n}"))
+        .unwrap_or_default();
     format!(
         "{listing}\n\n\
-         Source: {}{stale_hint} · fetched_at: {}\n\
+         Source: {}{provenance_note} · age: {age_str} (refresh interval {ttl_str}) · \
+         fetched_at: {}\n\
          Note: model availability also depends on the CLI's configured API keys. \
-         If model is omitted, the CLI uses its own default.",
+         If model is omitted, the CLI uses its own default.{truncation_notice}",
         source.as_str(),
         format_system_time(fetched_at),
     )
@@ -5527,11 +6776,41 @@ fn format_system_time(time: std::time::SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339()
 }
 
+/// Render a `Duration` as a short human-readable age/TTL (`45s`, `12m`,
+/// `2h15m`, `3d4h`) for the `agent_models` footer — coarse on purpose, since
+/// the footer only needs to convey rough freshness, not precise timing.
+fn format_duration_short(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m");
+    }
+    let hours = mins / 60;
+    let rem_mins = mins % 60;
+    if hours < 24 {
+        return if rem_mins == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h{rem_mins}m")
+        };
+    }
+    let days = hours / 24;
+    let rem_hours = hours % 24;
+    if rem_hours == 0 {
+        format!("{days}d")
+    } else {
+        format!("{days}d{rem_hours}h")
+    }
+}
+
 /// Find and skip `loop_id`'s currently `running` spec — its own bound spec,
-/// or, for a pool-driven run, the pool member currently in flight. A pool
-/// member's `loop_id` column stays `None` (pool membership never binds it),
+/// or, for a queue-driven run, the queue member currently in flight. A queue
+/// member's `loop_id` column stays `None` (queue membership never binds it),
 /// so `list_loop_specs(loop_id)` alone can't see it (B18): the loop's
-/// persisted `active_run_pool_id` is what names the pool to look in instead.
+/// persisted `active_run_queue_id` is what names the queue to look in instead.
 pub(crate) fn handle_skip_next_spec(db: &Database, loop_id: &str) -> Result<(), McpError> {
     let bound_running = db
         .list_loop_specs(loop_id)
@@ -5541,7 +6820,7 @@ pub(crate) fn handle_skip_next_spec(db: &Database, loop_id: &str) -> Result<(), 
 
     let current_spec = match bound_running {
         Some(spec) => spec,
-        None => pool_running_spec(db, loop_id)?.ok_or_else(|| {
+        None => queue_running_spec(db, loop_id)?.ok_or_else(|| {
             McpError::invalid_params("No running spec found to skip from this paused loop.", None)
         })?,
     };
@@ -5564,7 +6843,7 @@ pub(crate) fn handle_retry_current_node(db: &Database, loop_id: &str) -> Result<
         .map_err(internal_error)?
         .into_iter()
         .find(|spec| spec.status == LoopSpecStatus::Running);
-    if bound_running.is_none() && pool_running_spec(db, loop_id)?.is_none() {
+    if bound_running.is_none() && queue_running_spec(db, loop_id)?.is_none() {
         return Err(McpError::invalid_params(
             "No running spec found to retry from this paused loop.",
             None,
@@ -5573,18 +6852,18 @@ pub(crate) fn handle_retry_current_node(db: &Database, loop_id: &str) -> Result<
     Ok(())
 }
 
-/// The `running` member of `loop_id`'s currently active pool run, if any —
-/// `None` if the loop isn't drawing from a pool, or no member is `running`.
-fn pool_running_spec(db: &Database, loop_id: &str) -> Result<Option<LoopSpec>, McpError> {
-    let Some(pool_id) = db
+/// The `running` member of `loop_id`'s currently active queue run, if any —
+/// `None` if the loop isn't drawing from a queue, or no member is `running`.
+fn queue_running_spec(db: &Database, loop_id: &str) -> Result<Option<LoopSpec>, McpError> {
+    let Some(queue_id) = db
         .get_loop(loop_id)
         .map_err(internal_error)?
-        .and_then(|lp| lp.active_run_pool_id)
+        .and_then(|lp| lp.active_run_queue_id)
     else {
         return Ok(None);
     };
     for spec_id in db
-        .list_pool_member_spec_ids(&pool_id)
+        .list_queue_member_spec_ids(&queue_id)
         .map_err(internal_error)?
     {
         if let Some(spec) = db.get_loop_spec(&spec_id).map_err(internal_error)? {
@@ -5712,8 +6991,9 @@ fn loop_details_json(db: &Database, lp: &LoopDetails) -> anyhow::Result<serde_js
         "started_at": lp.lp.started_at.map(|value| value.to_rfc3339()),
         "completed_at": lp.lp.completed_at.map(|value| value.to_rfc3339()),
         "autorun_at": lp.lp.autorun_at.map(|value| value.to_rfc3339()),
+        "archived": lp.lp.archived,
         "graph": {
-            "nodes": lp.graph_nodes.iter().map(loop_node_json).collect::<Vec<_>>(),
+            "nodes": lp.graph_nodes.iter().map(|node| loop_node_json(node, &lp.graph_edges)).collect::<Vec<_>>(),
             "edges": lp.graph_edges.iter().map(loop_edge_json).collect::<Vec<_>>(),
             "ensembles": ensembles,
         },
@@ -5752,6 +7032,12 @@ fn ensemble_details_json(details: &crate::domain::loops::EnsembleDetails) -> ser
             "position": member.position,
             "platform": member.platform,
             "model": member.model,
+            "prompt_override": member.prompt_override,
+            // Which prompt this member actually renders — "override" (its own
+            // prompt_override) or "shared" (the ensemble's prompt_template) —
+            // so a client can tell the two apart without diffing member config
+            // against the ensemble row itself.
+            "prompt_source": if member.prompt_override.is_some() { "override" } else { "shared" },
         })).collect::<Vec<_>>(),
     })
 }
@@ -5822,14 +7108,14 @@ fn loop_spec_details_json(
         "spec_start_head": spec.spec.spec_start_head,
         "started_at": spec.spec.started_at.map(|value| value.to_rfc3339()),
         "completed_at": spec.spec.completed_at.map(|value| value.to_rfc3339()),
-        "nodes": spec.nodes.iter().map(loop_node_json).collect::<Vec<_>>(),
+        "nodes": spec.nodes.iter().map(|node| loop_node_json(node, &spec.edges)).collect::<Vec<_>>(),
         "edges": spec.edges.iter().map(loop_edge_json).collect::<Vec<_>>(),
         "ensembles": ensembles,
         "runs": runs,
     }))
 }
 
-fn loop_node_json(node: &LoopNode) -> serde_json::Value {
+fn loop_node_json(node: &LoopNode, edges: &[LoopEdge]) -> serde_json::Value {
     serde_json::json!({
         "id": node.id,
         "spec_id": node.spec_id,
@@ -5839,7 +7125,51 @@ fn loop_node_json(node: &LoopNode) -> serde_json::Value {
         "config": node.config,
         "position": node.position,
         "created_at": node.created_at.to_rfc3339(),
+        "routes": router_routes_json(node, edges),
+        "prompt_source": agent_prompt_source_json(node),
     })
+}
+
+/// For an agent node, which branch of `resolve_node_prompt_template`'s
+/// precedence it will actually run on — `"explicit"`, `"preset"`, or
+/// `"default_fallback"` (see `loop_engine::agent_prompt_source`) — so
+/// `loop_get` makes a node quietly running on the bare fallback template
+/// (no `prompt_template`, no `prompt_preset`) visible without requiring a
+/// run first. `None` for every other node kind, same convention as
+/// [`router_routes_json`].
+fn agent_prompt_source_json(node: &LoopNode) -> Option<&'static str> {
+    if node.kind != LoopNodeKind::Agent {
+        return None;
+    }
+    Some(crate::loop_engine::agent_prompt_source(&node.config))
+}
+
+/// For a router node, every declared route alongside the edge (if any) that
+/// currently serves it — `loop_get`'s view into "which edge serves each
+/// route". `None` for every other node kind (or if the router's `config`
+/// somehow fails to parse — `loop_get` should never fail outright over a
+/// display concern).
+fn router_routes_json(node: &LoopNode, edges: &[LoopEdge]) -> Option<serde_json::Value> {
+    if node.kind != LoopNodeKind::Router {
+        return None;
+    }
+    let (routes, fallback) = parse_router_routes(&node.config).ok()?;
+    Some(serde_json::json!(routes
+        .iter()
+        .map(|route| {
+            let serving_edge = edges.iter().find(|edge| {
+                edge.from_node == node.id
+                    && edge.condition.route_label() == Some(route.label.as_str())
+            });
+            serde_json::json!({
+                "label": route.label,
+                "description": route.description,
+                "fallback": route.label == fallback,
+                "edge_id": serving_edge.map(|edge| edge.id.clone()),
+                "to_node": serving_edge.map(|edge| edge.to_node.clone()),
+            })
+        })
+        .collect::<Vec<_>>()))
 }
 
 fn loop_edge_json(edge: &LoopEdge) -> serde_json::Value {
@@ -5850,6 +7180,7 @@ fn loop_edge_json(edge: &LoopEdge) -> serde_json::Value {
         "from_node": edge.from_node,
         "to_node": edge.to_node,
         "condition": edge.condition.as_str(),
+        "route": edge.condition.route_label(),
     })
 }
 
@@ -5874,6 +7205,104 @@ fn loop_run_blocker(run: &crate::domain::loops::LoopNodeRun) -> Option<String> {
         .and_then(|output| output.get("blocker"))
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+/// One row of `loop_node_runs_list` — deliberately excludes `input`/`output`
+/// (can be large; a caller wanting them calls `loop_node_run_get` with this
+/// row's `id`) but resolves `node_name` so a caller isn't left matching a
+/// bare node id back to the graph by hand.
+fn loop_node_run_summary_json(db: &Database, run: &LoopNodeRun) -> serde_json::Value {
+    let node_name = db
+        .get_loop_node(&run.node_id)
+        .ok()
+        .flatten()
+        .map(|node| node.name);
+    serde_json::json!({
+        "id": run.id,
+        "spec_id": run.spec_id,
+        "node_id": run.node_id,
+        "node_name": node_name,
+        "status": run.status.as_str(),
+        "iteration": run.iteration,
+        "started_at": run.started_at.to_rfc3339(),
+        "completed_at": run.completed_at.map(|value| value.to_rfc3339()),
+        "session_id": run.session_id,
+    })
+}
+
+/// The `loop_node_run_get` response: everything `loop_node_run_summary_json`
+/// carries, plus the full `input`/`output` the engine stored — redacted
+/// (see [`redact_sensitive_value`]) since either can carry secret-shaped
+/// content echoed by the wrapped CLI. `output` preserves whatever the engine
+/// wrote verbatim otherwise, including the B19 `infra_attempt`/`infra_crash`
+/// markers a caller needs to tell an infra retry from a semantic failure.
+fn loop_node_run_detail_json(run: &LoopNodeRun, node_name: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "id": run.id,
+        "loop_id": run.loop_id,
+        "spec_id": run.spec_id,
+        "node_id": run.node_id,
+        "node_name": node_name,
+        "status": run.status.as_str(),
+        "iteration": run.iteration,
+        "input": run.input.as_ref().map(redact_sensitive_value),
+        "output": run.output.as_ref().map(redact_sensitive_value),
+        "started_at": run.started_at.to_rfc3339(),
+        "completed_at": run.completed_at.map(|value| value.to_rfc3339()),
+        "session_id": run.session_id,
+    })
+}
+
+/// Secret-shaped substrings a node run's stored input/output can carry
+/// through whatever CLI it wrapped (an API key echoed into a shell command,
+/// a leaked token in stderr, a pasted private key). Compiled once and
+/// applied uniformly to every string leaf in the run's JSON — see
+/// [`redact_sensitive_value`] — rather than to specific fields like `stdout`
+/// or `command`, since sensitive content can land in any of them alike and a
+/// per-field allowlist would miss the next field name that carries it.
+static SECRET_PATTERNS: std::sync::LazyLock<Vec<regex::Regex>> = std::sync::LazyLock::new(|| {
+    [
+        // Anthropic/OpenAI-style API keys: sk-..., sk-ant-...
+        r"sk-[A-Za-z0-9_-]{16,}",
+        // GitHub personal/app/oauth/refresh tokens.
+        r"gh[pousr]_[A-Za-z0-9]{20,}",
+        // AWS access key IDs.
+        r"AKIA[0-9A-Z]{16}",
+        // Bearer tokens in an Authorization header or similar.
+        r"(?i)bearer\s+[A-Za-z0-9._-]{16,}",
+        // key/value assignments: api_key=..., "password": "...", token: ...
+        r#"(?i)(api[_-]?key|secret|password|access[_-]?token|token)["']?\s*[:=]\s*["']?[A-Za-z0-9._\-/+]{8,}"#,
+        // PEM private key blocks.
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
+    ]
+    .iter()
+    .map(|pattern| regex::Regex::new(pattern).expect("valid redaction regex"))
+    .collect()
+});
+
+pub(crate) fn redact_secrets(text: &str) -> String {
+    let mut result = text.to_string();
+    for pattern in SECRET_PATTERNS.iter() {
+        result = pattern.replace_all(&result, "[REDACTED]").into_owned();
+    }
+    result
+}
+
+/// Recursively redacts every string leaf of a node run's stored `input`/
+/// `output` before it crosses the MCP boundary via `loop_node_run_get`.
+fn redact_sensitive_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(s) => serde_json::Value::String(redact_secrets(s)),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(redact_sensitive_value).collect())
+        }
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), redact_sensitive_value(v)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
 }
 
 fn transport_details(port: u16) -> (&'static str, String) {
@@ -6016,26 +7445,25 @@ mod tests {
     use super::{
         build_ensemble_unit, build_get_tools_response, build_id_result, build_json_result,
         build_loop_completion_hook, build_loop_trigger, build_loop_update_response,
-        build_node_update_response, build_spec_update_response, handle_retry_current_node,
-        handle_skip_next_spec, header_str, json_value_kind_name, loop_details_json,
-        loop_run_status_guard, loop_trigger_json, member_node_config, missing_sync_identity_error,
-        node_copy_note, perform_loop_reset, plan_ensemble_copy, plan_node_copy, rag_result_json,
-        resolve_graph_target, resolve_node_kind_and_config, resolve_reported_run,
-        spec_summary_json, validate_absolute_dir, validate_at_least_one_bool,
-        validate_blueprint_exists, validate_edge_condition, validate_ensemble_members,
-        validate_node_config, validate_node_kind, validate_node_not_ensemble_owned,
-        validate_non_empty, validate_not_join_kind, validate_pool_exists,
-        validate_pool_member_removable, validate_pool_not_consumed, validate_pool_reorder,
-        validate_pool_reorder_locking, validate_spec_deletable, validate_spec_exists,
-        validate_spec_set_status_target, validate_spec_status, validate_spec_workdir,
-        BuiltEnsembleUnit, EnsembleMemberParams, EnsembleUnitSpec, TaskTriggerHandler,
-        MISSING_SYNC_IDENTITY_MESSAGE,
+        build_node_update_response, build_spec_update_response, effective_member_prompt,
+        find_in_flight_run, handle_retry_current_node, handle_skip_next_spec, header_str,
+        in_flight_run_error, json_value_kind_name, loop_details_json, loop_run_status_guard,
+        loop_trigger_json, member_node_config, missing_sync_identity_error, node_copy_note,
+        node_name_for_error, perform_loop_reset, plan_ensemble_copy, plan_node_copy,
+        rag_result_json, resolve_graph_target, resolve_node_kind_and_config, resolve_reported_run,
+        spec_summary_json, unknown_config_keys, validate_absolute_dir, validate_at_least_one_bool,
+        validate_blueprint_exists, validate_edge_condition, validate_edge_condition_with_route,
+        validate_ensemble_members, validate_node_config, validate_node_kind,
+        validate_node_not_ensemble_owned, validate_non_empty, validate_not_join_kind,
+        validate_queue_exists, validate_queue_member_removable, validate_queue_not_consumed,
+        validate_queue_reorder, validate_queue_reorder_locking, validate_route_edge_target,
+        validate_spec_deletable, validate_spec_exists, validate_spec_set_status_target,
+        validate_spec_status, validate_spec_workdir, BuiltEnsembleUnit, EnsembleMemberParams,
+        EnsembleUnitSpec, TaskTriggerHandler, MISSING_SYNC_IDENTITY_MESSAGE,
     };
     use crate::daemon::params::{
-        LoopCompletionHookParams, LoopCopyEnsembleParams, LoopCopyNodeParams, LoopRunParams,
+        LoopCompletionHookParams, LoopCopyEnsembleParams, LoopCopyNodeParams,
         LoopScheduleAutorunParams, LoopScheduleContinueParams, LoopTriggerParams,
-        PoolAddSpecParams, PoolCreateParams, PoolListParams, QueueAddSpecParams, QueueCreateParams,
-        QueueListParams,
     };
     use crate::db::Database;
     use crate::domain::blueprints::Blueprint;
@@ -6044,7 +7472,7 @@ mod tests {
         LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus,
     };
     use crate::domain::models::Trigger;
-    use crate::domain::pools::Pool;
+    use crate::domain::queues::Queue;
     use crate::shared::sync_identity::CANOPY_AGENT_ID_HEADER;
     use tempfile::tempdir;
 
@@ -6052,7 +7480,96 @@ mod tests {
         EnsembleMemberParams {
             platform: platform.to_string(),
             model: None,
+            prompt_override: None,
         }
+    }
+
+    fn ensemble_member_params_with_prompt(
+        platform: &str,
+        prompt_override: &str,
+    ) -> EnsembleMemberParams {
+        EnsembleMemberParams {
+            platform: platform.to_string(),
+            model: None,
+            prompt_override: Some(prompt_override.to_string()),
+        }
+    }
+
+    /// The `#[tool]` macro locates a handler's parameter wrapper by the
+    /// literal ident `Parameters`, then generates
+    /// `schema_for_type::<Parameters<T>>()` for the advertised MCP
+    /// `input_schema`. Swapping in this crate's own `Parameters<T>` (for
+    /// enriched deserialization-failure messages) must not silently fall
+    /// back to an empty schema — clients still need the real shape to build
+    /// correct calls in the first place.
+    #[test]
+    fn tool_router_still_advertises_real_input_schemas_for_swapped_parameters_type() {
+        let tools = TaskTriggerHandler::tool_router().list_all();
+
+        let create_seed = tools
+            .iter()
+            .find(|tool| tool.name == "create_seed")
+            .expect("create_seed tool should be registered");
+        let props = create_seed
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("create_seed input_schema should have properties");
+        assert!(props.contains_key("name"));
+        assert!(props.contains_key("directives"));
+
+        let intelligence_upsert = tools
+            .iter()
+            .find(|tool| tool.name == "intelligence_upsert")
+            .expect("intelligence_upsert tool should be registered");
+        let props = intelligence_upsert
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("intelligence_upsert input_schema should have properties");
+        assert!(props.contains_key("node_data"));
+    }
+
+    /// Regression guard for the class of bug where a nested-object parameter
+    /// is advertised as a bare `$ref` into `$defs` with no sibling `type` at
+    /// the property level. A client that builds tool arguments from a
+    /// shallow read of the property schema (never resolving `$ref`) sees no
+    /// declared type there and falls back to sending the value as a string.
+    /// This has already happened twice — `loop_add_node.config` and
+    /// `intelligence_upsert.node_data` — so this test walks every
+    /// registered tool's whole surface instead of asserting on one tool.
+    #[test]
+    fn every_tool_property_self_declares_its_type() {
+        let tools = TaskTriggerHandler::tool_router().list_all();
+        let mut violations = Vec::new();
+
+        for tool in &tools {
+            let Some(properties) = tool
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+            else {
+                continue;
+            };
+
+            for (prop_name, prop_schema) in properties {
+                // A `$ref` with a sibling `type` counts via `has_type`;
+                // a bare `$ref` with no sibling `type` does not, which is
+                // exactly the shape this guard rejects.
+                let has_type = prop_schema.get("type").is_some();
+                let has_combinator =
+                    prop_schema.get("anyOf").is_some() || prop_schema.get("oneOf").is_some();
+                if !has_type && !has_combinator {
+                    violations.push(format!("{}.{prop_name}", tool.name));
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "properties with no declared type at the property level — a client that doesn't \
+             resolve $ref can't tell these apart from an untyped string parameter: {violations:?}"
+        );
     }
 
     #[test]
@@ -6085,6 +7602,36 @@ mod tests {
         ];
         let err = validate_ensemble_members(&members).unwrap_err();
         assert!(err.contains("platform"), "{err}");
+    }
+
+    /// `prompt_override` is normalized like `model`: trimmed, and a
+    /// whitespace-only override collapses to `None` (use the shared
+    /// prompt), not an override of empty string.
+    #[test]
+    fn validate_ensemble_members_trims_prompt_override_and_blanks_to_none() {
+        let members = vec![
+            ensemble_member_params_with_prompt("claude", "  review for security  "),
+            {
+                let mut m = ensemble_member_params("codex");
+                m.prompt_override = Some("   ".to_string());
+                m
+            },
+        ];
+        let result = validate_ensemble_members(&members).unwrap();
+        assert_eq!(result[0].2.as_deref(), Some("review for security"));
+        assert_eq!(result[1].2, None);
+    }
+
+    #[test]
+    fn effective_member_prompt_prefers_override_over_shared() {
+        assert_eq!(
+            effective_member_prompt(Some("angle-specific prompt"), "shared prompt"),
+            "angle-specific prompt"
+        );
+        assert_eq!(
+            effective_member_prompt(None, "shared prompt"),
+            "shared prompt"
+        );
     }
 
     /// F1's "no nested ensembles" rule: wiring into a node that already
@@ -6231,6 +7778,7 @@ mod tests {
                 position: 0,
                 platform: "claude".to_string(),
                 model: None,
+                prompt_override: None,
             },
             EnsembleMember {
                 ensemble_id: "ens1".to_string(),
@@ -6238,6 +7786,7 @@ mod tests {
                 position: 1,
                 platform: "codex".to_string(),
                 model: None,
+                prompt_override: None,
             },
         ];
         db.insert_ensemble_unit(&ensemble, &members, &member_nodes, &join_node, &edges)
@@ -6306,6 +7855,7 @@ mod tests {
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         let loop_id = "loop-reset-test".to_string();
         db.insert_loop(&Loop {
+            archived: false,
             id: loop_id.clone(),
             name: "Loop".to_string(),
             description: None,
@@ -6318,7 +7868,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         })
         .unwrap();
@@ -6359,6 +7909,31 @@ mod tests {
         assert_eq!(done.status, LoopSpecStatus::Completed);
     }
 
+    /// `Interrupted` is treated like any other non-completed status: a plain
+    /// `loop_reset` (no explicit `specs`) returns it to `pending`, same as it
+    /// would `failed` — an interruption isn't the special case here, only
+    /// `completed` is (preserved unless named explicitly).
+    #[test]
+    fn loop_reset_resets_interrupted_spec_to_pending() {
+        let (_dir, db, loop_id) = loop_reset_fixture(LoopStatus::Failed);
+        db.insert_loop_spec(&spec_with_status(
+            &loop_id,
+            "spec-interrupted",
+            1,
+            LoopSpecStatus::Interrupted,
+        ))
+        .unwrap();
+
+        let result = perform_loop_reset(&db, &loop_id, None).unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+
+        let specs = db.list_loop_specs(&loop_id).unwrap();
+        let interrupted = specs.iter().find(|s| s.id == "spec-interrupted").unwrap();
+        assert_eq!(interrupted.status, LoopSpecStatus::Pending);
+        assert!(interrupted.started_at.is_none());
+        assert!(interrupted.completed_at.is_none());
+    }
+
     #[test]
     fn loop_reset_with_explicit_specs_resets_completed_spec_too() {
         let (_dir, db, loop_id) = loop_reset_fixture(LoopStatus::Failed);
@@ -6378,18 +7953,19 @@ mod tests {
         assert!(spec.completed_at.is_none());
     }
 
-    /// A loop whose last run was against a pool has empty (or irrelevant)
-    /// bound specs — the pool's *members* are what actually need resetting.
+    /// A loop whose last run was against a queue has empty (or irrelevant)
+    /// bound specs — the queue's *members* are what actually need resetting.
     /// `loop_reset` must find them via the loop's persisted
-    /// `active_run_pool_id`, reset every non-completed one back to pending
+    /// `active_run_queue_id`, reset every non-completed one back to pending
     /// (completed members untouched), and report the real count — not "0
     /// spec(s) reset", the false report from the incident this spec fixes.
     #[test]
-    fn loop_reset_pool_run_resets_pending_pool_members_and_reports_count() {
+    fn loop_reset_queue_run_resets_pending_queue_members_and_reports_count() {
         let dir = tempdir().unwrap();
         let db = Database::new(&dir.path().join("test.db")).unwrap();
-        let loop_id = "loop-pool-reset-test".to_string();
+        let loop_id = "loop-queue-reset-test".to_string();
         db.insert_loop(&Loop {
+            archived: false,
             id: loop_id.clone(),
             name: "Loop".to_string(),
             description: None,
@@ -6402,7 +7978,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: Some("pool-1".to_string()),
+            active_run_queue_id: Some("queue-1".to_string()),
             on_completed: None,
         })
         .unwrap();
@@ -6423,20 +7999,20 @@ mod tests {
             completed_via_reason: None,
             completed_via_at: None,
         };
-        db.insert_loop_spec(&standalone("pool-done", 1, LoopSpecStatus::Completed))
+        db.insert_loop_spec(&standalone("queue-done", 1, LoopSpecStatus::Completed))
             .unwrap();
-        db.insert_loop_spec(&standalone("pool-failed", 2, LoopSpecStatus::Failed))
+        db.insert_loop_spec(&standalone("queue-failed", 2, LoopSpecStatus::Failed))
             .unwrap();
-        db.insert_loop_spec(&standalone("pool-pending", 3, LoopSpecStatus::Pending))
+        db.insert_loop_spec(&standalone("queue-pending", 3, LoopSpecStatus::Pending))
             .unwrap();
-        db.insert_pool(&Pool {
-            id: "pool-1".to_string(),
-            name: "pool-1".to_string(),
+        db.insert_queue(&Queue {
+            id: "queue-1".to_string(),
+            name: "queue-1".to_string(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
-        for spec_id in ["pool-done", "pool-failed", "pool-pending"] {
-            db.append_pool_member("pool-1", spec_id, None).unwrap();
+        for spec_id in ["queue-done", "queue-failed", "queue-pending"] {
+            db.append_queue_member("queue-1", spec_id, None).unwrap();
         }
 
         let result = perform_loop_reset(&db, &loop_id, None).unwrap();
@@ -6447,31 +8023,96 @@ mod tests {
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         assert_eq!(lp.status, LoopStatus::Draft);
 
-        let done = db.get_loop_spec("pool-done").unwrap().unwrap();
-        let failed = db.get_loop_spec("pool-failed").unwrap().unwrap();
-        let pending = db.get_loop_spec("pool-pending").unwrap().unwrap();
+        let done = db.get_loop_spec("queue-done").unwrap().unwrap();
+        let failed = db.get_loop_spec("queue-failed").unwrap().unwrap();
+        let pending = db.get_loop_spec("queue-pending").unwrap().unwrap();
         assert_eq!(
             done.status,
             LoopSpecStatus::Completed,
-            "completed pool member must be left untouched"
+            "completed queue member must be left untouched"
         );
         assert_eq!(failed.status, LoopSpecStatus::Pending);
         assert!(failed.completed_at.is_none());
         assert_eq!(pending.status, LoopSpecStatus::Pending);
     }
 
+    /// A `Running`-status loop with no actual in-flight run is now
+    /// resettable — the old status-only guard would have refused this
+    /// (status alone said "running"), but the ground truth is the
+    /// `loop_runs` table, and here it has nothing running under this loop.
+    /// This is the intended flip side of
+    /// `loop_reset_rejects_loop_with_in_flight_run_even_when_status_is_paused`:
+    /// status and a run's lifetime are independent in both directions.
     #[test]
-    fn loop_reset_rejects_running_loop_with_actionable_error() {
+    fn loop_reset_allows_running_status_loop_with_no_in_flight_run() {
         let (_dir, db, loop_id) = loop_reset_fixture(LoopStatus::Running);
+
+        let result = perform_loop_reset(&db, &loop_id, None).unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Draft);
+    }
+
+    /// The ground truth is the `loop_runs` table, not `lp.status` — a loop
+    /// left `paused` by a sibling node's blocker report while a *different*
+    /// node keeps executing must still refuse the reset, naming the node and
+    /// run still in flight so the caller can wait or kill it deliberately
+    /// (the 2026-08-05 incident this guards against: a reset silently killed
+    /// and reset the still-running node's spec, and its late completion
+    /// routed an edge and failed the loop out from under the fresh dispatch
+    /// the reset then launched).
+    #[test]
+    fn loop_reset_rejects_loop_with_in_flight_run_even_when_status_is_paused() {
+        let (_dir, db, loop_id) = loop_reset_fixture(LoopStatus::Paused);
+        db.insert_loop_spec(&spec_with_status(
+            &loop_id,
+            "spec-a",
+            1,
+            LoopSpecStatus::Running,
+        ))
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-resilience".to_string(),
+            spec_id: Some("spec-a".to_string()),
+            loop_id: None,
+            name: "resilience".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "sleep 30"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_run(&LoopNodeRun {
+            id: "run-live".to_string(),
+            loop_id: loop_id.clone(),
+            spec_id: "spec-a".to_string(),
+            node_id: "node-resilience".to_string(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        })
+        .unwrap();
 
         let result = perform_loop_reset(&db, &loop_id, None).unwrap();
         assert!(result.is_error.unwrap_or(false));
         let text = format!("{:?}", result.content);
-        assert!(text.contains("loop_pause"), "{text}");
+        assert!(text.contains("resilience"), "{text}");
+        assert!(text.contains("run-live"), "{text}");
 
-        // Status untouched.
+        // Nothing touched: status, spec, and the run row all untouched.
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
-        assert_eq!(lp.status, LoopStatus::Running);
+        assert_eq!(lp.status, LoopStatus::Paused);
+        let spec = db.get_loop_spec("spec-a").unwrap().unwrap();
+        assert_eq!(spec.status, LoopSpecStatus::Running);
+        let run = db.get_loop_run("run-live").unwrap().unwrap();
+        assert_eq!(run.status, LoopRunStatus::Running);
     }
 
     #[test]
@@ -6512,6 +8153,68 @@ mod tests {
     fn loop_run_status_guard_accepts_draft_and_paused_loops() {
         assert!(loop_run_status_guard("loop-1", LoopStatus::Draft).is_ok());
         assert!(loop_run_status_guard("loop-1", LoopStatus::Paused).is_ok());
+    }
+
+    // ── find_in_flight_run: loop_run's dispatch guard ────────────────────
+
+    #[test]
+    fn find_in_flight_run_none_when_nothing_running() {
+        let (_dir, db, loop_id) = loop_reset_fixture(LoopStatus::Paused);
+        assert!(find_in_flight_run(&db, &loop_id).unwrap().is_none());
+    }
+
+    /// `loop_run` must refuse a duplicate dispatch while a node executes,
+    /// regardless of the loop's own status — a `paused` loop can still have
+    /// a live run when a sibling node's blocker report flipped status
+    /// without terminating it (see `loop_reset_rejects_loop_with_in_flight_run_even_when_status_is_paused`
+    /// for the same ground truth on the reset side).
+    #[test]
+    fn find_in_flight_run_finds_running_row_regardless_of_loop_status() {
+        let (_dir, db, loop_id) = loop_reset_fixture(LoopStatus::Paused);
+        db.insert_loop_spec(&spec_with_status(
+            &loop_id,
+            "spec-a",
+            1,
+            LoopSpecStatus::Running,
+        ))
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-resilience".to_string(),
+            spec_id: Some("spec-a".to_string()),
+            loop_id: None,
+            name: "resilience".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "sleep 30"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_run(&LoopNodeRun {
+            id: "run-live".to_string(),
+            loop_id: loop_id.clone(),
+            spec_id: "spec-a".to_string(),
+            node_id: "node-resilience".to_string(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        })
+        .unwrap();
+
+        let run = find_in_flight_run(&db, &loop_id)
+            .unwrap()
+            .expect("the still-running row must be found even though status is paused");
+        assert_eq!(run.id, "run-live");
+
+        let node_name = node_name_for_error(&db, &run.node_id).unwrap();
+        let message = in_flight_run_error(&loop_id, &run.id, &node_name, run.started_at);
+        assert!(message.contains("resilience"), "{message}");
+        assert!(message.contains("run-live"), "{message}");
     }
 
     #[test]
@@ -6572,6 +8275,154 @@ mod tests {
         .is_ok());
     }
 
+    fn router_config(routes: &serde_json::Value, fallback: &str) -> serde_json::Value {
+        serde_json::json!({ "routes": routes, "fallback": fallback })
+    }
+
+    fn two_routes_json() -> serde_json::Value {
+        serde_json::json!([
+            { "label": "retry", "description": "Retry the current step." },
+            { "label": "escalate", "description": "Hand off to a human." },
+        ])
+    }
+
+    #[test]
+    fn validate_node_config_router_accepts_valid_shape() {
+        let config = router_config(&two_routes_json(), "retry");
+        assert!(validate_node_config(LoopNodeKind::Router, &config).is_ok());
+    }
+
+    #[test]
+    fn validate_node_config_router_rejects_fewer_than_two_routes() {
+        let config = router_config(
+            &serde_json::json!([{ "label": "retry", "description": "Retry." }]),
+            "retry",
+        );
+        let error = validate_node_config(LoopNodeKind::Router, &config).unwrap_err();
+        assert!(error.contains("at least 2 routes"), "{error}");
+    }
+
+    #[test]
+    fn validate_node_config_router_rejects_no_fallback() {
+        let config = serde_json::json!({ "routes": two_routes_json() });
+        let error = validate_node_config(LoopNodeKind::Router, &config).unwrap_err();
+        assert!(error.contains("fallback"), "{error}");
+    }
+
+    #[test]
+    fn validate_node_config_router_rejects_missing_routes_field() {
+        let error = validate_node_config(LoopNodeKind::Router, &serde_json::json!({})).unwrap_err();
+        assert!(error.contains("'routes'"), "{error}");
+    }
+
+    /// The exact incident shape (loop `824de730-7fec-4031-800a-7933d2cf94c1`,
+    /// node `d0458fe0-24b8-4a29-8a69-7bb0e742e046`): an agent node config
+    /// with `prompt` instead of `prompt_template` must fail loudly, naming
+    /// `prompt_template` as the field that's actually read — not be accepted
+    /// and silently run on the bare fallback template.
+    #[test]
+    fn validate_node_config_agent_rejects_prompt_key_naming_prompt_template() {
+        let config = serde_json::json!({ "platform": "claude", "prompt": "do the thing" });
+        let error = validate_node_config(LoopNodeKind::Agent, &config).unwrap_err();
+        assert!(error.contains("'prompt'"), "{error}");
+        assert!(
+            error.contains("prompt_template"),
+            "error must name the correct key: {error}"
+        );
+    }
+
+    #[test]
+    fn validate_node_config_rejects_unknown_key_for_every_kind() {
+        let agent_error = validate_node_config(
+            LoopNodeKind::Agent,
+            &serde_json::json!({ "platform": "claude", "unexpected_field": true }),
+        )
+        .unwrap_err();
+        assert!(agent_error.contains("unexpected_field"), "{agent_error}");
+        assert!(agent_error.contains("'agent'"), "{agent_error}");
+
+        let check_error = validate_node_config(
+            LoopNodeKind::Check,
+            &serde_json::json!({ "command": "true", "unexpected_field": true }),
+        )
+        .unwrap_err();
+        assert!(check_error.contains("unexpected_field"), "{check_error}");
+
+        let gate_error = validate_node_config(
+            LoopNodeKind::Gate,
+            &serde_json::json!({ "evaluate": "output_contains", "value": "ok", "unexpected_field": true }),
+        )
+        .unwrap_err();
+        assert!(gate_error.contains("unexpected_field"), "{gate_error}");
+
+        let router_error = validate_node_config(
+            LoopNodeKind::Router,
+            &serde_json::json!({ "routes": two_routes_json(), "fallback": "retry", "unexpected_field": true }),
+        )
+        .unwrap_err();
+        assert!(router_error.contains("unexpected_field"), "{router_error}");
+    }
+
+    /// `commit_rights` (B37) is engine-checked on every node kind
+    /// uniformly, so it must be accepted everywhere, not just on agent
+    /// nodes.
+    #[test]
+    fn validate_node_config_accepts_commit_rights_on_every_kind() {
+        assert!(validate_node_config(
+            LoopNodeKind::Agent,
+            &serde_json::json!({ "platform": "claude", "commit_rights": true })
+        )
+        .is_ok());
+        assert!(validate_node_config(
+            LoopNodeKind::Check,
+            &serde_json::json!({ "command": "true", "commit_rights": true })
+        )
+        .is_ok());
+    }
+
+    /// `require_report` is an agent-only key (unlike `commit_rights`, which
+    /// is engine-checked on every kind) — accepted on `agent`, rejected as
+    /// unrecognized everywhere else, since only an agent node's process exit
+    /// can be judged against a self-report.
+    #[test]
+    fn validate_node_config_accepts_require_report_on_agent_only() {
+        assert!(validate_node_config(
+            LoopNodeKind::Agent,
+            &serde_json::json!({ "platform": "claude", "require_report": true })
+        )
+        .is_ok());
+
+        let check_error = validate_node_config(
+            LoopNodeKind::Check,
+            &serde_json::json!({ "command": "true", "require_report": true }),
+        )
+        .unwrap_err();
+        assert!(check_error.contains("require_report"), "{check_error}");
+    }
+
+    /// Neither `prompt_template` nor `prompt_preset` is still a VALID agent
+    /// config (the bare fallback template is deliberately kept reachable —
+    /// see the spec's "keep the fallback" constraint) — this only rejects
+    /// keys the engine never reads, not this legitimate default-reliant
+    /// shape. Visibility into "this node runs on the default" is a separate
+    /// concern, handled by `agent_prompt_source`/`loop_node_json`'s
+    /// `prompt_source` field, not by rejecting the config outright.
+    #[test]
+    fn validate_node_config_agent_without_prompt_template_or_preset_is_still_valid() {
+        assert!(validate_node_config(
+            LoopNodeKind::Agent,
+            &serde_json::json!({ "platform": "claude" })
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn unknown_config_keys_is_empty_for_join_regardless_of_content() {
+        let config = serde_json::json!({ "anything": "goes", "ensemble_id": "e1" });
+        let map = config.as_object().unwrap();
+        assert!(unknown_config_keys(LoopNodeKind::Join, map).is_empty());
+    }
+
     #[test]
     fn blueprints_are_listed_after_a_fresh_startup_and_reseeding_is_idempotent() {
         let dir = tempdir().unwrap();
@@ -6584,11 +8435,11 @@ mod tests {
             .map(|b| b.name)
             .collect();
         for expected in [
-            "implementer-claude",
+            "implementer",
             "cargo-gates",
-            "reviewer-committer-mimo",
+            "reviewer-committer",
             "commit-check",
-            "resilience-mimo",
+            "resilience",
         ] {
             assert!(
                 names_after_first_start.contains(&expected.to_string()),
@@ -6644,11 +8495,11 @@ mod tests {
         // Deleting a builtin is refused at the validation layer with an
         // actionable message, before ever touching the DB.
         let builtin = db
-            .get_blueprint_by_name("implementer-claude")
+            .get_blueprint_by_name("implementer")
             .unwrap()
             .expect("builtin should exist");
         let error = super::validate_blueprint_deletable(&builtin).unwrap_err();
-        assert!(error.contains("implementer-claude"));
+        assert!(error.contains("implementer"));
         assert!(error.contains("cannot be deleted"));
     }
 
@@ -6657,24 +8508,68 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Database::new(&dir.path().join("test.db")).unwrap();
 
+        // The builtin carries no platform (see `builtin_blueprint_specs`),
+        // so the caller must supply one via `config_overrides` — this also
+        // exercises the required-override path with a successful call.
         let mut overrides = serde_json::Map::new();
-        overrides.insert(
-            "prompt".to_string(),
-            serde_json::json!("custom overridden prompt"),
-        );
+        overrides.insert("platform".to_string(), serde_json::json!("claude"));
+        overrides.insert("model".to_string(), serde_json::json!("opus"));
 
-        let (kind, config) = resolve_node_kind_and_config(
-            &db,
-            None,
-            None,
-            Some("implementer-claude"),
-            Some(overrides),
-        )
-        .expect("blueprint resolution should succeed");
+        let (kind, config) =
+            resolve_node_kind_and_config(&db, None, None, Some("implementer"), Some(overrides))
+                .expect("blueprint resolution should succeed");
 
         assert_eq!(kind, LoopNodeKind::Agent);
-        assert_eq!(config["prompt"], "custom overridden prompt");
-        // Other templated keys (e.g. platform) survive the shallow merge.
+        assert_eq!(config["platform"], "claude");
+        assert_eq!(config["model"], "opus");
+        // The templated key (prompt_preset) survives the shallow merge.
+        assert_eq!(config["prompt_preset"], "implementer");
+    }
+
+    /// The caller-must-supply-a-harness contract, from the other side: an
+    /// agent blueprint's config omits `platform`/`cli` by design (see
+    /// `builtin_blueprint_specs`), so creating a node from one without
+    /// `config_overrides` supplying it must fail — never silently fall back
+    /// to a default harness — with a message that names the missing field
+    /// and says the omission is intentional.
+    #[test]
+    fn loop_add_node_from_agent_blueprint_without_harness_override_fails_with_useful_message() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+
+        let error =
+            resolve_node_kind_and_config(&db, None, None, Some("implementer"), None).unwrap_err();
+
+        assert!(error.contains("implementer"), "{error}");
+        assert!(error.contains("platform"), "{error}");
+        assert!(
+            error.contains("intentionally"),
+            "error should explain the blueprint intentionally omits a harness: {error}"
+        );
+    }
+
+    /// A custom blueprint that pins its own platform (the pre-existing,
+    /// still-supported pattern) needs no override at all — only the
+    /// harness-free builtins require one.
+    #[test]
+    fn loop_add_node_from_custom_blueprint_with_platform_needs_no_override() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        db.insert_blueprint(&Blueprint {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "my-pinned-implementer".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "claude", "prompt": "go implement it"}),
+            builtin: false,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let (kind, config) =
+            resolve_node_kind_and_config(&db, None, None, Some("my-pinned-implementer"), None)
+                .expect("a custom blueprint with its own platform should not require an override");
+
+        assert_eq!(kind, LoopNodeKind::Agent);
         assert_eq!(config["platform"], "claude");
     }
 
@@ -6686,11 +8581,11 @@ mod tests {
         let error = validate_blueprint_exists(&db, "does-not-exist").unwrap_err();
 
         assert!(error.contains("does-not-exist"));
-        assert!(error.contains("implementer-claude"));
+        assert!(error.contains("implementer"));
         assert!(error.contains("cargo-gates"));
-        assert!(error.contains("reviewer-committer-mimo"));
+        assert!(error.contains("reviewer-committer"));
         assert!(error.contains("commit-check"));
-        assert!(error.contains("resilience-mimo"));
+        assert!(error.contains("resilience"));
     }
 
     #[test]
@@ -6741,14 +8636,14 @@ mod tests {
         }
     }
 
-    fn pool_test_db() -> (tempfile::TempDir, Database) {
+    fn queue_test_db() -> (tempfile::TempDir, Database) {
         let dir = tempdir().unwrap();
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         (dir, db)
     }
 
-    fn insert_pool(db: &Database, id: &str) {
-        db.insert_pool(&Pool {
+    fn insert_queue(db: &Database, id: &str) {
+        db.insert_queue(&Queue {
             id: id.to_string(),
             name: format!("{id}-name"),
             created_at: chrono::Utc::now(),
@@ -6757,8 +8652,8 @@ mod tests {
     }
 
     /// Build a fully-wired `TaskTriggerHandler` over an in-memory-ish temp DB
-    /// so the queue/pool `#[tool]` methods (and their shared `do_queue_*`
-    /// helpers) can be exercised end-to-end.
+    /// so the queue `#[tool]` methods (and their shared `do_queue_*` helpers)
+    /// can be exercised end-to-end.
     fn queue_test_handler() -> (
         tempfile::TempDir,
         std::sync::Arc<Database>,
@@ -6814,215 +8709,25 @@ mod tests {
         format!("{:?}", result.content)
     }
 
-    /// Q1: the primary `queue_create` and the deprecated `pool_create` alias
-    /// must both route to the same `do_queue_create` helper, both emit the
-    /// `queue_id` result key (never the old `pool_id`), and both persist a real
-    /// queue row.
-    #[tokio::test]
-    async fn queue_create_and_pool_alias_route_to_same_handler() {
-        use rmcp::handler::server::wrapper::Parameters;
-
-        let (_dir, db, handler) = queue_test_handler();
-
-        let via_queue = handler
-            .queue_create(Parameters(QueueCreateParams {
-                name: "Primary".to_string(),
-            }))
-            .await
-            .unwrap();
-        let via_pool = handler
-            .pool_create(Parameters(PoolCreateParams {
-                name: "Alias".to_string(),
-            }))
-            .await
-            .unwrap();
-
-        for text in [result_text(&via_queue), result_text(&via_pool)] {
-            assert!(text.contains("queue_id"), "expected queue_id key: {text}");
-            assert!(
-                !text.contains("pool_id"),
-                "result must not leak pool_id: {text}"
-            );
-        }
-
-        let pools = db.list_pools().unwrap();
-        assert!(pools.iter().any(|p| p.name == "Primary"));
-        assert!(pools.iter().any(|p| p.name == "Alias"));
-    }
-
-    /// Q1: `queue_add_spec` and its `pool_add_spec` alias share one handler —
-    /// adding via either path lands the spec in the same underlying queue and
-    /// returns queue-worded confirmation.
-    #[tokio::test]
-    async fn queue_add_spec_and_pool_alias_are_equivalent() {
-        use rmcp::handler::server::wrapper::Parameters;
-
-        let (_dir, db, handler) = queue_test_handler();
-        for id in ["spec-a", "spec-b"] {
-            db.insert_loop_spec(&standalone_spec(id)).unwrap();
-        }
-        insert_pool(&db, "queue-1");
-
-        let via_queue = handler
-            .queue_add_spec(Parameters(QueueAddSpecParams {
-                queue_id: "queue-1".to_string(),
-                spec_id: "spec-a".to_string(),
-                group: None,
-            }))
-            .await
-            .unwrap();
-        let via_pool = handler
-            .pool_add_spec(Parameters(PoolAddSpecParams {
-                pool_id: "queue-1".to_string(),
-                spec_id: "spec-b".to_string(),
-                group: None,
-            }))
-            .await
-            .unwrap();
-
-        assert!(result_text(&via_queue).contains("added to queue"));
-        assert!(result_text(&via_pool).contains("added to queue"));
-        assert_eq!(
-            db.list_pool_member_spec_ids("queue-1").unwrap(),
-            vec!["spec-a", "spec-b"]
-        );
-    }
-
-    /// Q1: `queue_list` emits the queue-worded payload keys (`queue`/`queues`),
-    /// and the `pool_list` alias produces the identical payload.
-    #[tokio::test]
-    async fn queue_list_and_pool_alias_use_queue_keys() {
-        use rmcp::handler::server::wrapper::Parameters;
-
-        let (_dir, db, handler) = queue_test_handler();
-        db.insert_loop_spec(&standalone_spec("spec-a")).unwrap();
-        insert_pool(&db, "queue-1");
-        db.append_pool_member("queue-1", "spec-a", None).unwrap();
-
-        let all_via_queue = handler
-            .queue_list(Parameters(QueueListParams { queue_id: None }))
-            .await
-            .unwrap();
-        let all_via_pool = handler
-            .pool_list(Parameters(PoolListParams { pool_id: None }))
-            .await
-            .unwrap();
-        assert_eq!(result_text(&all_via_queue), result_text(&all_via_pool));
-        assert!(result_text(&all_via_queue).contains("queues"));
-
-        let one = handler
-            .queue_list(Parameters(QueueListParams {
-                queue_id: Some("queue-1".to_string()),
-            }))
-            .await
-            .unwrap();
-        let text = result_text(&one);
-        assert!(text.contains("queue"), "{text}");
-        assert!(
-            !text.contains("\\\"pool\\\""),
-            "must not use pool key: {text}"
-        );
-    }
-
-    /// Q1: `loop_run` accepts the deprecated `pool_id` as an alias for
-    /// `queue_id`. Routing an empty queue through it surfaces the (queue-worded)
-    /// empty-launch error naming that queue — proof the id resolved.
-    #[tokio::test]
-    async fn loop_run_accepts_pool_id_alias() {
-        use rmcp::handler::server::wrapper::Parameters;
-
-        let (dir, db, handler) = queue_test_handler();
-        db.insert_loop(&Loop {
-            id: "loop-1".to_string(),
-            name: "loop-1".to_string(),
-            description: None,
-            workdir: dir.path().to_string_lossy().to_string(),
-            status: LoopStatus::Draft,
-            trigger: None,
-            created_at: chrono::Utc::now(),
-            started_at: None,
-            completed_at: None,
-            autorun_at: None,
-            auto_continue_at: None,
-            auto_continue_action: None,
-            active_run_pool_id: None,
-            on_completed: None,
-        })
-        .unwrap();
-        insert_pool(&db, "queue-empty");
-
-        let result = handler
-            .loop_run(Parameters(LoopRunParams {
-                loop_id: "loop-1".to_string(),
-                queue_id: None,
-                pool_id: Some("queue-empty".to_string()),
-                workdir: None,
-            }))
-            .await
-            .unwrap();
-        let text = result_text(&result);
-        assert!(text.contains("queue-empty"), "pool_id must resolve: {text}");
-    }
-
-    /// Q1: when both `queue_id` and `pool_id` are set, `queue_id` wins.
-    #[tokio::test]
-    async fn loop_run_prefers_queue_id_over_pool_id() {
-        use rmcp::handler::server::wrapper::Parameters;
-
-        let (dir, db, handler) = queue_test_handler();
-        db.insert_loop(&Loop {
-            id: "loop-1".to_string(),
-            name: "loop-1".to_string(),
-            description: None,
-            workdir: dir.path().to_string_lossy().to_string(),
-            status: LoopStatus::Draft,
-            trigger: None,
-            created_at: chrono::Utc::now(),
-            started_at: None,
-            completed_at: None,
-            autorun_at: None,
-            auto_continue_at: None,
-            auto_continue_action: None,
-            active_run_pool_id: None,
-            on_completed: None,
-        })
-        .unwrap();
-        insert_pool(&db, "queue-win");
-        insert_pool(&db, "queue-lose");
-
-        let result = handler
-            .loop_run(Parameters(LoopRunParams {
-                loop_id: "loop-1".to_string(),
-                queue_id: Some("queue-win".to_string()),
-                pool_id: Some("queue-lose".to_string()),
-                workdir: None,
-            }))
-            .await
-            .unwrap();
-        let text = result_text(&result);
-        assert!(text.contains("queue-win"), "queue_id must win: {text}");
-        assert!(!text.contains("queue-lose"), "pool_id must lose: {text}");
-    }
-
     #[test]
-    fn pool_crud_and_ordering_round_trips() {
-        let (_dir, db) = pool_test_db();
+    fn queue_crud_and_ordering_round_trips() {
+        let (_dir, db) = queue_test_db();
         for id in ["spec-a", "spec-b", "spec-c"] {
             db.insert_loop_spec(&standalone_spec(id)).unwrap();
         }
-        insert_pool(&db, "pool-1");
+        insert_queue(&db, "queue-1");
 
-        db.append_pool_member("pool-1", "spec-a", None).unwrap();
-        db.append_pool_member("pool-1", "spec-b", None).unwrap();
-        db.append_pool_member("pool-1", "spec-c", None).unwrap();
+        db.append_queue_member("queue-1", "spec-a", None).unwrap();
+        db.append_queue_member("queue-1", "spec-b", None).unwrap();
+        db.append_queue_member("queue-1", "spec-c", None).unwrap();
 
         assert_eq!(
-            db.list_pool_member_spec_ids("pool-1").unwrap(),
+            db.list_queue_member_spec_ids("queue-1").unwrap(),
             vec!["spec-a", "spec-b", "spec-c"]
         );
 
-        let details = db.get_pool_details("pool-1").unwrap().unwrap();
-        assert_eq!(details.pool.id, "pool-1");
+        let details = db.get_queue_details("queue-1").unwrap().unwrap();
+        assert_eq!(details.queue.id, "queue-1");
         assert_eq!(
             details
                 .members
@@ -7032,41 +8737,41 @@ mod tests {
             vec!["spec-a", "spec-b", "spec-c"]
         );
 
-        assert!(db.remove_pool_member("pool-1", "spec-b").unwrap());
+        assert!(db.remove_queue_member("queue-1", "spec-b").unwrap());
         assert_eq!(
-            db.list_pool_member_spec_ids("pool-1").unwrap(),
+            db.list_queue_member_spec_ids("queue-1").unwrap(),
             vec!["spec-a", "spec-c"]
         );
-        assert!(!db.remove_pool_member("pool-1", "spec-b").unwrap());
+        assert!(!db.remove_queue_member("queue-1", "spec-b").unwrap());
 
-        assert!(db.list_pools().unwrap().iter().any(|p| p.id == "pool-1"));
+        assert!(db.list_queues().unwrap().iter().any(|p| p.id == "queue-1"));
     }
 
     #[test]
-    fn pool_reorder_is_total_and_deterministic() {
-        let (_dir, db) = pool_test_db();
+    fn queue_reorder_is_total_and_deterministic() {
+        let (_dir, db) = queue_test_db();
         for id in ["spec-a", "spec-b", "spec-c"] {
             db.insert_loop_spec(&standalone_spec(id)).unwrap();
         }
-        insert_pool(&db, "pool-1");
+        insert_queue(&db, "queue-1");
         for id in ["spec-a", "spec-b", "spec-c"] {
-            db.append_pool_member("pool-1", id, None).unwrap();
+            db.append_queue_member("queue-1", id, None).unwrap();
         }
 
-        let current = db.list_pool_member_spec_ids("pool-1").unwrap();
+        let current = db.list_queue_member_spec_ids("queue-1").unwrap();
         let order = vec![
             "spec-c".to_string(),
             "spec-a".to_string(),
             "spec-b".to_string(),
         ];
-        assert!(validate_pool_reorder(&current, &order).is_ok());
+        assert!(validate_queue_reorder(&current, &order).is_ok());
 
-        db.reorder_pool_members("pool-1", &order).unwrap();
-        assert_eq!(db.list_pool_member_spec_ids("pool-1").unwrap(), order);
+        db.reorder_queue_members("queue-1", &order).unwrap();
+        assert_eq!(db.list_queue_member_spec_ids("queue-1").unwrap(), order);
     }
 
     #[test]
-    fn pool_reorder_rejects_partial_list() {
+    fn queue_reorder_rejects_partial_list() {
         let current = vec![
             "spec-a".to_string(),
             "spec-b".to_string(),
@@ -7074,12 +8779,12 @@ mod tests {
         ];
         let order = vec!["spec-a".to_string(), "spec-b".to_string()];
 
-        let error = validate_pool_reorder(&current, &order).unwrap_err();
+        let error = validate_queue_reorder(&current, &order).unwrap_err();
         assert!(error.contains("exactly once; got 2"), "{error}");
     }
 
     #[test]
-    fn pool_reorder_rejects_unknown_spec() {
+    fn queue_reorder_rejects_unknown_spec() {
         let current = vec![
             "spec-a".to_string(),
             "spec-b".to_string(),
@@ -7091,7 +8796,7 @@ mod tests {
             "ghost".to_string(),
         ];
 
-        let error = validate_pool_reorder(&current, &order).unwrap_err();
+        let error = validate_queue_reorder(&current, &order).unwrap_err();
         assert!(error.contains("no spec 'ghost'"), "{error}");
     }
 
@@ -7104,6 +8809,7 @@ mod tests {
     /// A minimal loop row, needed only to satisfy `loop_runs.loop_id`'s FK.
     fn insert_test_loop(db: &Database, id: &str) {
         db.insert_loop(&Loop {
+            archived: false,
             id: id.to_string(),
             name: id.to_string(),
             description: None,
@@ -7116,7 +8822,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         })
         .unwrap();
@@ -7249,23 +8955,23 @@ mod tests {
     }
 
     #[test]
-    fn pool_not_consumed_allows_start_when_every_member_is_pending() {
-        let (_dir, db) = pool_test_db();
+    fn queue_not_consumed_allows_start_when_every_member_is_pending() {
+        let (_dir, db) = queue_test_db();
         db.insert_loop_spec(&standalone_spec("spec-a")).unwrap();
         db.insert_loop_spec(&standalone_spec("spec-b")).unwrap();
-        insert_pool(&db, "pool-1");
-        db.append_pool_member("pool-1", "spec-a", None).unwrap();
-        db.append_pool_member("pool-1", "spec-b", None).unwrap();
+        insert_queue(&db, "queue-1");
+        db.append_queue_member("queue-1", "spec-a", None).unwrap();
+        db.append_queue_member("queue-1", "spec-b", None).unwrap();
 
-        assert!(validate_pool_not_consumed(&db, "pool-1", "loop-requesting").is_ok());
+        assert!(validate_queue_not_consumed(&db, "queue-1", "loop-requesting").is_ok());
     }
 
     #[test]
-    fn pool_not_consumed_blocks_when_a_member_runs_under_another_loop() {
-        let (_dir, db) = pool_test_db();
+    fn queue_not_consumed_blocks_when_a_member_runs_under_another_loop() {
+        let (_dir, db) = queue_test_db();
         db.insert_loop_spec(&running_spec("spec-a")).unwrap();
-        insert_pool(&db, "pool-1");
-        db.append_pool_member("pool-1", "spec-a", None).unwrap();
+        insert_queue(&db, "queue-1");
+        db.append_queue_member("queue-1", "spec-a", None).unwrap();
         insert_test_loop(&db, "loop-other");
         insert_test_node(&db, "node-1", "spec-a");
         db.insert_loop_run(&loop_run_row(
@@ -7276,21 +8982,21 @@ mod tests {
         ))
         .unwrap();
 
-        let error = validate_pool_not_consumed(&db, "pool-1", "loop-requesting").unwrap_err();
+        let error = validate_queue_not_consumed(&db, "queue-1", "loop-requesting").unwrap_err();
 
         assert!(error.contains("spec-a"), "{error}");
         assert!(error.contains("loop-other"), "{error}");
     }
 
     #[test]
-    fn pool_not_consumed_allows_the_owning_loop_to_resume_its_own_running_spec() {
-        // A paused pool run's active spec stays `running` between node
-        // executions. Resuming the SAME loop against the SAME pool must not
+    fn queue_not_consumed_allows_the_owning_loop_to_resume_its_own_running_spec() {
+        // A paused queue run's active spec stays `running` between node
+        // executions. Resuming the SAME loop against the SAME queue must not
         // be mistaken for a conflicting run.
-        let (_dir, db) = pool_test_db();
+        let (_dir, db) = queue_test_db();
         db.insert_loop_spec(&running_spec("spec-a")).unwrap();
-        insert_pool(&db, "pool-1");
-        db.append_pool_member("pool-1", "spec-a", None).unwrap();
+        insert_queue(&db, "queue-1");
+        db.append_queue_member("queue-1", "spec-a", None).unwrap();
         insert_test_loop(&db, "loop-owner");
         insert_test_node(&db, "node-1", "spec-a");
         db.insert_loop_run(&loop_run_row(
@@ -7301,27 +9007,27 @@ mod tests {
         ))
         .unwrap();
 
-        assert!(validate_pool_not_consumed(&db, "pool-1", "loop-owner").is_ok());
+        assert!(validate_queue_not_consumed(&db, "queue-1", "loop-owner").is_ok());
     }
 
-    /// B18 (Requirement 2): `skip_next_spec` on a pool-driven paused loop
+    /// B18 (Requirement 2): `skip_next_spec` on a queue-driven paused loop
     /// must find its in-flight member through the loop's persisted
-    /// `active_run_pool_id` — the member's own `loop_id` column stays `None`
-    /// (pool membership never binds it), so `list_loop_specs(loop_id)` alone
+    /// `active_run_queue_id` — the member's own `loop_id` column stays `None`
+    /// (queue membership never binds it), so `list_loop_specs(loop_id)` alone
     /// can't see it. Before this fix `handle_skip_next_spec` always errored
-    /// "No running spec found" for a pool-driven pause.
+    /// "No running spec found" for a queue-driven pause.
     #[test]
-    fn skip_next_spec_finds_and_skips_the_running_pool_member() {
-        let (_dir, db) = pool_test_db();
+    fn skip_next_spec_finds_and_skips_the_running_queue_member() {
+        let (_dir, db) = queue_test_db();
         insert_test_loop(&db, "loop-owner");
-        db.set_loop_active_run_pool("loop-owner", Some("pool-1"))
+        db.set_loop_active_run_queue("loop-owner", Some("queue-1"))
             .unwrap();
 
         db.insert_loop_spec(&running_spec("spec-a")).unwrap();
         db.insert_loop_spec(&standalone_spec("spec-b")).unwrap();
-        insert_pool(&db, "pool-1");
-        db.append_pool_member("pool-1", "spec-a", None).unwrap();
-        db.append_pool_member("pool-1", "spec-b", None).unwrap();
+        insert_queue(&db, "queue-1");
+        db.append_queue_member("queue-1", "spec-a", None).unwrap();
+        db.append_queue_member("queue-1", "spec-b", None).unwrap();
 
         handle_skip_next_spec(&db, "loop-owner").unwrap();
 
@@ -7332,33 +9038,34 @@ mod tests {
     }
 
     #[test]
-    fn skip_next_spec_prefers_the_loop_bound_spec_over_pool_context() {
+    fn skip_next_spec_prefers_the_loop_bound_spec_over_queue_context() {
         // A loop with its own bound `running` spec must use that, even if a
-        // stale `active_run_pool_id` is still sitting on the loop from an
-        // earlier, unrelated pool run.
-        let (_dir, db) = pool_test_db();
+        // stale `active_run_queue_id` is still sitting on the loop from an
+        // earlier, unrelated queue run.
+        let (_dir, db) = queue_test_db();
         insert_test_loop(&db, "loop-owner");
-        db.set_loop_active_run_pool("loop-owner", Some("pool-1"))
+        db.set_loop_active_run_queue("loop-owner", Some("queue-1"))
             .unwrap();
 
         let mut bound = running_spec("spec-bound");
         bound.loop_id = Some("loop-owner".to_string());
         db.insert_loop_spec(&bound).unwrap();
-        db.insert_loop_spec(&running_spec("spec-pool")).unwrap();
-        insert_pool(&db, "pool-1");
-        db.append_pool_member("pool-1", "spec-pool", None).unwrap();
+        db.insert_loop_spec(&running_spec("spec-queue")).unwrap();
+        insert_queue(&db, "queue-1");
+        db.append_queue_member("queue-1", "spec-queue", None)
+            .unwrap();
 
         handle_skip_next_spec(&db, "loop-owner").unwrap();
 
         let bound_after = db.get_loop_spec("spec-bound").unwrap().unwrap();
-        let pool_after = db.get_loop_spec("spec-pool").unwrap().unwrap();
+        let queue_after = db.get_loop_spec("spec-queue").unwrap().unwrap();
         assert_eq!(bound_after.status, LoopSpecStatus::Skipped);
-        assert_eq!(pool_after.status, LoopSpecStatus::Running);
+        assert_eq!(queue_after.status, LoopSpecStatus::Running);
     }
 
     #[test]
     fn skip_next_spec_errors_when_no_spec_is_running_anywhere() {
-        let (_dir, db) = pool_test_db();
+        let (_dir, db) = queue_test_db();
         insert_test_loop(&db, "loop-owner");
 
         let error = handle_skip_next_spec(&db, "loop-owner").unwrap_err();
@@ -7366,37 +9073,37 @@ mod tests {
     }
 
     /// B35: `retry_current_node` must error when no spec is running in
-    /// either the loop's bound specs or its pool — same validation shape as
+    /// either the loop's bound specs or its queue — same validation shape as
     /// `skip_next_spec`.
     #[test]
     fn retry_current_node_errors_when_no_running_spec() {
-        let (_dir, db) = pool_test_db();
+        let (_dir, db) = queue_test_db();
         insert_test_loop(&db, "loop-owner");
         let error = handle_retry_current_node(&db, "loop-owner").unwrap_err();
         assert!(error.message.contains("No running spec found"));
     }
 
     /// B35: `retry_current_node` must find the running spec through the
-    /// loop's persisted `active_run_pool_id` (pool member has `loop_id: None`).
+    /// loop's persisted `active_run_queue_id` (queue member has `loop_id: None`).
     #[test]
-    fn retry_current_node_finds_running_pool_member() {
-        let (_dir, db) = pool_test_db();
+    fn retry_current_node_finds_running_queue_member() {
+        let (_dir, db) = queue_test_db();
         insert_test_loop(&db, "loop-owner");
-        db.set_loop_active_run_pool("loop-owner", Some("pool-1"))
+        db.set_loop_active_run_queue("loop-owner", Some("queue-1"))
             .unwrap();
 
         db.insert_loop_spec(&running_spec("spec-a")).unwrap();
         db.insert_loop_spec(&standalone_spec("spec-b")).unwrap();
-        insert_pool(&db, "pool-1");
-        db.append_pool_member("pool-1", "spec-a", None).unwrap();
-        db.append_pool_member("pool-1", "spec-b", None).unwrap();
+        insert_queue(&db, "queue-1");
+        db.append_queue_member("queue-1", "spec-a", None).unwrap();
+        db.append_queue_member("queue-1", "spec-b", None).unwrap();
 
         // Should succeed without error — a running spec exists.
         assert!(handle_retry_current_node(&db, "loop-owner").is_ok());
     }
 
     #[test]
-    fn pool_reorder_rejects_duplicate_spec() {
+    fn queue_reorder_rejects_duplicate_spec() {
         let current = vec![
             "spec-a".to_string(),
             "spec-b".to_string(),
@@ -7408,24 +9115,24 @@ mod tests {
             "spec-b".to_string(),
         ];
 
-        let error = validate_pool_reorder(&current, &order).unwrap_err();
+        let error = validate_queue_reorder(&current, &order).unwrap_err();
         assert!(error.contains("more than once"), "{error}");
     }
 
     #[test]
-    fn pool_reorder_locking_refuses_ordering_that_moves_a_running_member() {
-        // R6: the currently running spec is immutable in the pool's order.
+    fn queue_reorder_locking_refuses_ordering_that_moves_a_running_member() {
+        // R6: the currently running spec is immutable in the queue's order.
         // Swapping it with a pending member must be refused, even though the
         // result is still a valid total permutation.
-        let (_dir, db) = pool_test_db();
+        let (_dir, db) = queue_test_db();
         db.insert_loop_spec(&running_spec("spec-a")).unwrap();
         db.insert_loop_spec(&standalone_spec("spec-b")).unwrap();
         db.insert_loop_spec(&standalone_spec("spec-c")).unwrap();
-        insert_pool(&db, "pool-1");
+        insert_queue(&db, "queue-1");
         for id in ["spec-a", "spec-b", "spec-c"] {
-            db.append_pool_member("pool-1", id, None).unwrap();
+            db.append_queue_member("queue-1", id, None).unwrap();
         }
-        let current = db.list_pool_member_spec_ids("pool-1").unwrap();
+        let current = db.list_queue_member_spec_ids("queue-1").unwrap();
 
         // Moves spec-a (running) from position 0 to position 1.
         let order = vec![
@@ -7433,43 +9140,43 @@ mod tests {
             "spec-a".to_string(),
             "spec-c".to_string(),
         ];
-        assert!(validate_pool_reorder(&current, &order).is_ok());
+        assert!(validate_queue_reorder(&current, &order).is_ok());
 
-        let error = validate_pool_reorder_locking(&db, &current, &order).unwrap_err();
+        let error = validate_queue_reorder_locking(&db, &current, &order).unwrap_err();
         assert!(error.contains("spec-a"), "{error}");
         assert!(error.contains("running"), "{error}");
     }
 
     #[test]
-    fn pool_reorder_locking_refuses_ordering_that_moves_a_completed_member() {
-        let (_dir, db) = pool_test_db();
+    fn queue_reorder_locking_refuses_ordering_that_moves_a_completed_member() {
+        let (_dir, db) = queue_test_db();
         let mut done = standalone_spec("spec-a");
         done.status = LoopSpecStatus::Completed;
         db.insert_loop_spec(&done).unwrap();
         db.insert_loop_spec(&standalone_spec("spec-b")).unwrap();
-        insert_pool(&db, "pool-1");
+        insert_queue(&db, "queue-1");
         for id in ["spec-a", "spec-b"] {
-            db.append_pool_member("pool-1", id, None).unwrap();
+            db.append_queue_member("queue-1", id, None).unwrap();
         }
-        let current = db.list_pool_member_spec_ids("pool-1").unwrap();
+        let current = db.list_queue_member_spec_ids("queue-1").unwrap();
 
         let order = vec!["spec-b".to_string(), "spec-a".to_string()];
-        let error = validate_pool_reorder_locking(&db, &current, &order).unwrap_err();
+        let error = validate_queue_reorder_locking(&db, &current, &order).unwrap_err();
         assert!(error.contains("spec-a"), "{error}");
         assert!(error.contains("completed"), "{error}");
     }
 
     #[test]
-    fn pool_reorder_locking_allows_permuting_pending_members_only() {
-        let (_dir, db) = pool_test_db();
+    fn queue_reorder_locking_allows_permuting_pending_members_only() {
+        let (_dir, db) = queue_test_db();
         db.insert_loop_spec(&running_spec("spec-a")).unwrap();
         db.insert_loop_spec(&standalone_spec("spec-b")).unwrap();
         db.insert_loop_spec(&standalone_spec("spec-c")).unwrap();
-        insert_pool(&db, "pool-1");
+        insert_queue(&db, "queue-1");
         for id in ["spec-a", "spec-b", "spec-c"] {
-            db.append_pool_member("pool-1", id, None).unwrap();
+            db.append_queue_member("queue-1", id, None).unwrap();
         }
-        let current = db.list_pool_member_spec_ids("pool-1").unwrap();
+        let current = db.list_queue_member_spec_ids("queue-1").unwrap();
 
         // spec-a (running) stays at position 0; only the pending tail moves.
         let order = vec![
@@ -7477,17 +9184,17 @@ mod tests {
             "spec-c".to_string(),
             "spec-b".to_string(),
         ];
-        assert!(validate_pool_reorder_locking(&db, &current, &order).is_ok());
+        assert!(validate_queue_reorder_locking(&db, &current, &order).is_ok());
     }
 
     #[test]
-    fn pool_remove_spec_refuses_the_currently_running_spec() {
-        let (_dir, db) = pool_test_db();
+    fn queue_remove_spec_refuses_the_currently_running_spec() {
+        let (_dir, db) = queue_test_db();
         db.insert_loop_spec(&running_spec("spec-a")).unwrap();
-        insert_pool(&db, "pool-1");
-        db.append_pool_member("pool-1", "spec-a", None).unwrap();
+        insert_queue(&db, "queue-1");
+        db.append_queue_member("queue-1", "spec-a", None).unwrap();
 
-        let error = validate_pool_member_removable(&db, "pool-1", "spec-a").unwrap_err();
+        let error = validate_queue_member_removable(&db, "queue-1", "spec-a").unwrap_err();
         assert!(error.contains("spec-a"), "{error}");
         assert!(error.contains("running"), "{error}");
 
@@ -7499,23 +9206,23 @@ mod tests {
             Some(chrono::Utc::now()),
         )
         .unwrap();
-        assert!(validate_pool_member_removable(&db, "pool-1", "spec-a").is_ok());
+        assert!(validate_queue_member_removable(&db, "queue-1", "spec-a").is_ok());
     }
 
     #[test]
-    fn pool_add_spec_rejects_nonexistent_spec() {
-        let (_dir, db) = pool_test_db();
-        insert_pool(&db, "pool-1");
+    fn queue_add_spec_rejects_nonexistent_spec() {
+        let (_dir, db) = queue_test_db();
+        insert_queue(&db, "queue-1");
 
         let error = validate_spec_exists(&db, "ghost-spec").unwrap_err();
         assert!(error.contains("not found"), "{error}");
     }
 
     #[test]
-    fn pool_operations_reject_nonexistent_pool() {
-        let (_dir, db) = pool_test_db();
+    fn queue_operations_reject_nonexistent_queue() {
+        let (_dir, db) = queue_test_db();
 
-        let error = validate_pool_exists(&db, "does-not-exist").unwrap_err();
+        let error = validate_queue_exists(&db, "does-not-exist").unwrap_err();
         assert!(error.contains("not found"), "{error}");
     }
 
@@ -7548,6 +9255,7 @@ mod tests {
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         let loop_id = "loop-with-graph".to_string();
         db.insert_loop(&Loop {
+            archived: false,
             id: loop_id.clone(),
             name: "Loop".to_string(),
             description: None,
@@ -7560,7 +9268,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         })
         .unwrap();
@@ -7594,6 +9302,7 @@ mod tests {
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         let loop_id = "loop-with-pinned-skills".to_string();
         db.insert_loop(&Loop {
+            archived: false,
             id: loop_id.clone(),
             name: "Loop".to_string(),
             description: None,
@@ -7606,7 +9315,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         })
         .unwrap();
@@ -7644,6 +9353,7 @@ mod tests {
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         let loop_id = "loop-with-autorun".to_string();
         db.insert_loop(&Loop {
+            archived: false,
             id: loop_id.clone(),
             name: "Loop".to_string(),
             description: None,
@@ -7656,7 +9366,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         })
         .unwrap();
@@ -7684,6 +9394,7 @@ mod tests {
 
     fn autorun_test_loop(loop_id: &str, workdir: &str, status: LoopStatus) -> Loop {
         Loop {
+            archived: false,
             id: loop_id.to_string(),
             name: loop_id.to_string(),
             description: None,
@@ -7696,7 +9407,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         }
     }
@@ -7706,7 +9417,7 @@ mod tests {
     /// succeed and report the time that was cleared.
     #[tokio::test]
     async fn loop_schedule_autorun_cancels_pending_schedule_on_failed_loop() {
-        use rmcp::handler::server::wrapper::Parameters;
+        use crate::daemon::params_extract::Parameters;
 
         let (dir, db, handler) = queue_test_handler();
         let loop_id = "loop-failed-autorun";
@@ -7743,7 +9454,7 @@ mod tests {
     /// status a loop with a pending autorun can hold.
     #[tokio::test]
     async fn loop_schedule_autorun_cancels_pending_schedule_on_completed_loop() {
-        use rmcp::handler::server::wrapper::Parameters;
+        use crate::daemon::params_extract::Parameters;
 
         let (dir, db, handler) = queue_test_handler();
         let loop_id = "loop-completed-autorun";
@@ -7775,7 +9486,7 @@ mod tests {
     /// already satisfied.
     #[tokio::test]
     async fn loop_schedule_autorun_cancel_with_nothing_scheduled_is_not_an_error() {
-        use rmcp::handler::server::wrapper::Parameters;
+        use crate::daemon::params_extract::Parameters;
 
         let (dir, db, handler) = queue_test_handler();
         let loop_id = "loop-no-autorun";
@@ -7806,7 +9517,7 @@ mod tests {
     /// and default the action to `retry_current_node` when omitted.
     #[tokio::test]
     async fn loop_schedule_continue_sets_pending_schedule_with_default_action() {
-        use rmcp::handler::server::wrapper::Parameters;
+        use crate::daemon::params_extract::Parameters;
 
         let (dir, db, handler) = queue_test_handler();
         let loop_id = "loop-paused-continue";
@@ -7845,7 +9556,7 @@ mod tests {
     /// An explicit `skip_next_spec` action must be persisted as given.
     #[tokio::test]
     async fn loop_schedule_continue_persists_explicit_skip_action() {
-        use rmcp::handler::server::wrapper::Parameters;
+        use crate::daemon::params_extract::Parameters;
 
         let (dir, db, handler) = queue_test_handler();
         let loop_id = "loop-paused-continue-skip";
@@ -7872,7 +9583,7 @@ mod tests {
     /// An invalid action must be rejected without touching the schedule.
     #[tokio::test]
     async fn loop_schedule_continue_rejects_invalid_action() {
-        use rmcp::handler::server::wrapper::Parameters;
+        use crate::daemon::params_extract::Parameters;
 
         let (dir, db, handler) = queue_test_handler();
         let loop_id = "loop-paused-continue-bad-action";
@@ -7904,7 +9615,7 @@ mod tests {
     /// `loop_schedule_autorun`'s cancel semantics (B41).
     #[tokio::test]
     async fn loop_schedule_continue_cancels_pending_schedule() {
-        use rmcp::handler::server::wrapper::Parameters;
+        use crate::daemon::params_extract::Parameters;
 
         let (dir, db, handler) = queue_test_handler();
         let loop_id = "loop-paused-continue-cancel";
@@ -7947,7 +9658,7 @@ mod tests {
     /// Cancelling when nothing is scheduled must succeed and say so.
     #[tokio::test]
     async fn loop_schedule_continue_cancel_with_nothing_scheduled_is_not_an_error() {
-        use rmcp::handler::server::wrapper::Parameters;
+        use crate::daemon::params_extract::Parameters;
 
         let (dir, db, handler) = queue_test_handler();
         let loop_id = "loop-paused-no-continue";
@@ -7977,7 +9688,7 @@ mod tests {
     /// they can never be conflated at fire time.
     #[tokio::test]
     async fn loop_schedule_continue_and_loop_schedule_autorun_are_independent() {
-        use rmcp::handler::server::wrapper::Parameters;
+        use crate::daemon::params_extract::Parameters;
 
         let (dir, db, handler) = queue_test_handler();
         let loop_id = "loop-independent-schedules";
@@ -8054,8 +9765,8 @@ mod tests {
         to: &str,
     ) -> BuiltEnsembleUnit {
         let members = [
-            ("claude".to_string(), None),
-            ("codex".to_string(), Some("o1".to_string())),
+            ("claude".to_string(), None, None),
+            ("codex".to_string(), Some("o1".to_string()), None),
         ];
         let built = build_ensemble_unit(&EnsembleUnitSpec {
             spec_id: spec_id.map(str::to_string),
@@ -8737,6 +10448,150 @@ mod tests {
         assert!(err.contains("always"), "{err}");
     }
 
+    // ── validate_edge_condition_with_route ───────────────────────────
+
+    #[test]
+    fn validate_edge_condition_with_route_builds_route_condition() {
+        let c = validate_edge_condition_with_route("route", Some("escalate")).unwrap();
+        assert_eq!(c, LoopEdgeCondition::Route("escalate".to_string()));
+    }
+
+    #[test]
+    fn validate_edge_condition_with_route_requires_non_empty_label() {
+        let err = validate_edge_condition_with_route("route", None).unwrap_err();
+        assert!(err.contains("non-empty 'route' label"), "{err}");
+
+        let err = validate_edge_condition_with_route("route", Some("  ")).unwrap_err();
+        assert!(err.contains("non-empty 'route' label"), "{err}");
+    }
+
+    #[test]
+    fn validate_edge_condition_with_route_leaves_simple_conditions_untouched() {
+        assert_eq!(
+            validate_edge_condition_with_route("pass", None).unwrap(),
+            LoopEdgeCondition::Pass
+        );
+        assert_eq!(
+            validate_edge_condition_with_route("fail", None).unwrap(),
+            LoopEdgeCondition::Fail
+        );
+        assert_eq!(
+            validate_edge_condition_with_route("always", None).unwrap(),
+            LoopEdgeCondition::Always
+        );
+        assert!(validate_edge_condition_with_route("sideways", None).is_err());
+    }
+
+    // ── validate_route_edge_target ────────────────────────────────────
+
+    #[test]
+    fn validate_route_edge_target_is_noop_for_non_route_conditions() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        // No node inserted at all — a non-route condition must never look it
+        // up, let alone fail over a missing node.
+        assert!(validate_route_edge_target(&db, "missing-node", &LoopEdgeCondition::Pass).is_ok());
+    }
+
+    /// Insert a standalone spec (no owning loop) so a test can hang nodes
+    /// off it without needing a full `Loop` row too.
+    fn insert_standalone_spec(db: &Database, id: &str) {
+        db.insert_loop_spec(&LoopSpec {
+            id: id.to_string(),
+            loop_id: None,
+            name: id.to_string(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn validate_route_edge_target_rejects_non_router_from_node() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        insert_standalone_spec(&db, "spec-1");
+        db.insert_loop_node(&LoopNode {
+            id: "agent-1".to_string(),
+            spec_id: Some("spec-1".to_string()),
+            loop_id: None,
+            name: "Agent".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({ "platform": "claude" }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let err = validate_route_edge_target(
+            &db,
+            "agent-1",
+            &LoopEdgeCondition::Route("retry".to_string()),
+        )
+        .unwrap_err();
+        assert!(err.contains("router node"), "{err}");
+    }
+
+    #[test]
+    fn validate_route_edge_target_rejects_undeclared_route() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        insert_standalone_spec(&db, "spec-1");
+        db.insert_loop_node(&LoopNode {
+            id: "router-1".to_string(),
+            spec_id: Some("spec-1".to_string()),
+            loop_id: None,
+            name: "Router".to_string(),
+            kind: LoopNodeKind::Router,
+            config: router_config(&two_routes_json(), "retry"),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let err = validate_route_edge_target(
+            &db,
+            "router-1",
+            &LoopEdgeCondition::Route("nonexistent".to_string()),
+        )
+        .unwrap_err();
+        assert!(err.contains("undeclared route 'nonexistent'"), "{err}");
+    }
+
+    #[test]
+    fn validate_route_edge_target_accepts_declared_route() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        insert_standalone_spec(&db, "spec-1");
+        db.insert_loop_node(&LoopNode {
+            id: "router-1".to_string(),
+            spec_id: Some("spec-1".to_string()),
+            loop_id: None,
+            name: "Router".to_string(),
+            kind: LoopNodeKind::Router,
+            config: router_config(&two_routes_json(), "retry"),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        assert!(validate_route_edge_target(
+            &db,
+            "router-1",
+            &LoopEdgeCondition::Route("escalate".to_string()),
+        )
+        .is_ok());
+    }
+
     // ── validate_node_kind ──────────────────────────────────────────
 
     #[test]
@@ -8822,6 +10677,10 @@ mod tests {
         assert_eq!(
             validate_spec_status("skipped").unwrap(),
             LoopSpecStatus::Skipped
+        );
+        assert_eq!(
+            validate_spec_status("interrupted").unwrap(),
+            LoopSpecStatus::Interrupted
         );
     }
 
@@ -8954,45 +10813,45 @@ mod tests {
         assert!(validate_at_least_one_bool(&[true, true, true], "fields").is_ok());
     }
 
-    // ── validate_pool_reorder ───────────────────────────────────────
+    // ── validate_queue_reorder ───────────────────────────────────────
 
     #[test]
-    fn validate_pool_reorder_accepts_valid_permutation() {
+    fn validate_queue_reorder_accepts_valid_permutation() {
         let current = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let reordered = vec!["c".to_string(), "a".to_string(), "b".to_string()];
-        assert!(validate_pool_reorder(&current, &reordered).is_ok());
+        assert!(validate_queue_reorder(&current, &reordered).is_ok());
     }
 
     #[test]
-    fn validate_pool_reorder_accepts_same_order() {
+    fn validate_queue_reorder_accepts_same_order() {
         let current = vec!["a".to_string(), "b".to_string()];
         let reordered = vec!["a".to_string(), "b".to_string()];
-        assert!(validate_pool_reorder(&current, &reordered).is_ok());
+        assert!(validate_queue_reorder(&current, &reordered).is_ok());
     }
 
     #[test]
-    fn validate_pool_reorder_rejects_length_mismatch() {
+    fn validate_queue_reorder_rejects_length_mismatch() {
         let current = vec!["a".to_string(), "b".to_string()];
         let reordered = vec!["a".to_string()];
-        let err = validate_pool_reorder(&current, &reordered).unwrap_err();
+        let err = validate_queue_reorder(&current, &reordered).unwrap_err();
         assert!(err.contains("2"), "{err}");
         assert!(err.contains("1"), "{err}");
     }
 
     #[test]
-    fn validate_pool_reorder_rejects_duplicate() {
+    fn validate_queue_reorder_rejects_duplicate() {
         let current = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let reordered = vec!["a".to_string(), "a".to_string(), "b".to_string()];
-        let err = validate_pool_reorder(&current, &reordered).unwrap_err();
+        let err = validate_queue_reorder(&current, &reordered).unwrap_err();
         assert!(err.contains("a"), "{err}");
         assert!(err.contains("more than once"), "{err}");
     }
 
     #[test]
-    fn validate_pool_reorder_rejects_unknown_id() {
+    fn validate_queue_reorder_rejects_unknown_id() {
         let current = vec!["a".to_string(), "b".to_string()];
         let reordered = vec!["a".to_string(), "x".to_string()];
-        let err = validate_pool_reorder(&current, &reordered).unwrap_err();
+        let err = validate_queue_reorder(&current, &reordered).unwrap_err();
         assert!(err.contains("x"), "{err}");
         assert!(err.contains("no spec"), "{err}");
     }
@@ -9112,6 +10971,7 @@ mod tests {
 
     fn make_loop_with_trigger(trigger: Option<Trigger>) -> Loop {
         Loop {
+            archived: false,
             id: "loop-1".to_string(),
             name: "Test Loop".to_string(),
             description: None,
@@ -9124,7 +10984,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         }
     }
@@ -9383,6 +11243,7 @@ mod tests {
             LoopSpecStatus::Completed,
             LoopSpecStatus::Failed,
             LoopSpecStatus::Skipped,
+            LoopSpecStatus::Interrupted,
         ] {
             let s = status.as_str();
             assert_eq!(LoopSpecStatus::from_str(s), status);
@@ -9443,7 +11304,7 @@ mod additional_tests {
         LoopStatus,
     };
     use crate::domain::models::Trigger;
-    use crate::domain::pools::Pool;
+    use crate::domain::queues::Queue;
     use tempfile::tempdir;
 
     fn standalone_spec(id: &str) -> LoopSpec {
@@ -9467,6 +11328,7 @@ mod additional_tests {
 
     fn insert_test_loop(db: &Database, id: &str) {
         db.insert_loop(&Loop {
+            archived: false,
             id: id.to_string(),
             name: id.to_string(),
             description: None,
@@ -9479,7 +11341,7 @@ mod additional_tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         })
         .unwrap();
@@ -9762,18 +11624,18 @@ mod additional_tests {
         assert!(validate_at_least_one_bool(&[], "f").is_err());
     }
 
-    // ── validate_pool_reorder edge cases ──────────────────────────
+    // ── validate_queue_reorder edge cases ──────────────────────────
 
     #[test]
-    fn validate_pool_reorder_empty_current_and_ids() {
-        assert!(validate_pool_reorder(&[], &[]).is_ok());
+    fn validate_queue_reorder_empty_current_and_ids() {
+        assert!(validate_queue_reorder(&[], &[]).is_ok());
     }
 
     #[test]
-    fn validate_pool_reorder_single_element() {
+    fn validate_queue_reorder_single_element() {
         let current = vec!["a".to_string()];
         let reordered = vec!["a".to_string()];
-        assert!(validate_pool_reorder(&current, &reordered).is_ok());
+        assert!(validate_queue_reorder(&current, &reordered).is_ok());
     }
 
     // ── validate_non_empty edge cases ─────────────────────────────
@@ -9909,25 +11771,25 @@ mod additional_tests {
         assert!(err.contains("event"), "{err}");
     }
 
-    // ── validate_pool_reorder_locking: pending spec is movable ────
+    // ── validate_queue_reorder_locking: pending spec is movable ────
 
     #[test]
-    fn validate_pool_reorder_locking_allows_moving_pending_members() {
+    fn validate_queue_reorder_locking_allows_moving_pending_members() {
         let dir = tempdir().unwrap();
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         db.insert_loop_spec(&standalone_spec("spec-a")).unwrap();
         db.insert_loop_spec(&standalone_spec("spec-b")).unwrap();
         db.insert_loop_spec(&standalone_spec("spec-c")).unwrap();
-        db.insert_pool(&Pool {
-            id: "pool-1".to_string(),
-            name: "pool-1".to_string(),
+        db.insert_queue(&Queue {
+            id: "queue-1".to_string(),
+            name: "queue-1".to_string(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
         for id in ["spec-a", "spec-b", "spec-c"] {
-            db.append_pool_member("pool-1", id, None).unwrap();
+            db.append_queue_member("queue-1", id, None).unwrap();
         }
-        let current = db.list_pool_member_spec_ids("pool-1").unwrap();
+        let current = db.list_queue_member_spec_ids("queue-1").unwrap();
 
         // All pending — any permutation is allowed.
         let order = vec![
@@ -9935,23 +11797,23 @@ mod additional_tests {
             "spec-a".to_string(),
             "spec-b".to_string(),
         ];
-        assert!(validate_pool_reorder_locking(&db, &current, &order).is_ok());
+        assert!(validate_queue_reorder_locking(&db, &current, &order).is_ok());
     }
 
-    // ── validate_pool_member_removable: non-running spec ──────────
+    // ── validate_queue_member_removable: non-running spec ──────────
 
     #[test]
-    fn validate_pool_member_removable_pending_spec_ok() {
+    fn validate_queue_member_removable_pending_spec_ok() {
         let dir = tempdir().unwrap();
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         db.insert_loop_spec(&standalone_spec("spec-a")).unwrap();
-        db.insert_pool(&Pool {
-            id: "pool-1".to_string(),
-            name: "pool-1".to_string(),
+        db.insert_queue(&Queue {
+            id: "queue-1".to_string(),
+            name: "queue-1".to_string(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
-        assert!(validate_pool_member_removable(&db, "pool-1", "spec-a").is_ok());
+        assert!(validate_queue_member_removable(&db, "queue-1", "spec-a").is_ok());
     }
 
     // ── resolve_reported_run: run not found for node_id ───────────
@@ -9976,19 +11838,19 @@ mod additional_tests {
         assert!(err.is_error.unwrap_or(false));
     }
 
-    // ── validate_pool_not_consumed: empty pool ────────────────────
+    // ── validate_queue_not_consumed: empty queue ────────────────────
 
     #[test]
-    fn validate_pool_not_consumed_empty_pool() {
+    fn validate_queue_not_consumed_empty_queue() {
         let dir = tempdir().unwrap();
         let db = Database::new(&dir.path().join("test.db")).unwrap();
-        db.insert_pool(&Pool {
-            id: "pool-empty".to_string(),
+        db.insert_queue(&Queue {
+            id: "queue-empty".to_string(),
             name: "empty".to_string(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
-        assert!(validate_pool_not_consumed(&db, "pool-empty", "loop-1").is_ok());
+        assert!(validate_queue_not_consumed(&db, "queue-empty", "loop-1").is_ok());
     }
 
     // ── loop_run_status_guard: error messages name the loop ───────
@@ -10037,10 +11899,12 @@ mod additional_tests {
             EnsembleMemberParams {
                 platform: "claude".to_string(),
                 model: None,
+                prompt_override: None,
             },
             EnsembleMemberParams {
                 platform: "\t\n".to_string(),
                 model: None,
+                prompt_override: None,
             },
         ];
         let err = validate_ensemble_members(&members).unwrap_err();
@@ -10055,10 +11919,12 @@ mod additional_tests {
             EnsembleMemberParams {
                 platform: "claude".to_string(),
                 model: Some("  opus-4  ".to_string()),
+                prompt_override: None,
             },
             EnsembleMemberParams {
                 platform: "mimo".to_string(),
                 model: Some("   ".to_string()),
+                prompt_override: None,
             },
         ];
         let result = validate_ensemble_members(&members).unwrap();
@@ -10196,28 +12062,28 @@ mod additional_tests {
         assert!(validate_node_config(LoopNodeKind::Gate, &config).is_ok());
     }
 
-    // ── validate_pool_reorder_locking: skipped spec is locked ─────
+    // ── validate_queue_reorder_locking: skipped spec is locked ─────
 
     #[test]
-    fn validate_pool_reorder_locking_refuses_moving_skipped_spec() {
+    fn validate_queue_reorder_locking_refuses_moving_skipped_spec() {
         let dir = tempdir().unwrap();
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         let mut skipped = standalone_spec("spec-a");
         skipped.status = LoopSpecStatus::Skipped;
         db.insert_loop_spec(&skipped).unwrap();
         db.insert_loop_spec(&standalone_spec("spec-b")).unwrap();
-        db.insert_pool(&Pool {
-            id: "pool-1".to_string(),
-            name: "pool-1".to_string(),
+        db.insert_queue(&Queue {
+            id: "queue-1".to_string(),
+            name: "queue-1".to_string(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
-        db.append_pool_member("pool-1", "spec-a", None).unwrap();
-        db.append_pool_member("pool-1", "spec-b", None).unwrap();
-        let current = db.list_pool_member_spec_ids("pool-1").unwrap();
+        db.append_queue_member("queue-1", "spec-a", None).unwrap();
+        db.append_queue_member("queue-1", "spec-b", None).unwrap();
+        let current = db.list_queue_member_spec_ids("queue-1").unwrap();
 
         let order = vec!["spec-b".to_string(), "spec-a".to_string()];
-        let error = validate_pool_reorder_locking(&db, &current, &order).unwrap_err();
+        let error = validate_queue_reorder_locking(&db, &current, &order).unwrap_err();
         assert!(error.contains("spec-a"), "{error}");
         assert!(error.contains("skipped"), "{error}");
     }
@@ -10470,6 +12336,10 @@ mod additional_tests {
             validate_spec_status("skipped").unwrap(),
             LoopSpecStatus::Skipped
         ));
+        assert!(matches!(
+            validate_spec_status("interrupted").unwrap(),
+            LoopSpecStatus::Interrupted
+        ));
     }
 
     #[test]
@@ -10669,6 +12539,7 @@ mod additional_tests {
     #[test]
     fn loop_trigger_json_manual() {
         let lp = Loop {
+            archived: false,
             id: "l1".to_string(),
             name: "l1".to_string(),
             description: None,
@@ -10681,7 +12552,7 @@ mod additional_tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         };
         let json = loop_trigger_json(&lp);
@@ -10692,6 +12563,7 @@ mod additional_tests {
     #[test]
     fn loop_trigger_json_cron() {
         let lp = Loop {
+            archived: false,
             id: "l1".to_string(),
             name: "l1".to_string(),
             description: None,
@@ -10706,7 +12578,7 @@ mod additional_tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         };
         let json = loop_trigger_json(&lp);
@@ -10714,34 +12586,34 @@ mod additional_tests {
         assert_eq!(json["schedule"], "0 9 * * *");
     }
 
-    // ── validate_pool_reorder ─────────────────────────────────────
+    // ── validate_queue_reorder ─────────────────────────────────────
 
     #[test]
-    fn validate_pool_reorder_wrong_count() {
+    fn validate_queue_reorder_wrong_count() {
         let current = vec!["a".to_string(), "b".to_string()];
         let spec_ids = vec!["a".to_string()];
-        assert!(validate_pool_reorder(&current, &spec_ids).is_err());
+        assert!(validate_queue_reorder(&current, &spec_ids).is_err());
     }
 
     #[test]
-    fn validate_pool_reorder_duplicate() {
+    fn validate_queue_reorder_duplicate() {
         let current = vec!["a".to_string(), "b".to_string()];
         let spec_ids = vec!["a".to_string(), "a".to_string()];
-        assert!(validate_pool_reorder(&current, &spec_ids).is_err());
+        assert!(validate_queue_reorder(&current, &spec_ids).is_err());
     }
 
     #[test]
-    fn validate_pool_reorder_unknown_spec() {
+    fn validate_queue_reorder_unknown_spec() {
         let current = vec!["a".to_string(), "b".to_string()];
         let spec_ids = vec!["a".to_string(), "c".to_string()];
-        assert!(validate_pool_reorder(&current, &spec_ids).is_err());
+        assert!(validate_queue_reorder(&current, &spec_ids).is_err());
     }
 
     #[test]
-    fn validate_pool_reorder_valid() {
+    fn validate_queue_reorder_valid() {
         let current = vec!["a".to_string(), "b".to_string()];
         let spec_ids = vec!["b".to_string(), "a".to_string()];
-        assert!(validate_pool_reorder(&current, &spec_ids).is_ok());
+        assert!(validate_queue_reorder(&current, &spec_ids).is_ok());
     }
 
     // ── blueprint_json ────────────────────────────────────────────
@@ -10793,7 +12665,7 @@ mod coverage_tests {
         LoopSpecStatus, LoopStatus,
     };
     use crate::domain::models::{Agent, Cli};
-    use crate::domain::pools::Pool;
+    use crate::domain::queues::Queue;
     use tempfile::tempdir;
 
     fn standalone_spec(id: &str) -> LoopSpec {
@@ -10844,6 +12716,7 @@ mod coverage_tests {
 
     fn make_loop(loop_id: &str, status: LoopStatus) -> Loop {
         Loop {
+            archived: false,
             id: loop_id.to_string(),
             name: loop_id.to_string(),
             description: None,
@@ -10856,7 +12729,7 @@ mod coverage_tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         }
     }
@@ -11080,7 +12953,7 @@ mod coverage_tests {
             position: 5,
             created_at: chrono::Utc::now(),
         };
-        let json = super::loop_node_json(&node);
+        let json = super::loop_node_json(&node, &[]);
         assert_eq!(json["id"], "n1");
         assert_eq!(json["spec_id"], "s1");
         assert!(json["loop_id"].is_null());
@@ -11100,7 +12973,7 @@ mod coverage_tests {
             position: 10,
             created_at: chrono::Utc::now(),
         };
-        let json = super::loop_node_json(&node);
+        let json = super::loop_node_json(&node, &[]);
         assert_eq!(json["kind"], "quorum");
     }
 
@@ -11236,6 +13109,7 @@ mod coverage_tests {
                     position: 0,
                     platform: "claude".into(),
                     model: None,
+                    prompt_override: Some("review for security issues only".into()),
                 },
                 EnsembleMember {
                     ensemble_id: "ens1".into(),
@@ -11243,6 +13117,7 @@ mod coverage_tests {
                     position: 1,
                     platform: "codex".into(),
                     model: Some("o1".into()),
+                    prompt_override: None,
                 },
             ],
         };
@@ -11252,6 +13127,14 @@ mod coverage_tests {
         assert_eq!(json["effective_straggler_timeout_minutes"], 10);
         assert_eq!(json["on_fail_to"], "cleanup");
         assert_eq!(json["members"].as_array().unwrap().len(), 2);
+        let members = json["members"].as_array().unwrap();
+        assert_eq!(members[0]["prompt_source"], "override");
+        assert_eq!(
+            members[0]["prompt_override"],
+            "review for security issues only"
+        );
+        assert_eq!(members[1]["prompt_source"], "shared");
+        assert!(members[1]["prompt_override"].is_null());
     }
 
     #[test]
@@ -11279,6 +13162,7 @@ mod coverage_tests {
                 position: 0,
                 platform: "claude".into(),
                 model: None,
+                prompt_override: None,
             }],
         };
         let json = super::ensemble_details_json(&details);
@@ -11366,33 +13250,103 @@ mod coverage_tests {
 
     #[test]
     fn footer_live_source() {
+        use crate::daemon::handler_formatting::ModelTruncation;
         use crate::domain::models_db::CatalogSource;
         let f = super::model_result_footer(
             "Models:",
             CatalogSource::Live,
             std::time::SystemTime::now(),
+            std::time::Duration::from_secs(24 * 60 * 60),
+            &ModelTruncation::default(),
         );
         assert!(f.contains("Source: live"));
-        assert!(!f.contains("out of date"));
+        assert!(!f.contains("unreachable"));
+        assert!(f.contains("age:"));
+        assert!(f.contains("refresh interval"));
     }
 
     #[test]
-    fn footer_stale_source() {
+    fn footer_stale_source_says_how_stale_in_the_same_line() {
+        use crate::daemon::handler_formatting::ModelTruncation;
         use crate::domain::models_db::CatalogSource;
+        let fetched_at = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 3600);
         let f = super::model_result_footer(
             "Models:",
             CatalogSource::Stale,
-            std::time::SystemTime::now(),
+            fetched_at,
+            std::time::Duration::from_secs(24 * 60 * 60),
+            &ModelTruncation::default(),
         );
-        assert!(f.contains("Source: stale"));
-        assert!(f.contains("out of date"));
+        let source_line = f
+            .lines()
+            .find(|l| l.starts_with("Source:"))
+            .expect("footer must have a Source line");
+        assert!(source_line.contains("unreachable"));
+        // How stale must be on the *same* line as the unreachable notice, not
+        // just somewhere in the footer. 30h renders as "1d6h".
+        assert!(source_line.contains("1d6h"));
+    }
+
+    #[test]
+    fn footer_fresh_cache_does_not_say_refresh_due() {
+        use crate::daemon::handler_formatting::ModelTruncation;
+        use crate::domain::models_db::CatalogSource;
+        let f = super::model_result_footer(
+            "Models:",
+            CatalogSource::Cache,
+            std::time::SystemTime::now() - std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(24 * 60 * 60),
+            &ModelTruncation::default(),
+        );
+        assert!(!f.contains("refresh due"));
+        assert!(f.contains("age: 1m"));
+    }
+
+    #[test]
+    fn footer_states_refresh_due_when_age_exceeds_ttl() {
+        use crate::daemon::handler_formatting::ModelTruncation;
+        use crate::domain::models_db::CatalogSource;
+        // A source other than Stale whose age has still crept past the TTL
+        // (e.g. the TTL was lowered after the cache was written) must still
+        // surface a due-for-refresh notice, not just the raw age.
+        let fetched_at = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
+        let f = super::model_result_footer(
+            "Models:",
+            CatalogSource::Live,
+            fetched_at,
+            std::time::Duration::from_secs(3600),
+            &ModelTruncation::default(),
+        );
+        assert!(f.contains("refresh due"));
+    }
+
+    #[test]
+    fn format_duration_short_renders_expected_units() {
+        use std::time::Duration;
+        assert_eq!(super::format_duration_short(Duration::from_secs(45)), "45s");
+        assert_eq!(super::format_duration_short(Duration::from_secs(90)), "1m");
+        assert_eq!(
+            super::format_duration_short(Duration::from_secs(2 * 3600 + 15 * 60)),
+            "2h15m"
+        );
+        assert_eq!(
+            super::format_duration_short(Duration::from_secs(24 * 3600)),
+            "1d"
+        );
+        assert_eq!(
+            super::format_duration_short(Duration::from_secs(3 * 24 * 3600 + 4 * 3600)),
+            "3d4h"
+        );
     }
 
     // ── build_ensemble_unit: with and without on_fail_to ───────────
 
     #[test]
     fn ensemble_unit_with_fail_to() {
-        let members = vec![("claude".into(), None), ("codex".into(), Some("o1".into()))];
+        let members = vec![
+            ("claude".into(), None, None),
+            ("codex".into(), Some("o1".into()), None),
+        ];
         let built = build_ensemble_unit(&EnsembleUnitSpec {
             spec_id: Some("s1".into()),
             loop_id: None,
@@ -11420,7 +13374,7 @@ mod coverage_tests {
 
     #[test]
     fn ensemble_unit_no_fail_to() {
-        let members = vec![("claude".into(), None)];
+        let members = vec![("claude".into(), None, None)];
         let built = build_ensemble_unit(&EnsembleUnitSpec {
             spec_id: None,
             loop_id: Some("l1".into()),
@@ -11448,9 +13402,9 @@ mod coverage_tests {
     #[test]
     fn ensemble_unit_positions_sequential() {
         let members = vec![
-            ("p1".into(), None),
-            ("p2".into(), None),
-            ("p3".into(), None),
+            ("p1".into(), None, None),
+            ("p2".into(), None, None),
+            ("p3".into(), None, None),
         ];
         let built = build_ensemble_unit(&EnsembleUnitSpec {
             spec_id: None,
@@ -11559,50 +13513,50 @@ mod coverage_tests {
         assert!(validate_node_position_conflict(&db, &node, "n2", 2).is_ok());
     }
 
-    // ── validate_pool_not_consumed edge cases ──────────────────────
+    // ── validate_queue_not_consumed edge cases ──────────────────────
 
     #[test]
-    fn pool_not_consumed_empty_pool() {
+    fn queue_not_consumed_empty_queue() {
         let dir = tempdir().unwrap();
         let db = Database::new(&dir.path().join("test.db")).unwrap();
-        db.insert_pool(&Pool {
-            id: "pool-e".into(),
+        db.insert_queue(&Queue {
+            id: "queue-e".into(),
             name: "empty".into(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
-        assert!(validate_pool_not_consumed(&db, "pool-e", "loop-1").is_ok());
+        assert!(validate_queue_not_consumed(&db, "queue-e", "loop-1").is_ok());
     }
 
     #[test]
-    fn pool_not_consumed_pending_spec() {
+    fn queue_not_consumed_pending_spec() {
         let dir = tempdir().unwrap();
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         db.insert_loop_spec(&standalone_spec("s1")).unwrap();
-        db.insert_pool(&Pool {
-            id: "pool-p".into(),
-            name: "pool-p".into(),
+        db.insert_queue(&Queue {
+            id: "queue-p".into(),
+            name: "queue-p".into(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
-        db.append_pool_member("pool-p", "s1", None).unwrap();
-        assert!(validate_pool_not_consumed(&db, "pool-p", "loop-other").is_ok());
+        db.append_queue_member("queue-p", "s1", None).unwrap();
+        assert!(validate_queue_not_consumed(&db, "queue-p", "loop-other").is_ok());
     }
 
     #[test]
-    fn pool_not_consumed_own_loop() {
+    fn queue_not_consumed_own_loop() {
         let dir = tempdir().unwrap();
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         db.insert_loop_spec(&running_spec("s-owned")).unwrap();
         db.insert_loop(&make_loop("loop-owner", LoopStatus::Running))
             .unwrap();
-        db.insert_pool(&Pool {
-            id: "pool-o".into(),
-            name: "pool-o".into(),
+        db.insert_queue(&Queue {
+            id: "queue-o".into(),
+            name: "queue-o".into(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
-        db.append_pool_member("pool-o", "s-owned", None).unwrap();
+        db.append_queue_member("queue-o", "s-owned", None).unwrap();
         insert_test_node(&db, "node-1", "s-owned");
         db.insert_loop_run(&loop_run_row(
             "run1",
@@ -11611,36 +13565,36 @@ mod coverage_tests {
             LoopRunStatus::Running,
         ))
         .unwrap();
-        assert!(validate_pool_not_consumed(&db, "pool-o", "loop-owner").is_ok());
+        assert!(validate_queue_not_consumed(&db, "queue-o", "loop-owner").is_ok());
     }
 
-    // ── validate_pool_member_removable edge cases ──────────────────
+    // ── validate_queue_member_removable edge cases ──────────────────
 
     #[test]
-    fn pool_member_removable_pending() {
+    fn queue_member_removable_pending() {
         let dir = tempdir().unwrap();
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         db.insert_loop_spec(&standalone_spec("s1")).unwrap();
-        db.insert_pool(&Pool {
-            id: "pool-r".into(),
-            name: "pool-r".into(),
+        db.insert_queue(&Queue {
+            id: "queue-r".into(),
+            name: "queue-r".into(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
-        assert!(validate_pool_member_removable(&db, "pool-r", "s1").is_ok());
+        assert!(validate_queue_member_removable(&db, "queue-r", "s1").is_ok());
     }
 
     #[test]
-    fn pool_member_removable_nonexistent() {
+    fn queue_member_removable_nonexistent() {
         let dir = tempdir().unwrap();
         let db = Database::new(&dir.path().join("test.db")).unwrap();
-        db.insert_pool(&Pool {
-            id: "pool-r".into(),
-            name: "pool-r".into(),
+        db.insert_queue(&Queue {
+            id: "queue-r".into(),
+            name: "queue-r".into(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
-        assert!(validate_pool_member_removable(&db, "pool-r", "ghost").is_ok());
+        assert!(validate_queue_member_removable(&db, "queue-r", "ghost").is_ok());
     }
 
     // ── resolve_reported_run: stale statuses ───────────────────────
@@ -11677,7 +13631,7 @@ mod coverage_tests {
             .unwrap_or(false));
     }
 
-    // ── validate_pool_reorder_locking edge cases ───────────────────
+    // ── validate_queue_reorder_locking edge cases ───────────────────
 
     #[test]
     fn reorder_locking_all_pending() {
@@ -11686,18 +13640,18 @@ mod coverage_tests {
         db.insert_loop_spec(&standalone_spec("a")).unwrap();
         db.insert_loop_spec(&standalone_spec("b")).unwrap();
         db.insert_loop_spec(&standalone_spec("c")).unwrap();
-        db.insert_pool(&Pool {
+        db.insert_queue(&Queue {
             id: "p1".into(),
             name: "p1".into(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
         for id in ["a", "b", "c"] {
-            db.append_pool_member("p1", id, None).unwrap();
+            db.append_queue_member("p1", id, None).unwrap();
         }
-        let current = db.list_pool_member_spec_ids("p1").unwrap();
+        let current = db.list_queue_member_spec_ids("p1").unwrap();
         let order = vec!["c".into(), "a".into(), "b".into()];
-        assert!(validate_pool_reorder_locking(&db, &current, &order).is_ok());
+        assert!(validate_queue_reorder_locking(&db, &current, &order).is_ok());
     }
 
     #[test]
@@ -11708,17 +13662,17 @@ mod coverage_tests {
         f.status = LoopSpecStatus::Failed;
         db.insert_loop_spec(&f).unwrap();
         db.insert_loop_spec(&standalone_spec("p")).unwrap();
-        db.insert_pool(&Pool {
+        db.insert_queue(&Queue {
             id: "p1".into(),
             name: "p1".into(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
-        db.append_pool_member("p1", "f", None).unwrap();
-        db.append_pool_member("p1", "p", None).unwrap();
-        let current = db.list_pool_member_spec_ids("p1").unwrap();
+        db.append_queue_member("p1", "f", None).unwrap();
+        db.append_queue_member("p1", "p", None).unwrap();
+        let current = db.list_queue_member_spec_ids("p1").unwrap();
         let order = vec!["p".into(), "f".into()];
-        let err = validate_pool_reorder_locking(&db, &current, &order).unwrap_err();
+        let err = validate_queue_reorder_locking(&db, &current, &order).unwrap_err();
         assert!(err.contains("failed"), "{err}");
     }
 
@@ -11730,17 +13684,17 @@ mod coverage_tests {
         s.status = LoopSpecStatus::Skipped;
         db.insert_loop_spec(&s).unwrap();
         db.insert_loop_spec(&standalone_spec("p")).unwrap();
-        db.insert_pool(&Pool {
+        db.insert_queue(&Queue {
             id: "p1".into(),
             name: "p1".into(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
-        db.append_pool_member("p1", "s", None).unwrap();
-        db.append_pool_member("p1", "p", None).unwrap();
-        let current = db.list_pool_member_spec_ids("p1").unwrap();
+        db.append_queue_member("p1", "s", None).unwrap();
+        db.append_queue_member("p1", "p", None).unwrap();
+        let current = db.list_queue_member_spec_ids("p1").unwrap();
         let order = vec!["p".into(), "s".into()];
-        let err = validate_pool_reorder_locking(&db, &current, &order).unwrap_err();
+        let err = validate_queue_reorder_locking(&db, &current, &order).unwrap_err();
         assert!(err.contains("skipped"), "{err}");
     }
 
@@ -11751,24 +13705,24 @@ mod coverage_tests {
         db.insert_loop_spec(&running_spec("r")).unwrap();
         db.insert_loop_spec(&standalone_spec("p1")).unwrap();
         db.insert_loop_spec(&standalone_spec("p2")).unwrap();
-        db.insert_pool(&Pool {
+        db.insert_queue(&Queue {
             id: "p1".into(),
             name: "p1".into(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
-        db.append_pool_member("p1", "r", None).unwrap();
-        db.append_pool_member("p1", "p1", None).unwrap();
-        db.append_pool_member("p1", "p2", None).unwrap();
-        let current = db.list_pool_member_spec_ids("p1").unwrap();
+        db.append_queue_member("p1", "r", None).unwrap();
+        db.append_queue_member("p1", "p1", None).unwrap();
+        db.append_queue_member("p1", "p2", None).unwrap();
+        let current = db.list_queue_member_spec_ids("p1").unwrap();
         let order = vec!["r".into(), "p2".into(), "p1".into()];
-        assert!(validate_pool_reorder_locking(&db, &current, &order).is_ok());
+        assert!(validate_queue_reorder_locking(&db, &current, &order).is_ok());
     }
 
-    // ── validate_pool_reorder: all permutations ────────────────────
+    // ── validate_queue_reorder: all permutations ────────────────────
 
     #[test]
-    fn pool_reorder_all_perms_of_three() {
+    fn queue_reorder_all_perms_of_three() {
         let current = vec!["a".into(), "b".into(), "c".into()];
         for perm in [
             ["a", "b", "c"],
@@ -11779,21 +13733,21 @@ mod coverage_tests {
             ["c", "b", "a"],
         ] {
             let reordered: Vec<String> = perm.into_iter().map(String::from).collect();
-            assert!(validate_pool_reorder(&current, &reordered).is_ok());
+            assert!(validate_queue_reorder(&current, &reordered).is_ok());
         }
     }
 
     #[test]
-    fn pool_reorder_empty() {
-        assert!(validate_pool_reorder(&[], &[]).is_ok());
+    fn queue_reorder_empty() {
+        assert!(validate_queue_reorder(&[], &[]).is_ok());
     }
 
     #[test]
-    fn pool_reorder_large_pool() {
+    fn queue_reorder_large_queue() {
         let current: Vec<String> = (0..100).map(|i| format!("s{i}")).collect();
         let mut reordered = current.clone();
         reordered.reverse();
-        assert!(validate_pool_reorder(&current, &reordered).is_ok());
+        assert!(validate_queue_reorder(&current, &reordered).is_ok());
     }
 
     // ── validate_ensemble_members: boundaries ──────────────────────
@@ -11804,6 +13758,7 @@ mod coverage_tests {
             .map(|i| EnsembleMemberParams {
                 platform: format!("p{i}"),
                 model: None,
+                prompt_override: None,
             })
             .collect();
         assert!(validate_ensemble_members(&m).is_ok());
@@ -11815,6 +13770,7 @@ mod coverage_tests {
             .map(|i| EnsembleMemberParams {
                 platform: format!("p{i}"),
                 model: None,
+                prompt_override: None,
             })
             .collect();
         assert!(validate_ensemble_members(&m).is_ok());
@@ -11826,6 +13782,7 @@ mod coverage_tests {
             .map(|i| EnsembleMemberParams {
                 platform: format!("p{i}"),
                 model: None,
+                prompt_override: None,
             })
             .collect();
         assert!(validate_ensemble_members(&m).unwrap_err().contains("2-8"));
@@ -11837,10 +13794,12 @@ mod coverage_tests {
             EnsembleMemberParams {
                 platform: "claude".into(),
                 model: Some("".into()),
+                prompt_override: None,
             },
             EnsembleMemberParams {
                 platform: "mimo".into(),
                 model: None,
+                prompt_override: None,
             },
         ];
         let result = validate_ensemble_members(&m).unwrap();
@@ -11866,6 +13825,7 @@ mod coverage_tests {
             LoopSpecStatus::Completed,
             LoopSpecStatus::Failed,
             LoopSpecStatus::Skipped,
+            LoopSpecStatus::Interrupted,
         ] {
             let mut spec = standalone_spec("s");
             spec.status = status;
@@ -12011,6 +13971,7 @@ mod endpoint_tests {
     use crate::application::notification_service::{
         DefaultNotificationService, NotificationService,
     };
+    use crate::daemon::params_extract::Parameters;
     use crate::db::Database;
     use crate::domain::models::{Agent, Cli, RunLog, RunStatus, TriggerType};
     use crate::executor::Executor;
@@ -12018,7 +13979,6 @@ mod endpoint_tests {
     use crate::rag::ingestion::IngestionManager;
     use crate::sync_manager::SyncManager;
     use crate::watchers::WatcherEngine;
-    use rmcp::handler::server::wrapper::Parameters;
     use tempfile::tempdir;
     use tokio::sync::Notify;
 
@@ -12554,6 +14514,7 @@ mod endpoint_tests {
             .task_models(Parameters(TaskModelsParams {
                 platform: Some("not-configured-platform".to_string()),
                 refresh: None,
+                full: None,
             }))
             .await
             .unwrap();
@@ -12591,6 +14552,7 @@ mod endpoint_tests {
             .task_models(Parameters(TaskModelsParams {
                 platform: Some("native-cli".to_string()),
                 refresh: Some(true),
+                full: None,
             }))
             .await
             .unwrap();
@@ -12944,6 +14906,486 @@ mod endpoint_tests {
         assert!(text(&bad_workdir).contains("absolute") || text(&bad_workdir).contains("exist"));
     }
 
+    fn check_node_config(command: &str) -> serde_json::Map<String, serde_json::Value> {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "command".to_string(),
+            serde_json::Value::String(command.to_string()),
+        );
+        map
+    }
+
+    /// Builds a loop with implementer -> gate -> committer (agent, check,
+    /// agent), returning the loop id and each node's id in graph order.
+    async fn build_simple_loop(
+        handler: &TaskTriggerHandler,
+        workdir: &str,
+        loop_name: &str,
+    ) -> (String, String, String, String) {
+        let created = handler
+            .loop_create(Parameters(LoopCreateParams {
+                name: loop_name.to_string(),
+                description: Some("A shareable design".to_string()),
+                workdir: workdir.to_string(),
+                trigger: None,
+            }))
+            .await
+            .unwrap();
+        let loop_id = extract_id(&created, "loop_id");
+
+        let n1 = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: None,
+                loop_id: Some(loop_id.clone()),
+                name: "implementer".to_string(),
+                kind: Some("agent".to_string()),
+                config: Some(agent_node_config("claude")),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        let n1_id = extract_id(&n1, "node_id");
+
+        let n2 = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: None,
+                loop_id: Some(loop_id.clone()),
+                name: "gate".to_string(),
+                kind: Some("check".to_string()),
+                config: Some(check_node_config("cargo test")),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        let n2_id = extract_id(&n2, "node_id");
+
+        let n3 = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: None,
+                loop_id: Some(loop_id.clone()),
+                name: "committer".to_string(),
+                kind: Some("agent".to_string()),
+                config: Some(agent_node_config("claude")),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        let n3_id = extract_id(&n3, "node_id");
+
+        for (from, to, condition) in [(&n1_id, &n2_id, "always"), (&n2_id, &n3_id, "pass")] {
+            let edge = handler
+                .loop_add_edge(Parameters(LoopAddEdgeParams {
+                    spec_id: None,
+                    loop_id: Some(loop_id.clone()),
+                    from_node: from.clone(),
+                    to_node: to.clone(),
+                    condition: condition.to_string(),
+                    route: None,
+                }))
+                .await
+                .unwrap();
+            assert!(!is_err(&edge), "{}", text(&edge));
+        }
+
+        (loop_id, n1_id, n2_id, n3_id)
+    }
+
+    #[tokio::test]
+    async fn loop_export_returns_error_for_unknown_loop() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let result = handler
+            .loop_export(Parameters(LoopExportParams {
+                loop_id: "missing".to_string(),
+                with_models: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&result));
+        assert!(text(&result).contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn loop_export_strips_platform_by_default_and_keeps_it_with_with_models() {
+        let (dir, _db, handler) = endpoint_test_handler();
+        let workdir = dir.path().to_string_lossy().to_string();
+        let (loop_id, ..) = build_simple_loop(&handler, &workdir, "Export Loop").await;
+
+        let stripped = handler
+            .loop_export(Parameters(LoopExportParams {
+                loop_id: loop_id.clone(),
+                with_models: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&stripped), "{}", text(&stripped));
+        let doc: serde_json::Value = serde_json::from_str(&raw_text(&stripped)).unwrap();
+        assert_eq!(doc["format_version"], 1);
+        let implementer = doc["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["name"] == "implementer")
+            .unwrap();
+        assert!(implementer["config"].get("platform").is_none());
+
+        let with_models = handler
+            .loop_export(Parameters(LoopExportParams {
+                loop_id,
+                with_models: Some(true),
+            }))
+            .await
+            .unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&raw_text(&with_models)).unwrap();
+        let implementer = doc["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["name"] == "implementer")
+            .unwrap();
+        assert_eq!(implementer["config"]["platform"], "claude");
+    }
+
+    /// Decision 2's enforced consequence: `loop_add_node` doesn't itself
+    /// forbid two nodes sharing a name, so export must catch it — naming
+    /// the offending node(s) rather than producing an ambiguous file.
+    #[tokio::test]
+    async fn loop_export_rejects_duplicate_node_names() {
+        let (dir, _db, handler) = endpoint_test_handler();
+        let workdir = dir.path().to_string_lossy().to_string();
+        let created = handler
+            .loop_create(Parameters(LoopCreateParams {
+                name: "Dup Loop".to_string(),
+                description: None,
+                workdir,
+                trigger: None,
+            }))
+            .await
+            .unwrap();
+        let loop_id = extract_id(&created, "loop_id");
+        for _ in 0..2 {
+            handler
+                .loop_add_node(Parameters(LoopAddNodeParams {
+                    spec_id: None,
+                    loop_id: Some(loop_id.clone()),
+                    name: "dup".to_string(),
+                    kind: Some("check".to_string()),
+                    config: Some(check_node_config("true")),
+                    blueprint: None,
+                    config_overrides: None,
+                }))
+                .await
+                .unwrap();
+        }
+
+        let result = handler
+            .loop_export(Parameters(LoopExportParams {
+                loop_id,
+                with_models: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&result));
+        assert!(text(&result).contains("dup"));
+        assert!(text(&result).to_lowercase().contains("duplicate"));
+    }
+
+    #[tokio::test]
+    async fn loop_import_creates_new_loop_and_reports_missing_platform() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let workdir = dir.path().to_string_lossy().to_string();
+        let (source_loop_id, ..) = build_simple_loop(&handler, &workdir, "Source Loop").await;
+
+        let exported = handler
+            .loop_export(Parameters(LoopExportParams {
+                loop_id: source_loop_id,
+                with_models: None,
+            }))
+            .await
+            .unwrap();
+        let document: serde_json::Value = serde_json::from_str(&raw_text(&exported)).unwrap();
+
+        let imported = handler
+            .loop_import(Parameters(LoopImportParams {
+                document,
+                workdir: workdir.clone(),
+                name: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&imported), "{}", text(&imported));
+        let body: serde_json::Value = serde_json::from_str(&raw_text(&imported)).unwrap();
+        // The source loop itself is still named "Source Loop" in this same
+        // workdir, so decision 4's collision handling suffixes the import.
+        assert_eq!(body["name"], "Source Loop (2)");
+        let new_loop_id = body["loop_id"].as_str().unwrap().to_string();
+        assert_ne!(new_loop_id, "");
+
+        let missing: Vec<&str> = body["nodes_missing_platform"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(missing.contains(&"implementer"));
+        assert!(missing.contains(&"committer"));
+
+        let nodes = db.list_loop_nodes_for_loop(&new_loop_id).unwrap();
+        assert_eq!(nodes.len(), 3);
+        let edges = db.list_loop_edges_for_loop(&new_loop_id).unwrap();
+        assert_eq!(edges.len(), 2);
+        // Import always creates a new loop, never touching the source.
+        assert_eq!(db.list_loops(Some(&workdir), true).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn loop_import_name_param_overrides_document_name() {
+        let (dir, _db, handler) = endpoint_test_handler();
+        let workdir = dir.path().to_string_lossy().to_string();
+        let (source_loop_id, ..) = build_simple_loop(&handler, &workdir, "Source Loop").await;
+        let exported = handler
+            .loop_export(Parameters(LoopExportParams {
+                loop_id: source_loop_id,
+                with_models: None,
+            }))
+            .await
+            .unwrap();
+        let document: serde_json::Value = serde_json::from_str(&raw_text(&exported)).unwrap();
+
+        let imported = handler
+            .loop_import(Parameters(LoopImportParams {
+                document,
+                workdir,
+                name: Some("Custom Name".to_string()),
+            }))
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&raw_text(&imported)).unwrap();
+        assert_eq!(body["name"], "Custom Name");
+    }
+
+    /// Decision 4: import never overwrites — a name collision in the target
+    /// workdir gets a numeric suffix instead of a refusal or an overwrite.
+    #[tokio::test]
+    async fn loop_import_dedupes_colliding_name_with_numeric_suffix() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let workdir = dir.path().to_string_lossy().to_string();
+        let (source_loop_id, ..) = build_simple_loop(&handler, &workdir, "Source Loop").await;
+        let exported = handler
+            .loop_export(Parameters(LoopExportParams {
+                loop_id: source_loop_id,
+                with_models: None,
+            }))
+            .await
+            .unwrap();
+        let document: serde_json::Value = serde_json::from_str(&raw_text(&exported)).unwrap();
+
+        let first = handler
+            .loop_import(Parameters(LoopImportParams {
+                document: document.clone(),
+                workdir: workdir.clone(),
+                name: Some("Collide".to_string()),
+            }))
+            .await
+            .unwrap();
+        let first_body: serde_json::Value = serde_json::from_str(&raw_text(&first)).unwrap();
+        assert_eq!(first_body["name"], "Collide");
+
+        let second = handler
+            .loop_import(Parameters(LoopImportParams {
+                document,
+                workdir: workdir.clone(),
+                name: Some("Collide".to_string()),
+            }))
+            .await
+            .unwrap();
+        let second_body: serde_json::Value = serde_json::from_str(&raw_text(&second)).unwrap();
+        assert_eq!(second_body["name"], "Collide (2)");
+        assert_ne!(second_body["loop_id"], first_body["loop_id"]);
+        assert_eq!(db.list_loops(Some(&workdir), true).unwrap().len(), 3);
+    }
+
+    /// Decision 5's all-or-nothing guarantee: a document whose edge names a
+    /// nonexistent node is rejected before anything is written.
+    #[tokio::test]
+    async fn loop_import_rejects_bad_edge_reference_and_writes_nothing() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let workdir = dir.path().to_string_lossy().to_string();
+        let document = serde_json::json!({
+            "format_version": 1,
+            "name": "Broken Loop",
+            "nodes": [
+                {"name": "only", "kind": "check", "position": 1, "config": {"command": "true"}}
+            ],
+            "edges": [
+                {"from_node": "only", "to_node": "ghost", "condition": "always"}
+            ],
+            "ensembles": []
+        });
+
+        let result = handler
+            .loop_import(Parameters(LoopImportParams {
+                document,
+                workdir: workdir.clone(),
+                name: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&result));
+        assert!(text(&result).contains("ghost"));
+        assert!(db.list_loops(Some(&workdir), true).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn loop_import_rejects_missing_format_version() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let workdir = dir.path().to_string_lossy().to_string();
+        let document = serde_json::json!({
+            "name": "No Version",
+            "nodes": [],
+            "edges": [],
+            "ensembles": []
+        });
+
+        let result = handler
+            .loop_import(Parameters(LoopImportParams {
+                document,
+                workdir: workdir.clone(),
+                name: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&result));
+        assert!(text(&result).contains("format_version"));
+        assert!(db.list_loops(Some(&workdir), true).unwrap().is_empty());
+    }
+
+    /// Requirement 5, exercised end to end through the MCP surface: export,
+    /// import, export again — identical document except the name — for a
+    /// loop that includes an ensemble, which must survive as an ensemble
+    /// rather than expanded member nodes.
+    #[tokio::test]
+    async fn loop_export_import_round_trip_with_models_preserves_ensemble() {
+        let (dir, _db, handler) = endpoint_test_handler();
+        let workdir = dir.path().to_string_lossy().to_string();
+
+        let created = handler
+            .loop_create(Parameters(LoopCreateParams {
+                name: "Ensemble Loop".to_string(),
+                description: Some("Has an ensemble".to_string()),
+                workdir: workdir.clone(),
+                trigger: None,
+            }))
+            .await
+            .unwrap();
+        let loop_id = extract_id(&created, "loop_id");
+
+        let kickoff = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: None,
+                loop_id: Some(loop_id.clone()),
+                name: "kickoff".to_string(),
+                kind: Some("check".to_string()),
+                config: Some(check_node_config("true")),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        let kickoff_id = extract_id(&kickoff, "node_id");
+
+        let downstream = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: None,
+                loop_id: Some(loop_id.clone()),
+                name: "downstream".to_string(),
+                kind: Some("agent".to_string()),
+                config: Some(agent_node_config("claude")),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        let downstream_id = extract_id(&downstream, "node_id");
+
+        let ensemble = handler
+            .loop_add_ensemble(Parameters(LoopAddEnsembleParams {
+                spec_id: None,
+                loop_id: Some(loop_id.clone()),
+                name: "Proposers".to_string(),
+                prompt_template: Some("draft it".to_string()),
+                blueprint: None,
+                members: Some(vec![
+                    EnsembleMemberParams {
+                        platform: "openrouter".to_string(),
+                        model: Some("model-a".to_string()),
+                        prompt_override: None,
+                    },
+                    EnsembleMemberParams {
+                        platform: "openrouter".to_string(),
+                        model: Some("model-b".to_string()),
+                        prompt_override: None,
+                    },
+                ]),
+                condition: "always".to_string(),
+                from_node: kickoff_id.clone(),
+                on_pass_to: downstream_id.clone(),
+                on_fail_to: None,
+                min_pass: None,
+                timeout_minutes: None,
+                straggler_timeout_minutes: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&ensemble), "{}", text(&ensemble));
+
+        let first_export = handler
+            .loop_export(Parameters(LoopExportParams {
+                loop_id,
+                with_models: Some(true),
+            }))
+            .await
+            .unwrap();
+        let first_doc: serde_json::Value = serde_json::from_str(&raw_text(&first_export)).unwrap();
+        assert_eq!(first_doc["ensembles"].as_array().unwrap().len(), 1);
+        // The plain node list must exclude the ensemble's member/join nodes.
+        assert_eq!(first_doc["nodes"].as_array().unwrap().len(), 2);
+
+        let imported = handler
+            .loop_import(Parameters(LoopImportParams {
+                document: first_doc.clone(),
+                workdir: workdir.clone(),
+                name: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&imported), "{}", text(&imported));
+        let imported_body: serde_json::Value = serde_json::from_str(&raw_text(&imported)).unwrap();
+        let new_loop_id = imported_body["loop_id"].as_str().unwrap().to_string();
+        assert_eq!(imported_body["name"], "Ensemble Loop (2)");
+        // Every member carried its platform/model through with_models — no
+        // node should be flagged.
+        assert!(imported_body["nodes_missing_platform"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        let second_export = handler
+            .loop_export(Parameters(LoopExportParams {
+                loop_id: new_loop_id,
+                with_models: Some(true),
+            }))
+            .await
+            .unwrap();
+        let mut second_doc: serde_json::Value =
+            serde_json::from_str(&raw_text(&second_export)).unwrap();
+        // Identical except the name (decision 4 renamed it on collision).
+        second_doc["name"] = first_doc["name"].clone();
+        assert_eq!(first_doc, second_doc);
+    }
+
     #[tokio::test]
     async fn loop_update_rejects_unknown_loop_and_requires_a_field() {
         let (dir, db, handler) = endpoint_test_handler();
@@ -12978,6 +15420,7 @@ mod endpoint_tests {
 
     fn insert_test_loop(db: &Database, workdir: &std::path::Path) -> Loop {
         let lp = Loop {
+            archived: false,
             id: uuid::Uuid::new_v4().to_string(),
             name: "Test Loop".to_string(),
             description: None,
@@ -12990,7 +15433,7 @@ mod endpoint_tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         };
         db.insert_loop(&lp).unwrap();
@@ -13450,6 +15893,38 @@ mod endpoint_tests {
         assert!(text(&join_rejected).contains("engine-managed"));
     }
 
+    /// The exact incident shape, through the real `loop_add_node` tool
+    /// call: a `prompt` key (instead of `prompt_template`) must be rejected
+    /// at write time, naming the correct key, and must never reach the DB.
+    #[tokio::test]
+    async fn loop_add_node_rejects_prompt_key_naming_prompt_template() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+
+        let mut config = agent_node_config("claude");
+        config.insert(
+            "prompt".to_string(),
+            serde_json::Value::String("implement the spec".to_string()),
+        );
+
+        let rejected = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Implementer".to_string(),
+                kind: Some("agent".to_string()),
+                config: Some(config),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&rejected), "{}", text(&rejected));
+        assert!(text(&rejected).contains("prompt_template"));
+        assert!(db.list_loop_nodes(&spec.id).unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn loop_update_node_renames_and_validates() {
         let (dir, db, handler) = endpoint_test_handler();
@@ -13543,6 +16018,7 @@ mod endpoint_tests {
                 from_node: a.clone(),
                 to_node: b.clone(),
                 condition: "always".to_string(),
+                route: None,
             }))
             .await
             .unwrap();
@@ -13556,6 +16032,7 @@ mod endpoint_tests {
                 from_node: a.clone(),
                 to_node: "not-a-real-node".to_string(),
                 condition: "always".to_string(),
+                route: None,
             }))
             .await
             .unwrap();
@@ -13568,6 +16045,7 @@ mod endpoint_tests {
                 from_node: a,
                 to_node: b,
                 condition: "sideways".to_string(),
+                route: None,
             }))
             .await
             .unwrap();
@@ -13581,6 +16059,8 @@ mod endpoint_tests {
             .loop_update_edge(Parameters(LoopUpdateEdgeParams {
                 edge_id: edge_id.clone(),
                 condition: "fail".to_string(),
+                route: None,
+                to_node: None,
             }))
             .await
             .unwrap();
@@ -13590,6 +16070,8 @@ mod endpoint_tests {
             .loop_update_edge(Parameters(LoopUpdateEdgeParams {
                 edge_id: edge_id.clone(),
                 condition: "fail".to_string(),
+                route: None,
+                to_node: None,
             }))
             .await
             .unwrap();
@@ -13600,10 +16082,521 @@ mod endpoint_tests {
             .loop_update_edge(Parameters(LoopUpdateEdgeParams {
                 edge_id: "ghost-edge".to_string(),
                 condition: "pass".to_string(),
+                route: None,
+                to_node: None,
             }))
             .await
             .unwrap();
         assert!(is_err(&missing_edge));
+    }
+
+    // ── loop_update_edge(to_node) / loop_delete_edge / loop_delete_node ──
+
+    #[tokio::test]
+    async fn loop_update_edge_retargets_destination_without_changing_condition() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let a = add_agent_node(&handler, &spec.id, "A").await;
+        let b = add_agent_node(&handler, &spec.id, "B").await;
+        let c = add_agent_node(&handler, &spec.id, "C").await;
+
+        let added = handler
+            .loop_add_edge(Parameters(LoopAddEdgeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                from_node: a.clone(),
+                to_node: b.clone(),
+                condition: "pass".to_string(),
+                route: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&added), "{}", text(&added));
+        let edge_id = db.list_loop_edges(&spec.id).unwrap()[0].id.clone();
+
+        let retargeted = handler
+            .loop_update_edge(Parameters(LoopUpdateEdgeParams {
+                edge_id: edge_id.clone(),
+                condition: "pass".to_string(),
+                route: None,
+                to_node: Some(c.clone()),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&retargeted), "{}", text(&retargeted));
+
+        let edge = db.get_loop_edge(&edge_id).unwrap().unwrap();
+        assert_eq!(edge.to_node, c, "target changed to the new node");
+        assert_eq!(
+            edge.condition,
+            crate::domain::loops::LoopEdgeCondition::Pass,
+            "condition untouched by a target-only update"
+        );
+        assert_eq!(
+            edge.from_node, a,
+            "source untouched by a target-only update"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_update_edge_rejects_retarget_to_a_node_in_another_loop() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let a = add_agent_node(&handler, &spec.id, "A").await;
+        let b = add_agent_node(&handler, &spec.id, "B").await;
+
+        let other_lp = insert_test_loop(&db, dir.path());
+        let other_spec = insert_test_spec(&db, &other_lp.id, 1);
+        let foreign = add_agent_node(&handler, &other_spec.id, "Foreign").await;
+
+        handler
+            .loop_add_edge(Parameters(LoopAddEdgeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                from_node: a.clone(),
+                to_node: b.clone(),
+                condition: "pass".to_string(),
+                route: None,
+            }))
+            .await
+            .unwrap();
+        let edge_id = db.list_loop_edges(&spec.id).unwrap()[0].id.clone();
+
+        let result = handler
+            .loop_update_edge(Parameters(LoopUpdateEdgeParams {
+                edge_id: edge_id.clone(),
+                condition: "pass".to_string(),
+                route: None,
+                to_node: Some(foreign),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&result));
+
+        let edge = db.get_loop_edge(&edge_id).unwrap().unwrap();
+        assert_eq!(edge.to_node, b, "cross-loop retarget never persisted");
+    }
+
+    #[tokio::test]
+    async fn loop_delete_edge_removes_a_single_edge() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let a = add_agent_node(&handler, &spec.id, "A").await;
+        let b = add_agent_node(&handler, &spec.id, "B").await;
+        handler
+            .loop_add_edge(Parameters(LoopAddEdgeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                from_node: a,
+                to_node: b,
+                condition: "pass".to_string(),
+                route: None,
+            }))
+            .await
+            .unwrap();
+        let edge_id = db.list_loop_edges(&spec.id).unwrap()[0].id.clone();
+
+        let deleted = handler
+            .loop_delete_edge(Parameters(LoopDeleteEdgeParams {
+                edge_id: edge_id.clone(),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&deleted), "{}", text(&deleted));
+        assert!(db.get_loop_edge(&edge_id).unwrap().is_none());
+
+        let missing = handler
+            .loop_delete_edge(Parameters(LoopDeleteEdgeParams {
+                edge_id: "ghost-edge".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&missing));
+    }
+
+    #[tokio::test]
+    async fn loop_delete_node_cascades_to_its_edges() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let a = add_agent_node(&handler, &spec.id, "A").await;
+        let b = add_agent_node(&handler, &spec.id, "B").await;
+        let c = add_agent_node(&handler, &spec.id, "C").await;
+        for (from, to) in [(a.clone(), b.clone()), (b.clone(), c.clone())] {
+            handler
+                .loop_add_edge(Parameters(LoopAddEdgeParams {
+                    spec_id: Some(spec.id.clone()),
+                    loop_id: None,
+                    from_node: from,
+                    to_node: to,
+                    condition: "pass".to_string(),
+                    route: None,
+                }))
+                .await
+                .unwrap();
+        }
+        assert_eq!(db.list_loop_edges(&spec.id).unwrap().len(), 2);
+
+        // `b` (not the entry point — `a` is) sits between two edges; deleting
+        // it must drop both, not just the ones naming it as `from_node`.
+        let deleted = handler
+            .loop_delete_node(Parameters(LoopDeleteNodeParams { node_id: b.clone() }))
+            .await
+            .unwrap();
+        assert!(!is_err(&deleted), "{}", text(&deleted));
+
+        assert!(db.get_loop_node(&b).unwrap().is_none());
+        assert!(db.list_loop_edges(&spec.id).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn loop_delete_node_rejects_the_graphs_entry_point() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let a = add_agent_node(&handler, &spec.id, "A").await;
+        let b = add_agent_node(&handler, &spec.id, "B").await;
+        handler
+            .loop_add_edge(Parameters(LoopAddEdgeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                from_node: a.clone(),
+                to_node: b,
+                condition: "pass".to_string(),
+                route: None,
+            }))
+            .await
+            .unwrap();
+
+        let result = handler
+            .loop_delete_node(Parameters(LoopDeleteNodeParams { node_id: a.clone() }))
+            .await
+            .unwrap();
+        assert!(is_err(&result));
+        assert!(db.get_loop_node(&a).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn topology_mutations_are_rejected_while_the_loop_is_running() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let a = add_agent_node(&handler, &spec.id, "A").await;
+        let b = add_agent_node(&handler, &spec.id, "B").await;
+        let c = add_agent_node(&handler, &spec.id, "C").await;
+        handler
+            .loop_add_edge(Parameters(LoopAddEdgeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                from_node: a,
+                to_node: b.clone(),
+                condition: "pass".to_string(),
+                route: None,
+            }))
+            .await
+            .unwrap();
+        let edge_id = db.list_loop_edges(&spec.id).unwrap()[0].id.clone();
+
+        db.update_loop_status(&lp.id, LoopStatus::Running, None, None)
+            .unwrap();
+
+        let retarget = handler
+            .loop_update_edge(Parameters(LoopUpdateEdgeParams {
+                edge_id: edge_id.clone(),
+                condition: "pass".to_string(),
+                route: None,
+                to_node: Some(c),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&retarget));
+        assert!(text(&retarget).contains("running"), "{}", text(&retarget));
+
+        let delete_edge = handler
+            .loop_delete_edge(Parameters(LoopDeleteEdgeParams {
+                edge_id: edge_id.clone(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&delete_edge));
+        assert!(
+            text(&delete_edge).contains("running"),
+            "{}",
+            text(&delete_edge)
+        );
+
+        let delete_node = handler
+            .loop_delete_node(Parameters(LoopDeleteNodeParams { node_id: b.clone() }))
+            .await
+            .unwrap();
+        assert!(is_err(&delete_node));
+        assert!(
+            text(&delete_node).contains("running"),
+            "{}",
+            text(&delete_node)
+        );
+
+        // Nothing actually mutated while the loop was running.
+        assert_eq!(db.get_loop_edge(&edge_id).unwrap().unwrap().to_node, b);
+        assert!(db.get_loop_node(&b).unwrap().is_some());
+    }
+
+    // ── router nodes (routes + route edges) ──────────────────────────
+
+    fn router_node_config(
+        routes: &serde_json::Value,
+        fallback: &str,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::json!({ "routes": routes, "fallback": fallback })
+            .as_object()
+            .unwrap()
+            .clone()
+    }
+
+    fn two_routes() -> serde_json::Value {
+        serde_json::json!([
+            { "label": "retry", "description": "Retry the current step." },
+            { "label": "escalate", "description": "Hand off to a human." },
+        ])
+    }
+
+    #[tokio::test]
+    async fn loop_add_node_router_created_persisted_and_read_back_with_routes() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+
+        let router_result = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Router".to_string(),
+                kind: Some("router".to_string()),
+                config: Some(router_node_config(&two_routes(), "retry")),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&router_result), "{}", text(&router_result));
+        let router_id = extract_id(&router_result, "node_id");
+
+        let retry_target = add_agent_node(&handler, &spec.id, "Retry target").await;
+        let escalate_target = add_agent_node(&handler, &spec.id, "Escalate target").await;
+
+        for (route, target) in [("retry", &retry_target), ("escalate", &escalate_target)] {
+            let edge = handler
+                .loop_add_edge(Parameters(LoopAddEdgeParams {
+                    spec_id: Some(spec.id.clone()),
+                    loop_id: None,
+                    from_node: router_id.clone(),
+                    to_node: target.clone(),
+                    condition: "route".to_string(),
+                    route: Some(route.to_string()),
+                }))
+                .await
+                .unwrap();
+            assert!(!is_err(&edge), "{}", text(&edge));
+        }
+
+        let got = handler
+            .loop_get(Parameters(LoopGetParams {
+                loop_id: lp.id.clone(),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&got), "{}", text(&got));
+        let json: serde_json::Value = serde_json::from_str(&raw_text(&got)).unwrap();
+        let nodes = json["specs"][0]["nodes"].as_array().unwrap();
+        let router_json = nodes
+            .iter()
+            .find(|n| n["id"] == router_id)
+            .expect("router node present in loop_get");
+        assert_eq!(router_json["kind"], "router");
+        let routes = router_json["routes"].as_array().expect("routes array");
+        assert_eq!(routes.len(), 2);
+        let retry_route = routes
+            .iter()
+            .find(|r| r["label"] == "retry")
+            .expect("retry route present");
+        assert_eq!(retry_route["fallback"], true);
+        assert_eq!(retry_route["to_node"], retry_target);
+        let escalate_route = routes
+            .iter()
+            .find(|r| r["label"] == "escalate")
+            .expect("escalate route present");
+        assert_eq!(escalate_route["fallback"], false);
+        assert_eq!(escalate_route["to_node"], escalate_target);
+    }
+
+    #[tokio::test]
+    async fn loop_add_node_router_rejects_fewer_than_two_routes_and_missing_fallback() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+
+        let too_few = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Router".to_string(),
+                kind: Some("router".to_string()),
+                config: Some(router_node_config(
+                    &serde_json::json!([{ "label": "retry", "description": "Retry." }]),
+                    "retry",
+                )),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&too_few));
+        assert!(text(&too_few).contains("at least 2 routes"));
+
+        let mut no_fallback_config = router_node_config(&two_routes(), "retry");
+        no_fallback_config.remove("fallback");
+        let no_fallback = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: Some(spec.id),
+                loop_id: None,
+                name: "Router".to_string(),
+                kind: Some("router".to_string()),
+                config: Some(no_fallback_config),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&no_fallback));
+        assert!(text(&no_fallback).contains("fallback"));
+    }
+
+    #[tokio::test]
+    async fn loop_add_edge_route_condition_rejects_undeclared_route_and_non_router_source() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+
+        let router_result = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Router".to_string(),
+                kind: Some("router".to_string()),
+                config: Some(router_node_config(&two_routes(), "retry")),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        let router_id = extract_id(&router_result, "node_id");
+        let target = add_agent_node(&handler, &spec.id, "Target").await;
+
+        let undeclared = handler
+            .loop_add_edge(Parameters(LoopAddEdgeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                from_node: router_id.clone(),
+                to_node: target.clone(),
+                condition: "route".to_string(),
+                route: Some("nonexistent".to_string()),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&undeclared));
+        assert!(text(&undeclared).contains("undeclared route"));
+
+        let non_router = add_agent_node(&handler, &spec.id, "Non-router source").await;
+        let wrong_source = handler
+            .loop_add_edge(Parameters(LoopAddEdgeParams {
+                spec_id: Some(spec.id),
+                loop_id: None,
+                from_node: non_router,
+                to_node: target,
+                condition: "route".to_string(),
+                route: Some("retry".to_string()),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&wrong_source));
+        assert!(text(&wrong_source).contains("router node"));
+    }
+
+    #[tokio::test]
+    async fn loop_update_node_router_enforces_route_coverage_and_edge_consistency() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+
+        let router_result = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Router".to_string(),
+                kind: Some("router".to_string()),
+                config: Some(router_node_config(&two_routes(), "retry")),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        let router_id = extract_id(&router_result, "node_id");
+        let retry_target = add_agent_node(&handler, &spec.id, "Retry target").await;
+
+        // Wire only the "retry" route — "escalate" is declared but not yet
+        // served by any edge.
+        let edge = handler
+            .loop_add_edge(Parameters(LoopAddEdgeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                from_node: router_id.clone(),
+                to_node: retry_target,
+                condition: "route".to_string(),
+                route: Some("retry".to_string()),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&edge), "{}", text(&edge));
+
+        // Re-asserting the same routes now that wiring has started must
+        // fail: "escalate" has no outgoing edge.
+        let no_coverage = handler
+            .loop_update_node(Parameters(LoopUpdateNodeParams {
+                node_id: router_id.clone(),
+                name: None,
+                kind: None,
+                config: Some(router_node_config(&two_routes(), "retry")),
+                position: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&no_coverage));
+        assert!(text(&no_coverage).contains("'escalate' has no outgoing edge"));
+
+        // Changing the declared routes so they no longer include "retry"
+        // leaves the existing retry-labeled edge dangling on an undeclared
+        // route.
+        let stale_edge = handler
+            .loop_update_node(Parameters(LoopUpdateNodeParams {
+                node_id: router_id.clone(),
+                name: None,
+                kind: None,
+                config: Some(router_node_config(
+                    &serde_json::json!([
+                        { "label": "escalate", "description": "Hand off to a human." },
+                        { "label": "abort", "description": "Give up." },
+                    ]),
+                    "escalate",
+                )),
+                position: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&stale_edge));
+        assert!(text(&stale_edge).contains("undeclared route 'retry'"));
     }
 
     // ── loop_add_ensemble ──────────────────────────────────────────
@@ -13620,10 +16613,12 @@ mod endpoint_tests {
             crate::daemon::params::EnsembleMemberParams {
                 platform: "claude".to_string(),
                 model: None,
+                prompt_override: None,
             },
             crate::daemon::params::EnsembleMemberParams {
                 platform: "opencode".to_string(),
                 model: None,
+                prompt_override: None,
             },
         ];
 
@@ -13757,7 +16752,10 @@ mod endpoint_tests {
         assert!(is_err(&missing));
 
         let listed = handler
-            .loop_list(Parameters(LoopListParams { workdir: None }))
+            .loop_list(Parameters(LoopListParams {
+                workdir: None,
+                include_archived: None,
+            }))
             .await
             .unwrap();
         assert!(raw_text(&listed).contains(&lp.id));
@@ -13765,10 +16763,386 @@ mod endpoint_tests {
         let filtered_out = handler
             .loop_list(Parameters(LoopListParams {
                 workdir: Some("/nowhere".to_string()),
+                include_archived: None,
             }))
             .await
             .unwrap();
         assert!(!raw_text(&filtered_out).contains(&lp.id));
+    }
+
+    /// `loop_get`'s node JSON must make an agent node's prompt source
+    /// visible: `"explicit"` for a `prompt_template`, `"preset"` for a
+    /// `prompt_preset`, and — the case this spec exists for — the node
+    /// running on the bare fallback nobody chose must be distinguishable
+    /// too, as `"default_fallback"`, without requiring a run first.
+    #[tokio::test]
+    async fn loop_get_reports_prompt_source_for_agent_nodes() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+
+        let mut explicit_config = agent_node_config("claude");
+        explicit_config.insert(
+            "prompt_template".to_string(),
+            serde_json::Value::String("do the thing".to_string()),
+        );
+        let explicit_id = extract_id(
+            &handler
+                .loop_add_node(Parameters(LoopAddNodeParams {
+                    spec_id: Some(spec.id.clone()),
+                    loop_id: None,
+                    name: "Explicit".to_string(),
+                    kind: Some("agent".to_string()),
+                    config: Some(explicit_config),
+                    blueprint: None,
+                    config_overrides: None,
+                }))
+                .await
+                .unwrap(),
+            "node_id",
+        );
+
+        let mut preset_config = agent_node_config("claude");
+        preset_config.insert(
+            "prompt_preset".to_string(),
+            serde_json::Value::String("implementer".to_string()),
+        );
+        let preset_id = extract_id(
+            &handler
+                .loop_add_node(Parameters(LoopAddNodeParams {
+                    spec_id: Some(spec.id.clone()),
+                    loop_id: None,
+                    name: "Preset".to_string(),
+                    kind: Some("agent".to_string()),
+                    config: Some(preset_config),
+                    blueprint: None,
+                    config_overrides: None,
+                }))
+                .await
+                .unwrap(),
+            "node_id",
+        );
+
+        let default_id = extract_id(
+            &handler
+                .loop_add_node(Parameters(LoopAddNodeParams {
+                    spec_id: Some(spec.id.clone()),
+                    loop_id: None,
+                    name: "Default".to_string(),
+                    kind: Some("agent".to_string()),
+                    config: Some(agent_node_config("claude")),
+                    blueprint: None,
+                    config_overrides: None,
+                }))
+                .await
+                .unwrap(),
+            "node_id",
+        );
+
+        let got = handler
+            .loop_get(Parameters(LoopGetParams {
+                loop_id: lp.id.clone(),
+            }))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw_text(&got)).unwrap();
+        let nodes = json["specs"][0]["nodes"].as_array().unwrap();
+        let prompt_source_of = |node_id: &str| -> String {
+            nodes
+                .iter()
+                .find(|n| n["id"] == node_id)
+                .unwrap_or_else(|| panic!("node {node_id} not found in {nodes:?}"))["prompt_source"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(prompt_source_of(&explicit_id), "explicit");
+        assert_eq!(prompt_source_of(&preset_id), "preset");
+        assert_eq!(prompt_source_of(&default_id), "default_fallback");
+    }
+
+    /// `loop_audit_node_configs` must find a node that predates write-time
+    /// validation and still carries a key its kind never reads — verified
+    /// against the exact incident shape (a `prompt` key on an agent node)
+    /// and resolving the owning loop through the node's spec, since a
+    /// spec-scoped node's own row has no `loop_id`.
+    #[tokio::test]
+    async fn loop_audit_node_configs_finds_node_with_ignored_prompt_key() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+
+        // Bypass `loop_add_node`'s validation to simulate a node that was
+        // written before this spec's check existed — exactly how loop
+        // `824de730-7fec-4031-800a-7933d2cf94c1`'s node
+        // `d0458fe0-24b8-4a29-8a69-7bb0e742e046` ended up carrying `prompt`.
+        let legacy_node = LoopNode {
+            id: uuid::Uuid::new_v4().to_string(),
+            spec_id: Some(spec.id.clone()),
+            loop_id: None,
+            name: "Legacy Implementer".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "claude", "prompt": "implement the spec"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+        db.insert_loop_node(&legacy_node).unwrap();
+
+        // A clean node must not show up in the audit.
+        let clean_node = insert_named_node(&db, &spec.id, "Clean", 2);
+
+        let audited = handler.loop_audit_node_configs().await.unwrap();
+        assert!(!is_err(&audited), "{}", text(&audited));
+        let json: serde_json::Value = serde_json::from_str(&raw_text(&audited)).unwrap();
+        let flagged = json["flagged_nodes"].as_array().unwrap();
+        assert_eq!(flagged.len(), 1);
+        let flagged_node = &flagged[0];
+        assert_eq!(flagged_node["node_id"], legacy_node.id);
+        assert_eq!(flagged_node["loop_id"], lp.id);
+        assert_eq!(flagged_node["unknown_keys"], serde_json::json!(["prompt"]));
+        assert!(flagged.iter().all(|n| n["node_id"] != clean_node.id));
+    }
+
+    // ── loop_node_runs_list / loop_node_run_get ────────────────────
+
+    fn insert_named_node(db: &Database, spec_id: &str, name: &str, position: i64) -> LoopNode {
+        let node = LoopNode {
+            id: uuid::Uuid::new_v4().to_string(),
+            spec_id: Some(spec_id.to_string()),
+            loop_id: None,
+            name: name.to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "claude"}),
+            position,
+            created_at: chrono::Utc::now(),
+        };
+        db.insert_loop_node(&node).unwrap();
+        node
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_finalized_node_run(
+        db: &Database,
+        loop_id: &str,
+        spec_id: &str,
+        node_id: &str,
+        status: LoopRunStatus,
+        output: Option<serde_json::Value>,
+        started_at: chrono::DateTime<chrono::Utc>,
+    ) -> LoopNodeRun {
+        let run = LoopNodeRun {
+            id: uuid::Uuid::new_v4().to_string(),
+            loop_id: loop_id.to_string(),
+            spec_id: spec_id.to_string(),
+            node_id: node_id.to_string(),
+            status,
+            input: None,
+            output,
+            started_at,
+            completed_at: Some(started_at),
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: Some("ses_test_123".to_string()),
+        };
+        db.insert_loop_run(&run).unwrap();
+        run
+    }
+
+    #[tokio::test]
+    async fn loop_node_runs_list_defaults_to_most_recent_first_and_resolves_node_name() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let node_a = insert_named_node(&db, &spec.id, "build", 1);
+        let node_b = insert_named_node(&db, &spec.id, "review", 2);
+
+        let now = chrono::Utc::now();
+        let older = insert_finalized_node_run(
+            &db,
+            &lp.id,
+            &spec.id,
+            &node_a.id,
+            LoopRunStatus::Pass,
+            Some(serde_json::json!({"reported_output": "ok"})),
+            now - chrono::Duration::minutes(10),
+        );
+        let newer = insert_finalized_node_run(
+            &db,
+            &lp.id,
+            &spec.id,
+            &node_b.id,
+            LoopRunStatus::Fail,
+            Some(serde_json::json!({"stderr": "Error: Unsupported model mimo-auto"})),
+            now,
+        );
+
+        let listed = handler
+            .loop_node_runs_list(Parameters(LoopNodeRunsListParams {
+                loop_id: lp.id.clone(),
+                spec_id: None,
+                node_id: None,
+                limit: None,
+                offset: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&listed), "{}", text(&listed));
+        let body = raw_text(&listed);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let runs = parsed["runs"].as_array().unwrap();
+        assert_eq!(
+            runs[0]["id"], newer.id,
+            "the most recently started run must lead the default listing"
+        );
+        assert_eq!(runs[1]["id"], older.id);
+        assert_eq!(runs[0]["node_name"], "review");
+        assert_eq!(runs[0]["status"], "fail");
+        assert_eq!(runs[0]["session_id"], "ses_test_123");
+        assert!(
+            runs[0].get("output").is_none(),
+            "list responses must omit output — fetch it via loop_node_run_get"
+        );
+
+        let unknown_loop = handler
+            .loop_node_runs_list(Parameters(LoopNodeRunsListParams {
+                loop_id: "ghost".to_string(),
+                spec_id: None,
+                node_id: None,
+                limit: None,
+                offset: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&unknown_loop));
+    }
+
+    #[tokio::test]
+    async fn loop_node_runs_list_filters_by_spec_and_node_and_respects_limit() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec1 = insert_test_spec(&db, &lp.id, 1);
+        let spec2 = insert_test_spec(&db, &lp.id, 2);
+        let node1 = insert_named_node(&db, &spec1.id, "node1", 1);
+        let node2 = insert_named_node(&db, &spec2.id, "node2", 1);
+        let now = chrono::Utc::now();
+        insert_finalized_node_run(
+            &db,
+            &lp.id,
+            &spec1.id,
+            &node1.id,
+            LoopRunStatus::Pass,
+            None,
+            now - chrono::Duration::minutes(2),
+        );
+        let spec2_run = insert_finalized_node_run(
+            &db,
+            &lp.id,
+            &spec2.id,
+            &node2.id,
+            LoopRunStatus::Pass,
+            None,
+            now - chrono::Duration::minutes(1),
+        );
+        insert_finalized_node_run(
+            &db,
+            &lp.id,
+            &spec1.id,
+            &node1.id,
+            LoopRunStatus::Fail,
+            None,
+            now,
+        );
+
+        let by_spec = handler
+            .loop_node_runs_list(Parameters(LoopNodeRunsListParams {
+                loop_id: lp.id.clone(),
+                spec_id: Some(spec2.id.clone()),
+                node_id: None,
+                limit: None,
+                offset: None,
+            }))
+            .await
+            .unwrap();
+        let by_spec_runs = serde_json::from_str::<serde_json::Value>(&raw_text(&by_spec)).unwrap()
+            ["runs"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(by_spec_runs.len(), 1);
+        assert_eq!(by_spec_runs[0]["id"], spec2_run.id);
+
+        let limited = handler
+            .loop_node_runs_list(Parameters(LoopNodeRunsListParams {
+                loop_id: lp.id.clone(),
+                spec_id: None,
+                node_id: None,
+                limit: Some(1),
+                offset: None,
+            }))
+            .await
+            .unwrap();
+        let limited_runs = serde_json::from_str::<serde_json::Value>(&raw_text(&limited)).unwrap()
+            ["runs"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(limited_runs.len(), 1, "limit must bound the page size");
+        assert_eq!(
+            limited_runs[0]["status"], "fail",
+            "the single returned run must be the most recent one"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_node_run_get_returns_full_output_and_redacts_secrets() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let node = insert_named_node(&db, &spec.id, "resilience", 1);
+        let run = insert_finalized_node_run(
+            &db,
+            &lp.id,
+            &spec.id,
+            &node.id,
+            LoopRunStatus::Fail,
+            Some(serde_json::json!({
+                "cli": "mimocode",
+                "stderr": "Error: Unsupported model mimo-auto",
+                "stdout": "leaked token=abcdefghij1234567890 in output",
+                "infra_attempt": 1,
+                "infra_crash": true,
+            })),
+            chrono::Utc::now(),
+        );
+
+        let got = handler
+            .loop_node_run_get(Parameters(LoopNodeRunGetParams {
+                run_id: run.id.clone(),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&got), "{}", text(&got));
+        let body = raw_text(&got);
+        assert!(body.contains("Unsupported model mimo-auto"));
+        assert!(body.contains("\"node_name\": \"resilience\""));
+        assert!(
+            body.contains("\"infra_attempt\": 1") && body.contains("\"infra_crash\": true"),
+            "B19 infra markers must survive verbatim: {body}"
+        );
+        assert!(
+            !body.contains("abcdefghij1234567890"),
+            "a token-shaped value must be redacted, not passed through: {body}"
+        );
+        assert!(body.contains("[REDACTED]"));
+
+        let missing = handler
+            .loop_node_run_get(Parameters(LoopNodeRunGetParams {
+                run_id: "ghost-run".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&missing));
     }
 
     // ── loop_pause / loop_continue ────────────────────────────────
@@ -13955,6 +17329,65 @@ mod endpoint_tests {
         );
     }
 
+    /// The defect this closes (2026-08-06, loop 824de730): a spec that dies
+    /// because a FAILING node has no outgoing edge left no blocker anywhere
+    /// a human could see from `loop_list` — the engine now derives one onto
+    /// the terminating run (`LoopEngine::record_terminal_blocker`), and
+    /// `loop_list` picks it up through the unchanged `loop_run_blocker`
+    /// read path, with no MCP-side change required.
+    #[tokio::test]
+    async fn loop_list_reports_blocked_for_a_spec_that_dead_ends_on_a_failing_node() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        db.insert_loop_node(&LoopNode {
+            id: "dead-end".to_string(),
+            spec_id: Some(spec.id.clone()),
+            loop_id: None,
+            name: "dead-end".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "exit 1",
+                "success_condition": "exit_code_0",
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        // No outgoing edge from "dead-end" for either status — the spec
+        // terminates right there.
+
+        handler
+            .loop_engine
+            .run_loop(lp.id.clone(), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.get_loop_spec(&spec.id).unwrap().unwrap().status,
+            LoopSpecStatus::Failed
+        );
+
+        let listed = handler
+            .loop_list(Parameters(LoopListParams {
+                workdir: None,
+                include_archived: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&listed), "{}", text(&listed));
+        let value: serde_json::Value = serde_json::from_str(&raw_text(&listed)).unwrap();
+        let entry = value
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["id"] == lp.id)
+            .expect("loop must appear in loop_list");
+        assert_eq!(entry["blocked"], serde_json::json!(true));
+        let blocker = entry["blocker"].as_str().expect("blocker must be a string");
+        assert!(blocker.contains("dead-end"), "blocker: {blocker}");
+    }
+
     // ── loop_copy_node / loop_copy_ensemble ───────────────────────
 
     #[tokio::test]
@@ -14038,10 +17471,12 @@ mod endpoint_tests {
                     crate::daemon::params::EnsembleMemberParams {
                         platform: "claude".to_string(),
                         model: None,
+                        prompt_override: None,
                     },
                     crate::daemon::params::EnsembleMemberParams {
                         platform: "opencode".to_string(),
                         model: None,
+                        prompt_override: None,
                     },
                 ]),
                 blueprint: None,
@@ -14106,6 +17541,125 @@ mod endpoint_tests {
         assert!(is_err(&missing_source));
     }
 
+    /// A member's `prompt_override` replaces the shared `prompt_template` for
+    /// that member only — everything else (platform/model semantics, the
+    /// other members, `loop_get`'s prompt_source, and `loop_copy_ensemble`
+    /// carrying it forward) keeps working exactly as before this field
+    /// existed.
+    #[tokio::test]
+    async fn loop_add_ensemble_member_prompt_override_replaces_shared_prompt_for_that_member_only()
+    {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let entry = add_agent_node(&handler, &spec.id, "Entry").await;
+        let arbiter = add_agent_node(&handler, &spec.id, "Arbiter").await;
+
+        let created = handler
+            .loop_add_ensemble(Parameters(LoopAddEnsembleParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Panel".to_string(),
+                prompt_template: Some("shared review prompt".to_string()),
+                members: Some(vec![
+                    crate::daemon::params::EnsembleMemberParams {
+                        platform: "claude".to_string(),
+                        model: None,
+                        prompt_override: Some("review for security issues".to_string()),
+                    },
+                    crate::daemon::params::EnsembleMemberParams {
+                        platform: "codex".to_string(),
+                        model: None,
+                        prompt_override: None,
+                    },
+                ]),
+                blueprint: None,
+                from_node: entry,
+                condition: "always".to_string(),
+                min_pass: Some(2),
+                straggler_timeout_minutes: None,
+                timeout_minutes: None,
+                on_pass_to: arbiter,
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&created), "{}", text(&created));
+        let ensemble_id = extract_id(&created, "ensemble_id");
+        let details = db.get_ensemble_details(&ensemble_id).unwrap().unwrap();
+
+        // Platform/model are untouched by the override — it's an independent
+        // knob, not a replacement for them.
+        assert_eq!(details.members[0].platform, "claude");
+        assert_eq!(
+            details.members[0].prompt_override.as_deref(),
+            Some("review for security issues")
+        );
+        assert_eq!(details.members[1].prompt_override, None);
+
+        let overridden_node = db
+            .get_loop_node(&details.members[0].node_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            overridden_node
+                .config
+                .get("prompt_template")
+                .and_then(|v| v.as_str()),
+            Some("review for security issues")
+        );
+        let shared_node = db
+            .get_loop_node(&details.members[1].node_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            shared_node
+                .config
+                .get("prompt_template")
+                .and_then(|v| v.as_str()),
+            Some("shared review prompt")
+        );
+
+        // loop_get's ensemble view distinguishes shared vs. override per
+        // member without the caller having to diff node config themselves.
+        let ensembles_json = crate::daemon::handler::ensemble_details_json(&details);
+        let members_json = ensembles_json["members"].as_array().unwrap();
+        assert_eq!(members_json[0]["prompt_source"], "override");
+        assert_eq!(members_json[1]["prompt_source"], "shared");
+
+        // Copying without replacing members carries each member's own
+        // override (or lack of one) forward into the copy.
+        let copied = handler
+            .loop_copy_ensemble(Parameters(LoopCopyEnsembleParams {
+                source_ensemble_id: ensemble_id.clone(),
+                spec_id: None,
+                loop_id: None,
+                name: Some("Panel copy".to_string()),
+                prompt_template: None,
+                members: None,
+                min_pass: None,
+                timeout_minutes: None,
+                straggler_timeout_minutes: None,
+                from_node: None,
+                condition: None,
+                on_pass_to: None,
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&copied), "{}", text(&copied));
+        let copied_ensemble_id = extract_id(&copied, "ensemble_id");
+        let copied_details = db
+            .get_ensemble_details(&copied_ensemble_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            copied_details.members[0].prompt_override.as_deref(),
+            Some("review for security issues")
+        );
+        assert_eq!(copied_details.members[1].prompt_override, None);
+    }
+
     // ── loop_update_ensemble ────────────────────────────────────────
 
     #[tokio::test]
@@ -14127,10 +17681,12 @@ mod endpoint_tests {
                     crate::daemon::params::EnsembleMemberParams {
                         platform: "claude".to_string(),
                         model: None,
+                        prompt_override: None,
                     },
                     crate::daemon::params::EnsembleMemberParams {
                         platform: "opencode".to_string(),
                         model: None,
+                        prompt_override: None,
                     },
                 ]),
                 blueprint: None,
@@ -14190,14 +17746,17 @@ mod endpoint_tests {
                     crate::daemon::params::EnsembleMemberParams {
                         platform: "claude".to_string(),
                         model: None,
+                        prompt_override: None,
                     },
                     crate::daemon::params::EnsembleMemberParams {
                         platform: "opencode".to_string(),
                         model: None,
+                        prompt_override: None,
                     },
                     crate::daemon::params::EnsembleMemberParams {
                         platform: "gemini".to_string(),
                         model: None,
+                        prompt_override: Some("Review only for test coverage gaps.".to_string()),
                     },
                 ]),
                 min_pass: None,
@@ -14211,6 +17770,26 @@ mod endpoint_tests {
         assert!(!is_err(&grown), "{}", text(&grown));
         let details = db.get_ensemble_details(&ensemble_id).unwrap().unwrap();
         assert_eq!(details.members.len(), 3);
+        // The new member's own prompt_override is persisted on the ensemble
+        // row and propagated into its node config as the effective prompt,
+        // while the other two still carry no override.
+        assert_eq!(details.members[0].prompt_override, None);
+        assert_eq!(details.members[1].prompt_override, None);
+        assert_eq!(
+            details.members[2].prompt_override.as_deref(),
+            Some("Review only for test coverage gaps.")
+        );
+        let gemini_node = db
+            .get_loop_node(&details.members[2].node_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            gemini_node
+                .config
+                .get("prompt_template")
+                .and_then(|v| v.as_str()),
+            Some("Review only for test coverage gaps.")
+        );
 
         // Shrink membership 3 -> 2.
         let shrunk = handler
@@ -14221,10 +17800,12 @@ mod endpoint_tests {
                     crate::daemon::params::EnsembleMemberParams {
                         platform: "claude".to_string(),
                         model: None,
+                        prompt_override: None,
                     },
                     crate::daemon::params::EnsembleMemberParams {
                         platform: "opencode".to_string(),
                         model: None,
+                        prompt_override: None,
                     },
                 ]),
                 min_pass: None,
@@ -14435,6 +18016,218 @@ mod endpoint_tests {
         assert!(is_err(&missing_root));
     }
 
+    // ── intelligence_delete_node / intelligence_delete_relation ──────────
+
+    async fn upsert_intel_fact(
+        handler: &TaskTriggerHandler,
+        id: &str,
+        title: &str,
+        relations: Option<Vec<IntelligenceRelationParams>>,
+    ) {
+        let result = handler
+            .intelligence_upsert(
+                Parameters(IntelligenceUpsertParams {
+                    node_data: IntelligenceNodeParams {
+                        id: Some(id.to_string()),
+                        kind: "fact".to_string(),
+                        title: title.to_string(),
+                        body: "Test body".to_string(),
+                        metadata: None,
+                        project_hash: None,
+                        session_id: None,
+                        relations,
+                    },
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(!is_err(&result), "{}", text(&result));
+    }
+
+    #[tokio::test]
+    async fn intelligence_delete_node_removes_node_and_reports_relations() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let _agent_guard = AgentIdVar::set("agent-intel-delete-1");
+
+        upsert_intel_fact(&handler, "delete-a", "Node A", None).await;
+        upsert_intel_fact(
+            &handler,
+            "delete-b",
+            "Node B",
+            Some(vec![IntelligenceRelationParams {
+                to_node_id: "delete-a".to_string(),
+                relation: "supports".to_string(),
+                weight: None,
+            }]),
+        )
+        .await;
+        upsert_intel_fact(
+            &handler,
+            "delete-c",
+            "Node C",
+            Some(vec![IntelligenceRelationParams {
+                to_node_id: "delete-b".to_string(),
+                relation: "supports".to_string(),
+                weight: None,
+            }]),
+        )
+        .await;
+
+        // "delete-b" sits in the middle of a -> b, b -> c: two edges touch it.
+        let deleted = handler
+            .intelligence_delete_node(
+                Parameters(IntelligenceDeleteNodeParams {
+                    node_id: "delete-b".to_string(),
+                    project_hash: None,
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(!is_err(&deleted), "{}", text(&deleted));
+        let body = raw_text(&deleted);
+        assert!(body.contains("delete-b"));
+        assert!(body.contains("\"relations_removed\": 2"));
+
+        let searched = handler
+            .intelligence_search(
+                Parameters(IntelligenceSearchParams {
+                    query: "Node B".to_string(),
+                    kind: None,
+                    limit: Some(5),
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(!raw_text(&searched).contains("delete-b"));
+
+        // Neither surviving neighbor's graph walk should error or reference
+        // the removed middle node.
+        let from_a = handler
+            .intelligence_graph_walk(Parameters(IntelligenceGraphWalkParams {
+                node_id: "delete-a".to_string(),
+                depth: Some(3),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&from_a), "{}", text(&from_a));
+        assert!(!raw_text(&from_a).contains("delete-b"));
+
+        let from_c = handler
+            .intelligence_graph_walk(Parameters(IntelligenceGraphWalkParams {
+                node_id: "delete-c".to_string(),
+                depth: Some(3),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&from_c), "{}", text(&from_c));
+        assert!(!raw_text(&from_c).contains("delete-b"));
+    }
+
+    #[tokio::test]
+    async fn intelligence_delete_node_missing_id_returns_error_not_silent_success() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let _agent_guard = AgentIdVar::set("agent-intel-delete-2");
+
+        let deleted = handler
+            .intelligence_delete_node(
+                Parameters(IntelligenceDeleteNodeParams {
+                    node_id: "ghost-node".to_string(),
+                    project_hash: None,
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(is_err(&deleted));
+    }
+
+    #[tokio::test]
+    async fn intelligence_delete_relation_removes_edge_leaves_nodes_intact() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let _agent_guard = AgentIdVar::set("agent-intel-delete-3");
+
+        upsert_intel_fact(&handler, "rel-a", "Node A", None).await;
+        upsert_intel_fact(
+            &handler,
+            "rel-b",
+            "Node B",
+            Some(vec![IntelligenceRelationParams {
+                to_node_id: "rel-a".to_string(),
+                relation: "supports".to_string(),
+                weight: None,
+            }]),
+        )
+        .await;
+
+        let walked = handler
+            .intelligence_graph_walk(Parameters(IntelligenceGraphWalkParams {
+                node_id: "rel-b".to_string(),
+                depth: Some(1),
+            }))
+            .await
+            .unwrap();
+        let edge_id = serde_json::from_str::<serde_json::Value>(&raw_text(&walked))
+            .unwrap()
+            .get("edges")
+            .and_then(|edges| edges.as_array())
+            .and_then(|edges| edges.first())
+            .and_then(|edge| edge.get("id"))
+            .and_then(|id| id.as_i64())
+            .expect("edge id present in graph walk response");
+
+        let deleted = handler
+            .intelligence_delete_relation(
+                Parameters(IntelligenceDeleteRelationParams {
+                    edge_id,
+                    project_hash: None,
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(!is_err(&deleted), "{}", text(&deleted));
+
+        let walked_after = handler
+            .intelligence_graph_walk(Parameters(IntelligenceGraphWalkParams {
+                node_id: "rel-b".to_string(),
+                depth: Some(1),
+            }))
+            .await
+            .unwrap();
+        assert!(!raw_text(&walked_after).contains("rel-a"));
+
+        // Both endpoint nodes survive the relation delete.
+        let searched = handler
+            .intelligence_search(
+                Parameters(IntelligenceSearchParams {
+                    query: "Node".to_string(),
+                    kind: Some("fact".to_string()),
+                    limit: Some(10),
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        let search_body = raw_text(&searched);
+        assert!(search_body.contains("rel-a"));
+        assert!(search_body.contains("rel-b"));
+
+        let missing = handler
+            .intelligence_delete_relation(
+                Parameters(IntelligenceDeleteRelationParams {
+                    edge_id,
+                    project_hash: None,
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(is_err(&missing));
+    }
+
     #[tokio::test]
     async fn intelligence_get_context_light_and_full() {
         let (_dir, _db, handler) = endpoint_test_handler();
@@ -14615,6 +18408,95 @@ mod endpoint_tests {
             .await
             .unwrap();
         assert!(is_err(&missing));
+    }
+
+    // ── project_remap ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn project_remap_moves_project_to_new_path() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        let base = tempdir().unwrap();
+        let old_dir = base.path().join("cadforge");
+        let new_dir = base.path().join("cadspec");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::create_dir_all(&new_dir).unwrap();
+        let project = db.register_project_path(&old_dir).unwrap();
+        db.insert_terminal_session("t-1", "t-1", "bash", &project.path)
+            .unwrap();
+
+        let result = handler
+            .project_remap(Parameters(ProjectRemapParams {
+                project_hash: project.hash.clone(),
+                new_path: new_dir.to_string_lossy().to_string(),
+                dry_run: None,
+                force: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&result), "{}", text(&result));
+        let body = raw_text(&result);
+        assert!(body.contains("\"kind\": \"move\""));
+        assert!(body.contains("\"rows_moved\": 2"));
+
+        assert!(db.get_project(&project.hash).unwrap().is_none());
+        let new_canonical = std::fs::canonicalize(&new_dir).unwrap();
+        let moved = db
+            .get_project_by_path(&new_canonical)
+            .unwrap()
+            .expect("project moved to new path");
+        assert_eq!(
+            db.project_dependent_counts(&moved.path)
+                .unwrap()
+                .terminal_sessions,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn project_remap_dry_run_changes_nothing() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        let base = tempdir().unwrap();
+        let old_dir = base.path().join("old-loc");
+        let new_dir = base.path().join("new-loc");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::create_dir_all(&new_dir).unwrap();
+        let project = db.register_project_path(&old_dir).unwrap();
+
+        let result = handler
+            .project_remap(Parameters(ProjectRemapParams {
+                project_hash: project.hash.clone(),
+                new_path: new_dir.to_string_lossy().to_string(),
+                dry_run: Some(true),
+                force: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&result), "{}", text(&result));
+        assert!(raw_text(&result).contains("\"dry_run\": true"));
+
+        // Nothing actually moved.
+        assert!(db.get_project(&project.hash).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn project_remap_refuses_missing_path_without_force() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        let base = tempdir().unwrap();
+        let old_dir = base.path().join("still-here");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        let project = db.register_project_path(&old_dir).unwrap();
+
+        let result = handler
+            .project_remap(Parameters(ProjectRemapParams {
+                project_hash: project.hash.clone(),
+                new_path: "/definitely/does/not/exist/anywhere".to_string(),
+                dry_run: None,
+                force: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&result));
+        assert!(db.get_project(&project.hash).unwrap().is_some());
     }
 
     // ── skill_list / skill_get ──
