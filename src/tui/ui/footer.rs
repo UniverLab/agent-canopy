@@ -46,6 +46,17 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Them
                 let is_bg = matches!(app.selected_agent(), Some(AgentEntry::Agent(_)));
                 let mut h = vec![("↑↓", "nav"), ("Enter", "focus"), ("Shift+←→", "tab")];
                 if on_loop {
+                    // Run-time controls apply only to the live (non-archived)
+                    // list — an archived loop is inert until restored.
+                    if !app.loop_view_archived {
+                        if let Some(lp) = app.selected_loop() {
+                            for action in crate::tui::app::dialog::available_loop_actions(lp.status)
+                            {
+                                h.push((action.key(), action.label()));
+                            }
+                            h.push(("a", "autorun"));
+                        }
+                    }
                     h.push(("e", "edit"));
                     if app.loop_view_archived {
                         h.push(("R", "restore"));
@@ -739,5 +750,105 @@ mod tests {
             text.contains("search"),
             "Agent playground footer should show 'search': {text}"
         );
+    }
+
+    fn loop_with_status(status: crate::domain::loops::LoopStatus) -> crate::domain::loops::Loop {
+        crate::domain::loops::Loop {
+            archived: false,
+            id: "lp1".to_string(),
+            name: "Nightly review".to_string(),
+            description: None,
+            workdir: "/tmp".to_string(),
+            status,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        }
+    }
+
+    fn app_on_loop(status: crate::domain::loops::LoopStatus) -> App {
+        let mut app = make_app();
+        app.focus = Focus::Preview;
+        app.sidebar_layer = SidebarLayer::Automation;
+        app.automation_kind = crate::tui::app::AutomationKind::Loop;
+        app.loops = vec![loop_with_status(status)];
+        app.selected_loop_id = Some("lp1".to_string());
+        app
+    }
+
+    #[test]
+    fn footer_on_a_running_loop_offers_only_pause() {
+        let app = app_on_loop(crate::domain::loops::LoopStatus::Running);
+        let theme = Theme::classic();
+        let text = render_footer_to_text(200, 1, |frame, area| {
+            draw_footer(frame, area, &app, &theme);
+        });
+        assert!(text.contains("pause"), "{text}");
+        // "autorun" is always offered and legitimately contains "run" as a
+        // substring — check for the standalone "r run" hint (key + label)
+        // instead, so this doesn't false-positive on "a autorun".
+        assert!(!text.contains("r run"), "{text}");
+        assert!(!text.contains("reset"), "{text}");
+        assert!(!text.contains("continue"), "{text}");
+    }
+
+    #[test]
+    fn footer_on_a_paused_loop_offers_both_continue_modes() {
+        let app = app_on_loop(crate::domain::loops::LoopStatus::Paused);
+        let theme = Theme::classic();
+        let text = render_footer_to_text(200, 1, |frame, area| {
+            draw_footer(frame, area, &app, &theme);
+        });
+        assert!(text.contains("continue (retry)"), "{text}");
+        assert!(text.contains("continue (skip spec)"), "{text}");
+        assert!(!text.contains("pause"), "{text}");
+    }
+
+    #[test]
+    fn footer_on_a_completed_loop_offers_reset_and_run() {
+        let app = app_on_loop(crate::domain::loops::LoopStatus::Completed);
+        let theme = Theme::classic();
+        let text = render_footer_to_text(200, 1, |frame, area| {
+            draw_footer(frame, area, &app, &theme);
+        });
+        assert!(text.contains("reset"), "{text}");
+        assert!(text.contains("run"), "{text}");
+        assert!(!text.contains("pause"), "{text}");
+    }
+
+    #[test]
+    fn footer_always_offers_autorun_for_a_selected_live_loop() {
+        for status in [
+            crate::domain::loops::LoopStatus::Draft,
+            crate::domain::loops::LoopStatus::Running,
+            crate::domain::loops::LoopStatus::Paused,
+            crate::domain::loops::LoopStatus::Completed,
+            crate::domain::loops::LoopStatus::Failed,
+        ] {
+            let app = app_on_loop(status);
+            let theme = Theme::classic();
+            let text = render_footer_to_text(200, 1, |frame, area| {
+                draw_footer(frame, area, &app, &theme);
+            });
+            assert!(text.contains("autorun"), "status {status:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn footer_omits_run_time_controls_in_the_archived_view() {
+        let mut app = app_on_loop(crate::domain::loops::LoopStatus::Completed);
+        app.loop_view_archived = true;
+        let theme = Theme::classic();
+        let text = render_footer_to_text(200, 1, |frame, area| {
+            draw_footer(frame, area, &app, &theme);
+        });
+        assert!(!text.contains("autorun"), "{text}");
+        assert!(!text.contains("reset"), "{text}");
     }
 }

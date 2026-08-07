@@ -167,6 +167,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         dialogs::draw_archive_loop_confirm(frame, &theme);
     } else if app.permanent_delete_loop_confirm {
         dialogs::draw_permanent_delete_loop_confirm(frame, &theme);
+    } else if app.loop_reset_confirm {
+        dialogs::draw_loop_reset_confirm(frame, app, &theme);
+    }
+
+    if app.loop_autorun_dialog.is_some() {
+        dialogs::draw_loop_autorun_dialog(frame, app, &theme);
+    }
+
+    if app.loop_action_message.is_some() {
+        dialogs::draw_loop_action_message(frame, app, &theme);
     }
 
     if app.show_legend {

@@ -108,6 +108,37 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
         }
         return Ok(());
     }
+    if app.loop_reset_confirm {
+        match code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                app.confirm_reset_selected_loop();
+                app.loop_reset_confirm = false;
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                app.loop_reset_confirm = false;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+    if app.loop_autorun_dialog.is_some() {
+        match code {
+            KeyCode::Esc => app.close_loop_autorun_dialog(),
+            KeyCode::Enter => app.submit_loop_autorun_dialog(),
+            KeyCode::Backspace => {
+                if let Some(dialog) = app.loop_autorun_dialog.as_mut() {
+                    dialog.input.pop();
+                }
+            }
+            KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(dialog) = app.loop_autorun_dialog.as_mut() {
+                    dialog.input.push(c);
+                }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
     if handle_playground_key(app, code, modifiers) {
         return Ok(());
     }
@@ -209,6 +240,29 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
             if !app.agents_rag_focused && app.sidebar_layer != SidebarLayer::Knowledge =>
         {
             let _ = app.toggle_enable();
+        }
+        // Loop run-time controls (run/pause/continue/reset/autorun),
+        // delegated to the daemon's MCP tools — see
+        // `app::dialog::loop_control`. Only the action valid for the
+        // focused loop's current status actually does anything; the others
+        // are simply absent from the footer's hints.
+        KeyCode::Char('r') if on_loop => {
+            app.run_selected_loop();
+        }
+        KeyCode::Char('p') if on_loop => {
+            app.pause_selected_loop();
+        }
+        KeyCode::Char('c') if on_loop => {
+            app.continue_selected_loop_retry();
+        }
+        KeyCode::Char('C') if on_loop => {
+            app.continue_selected_loop_skip();
+        }
+        KeyCode::Char('x') if on_loop => {
+            app.open_loop_reset_confirm();
+        }
+        KeyCode::Char('a') if on_loop => {
+            app.open_loop_autorun_dialog();
         }
         KeyCode::Char('r')
             if !app.agents_rag_focused && app.sidebar_layer != SidebarLayer::Knowledge =>
@@ -1180,5 +1234,208 @@ mod preview_key_tests {
         app.agents = vec![AgentEntry::Agent(cron_agent("a1"))];
         app.selected = 0;
         let _ = handle_preview_key(&mut app, KeyCode::Char('e'), KeyModifiers::NONE);
+    }
+
+    // ── Loop run-time controls ──────────────────────────────────────
+
+    fn loop_with_status(status: crate::domain::loops::LoopStatus) -> crate::domain::loops::Loop {
+        crate::domain::loops::Loop {
+            archived: false,
+            id: "lp1".to_string(),
+            name: "Nightly review".to_string(),
+            description: None,
+            workdir: "/tmp".to_string(),
+            status,
+            trigger: None,
+            created_at: Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        }
+    }
+
+    fn app_on_loop(status: crate::domain::loops::LoopStatus) -> App {
+        let mut app = app_with_agents();
+        app.focus = Focus::Preview;
+        app.sidebar_layer = SidebarLayer::Automation;
+        app.automation_kind = crate::tui::app::AutomationKind::Loop;
+        app.loops = vec![loop_with_status(status)];
+        app.selected_loop_id = Some("lp1".to_string());
+        app
+    }
+
+    #[test]
+    fn preview_r_on_a_completed_loop_dispatches_run() {
+        let mut app = app_on_loop(crate::domain::loops::LoopStatus::Completed);
+        handle_preview_key(&mut app, KeyCode::Char('r'), KeyModifiers::NONE).unwrap();
+        assert!(app.loop_action_pending);
+        assert!(app.loop_action_rx.is_some());
+    }
+
+    #[test]
+    fn preview_r_on_a_running_loop_is_not_bound() {
+        // Run is not a valid action for a running loop (decision 3) — 'r'
+        // must be a no-op, not a dispatch the daemon then refuses.
+        let mut app = app_on_loop(crate::domain::loops::LoopStatus::Running);
+        handle_preview_key(&mut app, KeyCode::Char('r'), KeyModifiers::NONE).unwrap();
+        assert!(!app.loop_action_pending);
+        assert!(app.loop_action_rx.is_none());
+    }
+
+    #[test]
+    fn preview_p_on_a_running_loop_dispatches_pause() {
+        let mut app = app_on_loop(crate::domain::loops::LoopStatus::Running);
+        handle_preview_key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE).unwrap();
+        assert!(app.loop_action_pending);
+    }
+
+    #[test]
+    fn preview_p_on_a_non_running_loop_is_not_bound() {
+        let mut app = app_on_loop(crate::domain::loops::LoopStatus::Draft);
+        handle_preview_key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE).unwrap();
+        assert!(!app.loop_action_pending);
+    }
+
+    #[test]
+    fn preview_c_and_shift_c_on_a_paused_loop_dispatch_continue() {
+        let mut app = app_on_loop(crate::domain::loops::LoopStatus::Paused);
+        handle_preview_key(&mut app, KeyCode::Char('c'), KeyModifiers::NONE).unwrap();
+        assert!(app.loop_action_pending);
+
+        let mut app = app_on_loop(crate::domain::loops::LoopStatus::Paused);
+        handle_preview_key(&mut app, KeyCode::Char('C'), KeyModifiers::SHIFT).unwrap();
+        assert!(app.loop_action_pending);
+    }
+
+    #[test]
+    fn preview_continue_keys_on_a_non_paused_loop_are_not_bound() {
+        let mut app = app_on_loop(crate::domain::loops::LoopStatus::Running);
+        handle_preview_key(&mut app, KeyCode::Char('c'), KeyModifiers::NONE).unwrap();
+        assert!(!app.loop_action_pending);
+        handle_preview_key(&mut app, KeyCode::Char('C'), KeyModifiers::SHIFT).unwrap();
+        assert!(!app.loop_action_pending);
+    }
+
+    #[test]
+    fn preview_x_on_a_completed_loop_opens_reset_confirm() {
+        let mut app = app_on_loop(crate::domain::loops::LoopStatus::Completed);
+        handle_preview_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE).unwrap();
+        assert!(app.loop_reset_confirm);
+    }
+
+    #[test]
+    fn preview_x_on_a_running_loop_is_not_bound() {
+        let mut app = app_on_loop(crate::domain::loops::LoopStatus::Running);
+        handle_preview_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE).unwrap();
+        assert!(!app.loop_reset_confirm);
+    }
+
+    #[test]
+    fn loop_reset_confirm_y_dispatches_reset_and_closes_the_modal() {
+        let mut app = app_on_loop(crate::domain::loops::LoopStatus::Failed);
+        app.loop_reset_confirm = true;
+        handle_preview_key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE).unwrap();
+        assert!(!app.loop_reset_confirm);
+        assert!(app.loop_action_pending);
+    }
+
+    #[test]
+    fn loop_reset_confirm_n_cancels_without_dispatching() {
+        let mut app = app_on_loop(crate::domain::loops::LoopStatus::Failed);
+        app.loop_reset_confirm = true;
+        handle_preview_key(&mut app, KeyCode::Char('n'), KeyModifiers::NONE).unwrap();
+        assert!(!app.loop_reset_confirm);
+        assert!(!app.loop_action_pending);
+    }
+
+    #[test]
+    fn preview_a_opens_autorun_dialog_regardless_of_status() {
+        for status in [
+            crate::domain::loops::LoopStatus::Draft,
+            crate::domain::loops::LoopStatus::Running,
+            crate::domain::loops::LoopStatus::Paused,
+            crate::domain::loops::LoopStatus::Completed,
+            crate::domain::loops::LoopStatus::Failed,
+        ] {
+            let mut app = app_on_loop(status);
+            handle_preview_key(&mut app, KeyCode::Char('a'), KeyModifiers::NONE).unwrap();
+            assert!(app.loop_autorun_dialog.is_some(), "status {status:?}");
+        }
+    }
+
+    #[test]
+    fn loop_autorun_dialog_typing_backspace_and_submit() {
+        let mut app = app_on_loop(crate::domain::loops::LoopStatus::Failed);
+        handle_preview_key(&mut app, KeyCode::Char('a'), KeyModifiers::NONE).unwrap();
+
+        handle_preview_key(&mut app, KeyCode::Char('1'), KeyModifiers::NONE).unwrap();
+        handle_preview_key(&mut app, KeyCode::Char('2'), KeyModifiers::NONE).unwrap();
+        handle_preview_key(&mut app, KeyCode::Backspace, KeyModifiers::NONE).unwrap();
+        assert_eq!(app.loop_autorun_dialog.as_ref().unwrap().input, "1");
+
+        handle_preview_key(&mut app, KeyCode::Enter, KeyModifiers::NONE).unwrap();
+        assert!(app.loop_autorun_dialog.is_none());
+        assert!(app.loop_action_pending);
+    }
+
+    #[test]
+    fn loop_autorun_dialog_esc_closes_without_dispatching() {
+        let mut app = app_on_loop(crate::domain::loops::LoopStatus::Failed);
+        handle_preview_key(&mut app, KeyCode::Char('a'), KeyModifiers::NONE).unwrap();
+        handle_preview_key(&mut app, KeyCode::Esc, KeyModifiers::NONE).unwrap();
+        assert!(app.loop_autorun_dialog.is_none());
+        assert!(!app.loop_action_pending);
+    }
+
+    #[test]
+    fn existing_navigation_keys_are_unaffected_by_the_new_bindings() {
+        // Arrows/Tab must keep meaning exactly what they meant before —
+        // decision 8 of the loop controls spec.
+        let mut app = app_on_loop(crate::domain::loops::LoopStatus::Running);
+        app.loop_live_state = Some(crate::tui::app::loop_live_state::LoopLiveState {
+            loop_id: "lp1".to_string(),
+            loop_name: "Nightly review".to_string(),
+            loop_status: crate::domain::loops::LoopStatus::Running,
+            workdir: "/tmp".to_string(),
+            trigger_type: "manual".to_string(),
+            schedule_expr: None,
+            watch_path: None,
+            autorun_at: None,
+            spec_queue: Vec::new(),
+            done_count: 0,
+            total_count: 0,
+            current_spec_id: None,
+            effective_nodes: vec![crate::domain::loops::LoopNode {
+                id: "n1".to_string(),
+                spec_id: None,
+                loop_id: Some("lp1".to_string()),
+                name: "Implement".to_string(),
+                kind: crate::domain::loops::LoopNodeKind::Agent,
+                config: serde_json::json!({}),
+                position: 0,
+                created_at: Utc::now(),
+            }],
+            effective_edges: Vec::new(),
+            ensembles: Vec::new(),
+            router_taken_routes: std::collections::HashMap::new(),
+            current_node_id: None,
+            current_node_status: None,
+            current_node_started_at: None,
+            current_node_iteration: None,
+            current_node_output_tail: None,
+        });
+
+        let before_follow = app.loop_graph_follow;
+        handle_preview_key(&mut app, KeyCode::Right, KeyModifiers::NONE).unwrap();
+        // Moving the graph highlight right drops auto-follow, same as always.
+        assert_ne!(before_follow, app.loop_graph_follow);
+
+        let before_focus = app.loop_live_focus;
+        handle_preview_key(&mut app, KeyCode::Tab, KeyModifiers::NONE).unwrap();
+        assert_ne!(before_focus, app.loop_live_focus);
     }
 }

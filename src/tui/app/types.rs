@@ -630,6 +630,12 @@ pub struct App {
     /// Permanent-delete confirmation, reachable only from the archived
     /// view on an already-archived loop — see [`App::permanent_delete_selected_archived_loop`].
     pub(crate) permanent_delete_loop_confirm: bool,
+    /// Confirmation gate for `loop_reset` (mirrors `archive_loop_confirm`) —
+    /// reset clears progress on every non-completed spec, so it asks first,
+    /// with the same wording the CLI's own prompt uses (see
+    /// `daemon::loop_cli::confirm_reset`) so the two surfaces never teach
+    /// different levels of caution.
+    pub(crate) loop_reset_confirm: bool,
 
     // Brian's Brain automaton (sidebar decoration)
     pub(crate) sidebar_brain: Option<crate::tui::brians_brain::BriansBrain>,
@@ -727,6 +733,27 @@ pub struct App {
     /// Mouse hit-test cells for the marker strip, populated during draw:
     /// `(spec id, row, col_start, col_end)` — mirrors `sidebar_tab_click_map`.
     pub(crate) loop_spec_strip_click_map: Vec<(String, u16, u16, u16)>,
+    /// Open autorun-scheduling input for the loop currently focused in the
+    /// live view — `None` when not open. See
+    /// [`crate::tui::app::dialog::LoopAutorunDialog`].
+    pub(crate) loop_autorun_dialog: Option<crate::tui::app::dialog::LoopAutorunDialog>,
+    /// True while a loop-control dispatch (`loop_run`/`loop_pause`/
+    /// `loop_continue`/`loop_reset`/`loop_schedule_autorun`) is in flight on
+    /// `loop_action_rx` — guards against a second dispatch racing the first.
+    pub(crate) loop_action_pending: bool,
+    /// Receiver for the background thread running the current loop-control
+    /// dispatch (see `App::dispatch_loop_action`), polled non-blockingly by
+    /// `App::poll_loop_action` every tick so the UI thread never waits on the
+    /// daemon's HTTP round-trip.
+    pub(crate) loop_action_rx:
+        Option<std::sync::mpsc::Receiver<crate::tui::app::dialog::LoopActionOutcome>>,
+    /// The daemon's verbatim response to the last loop-control action, shown
+    /// until dismissed or superseded by the next dispatch — success or
+    /// error, per the loop controls' "always shown, never swallowed" rule.
+    pub(crate) loop_action_message: Option<crate::tui::app::dialog::LoopActionMessage>,
+    /// When the current `loop_action_message` was set — drives its
+    /// auto-dismiss (mirrors `copied_at`/`dismiss_copied`).
+    pub(crate) loop_action_message_at: std::time::Instant,
     /// Standalone/backlog specs (no loop yet), filtered to the selected
     /// project's workdir tag when a project is selected. Refreshed alongside
     /// `projects` in `App::refresh_projects`.

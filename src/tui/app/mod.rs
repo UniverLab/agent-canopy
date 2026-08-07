@@ -94,6 +94,7 @@ impl App {
             delete_project_confirm: false,
             archive_loop_confirm: false,
             permanent_delete_loop_confirm: false,
+            loop_reset_confirm: false,
             sidebar_brain: None,
             home_brain: None,
             sidebar_click_map: Vec::new(),
@@ -128,6 +129,11 @@ impl App {
             loop_spec_strip_scroll: 0,
             loop_spec_strip_capacity: 0,
             loop_spec_strip_click_map: Vec::new(),
+            loop_autorun_dialog: None,
+            loop_action_pending: false,
+            loop_action_rx: None,
+            loop_action_message: None,
+            loop_action_message_at: std::time::Instant::now() - std::time::Duration::from_secs(999),
             backlog_specs: Vec::new(),
             selected_backlog: 0,
             global_rag_queue: Vec::new(),
@@ -242,6 +248,8 @@ impl App {
         self.resize_interactive_agents();
         self.poll_playground_search();
         self.refresh_playground_search()?;
+        self.poll_loop_action();
+        self.dismiss_loop_action_message();
         if let Some(dialog) = self.simple_prompt_dialog.as_mut() {
             dialog.tick_at_picker();
         }

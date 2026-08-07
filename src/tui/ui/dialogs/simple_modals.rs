@@ -44,6 +44,21 @@ pub fn draw_permanent_delete_loop_confirm(frame: &mut Frame, theme: &Theme) {
     );
 }
 
+/// Confirmation for `loop_reset` (`x` on a completed/failed loop) — same
+/// wording as the CLI's own prompt (`daemon::loop_cli::confirm_reset`), so
+/// the two surfaces never teach different levels of caution.
+pub fn draw_loop_reset_confirm(frame: &mut Frame, app: &App, theme: &Theme) {
+    let loop_name = app.selected_loop().map(|lp| lp.name.as_str()).unwrap_or("");
+    draw_modal_confirm(
+        frame,
+        " Reset Loop? ",
+        &format!(
+            "Reset loop '{loop_name}' back to pending? This clears progress on its non-completed specs.\ny: reset, n/Esc: abort"
+        ),
+        theme,
+    );
+}
+
 fn draw_modal_confirm(frame: &mut Frame, title: &str, text: &str, theme: &Theme) {
     let dialog_width = frame.area().width * 40 / 100;
     let inner_width = dialog_width.saturating_sub(2).max(1);
