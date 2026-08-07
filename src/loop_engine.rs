@@ -3397,7 +3397,11 @@ fn evaluate_success_condition(condition: &str, exit_code: i32, output: &str) -> 
     bail!("Unsupported success condition '{}'.", condition)
 }
 
-fn find_entry_node(nodes: &[LoopNode], edges: &[LoopEdge], spec_name: &str) -> Result<String> {
+pub(crate) fn find_entry_node(
+    nodes: &[LoopNode],
+    edges: &[LoopEdge],
+    spec_name: &str,
+) -> Result<String> {
     let incoming = edges
         .iter()
         .map(|edge| edge.to_node.as_str())

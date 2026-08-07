@@ -584,6 +584,25 @@ pub struct LoopUpdateEdgeParams {
     /// `"route"`, and must name one of the edge's `from_node`'s declared
     /// routes. Ignored otherwise.
     pub route: Option<String>,
+    /// New destination node ID — retargets the edge instead of recreating
+    /// it, preserving its `edge_id` and any run history keyed against it.
+    /// Must belong to the same spec/loop graph as the edge. Omit to leave
+    /// the edge's target unchanged.
+    pub to_node: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopDeleteEdgeParams {
+    /// Existing edge ID to delete.
+    pub edge_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopDeleteNodeParams {
+    /// Existing node ID to delete. Cascades to every edge naming it as
+    /// `from_node` or `to_node`. Rejected if the node is the graph's entry
+    /// point.
+    pub node_id: String,
 }
 
 /// One ensemble member: differs from its siblings by platform/model and,

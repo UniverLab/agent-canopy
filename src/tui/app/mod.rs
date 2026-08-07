@@ -1735,6 +1735,111 @@ impl App {
         Ok(())
     }
 
+    /// Open the highlighted node's `Edges` dialog: its outgoing
+    /// `pass`/`fail`/`always` edges, retargetable/deletable in place. A
+    /// router's `route` edges stay under its `RouterRoutes` dialog instead
+    /// (see [`Self::build_edges_dialog`]'s filter).
+    pub fn open_loop_edges_dialog(&mut self) -> Result<()> {
+        let Some(node) = self.selected_loop_node() else {
+            return Ok(());
+        };
+        let dialog = self.build_edges_dialog(node);
+        self.loop_editor_dialog = Some(dialog);
+        self.focus = Focus::LoopEditorDialog;
+        Ok(())
+    }
+
+    fn build_edges_dialog(
+        &self,
+        node: &crate::domain::loops::LoopNode,
+    ) -> crate::tui::app::types::LoopEditorDialog {
+        let edges: Vec<crate::domain::loops::LoopEdge> = self
+            .router_existing_edges(node)
+            .into_iter()
+            .filter(|edge| edge.condition.route_label().is_none())
+            .collect();
+        let targets = self.router_candidate_targets(node);
+        crate::tui::app::types::LoopEditorDialog::new_edges(
+            node.id.clone(),
+            node.name.clone(),
+            format!(" Edges · {} ", node.name),
+            "↑↓ edge · ←→ retarget · Ctrl+D delete · Esc close".to_string(),
+            edges,
+            targets,
+        )
+    }
+
+    /// Retarget the `Edges` dialog's focused edge to the next/previous
+    /// candidate node — applied immediately through the same validated path
+    /// as the `loop_update_edge` MCP tool
+    /// ([`crate::daemon::handler::retarget_loop_edge`]), so a running loop
+    /// or a cross-graph target is rejected the same way it would be over
+    /// MCP, with the rejection shown as the dialog's error line.
+    pub fn retarget_focused_loop_edge(&mut self, forward: bool) -> Result<()> {
+        let Some(dialog) = self.loop_editor_dialog.as_ref() else {
+            return Ok(());
+        };
+        let Some(edge) = dialog.focused_edge() else {
+            return Ok(());
+        };
+        let edge_id = edge.id.clone();
+        let current_target = edge.to_node.clone();
+        let Some(next_target) = dialog.next_edge_target_candidate(forward) else {
+            return Ok(());
+        };
+        if next_target == current_target {
+            return Ok(());
+        }
+        match crate::daemon::handler::retarget_loop_edge(&self.db, &edge_id, &next_target) {
+            Ok(updated) => {
+                if let Some(dialog) = self.loop_editor_dialog.as_mut() {
+                    dialog.parse_error = None;
+                    if let Some(row) = dialog.edge_rows.get_mut(dialog.edge_row_index) {
+                        *row = updated;
+                    }
+                }
+                self.refresh_loops()?;
+            }
+            Err(message) => {
+                if let Some(dialog) = self.loop_editor_dialog.as_mut() {
+                    dialog.parse_error = Some(message);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete the `Edges` dialog's focused edge — through the same
+    /// validated path as the `loop_delete_edge` MCP tool
+    /// ([`crate::daemon::handler::delete_loop_edge_checked`]).
+    pub fn delete_focused_loop_edge(&mut self) -> Result<()> {
+        let Some(dialog) = self.loop_editor_dialog.as_ref() else {
+            return Ok(());
+        };
+        let Some(edge) = dialog.focused_edge() else {
+            return Ok(());
+        };
+        let edge_id = edge.id.clone();
+        match crate::daemon::handler::delete_loop_edge_checked(&self.db, &edge_id) {
+            Ok(_) => {
+                if let Some(dialog) = self.loop_editor_dialog.as_mut() {
+                    dialog.parse_error = None;
+                    dialog.edge_rows.retain(|edge| edge.id != edge_id);
+                    if dialog.edge_row_index >= dialog.edge_rows.len() {
+                        dialog.edge_row_index = dialog.edge_rows.len().saturating_sub(1);
+                    }
+                }
+                self.refresh_loops()?;
+            }
+            Err(message) => {
+                if let Some(dialog) = self.loop_editor_dialog.as_mut() {
+                    dialog.parse_error = Some(message);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// U10: duplicate the highlighted loop node — a fresh, unwired copy of its
     /// config into the same graph — then open the editor on the copy so its
     /// prompt/config can be tweaked (the closest thing the TUI has to a
@@ -2062,7 +2167,8 @@ impl App {
                 .find(|edge| edge.condition.route_label() == Some(label));
             match (&draft.target_node_id, existing) {
                 (Some(target), Some(edge)) if &edge.to_node != target => {
-                    self.db.update_loop_edge_target(&edge.id, target)?;
+                    crate::daemon::handler::retarget_loop_edge(&self.db, &edge.id, target)
+                        .map_err(anyhow::Error::msg)?;
                 }
                 (Some(target), None) => {
                     self.db.insert_loop_edge(&crate::domain::loops::LoopEdge {
@@ -2087,7 +2193,8 @@ impl App {
                 continue;
             };
             if !routes.iter().any(|route| route.label == label) {
-                self.db.delete_loop_edge(&edge.id)?;
+                crate::daemon::handler::delete_loop_edge_checked(&self.db, &edge.id)
+                    .map_err(anyhow::Error::msg)?;
             }
         }
 
@@ -2134,6 +2241,12 @@ impl App {
             crate::tui::app::types::LoopEditorMode::RouterRoutes => unreachable!(
                 "RouterRoutes is handled by save_router_routes_dialog before this call"
             ),
+            // Edges mode has no Ctrl+S save step — every retarget/delete
+            // applies immediately (see `handle_edges_key`), so this is
+            // never reached.
+            crate::tui::app::types::LoopEditorMode::Edges => {
+                unreachable!("Edges mode has no save step; mutations apply immediately")
+            }
         }
     }
 
@@ -5666,6 +5779,171 @@ mod tests {
         app.copied_at = std::time::Instant::now() - std::time::Duration::from_secs(5);
         app.dismiss_copied();
         assert!(!app.show_copied);
+    }
+
+    // ── Edges dialog (retarget/delete an ordinary edge) ───────────────
+
+    /// Seeds a `Draft` loop with three plain agent nodes `A -> B -> C`
+    /// (`pass` edges) — the fixture the `Edges` dialog tests in this
+    /// section start from. `A` has no incoming edge (the graph's entry
+    /// point); only `A -> B` is wired, so there's a spare target (`C`) to
+    /// retarget onto.
+    fn seed_plain_edge_loop(db: &Database) {
+        use crate::domain::loops::{
+            Loop, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind, LoopSpec,
+        };
+
+        db.insert_loop(&Loop {
+            archived: false,
+            id: "plp1".to_string(),
+            name: "plain loop".to_string(),
+            description: None,
+            workdir: "/tmp/plain-edge-test".to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        })
+        .unwrap();
+        db.insert_loop_spec(&LoopSpec {
+            id: "ps1".to_string(),
+            loop_id: Some("plp1".to_string()),
+            name: "spec one".to_string(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+        for (id, name, position) in [("node_a", "A", 0), ("node_b", "B", 1), ("node_c", "C", 2)] {
+            db.insert_loop_node(&LoopNode {
+                id: id.to_string(),
+                spec_id: Some("ps1".to_string()),
+                loop_id: None,
+                name: name.to_string(),
+                kind: LoopNodeKind::Agent,
+                config: serde_json::json!({}),
+                position,
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        }
+        db.insert_loop_edge(&LoopEdge {
+            id: "e_ab".to_string(),
+            spec_id: Some("ps1".to_string()),
+            loop_id: None,
+            from_node: "node_a".to_string(),
+            to_node: "node_b".to_string(),
+            condition: LoopEdgeCondition::Pass,
+        })
+        .unwrap();
+    }
+
+    fn app_on_plain_node(db: &Arc<Database>, data_dir: &std::path::Path, node_index: usize) -> App {
+        let mut app = App::new(Arc::clone(db), data_dir).expect("create app");
+        app.refresh_loops().expect("refresh loops");
+        app.loop_selected_spec = 0;
+        app.loop_selected_node = node_index;
+        app
+    }
+
+    #[test]
+    fn open_loop_edges_dialog_lists_the_nodes_outgoing_plain_edges() {
+        let db = test_db();
+        seed_plain_edge_loop(&db);
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = app_on_plain_node(&db, data_dir.path(), 0);
+
+        app.open_loop_edges_dialog().expect("open edges dialog");
+
+        let dialog = app.loop_editor_dialog.as_ref().expect("dialog opens");
+        assert!(matches!(
+            dialog.mode,
+            crate::tui::app::types::LoopEditorMode::Edges
+        ));
+        assert_eq!(dialog.edge_rows.len(), 1);
+        assert_eq!(dialog.edge_rows[0].to_node, "node_b");
+        assert!(
+            !dialog.edge_targets.iter().any(|(id, _)| id == "node_a"),
+            "candidate targets exclude the node itself"
+        );
+    }
+
+    #[test]
+    fn retarget_focused_loop_edge_changes_only_the_destination() {
+        let db = test_db();
+        seed_plain_edge_loop(&db);
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = app_on_plain_node(&db, data_dir.path(), 0);
+        app.open_loop_edges_dialog().expect("open edges dialog");
+
+        app.retarget_focused_loop_edge(true).expect("retarget");
+
+        let dialog = app.loop_editor_dialog.as_ref().expect("dialog still open");
+        assert!(dialog.parse_error.is_none(), "{:?}", dialog.parse_error);
+        assert_eq!(dialog.edge_rows[0].to_node, "node_c");
+        assert_eq!(
+            dialog.edge_rows[0].condition,
+            crate::domain::loops::LoopEdgeCondition::Pass,
+            "retargeting never touches the edge's condition"
+        );
+
+        let edge = db.get_loop_edge("e_ab").unwrap().unwrap();
+        assert_eq!(edge.to_node, "node_c");
+        assert_eq!(edge.from_node, "node_a");
+    }
+
+    #[test]
+    fn delete_focused_loop_edge_removes_it_from_the_db_and_the_dialog() {
+        let db = test_db();
+        seed_plain_edge_loop(&db);
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = app_on_plain_node(&db, data_dir.path(), 0);
+        app.open_loop_edges_dialog().expect("open edges dialog");
+
+        app.delete_focused_loop_edge().expect("delete edge");
+
+        let dialog = app.loop_editor_dialog.as_ref().expect("dialog still open");
+        assert!(dialog.edge_rows.is_empty());
+        assert!(db.get_loop_edge("e_ab").unwrap().is_none());
+    }
+
+    #[test]
+    fn retarget_focused_loop_edge_surfaces_the_running_loop_rejection() {
+        let db = test_db();
+        seed_plain_edge_loop(&db);
+        db.update_loop_status(
+            "plp1",
+            crate::domain::loops::LoopStatus::Running,
+            None,
+            None,
+        )
+        .unwrap();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = app_on_plain_node(&db, data_dir.path(), 0);
+        app.open_loop_edges_dialog().expect("open edges dialog");
+
+        app.retarget_focused_loop_edge(true)
+            .expect("call returns Ok");
+
+        let dialog = app.loop_editor_dialog.as_ref().expect("dialog still open");
+        let error = dialog.parse_error.as_deref().unwrap_or_default();
+        assert!(error.contains("running"), "{error}");
+        // Target unchanged in the db.
+        assert_eq!(db.get_loop_edge("e_ab").unwrap().unwrap().to_node, "node_b");
     }
 
     // ── Router routes dialog (open/pre-fill/save) ────────────────────

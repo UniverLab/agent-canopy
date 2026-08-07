@@ -270,11 +270,11 @@ Queue membership is unaffected by `loop_run` — specs stay standalone.
 The `loop info` CLI and `loop_get` MCP tool show queue-driven progress
 by reconstructing what ran from the run history.
 
-## The 24 MCP tools
+## The 26 MCP tools
 
 | Stage | Tools |
 |---|---|
-| Authoring | `loop_create`, `loop_update`, `loop_add_spec`, `loop_update_spec`, `loop_add_node`, `loop_update_node`, `loop_add_edge`, `loop_update_edge`, `loop_add_ensemble`, `loop_update_ensemble` |
+| Authoring | `loop_create`, `loop_update`, `loop_add_spec`, `loop_update_spec`, `loop_add_node`, `loop_update_node`, `loop_add_edge`, `loop_update_edge`, `loop_delete_edge`, `loop_delete_node`, `loop_add_ensemble`, `loop_update_ensemble` |
 | Sharing | `loop_export`, `loop_import` |
 | Inspection | `loop_get`, `loop_list` |
 | Runtime | `loop_run`, `loop_reset`, `loop_schedule_autorun`, `loop_pause`, `loop_continue`, `loop_complete_node`, `loop_report_blocker` |

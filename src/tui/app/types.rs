@@ -248,6 +248,12 @@ pub(crate) enum LoopEditorMode {
     /// [`LoopEditorMode::NodeConfig`] with the `router_*` fields below, since
     /// wiring an edge per route isn't expressible as node config alone.
     RouterRoutes,
+    /// A node's outgoing `pass`/`fail`/`always` edges — lets an ordinary
+    /// edge be retargeted or deleted, through the same validated path
+    /// (`daemon::handler::retarget_loop_edge`/`delete_loop_edge_checked`)
+    /// the `loop_update_edge`/`loop_delete_edge` MCP tools use, rather than
+    /// only a router's route edges (see [`LoopEditorMode::RouterRoutes`]).
+    Edges,
 }
 
 /// Which sub-field of the currently-focused route row
@@ -288,6 +294,14 @@ pub(crate) struct LoopEditorDialog {
     /// Candidate `(node_id, node_name)` targets a route can wire to: every
     /// other node in the router's graph.
     pub router_targets: Vec<(String, String)>,
+    /// `Edges` mode only, below — unused (empty) otherwise. This node's
+    /// outgoing `pass`/`fail`/`always` edges (route edges are managed via
+    /// `RouterRoutes` instead).
+    pub edge_rows: Vec<crate::domain::loops::LoopEdge>,
+    pub edge_row_index: usize,
+    /// Candidate `(node_id, node_name)` retarget destinations: every other
+    /// node in the edge's graph — same pool as `router_targets`.
+    pub edge_targets: Vec<(String, String)>,
 }
 
 impl LoopEditorDialog {
@@ -314,7 +328,78 @@ impl LoopEditorDialog {
             router_route_index: 0,
             router_field: RouterField::Label,
             router_targets: Vec::new(),
+            edge_rows: Vec::new(),
+            edge_row_index: 0,
+            edge_targets: Vec::new(),
         }
+    }
+
+    pub fn new_edges(
+        node_id: String,
+        node_name: String,
+        title: String,
+        help: String,
+        edges: Vec<crate::domain::loops::LoopEdge>,
+        targets: Vec<(String, String)>,
+    ) -> Self {
+        Self {
+            node_id,
+            node_name,
+            title,
+            help,
+            buffer: String::new(),
+            cursor: 0,
+            mode: LoopEditorMode::Edges,
+            parse_error: None,
+            router_routes: Vec::new(),
+            router_fallback: String::new(),
+            router_route_index: 0,
+            router_field: RouterField::Label,
+            router_targets: Vec::new(),
+            edge_rows: edges,
+            edge_row_index: 0,
+            edge_targets: targets,
+        }
+    }
+
+    /// Move the `Edges` mode row focus among this node's outgoing edges,
+    /// wrapping. A no-op with zero or one row.
+    pub fn edge_move_row(&mut self, forward: bool) {
+        if self.edge_rows.is_empty() {
+            return;
+        }
+        self.edge_row_index = if forward {
+            (self.edge_row_index + 1) % self.edge_rows.len()
+        } else {
+            (self.edge_row_index + self.edge_rows.len() - 1) % self.edge_rows.len()
+        };
+    }
+
+    /// The edge currently focused in `Edges` mode's row list.
+    pub fn focused_edge(&self) -> Option<&crate::domain::loops::LoopEdge> {
+        self.edge_rows.get(self.edge_row_index)
+    }
+
+    /// The next/previous candidate destination for the focused edge,
+    /// cycling through `edge_targets` (every other node in the graph).
+    /// Unlike [`Self::cycle_router_target`], an ordinary edge always names a
+    /// concrete `to_node`, so there is no `(none)` state to cycle through.
+    pub fn next_edge_target_candidate(&self, forward: bool) -> Option<String> {
+        let edge = self.focused_edge()?;
+        if self.edge_targets.is_empty() {
+            return None;
+        }
+        let current = self
+            .edge_targets
+            .iter()
+            .position(|(id, _)| id == &edge.to_node);
+        let len = self.edge_targets.len();
+        let next_index = match current {
+            Some(index) if forward => (index + 1) % len,
+            Some(index) => (index + len - 1) % len,
+            None => 0,
+        };
+        Some(self.edge_targets[next_index].0.clone())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -341,6 +426,9 @@ impl LoopEditorDialog {
             router_route_index: 0,
             router_field: RouterField::Label,
             router_targets: targets,
+            edge_rows: Vec::new(),
+            edge_row_index: 0,
+            edge_targets: Vec::new(),
         }
     }
 

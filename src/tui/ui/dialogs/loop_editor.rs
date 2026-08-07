@@ -55,10 +55,12 @@ pub fn draw_loop_editor_dialog(frame: &mut Frame, app: &App, theme: &Theme) {
         inner.height.saturating_sub(2 + error_rows),
     );
 
-    if matches!(dialog.mode, LoopEditorMode::RouterRoutes) {
-        draw_router_routes_body(frame, dialog, editor_area, theme);
-    } else {
-        draw_text_buffer_body(frame, dialog, editor_area);
+    match dialog.mode {
+        LoopEditorMode::RouterRoutes => draw_router_routes_body(frame, dialog, editor_area, theme),
+        LoopEditorMode::Edges => draw_edges_body(frame, dialog, editor_area, theme),
+        LoopEditorMode::AgentPrompt | LoopEditorMode::NodeConfig => {
+            draw_text_buffer_body(frame, dialog, editor_area);
+        }
     }
 
     if let Some(err) = &dialog.parse_error {
@@ -230,6 +232,54 @@ fn router_route_lines(dialog: &LoopEditorDialog, theme: &Theme) -> Vec<Line<'sta
             Line::from(spans)
         })
         .collect()
+}
+
+/// A node's outgoing `pass`/`fail`/`always` edges: one line per edge naming
+/// its condition and current target, retargetable/deletable in place (see
+/// `handle_edges_key` in `tui::event::loop_editor`). No cursor to place —
+/// every action is a whole-row operation (move focus, cycle target,
+/// delete), unlike the free-cursor `buffer` used by the text-editing modes.
+fn draw_edges_body(frame: &mut Frame, dialog: &LoopEditorDialog, area: Rect, theme: &Theme) {
+    if dialog.edge_rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "(no outgoing pass/fail/always edges)",
+                Style::default().fg(theme.dim_text),
+            ))),
+            area,
+        );
+        return;
+    }
+
+    let lines: Vec<Line<'static>> = dialog
+        .edge_rows
+        .iter()
+        .enumerate()
+        .map(|(index, edge)| {
+            let is_focused = index == dialog.edge_row_index;
+            let marker = if is_focused { "▸ " } else { "  " };
+            let target_name = dialog
+                .edge_targets
+                .iter()
+                .find(|(id, _)| id == &edge.to_node)
+                .map(|(_, name)| name.clone())
+                .unwrap_or_else(|| edge.to_node.clone());
+            let style = if is_focused {
+                Style::default()
+                    .fg(theme.header_color)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            Line::from(vec![
+                Span::raw(marker),
+                Span::styled(edge.condition.as_str().to_string(), style),
+                Span::raw("  →  "),
+                Span::styled(target_name, style),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn field_style(is_focused_route: bool, is_focused_field: bool, theme: &Theme) -> Style {

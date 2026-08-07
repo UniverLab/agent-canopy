@@ -236,6 +236,12 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
             // U10: duplicate the highlighted loop node in place.
             let _ = app.duplicate_selected_loop_node();
         }
+        // Edit the highlighted node's outgoing pass/fail/always edges
+        // (retarget or delete) — a router's route edges stay under 'e'/
+        // Enter's RouterRoutes dialog instead.
+        KeyCode::Char('w') if on_loop => {
+            let _ = app.open_loop_edges_dialog();
+        }
         KeyCode::Char('d')
             if !app.agents_rag_focused && app.sidebar_layer != SidebarLayer::Knowledge =>
         {

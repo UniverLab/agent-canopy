@@ -650,6 +650,156 @@ fn validate_node_not_ensemble_owned(db: &Database, node_id: &str) -> Result<(), 
     Ok(())
 }
 
+/// Resolve the [`LoopStatus`] (and id) of the loop that owns a spec-scoped or
+/// loop-scoped graph object. A node/edge always has exactly one of
+/// `spec_id`/`loop_id` set. `None` means the object belongs to a standalone
+/// spec not yet bound to any loop — nothing running to guard against.
+fn resolve_owning_loop_status(
+    db: &Database,
+    spec_id: Option<&str>,
+    loop_id: Option<&str>,
+) -> Result<Option<(String, LoopStatus)>, String> {
+    if let Some(loop_id) = loop_id {
+        let lp = db
+            .get_loop(loop_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Loop '{loop_id}' not found."))?;
+        return Ok(Some((lp.id, lp.status)));
+    }
+    if let Some(spec_id) = spec_id {
+        let spec = validate_spec_exists(db, spec_id)?;
+        if let Some(loop_id) = &spec.loop_id {
+            let lp = db
+                .get_loop(loop_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("Loop '{loop_id}' not found."))?;
+            return Ok(Some((lp.id, lp.status)));
+        }
+    }
+    Ok(None)
+}
+
+/// Reject a topology mutation (retargeting/deleting an edge, deleting a
+/// node) while the owning loop is `running`. Deliberately stricter than node
+/// CONFIG edits, which are safe because the graph is snapshotted per spec at
+/// `run_spec` — a config edit lands on the next spec. Topology is different:
+/// an edge retargeted or a node deleted mid-dispatch can send a live run to
+/// a node the engine never selected.
+fn validate_topology_mutation_allowed(
+    db: &Database,
+    spec_id: Option<&str>,
+    loop_id: Option<&str>,
+) -> Result<(), String> {
+    if let Some((loop_id, LoopStatus::Running)) = resolve_owning_loop_status(db, spec_id, loop_id)?
+    {
+        return Err(format!(
+            "Loop '{loop_id}' is running; call loop_pause first, then retry this topology change."
+        ));
+    }
+    Ok(())
+}
+
+/// `to_node` must exist in the same spec/loop graph as `edge` — a
+/// cross-graph retarget would leave the edge's `spec_id`/`loop_id` naming one
+/// graph while `to_node` lives in another.
+fn validate_edge_retarget_destination(
+    db: &Database,
+    edge: &LoopEdge,
+    to_node: &str,
+) -> Result<(), String> {
+    let nodes = if let Some(spec_id) = &edge.spec_id {
+        db.list_loop_nodes(spec_id).map_err(|e| e.to_string())?
+    } else if let Some(loop_id) = &edge.loop_id {
+        db.list_loop_nodes_for_loop(loop_id)
+            .map_err(|e| e.to_string())?
+    } else {
+        Vec::new()
+    };
+    if !nodes.iter().any(|n| n.id == to_node) {
+        return Err(format!(
+            "Node '{to_node}' does not belong to the same graph as edge '{}'; retargeting across specs/loops is not allowed.",
+            edge.id
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `node` is the computed entry point of its graph (spec-scoped or
+/// loop-scoped) — see [`crate::loop_engine::find_entry_node`]. A graph with
+/// no *confirmed* single entry (e.g. `find_entry_node` errors on multiple
+/// sources) never blocks deletion here; only a confirmed single entry does.
+fn validate_node_not_entry_point(db: &Database, node: &LoopNode) -> Result<(), String> {
+    let (nodes, edges) = if let Some(spec_id) = &node.spec_id {
+        (
+            db.list_loop_nodes(spec_id).map_err(|e| e.to_string())?,
+            db.list_loop_edges(spec_id).map_err(|e| e.to_string())?,
+        )
+    } else if let Some(loop_id) = &node.loop_id {
+        (
+            db.list_loop_nodes_for_loop(loop_id)
+                .map_err(|e| e.to_string())?,
+            db.list_loop_edges_for_loop(loop_id)
+                .map_err(|e| e.to_string())?,
+        )
+    } else {
+        return Ok(());
+    };
+    if let Ok(entry_id) = crate::loop_engine::find_entry_node(&nodes, &edges, "graph") {
+        if entry_id == node.id {
+            return Err(format!(
+                "Node '{}' is the entry point of its graph; deleting it would leave the graph \
+                 unable to run. Wire a different node as the entry first.",
+                node.id
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validated retarget of an existing edge's `to_node` — the shared path used
+/// by both the `loop_update_edge` MCP tool and the TUI's edge editor, so an
+/// ordinary `pass`/`fail` edge gets the same checks a router's route edges
+/// have always had.
+pub(crate) fn retarget_loop_edge(
+    db: &Database,
+    edge_id: &str,
+    to_node: &str,
+) -> Result<LoopEdge, String> {
+    let edge = validate_edge_exists(db, edge_id)?;
+    validate_topology_mutation_allowed(db, edge.spec_id.as_deref(), edge.loop_id.as_deref())?;
+    validate_node_not_ensemble_owned(db, &edge.from_node)?;
+    validate_node_not_ensemble_owned(db, to_node)?;
+    validate_edge_retarget_destination(db, &edge, to_node)?;
+    db.update_loop_edge_target(&edge.id, to_node)
+        .map_err(|e| e.to_string())?;
+    Ok(LoopEdge {
+        to_node: to_node.to_string(),
+        ..edge
+    })
+}
+
+/// Validated deletion of a single edge — the shared path used by both the
+/// `loop_delete_edge` MCP tool and the TUI's edge editor.
+pub(crate) fn delete_loop_edge_checked(db: &Database, edge_id: &str) -> Result<LoopEdge, String> {
+    let edge = validate_edge_exists(db, edge_id)?;
+    validate_topology_mutation_allowed(db, edge.spec_id.as_deref(), edge.loop_id.as_deref())?;
+    db.delete_loop_edge(&edge.id).map_err(|e| e.to_string())?;
+    Ok(edge)
+}
+
+/// Validated deletion of a node — cascades (at the DB layer, via `ON DELETE
+/// CASCADE` foreign keys on `loop_edges.from_node`/`to_node`) to every edge
+/// naming it. The shared path used by both the `loop_delete_node` MCP tool
+/// and the TUI's graph editor.
+pub(crate) fn delete_loop_node_checked(db: &Database, node_id: &str) -> Result<LoopNode, String> {
+    let node = validate_node_exists(db, node_id)?;
+    validate_topology_mutation_allowed(db, node.spec_id.as_deref(), node.loop_id.as_deref())?;
+    validate_node_not_ensemble_owned(db, &node.id)?;
+    validate_node_not_entry_point(db, &node)?;
+    db.delete_loop_node(&node.id).map_err(|e| e.to_string())?;
+    Ok(node)
+}
+
 /// Unlike [`LoopSpecStatus::from_str`] (infallible, defaults to `Pending`
 /// for callers that already trust the value came from the DB), a
 /// `spec_list` status filter comes from the caller — an unrecognized value
@@ -4357,7 +4507,7 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "loop_update_edge",
-        description = "Update the routing condition of an existing loop edge."
+        description = "Update the routing condition and/or destination node of an existing loop edge. Omit to_node to leave the edge's target unchanged; provide it to retarget the edge in place (preserving its id and run history) instead of recreating it."
     )]
     async fn loop_update_edge(
         &self,
@@ -4384,19 +4534,62 @@ impl TaskTriggerHandler {
             return Ok(error_result(&e));
         }
 
-        if edge.condition == condition {
+        let to_node = params
+            .to_node
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let target_changed = to_node.is_some_and(|value| value != edge.to_node);
+        if target_changed {
+            if let Err(e) = retarget_loop_edge(&self.db, &edge.id, to_node.unwrap()) {
+                return Ok(error_result(&e));
+            }
+        }
+
+        let condition_changed = edge.condition != condition;
+        if condition_changed {
+            self.db
+                .update_loop_edge_condition(&edge.id, &condition)
+                .map_err(internal_error)?;
+        }
+
+        if !condition_changed && !target_changed {
             return Ok(success_result(&format!(
-                "Loop edge '{}' already uses condition '{}'.",
+                "Loop edge '{}' already uses condition '{}' and target unchanged.",
                 edge.id,
                 condition.as_str()
             )));
         }
 
-        self.db
-            .update_loop_edge_condition(&edge.id, &condition)
-            .map_err(internal_error)?;
-
         Ok(success_result(&format!("Loop edge '{}' updated.", edge.id)))
+    }
+
+    #[tool(
+        name = "loop_delete_edge",
+        description = "Delete a single loop edge by id. Rejected while the owning loop is running — pause it first."
+    )]
+    async fn loop_delete_edge(
+        &self,
+        Parameters(params): Parameters<LoopDeleteEdgeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match delete_loop_edge_checked(&self.db, params.edge_id.trim()) {
+            Ok(edge) => Ok(success_result(&format!("Loop edge '{}' deleted.", edge.id))),
+            Err(e) => Ok(error_result(&e)),
+        }
+    }
+
+    #[tool(
+        name = "loop_delete_node",
+        description = "Delete a loop node by id, cascading to every edge that names it as from_node or to_node. Rejected if the node is the graph's entry point, or while the owning loop is running — pause it first."
+    )]
+    async fn loop_delete_node(
+        &self,
+        Parameters(params): Parameters<LoopDeleteNodeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match delete_loop_node_checked(&self.db, params.node_id.trim()) {
+            Ok(node) => Ok(success_result(&format!("Loop node '{}' deleted.", node.id))),
+            Err(e) => Ok(error_result(&e)),
+        }
     }
 
     #[tool(
@@ -15867,6 +16060,7 @@ mod endpoint_tests {
                 edge_id: edge_id.clone(),
                 condition: "fail".to_string(),
                 route: None,
+                to_node: None,
             }))
             .await
             .unwrap();
@@ -15877,6 +16071,7 @@ mod endpoint_tests {
                 edge_id: edge_id.clone(),
                 condition: "fail".to_string(),
                 route: None,
+                to_node: None,
             }))
             .await
             .unwrap();
@@ -15888,10 +16083,265 @@ mod endpoint_tests {
                 edge_id: "ghost-edge".to_string(),
                 condition: "pass".to_string(),
                 route: None,
+                to_node: None,
             }))
             .await
             .unwrap();
         assert!(is_err(&missing_edge));
+    }
+
+    // ── loop_update_edge(to_node) / loop_delete_edge / loop_delete_node ──
+
+    #[tokio::test]
+    async fn loop_update_edge_retargets_destination_without_changing_condition() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let a = add_agent_node(&handler, &spec.id, "A").await;
+        let b = add_agent_node(&handler, &spec.id, "B").await;
+        let c = add_agent_node(&handler, &spec.id, "C").await;
+
+        let added = handler
+            .loop_add_edge(Parameters(LoopAddEdgeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                from_node: a.clone(),
+                to_node: b.clone(),
+                condition: "pass".to_string(),
+                route: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&added), "{}", text(&added));
+        let edge_id = db.list_loop_edges(&spec.id).unwrap()[0].id.clone();
+
+        let retargeted = handler
+            .loop_update_edge(Parameters(LoopUpdateEdgeParams {
+                edge_id: edge_id.clone(),
+                condition: "pass".to_string(),
+                route: None,
+                to_node: Some(c.clone()),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&retargeted), "{}", text(&retargeted));
+
+        let edge = db.get_loop_edge(&edge_id).unwrap().unwrap();
+        assert_eq!(edge.to_node, c, "target changed to the new node");
+        assert_eq!(
+            edge.condition,
+            crate::domain::loops::LoopEdgeCondition::Pass,
+            "condition untouched by a target-only update"
+        );
+        assert_eq!(
+            edge.from_node, a,
+            "source untouched by a target-only update"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_update_edge_rejects_retarget_to_a_node_in_another_loop() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let a = add_agent_node(&handler, &spec.id, "A").await;
+        let b = add_agent_node(&handler, &spec.id, "B").await;
+
+        let other_lp = insert_test_loop(&db, dir.path());
+        let other_spec = insert_test_spec(&db, &other_lp.id, 1);
+        let foreign = add_agent_node(&handler, &other_spec.id, "Foreign").await;
+
+        handler
+            .loop_add_edge(Parameters(LoopAddEdgeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                from_node: a.clone(),
+                to_node: b.clone(),
+                condition: "pass".to_string(),
+                route: None,
+            }))
+            .await
+            .unwrap();
+        let edge_id = db.list_loop_edges(&spec.id).unwrap()[0].id.clone();
+
+        let result = handler
+            .loop_update_edge(Parameters(LoopUpdateEdgeParams {
+                edge_id: edge_id.clone(),
+                condition: "pass".to_string(),
+                route: None,
+                to_node: Some(foreign),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&result));
+
+        let edge = db.get_loop_edge(&edge_id).unwrap().unwrap();
+        assert_eq!(edge.to_node, b, "cross-loop retarget never persisted");
+    }
+
+    #[tokio::test]
+    async fn loop_delete_edge_removes_a_single_edge() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let a = add_agent_node(&handler, &spec.id, "A").await;
+        let b = add_agent_node(&handler, &spec.id, "B").await;
+        handler
+            .loop_add_edge(Parameters(LoopAddEdgeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                from_node: a,
+                to_node: b,
+                condition: "pass".to_string(),
+                route: None,
+            }))
+            .await
+            .unwrap();
+        let edge_id = db.list_loop_edges(&spec.id).unwrap()[0].id.clone();
+
+        let deleted = handler
+            .loop_delete_edge(Parameters(LoopDeleteEdgeParams {
+                edge_id: edge_id.clone(),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&deleted), "{}", text(&deleted));
+        assert!(db.get_loop_edge(&edge_id).unwrap().is_none());
+
+        let missing = handler
+            .loop_delete_edge(Parameters(LoopDeleteEdgeParams {
+                edge_id: "ghost-edge".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&missing));
+    }
+
+    #[tokio::test]
+    async fn loop_delete_node_cascades_to_its_edges() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let a = add_agent_node(&handler, &spec.id, "A").await;
+        let b = add_agent_node(&handler, &spec.id, "B").await;
+        let c = add_agent_node(&handler, &spec.id, "C").await;
+        for (from, to) in [(a.clone(), b.clone()), (b.clone(), c.clone())] {
+            handler
+                .loop_add_edge(Parameters(LoopAddEdgeParams {
+                    spec_id: Some(spec.id.clone()),
+                    loop_id: None,
+                    from_node: from,
+                    to_node: to,
+                    condition: "pass".to_string(),
+                    route: None,
+                }))
+                .await
+                .unwrap();
+        }
+        assert_eq!(db.list_loop_edges(&spec.id).unwrap().len(), 2);
+
+        // `b` (not the entry point — `a` is) sits between two edges; deleting
+        // it must drop both, not just the ones naming it as `from_node`.
+        let deleted = handler
+            .loop_delete_node(Parameters(LoopDeleteNodeParams { node_id: b.clone() }))
+            .await
+            .unwrap();
+        assert!(!is_err(&deleted), "{}", text(&deleted));
+
+        assert!(db.get_loop_node(&b).unwrap().is_none());
+        assert!(db.list_loop_edges(&spec.id).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn loop_delete_node_rejects_the_graphs_entry_point() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let a = add_agent_node(&handler, &spec.id, "A").await;
+        let b = add_agent_node(&handler, &spec.id, "B").await;
+        handler
+            .loop_add_edge(Parameters(LoopAddEdgeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                from_node: a.clone(),
+                to_node: b,
+                condition: "pass".to_string(),
+                route: None,
+            }))
+            .await
+            .unwrap();
+
+        let result = handler
+            .loop_delete_node(Parameters(LoopDeleteNodeParams { node_id: a.clone() }))
+            .await
+            .unwrap();
+        assert!(is_err(&result));
+        assert!(db.get_loop_node(&a).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn topology_mutations_are_rejected_while_the_loop_is_running() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let a = add_agent_node(&handler, &spec.id, "A").await;
+        let b = add_agent_node(&handler, &spec.id, "B").await;
+        let c = add_agent_node(&handler, &spec.id, "C").await;
+        handler
+            .loop_add_edge(Parameters(LoopAddEdgeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                from_node: a,
+                to_node: b.clone(),
+                condition: "pass".to_string(),
+                route: None,
+            }))
+            .await
+            .unwrap();
+        let edge_id = db.list_loop_edges(&spec.id).unwrap()[0].id.clone();
+
+        db.update_loop_status(&lp.id, LoopStatus::Running, None, None)
+            .unwrap();
+
+        let retarget = handler
+            .loop_update_edge(Parameters(LoopUpdateEdgeParams {
+                edge_id: edge_id.clone(),
+                condition: "pass".to_string(),
+                route: None,
+                to_node: Some(c),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&retarget));
+        assert!(text(&retarget).contains("running"), "{}", text(&retarget));
+
+        let delete_edge = handler
+            .loop_delete_edge(Parameters(LoopDeleteEdgeParams {
+                edge_id: edge_id.clone(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&delete_edge));
+        assert!(
+            text(&delete_edge).contains("running"),
+            "{}",
+            text(&delete_edge)
+        );
+
+        let delete_node = handler
+            .loop_delete_node(Parameters(LoopDeleteNodeParams { node_id: b.clone() }))
+            .await
+            .unwrap();
+        assert!(is_err(&delete_node));
+        assert!(
+            text(&delete_node).contains("running"),
+            "{}",
+            text(&delete_node)
+        );
+
+        // Nothing actually mutated while the loop was running.
+        assert_eq!(db.get_loop_edge(&edge_id).unwrap().unwrap().to_node, b);
+        assert!(db.get_loop_node(&b).unwrap().is_some());
     }
 
     // ── router nodes (routes + route edges) ──────────────────────────
