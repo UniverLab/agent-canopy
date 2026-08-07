@@ -2,13 +2,14 @@ use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, OptionalExtension};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::io::{Error as IoError, ErrorKind};
 
 use crate::db::Database;
 use crate::domain::loops::{
-    Loop, LoopCompletionHook, LoopCompletionHookRun, LoopDetails, LoopEdge, LoopEdgeCondition,
-    LoopNode, LoopNodeKind, LoopNodeRun, LoopResetOutcome, LoopRunStatus, LoopSpec,
-    LoopSpecDetails, LoopSpecStatus, LoopStatus, SpecAdminStatusOutcome,
+    ArchiveLoopOutcome, Loop, LoopCompletionHook, LoopCompletionHookRun, LoopDetails, LoopEdge,
+    LoopEdgeCondition, LoopNode, LoopNodeKind, LoopNodeRun, LoopResetOutcome, LoopRunStatus,
+    LoopSpec, LoopSpecDetails, LoopSpecStatus, LoopStatus, SpecAdminStatusOutcome,
 };
 use crate::domain::models::Trigger;
 
@@ -30,8 +31,8 @@ impl Database {
         let (trigger_type, trigger_config) = encode_loop_trigger(lp.trigger.as_ref())?;
         let on_completed = encode_loop_completion_hook(lp.on_completed.as_ref())?;
         conn.execute(
-            "INSERT INTO loops (id, name, description, workdir, status, trigger_type, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            "INSERT INTO loops (id, name, description, workdir, status, trigger_type, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 &lp.id,
                 &lp.name,
@@ -44,10 +45,11 @@ impl Database {
                 lp.started_at.map(|value| value.timestamp()),
                 lp.completed_at.map(|value| value.timestamp()),
                 lp.autorun_at.map(|value| value.timestamp()),
-                &lp.active_run_pool_id,
+                &lp.active_run_queue_id,
                 on_completed,
                 lp.auto_continue_at.map(|value| value.timestamp()),
                 &lp.auto_continue_action,
+                lp.archived,
             ],
         )?;
         Ok(())
@@ -88,7 +90,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived
              FROM loops WHERE autorun_at IS NOT NULL",
         )?;
         let rows = stmt.query_map([], map_loop_row)?;
@@ -143,7 +145,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived
              FROM loops WHERE auto_continue_at IS NOT NULL",
         )?;
         let rows = stmt.query_map([], map_loop_row)?;
@@ -202,7 +204,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived
              FROM loops WHERE trigger_type = ?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![trigger_type], map_loop_row)?;
@@ -247,7 +249,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived
              FROM loops WHERE id = ?1",
         )?;
 
@@ -256,19 +258,36 @@ impl Database {
             .map_err(Into::into)
     }
 
-    pub fn list_loops(&self, workdir: Option<&str>) -> Result<Vec<Loop>> {
+    /// List loops, optionally narrowed to one `workdir`. `include_archived`
+    /// controls whether archived loops are included: `false` is the
+    /// "browsing" view (sidebar, `canopy loop list`, MCP `loop_list`) — an
+    /// archived loop is excluded by the query itself (not filtered in
+    /// memory), never by loading every row and discarding some. Pass `true`
+    /// for a lookup that must still resolve an archived loop (e.g. `canopy
+    /// loop info` by id/name) or to list the archived set for the archive
+    /// view.
+    pub fn list_loops(&self, workdir: Option<&str>, include_archived: bool) -> Result<Vec<Loop>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
-        let sql = if workdir.is_some() {
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action
-             FROM loops WHERE workdir = ?1 ORDER BY created_at DESC"
+        let archived_clause = if include_archived {
+            ""
         } else {
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action
-             FROM loops ORDER BY created_at DESC"
+            " AND archived = 0"
         };
-        let mut stmt = conn.prepare(sql)?;
+        let sql = if workdir.is_some() {
+            format!(
+                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived
+                 FROM loops WHERE workdir = ?1{archived_clause} ORDER BY created_at DESC"
+            )
+        } else {
+            format!(
+                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived
+                 FROM loops WHERE 1=1{archived_clause} ORDER BY created_at DESC"
+            )
+        };
+        let mut stmt = conn.prepare(&sql)?;
         let rows = if let Some(workdir) = workdir {
             stmt.query_map(params![workdir], map_loop_row)?
         } else {
@@ -277,6 +296,71 @@ impl Database {
 
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    /// Archive a loop: it leaves every browsing listing (`list_loops` with
+    /// `include_archived: false`) but its row, specs, and run history are
+    /// untouched — a single-row, atomic flag flip, never a delete/recreate
+    /// or a move to another table (the loop keeps its id and every foreign
+    /// key into it). Refuses a `running` loop (archiving is for work that's
+    /// finished with; pause it first) and a loop that's already archived.
+    pub fn archive_loop(&self, loop_id: &str) -> Result<ArchiveLoopOutcome> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let row: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT status, archived FROM loops WHERE id = ?1",
+                params![loop_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((status, archived)) = row else {
+            return Ok(ArchiveLoopOutcome::NotFound);
+        };
+        if LoopStatus::from_str(&status) == LoopStatus::Running {
+            return Ok(ArchiveLoopOutcome::Running);
+        }
+        if archived != 0 {
+            return Ok(ArchiveLoopOutcome::AlreadyArchived);
+        }
+        conn.execute(
+            "UPDATE loops SET archived = 1 WHERE id = ?1",
+            params![loop_id],
+        )?;
+        Ok(ArchiveLoopOutcome::Archived)
+    }
+
+    /// Restore an archived loop back to the main browsing list. A single-row,
+    /// atomic flag flip — everything the loop carries (specs, run history)
+    /// was never touched by archiving in the first place. Returns `true` when
+    /// a row was actually flipped (i.e. it existed and was archived).
+    pub fn restore_loop(&self, loop_id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE loops SET archived = 0 WHERE id = ?1 AND archived = 1",
+            params![loop_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Count of archived loops — the always-visible number that makes the
+    /// archive non-invisible (see the F4-archive spec). A dedicated `COUNT(*)`
+    /// query, not `list_loops(...).len()`, so the main view never pays for
+    /// loading every archived row just to show a number.
+    pub fn count_archived_loops(&self) -> Result<i64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        conn.query_row("SELECT COUNT(*) FROM loops WHERE archived = 1", [], |row| {
+            row.get(0)
+        })
+        .map_err(Into::into)
     }
 
     pub fn update_loop_status(
@@ -337,20 +421,20 @@ impl Database {
         Ok(rows > 0)
     }
 
-    /// Persist (or, with `None`, clear) the pool a run against `loop_id` is
+    /// Persist (or, with `None`, clear) the queue a run against `loop_id` is
     /// currently drawing from. Called once when a run starts — including a
-    /// resumed run, so a failed pool run that gets auto-reset-and-relaunched
-    /// re-persists the same pool rather than losing it — and cleared again
+    /// resumed run, so a failed queue run that gets auto-reset-and-relaunched
+    /// re-persists the same queue rather than losing it — and cleared again
     /// only when a run finishes genuinely. See
-    /// [`crate::domain::loops::Loop::active_run_pool_id`].
-    pub fn set_loop_active_run_pool(&self, loop_id: &str, pool_id: Option<&str>) -> Result<bool> {
+    /// [`crate::domain::loops::Loop::active_run_queue_id`].
+    pub fn set_loop_active_run_queue(&self, loop_id: &str, queue_id: Option<&str>) -> Result<bool> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let rows = conn.execute(
-            "UPDATE loops SET active_run_pool_id = ?1 WHERE id = ?2",
-            params![pool_id, loop_id],
+            "UPDATE loops SET active_run_queue_id = ?1 WHERE id = ?2",
+            params![queue_id, loop_id],
         )?;
         Ok(rows > 0)
     }
@@ -451,9 +535,9 @@ impl Database {
     /// scheduler's auto-reset-and-resume of a `failed` loop on autorun, so
     /// there is exactly one place that knows how to unstick a loop.
     ///
-    /// When the loop's last run was against a pool (`active_run_pool_id` is
-    /// set), the pool's *members* are what actually need resetting — the
-    /// loop's own bound specs are typically empty for a pool run — so they're
+    /// When the loop's last run was against a queue (`active_run_queue_id` is
+    /// set), the queue's *members* are what actually need resetting — the
+    /// loop's own bound specs are typically empty for a queue run — so they're
     /// folded into the same eligible set as the loop's bound specs, both for
     /// validating an explicit `specs` list and for the "every non-completed"
     /// default. This is the one reset implementation both `loop_reset` and
@@ -463,20 +547,35 @@ impl Database {
             return Ok(LoopResetOutcome::NotFound);
         };
 
-        if lp.status == LoopStatus::Running {
-            return Ok(LoopResetOutcome::Running);
+        // Ground truth for "is this loop actually busy right now" is the
+        // `loop_runs` table, not `lp.status` — a sibling node's
+        // `loop_report_blocker` can flip status to `paused` while a
+        // different node under the same loop keeps executing (status and a
+        // run's lifetime are independent). Resetting underneath that live
+        // run is exactly what corrupted the 2026-08-05 incident: the reset
+        // killed-and-reset the run's spec while its `execute_node` future
+        // was still in flight, so its late completion routed an edge and
+        // failed the loop out from under the fresh dispatch this reset then
+        // launched. Refuse outright instead — the caller's next move is an
+        // informed wait or a deliberate kill, not a race.
+        if let Some(run) = self.list_running_loop_runs(loop_id)?.into_iter().next() {
+            return Ok(LoopResetOutcome::InFlight {
+                run_id: run.id,
+                node_id: run.node_id,
+                started_at: run.started_at,
+            });
         }
 
         let bound_specs = self.list_loop_specs(loop_id)?;
-        let pool_specs: Vec<LoopSpec> = match &lp.active_run_pool_id {
-            Some(pool_id) => self
-                .list_pool_member_spec_ids(pool_id)?
+        let queue_specs: Vec<LoopSpec> = match &lp.active_run_queue_id {
+            Some(queue_id) => self
+                .list_queue_member_spec_ids(queue_id)?
                 .into_iter()
                 .filter_map(|spec_id| self.get_loop_spec(&spec_id).transpose())
                 .collect::<Result<Vec<_>>>()?,
             None => Vec::new(),
         };
-        let eligible_specs: Vec<&LoopSpec> = bound_specs.iter().chain(pool_specs.iter()).collect();
+        let eligible_specs: Vec<&LoopSpec> = bound_specs.iter().chain(queue_specs.iter()).collect();
 
         let valid_ids: std::collections::HashSet<&str> =
             eligible_specs.iter().map(|spec| spec.id.as_str()).collect();
@@ -497,29 +596,13 @@ impl Database {
                 .collect(),
         };
 
+        // No spec being reset can have a live `running` node-run row left:
+        // the guard above already confirmed zero `running` rows exist
+        // anywhere under this loop, and every eligible spec's runs are
+        // recorded under this same `loop_id` (bound or drawn live from a
+        // queue — see `list_loop_runs_for_loop`), so there is nothing left
+        // to terminate here.
         for spec_id in &target_ids {
-            // B12: a spec being reset can still have a `running` node-run row
-            // left over from an interrupted attempt — the loop itself is
-            // already non-`Running` here (the guard above refuses otherwise),
-            // but that doesn't mean every spec's last run was cleanly
-            // finalized (e.g. the loop failed on a *different* spec, or the
-            // daemon crashed mid-node). Kill its process, if it still has
-            // one, before wiping the spec back to `pending`, so a fresh run
-            // never races a still-alive leftover in the same workdir.
-            if let Some(stale) = self.get_active_loop_run_for_spec(spec_id)? {
-                if let Some(pid) = stale.pid {
-                    crate::daemon::process::terminate_process_group_async(
-                        pid,
-                        crate::daemon::process::KILL_GRACE,
-                    );
-                }
-                self.update_loop_run_result(
-                    &stale.id,
-                    LoopRunStatus::Fail,
-                    Some(&serde_json::json!({ "terminated": true, "reason": "spec reset" })),
-                    Some(Utc::now()),
-                )?;
-            }
             self.reset_loop_spec_status(spec_id)?;
         }
         self.reset_loop_status(loop_id)?;
@@ -586,7 +669,7 @@ impl Database {
 
     /// A single spec's own graph (nodes/edges), resolved by spec id alone —
     /// independent of whether the spec is bound to a loop (`loop_specs.loop_id`)
-    /// or a standalone pool member. Lets the loop engine drive a pool spec
+    /// or a standalone queue member. Lets the loop engine drive a queue spec
     /// through the same lookup path as a bound spec (see `loop_engine::run`).
     pub fn get_loop_spec_details(&self, spec_id: &str) -> Result<Option<LoopSpecDetails>> {
         let Some(spec) = self.get_loop_spec(spec_id)? else {
@@ -794,6 +877,28 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Every loop node in the database, across every loop and spec — unlike
+    /// [`list_loop_nodes`]/[`list_loop_nodes_for_loop`], which scope to one
+    /// graph. Used by the `loop_audit_node_configs` MCP tool to find nodes
+    /// already carrying a config key their kind will never read (e.g. a
+    /// `prompt` key on an agent node — see
+    /// `daemon::handler::validate_node_config`), which write-time validation
+    /// alone can't catch for nodes created before it existed.
+    pub fn list_all_loop_nodes(&self) -> Result<Vec<LoopNode>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, spec_id, loop_id, name, kind, config, position, created_at
+             FROM loop_nodes ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], map_loop_node_row)?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn get_loop_node(&self, node_id: &str) -> Result<Option<LoopNode>> {
         let conn = self
             .conn
@@ -845,8 +950,8 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         conn.execute(
-            "INSERT INTO loop_edges (id, spec_id, loop_id, from_node, to_node, condition)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO loop_edges (id, spec_id, loop_id, from_node, to_node, condition, route)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 &edge.id,
                 &edge.spec_id,
@@ -854,6 +959,7 @@ impl Database {
                 &edge.from_node,
                 &edge.to_node,
                 edge.condition.as_str(),
+                edge.condition.route_label(),
             ],
         )?;
         Ok(())
@@ -888,8 +994,8 @@ impl Database {
         )?;
         for edge in edges {
             tx.execute(
-                "INSERT INTO loop_edges (id, spec_id, loop_id, from_node, to_node, condition)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO loop_edges (id, spec_id, loop_id, from_node, to_node, condition, route)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     &edge.id,
                     &edge.spec_id,
@@ -897,6 +1003,7 @@ impl Database {
                     &edge.from_node,
                     &edge.to_node,
                     edge.condition.as_str(),
+                    edge.condition.route_label(),
                 ],
             )?;
         }
@@ -910,7 +1017,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, spec_id, loop_id, from_node, to_node, condition
+            "SELECT id, spec_id, loop_id, from_node, to_node, condition, route
              FROM loop_edges WHERE spec_id = ?1 ORDER BY rowid ASC",
         )?;
         let rows = stmt.query_map(params![spec_id], map_loop_edge_row)?;
@@ -927,7 +1034,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, spec_id, loop_id, from_node, to_node, condition
+            "SELECT id, spec_id, loop_id, from_node, to_node, condition, route
              FROM loop_edges WHERE loop_id = ?1 ORDER BY rowid ASC",
         )?;
         let rows = stmt.query_map(params![loop_id], map_loop_edge_row)?;
@@ -942,7 +1049,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, spec_id, loop_id, from_node, to_node, condition
+            "SELECT id, spec_id, loop_id, from_node, to_node, condition, route
              FROM loop_edges WHERE id = ?1",
         )?;
         stmt.query_row(params![edge_id], map_loop_edge_row)
@@ -953,7 +1060,7 @@ impl Database {
     pub fn update_loop_edge_condition(
         &self,
         edge_id: &str,
-        condition: LoopEdgeCondition,
+        condition: &LoopEdgeCondition,
     ) -> Result<bool> {
         let conn = self
             .conn
@@ -961,10 +1068,39 @@ impl Database {
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let rows = conn.execute(
             "UPDATE loop_edges
-             SET condition = ?1
-             WHERE id = ?2",
-            params![condition.as_str(), edge_id],
+             SET condition = ?1,
+                 route = ?2
+             WHERE id = ?3",
+            params![condition.as_str(), condition.route_label(), edge_id],
         )?;
+        Ok(rows > 0)
+    }
+
+    /// Repoint an existing edge at a new target node — used to rewire a
+    /// router route to a different destination without dropping and
+    /// re-creating the edge (which would lose its id).
+    pub fn update_loop_edge_target(&self, edge_id: &str, to_node: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE loop_edges SET to_node = ?1 WHERE id = ?2",
+            params![to_node, edge_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Drop a single edge — used when a router's routes editor removes a
+    /// declared route that already had an edge wired to it, so the edge
+    /// never outlives the route it named (see
+    /// [`crate::domain::loops::validate_router_edges_declared`]).
+    pub fn delete_loop_edge(&self, edge_id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute("DELETE FROM loop_edges WHERE id = ?1", params![edge_id])?;
         Ok(rows > 0)
     }
 
@@ -1078,10 +1214,10 @@ impl Database {
 
     /// All node runs recorded against `loop_id`, regardless of whether the
     /// spec they belong to is bound (`loop_specs.loop_id`) or was picked up
-    /// live from a pool (pool members always keep `loop_id: None` on their
+    /// live from a queue (queue members always keep `loop_id: None` on their
     /// own row — see `LoopEngine::run_loop`). `loop_runs.loop_id` is set on
     /// every insert either way, so this is the only reliable way to find a
-    /// pool-driven loop's current/recent activity without a pool id in hand.
+    /// queue-driven loop's current/recent activity without a queue id in hand.
     pub fn list_loop_runs_for_loop(&self, loop_id: &str) -> Result<Vec<LoopNodeRun>> {
         let conn = self
             .conn
@@ -1095,6 +1231,86 @@ impl Database {
 
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    /// Page through a loop's node runs, most-recent-first, optionally
+    /// narrowed to one spec and/or one node — the query a failure
+    /// investigation needs (`loop_node_runs_list`): find what ran, in what
+    /// order, without knowing a node id ahead of time. Unlike
+    /// [`Self::list_loop_runs_for_loop`] (oldest-first, unbounded — built for
+    /// the engine replaying a whole run), this is bounded by `limit`/`offset`
+    /// so a loop with hundreds of runs stays a usable response.
+    ///
+    /// `loop_id` alone rides `idx_loop_runs_loop_started(loop_id,
+    /// started_at DESC)` directly, matching this query's default order.
+    /// Adding `spec_id`/`node_id` applies as a residual filter on top of that
+    /// same index scan — both columns already carry their own index
+    /// (`idx_loop_runs_spec_started`, `idx_loop_runs_node_iteration`) for
+    /// other call sites, but the scan here is bounded by `loop_id` first
+    /// either way, so no additional composite index is needed.
+    pub fn list_loop_node_runs(
+        &self,
+        loop_id: &str,
+        spec_id: Option<&str>,
+        node_id: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<LoopNodeRun>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+
+        let mut sql = String::from(
+            "SELECT id, loop_id, spec_id, node_id, status, input, output, started_at, completed_at, iteration, pid, boot_id, session_id
+             FROM loop_runs WHERE loop_id = ?",
+        );
+        let mut query_params: Vec<&dyn rusqlite::ToSql> = vec![&loop_id];
+        if let Some(spec_id) = spec_id.as_ref() {
+            sql.push_str(" AND spec_id = ?");
+            query_params.push(spec_id);
+        }
+        if let Some(node_id) = node_id.as_ref() {
+            sql.push_str(" AND node_id = ?");
+            query_params.push(node_id);
+        }
+        sql.push_str(" ORDER BY started_at DESC, iteration DESC LIMIT ? OFFSET ?");
+        query_params.push(&limit);
+        query_params.push(&offset);
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(query_params.as_slice(), map_loop_run_row)?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Most recent `loop_runs.started_at` per loop, across every loop in a
+    /// single query — the sidebar's "last activity" signal. Unlike
+    /// [`Self::list_loop_specs`] (a loop's own bound specs, empty for a
+    /// queue-driven run whose specs live on the queue instead), this reads
+    /// `loop_runs.loop_id`, which is set on every insert regardless of how
+    /// the spec was bound (see [`Self::list_loop_runs_for_loop`]), so it
+    /// reflects real execution for every loop kind. A loop absent from the
+    /// returned map has never recorded a run.
+    pub fn list_loop_last_run_times(&self) -> Result<HashMap<String, DateTime<Utc>>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt =
+            conn.prepare("SELECT loop_id, MAX(started_at) FROM loop_runs GROUP BY loop_id")?;
+        let rows = stmt.query_map(params![], |row| {
+            let loop_id: String = row.get(0)?;
+            let started_at: i64 = row.get(1)?;
+            Ok((loop_id, started_at))
+        })?;
+        let mut result = HashMap::new();
+        for row in rows {
+            let (loop_id, started_at) = row?;
+            result.insert(loop_id, from_timestamp(started_at)?);
+        }
+        Ok(result)
     }
 
     pub fn get_loop_run(&self, run_id: &str) -> Result<Option<LoopNodeRun>> {
@@ -1274,17 +1490,50 @@ impl Database {
     /// No loop run survives the process that spawned it, so any loop still
     /// `Running` at startup was interrupted mid-execution by the previous
     /// daemon. Pause it, mark its dangling node runs as failed/interrupted,
-    /// and reset its in-flight spec (loop-bound or pool member — either way
-    /// `run.spec_id` names it) from `running` back to `pending`, all in one
+    /// and mark its in-flight spec (loop-bound or queue member — either way
+    /// `run.spec_id` names it) `Interrupted` (not `Pending` — the run was cut
+    /// short by something external, not a failure of the work), all in one
     /// transaction so there is no window where the loop is recoverable but
-    /// the spec is not (B18). A spec's completed work is preserved by the
-    /// worktree/commits, not by its status, so restarting it from its entry
-    /// node on resume is safe — and required: leaving it `running` made it
-    /// invisible to pool selection (`pool_next_pending_spec_id` only ever
-    /// picks a `pending` member), permanently orphaning it. `loop_continue`
-    /// alone is enough to resume it (no `loop_pause` detour needed).
-    /// Idempotent: a loop already `Paused` isn't touched by a later call.
-    pub fn reconcile_orphaned_loops(&self) -> Result<usize> {
+    /// the spec is not (B18). The engine never touches git here — no more
+    /// `git stash` — so any uncommitted work the interrupted run left behind
+    /// stays exactly where it is; restarting the spec from its entry node on
+    /// resume finds it there, and its node prompt says so. Leaving the spec
+    /// `running` made it invisible to queue selection
+    /// (`queue_next_pending_spec_id` only ever picks a `pending` or
+    /// `interrupted` member), permanently orphaning it — `Interrupted` is
+    /// just as selectable as `Pending`, so this still can't happen.
+    /// `loop_continue` alone is enough to resume it (no `loop_pause` detour
+    /// needed). Idempotent: a loop already `Paused` isn't touched by a later
+    /// call.
+    ///
+    /// Daemon-lifecycle recovery only — **never** call this from anything
+    /// other than the daemon's own startup path. On 2026-08-03, `canopy
+    /// bridge`'s embedded stdio fallback (spawned when the reachability probe
+    /// to a live daemon lost a race under concurrent load) ran this via
+    /// `run_stdio_server`'s startup sequence: a short-lived helper process
+    /// declared a graph the *live* daemon owned "orphaned", SIGKILLed its
+    /// node's process group, `git stash`ed the workdir, and paused the graph
+    /// — four times, silently, before it was noticed. The doc comment above
+    /// only holds for the process that actually owns the daemon's lifecycle;
+    /// it is false for any other process that happens to open the same
+    /// database. `run_stdio_server` must never call this again. `data_dir`
+    /// is used for the ownership gate below, which is the second line of
+    /// defence against exactly that mistake, not a substitute for keeping
+    /// the caller list to one entry.
+    pub fn reconcile_orphaned_loops(&self, data_dir: &std::path::Path) -> Result<usize> {
+        // Ownership gate: if the on-disk pid file names a *live* process
+        // that isn't us, some other process owns the daemon lifecycle right
+        // now and this call has no business touching graph state — signal
+        // nothing, pause nothing, quarantine nothing. Belt and braces with
+        // keeping `run_stdio_server` from calling this at all: that removes
+        // the caller, this makes the function itself safe to call by
+        // mistake.
+        if let Some(pid) = crate::daemon::process::read_pid(data_dir) {
+            if pid != std::process::id() && crate::daemon::process::is_process_running(pid) {
+                return Ok(0);
+            }
+        }
+
         let conn = self
             .conn
             .lock()
@@ -1293,7 +1542,7 @@ impl Database {
 
         let orphaned: Vec<Loop> = {
             let mut stmt = tx.prepare(
-                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_pool_id, on_completed, auto_continue_at, auto_continue_action
+                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived
                  FROM loops WHERE status = ?1",
             )?;
             let rows = stmt.query_map(params![LoopStatus::Running.as_str()], map_loop_row)?;
@@ -1317,7 +1566,7 @@ impl Database {
             }
             for run in &dangling_runs {
                 tracing::warn!(
-                    "Reconciling orphaned loop '{}': was running node '{}' (spec '{}') when the daemon last stopped; pausing loop, marking its run as interrupted, and resetting the spec to pending.",
+                    "Reconciling orphaned loop '{}': was running node '{}' (spec '{}') when the daemon last stopped; pausing loop, marking its run as interrupted, and marking the spec interrupted.",
                     lp.id,
                     run.node_id,
                     run.spec_id
@@ -1345,44 +1594,10 @@ impl Database {
                         );
                     }
                 }
-                // B36: read the spec's baseline before the reset below clears
-                // it — it's the bound that tells us which uncommitted changes
-                // are attributable to this interrupted run. Without it there
-                // is no reliable way to tell "left behind by this run" from
-                // "already here for some other reason", so quarantine is
-                // skipped rather than guessed at.
-                let spec_start_head: Option<String> = tx
-                    .query_row(
-                        "SELECT spec_start_head FROM loop_specs WHERE id = ?1",
-                        params![run.spec_id],
-                        |row| row.get::<_, Option<String>>(0),
-                    )
-                    .optional()?
-                    .flatten();
-                let quarantine = spec_start_head.and_then(|_| {
-                    let message = format!(
-                        "canopy-interrupted: loop={} spec={} node={} run={}",
-                        lp.id, run.spec_id, run.node_id, run.id
-                    );
-                    quarantine_worktree(&lp.workdir, &message).then_some(message)
-                });
-                let mut output = serde_json::json!({
+                let output = serde_json::json!({
                     "interrupted": true,
                     "reason": "daemon restarted while this node was running"
                 });
-                if let Some(message) = &quarantine {
-                    tracing::warn!(
-                        "Reconciling orphaned loop '{}': worktree had uncommitted changes left by the interrupted run; quarantined with `git stash` ({}). Recover with `git stash list` / `git stash pop` in {}.",
-                        lp.id,
-                        message,
-                        lp.workdir
-                    );
-                    output["quarantine"] = serde_json::json!({
-                        "stashed": true,
-                        "message": message,
-                        "recover_hint": "git stash list / git stash pop",
-                    });
-                }
 
                 let now = Utc::now();
                 tx.execute(
@@ -1396,16 +1611,22 @@ impl Database {
                         run.id,
                     ],
                 )?;
-                // B18: same reset `reset_loop_spec_status` performs (status,
-                // started_at, completed_at, spec_start_head all cleared) —
-                // done inline here, against `tx`, rather than by calling that
-                // method, since it would try to re-lock `self.conn` and
-                // deadlock against the lock already held above.
+                // The engine never touches git (no more `git stash`): the
+                // partial work an interrupted run left in the workdir stays
+                // exactly where it is. Marking the spec `Interrupted` (not
+                // reset to `Pending`) is what used to be the stash's job —
+                // it's what tells the next pickup's rendered prompt to say
+                // "a previous attempt exists, continue it" instead of
+                // silently starting fresh. `spec_start_head` is still
+                // cleared: the next attempt captures its own fresh baseline
+                // (`run_spec` only reuses a persisted baseline for a
+                // same-attempt resume of a `Running` spec, which an
+                // `Interrupted` pickup is not).
                 tx.execute(
                     "UPDATE loop_specs
                      SET status = ?1, started_at = NULL, completed_at = NULL, spec_start_head = NULL
                      WHERE id = ?2",
-                    params![LoopSpecStatus::Pending.as_str(), run.spec_id],
+                    params![LoopSpecStatus::Interrupted.as_str(), run.spec_id],
                 )?;
             }
             tx.execute(
@@ -1418,14 +1639,14 @@ impl Database {
         Ok(orphaned.len())
     }
 
-    /// Reset pool-member specs stuck `running` with no active node run in
+    /// Reset queue-member specs stuck `running` with no active node run in
     /// this daemon's lifetime back to `pending`. Covers the gap between
     /// `reconcile_orphaned_loops` (which only touches loops that were
-    /// themselves `Running` at boot) and a pool member left `running` by a
+    /// themselves `Running` at boot) and a queue member left `running` by a
     /// path that paused the loop without resetting the spec (e.g. a
     /// BLOCKER-reported spec that was never cleaned up). Called at server
     /// startup after `reconcile_orphaned_loops`.
-    pub fn reconcile_stranded_pool_specs(&self) -> Result<usize> {
+    pub fn reconcile_stranded_queue_specs(&self) -> Result<usize> {
         let conn = self
             .conn
             .lock()
@@ -1434,8 +1655,8 @@ impl Database {
 
         let paused_loops: Vec<(String, String)> = {
             let mut stmt = tx.prepare(
-                "SELECT id, active_run_pool_id FROM loops
-                 WHERE status = ?1 AND active_run_pool_id IS NOT NULL",
+                "SELECT id, active_run_queue_id FROM loops
+                 WHERE status = ?1 AND active_run_queue_id IS NOT NULL",
             )?;
             let rows = stmt.query_map(params![LoopStatus::Paused.as_str()], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -1447,12 +1668,12 @@ impl Database {
         let boot_id = crate::system::boot_id();
         let current_boot_id = boot_id.as_deref();
 
-        for (loop_id, pool_id) in &paused_loops {
+        for (loop_id, queue_id) in &paused_loops {
             let stranded_specs: Vec<String> = {
                 let mut stmt = tx.prepare(
-                    "SELECT pm.spec_id FROM pool_members pm
+                    "SELECT pm.spec_id FROM queue_members pm
                      JOIN loop_specs ls ON ls.id = pm.spec_id
-                     WHERE pm.pool_id = ?1 AND ls.status = ?2
+                     WHERE pm.queue_id = ?1 AND ls.status = ?2
                      AND NOT EXISTS (
                          SELECT 1 FROM loop_runs lr
                          WHERE lr.spec_id = pm.spec_id
@@ -1462,7 +1683,7 @@ impl Database {
                      ORDER BY pm.position ASC",
                 )?;
                 let rows = stmt.query_map(
-                    params![pool_id, LoopSpecStatus::Running.as_str(), current_boot_id],
+                    params![queue_id, LoopSpecStatus::Running.as_str(), current_boot_id],
                     |row| row.get::<_, String>(0),
                 )?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -1470,9 +1691,9 @@ impl Database {
 
             for spec_id in &stranded_specs {
                 tracing::warn!(
-                    "Reconciling stranded pool spec '{}' in loop '{}': \
+                    "Reconciling stranded queue spec '{}' in loop '{}': \
                      was 'running' with no active node run in this daemon's \
-                     lifetime; resetting to pending.",
+                     lifetime; checking for evidence it was genuinely interrupted.",
                     spec_id,
                     loop_id
                 );
@@ -1483,11 +1704,11 @@ impl Database {
                 // boot (e.g. the daemon died before a graceful path like
                 // `loop_report_blocker` could finalize it). Identify it from
                 // recorded facts only — a boot id that isn't this one, or a
-                // pid that's no longer alive — mark it distinctly as
-                // interrupted (never as a plain node failure), and quarantine
-                // any uncommitted worktree changes it may have left, bounded
-                // by the spec's own `spec_start_head` so unrelated dirt is
-                // never swept in.
+                // pid that's no longer alive — and mark it distinctly as
+                // interrupted (never as a plain node failure). The engine
+                // never touches git: no quarantine, no `git stash` — the
+                // interrupted run's worktree changes are left exactly as
+                // they were.
                 let stale_run: Option<(String, Option<i64>, Option<String>)> = tx
                     .query_row(
                         "SELECT id, pid, boot_id FROM loop_runs
@@ -1498,6 +1719,12 @@ impl Database {
                     )
                     .optional()?;
 
+                // Only evidence of a genuinely interrupted run (a stale-boot
+                // or dead-pid `loop_runs` row) earns `Interrupted` instead of
+                // a plain reset to `Pending` — a spec stuck `running` with no
+                // run row behind it at all has no such evidence, so it's
+                // reset exactly as before.
+                let mut interrupted = false;
                 if let Some((run_id, pid, run_boot_id)) = stale_run {
                     let boot_mismatch = match (run_boot_id.as_deref(), current_boot_id) {
                         (Some(a), Some(b)) => a != b,
@@ -1509,49 +1736,11 @@ impl Database {
                         .unwrap_or(false);
 
                     if boot_mismatch || pid_dead {
-                        let spec_start_head: Option<String> = tx
-                            .query_row(
-                                "SELECT spec_start_head FROM loop_specs WHERE id = ?1",
-                                params![spec_id],
-                                |row| row.get::<_, Option<String>>(0),
-                            )
-                            .optional()?
-                            .flatten();
-
-                        let mut output = serde_json::json!({
+                        interrupted = true;
+                        let output = serde_json::json!({
                             "interrupted": true,
                             "reason": "daemon restarted or its process died while this node was running"
                         });
-
-                        if spec_start_head.is_some() {
-                            let workdir: Option<String> = tx
-                                .query_row(
-                                    "SELECT workdir FROM loops WHERE id = ?1",
-                                    params![loop_id],
-                                    |row| row.get(0),
-                                )
-                                .optional()?;
-                            if let Some(workdir) = workdir {
-                                let message = format!(
-                                    "canopy-interrupted: loop={} spec={} run={}",
-                                    loop_id, spec_id, run_id
-                                );
-                                if quarantine_worktree(&workdir, &message) {
-                                    tracing::warn!(
-                                        "Reconciling stranded pool spec '{}' in loop '{}': worktree had uncommitted changes left by the interrupted run; quarantined with `git stash` ({}). Recover with `git stash list` / `git stash pop` in {}.",
-                                        spec_id,
-                                        loop_id,
-                                        message,
-                                        workdir
-                                    );
-                                    output["quarantine"] = serde_json::json!({
-                                        "stashed": true,
-                                        "message": message,
-                                        "recover_hint": "git stash list / git stash pop",
-                                    });
-                                }
-                            }
-                        }
 
                         tx.execute(
                             "UPDATE loop_runs
@@ -1567,12 +1756,17 @@ impl Database {
                     }
                 }
 
+                let new_status = if interrupted {
+                    LoopSpecStatus::Interrupted
+                } else {
+                    LoopSpecStatus::Pending
+                };
                 tx.execute(
                     "UPDATE loop_specs
                      SET status = ?1, started_at = NULL, completed_at = NULL,
                          spec_start_head = NULL
                      WHERE id = ?2",
-                    params![LoopSpecStatus::Pending.as_str(), spec_id],
+                    params![new_status.as_str(), spec_id],
                 )?;
                 reset_count += 1;
             }
@@ -1652,7 +1846,7 @@ fn map_loop_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Loop> {
             .get::<_, Option<i64>>(9)?
             .map(from_timestamp)
             .transpose()?,
-        active_run_pool_id: row.get(10)?,
+        active_run_queue_id: row.get(10)?,
         on_completed: row
             .get::<_, Option<String>>(11)?
             .as_deref()
@@ -1663,6 +1857,7 @@ fn map_loop_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Loop> {
             .map(from_timestamp)
             .transpose()?,
         auto_continue_action: row.get(13)?,
+        archived: row.get(14)?,
     })
 }
 
@@ -1757,16 +1952,19 @@ fn map_loop_node_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoopNode> {
 }
 
 fn map_loop_edge_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoopEdge> {
-    let condition = LoopEdgeCondition::from_str(&row.get::<_, String>(5)?).ok_or_else(|| {
-        rusqlite::Error::FromSqlConversionFailure(
-            5,
-            rusqlite::types::Type::Text,
-            Box::new(IoError::new(
-                ErrorKind::InvalidData,
-                "Invalid loop edge condition",
-            )),
-        )
-    })?;
+    let condition_tag: String = row.get(5)?;
+    let route_label: Option<String> = row.get(6)?;
+    let condition =
+        LoopEdgeCondition::from_parts(&condition_tag, route_label).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Text,
+                Box::new(IoError::new(
+                    ErrorKind::InvalidData,
+                    "Invalid loop edge condition",
+                )),
+            )
+        })?;
 
     Ok(LoopEdge {
         id: row.get(0)?,
@@ -1791,33 +1989,6 @@ fn active_loop_run_for_spec_locked(
     )?;
     stmt.query_row(params![spec_id], map_loop_run_row)
         .optional()
-}
-
-/// Stash any uncommitted changes in `workdir` so they survive an interrupted
-/// run as SUSPECT rather than being silently overwritten or blamed on
-/// whatever runs next (B36). There is no reliable way to tell a truncated
-/// write from a complete-but-uncommitted one, so this never reverts,
-/// checks out, or deletes anything — only `git stash push -u`, recoverable
-/// with tools the operator already knows (`git stash list` / `git stash
-/// pop`). Returns `false` (nothing quarantined) for anything short of a
-/// definite "yes, there are uncommitted changes here" — not a git repo,
-/// `git` unavailable, a clean tree — so reconciliation never fails just
-/// because a worktree is unusual.
-fn quarantine_worktree(workdir: &str, message: &str) -> bool {
-    let Ok(status) = std::process::Command::new("git")
-        .args(["-C", workdir, "status", "--porcelain"])
-        .output()
-    else {
-        return false;
-    };
-    if !status.status.success() || status.stdout.is_empty() {
-        return false;
-    }
-    std::process::Command::new("git")
-        .args(["-C", workdir, "stash", "push", "-u", "-m", message])
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
 }
 
 fn map_loop_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoopNodeRun> {
@@ -1905,6 +2076,7 @@ mod tests {
 
     fn sample_loop(id: &str) -> Loop {
         Loop {
+            archived: false,
             id: id.to_string(),
             name: format!("Loop {id}"),
             description: None,
@@ -1917,7 +2089,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         }
     }
@@ -1956,7 +2128,7 @@ mod tests {
     #[test]
     fn list_loops_empty() {
         let db = test_db();
-        let loops = db.list_loops(None).unwrap();
+        let loops = db.list_loops(None, false).unwrap();
         assert!(loops.is_empty());
     }
 
@@ -1968,7 +2140,7 @@ mod tests {
         db.insert_loop(&loop1).unwrap();
         db.insert_loop(&loop2).unwrap();
 
-        let loops = db.list_loops(None).unwrap();
+        let loops = db.list_loops(None, false).unwrap();
         assert_eq!(loops.len(), 2);
     }
 
@@ -2062,5 +2234,249 @@ mod tests {
     fn parse_json_value_invalid() {
         let result = parse_json_value("invalid json");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn list_loop_last_run_times_empty_when_no_runs() {
+        let db = test_db();
+        let loop_obj = sample_loop("loop1");
+        db.insert_loop(&loop_obj).unwrap();
+
+        let times = db.list_loop_last_run_times().unwrap();
+        assert!(
+            times.is_empty(),
+            "a loop with no recorded runs must not appear in the map"
+        );
+    }
+
+    #[test]
+    fn list_loop_last_run_times_returns_max_started_at_per_loop() {
+        let db = test_db();
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO loops (id, name, workdir, status, created_at) VALUES ('loop1', 'l1', '/tmp', 'draft', 0)",
+            params![],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO loops (id, name, workdir, status, created_at) VALUES ('loop2', 'l2', '/tmp', 'draft', 0)",
+            params![],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO loop_specs (id, loop_id, name, position, parallelizable, status) VALUES ('spec1', 'loop1', 's1', 0, 0, 'pending')",
+            params![],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO loop_nodes (id, spec_id, loop_id, name, kind, config, position, created_at) VALUES ('n1', 'spec1', NULL, 'node1', 'agent', '{}', 0, 0)",
+            params![],
+        )
+        .unwrap();
+        // Two runs on loop1 — the later one (started_at 500) must win.
+        conn.execute(
+            "INSERT INTO loop_runs (id, loop_id, spec_id, node_id, status, started_at, iteration) VALUES ('run1', 'loop1', 'spec1', 'n1', 'success', 100, 1)",
+            params![],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO loop_runs (id, loop_id, spec_id, node_id, status, started_at, iteration) VALUES ('run2', 'loop1', 'spec1', 'n1', 'success', 500, 2)",
+            params![],
+        )
+        .unwrap();
+        drop(conn);
+
+        let times = db.list_loop_last_run_times().unwrap();
+        assert_eq!(times.len(), 1, "loop2 has no runs, so must be absent");
+        assert_eq!(
+            times.get("loop1").unwrap().timestamp(),
+            500,
+            "must report the MAX started_at, not the first run"
+        );
+        assert!(!times.contains_key("loop2"));
+    }
+
+    /// Seeds loop1 (spec1: nodes n1/n2, spec2: node n3) and loop2 (spec3:
+    /// node n4) with runs at increasing `started_at`, so tests can assert
+    /// default ordering, spec/node filters, and paging against a fixture
+    /// that mirrors a real multi-spec, multi-node loop.
+    fn seed_node_runs_fixture(db: &Database) {
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO loops (id, name, workdir, status, created_at) VALUES ('loop1', 'l1', '/tmp', 'running', 0)",
+            params![],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO loops (id, name, workdir, status, created_at) VALUES ('loop2', 'l2', '/tmp', 'running', 0)",
+            params![],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO loop_specs (id, loop_id, name, position, parallelizable, status) VALUES ('spec1', 'loop1', 's1', 0, 0, 'pending')",
+            params![],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO loop_specs (id, loop_id, name, position, parallelizable, status) VALUES ('spec2', 'loop1', 's2', 1, 0, 'pending')",
+            params![],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO loop_specs (id, loop_id, name, position, parallelizable, status) VALUES ('spec3', 'loop2', 's3', 0, 0, 'pending')",
+            params![],
+        )
+        .unwrap();
+        for (node_id, spec_id, position) in [
+            ("n1", "spec1", 0),
+            ("n2", "spec1", 1),
+            ("n3", "spec2", 0),
+            ("n4", "spec3", 0),
+        ] {
+            conn.execute(
+                "INSERT INTO loop_nodes (id, spec_id, loop_id, name, kind, config, position, created_at) VALUES (?1, ?2, NULL, ?1, 'agent', '{}', ?3, 0)",
+                params![node_id, spec_id, position],
+            )
+            .unwrap();
+        }
+        // loop1: run1 (spec1/n1, t=100), run2 (spec1/n2, t=200), run3
+        // (spec2/n3, t=300, fail). loop2: run4 (spec3/n4, t=400) — must never
+        // leak into a loop1 query.
+        for (id, loop_id, spec_id, node_id, status, started_at) in [
+            ("run1", "loop1", "spec1", "n1", "pass", 100),
+            ("run2", "loop1", "spec1", "n2", "pass", 200),
+            ("run3", "loop1", "spec2", "n3", "fail", 300),
+            ("run4", "loop2", "spec3", "n4", "pass", 400),
+        ] {
+            conn.execute(
+                "INSERT INTO loop_runs (id, loop_id, spec_id, node_id, status, started_at, iteration) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+                params![id, loop_id, spec_id, node_id, status, started_at],
+            )
+            .unwrap();
+        }
+        drop(conn);
+    }
+
+    #[test]
+    fn list_loop_node_runs_defaults_to_most_recent_first_scoped_to_loop() {
+        let db = test_db();
+        seed_node_runs_fixture(&db);
+
+        let runs = db.list_loop_node_runs("loop1", None, None, 10, 0).unwrap();
+        let ids: Vec<&str> = runs.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["run3", "run2", "run1"],
+            "most-recent-started_at run must lead, and loop2's run4 must never appear"
+        );
+    }
+
+    #[test]
+    fn list_loop_node_runs_filters_by_spec_and_node() {
+        let db = test_db();
+        seed_node_runs_fixture(&db);
+
+        let by_spec = db
+            .list_loop_node_runs("loop1", Some("spec1"), None, 10, 0)
+            .unwrap();
+        assert_eq!(
+            by_spec.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["run2", "run1"]
+        );
+
+        let by_node = db
+            .list_loop_node_runs("loop1", None, Some("n3"), 10, 0)
+            .unwrap();
+        assert_eq!(
+            by_node.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["run3"]
+        );
+
+        let by_both = db
+            .list_loop_node_runs("loop1", Some("spec1"), Some("n1"), 10, 0)
+            .unwrap();
+        assert_eq!(
+            by_both.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["run1"]
+        );
+    }
+
+    #[test]
+    fn list_loop_node_runs_pages_with_limit_and_offset() {
+        let db = test_db();
+        seed_node_runs_fixture(&db);
+
+        let first_page = db.list_loop_node_runs("loop1", None, None, 2, 0).unwrap();
+        assert_eq!(
+            first_page.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["run3", "run2"]
+        );
+
+        let second_page = db.list_loop_node_runs("loop1", None, None, 2, 2).unwrap();
+        assert_eq!(
+            second_page
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["run1"],
+            "offset must skip past the first page's runs, not repeat them"
+        );
+    }
+
+    #[test]
+    fn list_all_loop_nodes_returns_every_node_regardless_of_spec_or_loop_scope() {
+        let db = test_db();
+        let lp = sample_loop("loop-1");
+        db.insert_loop(&lp).unwrap();
+        let spec = LoopSpec {
+            id: "spec-1".to_string(),
+            loop_id: Some(lp.id.clone()),
+            name: "Spec".to_string(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        db.insert_loop_spec(&spec).unwrap();
+
+        let spec_scoped = LoopNode {
+            id: "node-spec".to_string(),
+            spec_id: Some(spec.id),
+            loop_id: None,
+            name: "Spec Node".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "claude"}),
+            position: 1,
+            created_at: Utc::now(),
+        };
+        let loop_scoped = LoopNode {
+            id: "node-loop".to_string(),
+            spec_id: None,
+            loop_id: Some(lp.id),
+            name: "Loop Node".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "true"}),
+            position: 1,
+            created_at: Utc::now(),
+        };
+        db.insert_loop_node(&spec_scoped).unwrap();
+        db.insert_loop_node(&loop_scoped).unwrap();
+
+        let all_ids: Vec<String> = db
+            .list_all_loop_nodes()
+            .unwrap()
+            .into_iter()
+            .map(|node| node.id)
+            .collect();
+        assert_eq!(all_ids.len(), 2);
+        assert!(all_ids.contains(&"node-spec".to_string()));
+        assert!(all_ids.contains(&"node-loop".to_string()));
     }
 }

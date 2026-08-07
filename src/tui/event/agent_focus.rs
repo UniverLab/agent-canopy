@@ -55,10 +55,11 @@ pub fn handle_agent_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -
 }
 
 /// Keys while a project's Focus tab bar is open (`sidebar_layer ==
-/// Knowledge`, `project_focus.is_some()`): arrows navigate the active tab's
-/// list only — they never change tabs; Tab/Shift+Tab or `]`/`[` cycle tabs;
-/// o/b/k/h jump directly; Esc returns to the sidebar (functional
-/// requirement 4).
+/// Knowledge`, `project_focus.is_some()`): plain ↑↓ navigate the active
+/// tab's list; Tab/Shift+Tab, `]`/`[`, and Shift+←/→ all cycle tabs (the
+/// same ring-stepping convention as the sidebar's own tab strip — see
+/// `event::sidebar_tab_step_applies`); o/b/k/h jump directly; Esc returns to
+/// the sidebar (functional requirement 4).
 fn handle_project_focus_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     if app.knowledge_filter_mode {
         match code {
@@ -83,6 +84,12 @@ fn handle_project_focus_key(app: &mut App, code: KeyCode, modifiers: KeyModifier
         }
         KeyCode::Tab | KeyCode::Char(']') => app.cycle_project_tab(true),
         KeyCode::BackTab | KeyCode::Char('[') => app.cycle_project_tab(false),
+        KeyCode::Right if modifiers.contains(KeyModifiers::SHIFT) => {
+            app.cycle_project_tab(true);
+        }
+        KeyCode::Left if modifiers.contains(KeyModifiers::SHIFT) => {
+            app.cycle_project_tab(false);
+        }
         KeyCode::Char(c) if ProjectTab::ALL.iter().any(|tab| tab.hotkey() == c) => {
             let tab = ProjectTab::ALL
                 .into_iter()
@@ -269,12 +276,18 @@ fn handle_split_picker_shortcut(app: &mut App, code: KeyCode, modifiers: KeyModi
     true
 }
 
+/// Shift+←/→ moves focus between the two split panes. Only meaningful (and
+/// only reachable — see `event::sidebar_tab_step_applies`) while a split is
+/// active: without one, the global handler claims Shift+←/→ first to step
+/// the sidebar tab strip instead, so this never sees the key in that case.
+/// The `active_split_id` check here is a second, defensive guarantee of the
+/// same contract, not load-bearing given today's call order.
 fn handle_split_panel_focus_shortcut(
     app: &mut App,
     code: KeyCode,
     modifiers: KeyModifiers,
 ) -> bool {
-    if !modifiers.contains(KeyModifiers::SHIFT) {
+    if !modifiers.contains(KeyModifiers::SHIFT) || app.active_split_id.is_none() {
         return false;
     }
 
@@ -837,6 +850,77 @@ mod tests {
         app.selected = 0;
         app.focus = Focus::Agent;
         app
+    }
+
+    fn app_with_project_focus(tab: ProjectTab) -> App {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.projects = vec![crate::domain::project::Project::new("/tmp/proj")];
+        app.sidebar_layer = SidebarLayer::Knowledge;
+        app.selected_project = 0;
+        app.project_focus = Some(tab);
+        app.focus = Focus::Agent;
+        app
+    }
+
+    #[test]
+    fn shift_right_steps_project_tab_forward() {
+        let mut app = app_with_project_focus(ProjectTab::Overview);
+
+        handle_project_focus_key(&mut app, KeyCode::Right, KeyModifiers::SHIFT);
+
+        assert_eq!(app.project_focus, Some(ProjectTab::Backlog));
+    }
+
+    #[test]
+    fn shift_left_steps_project_tab_backward_and_wraps() {
+        let mut app = app_with_project_focus(ProjectTab::Overview);
+
+        handle_project_focus_key(&mut app, KeyCode::Left, KeyModifiers::SHIFT);
+
+        assert_eq!(
+            app.project_focus,
+            Some(ProjectTab::History),
+            "stepping left off the first tab wraps to the last"
+        );
+    }
+
+    #[test]
+    fn plain_arrows_do_not_step_project_tabs() {
+        // Plain ↑↓ navigate the active tab's list; plain ←/→ are unclaimed
+        // here (Shift+←/→ is the tab-stepping binding).
+        let mut app = app_with_project_focus(ProjectTab::Overview);
+
+        handle_project_focus_key(&mut app, KeyCode::Right, KeyModifiers::NONE);
+
+        assert_eq!(app.project_focus, Some(ProjectTab::Overview));
+    }
+
+    #[test]
+    fn split_panel_focus_shortcut_is_a_noop_without_an_active_split() {
+        // Without a split, Shift+←/→ must not be consumed here — the global
+        // handler claims it first to step the sidebar tab strip instead.
+        let mut app = app_with_background_agent();
+        app.active_split_id = None;
+
+        let handled =
+            handle_split_panel_focus_shortcut(&mut app, KeyCode::Right, KeyModifiers::SHIFT);
+
+        assert!(!handled);
+        assert!(!app.split_right_focused);
+    }
+
+    #[test]
+    fn split_panel_focus_shortcut_still_works_with_an_active_split() {
+        let mut app = app_with_background_agent();
+        app.active_split_id = Some("split-1".to_string());
+
+        let handled =
+            handle_split_panel_focus_shortcut(&mut app, KeyCode::Right, KeyModifiers::SHIFT);
+
+        assert!(handled);
+        assert!(app.split_right_focused);
     }
 
     #[test]

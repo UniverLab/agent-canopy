@@ -36,6 +36,7 @@ use std::io;
 use std::sync::Arc;
 
 use crate::db::Database;
+use crate::domain::db_paths::database_path;
 
 use crate::tui::app::types::App;
 use event::run_event_loop;
@@ -45,7 +46,7 @@ pub fn run_tui() -> Result<()> {
     crate::domain::notification::register_aumid();
     crate::domain::notification::clear_stale_notifications();
     let data_dir = crate::ensure_data_dir()?;
-    let db_path = data_dir.join("background_agents.db");
+    let db_path = database_path(&data_dir);
 
     if !db_path.exists() {
         eprintln!("Daemon not running — starting it automatically…");

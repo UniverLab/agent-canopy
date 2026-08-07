@@ -2,7 +2,13 @@ use crate::domain::sync::summarize_sync_context;
 
 use super::types::{AgentEntry, App, SidebarLayer, SyncPanelState};
 
-pub(crate) const ACTIVITY_PANEL_WIDTH: u16 = 34;
+// Ceiling on ultrawide terminals. The panel is mostly wrapped prose (mission
+// and message text), and past ~80 columns a single block of wrapped text
+// gets harder to read, not more useful — so growth stops there rather than
+// keeping pace with 30% of an arbitrarily wide screen. This only engages
+// past ~267 columns of total width, far beyond the ~113 where the old fixed
+// 34-column cap used to bind, so today's normal terminals are unaffected.
+const ACTIVITY_PANEL_MAX_WIDTH: u16 = 80;
 const ACTIVITY_PANEL_MIN_WIDTH: u16 = 24;
 const ACTIVITY_PANEL_FORCED_MIN_WIDTH: u16 = 16;
 const ACTIVITY_PANEL_PERCENT: u16 = 30;
@@ -78,7 +84,7 @@ impl App {
 
         let proportional_width = ((total_width as u32 * ACTIVITY_PANEL_PERCENT as u32 / 100)
             as u16)
-            .min(ACTIVITY_PANEL_WIDTH);
+            .min(ACTIVITY_PANEL_MAX_WIDTH);
 
         let force_shown = self
             .selected_activity_workdir()
@@ -412,14 +418,37 @@ mod tests {
     }
 
     #[test]
-    fn activity_panel_width_is_30_percent_clamped_between_24_and_34() {
+    fn activity_panel_width_is_30_percent_clamped_between_24_and_80() {
         let db = test_db();
         let data_dir = tempdir().expect("create data dir");
         let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
 
-        assert_eq!(app.activity_panel_layout_width(200, true), 34);
         assert_eq!(app.activity_panel_layout_width(100, true), 30);
         assert_eq!(app.activity_panel_layout_width(70, true), 0);
+    }
+
+    #[test]
+    fn activity_panel_width_grows_proportionally_past_the_old_fixed_cap() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+
+        // Narrow: below the minimum, panel is hidden.
+        assert_eq!(app.activity_panel_layout_width(70, true), 0);
+        // Right at the minimum threshold.
+        assert_eq!(app.activity_panel_layout_width(80, true), 24);
+        // Mid range: follows the 30% proportion.
+        assert_eq!(app.activity_panel_layout_width(100, true), 30);
+        // Where the old fixed 34-column cap used to bind — no longer capped.
+        assert_eq!(app.activity_panel_layout_width(114, true), 34);
+        assert_eq!(app.activity_panel_layout_width(150, true), 45);
+        assert_eq!(app.activity_panel_layout_width(200, true), 60);
+        // Approaching the new ceiling: still proportional, no jump.
+        assert_eq!(app.activity_panel_layout_width(266, true), 79);
+        assert_eq!(app.activity_panel_layout_width(267, true), 80);
+        // Past the ceiling: bounded, even on an ultrawide terminal.
+        assert_eq!(app.activity_panel_layout_width(300, true), 80);
+        assert_eq!(app.activity_panel_layout_width(1000, true), 80);
     }
 
     #[test]

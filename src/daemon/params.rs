@@ -114,6 +114,17 @@ pub struct TaskModelsParams {
     /// still-fresh local cache — use this to pick up newly published models.
     #[serde(default)]
     pub refresh: Option<bool>,
+    /// When true, bypass the per-provider and per-listing caps to show every
+    /// model. Defaults to false, which truncates long listings with a notice
+    /// naming the provider, how many were shown, and how many exist.
+    ///
+    /// An explicit flag rather than a bigger implicit cap for platform-scoped
+    /// queries: a single platform can still map to a provider with a large
+    /// native catalog (e.g. a gateway CLI), so "has a platform filter" isn't
+    /// a reliable proxy for "small enough to show uncapped" — an opt-in flag
+    /// keeps the worst case bounded and predictable regardless of query shape.
+    #[serde(default)]
+    pub full: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -168,6 +179,8 @@ pub struct SyncBroadcastParams {
     /// Human-readable message.
     pub message: String,
     /// Optional JSON metadata.
+    #[serde(default)]
+    #[schemars(schema_with = "arbitrary_json_value_schema")]
     pub metadata: Option<serde_json::Value>,
 }
 
@@ -199,7 +212,25 @@ pub struct IntelligenceRelationParams {
     pub weight: Option<f64>,
 }
 
+/// Schema for a field that accepts any well-formed JSON value. Plain
+/// `serde_json::Value` fields otherwise emit an untyped `{}` schema — list
+/// every JSON Schema primitive explicitly so a shallow schema reader (and
+/// the registered-tool schema regression guard) can see this parameter has
+/// a declared type, without narrowing what it actually accepts.
+fn arbitrary_json_value_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["object", "array", "string", "number", "boolean", "null"],
+    })
+}
+
+// `#[schemars(inline)]` makes every use site of this type emit its full
+// object schema in place instead of a bare `$ref` into `$defs`. Without it,
+// `IntelligenceUpsertParams.node_data` advertises only `{"$ref": "..."}`
+// with no sibling `type`, which is indistinguishable from an untyped
+// parameter to a client that doesn't resolve `$ref` — that client then
+// falls back to sending the object as a JSON-encoded string.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[schemars(inline)]
 pub struct IntelligenceNodeParams {
     /// Optional stable node ID. If omitted, a new UUID is generated.
     pub id: Option<String>,
@@ -210,6 +241,8 @@ pub struct IntelligenceNodeParams {
     /// Main body/content of the node.
     pub body: String,
     /// Optional structured metadata.
+    #[serde(default)]
+    #[schemars(schema_with = "arbitrary_json_value_schema")]
     pub metadata: Option<serde_json::Value>,
     /// Optional project hash this node belongs to.
     pub project_hash: Option<String>,
@@ -244,6 +277,27 @@ pub struct IntelligenceGraphWalkParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct IntelligenceDeleteNodeParams {
+    /// ID of the intelligence node to delete.
+    pub node_id: String,
+    /// Optional project hash to explicitly scope the deletion, the same way
+    /// `intelligence_get_context` allows an explicit override of the
+    /// project auto-detected from the session workdir.
+    pub project_hash: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct IntelligenceDeleteRelationParams {
+    /// ID of the relation (edge) to delete, as returned in the `edges` list
+    /// of `intelligence_graph_walk`.
+    pub edge_id: i64,
+    /// Optional project hash to explicitly scope the deletion, the same way
+    /// `intelligence_get_context` allows an explicit override of the
+    /// project auto-detected from the session workdir.
+    pub project_hash: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetToolsParams {
     /// Scope of the action. One of: session_start, file_write, test_run, close_session, multi_agent.
     pub scope: String,
@@ -267,6 +321,20 @@ pub struct ProjectUpdateParams {
     pub description: Option<String>,
     /// New tags list.
     pub tags: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProjectRemapParams {
+    /// The project's current workdir_hash (see `project_search` or
+    /// `canopy clean`'s orphan report).
+    pub project_hash: String,
+    /// The project's new absolute path on disk (where the directory was
+    /// renamed or moved to).
+    pub new_path: String,
+    /// Preview which rows would move without changing anything. Default: false.
+    pub dry_run: Option<bool>,
+    /// Remap even if `new_path` doesn't exist on disk yet. Default: false.
+    pub force: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -498,26 +566,61 @@ pub struct LoopAddEdgeParams {
     pub from_node: String,
     /// Destination node ID.
     pub to_node: String,
-    /// Routing condition: pass, fail, or always.
+    /// Routing condition: pass, fail, always, or route.
     pub condition: String,
+    /// Route label this edge serves — required when `condition` is
+    /// `"route"`, and must name one of `from_node`'s declared routes (see
+    /// `loop_add_node`'s router `config.routes`). Ignored otherwise.
+    pub route: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LoopUpdateEdgeParams {
     /// Existing edge ID.
     pub edge_id: String,
-    /// New routing condition: pass, fail, or always.
+    /// New routing condition: pass, fail, always, or route.
     pub condition: String,
+    /// Route label this edge serves — required when `condition` is
+    /// `"route"`, and must name one of the edge's `from_node`'s declared
+    /// routes. Ignored otherwise.
+    pub route: Option<String>,
+    /// New destination node ID — retargets the edge instead of recreating
+    /// it, preserving its `edge_id` and any run history keyed against it.
+    /// Must belong to the same spec/loop graph as the edge. Omit to leave
+    /// the edge's target unchanged.
+    pub to_node: Option<String>,
 }
 
-/// One ensemble member: differs from its siblings only by
-/// platform/model — homogeneous by design (v1), see `loop_add_ensemble`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopDeleteEdgeParams {
+    /// Existing edge ID to delete.
+    pub edge_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopDeleteNodeParams {
+    /// Existing node ID to delete. Cascades to every edge naming it as
+    /// `from_node` or `to_node`. Rejected if the node is the graph's entry
+    /// point.
+    pub node_id: String,
+}
+
+/// One ensemble member: differs from its siblings by platform/model and,
+/// optionally, its own prompt — see `loop_add_ensemble`.
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct EnsembleMemberParams {
     /// CLI platform for this member (e.g. "claude", "openrouter").
     pub platform: String,
     /// Optional model override for this member.
     pub model: Option<String>,
+    /// Optional prompt for this member only, replacing the ensemble's shared
+    /// `prompt_template` — same placeholders (e.g. `{{spec_content}}`,
+    /// `{{previous_feedback}}`), rendered the same way. Lets a panel review
+    /// the same input from several angles (context, security, conventions...)
+    /// in one ensemble instead of one prompt across different models. Omit to
+    /// use the shared prompt, same as every member before this field existed.
+    /// Independent of `platform`/`model`.
+    pub prompt_override: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -533,8 +636,9 @@ pub struct LoopAddEnsembleParams {
     /// placeholders as an agent node's `prompt_template`. Required unless
     /// `blueprint` supplies one.
     pub prompt_template: Option<String>,
-    /// 2-8 members: parallel proposer/reviewer variants that differ only by
-    /// platform/model. Required unless `blueprint` supplies them.
+    /// 2-8 members: parallel proposer/reviewer variants that differ by
+    /// platform/model and, optionally, per-member `prompt_override`. Required
+    /// unless `blueprint` supplies them.
     pub members: Option<Vec<EnsembleMemberParams>>,
     /// Name of an existing ensemble blueprint (e.g. "ensemble-proposers") to
     /// source `prompt_template`/`members` from when they're omitted above.
@@ -569,8 +673,10 @@ pub struct LoopUpdateEnsembleParams {
     /// New shared prompt, propagated to every current member.
     pub prompt_template: Option<String>,
     /// Replacement member list (2-8 entries) — added/removed/replaced by
-    /// position. Individual member overrides are not supported; this always
-    /// replaces the full list.
+    /// position, always the full list (there is no way to patch a single
+    /// member in place). Each entry may set its own `prompt_override`; a
+    /// member without one uses the (possibly also-updated) shared
+    /// `prompt_template`.
     pub members: Option<Vec<EnsembleMemberParams>>,
     /// New pass threshold.
     pub min_pass: Option<i64>,
@@ -702,51 +808,6 @@ pub struct QueueReorderParams {
     pub spec_ids: Vec<String>,
 }
 
-// DEPRECATED: back-compat params for the `pool_*` tool aliases. Prefer the
-// `Queue*Params` structs above and the `queue_*` tools. Kept so existing
-// callers passing `pool_id` keep working; both feed the same shared helpers.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct PoolCreateParams {
-    /// Human-readable pool name.
-    pub name: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct PoolAddSpecParams {
-    /// Existing pool ID.
-    pub pool_id: String,
-    /// Existing spec ID to append to the end of the pool's queue.
-    pub spec_id: String,
-    /// Optional context group (RS3). Specs sharing a group in the same queue
-    /// reuse one warm harness session. Omit for an ungrouped member.
-    #[serde(default)]
-    pub group: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct PoolListParams {
-    /// Existing pool ID. Omit to list every pool (summary only, no members).
-    pub pool_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct PoolRemoveSpecParams {
-    /// Existing pool ID.
-    pub pool_id: String,
-    /// Spec ID to remove from the pool.
-    pub spec_id: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct PoolReorderParams {
-    /// Existing pool ID.
-    pub pool_id: String,
-    /// Full list of spec IDs currently in the pool, in the desired final
-    /// order. Must be a total permutation of the pool's current members —
-    /// every spec id exactly once.
-    pub spec_ids: Vec<String>,
-}
-
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LoopGetParams {
     /// Loop ID.
@@ -754,9 +815,102 @@ pub struct LoopGetParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopExportParams {
+    /// Loop ID to export.
+    pub loop_id: String,
+    /// Include each agent node's/ensemble member's `platform`/`model` in the
+    /// document. Defaults to `false` — a shared design should never pin the
+    /// recipient to a harness or model they may not have; use `true` only
+    /// when exporting your own loop to restore later on your own machine.
+    #[serde(default)]
+    pub with_models: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopImportParams {
+    /// The exported loop document (the object `loop_export` returns).
+    #[schemars(schema_with = "arbitrary_json_value_schema")]
+    pub document: serde_json::Value,
+    /// Absolute workdir for the new loop.
+    pub workdir: String,
+    /// Loop name to use instead of the document's own `name`.
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopNodeRunsListParams {
+    /// Loop ID whose node runs to list.
+    pub loop_id: String,
+    /// Narrow to one spec's runs.
+    pub spec_id: Option<String>,
+    /// Narrow to one node's runs.
+    pub node_id: Option<String>,
+    /// Maximum number of runs to return, most recent first. Defaults to 20,
+    /// capped at 200.
+    pub limit: Option<u32>,
+    /// Number of most-recent runs to skip before returning `limit` more —
+    /// page past the default page (e.g. `offset: 20` for the next page after
+    /// the default). Defaults to 0.
+    pub offset: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopNodeRunGetParams {
+    /// The node run ID (the `id` field from loop_node_runs_list's results).
+    pub run_id: String,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct AgentProbeParams {
+    /// Platform to probe (e.g. "claude"). Omit to probe every platform
+    /// configured in canopy, each with its own default model.
+    #[serde(default)]
+    pub platform: Option<String>,
+    /// Model to probe for `platform` — validates the exact platform+model
+    /// pair a loop node would use, instead of the platform's default.
+    /// Requires `platform`; omit both to sweep every configured platform.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Seconds to wait for a response before reporting a timeout (distinct
+    /// from a response that came back but didn't contain the probe token).
+    /// Defaults to 30, clamped to [5, 120] — this is a liveness check, not a
+    /// capability benchmark.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopPreflightParams {
+    /// Loop ID to preflight.
+    pub loop_id: String,
+    /// Seconds to wait for each probe's response before reporting a
+    /// timeout. Defaults to 30, clamped to [5, 120].
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct LoopListParams {
     /// Optional absolute workdir filter.
     pub workdir: Option<String>,
+    /// Include archived loops in the results. Defaults to `false` — the
+    /// same "browsing" view as the TUI's main Loops list, which excludes
+    /// archived loops. An archived loop is still reachable directly by id
+    /// via `loop_get` regardless of this flag.
+    #[serde(default)]
+    pub include_archived: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopArchiveParams {
+    /// Loop ID to archive.
+    pub loop_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopRestoreParams {
+    /// Loop ID to restore from the archive back to the main list.
+    pub loop_id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -765,12 +919,8 @@ pub struct LoopRunParams {
     pub loop_id: String,
     /// Optional queue ID. When set, the loop runs the queue's pending specs (in
     /// queue order) through the loop's graph instead of its own bound specs.
-    /// Queue membership is unaffected — specs stay standalone. Wins over the
-    /// deprecated `pool_id` if both are set.
+    /// Queue membership is unaffected — specs stay standalone.
     pub queue_id: Option<String>,
-    /// DEPRECATED: use `queue_id` instead. Kept for back-compat; `queue_id`
-    /// takes precedence when both are provided.
-    pub pool_id: Option<String>,
     /// Optional absolute workdir override for this run only. Wins over the
     /// loop's own `workdir`; the loop's `workdir` is left unchanged.
     pub workdir: Option<String>,

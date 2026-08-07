@@ -848,11 +848,38 @@ impl App {
             return false;
         };
 
-        let scrollback = agent.last_lines(2000);
-        if let Some(hist) = self.terminal_histories.get_mut(&agent.name) {
-            let lines: Vec<String> = scrollback.lines().map(|s| s.to_string()).collect();
-            hist.update_scrollback(&lines);
-            save_history(&self.data_dir, &agent.name, hist);
+        // Design decision: keep scrollback as plain text and exclude
+        // full-screen programs, rather than switch to storing a replayable
+        // raw ANSI byte stream.
+        //
+        // A byte stream would let a full-screen app (vim, htop, a nested
+        // canopy) replay faithfully, but it changes what lands on disk in
+        // ways this spec explicitly flags as needing its own size/safety
+        // review, and it would still have to solve accumulation (the same
+        // append-forever bug that corrupts the current text format).
+        // Excluding full-screen output instead reuses the existing
+        // plain-text, line-capped format and needs no new on-disk shape.
+        //
+        // vt100 already tells us when a full-screen program is active:
+        // `Screen::alternate_screen()` mirrors DECSET 1049, and the crate
+        // never threads the alternate grid into scrollback (it's allocated
+        // with `scrollback_len: 0` — see vt100::Screen::new). So if the
+        // session is still in alternate-screen mode at close time,
+        // `last_lines` would only be able to return the program's current
+        // on-screen frame (there's no line history to fall back to), and
+        // persisting that as scrollback text is exactly the "rendered
+        // frames printed back as literal text" bug. Skip the capture
+        // entirely in that case and keep whatever was already persisted —
+        // once the program exits back to the shell, a later close captures
+        // real shell history again, since alternate-grid content never
+        // reached the primary grid's scrollback in the first place.
+        if !agent.in_alternate_screen() {
+            let scrollback = agent.last_lines(2000);
+            if let Some(hist) = self.terminal_histories.get_mut(&agent.name) {
+                let lines: Vec<String> = scrollback.lines().map(|s| s.to_string()).collect();
+                hist.update_scrollback(&lines);
+                save_history(&self.data_dir, &agent.name, hist);
+            }
         }
         agent.kill();
         self.remove_session_target(SessionTarget::Terminal(idx))
@@ -1213,5 +1240,138 @@ mod tests {
     fn effective_brain_dims_height_exactly_minimum() {
         let (_cols, rows) = effective_brain_dims((100, 3));
         assert_eq!(rows, 3);
+    }
+}
+
+#[cfg(test)]
+mod close_terminal_session_tests {
+    use super::*;
+    use crate::db::Database;
+    use crate::tui::terminal_history::load_history;
+    use std::sync::Arc;
+    use tempfile::{tempdir, NamedTempFile, TempDir};
+
+    fn test_db() -> Arc<Database> {
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        Arc::new(Database::new(&path).expect("create test db"))
+    }
+
+    /// `cat` is a lightweight stand-in shell. These tests drive its vt100
+    /// parser directly with known bytes (via `feed`) instead of depending on
+    /// real PTY timing, so what `cat` actually does with stdin never matters.
+    fn spawn_test_terminal(name: &str) -> InteractiveAgent {
+        InteractiveAgent::spawn_terminal(
+            "cat",
+            "/tmp",
+            80,
+            24,
+            Some(name),
+            &[],
+            ratatui::style::Color::White,
+        )
+        .expect("spawn terminal")
+    }
+
+    fn feed(agent: &InteractiveAgent, bytes: &[u8]) {
+        agent.vt.lock().expect("lock vt").process(bytes);
+    }
+
+    /// Builds an `App` with a real temp data dir and pre-populates
+    /// `terminal_histories` the way `launch_terminal`/`resume_terminal_session`
+    /// do (load-then-cache), so `close_terminal_session_at` has somewhere to
+    /// persist into.
+    fn app_with_history(name: &str) -> (App, TempDir) {
+        let db = test_db();
+        let data_dir = tempdir().expect("tempdir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        let hist = load_history(data_dir.path(), name);
+        app.terminal_histories.insert(name.to_string(), hist);
+        (app, data_dir)
+    }
+
+    #[test]
+    fn close_replaces_stored_scrollback_not_appends_across_repeated_closes() {
+        let (mut app, data_dir) = app_with_history("caolinita");
+
+        let agent = spawn_test_terminal("caolinita");
+        feed(&agent, b"first run output\r\n");
+        app.terminal_agents.push(agent);
+        assert!(app.close_terminal_session_at(0));
+
+        let after_first = load_history(data_dir.path(), "caolinita");
+        assert!(after_first
+            .scrollback
+            .iter()
+            .any(|l| l.contains("first run output")));
+
+        // Reopen (mirrors a fresh session with the same name) and close again
+        // with different content.
+        let agent2 = spawn_test_terminal("caolinita");
+        feed(&agent2, b"second run output\r\n");
+        app.terminal_agents.push(agent2);
+        assert!(app.close_terminal_session_at(0));
+
+        let after_second = load_history(data_dir.path(), "caolinita");
+        assert!(after_second
+            .scrollback
+            .iter()
+            .any(|l| l.contains("second run output")));
+        assert!(
+            !after_second
+                .scrollback
+                .iter()
+                .any(|l| l.contains("first run output")),
+            "closing again must replace, not append, the stored snapshot: {:?}",
+            after_second.scrollback
+        );
+    }
+
+    #[test]
+    fn close_excludes_full_screen_program_output() {
+        let (mut app, data_dir) = app_with_history("cuarzo");
+
+        let agent = spawn_test_terminal("cuarzo");
+        // Enter the alternate screen (DECSET 1049) and paint a frame, the way
+        // vim/htop/a nested canopy would.
+        feed(&agent, b"\x1b[?1049h");
+        feed(&agent, b"fake full-screen UI chrome\r\n");
+        assert!(agent.in_alternate_screen());
+        app.terminal_agents.push(agent);
+
+        assert!(app.close_terminal_session_at(0));
+
+        let after = load_history(data_dir.path(), "cuarzo");
+        assert!(
+            after.scrollback.is_empty(),
+            "closing while a full-screen program is active must not persist its frame \
+             as scrollback text: {:?}",
+            after.scrollback
+        );
+    }
+
+    #[test]
+    fn close_captures_normally_once_full_screen_program_has_exited() {
+        let (mut app, data_dir) = app_with_history("session");
+
+        let agent = spawn_test_terminal("session");
+        feed(&agent, b"\x1b[?1049h");
+        feed(&agent, b"vim frame\r\n");
+        feed(&agent, b"\x1b[?1049l"); // back to the primary screen / shell
+        feed(&agent, b"shell prompt$\r\n");
+        assert!(!agent.in_alternate_screen());
+        app.terminal_agents.push(agent);
+
+        assert!(app.close_terminal_session_at(0));
+
+        let after = load_history(data_dir.path(), "session");
+        assert!(after.scrollback.iter().any(|l| l.contains("shell prompt$")));
+        assert!(
+            !after.scrollback.iter().any(|l| l.contains("vim frame")),
+            "content painted only in the alternate screen must never reach primary \
+             scrollback: {:?}",
+            after.scrollback
+        );
     }
 }

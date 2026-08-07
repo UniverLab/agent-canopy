@@ -18,16 +18,17 @@ use uuid::Uuid;
 use crate::application::ports::StateRepository;
 use crate::db::Database;
 use crate::rag::chunker::{chunk_semantic, detect_lang, SemanticChunk};
-use crate::rag::embedding_client::{client_from_config, model_dimensions, EmbeddingClient};
+use crate::rag::embedding_client::{model_dimensions, EmbeddingClient};
 use crate::rag::vector_store::{VectorChunk, VectorStore};
 
 const QUEUE_MAX: usize = 10_000;
 /// How often the background task checks whether the cached embedding client
 /// has been idle long enough to unload.
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
-/// Exposed so `doctor` and `rag report` can point at the same cap when
-/// explaining why a file was skipped.
-pub(crate) const FILE_MAX_BYTES: u64 = 5 * 1024 * 1024; // 5 MB
+/// How often the background task checks whether the configured local model
+/// needs to be (re)acquired — proactively, so indexing doesn't wait on the
+/// first query to trigger a download.
+const MODEL_ACQUISITION_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 /// Max number of recorded `"error"` events before a file is given up on
 /// permanently, even if the error message doesn't match a known-fatal pattern.
 const MAX_RAG_ATTEMPTS: i64 = 3;
@@ -107,6 +108,32 @@ impl IngestionManager {
         // "1" surviving a daemon restart would make `canopy rag report` lie
         // about the model being loaded before anything has queried it.
         let _ = db.set_state(crate::rag::status::RAG_MODEL_LOADED_KEY, "0");
+
+        // A "downloading"/"preparing" acquisition state can only be true
+        // while a process is actively driving it — and this fresh process
+        // hasn't started anything yet. If either survived from a daemon
+        // that died mid-acquisition, it's stale: clear it so
+        // `ensure_configured_model_acquired` treats the model as never
+        // attempted and restarts it, rather than leaving a permanent
+        // "downloading" that nothing is driving. A persisted "failed" is
+        // left alone — that's a real outcome, not a restart artifact, and
+        // stays until an explicit retry.
+        let config = crate::domain::canopy_config::CanopyConfig::load(&data_dir);
+        let model_id = config.embeddings_model.trim();
+        if !model_id.is_empty() {
+            if let Some(
+                crate::rag::status::AcquisitionState::Downloading { .. }
+                | crate::rag::status::AcquisitionState::Preparing { .. },
+            ) = crate::rag::status::read_acquisition_state(&db, model_id)
+            {
+                tracing::warn!(
+                    "RAG: clearing stale in-progress acquisition state for '{model_id}' \
+                     left over from a previous daemon run"
+                );
+                crate::rag::status::clear_acquisition(&db, model_id);
+            }
+        }
+
         Self {
             db,
             data_dir,
@@ -265,7 +292,65 @@ impl IngestionManager {
             mgr_idle.idle_unload_loop(ct_idle).await;
         });
 
+        let ct_acquire = ct.child_token();
+        let mgr_acquire = Arc::clone(&self);
+        tokio::spawn(async move {
+            mgr_acquire.model_acquisition_loop(ct_acquire).await;
+        });
+
         ct
+    }
+
+    /// Proactively ensures the configured local embedding model is
+    /// available, so indexing can proceed without waiting on the first
+    /// query to trigger acquisition (FR1/FR2: setup returns immediately and
+    /// the download happens in the background, owned by the daemon). Runs
+    /// once right away and then on a slow poll — the poll (rather than a
+    /// one-shot at startup) is what picks up a model chosen by a `canopy
+    /// setup` run against an already-running daemon.
+    async fn model_acquisition_loop(&self, ct: tokio_util::sync::CancellationToken) {
+        self.ensure_configured_model_acquired().await;
+        loop {
+            tokio::select! {
+                _ = ct.cancelled() => break,
+                _ = tokio::time::sleep(MODEL_ACQUISITION_CHECK_INTERVAL) => {
+                    self.ensure_configured_model_acquired().await;
+                }
+            }
+        }
+    }
+
+    /// If the configured embeddings model is a local one this build can
+    /// serve, isn't already cached, and isn't already tracked as
+    /// downloading/preparing/failed, acquires it — reusing
+    /// `get_embedding_client` so the resulting client is cached for the
+    /// next query or indexing pass instead of being built twice.
+    async fn ensure_configured_model_acquired(&self) {
+        let config = crate::domain::canopy_config::CanopyConfig::load(&self.data_dir);
+        let model_id = config.embeddings_model.trim();
+        if model_id.is_empty() {
+            return;
+        }
+        if crate::rag::embedding_client::provider_for_model(model_id)
+            != Some(crate::rag::embedding_client::EmbeddingProvider::Local)
+        {
+            return; // Cloud clients build instantly from an API key — nothing to acquire proactively.
+        }
+        if !crate::rag::embedding_client::provider_available(
+            crate::rag::embedding_client::EmbeddingProvider::Local,
+        ) {
+            return; // Doctor/setup already surface this capability gap; nothing to acquire.
+        }
+        if crate::rag::status::read_acquisition_state(&self.db, model_id).is_some() {
+            // Already in flight (this tick or a concurrent one), or failed
+            // and awaiting an explicit `canopy rag model retry` — either
+            // way, not this loop's job right now.
+            return;
+        }
+
+        if let Err(e) = self.get_embedding_client(&config).await {
+            tracing::warn!("RAG: proactive model acquisition for '{model_id}' failed: {e:#}");
+        }
     }
 
     /// Periodically checks whether the cached embedding client has been idle
@@ -617,17 +702,42 @@ impl IngestionManager {
     /// startup, only here, on the first query or indexing pass that needs it.
     /// `pub(crate)` so `rag_search` shares the same cache (B22) instead of
     /// building throwaway clients that dodge the model-loaded status.
+    ///
+    /// For a local model still being downloaded/prepared, this fails fast
+    /// with a message naming the state instead of blocking on the
+    /// (possibly minutes-long) acquisition — callers never silently hang,
+    /// and never race the background acquisition loop into a duplicate
+    /// attempt by both trying to build the client at once.
     pub(crate) async fn get_embedding_client(
         &self,
         config: &crate::domain::canopy_config::CanopyConfig,
     ) -> anyhow::Result<Arc<dyn EmbeddingClient>> {
         let model_id = config.embeddings_model.trim().to_string();
+
+        if let Some(state) = crate::rag::status::read_acquisition_state(&self.db, &model_id) {
+            anyhow::bail!(crate::rag::status::acquisition_message(&model_id, &state));
+        }
+
+        // Claim any needed download before touching the client-cache lock
+        // below (see the function's own doc comment for why this ordering
+        // matters): a caller racing us now sees the state via the check
+        // above and bails immediately, instead of blocking on that lock for
+        // the whole download that follows.
+        crate::rag::model_acquisition::claim_local_download_if_needed(&self.db, &model_id);
+
         let config_clone = config.clone();
+        let db_clone = Arc::clone(&self.db);
         self.get_or_load_client(model_id, move || async move {
             // Load the model (potentially heavy for local ONNX models) off the async executor.
-            tokio::task::spawn_blocking(move || client_from_config(&config_clone).map(Arc::from))
-                .await
-                .map_err(|e| anyhow::anyhow!("Embedding client task panicked: {e}"))?
+            tokio::task::spawn_blocking(move || {
+                crate::rag::model_acquisition::client_from_config_for_ingestion(
+                    &config_clone,
+                    &db_clone,
+                )
+                .map(Arc::from)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Embedding client task panicked: {e}"))?
         })
         .await
     }
@@ -687,13 +797,19 @@ impl IngestionManager {
             return Ok(());
         }
 
+        // Loaded fresh (not cached on `self`) so a `rag_max_file_mb` edit in
+        // config.toml takes effect on this file's very next indexing pass —
+        // no daemon restart needed.
+        let config = crate::domain::canopy_config::CanopyConfig::load(&self.data_dir);
+        let max_bytes = config.rag_max_file_bytes();
+
         let meta = std::fs::metadata(path)?;
-        if meta.len() > FILE_MAX_BYTES {
+        if meta.len() > max_bytes {
             let size_mb = meta.len() as f64 / (1024.0 * 1024.0);
-            let cap_mb = FILE_MAX_BYTES as f64 / (1024.0 * 1024.0);
+            let cap_mb = max_bytes as f64 / (1024.0 * 1024.0);
             tracing::info!(
                 "Personal RAG: skipping '{source_path}' — {size_mb:.1} MB exceeds the \
-                 {cap_mb:.0} MB indexing limit (FILE_MAX_BYTES)"
+                 {cap_mb:.0} MB indexing limit (config.toml: rag_max_file_mb)"
             );
             record_oversize_skip(&self.db, source_path, meta.len());
             return Ok(());
@@ -713,7 +829,6 @@ impl IngestionManager {
             content.len()
         );
         let now = chrono::Utc::now().timestamp();
-        let config = crate::domain::canopy_config::CanopyConfig::load(&self.data_dir);
 
         let threshold = config.similarity_threshold;
         let Some(semantic_chunks) =
@@ -924,9 +1039,10 @@ async fn purge_vector_chunks(data_dir: &Path, source_path: &str, db: Option<&cra
     }
 }
 
-/// Record a `"skipped_oversize"` ledger event for a file that exceeds
-/// `FILE_MAX_BYTES`, unless the latest recorded event for that path is
-/// already a `"skipped_oversize"` for the same size — the file is rescanned
+/// Record a `"skipped_oversize"` ledger event for a file that exceeds the
+/// configured indexing limit (`CanopyConfig::rag_max_file_bytes`), unless the
+/// latest recorded event for that path is already a `"skipped_oversize"` for
+/// the same size — the file is rescanned
 /// on every startup and watcher pass, so without this check an unchanged
 /// oversize file would spam a duplicate row every time.
 fn record_oversize_skip(db: &Database, source_path: &str, size_bytes: u64) {
@@ -1656,8 +1772,9 @@ mod tests {
         assert_eq!(mgr.queue_len().await, 1);
     }
 
-    /// A file over `FILE_MAX_BYTES` records a `"skipped_oversize"` ledger
-    /// event carrying its size, instead of vanishing silently.
+    /// A file over the configured indexing limit records a
+    /// `"skipped_oversize"` ledger event carrying its size, instead of
+    /// vanishing silently.
     #[tokio::test]
     async fn record_oversize_skip_logs_event_with_size() {
         let (mgr, _dir) = test_manager();
@@ -1701,11 +1818,14 @@ mod tests {
 
     /// End-to-end: `index_file` on a file above the cap does not error, does
     /// not index anything, and leaves a `"skipped_oversize"` ledger trail.
+    /// Uses the default cap (10 MB — no config.toml in the test manager's
+    /// data dir) rather than a hardcoded constant.
     #[tokio::test]
     async fn index_file_skips_oversize_file_and_records_ledger_event() {
         let (mgr, dir) = test_manager();
+        let max_bytes = crate::domain::canopy_config::CanopyConfig::default().rag_max_file_bytes();
         let big_path = dir.path().join("huge.md");
-        std::fs::write(&big_path, vec![b'a'; (FILE_MAX_BYTES + 1) as usize]).unwrap();
+        std::fs::write(&big_path, vec![b'a'; (max_bytes + 1) as usize]).unwrap();
         let source_path = big_path.to_string_lossy().to_string();
 
         mgr.index_file(&source_path).await.unwrap();
@@ -1715,13 +1835,42 @@ mod tests {
         assert_eq!(events[0].event_type, "skipped_oversize");
         assert_eq!(
             events[0].detail.as_deref(),
-            Some((FILE_MAX_BYTES + 1).to_string().as_str())
+            Some((max_bytes + 1).to_string().as_str())
         );
 
         // Re-running against the unchanged file must not duplicate the event.
         mgr.index_file(&source_path).await.unwrap();
         let events = mgr.db().rag_events_for_file(&source_path).unwrap();
         assert_eq!(events.len(), 1);
+    }
+
+    /// A `rag_max_file_mb` written to config.toml is honored on the very
+    /// next `index_file` call against the *same, already-constructed*
+    /// manager — no daemon restart and no new `IngestionManager` needed.
+    /// This is the "read per ingestion pass" behavior the spec requires.
+    #[tokio::test]
+    async fn index_file_honors_a_lowered_configured_limit_without_restart() {
+        let (mgr, dir) = test_manager();
+
+        // 2 MB: comfortably under the 10 MB default, so before the config
+        // change below this file would sail past the size check.
+        let path = dir.path().join("medium.md");
+        std::fs::write(&path, vec![b'a'; 2 * 1024 * 1024]).unwrap();
+        let source_path = path.to_string_lossy().to_string();
+
+        // Lower the configured limit to 1 MB, below this file's size — set
+        // *after* the manager was constructed, and read fresh by `index_file`.
+        let config = crate::domain::canopy_config::CanopyConfig {
+            rag_max_file_mb: 1,
+            ..Default::default()
+        };
+        config.save(dir.path()).unwrap();
+
+        mgr.index_file(&source_path).await.unwrap();
+
+        let events = mgr.db().rag_events_for_file(&source_path).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "skipped_oversize");
     }
 }
 

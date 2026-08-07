@@ -35,6 +35,8 @@ use daemon::clean_cli::handle_clean_action;
 use daemon::cli::{handle_daemon_action, DaemonAction};
 use daemon::doctor::run_doctor;
 use daemon::loop_cli::{handle_loop_action, LoopAction};
+use daemon::models_cli::{handle_models_action, ModelsAction};
+use daemon::project_cli::{handle_project_action, ProjectAction};
 use daemon::prompts_cli::{handle_prompts_action, PromptsAction};
 use daemon::rag_cli::{handle_rag_action, RagAction};
 use daemon::server::{run_http_server, run_stdio_server};
@@ -81,7 +83,8 @@ enum Commands {
         #[command(subcommand)]
         action: RagAction,
     },
-    /// Inspect loop state (read-only).
+    /// Inspect and control loop state (list/info are read-only;
+    /// run/pause/continue/reset/autorun delegate to the daemon).
     Loop {
         #[command(subcommand)]
         action: LoopAction,
@@ -90,6 +93,16 @@ enum Commands {
     Spec {
         #[command(subcommand)]
         action: SpecAction,
+    },
+    /// Inspect or refresh the `agent_models` catalog cache.
+    Models {
+        #[command(subcommand)]
+        action: ModelsAction,
+    },
+    /// Manage the project registry (path-derived identity).
+    Project {
+        #[command(subcommand)]
+        action: ProjectAction,
     },
     /// Remove safely-removable stale data (soft cleanup, default mode).
     Clean {
@@ -110,6 +123,19 @@ enum Commands {
         /// delete a real cascade.
         #[arg(long)]
         yes: bool,
+        /// Skip reclaiming freed database space (VACUUM + WAL checkpoint)
+        /// even when this run deleted enough rows to warrant it. Use for a
+        /// fast run — reclamation takes an exclusive lock and rewrites the
+        /// whole database file.
+        #[arg(long = "no-reclaim")]
+        no_reclaim: bool,
+        /// Consent to stop the running daemon for the duration of a
+        /// warranted reclaim (refuse-if-busy, stop, quick_check, cleanup,
+        /// VACUUM + WAL checkpoint, restart), then restart it exactly as it
+        /// was running. Without this, an interactive terminal is prompted;
+        /// a non-interactive run skips reclamation while the daemon is up.
+        #[arg(long = "stop-daemon")]
+        stop_daemon: bool,
     },
     /// Discover file-backed prompt presets (~/.canopy/prompts/).
     Prompts {
@@ -160,14 +186,18 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(Commands::Rag { action }) => handle_rag_action(action).await,
-        Some(Commands::Loop { action }) => handle_loop_action(action).await,
-        Some(Commands::Spec { action }) => handle_spec_action(action).await,
+        Some(Commands::Loop { action }) => handle_loop_action(action, cli.port).await,
+        Some(Commands::Spec { action }) => handle_spec_action(action, cli.port).await,
+        Some(Commands::Models { action }) => handle_models_action(action).await,
+        Some(Commands::Project { action }) => handle_project_action(action).await,
         Some(Commands::Clean {
             dry_run,
             older_than,
             hard,
             yes,
-        }) => handle_clean_action(dry_run, older_than, hard, yes).await,
+            no_reclaim,
+            stop_daemon,
+        }) => handle_clean_action(dry_run, older_than, hard, yes, no_reclaim, stop_daemon).await,
         Some(Commands::Prompts { action }) => handle_prompts_action(action).await,
         Some(Commands::Bridge {
             agent_id,
@@ -207,6 +237,19 @@ pub(crate) fn ensure_data_dir() -> Result<std::path::PathBuf> {
     let data_dir = home.join(".canopy");
     std::fs::create_dir_all(&data_dir)?;
     std::fs::create_dir_all(data_dir.join("logs"))?;
+    // Migrate a pre-existing flat/JSON layout to the current one (TOML for
+    // hand-inspectable files, a named `cache/` dir for program-managed
+    // caches). Idempotent and cheap once migrated, so it's safe to run on
+    // every call rather than gating it behind a first-run flag.
+    //
+    // Both migrations defer deleting a legacy path while another canopy
+    // process may still be using it: this source tree gets rebuilt and
+    // re-run while the previously installed binary's daemon (and TUI) are
+    // still live, so "an old reader of the legacy path still exists" is the
+    // default assumption here, not an edge case.
+    let other_instance_may_be_running = daemon::process::other_instance_may_be_running(&data_dir);
+    domain::usage_stats::migrate_legacy_json(&data_dir, other_instance_may_be_running);
+    domain::models_db::migrate_legacy_caches(&data_dir, other_instance_may_be_running);
     Ok(data_dir)
 }
 

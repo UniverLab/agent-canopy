@@ -18,10 +18,11 @@ Loop
 ```
 
 - **Specs** — ordered units of work inside a loop.
-- **Nodes** — four kinds:
+- **Nodes** — five kinds:
   - `agent` — invokes a CLI tool with a prompt template.
   - `check` — executes a shell command.
   - `gate` — validates previous output (e.g. `output_contains`).
+  - `router` — classifies and routes by token matching with fallback.
   - `quorum` — engine-managed node that closes an
     [ensemble](#ensembles), never created directly.
 - **Edges** — connect nodes with routing conditions: `pass`, `fail`,
@@ -53,7 +54,7 @@ before routing onward. It replaces what would otherwise be N member
 nodes, N prompts, and 2N+2 edges wired by hand — `loop_add_ensemble`
 creates the whole unit in one call:
 
-```
+```json
 loop_add_ensemble {
   loop_id, name: "proposers",
   prompt_template: "...",              # one prompt, shared by every member
@@ -75,12 +76,12 @@ implementer itself) receives all of them and implements the consensus
 reviewer models review the same diff in parallel and the quorum
 consolidates their findings into one verdict.
 
-Members are homogeneous by design in v1 — they differ only by
-`platform`/`model`, share the one prompt, and can't be edited
-individually. `loop_update_ensemble` changes the shared prompt
-(propagated to every member), the member list, quorum config
-(`min_pass`, `straggler_timeout_minutes`), and exit wiring, all
-without touching member nodes directly. `loop_get` returns the
+Members differ by `platform`/`model`, and each may set its own
+`prompt_override` to review the same input from a different angle instead
+of sharing the template. `loop_update_ensemble` changes the shared prompt
+(propagated to every member without its own override), the member list,
+quorum config (`min_pass`, `straggler_timeout_minutes`), and exit wiring,
+all without touching member nodes directly. `loop_get` returns the
 ensemble as one unit (`ensemble_id`, members, quorum config) alongside
 its expanded nodes.
 
@@ -147,6 +148,33 @@ attributed to a single member, and the quorum fails as a whole.
 Non-git workdirs are unaffected, as is any node that edits files
 without committing — the normal case.
 
+## Self-report requirement
+
+A harness can exit 0 having done nothing: every tool call refused,
+a quota exhausted, a provider outage — the process still ends cleanly
+and the loop engine sees a clean exit code. By default that is
+recorded as `Pass` if the process also produced output, exactly as it
+always has. Set `require_report: true` in an agent node's config to
+close that gap for a node whose graph depends on being able to tell:
+
+```
+require_report: true
+```
+
+With the flag set, an agent run that exits 0 but never calls
+`loop_complete_node` itself is recorded as a deterministic **fail**
+(`failure_kind: "no_report"`) and routes down the node's `fail` edge —
+it is never retried as an infra crash, since nothing actually crashed.
+An explicit self-report always wins regardless of this flag, pass or
+fail; `require_report` only judges the case where none was ever made.
+
+Whether or not the flag is set, every agent run that finishes without
+calling `loop_complete_node` carries `"unreported": true` in its output
+— this is unconditional, so a resilience node downstream can always
+tell "the harness ran and chose not to report" apart from "the harness
+never ran," without needing `require_report` itself. Ensemble members
+are judged individually, exactly like a lone node.
+
 ## Lifecycle
 
 Create → run → (pause / continue) → complete. `loop_continue`
@@ -158,6 +186,22 @@ it, and `loop_schedule_autorun` sets a future time at which the loop
 auto-resumes (useful for quota-limited loops that fail and need to
 wait before retrying). Call it again with `at` omitted to cancel a
 pending schedule.
+
+## Concurrency
+
+Running many loops at once, against different working directories, is
+a supported capability — not an accident of the implementation. Start,
+run, pause, resume, or finish one loop, and no other loop's status,
+specs, node runs, or worktree are affected. There is no cap on how
+many loops can run concurrently, and nothing needs to be configured to
+enable it: it is the default behavior of the daemon.
+
+The one boundary: **two loops must not share a workdir.** Two loops
+racing to commit, check out, or edit files in the same working tree
+will fight over it — the engine does nothing to make that safe, and
+doing so is deliberately out of scope. Point concurrent loops at
+different working directories (or at worktrees of the same repo) and
+they run independently with no coordination required from you.
 
 ## `on_completed` hook
 
@@ -221,26 +265,168 @@ bound specs:
 | `queue_remove_spec` | Remove a spec from a queue |
 | `queue_reorder` | Full replacement of a queue's order |
 
-Pass a queue to `loop_run` via `queue_id` (the deprecated `pool_id`
-still works). The former `pool_*` tool names remain as deprecated
-back-compat aliases of the `queue_*` tools above.
+Pass a queue to `loop_run` via `queue_id`.
 
 Queue membership is unaffected by `loop_run` — specs stay standalone.
 The `loop info` CLI and `loop_get` MCP tool show queue-driven progress
 by reconstructing what ran from the run history.
 
-## The 24 MCP tools
+## The 32 MCP tools
 
 | Stage | Tools |
 |---|---|
-| Authoring | `loop_create`, `loop_update`, `loop_add_spec`, `loop_update_spec`, `loop_add_node`, `loop_update_node`, `loop_add_edge`, `loop_update_edge`, `loop_add_ensemble`, `loop_update_ensemble` |
-| Inspection | `loop_get`, `loop_list` |
-| Runtime | `loop_run`, `loop_reset`, `loop_schedule_autorun`, `loop_pause`, `loop_continue`, `loop_complete_node`, `loop_report_blocker` |
+| Authoring | `loop_create`, `loop_update`, `loop_add_spec`, `loop_update_spec`, `loop_add_node`, `loop_update_node`, `loop_add_edge`, `loop_update_edge`, `loop_delete_edge`, `loop_delete_node`, `loop_add_ensemble`, `loop_update_ensemble`, `loop_copy_node`, `loop_copy_ensemble`, `loop_audit_node_configs` |
+| Sharing | `loop_export`, `loop_import`, `loop_archive`, `loop_restore` |
+| Inspection | `loop_get`, `loop_list`, `loop_node_runs_list`, `loop_node_run_get` |
+| Runtime | `loop_run`, `loop_reset`, `loop_schedule_autorun`, `loop_schedule_continue`, `loop_pause`, `loop_continue`, `loop_complete_node`, `loop_report_blocker`, `loop_preflight` |
 
 Loops can be authored programmatically by agents through these tools,
 or edited in the [TUI loop editor](tui.md) with inline JSON config
-validation. The `canopy loop list` and `canopy loop info` CLI
-subcommands provide read-only inspection from the terminal.
+validation. The `canopy loop` CLI subcommands mirror the runtime tools
+from the terminal: `list`/`info`/`export` are read-only inspection, and
+`import`/`run`/`pause`/`continue`/`reset`/`autorun` delegate the
+matching MCP tool to the daemon — a second way to drive a loop when an
+MCP client can't reach it. See the
+[CLI reference](cli-reference.md#loop-control).
+
+## Export and import
+
+A loop's design — its name, description, nodes, edges, and ensembles —
+can leave one machine as a single JSON file and be recreated on
+another. Sharing a loop becomes sending a file, not narrating the
+`loop_add_node`/`loop_add_edge`/`loop_add_ensemble` calls that built
+it, and the file is also a diff: review a change to a loop, or keep
+one in a repo next to the code it operates on.
+
+```
+canopy loop export <loop_id> [--output <path>] [--with-models]
+canopy loop import <path> [--workdir <dir>] [--name <name>]
+```
+
+`export` writes to `--output`, or to stdout (so it can be piped) when
+omitted. `import` always creates a **new** loop — it never updates,
+merges, or overwrites an existing one; `--workdir` defaults to the
+current directory, and `--name` overrides the file's own name. If the
+resolved name is already taken in the target workdir, import still
+succeeds under a numeric suffix (`"My Loop (2)"`) and reports which
+name it used. The same two operations exist as MCP tools,
+`loop_export { loop_id, with_models? }` and
+`loop_import { document, workdir?, name? }`, so a loop is drivable end
+to end through MCP as well as the CLI.
+
+What the file **excludes** is deliberate: no ids (edges reference
+nodes by `name`, which is what makes the file reviewable and
+hand-editable — node names must therefore be unique within an exported
+loop, or export refuses with the names it found), no `workdir`, no
+specs, and no run/status state. A loop file is a shape and a set of
+instructions, not somebody else's backlog or history.
+
+`platform`/`model` are stripped from every agent node and ensemble
+member by default, for the same reason a [node blueprint](#node-blueprints)
+never carries one: a shared design pinned to a harness or model the
+recipient doesn't have is broken on arrival, and one pinned to a model
+they do have is worse, since it silently spends their quota on someone
+else's choice. Pass `--with-models` (`with_models: true` over MCP) only
+when exporting your own loop to restore later on your own machine.
+`import`'s response always lists every agent node left without a
+platform, so there's exactly one thing to check before running an
+imported loop: `nodes_missing_platform` in the MCP response, or the
+same list printed by the CLI.
+
+An [ensemble](#ensembles) round-trips as one ensemble — not as its
+expanded member/quorum nodes — via its own `ensembles` array entry.
+
+Here is a complete, hand-writable example: an implementer, a 2-model
+ensemble of reviewers, and a committer the quorum routes to on pass.
+
+```json
+{
+  "format_version": 1,
+  "name": "implement-and-review",
+  "description": "Implement a spec, get two model opinions, then commit.",
+  "nodes": [
+    {
+      "name": "implementer",
+      "kind": "agent",
+      "position": 1,
+      "config": {
+        "prompt_template": "Implement: {{spec_content}}",
+        "timeout_minutes": 30
+      }
+    },
+    {
+      "name": "committer",
+      "kind": "agent",
+      "position": 4,
+      "config": {
+        "prompt_template": "Review the feedback and commit if satisfied.",
+        "commit_rights": true,
+        "timeout_minutes": 15
+      }
+    }
+  ],
+  "edges": [],
+  "ensembles": [
+    {
+      "name": "reviewers",
+      "prompt_template": "Review this diff for correctness: {{previous_feedback}}",
+      "entry_from_node": "implementer",
+      "entry_condition": "always",
+      "on_pass_to": "committer",
+      "min_pass": 2,
+      "timeout_minutes": 20,
+      "members": [
+        {},
+        {}
+      ]
+    }
+  ]
+}
+```
+
+Note what is absent: no `id` anywhere, no `platform`/`model` on
+`implementer`/`committer`/the ensemble's members (this file was
+exported without `--with-models` — `import` will report all three as
+`nodes_missing_platform`), and the ensemble's own member/quorum nodes
+never appear in `nodes` — only its `entry_from_node`/`on_pass_to`
+(both plain node names) and its `members` array do.
+
+## Archive and restore
+
+Loops can be archived instead of deleted — they leave the main
+`loop_list`/sidebar view but their row, specs, and full run history
+are untouched and can be restored at any time:
+
+```
+canopy loop archive <loop_id>
+canopy loop restore <loop_id>
+```
+
+Over MCP: `loop_archive { loop_id }` and `loop_restore { loop_id }`.
+Archiving refuses a `running` loop — pause it first. The archived loop
+is still reachable directly by id via `loop_get` regardless of
+archived state. Restoring is a plain flag flip — no data is lost or
+moved.
+
+## Node run history
+
+When a loop fails, the node run history lets you diagnose exactly what
+happened:
+
+```
+canopy loop runs <loop_id> [--node <node_id>] [--limit <n>]
+```
+
+Over MCP: `loop_node_runs_list { loop_id, node_id?, spec_id?, limit? }`
+returns the most recent runs first (default 20, capped at 200).
+`loop_node_run_get { run_id }` fetches one run's full stored input and
+output, including `infra_attempt`/`infra_crash` markers when present.
+Secret-shaped substrings are redacted before the output crosses the
+boundary.
+
+This is the second step of failure diagnosis: list to find the
+offending run, then fetch its output here — the exact stderr/stdout/
+reported_output the engine recorded.
 
 ## Node blueprints
 

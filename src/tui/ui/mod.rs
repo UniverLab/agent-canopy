@@ -30,8 +30,17 @@ pub(crate) const STATUS_RUNNING_DIM: Color = Color::Rgb(74, 102, 77);
 pub(crate) const STATUS_RUNNING_BRIGHT: Color = Color::Rgb(129, 230, 133);
 pub(crate) const STATUS_OK: Color = Color::Rgb(66, 165, 245);
 pub(crate) const STATUS_FAIL: Color = Color::Rgb(229, 57, 53);
+/// A spec cut short by something external (daemon restart, crash) rather
+/// than a failure of the work — distinct from [`STATUS_FAIL`] so the marker
+/// strip never reads an interruption as the agent's own doing.
+pub(crate) const STATUS_INTERRUPTED: Color = Color::Rgb(255, 179, 0);
 pub(crate) const STATUS_WAIT_ON: Color = Color::Rgb(255, 255, 0);
 pub(crate) const STATUS_WAIT_OFF: Color = Color::Rgb(30, 30, 30);
+/// Tag color for a [`crate::domain::loops::LoopNodeKind::Router`] node's
+/// `[router]` kind tag in the live loop graph, so a branch point reads as
+/// visually distinct from agent/check/gate/quorum boxes at a glance instead
+/// of only via the text tag.
+pub(crate) const KIND_ROUTER: Color = Color::Rgb(171, 71, 188);
 
 /// Border set for a themed panel: `ALL` for classic, `NONE` for modern
 /// (which separates panels by background-color contrast instead).
@@ -154,8 +163,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         dialogs::draw_quit_confirm(frame, &theme);
     } else if app.delete_project_confirm {
         dialogs::draw_delete_project_confirm(frame, &theme);
-    } else if app.delete_loop_confirm {
-        dialogs::draw_delete_loop_confirm(frame, &theme);
+    } else if app.archive_loop_confirm {
+        dialogs::draw_archive_loop_confirm(frame, &theme);
+    } else if app.permanent_delete_loop_confirm {
+        dialogs::draw_permanent_delete_loop_confirm(frame, &theme);
+    } else if app.loop_reset_confirm {
+        dialogs::draw_loop_reset_confirm(frame, app, &theme);
+    }
+
+    if app.loop_autorun_dialog.is_some() {
+        dialogs::draw_loop_autorun_dialog(frame, app, &theme);
+    }
+
+    if app.loop_action_message.is_some() {
+        dialogs::draw_loop_action_message(frame, app, &theme);
     }
 
     if app.show_legend {

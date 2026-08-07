@@ -5,7 +5,7 @@ use crate::domain::loops::{
     LoopSpec, LoopSpecStatus, LoopStatus, SpecAdminStatusOutcome,
 };
 use crate::domain::models::{Agent, Cli, RunLog, RunStatus, Trigger, TriggerType, WatchEvent};
-use crate::domain::pools::Pool;
+use crate::domain::queues::Queue;
 use crate::domain::sync::{
     IntentPayload, MessageKind, MissionImpact, StatusPayload, WorkspaceStatus,
 };
@@ -92,6 +92,7 @@ fn sample_manual_agent(id: &str) -> Agent {
 
 fn sample_loop(id: &str) -> Loop {
     Loop {
+        archived: false,
         id: id.to_string(),
         name: "Auth loop".to_string(),
         description: Some("Implements auth in ordered specs".to_string()),
@@ -104,7 +105,7 @@ fn sample_loop(id: &str) -> Loop {
         autorun_at: None,
         auto_continue_at: None,
         auto_continue_action: None,
-        active_run_pool_id: None,
+        active_run_queue_id: None,
         on_completed: None,
     }
 }
@@ -1128,7 +1129,7 @@ fn loop_updates_persist_metadata_and_positions() {
         Some(4),
     )
     .unwrap();
-    db.update_loop_edge_condition(&edge.id, LoopEdgeCondition::Fail)
+    db.update_loop_edge_condition(&edge.id, &LoopEdgeCondition::Fail)
         .unwrap();
 
     let lp = db.get_loop(&lp.id).unwrap().unwrap();
@@ -1189,6 +1190,7 @@ fn loop_spec_start_head_persists_through_reread() {
 #[test]
 fn reconcile_orphaned_loops_pauses_running_loop_and_interrupts_its_run() {
     let db = test_db();
+    let data_dir = tempdir().unwrap();
     let mut lp = sample_loop("wf-orphan");
     lp.status = LoopStatus::Running;
     let mut spec = sample_loop_spec(&lp.id, "spec-orphan", 1);
@@ -1221,7 +1223,7 @@ fn reconcile_orphaned_loops_pauses_running_loop_and_interrupts_its_run() {
     db.set_loop_spec_start_head(&spec.id, Some("deadbeef"))
         .unwrap();
 
-    let reconciled = db.reconcile_orphaned_loops().unwrap();
+    let reconciled = db.reconcile_orphaned_loops(data_dir.path()).unwrap();
     assert_eq!(reconciled, 1);
 
     // Test 1: the loop is paused, and its dangling run is no longer `running`.
@@ -1237,46 +1239,51 @@ fn reconcile_orphaned_loops_pauses_running_loop_and_interrupts_its_run() {
         Some(&serde_json::json!(true))
     );
 
-    // Test 2 (B18): the spec is reset back to `pending` in the same pass —
-    // its completed work is preserved by the worktree/commits, not by its
-    // status, and leaving it `running` would make it invisible to pool
-    // selection (`pool_next_pending_spec_id` only ever picks `pending`).
+    // Test 2 (B18): the spec is marked `interrupted` in the same pass — not
+    // reset to `pending`, since the run was cut short by something external,
+    // not a failure of the work. Its completed work is preserved by the
+    // worktree/commits, not by its status, and leaving it `running` would
+    // make it invisible to queue selection (`queue_next_pending_spec_id`
+    // picks `pending` and `interrupted` alike).
     let spec_after = db.get_loop_spec(&spec.id).unwrap().unwrap();
-    assert_eq!(spec_after.status, LoopSpecStatus::Pending);
+    assert_eq!(spec_after.status, LoopSpecStatus::Interrupted);
     assert_eq!(spec_after.started_at, None);
     assert_eq!(spec_after.spec_start_head, None);
 }
 
-/// B18: the real incident — a pool-driven run's in-flight member (a
+/// B18: the real incident — a queue-driven run's in-flight member (a
 /// standalone spec, `loop_id: None`, never bound to the loop that's
-/// currently running it) must be reset to `pending` exactly like a
+/// currently running it) must be marked `interrupted` exactly like a
 /// loop-bound spec is. Left `running`, it would be invisible to
-/// `pool_next_pending_spec_id` (which only ever picks `pending` members)
-/// forever — the orphan this whole fix exists to prevent.
+/// `queue_next_pending_spec_id` forever — the orphan this whole fix exists
+/// to prevent — and `queue_next_pending_spec_id` must pick an `interrupted`
+/// member right back up, in the same position, exactly as it would a
+/// `pending` one.
 #[test]
-fn reconcile_orphaned_loops_resets_pool_member_spec_to_pending() {
+fn reconcile_orphaned_loops_marks_queue_member_spec_interrupted() {
     let db = test_db();
-    let mut lp = sample_loop("wf-orphan-pool");
+    let data_dir = tempdir().unwrap();
+    let mut lp = sample_loop("wf-orphan-queue");
     lp.status = LoopStatus::Running;
-    lp.active_run_pool_id = Some("pool-1".to_string());
+    lp.active_run_queue_id = Some("queue-1".to_string());
     db.insert_loop(&lp).unwrap();
 
-    let mut spec = sample_loop_spec("unused-loop-id", "spec-orphan-pool", 1);
-    spec.loop_id = None; // pool membership never binds the spec to a loop
+    let mut spec = sample_loop_spec("unused-loop-id", "spec-orphan-queue", 1);
+    spec.loop_id = None; // queue membership never binds the spec to a loop
     spec.status = LoopSpecStatus::Running;
     db.insert_loop_spec(&spec).unwrap();
-    db.insert_pool(&Pool {
-        id: "pool-1".to_string(),
-        name: "pool-1".to_string(),
+    db.insert_queue(&Queue {
+        id: "queue-1".to_string(),
+        name: "queue-1".to_string(),
         created_at: Utc::now(),
     })
     .unwrap();
-    db.append_pool_member("pool-1", &spec.id, None).unwrap();
+    db.append_queue_member("queue-1", &spec.id, None).unwrap();
 
-    let node = sample_loop_node(&spec.id, "node-orphan-pool", 1);
+    let node = sample_loop_node(&spec.id, "node-orphan-queue", 1);
     db.insert_loop_node(&node).unwrap();
     db.insert_loop_run(&LoopNodeRun {
-        id: "run-orphan-pool".to_string(),
+        id: "run-orphan-queue".to_string(),
         loop_id: lp.id.clone(),
         spec_id: spec.id.clone(),
         node_id: node.id,
@@ -1292,28 +1299,29 @@ fn reconcile_orphaned_loops_resets_pool_member_spec_to_pending() {
     })
     .unwrap();
 
-    assert_eq!(db.reconcile_orphaned_loops().unwrap(), 1);
+    assert_eq!(db.reconcile_orphaned_loops(data_dir.path()).unwrap(), 1);
 
     let lp_after = db.get_loop(&lp.id).unwrap().unwrap();
     assert_eq!(lp_after.status, LoopStatus::Paused);
     let spec_after = db.get_loop_spec(&spec.id).unwrap().unwrap();
-    assert_eq!(spec_after.status, LoopSpecStatus::Pending);
-    // The pool's live pick can now find it again.
+    assert_eq!(spec_after.status, LoopSpecStatus::Interrupted);
+    // The queue's live pick can now find it again, exactly as it would a
+    // `pending` member.
     assert_eq!(
-        db.pool_next_pending_spec_id("pool-1").unwrap().as_deref(),
+        db.queue_next_pending_spec_id("queue-1").unwrap().as_deref(),
         Some(spec.id.as_str())
     );
 }
 
-/// R3 (B18): the defensive selection safety net. A pool member left
+/// R3 (B18): the defensive selection safety net. A queue member left
 /// `running` with no `loop_runs` row proving it's still live in *this*
 /// daemon's lifetime must be flagged as stale — but a member whose `running`
 /// node run really does carry the current boot id (i.e. genuinely still in
 /// flight right now) must not be.
 #[test]
-fn pool_stale_running_members_flags_only_the_member_with_no_live_run() {
+fn queue_stale_running_members_flags_only_the_member_with_no_live_run() {
     let db = test_db();
-    let lp = sample_loop("wf-pool-stale");
+    let lp = sample_loop("wf-queue-stale");
     db.insert_loop(&lp).unwrap();
 
     let mut stale = sample_loop_spec("unused-loop-id", "spec-stale", 1);
@@ -1325,14 +1333,14 @@ fn pool_stale_running_members_flags_only_the_member_with_no_live_run() {
     db.insert_loop_spec(&stale).unwrap();
     db.insert_loop_spec(&live).unwrap();
 
-    db.insert_pool(&Pool {
-        id: "pool-1".to_string(),
-        name: "pool-1".to_string(),
+    db.insert_queue(&Queue {
+        id: "queue-1".to_string(),
+        name: "queue-1".to_string(),
         created_at: Utc::now(),
     })
     .unwrap();
-    db.append_pool_member("pool-1", &stale.id, None).unwrap();
-    db.append_pool_member("pool-1", &live.id, None).unwrap();
+    db.append_queue_member("queue-1", &stale.id, None).unwrap();
+    db.append_queue_member("queue-1", &live.id, None).unwrap();
 
     // `live`'s node run genuinely belongs to the current daemon's boot.
     let node = sample_loop_node(&live.id, "node-live", 1);
@@ -1355,7 +1363,7 @@ fn pool_stale_running_members_flags_only_the_member_with_no_live_run() {
     .unwrap();
 
     let stale_members = db
-        .pool_stale_running_members("pool-1", Some("boot-current"))
+        .queue_stale_running_members("queue-1", Some("boot-current"))
         .unwrap();
     assert_eq!(stale_members, vec![stale.id]);
 }
@@ -1363,6 +1371,7 @@ fn pool_stale_running_members_flags_only_the_member_with_no_live_run() {
 #[test]
 fn reconcile_orphaned_loops_is_idempotent() {
     let db = test_db();
+    let data_dir = tempdir().unwrap();
     let mut lp = sample_loop("wf-orphan-idempotent");
     lp.status = LoopStatus::Running;
     let mut spec = sample_loop_spec(&lp.id, "spec-orphan-idempotent", 1);
@@ -1389,14 +1398,14 @@ fn reconcile_orphaned_loops_is_idempotent() {
     db.insert_loop_node(&node).unwrap();
     db.insert_loop_run(&run).unwrap();
 
-    let first_pass = db.reconcile_orphaned_loops().unwrap();
+    let first_pass = db.reconcile_orphaned_loops(data_dir.path()).unwrap();
     assert_eq!(first_pass, 1);
     let lp_after_first = db.get_loop(&lp.id).unwrap().unwrap();
     let run_after_first = db.get_loop_run(&run.id).unwrap().unwrap();
 
     // Test 3: a second reconcile pass finds nothing left to reconcile, and
     // leaves the already-paused loop/run untouched.
-    let second_pass = db.reconcile_orphaned_loops().unwrap();
+    let second_pass = db.reconcile_orphaned_loops(data_dir.path()).unwrap();
     assert_eq!(second_pass, 0);
     let lp_after_second = db.get_loop(&lp.id).unwrap().unwrap();
     let run_after_second = db.get_loop_run(&run.id).unwrap().unwrap();
@@ -1419,6 +1428,7 @@ async fn reconcile_orphaned_loops_kills_survivor_pid_from_same_boot() {
     };
 
     let db = test_db();
+    let data_dir = tempdir().unwrap();
     let mut lp = sample_loop("wf-orphan-survivor");
     lp.status = LoopStatus::Running;
     let mut spec = sample_loop_spec(&lp.id, "spec-orphan-survivor", 1);
@@ -1461,7 +1471,7 @@ async fn reconcile_orphaned_loops_kills_survivor_pid_from_same_boot() {
     db.insert_loop_node(&node).unwrap();
     db.insert_loop_run(&run).unwrap();
 
-    assert_eq!(db.reconcile_orphaned_loops().unwrap(), 1);
+    assert_eq!(db.reconcile_orphaned_loops(data_dir.path()).unwrap(), 1);
 
     // The kill is fired via a detached task (see
     // `terminate_process_group_async`); poll briefly for the SIGTERM to
@@ -1488,6 +1498,7 @@ async fn reconcile_orphaned_loops_kills_survivor_pid_from_same_boot() {
 #[test]
 fn reconcile_orphaned_loops_skips_kill_for_mismatched_boot_id() {
     let db = test_db();
+    let data_dir = tempdir().unwrap();
     let mut lp = sample_loop("wf-orphan-stale-boot");
     lp.status = LoopStatus::Running;
     let mut spec = sample_loop_spec(&lp.id, "spec-orphan-stale-boot", 1);
@@ -1519,7 +1530,7 @@ fn reconcile_orphaned_loops_skips_kill_for_mismatched_boot_id() {
     // Must not panic or error even though pid 1 is a real (unkillable by
     // us) process — the boot_id mismatch must short-circuit before any
     // signal is ever attempted.
-    assert_eq!(db.reconcile_orphaned_loops().unwrap(), 1);
+    assert_eq!(db.reconcile_orphaned_loops(data_dir.path()).unwrap(), 1);
     let run_after = db.get_loop_run(&run.id).unwrap().unwrap();
     assert_ne!(run_after.status, LoopRunStatus::Running);
 }
@@ -1527,15 +1538,101 @@ fn reconcile_orphaned_loops_skips_kill_for_mismatched_boot_id() {
 #[test]
 fn reconcile_orphaned_loops_leaves_completed_loop_untouched() {
     let db = test_db();
+    let data_dir = tempdir().unwrap();
     let mut lp = sample_loop("wf-completed");
     lp.status = LoopStatus::Completed;
     db.insert_loop(&lp).unwrap();
 
     // Test 4: a `Completed` loop is not reconciled.
-    let reconciled = db.reconcile_orphaned_loops().unwrap();
+    let reconciled = db.reconcile_orphaned_loops(data_dir.path()).unwrap();
     assert_eq!(reconciled, 0);
     let lp_after = db.get_loop(&lp.id).unwrap().unwrap();
     assert_eq!(lp_after.status, LoopStatus::Completed);
+}
+
+/// The ownership gate (second line of defence, alongside never calling this
+/// from `run_stdio_server` at all — see the doc comment on
+/// `reconcile_orphaned_loops`): when the on-disk `daemon.pid` names a *live*
+/// process that isn't this one, some other process owns the daemon
+/// lifecycle right now, and this call must not touch graph state at all —
+/// no signal, no pause, no interrupted-run marking.
+#[tokio::test]
+async fn reconcile_orphaned_loops_skips_everything_when_foreign_daemon_pid_is_live() {
+    let Some(current_boot_id) = crate::system::boot_id() else {
+        return;
+    };
+
+    let data_dir = tempdir().unwrap();
+    // Stand in for "a live daemon other than us": a real, still-running
+    // process whose pid is guaranteed not to equal this test process's own.
+    let mut foreign_daemon = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn stand-in foreign daemon process");
+    std::fs::write(
+        data_dir.path().join("daemon.pid"),
+        foreign_daemon.id().to_string(),
+    )
+    .unwrap();
+
+    let db = test_db();
+    let mut lp = sample_loop("wf-foreign-daemon-owned");
+    lp.status = LoopStatus::Running;
+    let mut spec = sample_loop_spec(&lp.id, "spec-foreign-daemon-owned", 1);
+    spec.status = LoopSpecStatus::Running;
+    let node = sample_loop_node(&spec.id, "node-foreign-daemon-owned", 1);
+    // A pid/boot_id that WOULD be killed if the gate failed to short-circuit
+    // (same boot, matching the same-boot kill precondition tested elsewhere).
+    let run = LoopNodeRun {
+        id: "run-foreign-daemon-owned".to_string(),
+        loop_id: lp.id.clone(),
+        spec_id: spec.id.clone(),
+        node_id: node.id.clone(),
+        status: LoopRunStatus::Running,
+        input: None,
+        output: None,
+        started_at: Utc::now(),
+        completed_at: None,
+        iteration: 1,
+        pid: Some(foreign_daemon.id() as i64),
+        boot_id: Some(current_boot_id),
+        session_id: None,
+    };
+
+    db.insert_loop(&lp).unwrap();
+    db.insert_loop_spec(&spec).unwrap();
+    db.insert_loop_node(&node).unwrap();
+    db.insert_loop_run(&run).unwrap();
+
+    let reconciled = db.reconcile_orphaned_loops(data_dir.path()).unwrap();
+    assert_eq!(
+        reconciled, 0,
+        "must not report any loop reconciled while a foreign live daemon owns the pid file"
+    );
+
+    let lp_after = db.get_loop(&lp.id).unwrap().unwrap();
+    assert_eq!(
+        lp_after.status,
+        LoopStatus::Running,
+        "the graph must be left exactly as found, not paused"
+    );
+    let run_after = db.get_loop_run(&run.id).unwrap().unwrap();
+    assert_eq!(
+        run_after.status,
+        LoopRunStatus::Running,
+        "the run must not be reported as interrupted by a restart that never happened"
+    );
+
+    // The pid named in the "foreign daemon" run must never have been
+    // signaled — prove it's still alive rather than merely unreaped.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        foreign_daemon.try_wait().unwrap(),
+        None,
+        "the gate must never signal the pid it protects"
+    );
+    let _ = foreign_daemon.kill();
+    let _ = foreign_daemon.wait();
 }
 
 fn loop_with_trigger(id: &str, trigger: Option<Trigger>) -> Loop {
@@ -1561,8 +1658,8 @@ fn loop_trigger_round_trips_through_insert_and_get() {
     assert!(fetched.is_cron());
 }
 
-fn sample_pool(id: &str) -> Pool {
-    Pool {
+fn sample_queue(id: &str) -> Queue {
+    Queue {
         id: id.to_string(),
         name: format!("{id} name"),
         created_at: Utc::now(),
@@ -1570,25 +1667,25 @@ fn sample_pool(id: &str) -> Pool {
 }
 
 #[test]
-fn pool_and_members_round_trip_through_insert_and_get_details() {
+fn queue_and_members_round_trip_through_insert_and_get_details() {
     let db = test_db();
     for id in ["spec-a", "spec-b", "spec-c"] {
         db.insert_loop_spec(&sample_standalone_spec(id, None))
             .unwrap();
     }
-    db.insert_pool(&sample_pool("pool-1")).unwrap();
+    db.insert_queue(&sample_queue("queue-1")).unwrap();
 
-    db.append_pool_member("pool-1", "spec-a", None).unwrap();
-    db.append_pool_member("pool-1", "spec-b", None).unwrap();
-    db.append_pool_member("pool-1", "spec-c", None).unwrap();
+    db.append_queue_member("queue-1", "spec-a", None).unwrap();
+    db.append_queue_member("queue-1", "spec-b", None).unwrap();
+    db.append_queue_member("queue-1", "spec-c", None).unwrap();
     assert_eq!(
-        db.list_pool_member_spec_ids("pool-1").unwrap(),
+        db.list_queue_member_spec_ids("queue-1").unwrap(),
         vec!["spec-a", "spec-b", "spec-c"]
     );
-    assert!(db.pool_has_member("pool-1", "spec-b").unwrap());
+    assert!(db.queue_has_member("queue-1", "spec-b").unwrap());
 
-    let details = db.get_pool_details("pool-1").unwrap().unwrap();
-    assert_eq!(details.pool.name, "pool-1 name");
+    let details = db.get_queue_details("queue-1").unwrap().unwrap();
+    assert_eq!(details.queue.name, "queue-1 name");
     assert_eq!(
         details
             .members
@@ -1598,33 +1695,33 @@ fn pool_and_members_round_trip_through_insert_and_get_details() {
         vec!["spec-a", "spec-b", "spec-c"]
     );
 
-    assert!(db.remove_pool_member("pool-1", "spec-b").unwrap());
-    assert!(!db.pool_has_member("pool-1", "spec-b").unwrap());
+    assert!(db.remove_queue_member("queue-1", "spec-b").unwrap());
+    assert!(!db.queue_has_member("queue-1", "spec-b").unwrap());
     assert_eq!(
-        db.list_pool_member_spec_ids("pool-1").unwrap(),
+        db.list_queue_member_spec_ids("queue-1").unwrap(),
         vec!["spec-a", "spec-c"]
     );
 
     let names = db
-        .list_pools()
+        .list_queues()
         .unwrap()
         .into_iter()
-        .map(|pool| pool.id)
+        .map(|queue| queue.id)
         .collect::<Vec<_>>();
-    assert_eq!(names, vec!["pool-1"]);
-    assert!(db.get_pool("does-not-exist").unwrap().is_none());
+    assert_eq!(names, vec!["queue-1"]);
+    assert!(db.get_queue("does-not-exist").unwrap().is_none());
 }
 
 #[test]
-fn reorder_pool_members_replaces_positions_in_given_order() {
+fn reorder_queue_members_replaces_positions_in_given_order() {
     let db = test_db();
     for id in ["spec-a", "spec-b", "spec-c"] {
         db.insert_loop_spec(&sample_standalone_spec(id, None))
             .unwrap();
     }
-    db.insert_pool(&sample_pool("pool-1")).unwrap();
+    db.insert_queue(&sample_queue("queue-1")).unwrap();
     for id in ["spec-a", "spec-b", "spec-c"] {
-        db.append_pool_member("pool-1", id, None).unwrap();
+        db.append_queue_member("queue-1", id, None).unwrap();
     }
 
     let order = vec![
@@ -1632,18 +1729,18 @@ fn reorder_pool_members_replaces_positions_in_given_order() {
         "spec-a".to_string(),
         "spec-b".to_string(),
     ];
-    db.reorder_pool_members("pool-1", &order).unwrap();
+    db.reorder_queue_members("queue-1", &order).unwrap();
 
-    assert_eq!(db.list_pool_member_spec_ids("pool-1").unwrap(), order);
+    assert_eq!(db.list_queue_member_spec_ids("queue-1").unwrap(), order);
 }
 
 #[test]
-fn append_pool_member_rejects_nonexistent_spec() {
+fn append_queue_member_rejects_nonexistent_spec() {
     let db = test_db();
-    db.insert_pool(&sample_pool("pool-1")).unwrap();
+    db.insert_queue(&sample_queue("queue-1")).unwrap();
 
     let error = db
-        .append_pool_member("pool-1", "ghost-spec", None)
+        .append_queue_member("queue-1", "ghost-spec", None)
         .unwrap_err();
     assert!(
         error.to_string().to_lowercase().contains("foreign key"),
@@ -1652,16 +1749,16 @@ fn append_pool_member_rejects_nonexistent_spec() {
 }
 
 #[test]
-fn deleting_a_spec_cascades_its_pool_membership() {
+fn deleting_a_spec_cascades_its_queue_membership() {
     let db = test_db();
     db.insert_loop_spec(&sample_standalone_spec("spec-a", None))
         .unwrap();
-    db.insert_pool(&sample_pool("pool-1")).unwrap();
-    db.append_pool_member("pool-1", "spec-a", None).unwrap();
+    db.insert_queue(&sample_queue("queue-1")).unwrap();
+    db.append_queue_member("queue-1", "spec-a", None).unwrap();
 
     db.delete_loop_spec("spec-a").unwrap();
 
-    assert!(db.list_pool_member_spec_ids("pool-1").unwrap().is_empty());
+    assert!(db.list_queue_member_spec_ids("queue-1").unwrap().is_empty());
 }
 
 // ── RS3: context groups within a queue ──────────────────────────
@@ -1717,27 +1814,29 @@ fn rs3_fixture() -> Database {
     review.spec_id = None;
     review.loop_id = Some(lp.id);
     db.insert_loop_node(&review).unwrap();
-    db.insert_pool(&sample_pool("pool-1")).unwrap();
+    db.insert_queue(&sample_queue("queue-1")).unwrap();
     db
 }
 
 #[test]
 fn group_name_persists_through_add_and_reorder() {
     let db = rs3_fixture();
-    db.append_pool_member("pool-1", "spec-a", Some("ctx"))
+    db.append_queue_member("queue-1", "spec-a", Some("ctx"))
         .unwrap();
-    db.append_pool_member("pool-1", "spec-b", Some("ctx"))
+    db.append_queue_member("queue-1", "spec-b", Some("ctx"))
         .unwrap();
-    db.append_pool_member("pool-1", "spec-c", None).unwrap();
+    db.append_queue_member("queue-1", "spec-c", None).unwrap();
 
     // Groups are readable per member and in list order.
     assert_eq!(
-        db.pool_member_group("pool-1", "spec-a").unwrap().as_deref(),
+        db.queue_member_group("queue-1", "spec-a")
+            .unwrap()
+            .as_deref(),
         Some("ctx")
     );
-    assert_eq!(db.pool_member_group("pool-1", "spec-c").unwrap(), None);
+    assert_eq!(db.queue_member_group("queue-1", "spec-c").unwrap(), None);
     assert_eq!(
-        db.list_pool_member_groups("pool-1").unwrap(),
+        db.list_queue_member_groups("queue-1").unwrap(),
         vec![
             ("spec-a".to_string(), Some("ctx".to_string())),
             ("spec-b".to_string(), Some("ctx".to_string())),
@@ -1746,8 +1845,8 @@ fn group_name_persists_through_add_and_reorder() {
     );
 
     // Reorder must move rows AND preserve each row's group_name.
-    db.reorder_pool_members(
-        "pool-1",
+    db.reorder_queue_members(
+        "queue-1",
         &[
             "spec-c".to_string(),
             "spec-a".to_string(),
@@ -1756,7 +1855,7 @@ fn group_name_persists_through_add_and_reorder() {
     )
     .unwrap();
     assert_eq!(
-        db.list_pool_member_groups("pool-1").unwrap(),
+        db.list_queue_member_groups("queue-1").unwrap(),
         vec![
             ("spec-c".to_string(), None),
             ("spec-a".to_string(), Some("ctx".to_string())),
@@ -1768,9 +1867,9 @@ fn group_name_persists_through_add_and_reorder() {
 #[test]
 fn group_session_for_node_returns_completed_siblings_session() {
     let db = rs3_fixture();
-    db.append_pool_member("pool-1", "spec-a", Some("ctx"))
+    db.append_queue_member("queue-1", "spec-a", Some("ctx"))
         .unwrap();
-    db.append_pool_member("pool-1", "spec-b", Some("ctx"))
+    db.append_queue_member("queue-1", "spec-b", Some("ctx"))
         .unwrap();
     seed_group_sibling(
         &db,
@@ -1783,14 +1882,14 @@ fn group_session_for_node_returns_completed_siblings_session() {
 
     // spec-b's first visit to node-impl inherits spec-a's warm session.
     assert_eq!(
-        db.group_session_for_node("pool-1", "ctx", "spec-b", "node-impl")
+        db.group_session_for_node("queue-1", "ctx", "spec-b", "node-impl")
             .unwrap()
             .as_deref(),
         Some("ses-a")
     );
     // A node the sibling never ran → no session → cold start.
     assert_eq!(
-        db.group_session_for_node("pool-1", "ctx", "spec-b", "node-review")
+        db.group_session_for_node("queue-1", "ctx", "spec-b", "node-review")
             .unwrap(),
         None
     );
@@ -1800,11 +1899,11 @@ fn group_session_for_node_returns_completed_siblings_session() {
 fn group_session_taint_on_failed_nearest_sibling() {
     let db = rs3_fixture();
     // Three grouped siblings: a completed, then a failed, then the current one.
-    db.append_pool_member("pool-1", "spec-a", Some("ctx"))
+    db.append_queue_member("queue-1", "spec-a", Some("ctx"))
         .unwrap();
-    db.append_pool_member("pool-1", "spec-b", Some("ctx"))
+    db.append_queue_member("queue-1", "spec-b", Some("ctx"))
         .unwrap();
-    db.append_pool_member("pool-1", "spec-c", Some("ctx"))
+    db.append_queue_member("queue-1", "spec-c", Some("ctx"))
         .unwrap();
     seed_group_sibling(
         &db,
@@ -1827,7 +1926,7 @@ fn group_session_taint_on_failed_nearest_sibling() {
     // Taint: the broken chain forces a cold start — the earlier completed
     // spec-a session is NOT resurrected across the failure.
     assert_eq!(
-        db.group_session_for_node("pool-1", "ctx", "spec-c", "node-impl")
+        db.group_session_for_node("queue-1", "ctx", "spec-c", "node-impl")
             .unwrap(),
         None
     );
@@ -1836,9 +1935,9 @@ fn group_session_taint_on_failed_nearest_sibling() {
 #[test]
 fn group_session_is_independent_per_node() {
     let db = rs3_fixture();
-    db.append_pool_member("pool-1", "spec-a", Some("ctx"))
+    db.append_queue_member("queue-1", "spec-a", Some("ctx"))
         .unwrap();
-    db.append_pool_member("pool-1", "spec-b", Some("ctx"))
+    db.append_queue_member("queue-1", "spec-b", Some("ctx"))
         .unwrap();
     // spec-a completed after capturing a DISTINCT session on each node.
     let run_impl = LoopNodeRun {
@@ -1874,13 +1973,13 @@ fn group_session_is_independent_per_node() {
 
     // Implementer and reviewer sessions stay independent.
     assert_eq!(
-        db.group_session_for_node("pool-1", "ctx", "spec-b", "node-impl")
+        db.group_session_for_node("queue-1", "ctx", "spec-b", "node-impl")
             .unwrap()
             .as_deref(),
         Some("ses-impl")
     );
     assert_eq!(
-        db.group_session_for_node("pool-1", "ctx", "spec-b", "node-review")
+        db.group_session_for_node("queue-1", "ctx", "spec-b", "node-review")
             .unwrap()
             .as_deref(),
         Some("ses-review")
@@ -1891,10 +1990,10 @@ fn group_session_is_independent_per_node() {
 fn ungrouped_and_cross_group_members_never_cross_resume() {
     let db = rs3_fixture();
     // spec-a grouped "ctx", spec-b ungrouped, spec-c in a DIFFERENT group.
-    db.append_pool_member("pool-1", "spec-a", Some("ctx"))
+    db.append_queue_member("queue-1", "spec-a", Some("ctx"))
         .unwrap();
-    db.append_pool_member("pool-1", "spec-b", None).unwrap();
-    db.append_pool_member("pool-1", "spec-c", Some("other"))
+    db.append_queue_member("queue-1", "spec-b", None).unwrap();
+    db.append_queue_member("queue-1", "spec-c", Some("other"))
         .unwrap();
     seed_group_sibling(
         &db,
@@ -1906,18 +2005,18 @@ fn ungrouped_and_cross_group_members_never_cross_resume() {
     );
 
     // An ungrouped member never inherits (queried with its own — absent — group).
-    assert_eq!(db.pool_member_group("pool-1", "spec-b").unwrap(), None);
+    assert_eq!(db.queue_member_group("queue-1", "spec-b").unwrap(), None);
     // A member in another group does not see "ctx"'s session.
     assert_eq!(
-        db.group_session_for_node("pool-1", "other", "spec-c", "node-impl")
+        db.group_session_for_node("queue-1", "other", "spec-c", "node-impl")
             .unwrap(),
         None
     );
 }
 
 #[test]
-fn group_name_column_is_added_to_a_pre_rs3_pool_members_table() {
-    // Simulate a pre-RS3 database whose `pool_members` predates `group_name`.
+fn group_name_column_is_added_to_a_pre_rs3_queue_members_table() {
+    // Simulate a pre-RS3 database whose `queue_members` predates `group_name`.
     let tmp = NamedTempFile::new().expect("create temp file");
     let path = tmp.path().to_path_buf();
     std::mem::forget(tmp);
@@ -1937,7 +2036,7 @@ fn group_name_column_is_added_to_a_pre_rs3_pool_members_table() {
                 started_at INTEGER,
                 completed_at INTEGER,
                 autorun_at INTEGER,
-                spec_pool TEXT
+                spec_queue TEXT
              );
              CREATE TABLE loop_specs (
                 id TEXT PRIMARY KEY,
@@ -1951,23 +2050,23 @@ fn group_name_column_is_added_to_a_pre_rs3_pool_members_table() {
                 completed_at INTEGER,
                 workdir TEXT
              );
-             CREATE TABLE pools (
+             CREATE TABLE queues (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 created_at INTEGER NOT NULL
              );
-             -- Pre-RS3 pool_members: no group_name column.
-             CREATE TABLE pool_members (
-                pool_id TEXT NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
+             -- Pre-RS3 queue_members: no group_name column.
+             CREATE TABLE queue_members (
+                queue_id TEXT NOT NULL REFERENCES queues(id) ON DELETE CASCADE,
                 spec_id TEXT NOT NULL REFERENCES loop_specs(id) ON DELETE CASCADE,
                 position INTEGER NOT NULL,
-                PRIMARY KEY (pool_id, spec_id)
+                PRIMARY KEY (queue_id, spec_id)
              );
              INSERT INTO loop_specs (id, loop_id, name, position, status)
                  VALUES ('legacy-spec', NULL, 'Spec', 1, 'pending');
-             INSERT INTO pools (id, name, created_at) VALUES ('pool-1', 'Pool', 0);
-             INSERT INTO pool_members (pool_id, spec_id, position)
-                 VALUES ('pool-1', 'legacy-spec', 1);",
+             INSERT INTO queues (id, name, created_at) VALUES ('queue-1', 'Queue', 0);
+             INSERT INTO queue_members (queue_id, spec_id, position)
+                 VALUES ('queue-1', 'legacy-spec', 1);",
         )
         .expect("seed pre-RS3 schema");
     }
@@ -1975,16 +2074,22 @@ fn group_name_column_is_added_to_a_pre_rs3_pool_members_table() {
     // Migration adds the nullable column; the pre-existing row reads back as
     // ungrouped (NULL), and re-running init stays safe (idempotent guard).
     let db = Database::new(&path).expect("open pre-RS3 db, running migration");
-    assert_eq!(db.pool_member_group("pool-1", "legacy-spec").unwrap(), None);
+    assert_eq!(
+        db.queue_member_group("queue-1", "legacy-spec").unwrap(),
+        None
+    );
     drop(db);
     let db = Database::new(&path).expect("re-open is idempotent");
-    assert_eq!(db.pool_member_group("pool-1", "legacy-spec").unwrap(), None);
+    assert_eq!(
+        db.queue_member_group("queue-1", "legacy-spec").unwrap(),
+        None
+    );
 }
 
 #[test]
-fn pools_migration_is_idempotent_and_a_pre_r4_database_opens_cleanly() {
-    // Simulate a pre-R4 database: `loops` has the old `spec_pool` column
-    // (7f2efdf) but no `pools`/`pool_members` tables at all.
+fn queues_migration_is_idempotent_and_a_pre_r4_database_opens_cleanly() {
+    // Simulate a pre-R4 database: `loops` has the old `spec_queue` column
+    // (7f2efdf) but no `queues`/`queue_members` tables at all.
     let tmp = NamedTempFile::new().expect("create temp file");
     let path = tmp.path().to_path_buf();
     std::mem::forget(tmp);
@@ -2004,7 +2109,7 @@ fn pools_migration_is_idempotent_and_a_pre_r4_database_opens_cleanly() {
                 started_at INTEGER,
                 completed_at INTEGER,
                 autorun_at INTEGER,
-                spec_pool TEXT
+                spec_queue TEXT
              );
              CREATE TABLE loop_specs (
                 id TEXT PRIMARY KEY,
@@ -2018,7 +2123,7 @@ fn pools_migration_is_idempotent_and_a_pre_r4_database_opens_cleanly() {
                 completed_at INTEGER,
                 workdir TEXT
              );
-             INSERT INTO loops (id, name, workdir, status, created_at, spec_pool)
+             INSERT INTO loops (id, name, workdir, status, created_at, spec_queue)
                  VALUES ('legacy-loop', 'Legacy', '/tmp', 'draft', 0, NULL);
              INSERT INTO loop_specs (id, loop_id, name, position, status)
                  VALUES ('legacy-spec', 'legacy-loop', 'Spec', 1, 'pending');",
@@ -2027,15 +2132,15 @@ fn pools_migration_is_idempotent_and_a_pre_r4_database_opens_cleanly() {
     }
 
     // Opening the DB (Database::new runs the migration) must succeed and add
-    // the pools tables without disturbing existing rows.
+    // the queues tables without disturbing existing rows.
     let db = Database::new(&path).expect("open pre-R4 db, running migration");
     let lp = db.get_loop("legacy-loop").unwrap().unwrap();
     assert_eq!(lp.name, "Legacy");
-    db.insert_pool(&sample_pool("pool-1")).unwrap();
-    db.append_pool_member("pool-1", "legacy-spec", None)
+    db.insert_queue(&sample_queue("queue-1")).unwrap();
+    db.append_queue_member("queue-1", "legacy-spec", None)
         .unwrap();
     assert_eq!(
-        db.list_pool_member_spec_ids("pool-1").unwrap(),
+        db.list_queue_member_spec_ids("queue-1").unwrap(),
         vec!["legacy-spec"]
     );
     drop(db);
@@ -2044,11 +2149,11 @@ fn pools_migration_is_idempotent_and_a_pre_r4_database_opens_cleanly() {
     // no error (idempotent).
     let db = Database::new(&path).expect("reopen db after migration already applied");
     assert_eq!(
-        db.list_pool_member_spec_ids("pool-1").unwrap(),
+        db.list_queue_member_spec_ids("queue-1").unwrap(),
         vec!["legacy-spec"]
     );
 
-    // The retired `spec_pool` column is never written by current code: a
+    // The retired `spec_queue` column is never written by current code: a
     // freshly inserted loop leaves it NULL.
     db.insert_loop(&sample_loop("fresh-loop")).unwrap();
     let raw: Option<String> = db
@@ -2056,7 +2161,7 @@ fn pools_migration_is_idempotent_and_a_pre_r4_database_opens_cleanly() {
         .lock()
         .unwrap()
         .query_row(
-            "SELECT spec_pool FROM loops WHERE id = 'fresh-loop'",
+            "SELECT spec_queue FROM loops WHERE id = 'fresh-loop'",
             [],
             |row| row.get(0),
         )
@@ -2065,9 +2170,9 @@ fn pools_migration_is_idempotent_and_a_pre_r4_database_opens_cleanly() {
 }
 
 #[test]
-fn active_run_pool_id_migration_is_idempotent_and_a_pre_b8_database_opens_cleanly() {
-    // Simulate a pre-B8 database: `loops` has `autorun_at` and `pools`/
-    // `pool_members` already exist, but `loops` predates `active_run_pool_id`.
+fn active_run_queue_id_migration_is_idempotent_and_a_pre_b8_database_opens_cleanly() {
+    // Simulate a pre-B8 database: `loops` has `autorun_at` and `queues`/
+    // `queue_members` already exist, but `loops` predates `active_run_queue_id`.
     let tmp = NamedTempFile::new().expect("create temp file");
     let path = tmp.path().to_path_buf();
     std::mem::forget(tmp);
@@ -2087,7 +2192,7 @@ fn active_run_pool_id_migration_is_idempotent_and_a_pre_b8_database_opens_cleanl
                 started_at INTEGER,
                 completed_at INTEGER,
                 autorun_at INTEGER,
-                spec_pool TEXT
+                spec_queue TEXT
              );
              CREATE TABLE loop_specs (
                 id TEXT PRIMARY KEY,
@@ -2101,38 +2206,38 @@ fn active_run_pool_id_migration_is_idempotent_and_a_pre_b8_database_opens_cleanl
                 completed_at INTEGER,
                 workdir TEXT
              );
-             CREATE TABLE pools (
+             CREATE TABLE queues (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 created_at INTEGER NOT NULL
              );
-             CREATE TABLE pool_members (
-                pool_id TEXT NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
+             CREATE TABLE queue_members (
+                queue_id TEXT NOT NULL REFERENCES queues(id) ON DELETE CASCADE,
                 spec_id TEXT NOT NULL REFERENCES loop_specs(id) ON DELETE CASCADE,
                 position INTEGER NOT NULL,
-                PRIMARY KEY (pool_id, spec_id)
+                PRIMARY KEY (queue_id, spec_id)
              );
              INSERT INTO loops (id, name, workdir, status, created_at)
                  VALUES ('legacy-loop', 'Legacy', '/tmp', 'failed', 0);
              INSERT INTO loop_specs (id, loop_id, name, position, status)
                  VALUES ('legacy-spec', NULL, 'Spec', 1, 'pending');
-             INSERT INTO pools (id, name, created_at) VALUES ('pool-1', 'pool-1', 0);
-             INSERT INTO pool_members (pool_id, spec_id, position)
-                 VALUES ('pool-1', 'legacy-spec', 1);",
+             INSERT INTO queues (id, name, created_at) VALUES ('queue-1', 'queue-1', 0);
+             INSERT INTO queue_members (queue_id, spec_id, position)
+                 VALUES ('queue-1', 'legacy-spec', 1);",
         )
         .expect("seed legacy schema");
     }
 
     // Opening the DB (Database::new runs the migration) must succeed and add
-    // `active_run_pool_id` without disturbing existing rows.
+    // `active_run_queue_id` without disturbing existing rows.
     let db = Database::new(&path).expect("open pre-B8 db, running migration");
     let lp = db.get_loop("legacy-loop").unwrap().unwrap();
     assert_eq!(lp.name, "Legacy");
-    assert_eq!(lp.active_run_pool_id, None);
+    assert_eq!(lp.active_run_queue_id, None);
 
     // The new column is actually usable: persist a run context and reset
-    // through the shared path picks up the pool's members.
-    db.set_loop_active_run_pool("legacy-loop", Some("pool-1"))
+    // through the shared path picks up the queue's members.
+    db.set_loop_active_run_queue("legacy-loop", Some("queue-1"))
         .unwrap();
     let outcome = db.reset_loop("legacy-loop", None).unwrap();
     assert_eq!(
@@ -2145,7 +2250,228 @@ fn active_run_pool_id_migration_is_idempotent_and_a_pre_b8_database_opens_cleanl
     // no error (idempotent).
     let db = Database::new(&path).expect("reopen db after migration already applied");
     let lp = db.get_loop("legacy-loop").unwrap().unwrap();
-    assert_eq!(lp.active_run_pool_id.as_deref(), Some("pool-1"));
+    assert_eq!(lp.active_run_queue_id.as_deref(), Some("queue-1"));
+}
+
+#[test]
+fn legacy_queue_table_names_migrate_preserving_member_order_and_context_groups() {
+    // Simulate a database still on the previous-generation queue schema (the
+    // exact shape every pre-existing installation has on disk today, with
+    // its own table, column, and index names — see the raw SQL below). Two
+    // queues, several members each, deliberately inserted out of position
+    // order, spanning multiple (and no) context groups — the thing most
+    // worth not losing is the position-driven order and each member's group.
+    let tmp = NamedTempFile::new().expect("create temp file");
+    let path = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+
+    {
+        let conn = rusqlite::Connection::open(&path).expect("open raw legacy db");
+        conn.execute_batch(
+            "CREATE TABLE loops (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                workdir TEXT NOT NULL,
+                status TEXT NOT NULL,
+                trigger_type TEXT,
+                trigger_config TEXT,
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER,
+                autorun_at INTEGER,
+                spec_pool TEXT,
+                active_run_pool_id TEXT,
+                on_completed TEXT
+             );
+             CREATE TABLE loop_specs (
+                id TEXT PRIMARY KEY,
+                loop_id TEXT REFERENCES loops(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                description TEXT,
+                position INTEGER NOT NULL,
+                parallelizable INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER,
+                workdir TEXT
+             );
+             CREATE TABLE pools (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+             );
+             CREATE TABLE pool_members (
+                pool_id TEXT NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
+                spec_id TEXT NOT NULL REFERENCES loop_specs(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                group_name TEXT,
+                PRIMARY KEY (pool_id, spec_id)
+             );
+             CREATE UNIQUE INDEX idx_pool_members_position
+                 ON pool_members(pool_id, position);
+             INSERT INTO loops (id, name, workdir, status, created_at, active_run_pool_id)
+                 VALUES ('legacy-loop', 'Legacy', '/tmp', 'paused', 0, 'queue-a');
+             INSERT INTO pools (id, name, created_at) VALUES
+                 ('queue-a', 'Queue A', 0),
+                 ('queue-b', 'Queue B', 0);",
+        )
+        .expect("seed legacy schema");
+
+        for (spec_id, position) in [
+            ("spec-a1", 1),
+            ("spec-a2", 2),
+            ("spec-a3", 3),
+            ("spec-a4", 4),
+            ("spec-b1", 1),
+            ("spec-b2", 2),
+        ] {
+            conn.execute(
+                "INSERT INTO loop_specs (id, loop_id, name, position, status)
+                 VALUES (?1, NULL, ?1, 1, 'pending')",
+                [spec_id],
+            )
+            .unwrap();
+            let _ = position;
+        }
+
+        // Insert members out of position order to prove the migration
+        // preserves `position`, not insertion order.
+        conn.execute(
+            "INSERT INTO pool_members (pool_id, spec_id, position, group_name) VALUES
+                ('queue-a', 'spec-a3', 3, NULL),
+                ('queue-a', 'spec-a1', 1, 'group-1'),
+                ('queue-a', 'spec-a4', 4, 'group-2'),
+                ('queue-a', 'spec-a2', 2, 'group-1'),
+                ('queue-b', 'spec-b2', 2, 'group-3'),
+                ('queue-b', 'spec-b1', 1, NULL)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let db = Database::new(&path).expect("open legacy-schema db, running the rename migration");
+
+    // Table/index/column identity: old names are gone, new ones hold the data.
+    let conn = db.conn.lock().unwrap();
+    let old_objects: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('pools', 'pool_members', 'idx_pool_members_position')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(old_objects, 0, "legacy-named objects must not survive");
+    let new_objects: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('queues', 'queue_members', 'idx_queue_members_position')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(new_objects, 3, "renamed queue objects must exist");
+    drop(conn);
+
+    // Data identity: members present, in the same order, in the same groups.
+    assert_eq!(
+        db.list_queue_member_groups("queue-a").unwrap(),
+        vec![
+            ("spec-a1".to_string(), Some("group-1".to_string())),
+            ("spec-a2".to_string(), Some("group-1".to_string())),
+            ("spec-a3".to_string(), None),
+            ("spec-a4".to_string(), Some("group-2".to_string())),
+        ]
+    );
+    assert_eq!(
+        db.list_queue_member_groups("queue-b").unwrap(),
+        vec![
+            ("spec-b1".to_string(), None),
+            ("spec-b2".to_string(), Some("group-3".to_string())),
+        ]
+    );
+
+    // The loop's active-run reference survived under its renamed column.
+    let lp = db.get_loop("legacy-loop").unwrap().unwrap();
+    assert_eq!(lp.active_run_queue_id.as_deref(), Some("queue-a"));
+}
+
+#[test]
+fn legacy_queue_table_rename_is_a_noop_on_an_already_migrated_database() {
+    let tmp = NamedTempFile::new().expect("create temp file");
+    let path = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+
+    // First open: fresh database, already on the current (post-rename) schema.
+    let db = Database::new(&path).expect("create fresh db");
+    db.insert_loop_spec(&LoopSpec {
+        id: "spec-1".to_string(),
+        loop_id: None,
+        name: "spec-1".to_string(),
+        description: None,
+        position: 1,
+        parallelizable: false,
+        status: LoopSpecStatus::Pending,
+        started_at: None,
+        completed_at: None,
+        spec_start_head: None,
+        workdir: None,
+        completed_via: None,
+        completed_via_reason: None,
+        completed_via_at: None,
+    })
+    .unwrap();
+    db.insert_queue(&Queue {
+        id: "queue-1".to_string(),
+        name: "Queue".to_string(),
+        created_at: Utc::now(),
+    })
+    .unwrap();
+    db.append_queue_member("queue-1", "spec-1", Some("group-1"))
+        .unwrap();
+    drop(db);
+
+    // Reopening must not error and must not touch existing data — the
+    // rename's guard (legacy table absent) makes it a pure no-op.
+    let db = Database::new(&path).expect("reopen already-migrated db");
+    assert_eq!(
+        db.list_queue_member_groups("queue-1").unwrap(),
+        vec![("spec-1".to_string(), Some("group-1".to_string()))]
+    );
+    let conn = db.conn.lock().unwrap();
+    let legacy_table_present: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'pools'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        legacy_table_present, 0,
+        "the migration must not resurrect the legacy table"
+    );
+}
+
+#[test]
+fn a_schema_version_newer_than_this_binary_supports_fails_loudly_instead_of_starting_empty() {
+    let tmp = NamedTempFile::new().expect("create temp file");
+    let path = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+
+    let db = Database::new(&path).expect("create fresh db");
+    db.set_state("schema_version", "999").unwrap();
+    drop(db);
+
+    let result = Database::new(&path);
+    let message = match result {
+        Ok(_) => panic!(
+            "a database stamped with a newer schema version than this binary knows must not open"
+        ),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        message.contains("999") && message.to_lowercase().contains("schema version"),
+        "error must name the version mismatch: {message}"
+    );
 }
 
 #[test]
@@ -2171,8 +2497,8 @@ fn auto_continue_migration_is_idempotent_and_a_pre_migration_database_opens_clea
                 started_at INTEGER,
                 completed_at INTEGER,
                 autorun_at INTEGER,
-                spec_pool TEXT,
-                active_run_pool_id TEXT,
+                spec_queue TEXT,
+                active_run_queue_id TEXT,
                 on_completed TEXT
              );
              INSERT INTO loops (id, name, workdir, status, created_at)
@@ -3880,21 +4206,22 @@ fn set_spec_admin_status_rejects_active_run() {
 }
 
 #[test]
-fn set_spec_admin_status_propagates_to_pool_selection() {
+fn set_spec_admin_status_propagates_to_queue_selection() {
     let db = test_db();
-    let mut spec = sample_loop_spec("unused", "spec-pool-prop", 1);
+    let mut spec = sample_loop_spec("unused", "spec-queue-prop", 1);
     spec.loop_id = None;
     db.insert_loop_spec(&spec).unwrap();
 
-    let pool = Pool {
-        id: "pool-test".to_string(),
-        name: "pool-test".to_string(),
+    let queue = Queue {
+        id: "queue-test".to_string(),
+        name: "queue-test".to_string(),
         created_at: Utc::now(),
     };
-    db.insert_pool(&pool).unwrap();
-    db.append_pool_member("pool-test", &spec.id, None).unwrap();
+    db.insert_queue(&queue).unwrap();
+    db.append_queue_member("queue-test", &spec.id, None)
+        .unwrap();
 
-    let before = db.pool_next_pending_spec_id("pool-test").unwrap();
+    let before = db.queue_next_pending_spec_id("queue-test").unwrap();
     assert_eq!(before.as_deref(), Some(spec.id.as_str()));
 
     let outcome = db
@@ -3902,14 +4229,63 @@ fn set_spec_admin_status_propagates_to_pool_selection() {
         .unwrap();
     assert!(matches!(outcome, SpecAdminStatusOutcome::Success));
 
-    let after = db.pool_next_pending_spec_id("pool-test").unwrap();
-    assert_eq!(after, None, "pool should not select completed spec anymore");
+    let after = db.queue_next_pending_spec_id("queue-test").unwrap();
+    assert_eq!(
+        after, None,
+        "queue should not select completed spec anymore"
+    );
+}
+
+/// `Interrupted` must be exactly as selectable as `Pending` — a spec cut
+/// short by an external event (daemon restart, crash) is not less runnable
+/// than a spec that never started, and queue order between the two statuses
+/// is preserved (position, not status, decides who goes first).
+#[test]
+fn queue_next_pending_spec_id_picks_interrupted_spec_in_position_order() {
+    let db = test_db();
+    let queue = Queue {
+        id: "queue-interrupted".to_string(),
+        name: "queue-interrupted".to_string(),
+        created_at: Utc::now(),
+    };
+    db.insert_queue(&queue).unwrap();
+
+    let mut ahead = sample_loop_spec("unused", "spec-ahead-completed", 1);
+    ahead.loop_id = None;
+    ahead.status = LoopSpecStatus::Completed;
+    db.insert_loop_spec(&ahead).unwrap();
+    db.append_queue_member("queue-interrupted", &ahead.id, None)
+        .unwrap();
+
+    let mut interrupted = sample_loop_spec("unused", "spec-interrupted", 2);
+    interrupted.loop_id = None;
+    interrupted.status = LoopSpecStatus::Interrupted;
+    db.insert_loop_spec(&interrupted).unwrap();
+    db.append_queue_member("queue-interrupted", &interrupted.id, None)
+        .unwrap();
+
+    let mut pending = sample_loop_spec("unused", "spec-pending-after", 3);
+    pending.loop_id = None;
+    pending.status = LoopSpecStatus::Pending;
+    db.insert_loop_spec(&pending).unwrap();
+    db.append_queue_member("queue-interrupted", &pending.id, None)
+        .unwrap();
+
+    // Position 2 (`interrupted`) is picked before position 3 (`pending`) —
+    // selection follows queue order, not a preference between the two
+    // equally-runnable statuses.
+    assert_eq!(
+        db.queue_next_pending_spec_id("queue-interrupted")
+            .unwrap()
+            .as_deref(),
+        Some(interrupted.id.as_str())
+    );
 }
 
 #[test]
-fn pool_running_spec_id_returns_first_running_member() {
+fn queue_running_spec_id_returns_first_running_member() {
     let db = test_db();
-    let lp = sample_loop("wf-pool-running");
+    let lp = sample_loop("wf-queue-running");
     db.insert_loop(&lp).unwrap();
 
     let mut spec_a = sample_loop_spec("unused", "spec-a", 1);
@@ -3921,25 +4297,25 @@ fn pool_running_spec_id_returns_first_running_member() {
     db.insert_loop_spec(&spec_a).unwrap();
     db.insert_loop_spec(&spec_b).unwrap();
 
-    db.insert_pool(&Pool {
-        id: "pool-1".to_string(),
-        name: "pool-1".to_string(),
+    db.insert_queue(&Queue {
+        id: "queue-1".to_string(),
+        name: "queue-1".to_string(),
         created_at: Utc::now(),
     })
     .unwrap();
-    db.append_pool_member("pool-1", &spec_a.id, None).unwrap();
-    db.append_pool_member("pool-1", &spec_b.id, None).unwrap();
+    db.append_queue_member("queue-1", &spec_a.id, None).unwrap();
+    db.append_queue_member("queue-1", &spec_b.id, None).unwrap();
 
     assert_eq!(
-        db.pool_running_spec_id("pool-1").unwrap().as_deref(),
+        db.queue_running_spec_id("queue-1").unwrap().as_deref(),
         Some(spec_a.id.as_str())
     );
 }
 
 #[test]
-fn pool_running_spec_id_returns_none_when_no_running_member() {
+fn queue_running_spec_id_returns_none_when_no_running_member() {
     let db = test_db();
-    let lp = sample_loop("wf-pool-no-running");
+    let lp = sample_loop("wf-queue-no-running");
     db.insert_loop(&lp).unwrap();
 
     let mut spec = sample_loop_spec("unused", "spec-p", 1);
@@ -3947,23 +4323,23 @@ fn pool_running_spec_id_returns_none_when_no_running_member() {
     spec.status = LoopSpecStatus::Pending;
     db.insert_loop_spec(&spec).unwrap();
 
-    db.insert_pool(&Pool {
-        id: "pool-1".to_string(),
-        name: "pool-1".to_string(),
+    db.insert_queue(&Queue {
+        id: "queue-1".to_string(),
+        name: "queue-1".to_string(),
         created_at: Utc::now(),
     })
     .unwrap();
-    db.append_pool_member("pool-1", &spec.id, None).unwrap();
+    db.append_queue_member("queue-1", &spec.id, None).unwrap();
 
-    assert_eq!(db.pool_running_spec_id("pool-1").unwrap(), None);
+    assert_eq!(db.queue_running_spec_id("queue-1").unwrap(), None);
 }
 
 #[test]
-fn reconcile_stranded_pool_specs_resets_running_spec_with_no_active_run() {
+fn reconcile_stranded_queue_specs_resets_running_spec_with_no_active_run() {
     let db = test_db();
     let mut lp = sample_loop("wf-stranded");
     lp.status = LoopStatus::Paused;
-    lp.active_run_pool_id = Some("pool-1".to_string());
+    lp.active_run_queue_id = Some("queue-1".to_string());
     db.insert_loop(&lp).unwrap();
 
     let mut spec = sample_loop_spec("unused", "spec-stranded", 1);
@@ -3971,15 +4347,15 @@ fn reconcile_stranded_pool_specs_resets_running_spec_with_no_active_run() {
     spec.status = LoopSpecStatus::Running;
     db.insert_loop_spec(&spec).unwrap();
 
-    db.insert_pool(&Pool {
-        id: "pool-1".to_string(),
-        name: "pool-1".to_string(),
+    db.insert_queue(&Queue {
+        id: "queue-1".to_string(),
+        name: "queue-1".to_string(),
         created_at: Utc::now(),
     })
     .unwrap();
-    db.append_pool_member("pool-1", &spec.id, None).unwrap();
+    db.append_queue_member("queue-1", &spec.id, None).unwrap();
 
-    assert_eq!(db.reconcile_stranded_pool_specs().unwrap(), 1);
+    assert_eq!(db.reconcile_stranded_queue_specs().unwrap(), 1);
 
     let spec_after = db.get_loop_spec(&spec.id).unwrap().unwrap();
     assert_eq!(spec_after.status, LoopSpecStatus::Pending);
@@ -3988,11 +4364,11 @@ fn reconcile_stranded_pool_specs_resets_running_spec_with_no_active_run() {
 }
 
 #[test]
-fn reconcile_stranded_pool_specs_preserves_spec_with_active_run_in_current_boot() {
+fn reconcile_stranded_queue_specs_preserves_spec_with_active_run_in_current_boot() {
     let db = test_db();
     let mut lp = sample_loop("wf-stranded-live");
     lp.status = LoopStatus::Paused;
-    lp.active_run_pool_id = Some("pool-1".to_string());
+    lp.active_run_queue_id = Some("queue-1".to_string());
     db.insert_loop(&lp).unwrap();
 
     let mut spec = sample_loop_spec("unused", "spec-live", 1);
@@ -4000,13 +4376,13 @@ fn reconcile_stranded_pool_specs_preserves_spec_with_active_run_in_current_boot(
     spec.status = LoopSpecStatus::Running;
     db.insert_loop_spec(&spec).unwrap();
 
-    db.insert_pool(&Pool {
-        id: "pool-1".to_string(),
-        name: "pool-1".to_string(),
+    db.insert_queue(&Queue {
+        id: "queue-1".to_string(),
+        name: "queue-1".to_string(),
         created_at: Utc::now(),
     })
     .unwrap();
-    db.append_pool_member("pool-1", &spec.id, None).unwrap();
+    db.append_queue_member("queue-1", &spec.id, None).unwrap();
 
     let node = sample_loop_node(&spec.id, "node-live", 1);
     db.insert_loop_node(&node).unwrap();
@@ -4028,7 +4404,7 @@ fn reconcile_stranded_pool_specs_preserves_spec_with_active_run_in_current_boot(
     .unwrap();
 
     assert_eq!(
-        db.reconcile_stranded_pool_specs().unwrap(),
+        db.reconcile_stranded_queue_specs().unwrap(),
         0,
         "spec with active run in current boot must not be reset"
     );
@@ -4038,11 +4414,11 @@ fn reconcile_stranded_pool_specs_preserves_spec_with_active_run_in_current_boot(
 }
 
 #[test]
-fn reconcile_stranded_pool_specs_is_idempotent() {
+fn reconcile_stranded_queue_specs_is_idempotent() {
     let db = test_db();
     let mut lp = sample_loop("wf-stranded-idem");
     lp.status = LoopStatus::Paused;
-    lp.active_run_pool_id = Some("pool-1".to_string());
+    lp.active_run_queue_id = Some("queue-1".to_string());
     db.insert_loop(&lp).unwrap();
 
     let mut spec = sample_loop_spec("unused", "spec-idem", 1);
@@ -4050,23 +4426,23 @@ fn reconcile_stranded_pool_specs_is_idempotent() {
     spec.status = LoopSpecStatus::Running;
     db.insert_loop_spec(&spec).unwrap();
 
-    db.insert_pool(&Pool {
-        id: "pool-1".to_string(),
-        name: "pool-1".to_string(),
+    db.insert_queue(&Queue {
+        id: "queue-1".to_string(),
+        name: "queue-1".to_string(),
         created_at: Utc::now(),
     })
     .unwrap();
-    db.append_pool_member("pool-1", &spec.id, None).unwrap();
+    db.append_queue_member("queue-1", &spec.id, None).unwrap();
 
-    assert_eq!(db.reconcile_stranded_pool_specs().unwrap(), 1);
+    assert_eq!(db.reconcile_stranded_queue_specs().unwrap(), 1);
     assert_eq!(
-        db.reconcile_stranded_pool_specs().unwrap(),
+        db.reconcile_stranded_queue_specs().unwrap(),
         0,
         "second pass must find nothing to reset"
     );
 }
 
-// ── B36: interrupted-run quarantine ──────────────────────────────────────
+// ── B36: interrupted-run marking (no git stash) ──────────────────────────
 
 fn init_git_repo(path: &std::path::Path) {
     let run = |args: &[&str]| {
@@ -4108,17 +4484,8 @@ fn git_is_clean(path: &std::path::Path) -> bool {
     output.stdout.is_empty()
 }
 
-fn git_stash_list(path: &std::path::Path) -> String {
-    let output = std::process::Command::new("git")
-        .args(["stash", "list"])
-        .current_dir(path)
-        .output()
-        .expect("git stash list failed to run");
-    String::from_utf8_lossy(&output.stdout).to_string()
-}
-
 #[test]
-fn reconcile_orphaned_loops_quarantines_dirty_worktree_of_interrupted_run() {
+fn reconcile_orphaned_loops_marks_interrupted_and_leaves_dirty_worktree_untouched() {
     let dir = tempdir().unwrap();
     init_git_repo(dir.path());
     let head = git_head(dir.path());
@@ -4127,15 +4494,16 @@ fn reconcile_orphaned_loops_quarantines_dirty_worktree_of_interrupted_run() {
     assert!(!git_is_clean(dir.path()));
 
     let db = test_db();
-    let mut lp = sample_loop("wf-orphan-quarantine-dirty");
+    let data_dir = tempdir().unwrap();
+    let mut lp = sample_loop("wf-orphan-interrupted-dirty");
     lp.status = LoopStatus::Running;
     lp.workdir = dir.path().to_string_lossy().to_string();
-    let mut spec = sample_loop_spec(&lp.id, "spec-orphan-quarantine-dirty", 1);
+    let mut spec = sample_loop_spec(&lp.id, "spec-orphan-interrupted-dirty", 1);
     spec.status = LoopSpecStatus::Running;
     spec.spec_start_head = Some(head);
-    let node = sample_loop_node(&spec.id, "node-orphan-quarantine-dirty", 1);
+    let node = sample_loop_node(&spec.id, "node-orphan-interrupted-dirty", 1);
     let run = LoopNodeRun {
-        id: "run-orphan-quarantine-dirty".to_string(),
+        id: "run-orphan-interrupted-dirty".to_string(),
         loop_id: lp.id.clone(),
         spec_id: spec.id.clone(),
         node_id: node.id.clone(),
@@ -4155,92 +4523,48 @@ fn reconcile_orphaned_loops_quarantines_dirty_worktree_of_interrupted_run() {
     db.insert_loop_node(&node).unwrap();
     db.insert_loop_run(&run).unwrap();
 
-    assert_eq!(db.reconcile_orphaned_loops().unwrap(), 1);
+    assert_eq!(db.reconcile_orphaned_loops(data_dir.path()).unwrap(), 1);
 
     assert!(
-        git_is_clean(dir.path()),
-        "uncommitted changes must be stashed, leaving the worktree clean"
+        !git_is_clean(dir.path()),
+        "the engine must never touch git — uncommitted changes stay exactly as the interrupted run left them"
     );
-    assert!(
-        git_stash_list(dir.path()).contains(&run.id),
-        "the stash message must identify the interrupted run"
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("truncated.rs")).unwrap(),
+        "fn broken(",
+        "the partial write itself must be untouched, not just 'still dirty'"
     );
-
-    let run_after = db.get_loop_run(&run.id).unwrap().unwrap();
-    let output = run_after.output.as_ref().expect("output recorded");
-    assert_eq!(output.get("interrupted"), Some(&serde_json::json!(true)));
-    let quarantine = output.get("quarantine").expect("quarantine info recorded");
-    assert_eq!(quarantine.get("stashed"), Some(&serde_json::json!(true)));
-}
-
-#[test]
-fn reconcile_orphaned_loops_leaves_clean_worktree_unstashed() {
-    let dir = tempdir().unwrap();
-    init_git_repo(dir.path());
-    let head = git_head(dir.path());
-    assert!(git_is_clean(dir.path()));
-
-    let db = test_db();
-    let mut lp = sample_loop("wf-orphan-quarantine-clean");
-    lp.status = LoopStatus::Running;
-    lp.workdir = dir.path().to_string_lossy().to_string();
-    let mut spec = sample_loop_spec(&lp.id, "spec-orphan-quarantine-clean", 1);
-    spec.status = LoopSpecStatus::Running;
-    spec.spec_start_head = Some(head);
-    let node = sample_loop_node(&spec.id, "node-orphan-quarantine-clean", 1);
-    let run = LoopNodeRun {
-        id: "run-orphan-quarantine-clean".to_string(),
-        loop_id: lp.id.clone(),
-        spec_id: spec.id.clone(),
-        node_id: node.id.clone(),
-        status: LoopRunStatus::Running,
-        input: None,
-        output: None,
-        started_at: Utc::now(),
-        completed_at: None,
-        iteration: 1,
-        pid: None,
-        boot_id: None,
-        session_id: None,
-    };
-
-    db.insert_loop(&lp).unwrap();
-    db.insert_loop_spec(&spec).unwrap();
-    db.insert_loop_node(&node).unwrap();
-    db.insert_loop_run(&run).unwrap();
-
-    assert_eq!(db.reconcile_orphaned_loops().unwrap(), 1);
-
-    assert!(git_stash_list(dir.path()).is_empty(), "nothing to stash");
 
     let run_after = db.get_loop_run(&run.id).unwrap().unwrap();
     let output = run_after.output.as_ref().expect("output recorded");
     assert_eq!(output.get("interrupted"), Some(&serde_json::json!(true)));
     assert!(
         output.get("quarantine").is_none(),
-        "a clean worktree must not claim a quarantine happened"
+        "there is no quarantine mechanism left to report"
     );
+
+    let spec_after = db.get_loop_spec(&spec.id).unwrap().unwrap();
+    assert_eq!(spec_after.status, LoopSpecStatus::Interrupted);
 }
 
 #[test]
-fn reconcile_orphaned_loops_skips_quarantine_when_spec_start_head_unestablished() {
+fn reconcile_orphaned_loops_marks_interrupted_for_clean_worktree_too() {
     let dir = tempdir().unwrap();
     init_git_repo(dir.path());
-    // Left dirty, but the spec never recorded a `spec_start_head` (e.g. the
-    // workdir wasn't a git repo when the spec started) — there is no bound
-    // to attribute these changes to this run, so nothing may be quarantined.
-    std::fs::write(dir.path().join("truncated.rs"), "fn broken(").unwrap();
+    let head = git_head(dir.path());
+    assert!(git_is_clean(dir.path()));
 
     let db = test_db();
-    let mut lp = sample_loop("wf-orphan-quarantine-no-head");
+    let data_dir = tempdir().unwrap();
+    let mut lp = sample_loop("wf-orphan-interrupted-clean");
     lp.status = LoopStatus::Running;
     lp.workdir = dir.path().to_string_lossy().to_string();
-    let mut spec = sample_loop_spec(&lp.id, "spec-orphan-quarantine-no-head", 1);
+    let mut spec = sample_loop_spec(&lp.id, "spec-orphan-interrupted-clean", 1);
     spec.status = LoopSpecStatus::Running;
-    spec.spec_start_head = None;
-    let node = sample_loop_node(&spec.id, "node-orphan-quarantine-no-head", 1);
+    spec.spec_start_head = Some(head);
+    let node = sample_loop_node(&spec.id, "node-orphan-interrupted-clean", 1);
     let run = LoopNodeRun {
-        id: "run-orphan-quarantine-no-head".to_string(),
+        id: "run-orphan-interrupted-clean".to_string(),
         loop_id: lp.id.clone(),
         spec_id: spec.id.clone(),
         node_id: node.id.clone(),
@@ -4260,36 +4584,43 @@ fn reconcile_orphaned_loops_skips_quarantine_when_spec_start_head_unestablished(
     db.insert_loop_node(&node).unwrap();
     db.insert_loop_run(&run).unwrap();
 
-    assert_eq!(db.reconcile_orphaned_loops().unwrap(), 1);
+    assert_eq!(db.reconcile_orphaned_loops(data_dir.path()).unwrap(), 1);
 
-    assert!(
-        !git_is_clean(dir.path()),
-        "with no spec_start_head bound, uncommitted changes must be left exactly as found"
-    );
-    assert!(git_stash_list(dir.path()).is_empty());
+    assert!(git_is_clean(dir.path()), "still nothing to touch");
 
     let run_after = db.get_loop_run(&run.id).unwrap().unwrap();
     let output = run_after.output.as_ref().expect("output recorded");
+    assert_eq!(output.get("interrupted"), Some(&serde_json::json!(true)));
     assert!(output.get("quarantine").is_none());
+
+    let spec_after = db.get_loop_spec(&spec.id).unwrap().unwrap();
+    assert_eq!(
+        spec_after.status,
+        LoopSpecStatus::Interrupted,
+        "a spec becomes interrupted regardless of whether the worktree happened to be dirty"
+    );
 }
 
+/// The engine must not require git at all: a scratch workdir that was never
+/// `git init`ed still gets the spec marked `Interrupted`, with whatever
+/// partial work it holds left completely alone.
 #[test]
-fn reconcile_orphaned_loops_quarantine_is_idempotent_across_two_passes() {
+fn reconcile_orphaned_loops_marks_interrupted_in_non_git_workdir() {
     let dir = tempdir().unwrap();
-    init_git_repo(dir.path());
-    let head = git_head(dir.path());
+    // Deliberately no `init_git_repo` — this workdir is not a repository.
     std::fs::write(dir.path().join("truncated.rs"), "fn broken(").unwrap();
 
     let db = test_db();
-    let mut lp = sample_loop("wf-orphan-quarantine-idempotent");
+    let data_dir = tempdir().unwrap();
+    let mut lp = sample_loop("wf-orphan-interrupted-no-git");
     lp.status = LoopStatus::Running;
     lp.workdir = dir.path().to_string_lossy().to_string();
-    let mut spec = sample_loop_spec(&lp.id, "spec-orphan-quarantine-idempotent", 1);
+    let mut spec = sample_loop_spec(&lp.id, "spec-orphan-interrupted-no-git", 1);
     spec.status = LoopSpecStatus::Running;
-    spec.spec_start_head = Some(head);
-    let node = sample_loop_node(&spec.id, "node-orphan-quarantine-idempotent", 1);
+    spec.spec_start_head = None;
+    let node = sample_loop_node(&spec.id, "node-orphan-interrupted-no-git", 1);
     let run = LoopNodeRun {
-        id: "run-orphan-quarantine-idempotent".to_string(),
+        id: "run-orphan-interrupted-no-git".to_string(),
         loop_id: lp.id.clone(),
         spec_id: spec.id.clone(),
         node_id: node.id.clone(),
@@ -4309,55 +4640,112 @@ fn reconcile_orphaned_loops_quarantine_is_idempotent_across_two_passes() {
     db.insert_loop_node(&node).unwrap();
     db.insert_loop_run(&run).unwrap();
 
-    assert_eq!(db.reconcile_orphaned_loops().unwrap(), 1);
-    let stash_after_first = git_stash_list(dir.path());
-    assert_eq!(stash_after_first.lines().count(), 1);
+    assert_eq!(db.reconcile_orphaned_loops(data_dir.path()).unwrap(), 1);
 
-    // Second pass: the loop is already `Paused`, so it's not even a
-    // candidate — nothing should be stashed again.
-    assert_eq!(db.reconcile_orphaned_loops().unwrap(), 0);
-    let stash_after_second = git_stash_list(dir.path());
     assert_eq!(
-        stash_after_first, stash_after_second,
-        "a second pass must not stash again"
+        std::fs::read_to_string(dir.path().join("truncated.rs")).unwrap(),
+        "fn broken(",
+        "partial work in a non-git workdir must be left exactly as found"
     );
+
+    let run_after = db.get_loop_run(&run.id).unwrap().unwrap();
+    let output = run_after.output.as_ref().expect("output recorded");
+    assert_eq!(output.get("interrupted"), Some(&serde_json::json!(true)));
+    assert!(output.get("quarantine").is_none());
+
+    let spec_after = db.get_loop_spec(&spec.id).unwrap().unwrap();
+    assert_eq!(spec_after.status, LoopSpecStatus::Interrupted);
 }
 
 #[test]
-fn reconcile_stranded_pool_specs_marks_stale_running_run_interrupted_and_quarantines() {
+fn reconcile_orphaned_loops_interrupted_marking_is_idempotent_across_two_passes() {
     let dir = tempdir().unwrap();
     init_git_repo(dir.path());
     let head = git_head(dir.path());
     std::fs::write(dir.path().join("truncated.rs"), "fn broken(").unwrap();
 
     let db = test_db();
-    let mut lp = sample_loop("wf-stranded-quarantine");
+    let data_dir = tempdir().unwrap();
+    let mut lp = sample_loop("wf-orphan-interrupted-idempotent");
+    lp.status = LoopStatus::Running;
+    lp.workdir = dir.path().to_string_lossy().to_string();
+    let mut spec = sample_loop_spec(&lp.id, "spec-orphan-interrupted-idempotent", 1);
+    spec.status = LoopSpecStatus::Running;
+    spec.spec_start_head = Some(head);
+    let node = sample_loop_node(&spec.id, "node-orphan-interrupted-idempotent", 1);
+    let run = LoopNodeRun {
+        id: "run-orphan-interrupted-idempotent".to_string(),
+        loop_id: lp.id.clone(),
+        spec_id: spec.id.clone(),
+        node_id: node.id.clone(),
+        status: LoopRunStatus::Running,
+        input: None,
+        output: None,
+        started_at: Utc::now(),
+        completed_at: None,
+        iteration: 1,
+        pid: None,
+        boot_id: None,
+        session_id: None,
+    };
+
+    db.insert_loop(&lp).unwrap();
+    db.insert_loop_spec(&spec).unwrap();
+    db.insert_loop_node(&node).unwrap();
+    db.insert_loop_run(&run).unwrap();
+
+    assert_eq!(db.reconcile_orphaned_loops(data_dir.path()).unwrap(), 1);
+    let spec_after_first = db.get_loop_spec(&spec.id).unwrap().unwrap();
+    assert_eq!(spec_after_first.status, LoopSpecStatus::Interrupted);
+
+    // Second pass: the loop is already `Paused`, so it's not even a
+    // candidate — nothing should change again, and the worktree stays
+    // exactly as it was after the first pass.
+    assert_eq!(db.reconcile_orphaned_loops(data_dir.path()).unwrap(), 0);
+    let spec_after_second = db.get_loop_spec(&spec.id).unwrap().unwrap();
+    assert_eq!(spec_after_second.status, LoopSpecStatus::Interrupted);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("truncated.rs")).unwrap(),
+        "fn broken(",
+        "a second pass must not touch the worktree"
+    );
+}
+
+#[test]
+fn reconcile_stranded_queue_specs_marks_spec_interrupted_and_leaves_worktree_untouched() {
+    let dir = tempdir().unwrap();
+    init_git_repo(dir.path());
+    let head = git_head(dir.path());
+    std::fs::write(dir.path().join("truncated.rs"), "fn broken(").unwrap();
+
+    let db = test_db();
+    let mut lp = sample_loop("wf-stranded-interrupted");
     lp.status = LoopStatus::Paused;
     lp.workdir = dir.path().to_string_lossy().to_string();
-    lp.active_run_pool_id = Some("pool-1".to_string());
+    lp.active_run_queue_id = Some("queue-1".to_string());
     db.insert_loop(&lp).unwrap();
 
-    let mut spec = sample_loop_spec("unused", "spec-stranded-quarantine", 1);
+    let mut spec = sample_loop_spec("unused", "spec-stranded-interrupted", 1);
     spec.loop_id = None;
     spec.status = LoopSpecStatus::Running;
     spec.spec_start_head = Some(head);
     db.insert_loop_spec(&spec).unwrap();
 
-    db.insert_pool(&Pool {
-        id: "pool-1".to_string(),
-        name: "pool-1".to_string(),
+    db.insert_queue(&Queue {
+        id: "queue-1".to_string(),
+        name: "queue-1".to_string(),
         created_at: Utc::now(),
     })
     .unwrap();
-    db.append_pool_member("pool-1", &spec.id, None).unwrap();
+    db.append_queue_member("queue-1", &spec.id, None).unwrap();
 
-    let node = sample_loop_node(&spec.id, "node-stranded-quarantine", 1);
+    let node = sample_loop_node(&spec.id, "node-stranded-interrupted", 1);
     db.insert_loop_node(&node).unwrap();
     // A `loop_runs` row left `running` by a daemon that died before a
     // graceful path (e.g. `loop_report_blocker`) could finalize it — its
     // boot id is stale, proving it from a recorded fact rather than content.
     db.insert_loop_run(&LoopNodeRun {
-        id: "run-stranded-quarantine".to_string(),
+        id: "run-stranded-interrupted".to_string(),
         loop_id: lp.id,
         spec_id: spec.id.clone(),
         node_id: node.id,
@@ -4373,26 +4761,35 @@ fn reconcile_stranded_pool_specs_marks_stale_running_run_interrupted_and_quarant
     })
     .unwrap();
 
-    assert_eq!(db.reconcile_stranded_pool_specs().unwrap(), 1);
+    assert_eq!(db.reconcile_stranded_queue_specs().unwrap(), 1);
 
-    assert!(git_is_clean(dir.path()));
-    assert!(git_stash_list(dir.path()).contains("run-stranded-quarantine"));
+    assert!(
+        !git_is_clean(dir.path()),
+        "the engine must never touch git here either"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("truncated.rs")).unwrap(),
+        "fn broken("
+    );
 
-    let run_after = db.get_loop_run("run-stranded-quarantine").unwrap().unwrap();
+    let run_after = db
+        .get_loop_run("run-stranded-interrupted")
+        .unwrap()
+        .unwrap();
     assert_ne!(run_after.status, LoopRunStatus::Running);
     let output = run_after.output.as_ref().expect("output recorded");
     assert_eq!(output.get("interrupted"), Some(&serde_json::json!(true)));
-    assert_eq!(
-        output.get("quarantine").and_then(|q| q.get("stashed")),
-        Some(&serde_json::json!(true))
-    );
+    assert!(output.get("quarantine").is_none());
 
+    // The key behaviour change (B36 → this spec): a genuinely interrupted
+    // spec is marked `Interrupted`, not silently reset to `Pending` — it
+    // used to be indistinguishable from a spec that never started.
     let spec_after = db.get_loop_spec(&spec.id).unwrap().unwrap();
-    assert_eq!(spec_after.status, LoopSpecStatus::Pending);
+    assert_eq!(spec_after.status, LoopSpecStatus::Interrupted);
 }
 
 #[test]
-fn reconcile_stranded_pool_specs_leaves_worktree_untouched_for_healthy_run() {
+fn reconcile_stranded_queue_specs_leaves_worktree_untouched_for_healthy_run() {
     let dir = tempdir().unwrap();
     init_git_repo(dir.path());
     let head = git_head(dir.path());
@@ -4402,7 +4799,7 @@ fn reconcile_stranded_pool_specs_leaves_worktree_untouched_for_healthy_run() {
     let mut lp = sample_loop("wf-stranded-healthy");
     lp.status = LoopStatus::Paused;
     lp.workdir = dir.path().to_string_lossy().to_string();
-    lp.active_run_pool_id = Some("pool-1".to_string());
+    lp.active_run_queue_id = Some("queue-1".to_string());
     db.insert_loop(&lp).unwrap();
 
     let mut spec = sample_loop_spec("unused", "spec-stranded-healthy", 1);
@@ -4411,13 +4808,13 @@ fn reconcile_stranded_pool_specs_leaves_worktree_untouched_for_healthy_run() {
     spec.spec_start_head = Some(head);
     db.insert_loop_spec(&spec).unwrap();
 
-    db.insert_pool(&Pool {
-        id: "pool-1".to_string(),
-        name: "pool-1".to_string(),
+    db.insert_queue(&Queue {
+        id: "queue-1".to_string(),
+        name: "queue-1".to_string(),
         created_at: Utc::now(),
     })
     .unwrap();
-    db.append_pool_member("pool-1", &spec.id, None).unwrap();
+    db.append_queue_member("queue-1", &spec.id, None).unwrap();
 
     let node = sample_loop_node(&spec.id, "node-stranded-healthy", 1);
     db.insert_loop_node(&node).unwrap();
@@ -4441,7 +4838,7 @@ fn reconcile_stranded_pool_specs_leaves_worktree_untouched_for_healthy_run() {
     .unwrap();
 
     assert_eq!(
-        db.reconcile_stranded_pool_specs().unwrap(),
+        db.reconcile_stranded_queue_specs().unwrap(),
         0,
         "a genuinely live run must not be reconciled"
     );
@@ -4450,7 +4847,6 @@ fn reconcile_stranded_pool_specs_leaves_worktree_untouched_for_healthy_run() {
         !git_is_clean(dir.path()),
         "a healthy run's worktree changes must never be touched"
     );
-    assert!(git_stash_list(dir.path()).is_empty());
 
     let run_after = db.get_loop_run("run-stranded-healthy").unwrap().unwrap();
     assert_eq!(run_after.status, LoopRunStatus::Running);
@@ -4572,4 +4968,250 @@ fn list_project_history_merges_finished_loops_and_past_sessions_newest_first() {
     assert!(!history.iter().any(|e| e.name.contains("other-project")));
     assert!(!history.iter().any(|e| e.name == "Active session"));
     assert!(!history.iter().any(|e| e.name == "Idle terminal"));
+}
+
+// ── Archiving (F4): archive/restore preserve identity and history ──────
+
+/// The property that matters most: archiving a loop with real run history,
+/// then restoring it, must leave that history byte-for-byte intact — not
+/// just flip the `archived` flag. Archiving is deliberately a flag flip, not
+/// a delete-and-recreate or a move to another table, so the loop's id and
+/// its specs/nodes/runs (all foreign-keyed to that id) never move either.
+#[test]
+fn archive_then_restore_preserves_identity_and_run_history() {
+    let db = test_db();
+    let lp = sample_loop("wf-archive");
+    let spec = sample_loop_spec(&lp.id, "spec-archive", 1);
+    let node = sample_loop_node(&spec.id, "node-archive", 1);
+    let run = LoopNodeRun {
+        id: "run-archive".to_string(),
+        loop_id: lp.id.clone(),
+        spec_id: spec.id.clone(),
+        node_id: node.id.clone(),
+        status: LoopRunStatus::Pass,
+        input: Some(serde_json::json!({"feedback": "prior attempt"})),
+        output: Some(serde_json::json!({"summary": "diagnosed the failure"})),
+        started_at: Utc::now(),
+        completed_at: Some(Utc::now()),
+        iteration: 3,
+        pid: None,
+        boot_id: Some("boot-archive".to_string()),
+        session_id: Some("session-archive".to_string()),
+    };
+    db.insert_loop(&lp).unwrap();
+    db.insert_loop_spec(&spec).unwrap();
+    db.insert_loop_node(&node).unwrap();
+    db.insert_loop_run(&run).unwrap();
+
+    let outcome = db.archive_loop(&lp.id).unwrap();
+    assert_eq!(outcome, crate::domain::loops::ArchiveLoopOutcome::Archived);
+
+    // Excluded from the browsing listing (the query itself filters, not an
+    // in-memory pass) ...
+    assert!(!db
+        .list_loops(None, false)
+        .unwrap()
+        .iter()
+        .any(|l| l.id == lp.id));
+    // ... but still resolvable directly by id, and it kept its own id (no
+    // delete-and-recreate).
+    let archived = db.get_loop(&lp.id).unwrap().unwrap();
+    assert_eq!(archived.id, lp.id);
+    assert!(archived.archived);
+    // ... and included when a caller explicitly asks for archived loops too.
+    assert!(db
+        .list_loops(None, true)
+        .unwrap()
+        .iter()
+        .any(|l| l.id == lp.id));
+
+    // The run history — the entire point of archiving over deleting — is
+    // untouched: same spec, same node, same run with its exact payloads.
+    let specs = db.list_loop_specs(&lp.id).unwrap();
+    assert_eq!(specs.len(), 1);
+    assert_eq!(specs[0].id, spec.id);
+    let runs = db.list_loop_runs_for_spec(&spec.id).unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].id, run.id);
+    assert_eq!(runs[0].iteration, 3);
+    assert_eq!(runs[0].session_id.as_deref(), Some("session-archive"));
+    assert_eq!(
+        runs[0]
+            .output
+            .as_ref()
+            .and_then(|value| value.get("summary")),
+        Some(&serde_json::json!("diagnosed the failure"))
+    );
+
+    // Restoring flips the flag back and the loop reappears in the main
+    // listing — still the same row, still the same history.
+    assert!(db.restore_loop(&lp.id).unwrap());
+    let restored = db.get_loop(&lp.id).unwrap().unwrap();
+    assert!(!restored.archived);
+    assert!(db
+        .list_loops(None, false)
+        .unwrap()
+        .iter()
+        .any(|l| l.id == lp.id));
+    let runs_after_restore = db.list_loop_runs_for_spec(&spec.id).unwrap();
+    assert_eq!(runs_after_restore.len(), 1);
+    assert_eq!(runs_after_restore[0].id, run.id);
+}
+
+#[test]
+fn count_archived_loops_reflects_archive_state() {
+    let db = test_db();
+    let a = sample_loop("wf-count-a");
+    let b = sample_loop("wf-count-b");
+    db.insert_loop(&a).unwrap();
+    db.insert_loop(&b).unwrap();
+    assert_eq!(db.count_archived_loops().unwrap(), 0);
+
+    db.archive_loop(&a.id).unwrap();
+    assert_eq!(db.count_archived_loops().unwrap(), 1);
+
+    db.archive_loop(&b.id).unwrap();
+    assert_eq!(db.count_archived_loops().unwrap(), 2);
+
+    db.restore_loop(&a.id).unwrap();
+    assert_eq!(db.count_archived_loops().unwrap(), 1);
+}
+
+#[test]
+fn archive_loop_refuses_a_running_loop() {
+    let db = test_db();
+    let mut lp = sample_loop("wf-running");
+    lp.status = LoopStatus::Running;
+    db.insert_loop(&lp).unwrap();
+
+    let outcome = db.archive_loop(&lp.id).unwrap();
+    assert_eq!(outcome, crate::domain::loops::ArchiveLoopOutcome::Running);
+
+    // Refused, not silently ignored: the loop is still in the main listing.
+    let reloaded = db.get_loop(&lp.id).unwrap().unwrap();
+    assert!(!reloaded.archived);
+    assert_eq!(db.count_archived_loops().unwrap(), 0);
+}
+
+#[test]
+fn archive_loop_already_archived_reports_already_archived() {
+    let db = test_db();
+    let lp = sample_loop("wf-double-archive");
+    db.insert_loop(&lp).unwrap();
+
+    assert_eq!(
+        db.archive_loop(&lp.id).unwrap(),
+        crate::domain::loops::ArchiveLoopOutcome::Archived
+    );
+    assert_eq!(
+        db.archive_loop(&lp.id).unwrap(),
+        crate::domain::loops::ArchiveLoopOutcome::AlreadyArchived
+    );
+}
+
+#[test]
+fn restore_loop_not_archived_is_a_noop() {
+    let db = test_db();
+    let lp = sample_loop("wf-not-archived");
+    db.insert_loop(&lp).unwrap();
+
+    assert!(!db.restore_loop(&lp.id).unwrap());
+    assert!(!db.restore_loop("ghost-loop").unwrap());
+}
+
+/// Permanent deletion — reachable only from the archive on an
+/// already-archived loop — must actually destroy the run history it warns
+/// about, unlike archiving. Exercises the same cascade `ON DELETE CASCADE`
+/// relationships archiving is designed to never touch.
+#[test]
+fn permanent_delete_removes_the_loop_and_its_run_history() {
+    let db = test_db();
+    let lp = sample_loop("wf-permanent-delete");
+    let spec = sample_loop_spec(&lp.id, "spec-permanent-delete", 1);
+    let node = sample_loop_node(&spec.id, "node-permanent-delete", 1);
+    let run = LoopNodeRun {
+        id: "run-permanent-delete".to_string(),
+        loop_id: lp.id.clone(),
+        spec_id: spec.id.clone(),
+        node_id: node.id.clone(),
+        status: LoopRunStatus::Fail,
+        input: None,
+        output: None,
+        started_at: Utc::now(),
+        completed_at: Some(Utc::now()),
+        iteration: 1,
+        pid: None,
+        boot_id: None,
+        session_id: None,
+    };
+    db.insert_loop(&lp).unwrap();
+    db.insert_loop_spec(&spec).unwrap();
+    db.insert_loop_node(&node).unwrap();
+    db.insert_loop_run(&run).unwrap();
+    db.archive_loop(&lp.id).unwrap();
+
+    db.delete_loop(&lp.id).unwrap();
+
+    assert!(db.get_loop(&lp.id).unwrap().is_none());
+    assert!(db.list_loop_specs(&lp.id).unwrap().is_empty());
+    assert!(db.get_loop_run(&run.id).unwrap().is_none());
+}
+
+/// Older databases predate the `archived` column entirely. Opening one
+/// (`Database::new` runs the migration) must add the column, defaulting
+/// every existing row to not-archived with no data movement, and the
+/// migration must be a no-op on a second open.
+#[test]
+fn archived_migration_defaults_existing_rows_and_is_idempotent() {
+    let tmp = NamedTempFile::new().expect("create temp file");
+    let path = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+
+    {
+        let conn = rusqlite::Connection::open(&path).expect("open raw legacy db");
+        conn.execute_batch(
+            "CREATE TABLE loops (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                workdir TEXT NOT NULL,
+                status TEXT NOT NULL,
+                trigger_type TEXT,
+                trigger_config TEXT,
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER,
+                autorun_at INTEGER,
+                spec_queue TEXT,
+                active_run_queue_id TEXT,
+                on_completed TEXT,
+                auto_continue_at INTEGER,
+                auto_continue_action TEXT
+             );
+             INSERT INTO loops (id, name, workdir, status, created_at)
+                 VALUES ('legacy-loop', 'Legacy', '/tmp', 'completed', 0);",
+        )
+        .expect("seed legacy schema");
+    }
+
+    let db = Database::new(&path).expect("open pre-archived db, running migration");
+    let lp = db.get_loop("legacy-loop").unwrap().unwrap();
+    assert_eq!(lp.name, "Legacy");
+    assert!(
+        !lp.archived,
+        "pre-existing rows must default to not archived"
+    );
+
+    // The new column is actually usable after migration.
+    assert_eq!(
+        db.archive_loop("legacy-loop").unwrap(),
+        crate::domain::loops::ArchiveLoopOutcome::Archived
+    );
+    drop(db);
+
+    // Reopening after the migration already ran must be a no-op: same data,
+    // no error (idempotent), archived state preserved.
+    let db = Database::new(&path).expect("reopen db after migration already applied");
+    let lp = db.get_loop("legacy-loop").unwrap().unwrap();
+    assert!(lp.archived);
 }

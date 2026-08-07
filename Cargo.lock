@@ -2901,7 +2901,7 @@ dependencies = [
 
 [[package]]
 name = "harness-canopy"
-version = "2.1.1"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2917,6 +2917,7 @@ dependencies = [
  "fastembed",
  "flate2",
  "futures",
+ "hf-hub",
  "inquire",
  "lancedb",
  "libc",
@@ -2933,6 +2934,7 @@ dependencies = [
  "schemars 1.2.1",
  "serde",
  "serde_json",
+ "serde_path_to_error",
  "sha2 0.11.0",
  "shell-words",
  "sysinfo",

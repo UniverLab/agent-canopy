@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, OptionalExtension};
+use serde_json::Value;
+use std::collections::HashSet;
 use std::io::{Error as IoError, ErrorKind};
 
 use crate::db::Database;
@@ -67,23 +69,70 @@ impl Database {
         Ok(rows > 0)
     }
 
-    /// Seed the builtin blueprints (the proven 5-node pattern) if missing.
-    /// Idempotent: a builtin already present (by name) is left untouched, so
-    /// this is safe to call on every daemon startup.
+    /// Seed the builtin blueprints (the proven 5-node pattern) and keep
+    /// already-seeded builtin rows in sync with the current
+    /// `builtin_blueprint_specs()` shape. Idempotent and safe on every
+    /// daemon startup:
+    ///
+    /// - A name the spec no longer produces (e.g. the pre-rename
+    ///   `implementer-claude`) is deleted, provided the row is still
+    ///   `builtin` — a renamed builtin must not linger forever alongside its
+    ///   replacement (see the harness-free blueprint rename).
+    /// - A name the spec produces that already exists as a `builtin` row has
+    ///   its `kind`/`config` overwritten to match the spec exactly, so a
+    ///   stale shape (e.g. an old inline `prompt` instead of
+    ///   `prompt_preset`, or a leftover `platform`) gets reconciled instead
+    ///   of living on forever. Builtins have no update tool, so this startup
+    ///   sync is the only path that can ever change one.
+    /// - A name that exists as a *non-builtin* (custom, user-created) row is
+    ///   left completely alone — never overwritten, never deleted.
     pub fn seed_builtin_blueprints(&self) -> Result<()> {
-        for (name, kind, config) in builtin_blueprint_specs() {
-            if self.get_blueprint_by_name(name)?.is_some() {
-                continue;
+        let specs = builtin_blueprint_specs();
+        let current_names: HashSet<&str> = specs.iter().map(|(name, _, _)| *name).collect();
+
+        for existing in self.list_blueprints()? {
+            if existing.builtin && !current_names.contains(existing.name.as_str()) {
+                self.delete_blueprint_by_name(&existing.name)?;
             }
-            self.insert_blueprint(&Blueprint {
-                id: uuid::Uuid::new_v4().to_string(),
-                name: name.to_string(),
-                kind,
-                config,
-                builtin: true,
-                created_at: Utc::now(),
-            })?;
         }
+
+        for (name, kind, config) in specs {
+            match self.get_blueprint_by_name(name)? {
+                Some(existing) if existing.builtin => {
+                    if existing.kind != kind || existing.config != config {
+                        self.update_builtin_blueprint(&existing.id, kind, &config)?;
+                    }
+                }
+                // Name already claimed by a custom blueprint — leave it be.
+                Some(_) => {}
+                None => {
+                    self.insert_blueprint(&Blueprint {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        name: name.to_string(),
+                        kind,
+                        config,
+                        builtin: true,
+                        created_at: Utc::now(),
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Overwrite a builtin blueprint row's `kind`/`config` in place. Only
+    /// ever called by [`Self::seed_builtin_blueprints`] to reconcile a
+    /// stale builtin shape with the current spec — builtins have no
+    /// caller-facing update tool.
+    fn update_builtin_blueprint(&self, id: &str, kind: LoopNodeKind, config: &Value) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        conn.execute(
+            "UPDATE blueprints SET kind = ?1, config = ?2 WHERE id = ?3",
+            params![kind.as_str(), serde_json::to_string(config)?, id],
+        )?;
         Ok(())
     }
 }
@@ -153,6 +202,118 @@ mod tests {
         assert!(blueprints.iter().all(|b| b.builtin));
     }
 
+    /// The migration case the spec calls out explicitly: an existing
+    /// installation whose DB already has the old harness-bearing builtin
+    /// rows (`implementer-claude`, `reviewer-committer-mimo`,
+    /// `resilience-mimo`, one-line inline `prompt` instead of
+    /// `prompt_preset`) must end up with exactly the current builtin shape
+    /// after a startup reseed — old names gone, new names present, no
+    /// `platform`/`cli`/`model` anywhere, and it must be idempotent across a
+    /// second reseed.
+    #[test]
+    fn seed_builtin_blueprints_migrates_pre_rename_harness_bearing_rows() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+
+        // Simulate an installation from before this change: wipe the
+        // freshly-seeded current-shape builtins and replace them with the
+        // old harness-bearing shape under the old names.
+        for (name, _, _) in builtin_blueprint_specs() {
+            db.delete_blueprint_by_name(name).unwrap();
+        }
+        let legacy = [
+            (
+                "implementer-claude",
+                LoopNodeKind::Agent,
+                serde_json::json!({"platform": "claude", "prompt": "Implement this spec: …"}),
+            ),
+            (
+                "cargo-gates",
+                LoopNodeKind::Check,
+                serde_json::json!({"command": "cargo test"}),
+            ),
+            (
+                "reviewer-committer-mimo",
+                LoopNodeKind::Agent,
+                serde_json::json!({"platform": "mimo", "prompt": "Review the changes …"}),
+            ),
+            (
+                "commit-check",
+                LoopNodeKind::Check,
+                serde_json::json!({"command": "test \"$(git rev-parse HEAD)\" != \"{{spec_start_head}}\""}),
+            ),
+            (
+                "resilience-mimo",
+                LoopNodeKind::Agent,
+                serde_json::json!({"platform": "mimo", "prompt": "A node in this loop failed …"}),
+            ),
+        ];
+        for (name, kind, config) in legacy {
+            db.insert_blueprint(&Blueprint {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: name.to_string(),
+                kind,
+                config,
+                builtin: true,
+                created_at: Utc::now(),
+            })
+            .unwrap();
+        }
+
+        db.seed_builtin_blueprints().unwrap();
+
+        let after = db.list_blueprints().unwrap();
+        let mut names: Vec<&str> = after.iter().map(|b| b.name.as_str()).collect();
+        names.sort_unstable();
+        let mut expected: Vec<&str> = builtin_blueprint_specs()
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(names, expected, "old-named builtins must not linger");
+
+        for blueprint in &after {
+            assert!(blueprint.config.get("platform").is_none());
+            assert!(blueprint.config.get("cli").is_none());
+            assert!(blueprint.config.get("model").is_none());
+        }
+        let implementer = db.get_blueprint_by_name("implementer").unwrap().unwrap();
+        assert_eq!(implementer.config["prompt_preset"], "implementer");
+        assert!(implementer.config.get("prompt").is_none());
+
+        // Idempotent: a second reseed changes nothing further.
+        db.seed_builtin_blueprints().unwrap();
+        let after_second = db.list_blueprints().unwrap();
+        assert_eq!(after.len(), after_second.len());
+    }
+
+    /// A custom blueprint that happens to have claimed a name the builtin
+    /// spec now also wants (e.g. a user's own "implementer" predating this
+    /// rename) must never be overwritten or deleted by the migration.
+    #[test]
+    fn seed_builtin_blueprints_never_touches_a_custom_blueprint_with_a_builtin_name() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        db.delete_blueprint_by_name("implementer").unwrap();
+
+        let custom = Blueprint {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "implementer".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "codex", "prompt": "my own take"}),
+            builtin: false,
+            created_at: Utc::now(),
+        };
+        db.insert_blueprint(&custom).unwrap();
+
+        db.seed_builtin_blueprints().unwrap();
+
+        let fetched = db.get_blueprint_by_name("implementer").unwrap().unwrap();
+        assert!(!fetched.builtin, "custom blueprint must stay custom");
+        assert_eq!(fetched.config["platform"], "codex");
+        assert_eq!(fetched.config["prompt"], "my own take");
+    }
+
     #[test]
     fn custom_blueprint_create_list_delete_round_trip() {
         let dir = tempdir().unwrap();
@@ -190,7 +351,7 @@ mod tests {
         // that behavior so the guard isn't accidentally assumed here.
         let dir = tempdir().unwrap();
         let db = Database::new(&dir.path().join("test.db")).unwrap();
-        assert!(db.delete_blueprint_by_name("implementer-claude").unwrap());
+        assert!(db.delete_blueprint_by_name("implementer").unwrap());
     }
 
     #[test]

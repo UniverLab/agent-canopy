@@ -1,6 +1,6 @@
 [package]
 name = "harness-canopy"
-version = "2.1.1"
+version = "2.2.0"
 edition = "2021"
 rust-version = "1.91"
 description = "A self-contained MCP server for AI agent task scheduling and file watching"
@@ -10,6 +10,11 @@ homepage = "https://github.com/UniverLab/harness-canopy"
 keywords = ["mcp", "scheduler", "cron", "file-watcher", "ai-agent"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "README.md"
+# The demo recording is ~40 MB of gif and cast files. Nothing that `cargo
+# install`s this crate needs them, and they alone push the package past the
+# 10 MiB crates.io accepts — which the registry reports as an HTTP/2 stream
+# reset, not as a size error, so it reads like a network fault.
+exclude = ["demo/"]
 
 [[bin]]
 name = "canopy"
@@ -28,6 +33,10 @@ tokio = { version = "1.50", features = ["full"] }
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Field-path tracking for MCP tool parameter deserialization errors, so a
+# wrongly-shaped call gets a message naming the failing field instead of a
+# bare Rust type name.
+serde_path_to_error = "0.1"
 
 # Error handling
 anyhow = "1.0"
@@ -122,6 +131,19 @@ pdf-extract = "0.10.0"
 
 # Local embedding models via ONNX Runtime (no API key required)
 fastembed = { version = "5", optional = true }
+# Already a transitive dependency of fastembed (its cache-path resolution
+# and blocking download client both live here) — depended on directly so we
+# can (a) check whether a model is already cached without loading it, and
+# (b) fetch a model's files ourselves ahead of handing it to fastembed, so
+# the daemon can report "downloading" vs "preparing" as two distinct phases
+# instead of one opaque blocking call. `ureq` + `native-tls` matches exactly
+# what fastembed's own default features already pull in for hf-hub, so this
+# adds no new crate to the build graph — it just lets us name and call the
+# same already-compiled client directly instead of only through fastembed.
+hf-hub = { version = "0.5", optional = true, default-features = false, features = [
+    "ureq",
+    "native-tls",
+] }
 
 # Unix process management (kill, setsid)
 [target.'cfg(unix)'.dependencies]
@@ -133,7 +155,19 @@ tempfile = "3.8"
 
 [features]
 default = []
-local-embeddings = ["dep:fastembed"]
+# Kept optional and off by default in both CI and release builds — not
+# enabled here. fastembed's `ort` backend only ships prebuilt ONNX Runtime
+# binaries for glibc targets; this crate's Linux release target is
+# x86_64-unknown-linux-musl (for a fully static, portable binary), so there
+# is no prebuilt to download there, and the released tarballs ship a single
+# binary with no mechanism to carry a matching dylib alongside it. Making
+# this a default/release feature would mean either abandoning the musl
+# target or shipping a fragile dylib+rpath bundle — for a dependency this
+# heavy (ndarray, tokenizers, image, hf-hub) on top of already ~40 MB
+# tarballs. Instead, doctor/setup/rag-status all check capability
+# (`embedding_client::provider_available`) and refuse/warn explicitly when
+# this feature is off, so the absence is visible rather than silently green.
+local-embeddings = ["dep:fastembed", "dep:hf-hub"]
 
 [lints.clippy]
 # Production quality lints

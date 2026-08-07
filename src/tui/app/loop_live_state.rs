@@ -1,8 +1,12 @@
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::db::Database;
-use crate::domain::loops::{LoopEdge, LoopNode, LoopRunStatus, LoopSpecStatus, LoopStatus};
+use crate::domain::loops::{
+    LoopEdge, LoopNode, LoopNodeKind, LoopRunStatus, LoopSpecStatus, LoopStatus,
+};
 
 /// A snapshot of the currently-selected loop's runtime state, assembled
 /// fresh on every TUI tick. Renderer-agnostic (no ratatui types).
@@ -24,7 +28,7 @@ pub(crate) struct LoopLiveState {
     pub autorun_at: Option<DateTime<Utc>>,
 
     // ── Spec queue ──────────────────────────────────────────────
-    /// Ordered specs: pool members for a pool run, bound specs otherwise.
+    /// Ordered specs: queue members for a queue run, bound specs otherwise.
     pub spec_queue: Vec<SpecQueueEntry>,
     pub done_count: usize,
     pub total_count: usize,
@@ -40,6 +44,10 @@ pub(crate) struct LoopLiveState {
     /// models]" box with live per-member state, instead of drawing N+1
     /// separate boxes.
     pub ensembles: Vec<EnsembleLiveInfo>,
+    /// For every [`LoopNodeKind::Router`] node in `effective_nodes` with a
+    /// completed run, the route label it selected — lets the graph view mark
+    /// which of a router's N edges a run actually took, not just list them.
+    pub router_taken_routes: HashMap<String, String>,
 
     // ── Current node ────────────────────────────────────────────
     /// Id of the node currently executing, or the most recent completed node.
@@ -60,6 +68,10 @@ pub(crate) struct SpecQueueEntry {
     pub spec_id: String,
     pub spec_name: String,
     pub status: LoopSpecStatus,
+    /// Why this spec ended up `Failed`/`Skipped`: the admin-recorded reason
+    /// if it was administratively transitioned, else the output tail of its
+    /// last run. `None` for every other status.
+    pub failure_reason: Option<String>,
 }
 
 /// One ensemble (F1) collapsed for the graph view: its join node id (so the
@@ -103,14 +115,18 @@ pub(crate) fn assemble_loop_live_state(
         .count();
     let total_count = spec_queue.len();
 
-    // Current spec: first Running, else first Pending.
+    // Current spec: first Running, else first Pending/Interrupted (equally
+    // runnable — see `Database::queue_next_pending_spec_id`).
     let current_spec_id = spec_queue
         .iter()
         .find(|e| e.status == LoopSpecStatus::Running)
         .or_else(|| {
-            spec_queue
-                .iter()
-                .find(|e| e.status == LoopSpecStatus::Pending)
+            spec_queue.iter().find(|e| {
+                matches!(
+                    e.status,
+                    LoopSpecStatus::Pending | LoopSpecStatus::Interrupted
+                )
+            })
         })
         .map(|e| e.spec_id.clone());
 
@@ -118,6 +134,8 @@ pub(crate) fn assemble_loop_live_state(
     let (effective_nodes, effective_edges) =
         resolve_effective_graph(db, details, current_spec_id.as_deref());
     let ensembles = resolve_ensembles_live_info(db, &effective_nodes, current_spec_id.as_deref());
+    let router_taken_routes =
+        resolve_router_taken_routes(db, &effective_nodes, current_spec_id.as_deref());
 
     // ── Current node + output tail ──────────────────────────────
     let (current_node_id, current_node_info) = resolve_current_node(db, current_spec_id.as_deref());
@@ -138,6 +156,7 @@ pub(crate) fn assemble_loop_live_state(
         effective_nodes,
         effective_edges,
         ensembles,
+        router_taken_routes,
         current_node_id,
         current_node_status: current_node_info.status,
         current_node_started_at: current_node_info.started_at,
@@ -188,6 +207,30 @@ fn resolve_ensembles_live_info(
         .collect()
 }
 
+/// For every [`LoopNodeKind::Router`] node in `effective_nodes`, resolve the
+/// route its latest run selected (if it has completed one) — the graph view
+/// uses this to mark which of a router's several edges was actually taken,
+/// per the live view's "shows which route a completed run took" contract.
+/// Routers with no run yet, or whose latest run hasn't recorded a route
+/// (still running), are simply absent from the map.
+fn resolve_router_taken_routes(
+    db: &Database,
+    effective_nodes: &[LoopNode],
+    current_spec_id: Option<&str>,
+) -> HashMap<String, String> {
+    let Some(spec_id) = current_spec_id else {
+        return HashMap::new();
+    };
+    effective_nodes
+        .iter()
+        .filter(|node| node.kind == LoopNodeKind::Router)
+        .filter_map(|node| {
+            let info = resolve_node_run_info(db, spec_id, &node.id);
+            info.chosen_route.map(|route| (node.id.clone(), route))
+        })
+        .collect()
+}
+
 /// Latest-run info for a single node: status, start time, iteration, and a
 /// bounded output tail. Shared by the snapshot's auto-detected "current"
 /// node and by [`resolve_node_run_info`] for a caller-requested node.
@@ -198,6 +241,10 @@ pub(crate) struct NodeRunInfo {
     pub started_at: Option<DateTime<Utc>>,
     pub iteration: Option<i64>,
     pub output_tail: Option<String>,
+    /// The route label a router node's run selected, if this run is a
+    /// router's (see `loop_engine::execute_router_node`'s `"route"` output
+    /// field). `None` for every other node kind.
+    pub chosen_route: Option<String>,
 }
 
 impl NodeRunInfo {
@@ -207,8 +254,21 @@ impl NodeRunInfo {
             started_at: Some(run.started_at),
             iteration: Some(run.iteration),
             output_tail: extract_output_tail(&run.output),
+            chosen_route: extract_chosen_route(&run.output),
         }
     }
+}
+
+/// Pull the `"route"` field out of a router run's output JSON (see
+/// `loop_engine::execute_router_node`'s `NodeExecution::output`) — `None` for
+/// any run whose output isn't shaped like a router's (every other node
+/// kind).
+fn extract_chosen_route(output: &Option<Value>) -> Option<String> {
+    output
+        .as_ref()?
+        .get("route")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// Latest run info for `node_id` within `spec_id`: the active (running) run
@@ -234,11 +294,11 @@ pub(crate) fn resolve_node_run_info(db: &Database, spec_id: &str, node_id: &str)
 
 // ── Internal helpers ──────────────────────────────────────────────────
 
-/// Build the ordered spec queue from either the active pool's members or
+/// Build the ordered spec queue from either the active queue's members or
 /// the loop's bound specs.
 fn build_spec_queue(db: &Database, lp: &crate::domain::loops::Loop) -> Vec<SpecQueueEntry> {
-    let spec_ids = if let Some(ref pool_id) = lp.active_run_pool_id {
-        db.list_pool_member_spec_ids(pool_id).unwrap_or_default()
+    let spec_ids = if let Some(ref queue_id) = lp.active_run_queue_id {
+        db.list_queue_member_spec_ids(queue_id).unwrap_or_default()
     } else {
         db.list_loop_specs(&lp.id)
             .unwrap_or_default()
@@ -251,13 +311,38 @@ fn build_spec_queue(db: &Database, lp: &crate::domain::loops::Loop) -> Vec<SpecQ
         .into_iter()
         .filter_map(|spec_id| {
             let spec = db.get_loop_spec(&spec_id).ok().flatten()?;
+            let failure_reason = spec_failure_reason(db, &spec);
             Some(SpecQueueEntry {
                 spec_id: spec.id,
                 spec_name: spec.name,
                 status: spec.status,
+                failure_reason,
             })
         })
         .collect()
+}
+
+/// Reason a spec ended up `Failed`/`Skipped`, for the marker strip's detail
+/// view: the admin-recorded reason (`completed_via_reason`, set only for
+/// administrative transitions) if present, else the output tail of its last
+/// run — the best available proxy for an engine-driven failure, which
+/// doesn't persist a reason on the spec row itself. `None` for every other
+/// status, and when neither source has anything.
+fn spec_failure_reason(db: &Database, spec: &crate::domain::loops::LoopSpec) -> Option<String> {
+    if !matches!(
+        spec.status,
+        LoopSpecStatus::Failed | LoopSpecStatus::Skipped
+    ) {
+        return None;
+    }
+    if let Some(reason) = spec.completed_via_reason.clone() {
+        return Some(reason);
+    }
+    db.list_loop_runs_for_spec(&spec.id)
+        .unwrap_or_default()
+        .iter()
+        .rev()
+        .find_map(|run| extract_output_tail(&run.output))
 }
 
 /// Resolve the effective graph: spec's own graph if it has nodes, else the
@@ -274,7 +359,7 @@ fn resolve_effective_graph(
                 return (spec_detail.nodes.clone(), spec_detail.edges.clone());
             }
         }
-        // Fallback: try direct DB lookup (pool specs not in details).
+        // Fallback: try direct DB lookup (queue specs not in details).
         if let Ok(Some(detail)) = db.get_loop_spec_details(spec_id) {
             if !detail.nodes.is_empty() {
                 return (detail.nodes, detail.edges);
@@ -368,7 +453,7 @@ mod tests {
         Loop, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind, LoopNodeRun, LoopRunStatus,
         LoopSpec, LoopSpecStatus, LoopStatus,
     };
-    use crate::domain::pools::Pool;
+    use crate::domain::queues::Queue;
     use chrono::Utc;
     use serde_json::json;
     use tempfile::NamedTempFile;
@@ -382,6 +467,7 @@ mod tests {
 
     fn make_loop(id: &str, status: LoopStatus) -> Loop {
         Loop {
+            archived: false,
             id: id.to_string(),
             name: format!("Loop {id}"),
             description: None,
@@ -394,7 +480,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         }
     }
@@ -544,23 +630,23 @@ mod tests {
     }
 
     #[test]
-    fn pool_run_queue_uses_pool_member_order() {
+    fn queue_run_queue_uses_queue_member_order() {
         let db = test_db();
         let lp = make_loop("lp1", LoopStatus::Running);
 
-        // Create a pool and add specs to it.
-        let pool = Pool {
-            id: "pool1".to_string(),
-            name: "Test Pool".to_string(),
+        // Create a queue and add specs to it.
+        let queue = Queue {
+            id: "queue1".to_string(),
+            name: "Test Queue".to_string(),
             created_at: Utc::now(),
         };
-        db.insert_pool(&pool).unwrap();
+        db.insert_queue(&queue).unwrap();
 
-        // Specs are NOT bound to the loop (loop_id = None) — they're pool members.
+        // Specs are NOT bound to the loop (loop_id = None) — they're queue members.
         let ps1 = LoopSpec {
             id: "ps1".to_string(),
             loop_id: None,
-            name: "Pool Spec 1".to_string(),
+            name: "Queue Spec 1".to_string(),
             description: None,
             position: 1,
             parallelizable: false,
@@ -576,7 +662,7 @@ mod tests {
         let ps2 = LoopSpec {
             id: "ps2".to_string(),
             loop_id: None,
-            name: "Pool Spec 2".to_string(),
+            name: "Queue Spec 2".to_string(),
             description: None,
             position: 2,
             parallelizable: false,
@@ -592,21 +678,21 @@ mod tests {
         db.insert_loop_spec(&ps1).unwrap();
         db.insert_loop_spec(&ps2).unwrap();
 
-        db.append_pool_member("pool1", "ps1", None).unwrap();
-        db.append_pool_member("pool1", "ps2", None).unwrap();
+        db.append_queue_member("queue1", "ps1", None).unwrap();
+        db.append_queue_member("queue1", "ps2", None).unwrap();
 
-        // Set the loop's active pool.
-        let mut lp_with_pool = lp.clone();
-        lp_with_pool.active_run_pool_id = Some("pool1".to_string());
+        // Set the loop's active queue.
+        let mut lp_with_queue = lp.clone();
+        lp_with_queue.active_run_queue_id = Some("queue1".to_string());
         db.update_loop_details(
             &lp.id,
             Some(&lp.name),
             None,
-            lp_with_pool.active_run_pool_id.as_deref(),
+            lp_with_queue.active_run_queue_id.as_deref(),
         )
         .unwrap();
 
-        let details = details_from_loop(&db, &lp_with_pool);
+        let details = details_from_loop(&db, &lp_with_queue);
         let state = assemble_loop_live_state(&db, &details).unwrap();
 
         assert_eq!(state.spec_queue.len(), 2);
@@ -976,6 +1062,7 @@ mod tests {
                 position: i as i64,
                 platform: "openrouter".to_string(),
                 model: Some(format!("model-{i}")),
+                prompt_override: None,
             })
             .collect();
         db.insert_ensemble_unit(&ensemble, &members, &member_nodes, &join_node, &edges)

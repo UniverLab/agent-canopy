@@ -10,8 +10,8 @@ use ratatui::Frame;
 
 use super::theme::Theme;
 use super::{
-    truncate_str, truncate_str_keep_tail, INTERACTIVE_COLOR, STATUS_DISABLED, STATUS_FAIL,
-    STATUS_OK, STATUS_RUNNING,
+    truncate_str, truncate_str_keep_tail, INTERACTIVE_COLOR, KIND_ROUTER, STATUS_DISABLED,
+    STATUS_FAIL, STATUS_INTERRUPTED, STATUS_OK, STATUS_RUNNING,
 };
 use crate::tui::agent::ScreenSnapshot;
 use crate::tui::app::types::{AgentEntry, App, Focus, ProjectTab, SidebarLayer};
@@ -290,7 +290,7 @@ fn draw_log_panel_focus(frame: &mut Frame, area: Rect, app: &mut App, theme: &Th
     }
 }
 
-fn draw_preview_panel(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) -> bool {
+fn draw_preview_panel(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) -> bool {
     if app.playground_active {
         draw_playground_panel(frame, area, app, theme);
         return true;
@@ -1081,13 +1081,19 @@ fn draw_knowledge_overview(frame: &mut Frame, area: Rect, app: &App, theme: &The
 }
 
 fn rag_status(app: &App, theme: &Theme) -> (&'static str, Color) {
-    use crate::rag::status::{compute_rag_model_status, RagModelStatus};
+    use crate::rag::status::{compute_rag_status, RagModelStatus};
 
-    match compute_rag_model_status(
+    match compute_rag_status(
+        &app.rag_embeddings_model,
         app.rag_paused,
         app.rag_model_loaded,
         app.rag_info.processing_items,
+        app.rag_acquisition_state.clone(),
     ) {
+        RagModelStatus::Unavailable(_) => ("✗ unavailable", Color::Red),
+        RagModelStatus::DownloadFailed(_) => ("✗ download failed", Color::Red),
+        RagModelStatus::Downloading { .. } => ("⬇ downloading", Color::Yellow),
+        RagModelStatus::Preparing { .. } => ("⚙ preparing", Color::Yellow),
         RagModelStatus::Paused => ("⏸ paused", Color::Yellow),
         RagModelStatus::Ready if app.rag_info.processing_items > 0 => ("◉ indexing", Color::Yellow),
         RagModelStatus::Ready => ("● ready", theme.header_color),
@@ -1152,6 +1158,46 @@ fn rag_summary_lines(
 fn draw_rag_info_overview(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let (status_text, status_color) = rag_status(app, theme);
     let mut lines = rag_summary_lines(app, status_text, status_color, rag_queue_text(app), theme);
+
+    match crate::rag::status::compute_rag_status(
+        &app.rag_embeddings_model,
+        app.rag_paused,
+        app.rag_model_loaded,
+        app.rag_info.processing_items,
+        app.rag_acquisition_state.clone(),
+    ) {
+        crate::rag::status::RagModelStatus::Unavailable(reason) => {
+            lines.push(Line::from(Span::styled(
+                format!("  {reason}"),
+                Style::default().fg(Color::Red),
+            )));
+        }
+        crate::rag::status::RagModelStatus::Downloading { started_at } => {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  downloading model ({}s so far)",
+                    crate::rag::status::elapsed_secs(started_at)
+                ),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        crate::rag::status::RagModelStatus::Preparing { started_at } => {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  preparing model ({}s so far)",
+                    crate::rag::status::elapsed_secs(started_at)
+                ),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        crate::rag::status::RagModelStatus::DownloadFailed(reason) => {
+            lines.push(Line::from(Span::styled(
+                format!("  download failed: {reason} — retry: canopy rag model retry"),
+                Style::default().fg(Color::Red),
+            )));
+        }
+        _ => {}
+    }
 
     if !app.rag_file_status.is_empty() {
         lines.push(Line::from(""));
@@ -2338,5 +2384,77 @@ mod tests {
             &theme,
         );
         assert!(!lines.is_empty());
+    }
+
+    #[test]
+    #[cfg(not(feature = "local-embeddings"))]
+    fn rag_status_reports_unavailable_for_local_model_without_feature() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(db, data_dir.path()).unwrap();
+        // Even a "loaded" daemon state must not mask the capability gap.
+        app.rag_embeddings_model = "baai/bge-small-en-v1.5".to_string();
+        app.rag_model_loaded = true;
+        let theme = Theme::classic();
+        let (text, color) = rag_status(&app, &theme);
+        assert_eq!(text, "✗ unavailable");
+        assert_eq!(color, Color::Red);
+    }
+
+    #[test]
+    fn rag_status_reports_downloading_and_not_ready() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(db, data_dir.path()).unwrap();
+        app.rag_embeddings_model = "text-embedding-3-small".to_string();
+        // Even a "loaded" daemon state must not hide an in-progress download.
+        app.rag_model_loaded = true;
+        app.rag_acquisition_state =
+            Some(crate::rag::status::AcquisitionState::Downloading { started_at: 0 });
+        let theme = Theme::classic();
+        let (text, color) = rag_status(&app, &theme);
+        assert_eq!(text, "⬇ downloading");
+        assert_eq!(color, Color::Yellow);
+    }
+
+    #[test]
+    fn rag_status_reports_preparing() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(db, data_dir.path()).unwrap();
+        app.rag_embeddings_model = "text-embedding-3-small".to_string();
+        app.rag_acquisition_state =
+            Some(crate::rag::status::AcquisitionState::Preparing { started_at: 0 });
+        let theme = Theme::classic();
+        let (text, color) = rag_status(&app, &theme);
+        assert_eq!(text, "⚙ preparing");
+        assert_eq!(color, Color::Yellow);
+    }
+
+    #[test]
+    fn rag_status_reports_download_failed() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(crate::db::Database::new(&path).unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(db, data_dir.path()).unwrap();
+        app.rag_embeddings_model = "text-embedding-3-small".to_string();
+        app.rag_acquisition_state = Some(crate::rag::status::AcquisitionState::Failed {
+            reason: "connection reset".to_string(),
+        });
+        let theme = Theme::classic();
+        let (text, color) = rag_status(&app, &theme);
+        assert_eq!(text, "✗ download failed");
+        assert_eq!(color, Color::Red);
     }
 }

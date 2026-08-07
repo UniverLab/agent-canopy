@@ -162,7 +162,7 @@ impl Database {
     /// deleting `loops` cascades through `loop_specs` (loop-bound only) /
     /// `loop_nodes` / `loop_edges` / `loop_runs` /
     /// `loop_completion_hook_runs` / `ensembles` / `ensemble_members` /
-    /// `pool_members`; deleting `interactive_sessions` cascades through
+    /// `queue_members`; deleting `interactive_sessions` cascades through
     /// `seed_sessions`; deleting `intelligence_nodes` cascades through
     /// `intelligence_edges`. Those follow-on rows are therefore never
     /// deleted by an explicit statement here — issuing one *after* the
@@ -211,7 +211,7 @@ impl Database {
         )?;
         // CASCADEs to loop-bound loop_specs, which CASCADEs further to
         // loop_nodes / loop_edges / ensembles / ensemble_members /
-        // pool_members / loop_runs; loop_completion_hook_runs CASCADEs
+        // queue_members / loop_runs; loop_completion_hook_runs CASCADEs
         // directly off loop_id. Standalone specs (loop_id IS NULL) are
         // untouched, matching count_hard_cascade.
         tx.execute("DELETE FROM loops WHERE workdir = ?1", params![workdir])?;
@@ -224,6 +224,94 @@ impl Database {
 
         tx.commit()?;
         Ok(counts)
+    }
+
+    /// Rewrites the database file to return space freed by deleted rows to
+    /// the filesystem, then checkpoints the WAL into it so the `-wal` file
+    /// shrinks too. Takes an exclusive lock for the duration — callers must
+    /// make sure nothing else has the database open for writing (see
+    /// `daemon::clean_cli`'s reclaim step, which refuses to run this while
+    /// the daemon is up).
+    ///
+    /// A full `VACUUM` was chosen over `PRAGMA auto_vacuum=INCREMENTAL` +
+    /// `incremental_vacuum`: incremental auto-vacuum only takes effect for
+    /// databases created (or already fully rewritten) after the pragma is
+    /// set, so an existing database — like every one `canopy clean` will
+    /// ever run against — needs a one-time full rewrite regardless before
+    /// incremental mode does anything. A plain `VACUUM` gets the same space
+    /// back today, in one step, without also taking on a migration path and
+    /// a mode that still needs a periodic manual `incremental_vacuum` call
+    /// to keep paying off.
+    ///
+    /// If interrupted (crash, kill -9, power loss), SQLite's own commit
+    /// mechanism protects the original file: `VACUUM` builds its rewritten
+    /// copy in a separate temp database and only replaces the original as
+    /// part of committing that transaction, so a `VACUUM` that never
+    /// commits leaves the database exactly as it was — never a half
+    /// re-written, unusable file.
+    pub fn reclaim_space(&self) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        // Wait out a brief writer instead of failing instantly on
+        // `SQLITE_BUSY` — a short in-flight write (e.g. the TUI recording a
+        // session event) shouldn't abort the whole reclaim.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
+    }
+
+    /// A lightweight, single-pass integrity check — good enough to catch a
+    /// visibly broken file before an in-place-rewriting `VACUUM` entrenches
+    /// the damage. Returns `"ok"` when the database is fine; any other
+    /// string names the specific problem(s) `PRAGMA quick_check` found (it
+    /// can return multiple rows, joined here with `"; "`).
+    ///
+    /// Deliberately `quick_check`, not the fuller, slower
+    /// `PRAGMA integrity_check`: by the time `canopy clean`'s reclaim window
+    /// calls this, the service is already down and this gate only needs to
+    /// refuse a visibly broken file before `VACUUM` runs — the thorough scan
+    /// belongs to a periodic health routine, not the critical path of a
+    /// service-down window.
+    pub fn quick_check(&self) -> Result<String> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut stmt = conn.prepare("PRAGMA quick_check")?;
+        let rows: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.join("; "))
+    }
+
+    /// What's currently in flight that a `canopy clean --stop-daemon`
+    /// reclaim window must not interrupt: a running loop, or a live
+    /// interactive session (a human or TUI actively attached). Mirrors the
+    /// same `status = 'running'` / `status IN ('active', 'resumed')` checks
+    /// [`Self::project_hard_cascade_skip_reason`] already uses for "a human
+    /// or TUI is looking at this right now", just scoped to the whole
+    /// install instead of one project.
+    pub fn busy_reasons(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut reasons = Vec::new();
+
+        let running_loops: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM loops WHERE status = 'running'",
+            [],
+            |row| row.get(0),
+        )?;
+        if running_loops > 0 {
+            reasons.push(format!("{running_loops} loop(s) currently running"));
+        }
+
+        let active_sessions: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM interactive_sessions WHERE status IN ('active', 'resumed')",
+            [],
+            |row| row.get(0),
+        )?;
+        if active_sessions > 0 {
+            reasons.push(format!(
+                "{active_sessions} interactive session(s) attached (a TUI is in use)"
+            ));
+        }
+
+        Ok(reasons)
     }
 
     /// Why a project must be skipped by `--hard`, if any. Returns `Some` only
@@ -396,8 +484,8 @@ fn count_hard_cascade(
             params![workdir],
             |row| row.get(0),
         )?;
-    let pool_members: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM pool_members
+    let queue_members: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM queue_members
               WHERE spec_id IN (
                   SELECT id FROM loop_specs WHERE loop_id IN (SELECT id FROM loops WHERE workdir = ?1)
               )",
@@ -435,7 +523,7 @@ fn count_hard_cascade(
         loop_completion_hook_runs,
         ensembles,
         ensemble_members,
-        pool_members,
+        queue_members,
         seed_sessions,
         intelligence_edges,
     })
@@ -592,6 +680,7 @@ mod tests {
         status: crate::domain::loops::LoopStatus,
     ) -> crate::domain::loops::Loop {
         crate::domain::loops::Loop {
+            archived: false,
             id: id.to_string(),
             name: format!("loop-{id}"),
             description: None,
@@ -604,7 +693,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         }
     }
@@ -1004,7 +1093,7 @@ mod tests {
             "loop_completion_hook_runs",
             "ensembles",
             "ensemble_members",
-            "pool_members",
+            "queue_members",
             "seed_sessions",
             "intelligence_edges",
         ];
@@ -1028,7 +1117,7 @@ mod tests {
                 "loop_completion_hook_runs" => counts.loop_completion_hook_runs = 1,
                 "ensembles" => counts.ensembles = 1,
                 "ensemble_members" => counts.ensemble_members = 1,
-                "pool_members" => counts.pool_members = 1,
+                "queue_members" => counts.queue_members = 1,
                 "seed_sessions" => counts.seed_sessions = 1,
                 "intelligence_edges" => counts.intelligence_edges = 1,
                 _ => unreachable!(),
@@ -1094,9 +1183,9 @@ mod tests {
     }
 
     #[test]
-    fn cascade_delete_orphan_project_preserves_other_projects_pool_members() {
+    fn cascade_delete_orphan_project_preserves_other_projects_queue_members() {
         let db = test_db();
-        let workdir = "/proj-pool";
+        let workdir = "/proj-queue";
         db.upsert_project(&make_project("hash-p", workdir)).unwrap();
         db.insert_loop(&make_loop("loop-p", workdir, LoopStatus::Completed))
             .unwrap();
@@ -1136,27 +1225,28 @@ mod tests {
             completed_via_at: None,
         })
         .unwrap();
-        let pool = crate::domain::pools::Pool {
-            id: "pool-1".to_string(),
+        let queue = crate::domain::queues::Queue {
+            id: "queue-1".to_string(),
             name: "p1".to_string(),
             created_at: chrono::Utc::now(),
         };
-        db.insert_pool(&pool).unwrap();
-        db.append_pool_member(&pool.id, doomed_spec_id, None)
+        db.insert_queue(&queue).unwrap();
+        db.append_queue_member(&queue.id, doomed_spec_id, None)
             .unwrap();
-        db.append_pool_member(&pool.id, safe_spec_id, None).unwrap();
+        db.append_queue_member(&queue.id, safe_spec_id, None)
+            .unwrap();
 
         db.cascade_delete_orphan_project("hash-p", workdir).unwrap();
 
-        // Pool itself remains (shared, not project-owned).
-        assert!(db.get_pool(&pool.id).unwrap().is_some());
+        // Queue itself remains (shared, not project-owned).
+        assert!(db.get_queue(&queue.id).unwrap().is_some());
         // The doomed spec is gone (loop-bound → CASCADE).
         assert!(db.get_loop_spec(doomed_spec_id).unwrap().is_none());
-        // The standalone spec survives, and so does its pool membership.
+        // The standalone spec survives, and so does its queue membership.
         assert!(db.get_loop_spec(safe_spec_id).unwrap().is_some());
-        assert!(db.pool_has_member(&pool.id, safe_spec_id).unwrap());
-        // The pool membership that pointed at the doomed spec is gone.
-        assert!(!db.pool_has_member(&pool.id, doomed_spec_id).unwrap());
+        assert!(db.queue_has_member(&queue.id, safe_spec_id).unwrap());
+        // The queue membership that pointed at the doomed spec is gone.
+        assert!(!db.queue_has_member(&queue.id, doomed_spec_id).unwrap());
     }
 
     #[test]
@@ -1181,6 +1271,74 @@ mod tests {
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         let ids = db.list_agent_ids().unwrap();
         assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn reclaim_space_shrinks_file_after_bulk_delete() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("test.db");
+        let db = Database::new(&path).unwrap();
+
+        // Pad each row so the bulk insert actually grows the file across
+        // multiple pages instead of fitting in whatever SQLite pre-allocates.
+        let padding = "x".repeat(4096);
+        let mut ids = Vec::new();
+        for i in 0..500 {
+            let id = format!("s-{i}");
+            db.insert_interactive_session(
+                &id,
+                &id,
+                "opencode",
+                "/tmp",
+                Some(&padding),
+                None,
+                "interactive",
+                None,
+            )
+            .unwrap();
+            db.finish_interactive_session(&id, 0).unwrap();
+            ids.push(id);
+        }
+
+        // Force everything out of the WAL and into the main file so the
+        // "before" measurement reflects real page count, not whatever's
+        // still sitting in `-wal`.
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(FULL);").unwrap();
+        }
+        let size_before_delete = std::fs::metadata(&path).unwrap().len();
+
+        db.delete_interactive_sessions(&ids).unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(FULL);").unwrap();
+        }
+        let size_after_delete = std::fs::metadata(&path).unwrap().len();
+        // Deleting rows frees pages inside the file without shrinking it —
+        // this is the premise `reclaim_space` exists to fix.
+        assert_eq!(size_after_delete, size_before_delete);
+
+        db.reclaim_space().unwrap();
+        let size_after_reclaim = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            size_after_reclaim < size_after_delete,
+            "expected reclaim to shrink the file: {size_after_delete} -> {size_after_reclaim}"
+        );
+
+        // The database must still be fully usable afterwards.
+        db.insert_interactive_session(
+            "s-post-vacuum",
+            "s-post-vacuum",
+            "opencode",
+            "/tmp",
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+        assert_eq!(db.count_interactive_sessions().unwrap(), 1);
     }
 
     #[test]
@@ -1211,5 +1369,108 @@ mod tests {
     fn parse_rfc3339_ts_invalid() {
         let ts = parse_rfc3339_ts("invalid");
         assert_eq!(ts, 0);
+    }
+
+    // ── quick_check ─────────────────────────────────────────────────────
+
+    #[test]
+    fn quick_check_reports_ok_for_a_healthy_database() {
+        let db = test_db();
+        assert_eq!(db.quick_check().unwrap(), "ok");
+    }
+
+    #[test]
+    fn quick_check_reports_the_problem_for_a_corrupted_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("corrupt.db");
+        // Build a real database first so the file has a valid SQLite header,
+        // then stomp on page data after every handle to it is dropped —
+        // writing garbage over a file that was never a database at all just
+        // produces a "not a database" file-format error, not the kind of
+        // in-page corruption `quick_check` is meant to catch.
+        {
+            let db = Database::new(&path).unwrap();
+            db.insert_terminal_session("t1", "t1", "bash", "/tmp")
+                .unwrap();
+            drop(db);
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        let start = bytes.len() / 2;
+        let end = start + 200.min(bytes.len() - start);
+        for b in &mut bytes[start..end] {
+            *b ^= 0xFF;
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        let db = Database::new(&path).unwrap();
+        let verdict = db.quick_check().unwrap();
+        assert_ne!(verdict, "ok", "corrupted file must not report ok");
+    }
+
+    // ── busy_reasons ────────────────────────────────────────────────────
+
+    #[test]
+    fn busy_reasons_empty_when_nothing_in_flight() {
+        let db = test_db();
+        assert!(db.busy_reasons().unwrap().is_empty());
+    }
+
+    #[test]
+    fn busy_reasons_reports_a_running_loop() {
+        let db = test_db();
+        db.insert_loop(&make_loop("loop-1", "/tmp/proj", LoopStatus::Running))
+            .unwrap();
+
+        let reasons = db.busy_reasons().unwrap();
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].contains("running"), "{reasons:?}");
+    }
+
+    #[test]
+    fn busy_reasons_ignores_a_completed_loop() {
+        let db = test_db();
+        db.insert_loop(&make_loop("loop-1", "/tmp/proj", LoopStatus::Completed))
+            .unwrap();
+
+        assert!(db.busy_reasons().unwrap().is_empty());
+    }
+
+    #[test]
+    fn busy_reasons_reports_an_active_interactive_session() {
+        let db = test_db();
+        db.insert_interactive_session(
+            "s-active",
+            "s-active",
+            "opencode",
+            "/tmp",
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+
+        let reasons = db.busy_reasons().unwrap();
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].contains("interactive session"), "{reasons:?}");
+    }
+
+    #[test]
+    fn busy_reasons_ignores_a_completed_session() {
+        let db = test_db();
+        db.insert_interactive_session(
+            "s-done",
+            "s-done",
+            "opencode",
+            "/tmp",
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+        db.finish_interactive_session("s-done", 0).unwrap();
+
+        assert!(db.busy_reasons().unwrap().is_empty());
     }
 }

@@ -7,6 +7,24 @@ use crate::db::Database;
 use crate::domain::sync::{MessageKind, SyncMessage};
 
 impl Database {
+    /// Insert a `sync_locks` fixture row directly. Test-only: no production
+    /// code path acquires locks yet, but the table is part of the `--hard`
+    /// cascade and project remap's dependent-row accounting, so tests for
+    /// both need a way to seed it.
+    #[cfg(test)]
+    pub fn insert_sync_lock_for_test(&self, id: &str, workdir: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        conn.execute(
+            "INSERT INTO sync_locks (id, workdir, agent_id, lock_type, resource, acquired_at)
+             VALUES (?1, ?2, 'test-agent', 'test', 'test-resource', ?3)",
+            rusqlite::params![id, workdir, chrono::Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
     pub fn insert_sync_message(
         &self,
         workdir: &str,

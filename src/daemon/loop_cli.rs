@@ -1,14 +1,26 @@
 //! CLI handlers for `canopy loop` subcommands.
 //!
-//! Read-only: mirrors `canopy rag report` (see `rag_cli.rs`) in spirit — a
-//! terminal view onto state that previously required querying
-//! `background_agents.db` directly.
+//! `list`/`info`/`export` are read-only: mirror `canopy rag report` (see
+//! `rag_cli.rs`) in spirit — a terminal view onto state that previously
+//! required querying the database directly. Every other
+//! subcommand (`import`/`run`/`pause`/`continue`/`reset`/`autorun`) changes
+//! loop state, so it resolves the target loop (or, for `import`, has
+//! nothing yet to resolve) against that same local database (exactly as
+//! `list`/`info` already do — see [`resolve_loop`]) but then delegates the
+//! actual mutation to the daemon's MCP tool of the same name via
+//! `daemon::cli_daemon::call_tool`, never touching the database itself.
+//! This is the second surface for the operations `loop_import`/`loop_run`/
+//! `loop_pause`/`loop_continue`/`loop_reset`/`loop_schedule_autorun` already
+//! expose over MCP — for when an MCP client can't reach them but the daemon
+//! and its database still can.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use clap::Subcommand;
 
+use crate::daemon::cli_daemon::call_tool;
 use crate::db::Database;
+use crate::domain::db_paths::database_path;
 use crate::domain::loops::{
     Loop, LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus,
 };
@@ -26,20 +38,380 @@ pub(crate) enum LoopAction {
         /// Full loop id, an unambiguous id prefix, or the exact loop name.
         id_or_name: String,
     },
+    /// Export a loop's design (name, description, nodes, edges, ensembles)
+    /// as a portable JSON document, so it can be shared as a file and
+    /// recreated elsewhere with `import`.
+    Export {
+        /// Full loop id, an unambiguous id prefix, or the exact loop name.
+        id_or_name: String,
+        /// Write the exported JSON to this path instead of stdout.
+        #[arg(long)]
+        output: Option<String>,
+        /// Include each agent node's/ensemble member's platform/model in the
+        /// exported file. Omit for a shareable design that never pins the
+        /// recipient to a harness or model they may not have.
+        #[arg(long = "with-models")]
+        with_models: bool,
+    },
+    /// Create a new loop from an exported document — never overwrites an
+    /// existing loop.
+    Import {
+        /// Path to an exported loop JSON file.
+        path: String,
+        /// Absolute workdir for the new loop. Defaults to the current
+        /// directory.
+        #[arg(long)]
+        workdir: Option<String>,
+        /// Loop name to use instead of the file's own name.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Run a loop in the background, spec by spec.
+    Run {
+        /// Full loop id, an unambiguous id prefix, or the exact loop name.
+        id_or_name: String,
+        /// Run this queue's pending specs (in queue order) through the
+        /// loop's graph instead of the loop's own bound specs.
+        #[arg(long)]
+        queue: Option<String>,
+        /// Absolute workdir override for this run only.
+        #[arg(long)]
+        workdir: Option<String>,
+    },
+    /// Pause a running loop after the current node finishes.
+    Pause {
+        /// Full loop id, an unambiguous id prefix, or the exact loop name.
+        id_or_name: String,
+    },
+    /// Continue a paused loop by retrying the current node or skipping to
+    /// the next spec.
+    Continue {
+        /// Full loop id, an unambiguous id prefix, or the exact loop name.
+        id_or_name: String,
+        /// Retry the node that was running when the loop paused.
+        #[arg(long = "retry-current-node")]
+        retry_current_node: bool,
+        /// Skip the current spec and move on to the next one.
+        #[arg(long = "skip-next-spec")]
+        skip_next_spec: bool,
+    },
+    /// Reset a completed/failed loop back to pending so `run` can relaunch
+    /// it.
+    Reset {
+        /// Full loop id, an unambiguous id prefix, or the exact loop name.
+        id_or_name: String,
+        /// Reset exactly these spec IDs, even if already completed. Omit to
+        /// reset every non-completed spec, leaving completed ones untouched.
+        #[arg(long)]
+        specs: Vec<String>,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Schedule a one-shot future resume for a loop, or cancel a pending one.
+    Autorun {
+        /// Full loop id, an unambiguous id prefix, or the exact loop name.
+        id_or_name: String,
+        /// ISO 8601 timestamp at which the loop should resume, e.g.
+        /// "2026-07-10T09:00:00Z".
+        #[arg(long)]
+        at: Option<String>,
+        /// Raw CLI quota-limit message (e.g. "resets 1pm (America/Bogota)")
+        /// to compute the resume instant from, instead of passing `--at`.
+        #[arg(long = "quota-reset-message")]
+        quota_reset_message: Option<String>,
+        /// Cancel any pending autorun instead of scheduling one.
+        #[arg(long)]
+        cancel: bool,
+    },
 }
 
-pub(crate) async fn handle_loop_action(action: LoopAction) -> Result<()> {
+pub(crate) async fn handle_loop_action(
+    action: LoopAction,
+    port_override: Option<u16>,
+) -> Result<()> {
     let data_dir = crate::ensure_data_dir()?;
-    let db = Database::new(&data_dir.join("background_agents.db"))?;
+    let db = Database::new(&database_path(&data_dir))?;
 
     match action {
         LoopAction::List { workdir } => handle_loop_list(&db, workdir.as_deref()),
         LoopAction::Info { id_or_name } => handle_loop_info(&db, &id_or_name),
+        LoopAction::Export {
+            id_or_name,
+            output,
+            with_models,
+        } => handle_loop_export(&db, &id_or_name, output.as_deref(), with_models),
+        LoopAction::Import {
+            path,
+            workdir,
+            name,
+        } => handle_loop_import(port_override, &path, workdir, name),
+        LoopAction::Run {
+            id_or_name,
+            queue,
+            workdir,
+        } => handle_loop_run(&db, port_override, &id_or_name, queue, workdir),
+        LoopAction::Pause { id_or_name } => handle_loop_pause(&db, port_override, &id_or_name),
+        LoopAction::Continue {
+            id_or_name,
+            retry_current_node,
+            skip_next_spec,
+        } => handle_loop_continue(
+            &db,
+            port_override,
+            &id_or_name,
+            retry_current_node,
+            skip_next_spec,
+        ),
+        LoopAction::Reset {
+            id_or_name,
+            specs,
+            yes,
+        } => handle_loop_reset(&db, port_override, &id_or_name, &specs, yes),
+        LoopAction::Autorun {
+            id_or_name,
+            at,
+            quota_reset_message,
+            cancel,
+        } => handle_loop_autorun(
+            &db,
+            port_override,
+            &id_or_name,
+            at.as_deref(),
+            quota_reset_message.as_deref(),
+            cancel,
+        ),
     }
 }
 
+fn handle_loop_run(
+    db: &Database,
+    port_override: Option<u16>,
+    id_or_name: &str,
+    queue: Option<String>,
+    workdir: Option<String>,
+) -> Result<()> {
+    let loops = db.list_loops(None, true)?;
+    let lp = resolve_loop(&loops, id_or_name)?;
+
+    let mut args = serde_json::json!({ "loop_id": lp.id });
+    if let Some(queue_id) = queue {
+        args["queue_id"] = serde_json::json!(queue_id);
+    }
+    if let Some(workdir) = workdir {
+        args["workdir"] = serde_json::json!(workdir);
+    }
+
+    println!("{}", call_tool(port_override, "loop_run", &args)?);
+    Ok(())
+}
+
+fn handle_loop_pause(db: &Database, port_override: Option<u16>, id_or_name: &str) -> Result<()> {
+    let loops = db.list_loops(None, true)?;
+    let lp = resolve_loop(&loops, id_or_name)?;
+
+    println!(
+        "{}",
+        call_tool(
+            port_override,
+            "loop_pause",
+            &serde_json::json!({ "loop_id": lp.id }),
+        )?
+    );
+    Ok(())
+}
+
+fn handle_loop_continue(
+    db: &Database,
+    port_override: Option<u16>,
+    id_or_name: &str,
+    retry_current_node: bool,
+    skip_next_spec: bool,
+) -> Result<()> {
+    let action = match (retry_current_node, skip_next_spec) {
+        (true, false) => "retry_current_node",
+        (false, true) => "skip_next_spec",
+        (false, false) => {
+            return Err(anyhow!(
+                "Specify one of --retry-current-node or --skip-next-spec."
+            ))
+        }
+        (true, true) => {
+            return Err(anyhow!(
+                "--retry-current-node and --skip-next-spec are mutually exclusive."
+            ))
+        }
+    };
+
+    let loops = db.list_loops(None, true)?;
+    let lp = resolve_loop(&loops, id_or_name)?;
+
+    println!(
+        "{}",
+        call_tool(
+            port_override,
+            "loop_continue",
+            &serde_json::json!({ "loop_id": lp.id, "action": action }),
+        )?
+    );
+    Ok(())
+}
+
+fn handle_loop_reset(
+    db: &Database,
+    port_override: Option<u16>,
+    id_or_name: &str,
+    specs: &[String],
+    yes: bool,
+) -> Result<()> {
+    let loops = db.list_loops(None, true)?;
+    let lp = resolve_loop(&loops, id_or_name)?;
+
+    if !yes && !confirm_reset(&lp.name)? {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    let mut args = serde_json::json!({ "loop_id": lp.id });
+    if !specs.is_empty() {
+        args["specs"] = serde_json::json!(specs);
+    }
+
+    println!("{}", call_tool(port_override, "loop_reset", &args)?);
+    Ok(())
+}
+
+/// Interactive confirmation for `loop reset`, bypassable with `--yes` — the
+/// same `inquire::Confirm`-with-default-false pattern `canopy clean --hard`
+/// already uses for its own destructive cascade, and the CLI counterpart to
+/// the TUI's y/n modal for a loop deletion.
+fn confirm_reset(loop_name: &str) -> Result<bool> {
+    use inquire::Confirm;
+    Confirm::new(&format!(
+        "Reset loop '{loop_name}' back to pending? This clears progress on its non-completed specs."
+    ))
+    .with_default(false)
+    .with_help_message("y: reset, n/Esc: abort")
+    .prompt()
+    .map_err(|err| anyhow!("{err}"))
+}
+
+/// Read-only, like `list`/`info` — reads the local database directly rather
+/// than round-tripping through the daemon, so exporting a loop never
+/// requires the daemon to be running.
+fn handle_loop_export(
+    db: &Database,
+    id_or_name: &str,
+    output: Option<&str>,
+    with_models: bool,
+) -> Result<()> {
+    let loops = db.list_loops(None, true)?;
+    let lp = resolve_loop(&loops, id_or_name)?;
+
+    let graph_nodes = db.list_loop_nodes_for_loop(&lp.id)?;
+    let graph_edges = db.list_loop_edges_for_loop(&lp.id)?;
+    let ensembles = db.list_ensembles_for_loop(&lp.id)?;
+    let document = crate::domain::loop_transfer::build_export_document(
+        lp,
+        &graph_nodes,
+        &graph_edges,
+        &ensembles,
+        with_models,
+    )
+    .map_err(|e| anyhow!(e))?;
+    let json = serde_json::to_string_pretty(&document)?;
+
+    match output {
+        Some(path) => {
+            std::fs::write(path, format!("{json}\n"))
+                .with_context(|| format!("could not write '{path}'"))?;
+            println!("Exported loop '{}' to {path}.", lp.name);
+        }
+        None => println!("{json}"),
+    }
+    Ok(())
+}
+
+/// Import creates a new loop, which needs the daemon's own side effects
+/// (project path registration, trigger activation) — so unlike `export`
+/// this delegates to the daemon's `loop_import` MCP tool rather than
+/// writing to the database directly (see module doc: every mutation goes
+/// through the daemon).
+fn handle_loop_import(
+    port_override: Option<u16>,
+    path: &str,
+    workdir: Option<String>,
+    name: Option<String>,
+) -> Result<()> {
+    let raw = std::fs::read_to_string(path).with_context(|| format!("could not read '{path}'"))?;
+    // Validated locally first so a malformed file (bad JSON, missing
+    // format_version) fails fast with a clear message instead of a round
+    // trip to the daemon — `loop_import` re-validates it anyway (decision
+    // 5), so this is a UX nicety, not the source of truth.
+    let document = crate::domain::loop_transfer::parse_export_document_str(&raw)
+        .map_err(|e| anyhow!("'{path}': {e}"))?;
+    let document = serde_json::to_value(&document)?;
+
+    let workdir = match workdir {
+        Some(workdir) => workdir,
+        None => std::env::current_dir()
+            .context("could not determine the current directory")?
+            .to_string_lossy()
+            .to_string(),
+    };
+
+    let mut args = serde_json::json!({ "document": document, "workdir": workdir });
+    if let Some(name) = name {
+        args["name"] = serde_json::json!(name);
+    }
+
+    println!("{}", call_tool(port_override, "loop_import", &args)?);
+    Ok(())
+}
+
+fn handle_loop_autorun(
+    db: &Database,
+    port_override: Option<u16>,
+    id_or_name: &str,
+    at: Option<&str>,
+    quota_reset_message: Option<&str>,
+    cancel: bool,
+) -> Result<()> {
+    let set_count = [at.is_some(), quota_reset_message.is_some(), cancel]
+        .iter()
+        .filter(|set| **set)
+        .count();
+    if set_count == 0 {
+        return Err(anyhow!(
+            "Specify one of --at, --quota-reset-message, or --cancel."
+        ));
+    }
+    if set_count > 1 {
+        return Err(anyhow!(
+            "--at, --quota-reset-message, and --cancel are mutually exclusive."
+        ));
+    }
+
+    let loops = db.list_loops(None, true)?;
+    let lp = resolve_loop(&loops, id_or_name)?;
+
+    let args = if cancel {
+        serde_json::json!({ "loop_id": lp.id })
+    } else if let Some(at) = at {
+        serde_json::json!({ "loop_id": lp.id, "at": at })
+    } else {
+        serde_json::json!({ "loop_id": lp.id, "quota_reset_message": quota_reset_message })
+    };
+
+    println!(
+        "{}",
+        call_tool(port_override, "loop_schedule_autorun", &args)?
+    );
+    Ok(())
+}
+
 fn handle_loop_list(db: &Database, workdir: Option<&str>) -> Result<()> {
-    let loops = db.list_loops(workdir)?;
+    let loops = db.list_loops(workdir, false)?;
 
     if loops.is_empty() {
         println!("No loops found.");
@@ -76,7 +448,9 @@ fn handle_loop_list(db: &Database, workdir: Option<&str>) -> Result<()> {
 }
 
 fn handle_loop_info(db: &Database, id_or_name: &str) -> Result<()> {
-    let loops = db.list_loops(None)?;
+    // Resolves by id/name (not a browsing list), so an archived loop must
+    // still be found here.
+    let loops = db.list_loops(None, true)?;
     let lp = resolve_loop(&loops, id_or_name)?;
 
     println!("\n\x1b[1m── Loop: {} ──\x1b[0m", lp.name);
@@ -130,11 +504,11 @@ fn handle_loop_info(db: &Database, id_or_name: &str) -> Result<()> {
             );
         }
     } else if !all_runs.is_empty() {
-        // No specs are bound to this loop directly — it's draining a pool
-        // (pool members never set `loop_specs.loop_id`, see `LoopEngine::
+        // No specs are bound to this loop directly — it's draining a queue
+        // (queue members never set `loop_specs.loop_id`, see `LoopEngine::
         // run_loop`), so there's no fixed queue to show. Reconstruct what
         // ran so far from `loop_runs`, which always records the real
-        // `loop_id` regardless of pool membership.
+        // `loop_id` regardless of queue membership.
         println!(" (queue-driven — showing specs worked so far, not the full queue)");
         for spec_id in distinct_spec_ids_in_order(&all_runs) {
             if let Some(spec) = db.get_loop_spec(spec_id)? {
@@ -200,9 +574,9 @@ fn handle_loop_info(db: &Database, id_or_name: &str) -> Result<()> {
             .unwrap_or_default();
         // RS3: flag a run that continued a context group's warm session (its
         // session id was first captured by a grouped sibling on this node).
-        let group_note = match (lp.active_run_pool_id.as_deref(), run.session_id.as_deref()) {
-            (Some(pool_id), Some(session_id)) => db
-                .group_resume_source(pool_id, &run.spec_id, &run.node_id, session_id)?
+        let group_note = match (lp.active_run_queue_id.as_deref(), run.session_id.as_deref()) {
+            (Some(queue_id), Some(session_id)) => db
+                .group_resume_source(queue_id, &run.spec_id, &run.node_id, session_id)?
                 .map(|group| format!("  \x1b[36m(resumed group {group})\x1b[0m"))
                 .unwrap_or_default(),
             _ => String::new(),
@@ -262,19 +636,16 @@ fn commit_rights_note(output: Option<&serde_json::Value>) -> String {
 
 /// The `loop info` annotation for a run cut short by a daemon restart/kill
 /// (B36), or an empty string for every other run — pairs with the distinct
-/// icon `run_status_icon` already gives it. Also surfaces the recovery hint
-/// when uncommitted changes were quarantined via `git stash`, so a `fail`
-/// here never reads as the node's own doing.
+/// icon `run_status_icon` already gives it, so a `fail` here never reads as
+/// the node's own doing. The engine never touches git on this path, so
+/// there's nothing to point the operator at recovering — the spec's own
+/// `interrupted` status (visible via `loop_info`'s spec listing) is what
+/// says the worktree still holds the interrupted attempt's partial work.
 fn interrupted_note(output: Option<&serde_json::Value>) -> String {
     if !is_interrupted(output) {
         return String::new();
     }
-    match output.and_then(|o| o.get("quarantine")) {
-        Some(q) if q.get("stashed").and_then(|v| v.as_bool()) == Some(true) => {
-            "  \x1b[33m(interrupted — worktree changes quarantined, recover with `git stash pop`)\x1b[0m".to_string()
-        }
-        _ => "  \x1b[33m(interrupted — not a node failure)\x1b[0m".to_string(),
-    }
+    "  \x1b[33m(interrupted — not a node failure)\x1b[0m".to_string()
 }
 
 /// Count of specs that have reached a final `completed` state, alongside the
@@ -287,17 +658,17 @@ fn spec_progress(specs: &[LoopSpec]) -> (usize, usize) {
     (done, specs.len())
 }
 
-/// `done/total` progress for a loop's `loop list` row. A pool-driven run binds
-/// no specs of its own (`loop_specs.loop_id` stays null for pool members), so
+/// `done/total` progress for a loop's `loop list` row. A queue-driven run binds
+/// no specs of its own (`loop_specs.loop_id` stays null for queue members), so
 /// counting `bound_specs` renders a misleading `0/0`. When the loop's row
-/// carries an `active_run_pool_id`, count that pool's members instead —
+/// carries an `active_run_queue_id`, count that queue's members instead —
 /// mirroring `LoopEngine::spec_progress`, which the running engine uses for the
-/// same loop. Falls back to the bound specs for ordinary (non-pool) loops.
+/// same loop. Falls back to the bound specs for ordinary (non-queue) loops.
 fn loop_progress(db: &Database, lp: &Loop, bound_specs: &[LoopSpec]) -> Result<(usize, usize)> {
-    let Some(pool_id) = lp.active_run_pool_id.as_deref() else {
+    let Some(queue_id) = lp.active_run_queue_id.as_deref() else {
         return Ok(spec_progress(bound_specs));
     };
-    let ids = db.list_pool_member_spec_ids(pool_id)?;
+    let ids = db.list_queue_member_spec_ids(queue_id)?;
     let mut done = 0;
     for id in &ids {
         if let Some(spec) = db.get_loop_spec(id)? {
@@ -310,18 +681,26 @@ fn loop_progress(db: &Database, lp: &Loop, bound_specs: &[LoopSpec]) -> Result<(
 }
 
 /// The spec a loop is actively working through: the one currently `running`,
-/// or else the next `pending` one in position order. Mirrors
+/// or else the next `pending`/`interrupted` one (equally runnable — see
+/// `queue_next_pending_spec_id`) in position order. Mirrors
 /// `build_loop_summary_json` in `daemon/handler.rs` so the CLI and MCP report
 /// the same "current spec" for a given loop.
 fn current_spec(specs: &[LoopSpec]) -> Option<&LoopSpec> {
     specs
         .iter()
         .find(|s| s.status == LoopSpecStatus::Running)
-        .or_else(|| specs.iter().find(|s| s.status == LoopSpecStatus::Pending))
+        .or_else(|| {
+            specs.iter().find(|s| {
+                matches!(
+                    s.status,
+                    LoopSpecStatus::Pending | LoopSpecStatus::Interrupted
+                )
+            })
+        })
 }
 
 /// Name of the spec a loop is actively working through, for both bound-spec
-/// loops (via [`current_spec`]) and pool-driven loops, which never bind a
+/// loops (via [`current_spec`]) and queue-driven loops, which never bind a
 /// spec to `loop_specs.loop_id` and so must fall back to `loop_runs` (see
 /// [`Database::list_loop_runs_for_loop`]) to find what's currently running.
 fn current_spec_name(db: &Database, lp: &Loop, bound_specs: &[LoopSpec]) -> Result<Option<String>> {
@@ -345,7 +724,7 @@ fn current_running_run(runs: &[LoopNodeRun]) -> Option<&LoopNodeRun> {
 }
 
 /// Spec ids referenced by `runs`, in first-seen (chronological) order with
-/// duplicates dropped — used to approximate a pool-driven loop's queue from
+/// duplicates dropped — used to approximate a queue-driven loop's queue from
 /// its run history, since the queue itself isn't persisted per loop.
 fn distinct_spec_ids_in_order(runs: &[LoopNodeRun]) -> Vec<&str> {
     let mut seen = std::collections::HashSet::new();
@@ -432,11 +811,12 @@ fn spec_status_icon(status: LoopSpecStatus) -> &'static str {
         LoopSpecStatus::Failed => "\x1b[31m✗\x1b[0m",
         LoopSpecStatus::Skipped => "\x1b[90m⊘\x1b[0m",
         LoopSpecStatus::Pending => "\x1b[90m●\x1b[0m",
+        LoopSpecStatus::Interrupted => "\x1b[33m⚑\x1b[0m",
     }
 }
 
 /// B36: a run cut short by a daemon restart/kill is recorded as `fail` (see
-/// `reconcile_orphaned_loops` / `reconcile_stranded_pool_specs`), but it must
+/// `reconcile_orphaned_loops` / `reconcile_stranded_queue_specs`), but it must
 /// never render like an ordinary node failure — its own icon, distinct from
 /// both a genuine fail and a healthy pass.
 fn run_status_icon(status: LoopRunStatus, output: Option<&serde_json::Value>) -> &'static str {
@@ -536,8 +916,203 @@ mod tests {
         }
     }
 
+    #[test]
+    fn run_parses_queue_and_workdir() {
+        let cli = TestCli::try_parse_from(["test", "run", "my-loop"]).expect("should parse");
+        match cli.action {
+            LoopAction::Run {
+                id_or_name,
+                queue,
+                workdir,
+            } => {
+                assert_eq!(id_or_name, "my-loop");
+                assert!(queue.is_none());
+                assert!(workdir.is_none());
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+
+        let cli = TestCli::try_parse_from([
+            "test",
+            "run",
+            "my-loop",
+            "--queue",
+            "q1",
+            "--workdir",
+            "/tmp/proj",
+        ])
+        .expect("should parse");
+        match cli.action {
+            LoopAction::Run {
+                id_or_name,
+                queue,
+                workdir,
+            } => {
+                assert_eq!(id_or_name, "my-loop");
+                assert_eq!(queue.as_deref(), Some("q1"));
+                assert_eq!(workdir.as_deref(), Some("/tmp/proj"));
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pause_requires_id_or_name() {
+        assert!(TestCli::try_parse_from(["test", "pause"]).is_err());
+        let cli = TestCli::try_parse_from(["test", "pause", "my-loop"]).expect("should parse");
+        match cli.action {
+            LoopAction::Pause { id_or_name } => assert_eq!(id_or_name, "my-loop"),
+            other => panic!("expected Pause, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn export_parses_output_and_with_models() {
+        let cli = TestCli::try_parse_from(["test", "export", "my-loop"]).expect("should parse");
+        match cli.action {
+            LoopAction::Export {
+                id_or_name,
+                output,
+                with_models,
+            } => {
+                assert_eq!(id_or_name, "my-loop");
+                assert!(output.is_none());
+                assert!(!with_models);
+            }
+            other => panic!("expected Export, got {other:?}"),
+        }
+
+        let cli = TestCli::try_parse_from([
+            "test",
+            "export",
+            "my-loop",
+            "--output",
+            "loop.json",
+            "--with-models",
+        ])
+        .expect("should parse");
+        match cli.action {
+            LoopAction::Export {
+                id_or_name,
+                output,
+                with_models,
+            } => {
+                assert_eq!(id_or_name, "my-loop");
+                assert_eq!(output.as_deref(), Some("loop.json"));
+                assert!(with_models);
+            }
+            other => panic!("expected Export, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_parses_workdir_and_name() {
+        let cli = TestCli::try_parse_from(["test", "import", "loop.json"]).expect("should parse");
+        match cli.action {
+            LoopAction::Import {
+                path,
+                workdir,
+                name,
+            } => {
+                assert_eq!(path, "loop.json");
+                assert!(workdir.is_none());
+                assert!(name.is_none());
+            }
+            other => panic!("expected Import, got {other:?}"),
+        }
+
+        let cli = TestCli::try_parse_from([
+            "test",
+            "import",
+            "loop.json",
+            "--workdir",
+            "/tmp/proj",
+            "--name",
+            "New Name",
+        ])
+        .expect("should parse");
+        match cli.action {
+            LoopAction::Import {
+                path,
+                workdir,
+                name,
+            } => {
+                assert_eq!(path, "loop.json");
+                assert_eq!(workdir.as_deref(), Some("/tmp/proj"));
+                assert_eq!(name.as_deref(), Some("New Name"));
+            }
+            other => panic!("expected Import, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn continue_parses_retry_and_skip_flags() {
+        let cli = TestCli::try_parse_from(["test", "continue", "my-loop", "--retry-current-node"])
+            .expect("should parse");
+        match cli.action {
+            LoopAction::Continue {
+                id_or_name,
+                retry_current_node,
+                skip_next_spec,
+            } => {
+                assert_eq!(id_or_name, "my-loop");
+                assert!(retry_current_node);
+                assert!(!skip_next_spec);
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
+
+        let cli = TestCli::try_parse_from(["test", "continue", "my-loop", "--skip-next-spec"])
+            .expect("should parse");
+        match cli.action {
+            LoopAction::Continue { skip_next_spec, .. } => assert!(skip_next_spec),
+            other => panic!("expected Continue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reset_parses_repeated_specs_and_yes() {
+        let cli = TestCli::try_parse_from([
+            "test", "reset", "my-loop", "--specs", "a", "--specs", "b", "--yes",
+        ])
+        .expect("should parse");
+        match cli.action {
+            LoopAction::Reset {
+                id_or_name,
+                specs,
+                yes,
+            } => {
+                assert_eq!(id_or_name, "my-loop");
+                assert_eq!(specs, vec!["a".to_string(), "b".to_string()]);
+                assert!(yes);
+            }
+            other => panic!("expected Reset, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn autorun_parses_at_quota_message_and_cancel() {
+        let cli =
+            TestCli::try_parse_from(["test", "autorun", "my-loop", "--at", "2026-07-10T09:00:00Z"])
+                .expect("should parse");
+        match cli.action {
+            LoopAction::Autorun { at, .. } => {
+                assert_eq!(at.as_deref(), Some("2026-07-10T09:00:00Z"));
+            }
+            other => panic!("expected Autorun, got {other:?}"),
+        }
+
+        let cli = TestCli::try_parse_from(["test", "autorun", "my-loop", "--cancel"])
+            .expect("should parse");
+        match cli.action {
+            LoopAction::Autorun { cancel, .. } => assert!(cancel),
+            other => panic!("expected Autorun, got {other:?}"),
+        }
+    }
+
     fn make_loop(id: &str, name: &str, status: LoopStatus) -> Loop {
         Loop {
+            archived: false,
             id: id.to_string(),
             name: name.to_string(),
             description: None,
@@ -550,7 +1125,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         }
     }
@@ -591,74 +1166,74 @@ mod tests {
     }
 
     #[test]
-    fn loop_progress_counts_pool_members_when_active_run_pool_id_set() {
-        use crate::domain::pools::Pool;
+    fn loop_progress_counts_queue_members_when_active_run_queue_id_set() {
+        use crate::domain::queues::Queue;
 
         let dir = tempfile::tempdir().unwrap();
         let db = Database::new(&dir.path().join("t.db")).unwrap();
 
-        // A pool-driven loop binds no specs of its own, so counting bound
+        // A queue-driven loop binds no specs of its own, so counting bound
         // specs would render a misleading 0/0.
-        let mut lp = make_loop("loop-1", "pool-loop", LoopStatus::Running);
-        lp.active_run_pool_id = Some("pool-1".to_string());
+        let mut lp = make_loop("loop-1", "queue-loop", LoopStatus::Running);
+        lp.active_run_queue_id = Some("queue-1".to_string());
         db.insert_loop(&lp).unwrap();
-        db.insert_pool(&Pool {
-            id: "pool-1".to_string(),
+        db.insert_queue(&Queue {
+            id: "queue-1".to_string(),
             name: "P".to_string(),
             created_at: Utc::now(),
         })
         .unwrap();
 
-        // Two standalone pool members (loop_id: None, like real ones): one
+        // Two standalone queue members (loop_id: None, like real ones): one
         // completed, one pending.
         for (id, status) in [
             ("spec-a", LoopSpecStatus::Completed),
             ("spec-b", LoopSpecStatus::Pending),
         ] {
-            let mut spec = make_spec("pool", id, 0, status);
+            let mut spec = make_spec("queue", id, 0, status);
             spec.id = id.to_string();
             spec.loop_id = None;
             db.insert_loop_spec(&spec).unwrap();
-            db.append_pool_member("pool-1", id, None).unwrap();
+            db.append_queue_member("queue-1", id, None).unwrap();
         }
 
-        // Bound specs empty; pool progress is 1/2.
+        // Bound specs empty; queue progress is 1/2.
         assert_eq!(loop_progress(&db, &lp, &[]).unwrap(), (1, 2));
     }
 
     #[test]
-    fn loop_progress_shows_n_of_n_for_completed_pool_loop() {
-        use crate::domain::pools::Pool;
+    fn loop_progress_shows_n_of_n_for_completed_queue_loop() {
+        use crate::domain::queues::Queue;
 
         let dir = tempfile::tempdir().unwrap();
         let db = Database::new(&dir.path().join("t.db")).unwrap();
 
-        // B31: a finished pool-driven loop keeps its `active_run_pool_id`, so
+        // B31: a finished queue-driven loop keeps its `active_run_queue_id`, so
         // even in a terminal status it must still render its real n/n queue
         // progress rather than the 0/0 a bound-spec count would produce.
-        let mut lp = make_loop("loop-done", "pool-loop", LoopStatus::Completed);
-        lp.active_run_pool_id = Some("pool-1".to_string());
+        let mut lp = make_loop("loop-done", "queue-loop", LoopStatus::Completed);
+        lp.active_run_queue_id = Some("queue-1".to_string());
         db.insert_loop(&lp).unwrap();
-        db.insert_pool(&Pool {
-            id: "pool-1".to_string(),
+        db.insert_queue(&Queue {
+            id: "queue-1".to_string(),
             name: "P".to_string(),
             created_at: Utc::now(),
         })
         .unwrap();
 
         for id in ["spec-a", "spec-b"] {
-            let mut spec = make_spec("pool", id, 0, LoopSpecStatus::Completed);
+            let mut spec = make_spec("queue", id, 0, LoopSpecStatus::Completed);
             spec.id = id.to_string();
             spec.loop_id = None;
             db.insert_loop_spec(&spec).unwrap();
-            db.append_pool_member("pool-1", id, None).unwrap();
+            db.append_queue_member("queue-1", id, None).unwrap();
         }
 
         assert_eq!(loop_progress(&db, &lp, &[]).unwrap(), (2, 2));
     }
 
     #[test]
-    fn loop_progress_falls_back_to_bound_specs_without_pool() {
+    fn loop_progress_falls_back_to_bound_specs_without_queue() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::new(&dir.path().join("t.db")).unwrap();
         let lp = make_loop("loop-2", "bound", LoopStatus::Running);
@@ -909,6 +1484,7 @@ mod tests {
             LoopSpecStatus::Failed,
             LoopSpecStatus::Skipped,
             LoopSpecStatus::Pending,
+            LoopSpecStatus::Interrupted,
         ];
         let icons: std::collections::HashSet<&str> =
             statuses.iter().map(|s| spec_status_icon(*s)).collect();
@@ -969,23 +1545,11 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_note_renders_with_quarantine() {
-        let output = Some(serde_json::json!({
-            "interrupted": true,
-            "quarantine": {"stashed": true}
-        }));
-        let note = interrupted_note(output.as_ref());
-        assert!(note.contains("interrupted"));
-        assert!(note.contains("quarantined"));
-        assert!(note.contains("git stash pop"));
-    }
-
-    #[test]
-    fn interrupted_note_renders_without_quarantine() {
+    fn interrupted_note_renders_for_interrupted_run() {
         let output = Some(serde_json::json!({"interrupted": true}));
         let note = interrupted_note(output.as_ref());
         assert!(note.contains("interrupted"));
-        assert!(!note.contains("quarantined"));
+        assert!(!note.contains("git stash"));
     }
 
     #[test]
@@ -1099,5 +1663,361 @@ mod tests {
         let at = DateTime::<Utc>::from_timestamp(23 * 3600 + 59 * 60, 0).unwrap();
         let result = format_autorun_compact(at);
         assert!(result.contains("23:59Z"));
+    }
+
+    // ── state-changing handlers: daemon delegation ──────────────────
+
+    use crate::tui::mcp_client::test_support::{spawn_fake_daemon, unused_port};
+
+    fn db_with_loop(id: &str, name: &str, status: LoopStatus) -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(&dir.path().join("t.db")).unwrap();
+        db.insert_loop(&make_loop(id, name, status)).unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn handle_loop_run_calls_loop_run_tool_with_resolved_id() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Draft);
+        let fake = spawn_fake_daemon(serde_json::json!({
+            "content": [{"type": "text", "text": "Loop 'loop-1' launched in background."}],
+            "isError": false
+        }));
+        let port: u16 = fake.port.parse().unwrap();
+
+        handle_loop_run(&db, Some(port), "my-loop", Some("q1".to_string()), None)
+            .expect("run should succeed");
+
+        let calls = fake.recorded_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["name"], "loop_run");
+        assert_eq!(calls[0]["arguments"]["loop_id"], "loop-1");
+        assert_eq!(calls[0]["arguments"]["queue_id"], "q1");
+    }
+
+    #[test]
+    fn handle_loop_run_rejects_unknown_loop_before_touching_daemon() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Draft);
+        // No fake daemon is spawned — a request that reaches the network at
+        // all would fail differently (connection refused) than the
+        // not-found error resolution must produce locally.
+        let err = handle_loop_run(&db, Some(65535), "missing", None, None).unwrap_err();
+        assert!(err.to_string().contains("No loop matches"));
+    }
+
+    #[test]
+    fn handle_loop_pause_calls_loop_pause_tool() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Running);
+        let fake = spawn_fake_daemon(serde_json::json!({
+            "content": [{"type": "text", "text": "Loop 'loop-1' marked to pause."}],
+            "isError": false
+        }));
+        let port: u16 = fake.port.parse().unwrap();
+
+        handle_loop_pause(&db, Some(port), "loop-1").expect("pause should succeed");
+
+        let calls = fake.recorded_calls();
+        assert_eq!(calls[0]["name"], "loop_pause");
+        assert_eq!(calls[0]["arguments"]["loop_id"], "loop-1");
+    }
+
+    #[test]
+    fn handle_loop_continue_sends_retry_current_node_action() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Paused);
+        let fake = spawn_fake_daemon(serde_json::json!({
+            "content": [{"type": "text", "text": "resumed"}],
+            "isError": false
+        }));
+        let port: u16 = fake.port.parse().unwrap();
+
+        handle_loop_continue(&db, Some(port), "loop-1", true, false).expect("should succeed");
+
+        let calls = fake.recorded_calls();
+        assert_eq!(calls[0]["arguments"]["action"], "retry_current_node");
+    }
+
+    #[test]
+    fn handle_loop_continue_sends_skip_next_spec_action() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Paused);
+        let fake = spawn_fake_daemon(serde_json::json!({
+            "content": [{"type": "text", "text": "resumed"}],
+            "isError": false
+        }));
+        let port: u16 = fake.port.parse().unwrap();
+
+        handle_loop_continue(&db, Some(port), "loop-1", false, true).expect("should succeed");
+
+        let calls = fake.recorded_calls();
+        assert_eq!(calls[0]["arguments"]["action"], "skip_next_spec");
+    }
+
+    #[test]
+    fn handle_loop_continue_rejects_when_neither_flag_set() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Paused);
+        let err = handle_loop_continue(&db, Some(65535), "loop-1", false, false).unwrap_err();
+        assert!(err.to_string().contains("Specify one of"));
+    }
+
+    #[test]
+    fn handle_loop_continue_rejects_when_both_flags_set() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Paused);
+        let err = handle_loop_continue(&db, Some(65535), "loop-1", true, true).unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn handle_loop_reset_with_yes_sends_explicit_specs() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Failed);
+        // `yes: true` bypasses the interactive confirmation prompt (which
+        // would otherwise block on a non-tty test run), exercising the
+        // confirmed path deterministically.
+        let fake = spawn_fake_daemon(serde_json::json!({
+            "content": [{"type": "text", "text": "Loop 'loop-1' reset."}],
+            "isError": false
+        }));
+        let port: u16 = fake.port.parse().unwrap();
+
+        handle_loop_reset(
+            &db,
+            Some(port),
+            "loop-1",
+            &["spec-a".to_string(), "spec-b".to_string()],
+            true,
+        )
+        .expect("reset should succeed");
+
+        let calls = fake.recorded_calls();
+        assert_eq!(calls[0]["name"], "loop_reset");
+        assert_eq!(calls[0]["arguments"]["loop_id"], "loop-1");
+        assert_eq!(
+            calls[0]["arguments"]["specs"],
+            serde_json::json!(["spec-a", "spec-b"])
+        );
+    }
+
+    #[test]
+    fn handle_loop_reset_omits_specs_field_when_none_given() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Failed);
+        let fake = spawn_fake_daemon(serde_json::json!({
+            "content": [{"type": "text", "text": "Loop 'loop-1' reset."}],
+            "isError": false
+        }));
+        let port: u16 = fake.port.parse().unwrap();
+
+        handle_loop_reset(&db, Some(port), "loop-1", &[], true).expect("reset should succeed");
+
+        let calls = fake.recorded_calls();
+        assert!(calls[0]["arguments"].get("specs").is_none());
+    }
+
+    /// Export is read-only and must work without any daemon listening —
+    /// mirroring `list`/`info`, it reads the local database directly.
+    #[test]
+    fn handle_loop_export_writes_document_to_output_path_without_a_daemon() {
+        let (dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Draft);
+        db.insert_loop_node(&crate::domain::loops::LoopNode {
+            id: "n1".to_string(),
+            spec_id: None,
+            loop_id: Some("loop-1".to_string()),
+            name: "implementer".to_string(),
+            kind: crate::domain::loops::LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "claude", "prompt_template": "go"}),
+            position: 1,
+            created_at: Utc::now(),
+        })
+        .unwrap();
+
+        let out_path = dir.path().join("export.json");
+        handle_loop_export(&db, "loop-1", Some(out_path.to_str().unwrap()), false)
+            .expect("export should succeed");
+
+        let raw = std::fs::read_to_string(&out_path).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(doc["format_version"], 1);
+        assert_eq!(doc["name"], "my-loop");
+        assert!(doc["nodes"][0]["config"].get("platform").is_none());
+    }
+
+    #[test]
+    fn handle_loop_export_with_models_keeps_platform() {
+        let (dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Draft);
+        db.insert_loop_node(&crate::domain::loops::LoopNode {
+            id: "n1".to_string(),
+            spec_id: None,
+            loop_id: Some("loop-1".to_string()),
+            name: "implementer".to_string(),
+            kind: crate::domain::loops::LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "claude", "prompt_template": "go"}),
+            position: 1,
+            created_at: Utc::now(),
+        })
+        .unwrap();
+
+        let out_path = dir.path().join("export.json");
+        handle_loop_export(&db, "loop-1", Some(out_path.to_str().unwrap()), true)
+            .expect("export should succeed");
+
+        let raw = std::fs::read_to_string(&out_path).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(doc["nodes"][0]["config"]["platform"], "claude");
+    }
+
+    #[test]
+    fn handle_loop_export_rejects_unknown_loop_before_touching_disk() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Draft);
+        let err = handle_loop_export(&db, "missing", None, false).unwrap_err();
+        assert!(err.to_string().contains("No loop matches"));
+    }
+
+    /// Import delegates to the daemon's `loop_import` MCP tool — unlike
+    /// export, it has state-changing side effects (project registration,
+    /// trigger activation) that only the running daemon can perform.
+    #[test]
+    fn handle_loop_import_sends_document_workdir_and_name_to_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("loop.json");
+        std::fs::write(
+            &file_path,
+            serde_json::json!({
+                "format_version": 1,
+                "name": "Shared Loop",
+                "nodes": [],
+                "edges": [],
+                "ensembles": []
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let fake = spawn_fake_daemon(serde_json::json!({
+            "content": [{"type": "text", "text": "{\"loop_id\": \"new-1\", \"name\": \"Shared Loop\", \"nodes_missing_platform\": []}"}],
+            "isError": false
+        }));
+        let port: u16 = fake.port.parse().unwrap();
+
+        handle_loop_import(
+            Some(port),
+            file_path.to_str().unwrap(),
+            Some("/tmp/target".to_string()),
+            Some("Custom Name".to_string()),
+        )
+        .expect("import should succeed");
+
+        let calls = fake.recorded_calls();
+        assert_eq!(calls[0]["name"], "loop_import");
+        assert_eq!(calls[0]["arguments"]["workdir"], "/tmp/target");
+        assert_eq!(calls[0]["arguments"]["name"], "Custom Name");
+        assert_eq!(calls[0]["arguments"]["document"]["name"], "Shared Loop");
+    }
+
+    #[test]
+    fn handle_loop_import_rejects_missing_format_version_before_touching_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("loop.json");
+        std::fs::write(
+            &file_path,
+            serde_json::json!({"name": "x", "nodes": [], "edges": [], "ensembles": []}).to_string(),
+        )
+        .unwrap();
+
+        // No fake daemon spawned — a request that reaches the network at
+        // all would fail differently (connection refused).
+        let err =
+            handle_loop_import(Some(65535), file_path.to_str().unwrap(), None, None).unwrap_err();
+        assert!(err.to_string().contains("format_version"));
+    }
+
+    #[test]
+    fn handle_loop_import_rejects_unreadable_path() {
+        let err =
+            handle_loop_import(Some(65535), "/nonexistent/loop.json", None, None).unwrap_err();
+        assert!(err.to_string().contains("could not read"));
+    }
+
+    #[test]
+    fn handle_loop_autorun_sends_at() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Draft);
+        let fake = spawn_fake_daemon(serde_json::json!({
+            "content": [{"type": "text", "text": "scheduled"}],
+            "isError": false
+        }));
+        let port: u16 = fake.port.parse().unwrap();
+
+        handle_loop_autorun(
+            &db,
+            Some(port),
+            "loop-1",
+            Some("2026-07-10T09:00:00Z"),
+            None,
+            false,
+        )
+        .expect("autorun should succeed");
+
+        let calls = fake.recorded_calls();
+        assert_eq!(calls[0]["arguments"]["at"], "2026-07-10T09:00:00Z");
+    }
+
+    #[test]
+    fn handle_loop_autorun_cancel_omits_at_and_message() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Draft);
+        let fake = spawn_fake_daemon(serde_json::json!({
+            "content": [{"type": "text", "text": "cancelled"}],
+            "isError": false
+        }));
+        let port: u16 = fake.port.parse().unwrap();
+
+        handle_loop_autorun(&db, Some(port), "loop-1", None, None, true)
+            .expect("autorun cancel should succeed");
+
+        let calls = fake.recorded_calls();
+        assert!(calls[0]["arguments"].get("at").is_none());
+        assert!(calls[0]["arguments"].get("quota_reset_message").is_none());
+    }
+
+    #[test]
+    fn handle_loop_autorun_rejects_no_flags() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Draft);
+        let err = handle_loop_autorun(&db, Some(65535), "loop-1", None, None, false).unwrap_err();
+        assert!(err.to_string().contains("Specify one of"));
+    }
+
+    #[test]
+    fn handle_loop_autorun_rejects_multiple_flags() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Draft);
+        let err = handle_loop_autorun(
+            &db,
+            Some(65535),
+            "loop-1",
+            Some("2026-07-10T09:00:00Z"),
+            None,
+            true,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    /// The case this spec exists for: the daemon is unreachable on the
+    /// resolved port, and the failure must read as "daemon unreachable",
+    /// never as "the loop does not exist" (the loop resolves fine locally
+    /// against the same database `loop list`/`loop info` already read).
+    #[test]
+    fn handle_loop_pause_reports_daemon_unreachable_distinctly_from_not_found() {
+        let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Running);
+
+        for _ in 0..5 {
+            let port: u16 = unused_port().parse().unwrap();
+            match handle_loop_pause(&db, Some(port), "loop-1") {
+                Err(err) => {
+                    let chain: Vec<String> = err.chain().map(ToString::to_string).collect();
+                    assert!(chain
+                        .iter()
+                        .any(|m| m.contains("could not reach the daemon")));
+                    assert!(!chain.iter().any(|m| m.contains("No loop matches")));
+                    return;
+                }
+                Ok(()) => continue,
+            }
+        }
+        panic!("port kept getting claimed by another test after 5 attempts");
     }
 }

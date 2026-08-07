@@ -7,7 +7,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use super::theme::Theme;
-use crate::tui::app::types::{AgentEntry, App, Focus, ProjectTab, SidebarLayer};
+use crate::tui::app::types::{AgentEntry, App, AutomationKind, Focus, ProjectTab, SidebarLayer};
 
 pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let activity_available = app.activity_panel_available();
@@ -41,9 +41,40 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Them
                 h.push(("Esc", "home"));
                 h
             } else {
+                let on_loop = app.sidebar_layer == SidebarLayer::Automation
+                    && app.automation_kind == AutomationKind::Loop;
                 let is_bg = matches!(app.selected_agent(), Some(AgentEntry::Agent(_)));
                 let mut h = vec![("↑↓", "nav"), ("Enter", "focus"), ("Shift+←→", "tab")];
-                if is_bg {
+                if on_loop {
+                    // Run-time controls apply only to the live (non-archived)
+                    // list — an archived loop is inert until restored.
+                    if !app.loop_view_archived {
+                        if let Some(lp) = app.selected_loop() {
+                            for action in crate::tui::app::dialog::available_loop_actions(lp.status)
+                            {
+                                h.push((action.key(), action.label()));
+                            }
+                            h.push(("a", "autorun"));
+                        }
+                    }
+                    h.push(("e", "edit"));
+                    if app.loop_view_archived {
+                        h.push(("R", "restore"));
+                        h.push(("F4", "delete forever"));
+                    } else {
+                        h.push(("F4", "archive"));
+                    }
+                    h.push((
+                        "A",
+                        if app.loop_view_archived {
+                            "loops"
+                        } else if app.archived_loop_count > 0 {
+                            "archived"
+                        } else {
+                            "archive"
+                        },
+                    ));
+                } else if is_bg {
                     h.push(("e", "edit"));
                     h.push(("d", "toggle"));
                     h.push(("F4", "delete"));
@@ -73,6 +104,7 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Them
         Focus::Agent if app.sidebar_layer == SidebarLayer::Knowledge => {
             let mut h = vec![
                 ("Tab/]/[", "tab"),
+                ("Shift+←→", "tab"),
                 ("o/b/k/h", "jump tab"),
                 ("↑↓", "nav list"),
             ];
@@ -107,6 +139,7 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Them
                     h.push(("Shift+←→", "split focus"));
                 } else {
                     h.push(("F4", "end"));
+                    h.push(("Shift+←→", "tab"));
                 }
                 if matches!(app.selected_agent(), Some(AgentEntry::Terminal(_))) {
                     h.push(("Tab", "catalog"));
@@ -125,6 +158,9 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Them
                 let mut h = vec![("F10", "preview"), ("Esc", "home")];
                 if !app.agents_rag_focused {
                     h.push(("e", "edit"));
+                }
+                if !in_split {
+                    h.push(("Shift+←→", "tab"));
                 }
                 if activity_available {
                     h.push(("F3", "activity"));
@@ -618,6 +654,59 @@ mod tests {
         );
     }
 
+    /// App with a `Group` entry selected (so the `is_pty` footer branch
+    /// fires) and, optionally, an active split.
+    fn app_with_selected_group(active_split: bool) -> App {
+        let mut app = make_app();
+        app.focus = Focus::Agent;
+        app.agents = vec![crate::tui::app::types::AgentEntry::Group(0)];
+        app.selected = 0;
+        if active_split {
+            app.active_split_id = Some("test-split".to_string());
+            app.split_groups.push(crate::domain::models::SplitGroup {
+                id: "test-split".to_string(),
+                session_a: "session-a".to_string(),
+                session_b: "session-b".to_string(),
+                orientation: crate::domain::models::SplitOrientation::Horizontal,
+                created_at: chrono::Utc::now(),
+            });
+        }
+        app
+    }
+
+    #[test]
+    fn footer_in_split_advertises_split_focus_not_tab_step() {
+        // Functional requirement 5: the footer must show the binding that
+        // currently applies. With a split active, Shift+←/→ means split-pane
+        // focus, which stays the established, reachable binding.
+        let app = app_with_selected_group(true);
+        let theme = Theme::classic();
+        let text = render_footer_to_text(200, 1, |frame, area| {
+            draw_footer(frame, area, &app, &theme);
+        });
+        assert!(
+            text.contains("split focus"),
+            "with a split active, Shift+\u{2190}\u{2192} must mean split focus: {text}"
+        );
+    }
+
+    #[test]
+    fn footer_in_agent_focus_without_split_advertises_tab_step_not_split_focus() {
+        // Functional requirement 5: without a split, Shift+←/→ steps the
+        // sidebar tab strip instead (now reachable from focus per
+        // functional requirement 1), so the footer must say so, not
+        // advertise the split-focus binding that doesn't apply here.
+        let app = app_with_selected_group(false);
+        let theme = Theme::classic();
+        let text = render_footer_to_text(80, 1, |frame, area| {
+            draw_footer(frame, area, &app, &theme);
+        });
+        assert!(
+            !text.contains("split focus"),
+            "no split is active, so 'split focus' must not be advertised: {text}"
+        );
+    }
+
     #[test]
     fn footer_renders_in_preview_with_playground_active() {
         let mut app = make_app();
@@ -661,5 +750,105 @@ mod tests {
             text.contains("search"),
             "Agent playground footer should show 'search': {text}"
         );
+    }
+
+    fn loop_with_status(status: crate::domain::loops::LoopStatus) -> crate::domain::loops::Loop {
+        crate::domain::loops::Loop {
+            archived: false,
+            id: "lp1".to_string(),
+            name: "Nightly review".to_string(),
+            description: None,
+            workdir: "/tmp".to_string(),
+            status,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        }
+    }
+
+    fn app_on_loop(status: crate::domain::loops::LoopStatus) -> App {
+        let mut app = make_app();
+        app.focus = Focus::Preview;
+        app.sidebar_layer = SidebarLayer::Automation;
+        app.automation_kind = crate::tui::app::AutomationKind::Loop;
+        app.loops = vec![loop_with_status(status)];
+        app.selected_loop_id = Some("lp1".to_string());
+        app
+    }
+
+    #[test]
+    fn footer_on_a_running_loop_offers_only_pause() {
+        let app = app_on_loop(crate::domain::loops::LoopStatus::Running);
+        let theme = Theme::classic();
+        let text = render_footer_to_text(200, 1, |frame, area| {
+            draw_footer(frame, area, &app, &theme);
+        });
+        assert!(text.contains("pause"), "{text}");
+        // "autorun" is always offered and legitimately contains "run" as a
+        // substring — check for the standalone "r run" hint (key + label)
+        // instead, so this doesn't false-positive on "a autorun".
+        assert!(!text.contains("r run"), "{text}");
+        assert!(!text.contains("reset"), "{text}");
+        assert!(!text.contains("continue"), "{text}");
+    }
+
+    #[test]
+    fn footer_on_a_paused_loop_offers_both_continue_modes() {
+        let app = app_on_loop(crate::domain::loops::LoopStatus::Paused);
+        let theme = Theme::classic();
+        let text = render_footer_to_text(200, 1, |frame, area| {
+            draw_footer(frame, area, &app, &theme);
+        });
+        assert!(text.contains("continue (retry)"), "{text}");
+        assert!(text.contains("continue (skip spec)"), "{text}");
+        assert!(!text.contains("pause"), "{text}");
+    }
+
+    #[test]
+    fn footer_on_a_completed_loop_offers_reset_and_run() {
+        let app = app_on_loop(crate::domain::loops::LoopStatus::Completed);
+        let theme = Theme::classic();
+        let text = render_footer_to_text(200, 1, |frame, area| {
+            draw_footer(frame, area, &app, &theme);
+        });
+        assert!(text.contains("reset"), "{text}");
+        assert!(text.contains("run"), "{text}");
+        assert!(!text.contains("pause"), "{text}");
+    }
+
+    #[test]
+    fn footer_always_offers_autorun_for_a_selected_live_loop() {
+        for status in [
+            crate::domain::loops::LoopStatus::Draft,
+            crate::domain::loops::LoopStatus::Running,
+            crate::domain::loops::LoopStatus::Paused,
+            crate::domain::loops::LoopStatus::Completed,
+            crate::domain::loops::LoopStatus::Failed,
+        ] {
+            let app = app_on_loop(status);
+            let theme = Theme::classic();
+            let text = render_footer_to_text(200, 1, |frame, area| {
+                draw_footer(frame, area, &app, &theme);
+            });
+            assert!(text.contains("autorun"), "status {status:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn footer_omits_run_time_controls_in_the_archived_view() {
+        let mut app = app_on_loop(crate::domain::loops::LoopStatus::Completed);
+        app.loop_view_archived = true;
+        let theme = Theme::classic();
+        let text = render_footer_to_text(200, 1, |frame, area| {
+            draw_footer(frame, area, &app, &theme);
+        });
+        assert!(!text.contains("autorun"), "{text}");
+        assert!(!text.contains("reset"), "{text}");
     }
 }

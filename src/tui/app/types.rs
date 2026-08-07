@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
+
 use super::loop_live_state::LoopLiveState;
 use crate::application::notification_service::NotificationService;
 use crate::db::project::{RagInfoSummary, RagQueueItem};
@@ -118,6 +120,21 @@ pub enum ProjectTab {
     History,
 }
 
+/// Per-layer selection remembered across a keyboard tab *step*
+/// (`Shift+←/→`), so stepping away and back lands you where you left off —
+/// unlike a direct jump (mouse click, F2), which deliberately always lands
+/// on the tab's edge item. `Live` and `Automation`'s agent sub-list share
+/// `App::selected` as their index space, so a step away from one clobbers
+/// the other's value; this cache is what lets a step back restore it.
+#[derive(Clone, Default)]
+pub(crate) struct SidebarStepMemory {
+    pub(crate) live_selected: Option<usize>,
+    pub(crate) automation_kind: Option<AutomationKind>,
+    pub(crate) automation_selected: Option<usize>,
+    pub(crate) automation_loop_id: Option<String>,
+    pub(crate) knowledge_selected: Option<usize>,
+}
+
 impl ProjectTab {
     pub const ALL: [ProjectTab; 4] = [
         ProjectTab::Overview,
@@ -156,15 +173,47 @@ pub(crate) struct ProjectPreviewSummary {
     pub loop_running: bool,
 }
 
-/// Per-loop rendering data for the sidebar's `Loops` section — spec progress
-/// and whether the loop is stuck on a reported blocker (a `Paused` loop whose
-/// latest run recorded a `blocker`, see `loop_report_blocker`). Computed once
-/// per refresh cycle (`App::refresh_loops`) rather than queried per frame.
-#[derive(Clone, Copy, Default)]
+/// Per-loop rendering data for the sidebar's `Loops` section: when the loop
+/// last did something, and whether it is stuck on a reported blocker (a
+/// `Paused` loop whose latest run recorded a `blocker`, see
+/// `loop_report_blocker`). Computed once per refresh cycle
+/// (`App::refresh_loops`) rather than queried or formatted per frame — the
+/// sidebar just prints `last_run_label` as-is.
+///
+/// Deliberately not a per-loop spec count: that reads `0/0` for a
+/// queue-driven loop, whose specs live on the queue rather than on the loop
+/// itself (the loop focus view's `state.done_count`/`total_count` is the
+/// correct place for that number, and is unaffected by this struct).
+#[derive(Clone)]
 pub(crate) struct LoopSidebarMeta {
-    pub done: usize,
-    pub total: usize,
+    /// Last recorded activity for this loop: the latest `loop_runs.started_at`
+    /// across every node run belonging to it, or — if it has never run — the
+    /// loop's own `created_at`. A single monotonic "last activity" key that
+    /// is defined for every loop regardless of status — the sort key behind
+    /// `App::sidebar_loops`' most-recent-first ordering.
+    pub last_activity: DateTime<Utc>,
+    /// Precomputed display text for `last_activity`: a compact relative
+    /// time (`2m`, `1h`, `3d`), `"running"` while the loop is actively
+    /// executing, or `"never"` if it has never run.
+    pub last_run_label: String,
     pub blocked: bool,
+    /// `"resumes 5m"`-style label when the loop has a pending
+    /// `loop_schedule_autorun`, `None` otherwise.
+    pub autorun_label: Option<String>,
+}
+
+impl Default for LoopSidebarMeta {
+    /// Only used as a placeholder before the first `refresh_loops` populates
+    /// the real map — every loop gets a real entry on every refresh, so this
+    /// value is never actually shown.
+    fn default() -> Self {
+        Self {
+            last_activity: DateTime::<Utc>::from_timestamp(0, 0).expect("epoch is representable"),
+            last_run_label: String::new(),
+            blocked: false,
+            autorun_label: None,
+        }
+    }
 }
 
 /// Border-focus sub-section within the `Live` layer (interactive/terminal
@@ -178,10 +227,53 @@ pub enum AgentSectionFocus {
     Brain,
 }
 
+/// Which sub-region of the live loop view owns plain arrow-key navigation:
+/// the node graph (`loop_graph_move_highlight`, the long-standing default)
+/// or the spec marker strip at the top (`loop_spec_strip_move_selection`).
+/// Toggled with Tab/BackTab while a loop is the active sidebar selection —
+/// see `on_loop` in `crate::tui::event::home_preview`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum LoopLiveFocus {
+    #[default]
+    Graph,
+    SpecStrip,
+}
+
 #[derive(Clone)]
 pub(crate) enum LoopEditorMode {
     AgentPrompt,
     NodeConfig,
+    /// A [`crate::domain::loops::LoopNodeKind::Router`] node's structured
+    /// routes/fallback/wiring editor — replaces the raw JSON buffer used by
+    /// [`LoopEditorMode::NodeConfig`] with the `router_*` fields below, since
+    /// wiring an edge per route isn't expressible as node config alone.
+    RouterRoutes,
+    /// A node's outgoing `pass`/`fail`/`always` edges — lets an ordinary
+    /// edge be retargeted or deleted, through the same validated path
+    /// (`daemon::handler::retarget_loop_edge`/`delete_loop_edge_checked`)
+    /// the `loop_update_edge`/`loop_delete_edge` MCP tools use, rather than
+    /// only a router's route edges (see [`LoopEditorMode::RouterRoutes`]).
+    Edges,
+}
+
+/// Which sub-field of the currently-focused route row
+/// [`LoopEditorDialog::router_field`] points at.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RouterField {
+    Label,
+    Description,
+    Target,
+}
+
+/// One route being edited in the router routes dialog: the declared
+/// label/description (persisted into the node's `config`) plus the target
+/// node its `route` edge should point at (persisted as a separate
+/// [`crate::domain::loops::LoopEdge`] on save — `None` means not wired yet).
+#[derive(Clone, Default)]
+pub(crate) struct RouterRouteDraft {
+    pub label: String,
+    pub description: String,
+    pub target_node_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -194,6 +286,22 @@ pub(crate) struct LoopEditorDialog {
     pub cursor: usize,
     pub mode: LoopEditorMode,
     pub parse_error: Option<String>,
+    /// `RouterRoutes` mode only, below — unused (empty) otherwise.
+    pub router_routes: Vec<RouterRouteDraft>,
+    pub router_fallback: String,
+    pub router_route_index: usize,
+    pub router_field: RouterField,
+    /// Candidate `(node_id, node_name)` targets a route can wire to: every
+    /// other node in the router's graph.
+    pub router_targets: Vec<(String, String)>,
+    /// `Edges` mode only, below — unused (empty) otherwise. This node's
+    /// outgoing `pass`/`fail`/`always` edges (route edges are managed via
+    /// `RouterRoutes` instead).
+    pub edge_rows: Vec<crate::domain::loops::LoopEdge>,
+    pub edge_row_index: usize,
+    /// Candidate `(node_id, node_name)` retarget destinations: every other
+    /// node in the edge's graph — same pool as `router_targets`.
+    pub edge_targets: Vec<(String, String)>,
 }
 
 impl LoopEditorDialog {
@@ -215,6 +323,254 @@ impl LoopEditorDialog {
             cursor,
             mode,
             parse_error: None,
+            router_routes: Vec::new(),
+            router_fallback: String::new(),
+            router_route_index: 0,
+            router_field: RouterField::Label,
+            router_targets: Vec::new(),
+            edge_rows: Vec::new(),
+            edge_row_index: 0,
+            edge_targets: Vec::new(),
+        }
+    }
+
+    pub fn new_edges(
+        node_id: String,
+        node_name: String,
+        title: String,
+        help: String,
+        edges: Vec<crate::domain::loops::LoopEdge>,
+        targets: Vec<(String, String)>,
+    ) -> Self {
+        Self {
+            node_id,
+            node_name,
+            title,
+            help,
+            buffer: String::new(),
+            cursor: 0,
+            mode: LoopEditorMode::Edges,
+            parse_error: None,
+            router_routes: Vec::new(),
+            router_fallback: String::new(),
+            router_route_index: 0,
+            router_field: RouterField::Label,
+            router_targets: Vec::new(),
+            edge_rows: edges,
+            edge_row_index: 0,
+            edge_targets: targets,
+        }
+    }
+
+    /// Move the `Edges` mode row focus among this node's outgoing edges,
+    /// wrapping. A no-op with zero or one row.
+    pub fn edge_move_row(&mut self, forward: bool) {
+        if self.edge_rows.is_empty() {
+            return;
+        }
+        self.edge_row_index = if forward {
+            (self.edge_row_index + 1) % self.edge_rows.len()
+        } else {
+            (self.edge_row_index + self.edge_rows.len() - 1) % self.edge_rows.len()
+        };
+    }
+
+    /// The edge currently focused in `Edges` mode's row list.
+    pub fn focused_edge(&self) -> Option<&crate::domain::loops::LoopEdge> {
+        self.edge_rows.get(self.edge_row_index)
+    }
+
+    /// The next/previous candidate destination for the focused edge,
+    /// cycling through `edge_targets` (every other node in the graph).
+    /// Unlike [`Self::cycle_router_target`], an ordinary edge always names a
+    /// concrete `to_node`, so there is no `(none)` state to cycle through.
+    pub fn next_edge_target_candidate(&self, forward: bool) -> Option<String> {
+        let edge = self.focused_edge()?;
+        if self.edge_targets.is_empty() {
+            return None;
+        }
+        let current = self
+            .edge_targets
+            .iter()
+            .position(|(id, _)| id == &edge.to_node);
+        let len = self.edge_targets.len();
+        let next_index = match current {
+            Some(index) if forward => (index + 1) % len,
+            Some(index) => (index + len - 1) % len,
+            None => 0,
+        };
+        Some(self.edge_targets[next_index].0.clone())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_router_routes(
+        node_id: String,
+        node_name: String,
+        title: String,
+        help: String,
+        routes: Vec<RouterRouteDraft>,
+        fallback: String,
+        targets: Vec<(String, String)>,
+    ) -> Self {
+        Self {
+            node_id,
+            node_name,
+            title,
+            help,
+            buffer: String::new(),
+            cursor: 0,
+            mode: LoopEditorMode::RouterRoutes,
+            parse_error: None,
+            router_routes: routes,
+            router_fallback: fallback,
+            router_route_index: 0,
+            router_field: RouterField::Label,
+            router_targets: targets,
+            edge_rows: Vec::new(),
+            edge_row_index: 0,
+            edge_targets: Vec::new(),
+        }
+    }
+
+    /// The label/description text behind the focused route's focused field,
+    /// if the focus is on a text field (not the target picker).
+    pub fn router_focused_text_mut(&mut self) -> Option<&mut String> {
+        let field = self.router_field;
+        let route = self.router_routes.get_mut(self.router_route_index)?;
+        match field {
+            RouterField::Label => Some(&mut route.label),
+            RouterField::Description => Some(&mut route.description),
+            RouterField::Target => None,
+        }
+    }
+
+    /// Append to the focused route's focused text field. No-op on the
+    /// target field (see [`Self::cycle_router_target`] instead) — fields are
+    /// short single-line labels, so editing is append/pop-at-end only,
+    /// unlike the free-cursor `buffer` used by the other editor modes.
+    pub fn router_push_char(&mut self, value: char) {
+        if let Some(text) = self.router_focused_text_mut() {
+            text.push(value);
+        }
+    }
+
+    /// Drop the last character of the focused route's focused text field.
+    pub fn router_pop_char(&mut self) {
+        if let Some(text) = self.router_focused_text_mut() {
+            text.pop();
+        }
+    }
+
+    /// Unwire the focused route's target (Backspace while it's focused).
+    pub fn router_clear_target(&mut self) {
+        if let Some(route) = self.router_routes.get_mut(self.router_route_index) {
+            route.target_node_id = None;
+        }
+    }
+
+    /// Cycle the focused route's target through `(none) -> targets... ->
+    /// (none)`, in `router_targets` order.
+    pub fn cycle_router_target(&mut self, forward: bool) {
+        let Some(route) = self.router_routes.get_mut(self.router_route_index) else {
+            return;
+        };
+        if self.router_targets.is_empty() {
+            route.target_node_id = None;
+            return;
+        }
+        let current = route
+            .target_node_id
+            .as_deref()
+            .and_then(|id| self.router_targets.iter().position(|(tid, _)| tid == id));
+        // Index space is `[None, targets[0], targets[1], ...]`.
+        let len = self.router_targets.len() + 1;
+        let current_index = current.map(|i| i + 1).unwrap_or(0);
+        let next_index = if forward {
+            (current_index + 1) % len
+        } else {
+            (current_index + len - 1) % len
+        };
+        route.target_node_id = if next_index == 0 {
+            None
+        } else {
+            Some(self.router_targets[next_index - 1].0.clone())
+        };
+    }
+
+    /// Move route/field focus to the next sub-field, wrapping to the next
+    /// route's first field at the end.
+    pub fn router_next_field(&mut self) {
+        self.router_field = match self.router_field {
+            RouterField::Label => RouterField::Description,
+            RouterField::Description => RouterField::Target,
+            RouterField::Target => {
+                if !self.router_routes.is_empty() {
+                    self.router_route_index =
+                        (self.router_route_index + 1) % self.router_routes.len();
+                }
+                RouterField::Label
+            }
+        };
+    }
+
+    pub fn router_prev_field(&mut self) {
+        self.router_field = match self.router_field {
+            RouterField::Target => RouterField::Description,
+            RouterField::Description => RouterField::Label,
+            RouterField::Label => {
+                if !self.router_routes.is_empty() {
+                    self.router_route_index = self
+                        .router_route_index
+                        .checked_sub(1)
+                        .unwrap_or(self.router_routes.len() - 1);
+                }
+                RouterField::Target
+            }
+        };
+    }
+
+    /// Move the route selection itself (Up/Down), keeping the focused
+    /// sub-field.
+    pub fn router_move_route(&mut self, forward: bool) {
+        if self.router_routes.is_empty() {
+            return;
+        }
+        self.router_route_index = if forward {
+            (self.router_route_index + 1) % self.router_routes.len()
+        } else {
+            self.router_route_index
+                .checked_sub(1)
+                .unwrap_or(self.router_routes.len() - 1)
+        };
+    }
+
+    /// Append a fresh, unwired route and focus it (Ctrl+N).
+    pub fn router_add_route(&mut self) {
+        self.router_routes.push(RouterRouteDraft::default());
+        self.router_route_index = self.router_routes.len() - 1;
+        self.router_field = RouterField::Label;
+    }
+
+    /// Drop the focused route (Ctrl+D). If it was the fallback, the fallback
+    /// is cleared — [`crate::domain::loops::validate_router_routes`] will
+    /// catch an empty/dangling fallback on save.
+    pub fn router_remove_route(&mut self) {
+        if self.router_routes.is_empty() {
+            return;
+        }
+        let removed = self.router_routes.remove(self.router_route_index);
+        if self.router_fallback == removed.label {
+            self.router_fallback.clear();
+        }
+        if self.router_route_index >= self.router_routes.len() {
+            self.router_route_index = self.router_routes.len().saturating_sub(1);
+        }
+    }
+
+    /// Set the focused route as the fallback (Ctrl+F).
+    pub fn router_set_fallback(&mut self) {
+        if let Some(route) = self.router_routes.get(self.router_route_index) {
+            self.router_fallback = route.label.clone();
         }
     }
 
@@ -336,6 +692,9 @@ pub struct App {
     pub(crate) sidebar_layer: SidebarLayer,
     /// Which of Automation's two sub-lists is active for navigation.
     pub(crate) automation_kind: AutomationKind,
+    /// Remembered per-layer selection for `App::step_sidebar_tab`, so a step
+    /// away and back doesn't reset the tab you return to.
+    pub(crate) sidebar_step_memory: SidebarStepMemory,
     /// `Some(tab)` while a project is entered (Focus tab bar showing);
     /// `None` while only highlighted (Preview summary card showing).
     pub(crate) project_focus: Option<ProjectTab>,
@@ -355,7 +714,16 @@ pub struct App {
     pub(crate) pending_launch_dialog: Option<NewAgentDialog>,
     pub(crate) quit_confirm: bool,
     pub(crate) delete_project_confirm: bool,
-    pub(crate) delete_loop_confirm: bool,
+    pub(crate) archive_loop_confirm: bool,
+    /// Permanent-delete confirmation, reachable only from the archived
+    /// view on an already-archived loop — see [`App::permanent_delete_selected_archived_loop`].
+    pub(crate) permanent_delete_loop_confirm: bool,
+    /// Confirmation gate for `loop_reset` (mirrors `archive_loop_confirm`) —
+    /// reset clears progress on every non-completed spec, so it asks first,
+    /// with the same wording the CLI's own prompt uses (see
+    /// `daemon::loop_cli::confirm_reset`) so the two surfaces never teach
+    /// different levels of caution.
+    pub(crate) loop_reset_confirm: bool,
 
     // Brian's Brain automaton (sidebar decoration)
     pub(crate) sidebar_brain: Option<crate::tui::brians_brain::BriansBrain>,
@@ -401,6 +769,18 @@ pub struct App {
     /// tab.
     pub(crate) sidebar_tab_click_map: Vec<(SidebarLayer, u16, u16, u16)>,
     pub(crate) loops: Vec<Loop>,
+    /// Archived loops (excluded from `loops`), populated only while
+    /// `loop_view_archived` is true — see [`App::refresh_loops`].
+    pub(crate) archived_loops: Vec<Loop>,
+    /// Count of archived loops, kept up to date on every refresh so it's
+    /// visible from the main view at all times regardless of
+    /// `loop_view_archived`.
+    pub(crate) archived_loop_count: usize,
+    /// Whether the Loops sidebar section is currently showing the archive
+    /// (`true`) instead of the main list (`false`) — a toggle on the
+    /// existing Loops section rather than a separate sidebar layer, so
+    /// archived loops stay in the same mental place as active ones.
+    pub(crate) loop_view_archived: bool,
     pub(crate) selected_loop_id: Option<String>,
     pub(crate) loop_details: Option<LoopDetails>,
     pub(crate) loop_runs: Vec<LoopNodeRun>,
@@ -423,6 +803,45 @@ pub struct App {
     /// The node id manually highlighted in the live loop view's graph.
     /// Only meaningful while `loop_graph_follow` is `false`.
     pub(crate) loop_graph_selected_node: Option<String>,
+    /// Which sub-region of the live loop view plain arrow keys drive.
+    /// Reset to `Graph` whenever the selected loop changes.
+    pub(crate) loop_live_focus: LoopLiveFocus,
+    /// The spec id manually selected in the live loop view's marker strip
+    /// (independent of `current_spec_id` / the graph's own follow state —
+    /// selecting a spec here never touches `loop_graph_follow`). `None`
+    /// means the strip shows the running/next-pending spec by default.
+    pub(crate) loop_spec_strip_selected: Option<String>,
+    /// First visible index into `LoopLiveState::spec_queue` for the marker
+    /// strip, when there are more specs than fit in the panel's width.
+    pub(crate) loop_spec_strip_scroll: usize,
+    /// How many marker chips fit in the panel's width on the last render —
+    /// used to keep keyboard navigation's scroll offset in sync with what's
+    /// actually drawn. Populated in `draw_loop_live_view`.
+    pub(crate) loop_spec_strip_capacity: usize,
+    /// Mouse hit-test cells for the marker strip, populated during draw:
+    /// `(spec id, row, col_start, col_end)` — mirrors `sidebar_tab_click_map`.
+    pub(crate) loop_spec_strip_click_map: Vec<(String, u16, u16, u16)>,
+    /// Open autorun-scheduling input for the loop currently focused in the
+    /// live view — `None` when not open. See
+    /// [`crate::tui::app::dialog::LoopAutorunDialog`].
+    pub(crate) loop_autorun_dialog: Option<crate::tui::app::dialog::LoopAutorunDialog>,
+    /// True while a loop-control dispatch (`loop_run`/`loop_pause`/
+    /// `loop_continue`/`loop_reset`/`loop_schedule_autorun`) is in flight on
+    /// `loop_action_rx` — guards against a second dispatch racing the first.
+    pub(crate) loop_action_pending: bool,
+    /// Receiver for the background thread running the current loop-control
+    /// dispatch (see `App::dispatch_loop_action`), polled non-blockingly by
+    /// `App::poll_loop_action` every tick so the UI thread never waits on the
+    /// daemon's HTTP round-trip.
+    pub(crate) loop_action_rx:
+        Option<std::sync::mpsc::Receiver<crate::tui::app::dialog::LoopActionOutcome>>,
+    /// The daemon's verbatim response to the last loop-control action, shown
+    /// until dismissed or superseded by the next dispatch — success or
+    /// error, per the loop controls' "always shown, never swallowed" rule.
+    pub(crate) loop_action_message: Option<crate::tui::app::dialog::LoopActionMessage>,
+    /// When the current `loop_action_message` was set — drives its
+    /// auto-dismiss (mirrors `copied_at`/`dismiss_copied`).
+    pub(crate) loop_action_message_at: std::time::Instant,
     /// Standalone/backlog specs (no loop yet), filtered to the selected
     /// project's workdir tag when a project is selected. Refreshed alongside
     /// `projects` in `App::refresh_projects`.
@@ -505,6 +924,17 @@ pub struct App {
     /// Whether the embedding model is currently loaded in the daemon's
     /// memory (synced from daemon_state table — see `rag::status`).
     pub(crate) rag_model_loaded: bool,
+    /// Configured embeddings model id, snapshotted from config.toml at
+    /// startup — lets the status widgets show "unavailable" when the
+    /// configured provider is one this binary cannot serve (see
+    /// `rag::status::compute_rag_status`), instead of only failing at
+    /// query time.
+    pub(crate) rag_embeddings_model: String,
+    /// Current acquisition (download+prepare) state for the configured
+    /// local embedding model, read from daemon_state per-model keys.
+    /// `None` when the model is already fully available or was never
+    /// tracked — the normal ready/sleeping logic applies.
+    pub(crate) rag_acquisition_state: Option<crate::rag::status::AcquisitionState>,
     /// Whether the RagInfo panel has focus in Agents sidebar mode.
     pub(crate) agents_rag_focused: bool,
 
@@ -587,4 +1017,170 @@ pub(crate) struct ProjectRelationDialog {
 pub(crate) struct WorkdirSystemState {
     pub sent: bool,
     pub sent_as_solo: bool,
+}
+
+#[cfg(test)]
+mod router_routes_dialog_tests {
+    use super::{LoopEditorDialog, RouterField, RouterRouteDraft};
+
+    fn dialog_with_routes(labels: &[&str]) -> LoopEditorDialog {
+        let routes = labels
+            .iter()
+            .map(|label| RouterRouteDraft {
+                label: label.to_string(),
+                description: format!("{label} desc"),
+                target_node_id: None,
+            })
+            .collect();
+        let targets = vec![
+            ("n1".to_string(), "Node One".to_string()),
+            ("n2".to_string(), "Node Two".to_string()),
+        ];
+        LoopEditorDialog::new_router_routes(
+            "router1".to_string(),
+            "Classify".to_string(),
+            "title".to_string(),
+            "help".to_string(),
+            routes,
+            String::new(),
+            targets,
+        )
+    }
+
+    #[test]
+    fn router_next_field_cycles_through_a_route_then_advances_to_the_next() {
+        let mut dialog = dialog_with_routes(&["a", "b"]);
+        assert_eq!(dialog.router_field, RouterField::Label);
+
+        dialog.router_next_field();
+        assert_eq!(dialog.router_field, RouterField::Description);
+        assert_eq!(dialog.router_route_index, 0);
+
+        dialog.router_next_field();
+        assert_eq!(dialog.router_field, RouterField::Target);
+        assert_eq!(dialog.router_route_index, 0);
+
+        dialog.router_next_field();
+        assert_eq!(dialog.router_field, RouterField::Label);
+        assert_eq!(dialog.router_route_index, 1, "wraps to the next route");
+    }
+
+    #[test]
+    fn router_prev_field_is_the_exact_inverse() {
+        let mut dialog = dialog_with_routes(&["a", "b"]);
+        dialog.router_route_index = 1;
+        dialog.router_field = RouterField::Label;
+
+        dialog.router_prev_field();
+        assert_eq!(dialog.router_field, RouterField::Target);
+        assert_eq!(
+            dialog.router_route_index, 0,
+            "wraps back to the previous route"
+        );
+    }
+
+    #[test]
+    fn router_push_and_pop_char_edit_the_focused_route_field() {
+        let mut dialog = dialog_with_routes(&["", ""]);
+        dialog.router_routes[0].description.clear();
+        dialog.router_field = RouterField::Label;
+        dialog.router_push_char('b');
+        dialog.router_push_char('i');
+        dialog.router_push_char('n');
+        assert_eq!(dialog.router_routes[0].label, "bin");
+
+        dialog.router_pop_char();
+        assert_eq!(dialog.router_routes[0].label, "bi");
+
+        dialog.router_next_field();
+        dialog.router_push_char('x');
+        assert_eq!(dialog.router_routes[0].description, "x");
+        // The other route is untouched.
+        assert_eq!(dialog.router_routes[1].label, "");
+    }
+
+    #[test]
+    fn cycle_router_target_moves_through_none_and_every_candidate() {
+        let mut dialog = dialog_with_routes(&["a"]);
+        assert_eq!(dialog.router_routes[0].target_node_id, None);
+
+        dialog.cycle_router_target(true);
+        assert_eq!(
+            dialog.router_routes[0].target_node_id.as_deref(),
+            Some("n1")
+        );
+
+        dialog.cycle_router_target(true);
+        assert_eq!(
+            dialog.router_routes[0].target_node_id.as_deref(),
+            Some("n2")
+        );
+
+        dialog.cycle_router_target(true);
+        assert_eq!(
+            dialog.router_routes[0].target_node_id, None,
+            "wraps back to unwired after the last candidate"
+        );
+
+        dialog.cycle_router_target(false);
+        assert_eq!(
+            dialog.router_routes[0].target_node_id.as_deref(),
+            Some("n2")
+        );
+    }
+
+    #[test]
+    fn router_clear_target_unwires_the_focused_route() {
+        let mut dialog = dialog_with_routes(&["a"]);
+        dialog.router_routes[0].target_node_id = Some("n1".to_string());
+        dialog.router_clear_target();
+        assert_eq!(dialog.router_routes[0].target_node_id, None);
+    }
+
+    #[test]
+    fn router_add_route_appends_and_focuses_a_fresh_unwired_route() {
+        let mut dialog = dialog_with_routes(&["a", "b"]);
+        dialog.router_add_route();
+
+        assert_eq!(dialog.router_routes.len(), 3);
+        assert_eq!(dialog.router_route_index, 2);
+        assert_eq!(dialog.router_field, RouterField::Label);
+        assert_eq!(dialog.router_routes[2].label, "");
+        assert_eq!(dialog.router_routes[2].target_node_id, None);
+    }
+
+    #[test]
+    fn router_remove_route_drops_it_and_clears_a_dangling_fallback() {
+        let mut dialog = dialog_with_routes(&["a", "b", "c"]);
+        dialog.router_fallback = "b".to_string();
+        dialog.router_route_index = 1;
+
+        dialog.router_remove_route();
+
+        assert_eq!(dialog.router_routes.len(), 2);
+        assert!(dialog.router_routes.iter().all(|r| r.label != "b"));
+        assert_eq!(
+            dialog.router_fallback, "",
+            "fallback naming the removed route is cleared, not left dangling"
+        );
+    }
+
+    #[test]
+    fn router_remove_route_keeps_an_unrelated_fallback() {
+        let mut dialog = dialog_with_routes(&["a", "b", "c"]);
+        dialog.router_fallback = "a".to_string();
+        dialog.router_route_index = 1; // removes "b"
+
+        dialog.router_remove_route();
+
+        assert_eq!(dialog.router_fallback, "a");
+    }
+
+    #[test]
+    fn router_set_fallback_names_the_focused_route() {
+        let mut dialog = dialog_with_routes(&["a", "b"]);
+        dialog.router_route_index = 1;
+        dialog.router_set_fallback();
+        assert_eq!(dialog.router_fallback, "b");
+    }
 }

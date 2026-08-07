@@ -11,7 +11,7 @@ use crate::daemon::process::KILL_GRACE;
 use crate::db::Database;
 use crate::domain::loops::{
     EnsembleDetails, EnsembleMember, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind,
-    LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus,
+    LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus, RouterRoute,
 };
 use crate::domain::models::Cli;
 
@@ -37,7 +37,7 @@ pub struct LoopEngine {
     /// concurrently across every loop this engine drives. Shared (not
     /// per-run) so an 8-member ensemble in one loop can't starve another
     /// loop's ensemble running at the same time — they queue for the same
-    /// pool of permits.
+    /// queue of permits.
     ensemble_concurrency: Arc<Semaphore>,
     /// Backing store (S1) for resolving skills pinned on agent nodes (S2)
     /// at spawn time. `None` in engines built without one (most tests) —
@@ -70,12 +70,15 @@ enum SpecExecutionOutcome {
     },
     Paused,
     Failed(String),
-    /// This spec's in-flight node run was terminated because a newer attempt at
-    /// the same node superseded it (B42). Pure engine bookkeeping, not a node
-    /// failure: the dispatch that owned the superseded run stops silently —
-    /// it routes down no edge, fails nothing, and completes nothing. The newer
-    /// attempt (or, for a duplicate resume, the dispatch that won the loop
-    /// claim) is what now drives the loop.
+    /// This spec's in-flight node run was terminated out from under this
+    /// dispatch by the engine itself — a newer attempt at the same node
+    /// (B42), a concurrent `loop_reset`, `loop_pause`, iteration-budget
+    /// exhaustion, or `fail_loop`'s own sweep — see
+    /// `run_was_terminated_out_of_band`. Pure engine bookkeeping, not a node
+    /// failure: the dispatch that owned the run stops silently — it routes
+    /// down no edge, fails nothing, and completes nothing. Whatever
+    /// terminated it (a newer attempt, or the dispatch that won the loop
+    /// claim after a reset) is what now drives the loop.
     Superseded,
 }
 
@@ -86,7 +89,7 @@ struct NodeExecution {
 }
 
 /// (B17) Distinct failure mode for [`LoopEngine::run_loop_dispatch`]'s launch
-/// guard: the loop's effective spec set (bound specs, or the given pool's
+/// guard: the loop's effective spec set (bound specs, or the given queue's
 /// pending members) was empty, so the run never actually launched. Unlike
 /// every other error `run_loop_dispatch` can return, this one must never flip
 /// the loop to `Failed` — [`LoopEngine::start_background_run`] and
@@ -136,7 +139,7 @@ impl LoopEngine {
     }
 
     /// Same as [`Self::start_background`], but optionally drives the loop's
-    /// pending pool specs (see [`Self::run_loop`]) and/or overrides the
+    /// pending queue specs (see [`Self::run_loop`]) and/or overrides the
     /// workdir for this run only.
     ///
     /// This is a fresh dispatch, not a resume — it backs `loop_run`, the tool
@@ -151,12 +154,12 @@ impl LoopEngine {
     pub fn start_background_run(
         self: Arc<Self>,
         loop_id: String,
-        pool_id: Option<String>,
+        queue_id: Option<String>,
         workdir_override: Option<String>,
     ) {
         tokio::spawn(async move {
             if let Err(error) = self
-                .run_loop(loop_id.clone(), pool_id, workdir_override)
+                .run_loop(loop_id.clone(), queue_id, workdir_override)
                 .await
             {
                 if error.downcast_ref::<EmptySpecSetError>().is_some() {
@@ -166,7 +169,7 @@ impl LoopEngine {
                     tracing::error!("Loop '{}' launch refused: {error:#}", loop_id);
                 } else {
                     tracing::error!("Loop '{}' failed to run: {error:#}", loop_id);
-                    let _ = self.fail_loop(&loop_id, None, &error.to_string());
+                    let _ = self.fail_loop(&loop_id, None, None, &error.to_string());
                 }
             }
         });
@@ -202,24 +205,24 @@ impl LoopEngine {
 
     /// Run `loop_id`'s specs through its graph (R2).
     ///
-    /// With `pool_id`: runs the pool's pending members, in the pool's queue
-    /// order, instead of the loop's own bound specs. Pool membership never
+    /// With `queue_id`: runs the queue's pending members, in the queue's queue
+    /// order, instead of the loop's own bound specs. Queue membership never
     /// mutates the specs themselves — they stay standalone (`loop_id: None`)
-    /// so the same pool can be run by different loops over time.
+    /// so the same queue can be run by different loops over time.
     ///
-    /// A pool run is *live* (R6): the "next pending" spec is re-queried from
-    /// the pool at every spec boundary via
-    /// [`Database::pool_next_pending_spec_id`], never off a list captured at
-    /// launch. That's what lets `pool_add_spec`/`pool_reorder` calls made
+    /// A queue run is *live* (R6): the "next pending" spec is re-queried from
+    /// the queue at every spec boundary via
+    /// [`Database::queue_next_pending_spec_id`], never off a list captured at
+    /// launch. That's what lets `queue_add_spec`/`queue_reorder` calls made
     /// while the run is in flight actually change what runs next — the run
     /// ends only when a pick finds no pending member left. A bound run (no
-    /// `pool_id`) keeps the pre-pool behavior below: its spec list is fixed
+    /// `queue_id`) keeps the pre-queue behavior below: its spec list is fixed
     /// at launch.
     ///
     /// `workdir_override`, when set, wins over `loop.workdir` for this run
     /// only — the loop's own `workdir` is left untouched.
     ///
-    /// Without `pool_id`: identical to the pre-pool behavior (bound specs,
+    /// Without `queue_id`: identical to the pre-queue behavior (bound specs,
     /// `loop.workdir`).
     ///
     /// Equivalent to a fresh (non-resumed) dispatch — see
@@ -228,17 +231,17 @@ impl LoopEngine {
     pub async fn run_loop(
         &self,
         loop_id: String,
-        pool_id: Option<String>,
+        queue_id: Option<String>,
         workdir_override: Option<String>,
     ) -> Result<()> {
-        self.run_loop_dispatch(loop_id, pool_id, workdir_override, false)
+        self.run_loop_dispatch(loop_id, queue_id, workdir_override, false)
             .await
     }
 
     /// Core of [`Self::run_loop`], plus the one bit `run_loop`'s public
     /// signature can't carry: whether this call is *resuming* an
     /// already-in-flight run ([`Self::resume_background`], the sole path
-    /// behind `loop_continue` and interrupted-pool/autorun resumption) or a
+    /// behind `loop_continue` and interrupted-queue/autorun resumption) or a
     /// fresh dispatch (`loop_run`, including relaunching a `paused` loop
     /// directly, and the loop's initial launch).
     ///
@@ -254,7 +257,7 @@ impl LoopEngine {
     async fn run_loop_dispatch(
         &self,
         loop_id: String,
-        pool_id: Option<String>,
+        queue_id: Option<String>,
         workdir_override: Option<String>,
         is_resume: bool,
     ) -> Result<()> {
@@ -270,7 +273,7 @@ impl LoopEngine {
         // untouched and record no run, so monitoring never sees a false
         // `completed` over a backlog the caller simply failed to point this
         // launch at (the 2026-07-14T14:16:31Z incident).
-        if let Some(message) = self.empty_launch_check(&loop_id, pool_id.as_deref())? {
+        if let Some(message) = self.empty_launch_check(&loop_id, queue_id.as_deref())? {
             return Err(EmptySpecSetError(message).into());
         }
 
@@ -284,9 +287,19 @@ impl LoopEngine {
         // of the atomic claim finds the loop already `Running` and returns a
         // silent no-op rather than starting a duplicate run that would
         // supersede the winner's in-flight node the moment it reached the same
-        // node. It touches nothing (no status flip, no pool context, no
+        // node. It touches nothing (no status flip, no queue context, no
         // notification), leaving the loop exactly as the winning dispatch left it.
-        if !self.db.claim_loop_for_run(&loop_id, chrono::Utc::now())? {
+        // Captured once, right at the claim, as this dispatch's own
+        // generation marker — `claim_loop_for_run` persists it as the loop's
+        // `started_at`, so a LATER re-fetch of that column tells this exact
+        // dispatch (not just any dispatch) whether it's still the current
+        // one. `fail_loop` compares against it before acting, so a stale
+        // dispatch's late failure can never flip status or sweep runs out
+        // from under whichever fresher dispatch has since claimed the loop
+        // (the 2026-08-05 incident: a reset + relaunch raced a still-live
+        // dispatch, and the loser's late `Fail` took the winner down with it).
+        let claimed_at = chrono::Utc::now();
+        if !self.db.claim_loop_for_run(&loop_id, claimed_at)? {
             tracing::info!(
                 "Loop '{}' is already running; this launch is a duplicate and was refused \
                  (another dispatch owns the run).",
@@ -294,16 +307,16 @@ impl LoopEngine {
             );
             return Ok(());
         }
-        // Persist which pool (if any) this run is drawing from *before* the
+        // Persist which queue (if any) this run is drawing from *before* the
         // first spec executes, so an interruption (quota failure, daemon
         // crash) leaves behind the context every resume path needs — a
         // resumed run must never fall back to the loop's own (often empty)
         // bound specs. `None` for a bound-spec run, overwriting whatever a
         // previous run against this loop may have left behind.
         self.db
-            .set_loop_active_run_pool(&loop_id, pool_id.as_deref())?;
+            .set_loop_active_run_queue(&loop_id, queue_id.as_deref())?;
 
-        // The run's `workdir` param wins over `loop.workdir` — a pool run can
+        // The run's `workdir` param wins over `loop.workdir` — a queue run can
         // point the same loop's graph at a different checkout without
         // mutating the loop itself.
         let workdir = workdir_override.unwrap_or_else(|| lp.workdir.clone());
@@ -312,14 +325,14 @@ impl LoopEngine {
         // `loop_run`, a cron/watch trigger) and a resume (`loop_continue`,
         // autorun's auto-reset-and-resume) alike — every path that reaches
         // this function is a run actually starting to execute.
-        let (done, total_specs) = self.spec_progress(&loop_id, pool_id.as_deref())?;
+        let (done, total_specs) = self.spec_progress(&loop_id, queue_id.as_deref())?;
         // "Resumed" vs "Started": a resume of an in-flight run (autorun /
         // loop_continue), or any dispatch where prior specs already completed,
         // shouldn't read as the loop starting over from scratch. The first
         // spec this dispatch will work is surfaced so the toast says what's
         // next, not just a count.
         let resumed = is_resume || done > 0;
-        let first_pending = self.first_pending_spec_name(&loop_id, pool_id.as_deref())?;
+        let first_pending = self.first_pending_spec_name(&loop_id, queue_id.as_deref())?;
         self.notification_service.notify_loop_started(
             &lp.name,
             total_specs,
@@ -334,9 +347,9 @@ impl LoopEngine {
         // see `render_completion_hook_prompt`.
         let mut completed_specs: Vec<(String, String)> = Vec::new();
 
-        match &pool_id {
-            Some(pool_id) => {
-                // R3 (B18): a pool member can be left `running` with no live
+        match &queue_id {
+            Some(queue_id) => {
+                // R3 (B18): a queue member can be left `running` with no live
                 // node run behind it by a path G2 boot reconcile never
                 // touches (reconcile only reconciles a loop that was itself
                 // `Running` at boot — see `reconcile_orphaned_loops`). Surface
@@ -348,33 +361,33 @@ impl LoopEngine {
                 // Auto-resetting would risk yanking a spec out from under a
                 // dispatch that's still actively working it. Recovery stays
                 // the documented manual path: `loop_reset` (see
-                // `pool_has_incomplete_members`'s own guard below, which
+                // `queue_has_incomplete_members`'s own guard below, which
                 // leaves the loop `running` rather than completing out from
                 // under a member stuck like this).
                 for spec_id in self
                     .db
-                    .pool_stale_running_members(pool_id, crate::system::boot_id().as_deref())?
+                    .queue_stale_running_members(queue_id, crate::system::boot_id().as_deref())?
                 {
                     tracing::warn!(
-                        "Loop '{}' pool run against '{}': member spec '{}' is 'running' with no \
+                        "Loop '{}' queue run against '{}': member spec '{}' is 'running' with no \
                          live node run in this daemon's lifetime; leaving it as-is. Reset it via \
                          loop_reset to resume if it's genuinely stuck.",
                         loop_id,
-                        pool_id,
+                        queue_id,
                         spec_id
                     );
                 }
                 // B35: When resuming (retry_current_node), re-dispatch the
                 // spec that was already `running` before falling through to
-                // the pending-picker. Without this, pool_next_pending_spec_id
+                // the pending-picker. Without this, queue_next_pending_spec_id
                 // skips the running spec (it only picks `pending`) and the
                 // loop advances to the next queue member, stranding the
                 // original spec in `running` with no active run.
                 if is_resume {
-                    if let Some(running_spec_id) = self.db.pool_running_spec_id(pool_id)? {
+                    if let Some(running_spec_id) = self.db.queue_running_spec_id(queue_id)? {
                         if let Some(spec) = self.db.get_loop_spec(&running_spec_id)? {
                             match self
-                                .run_spec(&lp, &spec, &workdir, is_resume, Some(pool_id.as_str()))
+                                .run_spec(&lp, &spec, &workdir, is_resume, Some(queue_id.as_str()))
                                 .await?
                             {
                                 SpecExecutionOutcome::Completed { summary } => {
@@ -387,7 +400,12 @@ impl LoopEngine {
                                     return Ok(())
                                 }
                                 SpecExecutionOutcome::Failed(summary) => {
-                                    self.fail_loop(&loop_id, Some(&spec.name), &summary)?;
+                                    self.fail_loop(
+                                        &loop_id,
+                                        Some(claimed_at),
+                                        Some(&spec.name),
+                                        &summary,
+                                    )?;
                                     return Ok(());
                                 }
                             }
@@ -399,11 +417,12 @@ impl LoopEngine {
                         return Ok(());
                     }
                     // Live pick: fresh query, not a frozen list. Only ever
-                    // returns a spec whose status is `pending` (defense in
-                    // depth — even if the pool's stored order were ever
-                    // corrupted to place a running/completed member where a
-                    // pending one belongs, this filter still won't pick it).
-                    let Some(spec_id) = self.db.pool_next_pending_spec_id(pool_id)? else {
+                    // returns a spec whose status is `pending` or
+                    // `interrupted` (defense in depth — even if the queue's
+                    // stored order were ever corrupted to place a
+                    // running/completed member where a runnable one belongs,
+                    // this filter still won't pick it).
+                    let Some(spec_id) = self.db.queue_next_pending_spec_id(queue_id)? else {
                         break;
                     };
                     let Some(spec) = self.db.get_loop_spec(&spec_id)? else {
@@ -411,7 +430,7 @@ impl LoopEngine {
                     };
 
                     match self
-                        .run_spec(&lp, &spec, &workdir, is_resume, Some(pool_id.as_str()))
+                        .run_spec(&lp, &spec, &workdir, is_resume, Some(queue_id.as_str()))
                         .await?
                     {
                         SpecExecutionOutcome::Completed { summary } => {
@@ -422,7 +441,7 @@ impl LoopEngine {
                             return Ok(())
                         }
                         SpecExecutionOutcome::Failed(summary) => {
-                            self.fail_loop(&loop_id, Some(&spec.name), &summary)?;
+                            self.fail_loop(&loop_id, Some(claimed_at), Some(&spec.name), &summary)?;
                             return Ok(());
                         }
                     }
@@ -449,7 +468,7 @@ impl LoopEngine {
                             return Ok(())
                         }
                         SpecExecutionOutcome::Failed(summary) => {
-                            self.fail_loop(&loop_id, Some(&spec.name), &summary)?;
+                            self.fail_loop(&loop_id, Some(claimed_at), Some(&spec.name), &summary)?;
                             return Ok(());
                         }
                     }
@@ -457,37 +476,37 @@ impl LoopEngine {
             }
         }
 
-        // A pool run's live-pick loop above only ever breaks when no
+        // A queue run's live-pick loop above only ever breaks when no
         // `pending` member remains — but a member can still be stuck
         // `running`/`failed` from a prior interrupted run that was never
-        // reset. That isn't a genuinely finished pool, so the loop must not
+        // reset. That isn't a genuinely finished queue, so the loop must not
         // be marked `completed` out from under it (it would silently strand
         // those members forever, exactly the false-completion this guards
         // against).
-        if let Some(pool_id) = &pool_id {
-            if self.db.pool_has_incomplete_members(pool_id)? {
+        if let Some(queue_id) = &queue_id {
+            if self.db.queue_has_incomplete_members(queue_id)? {
                 tracing::warn!(
-                    "Loop '{}' pool run against '{}' found no pending member to pick, but the \
-                     pool still has incomplete (non completed/skipped) member(s); leaving the \
+                    "Loop '{}' queue run against '{}' found no pending member to pick, but the \
+                     queue still has incomplete (non completed/skipped) member(s); leaving the \
                      loop as-is rather than marking it completed. Reset the stuck member(s) via \
                      loop_reset to resume.",
                     loop_id,
-                    pool_id
+                    queue_id
                 );
                 return Ok(());
             }
         }
 
-        // The run is genuinely finished, but keep `active_run_pool_id` as
+        // The run is genuinely finished, but keep `active_run_queue_id` as
         // last-run context rather than clearing it (B31): a finished
-        // pool-driven loop with no bound specs of its own would otherwise
+        // queue-driven loop with no bound specs of its own would otherwise
         // lose the only link back to the queue it ran, so `loop list` /
         // `loop info` render a misleading `0/0` instead of its real `n/n`
         // (`loop_progress` in `daemon/loop_cli.rs` reads this field). B8's
         // anti-pollution guarantee is unaffected: every launch path
         // re-persists this field before the first spec runs (the
-        // unconditional `set_loop_active_run_pool` above), so a later fresh
-        // `loop_run` against a different pool — or a bound-spec run (`None`)
+        // unconditional `set_loop_active_run_queue` above), so a later fresh
+        // `loop_run` against a different queue — or a bound-spec run (`None`)
         // — overwrites this value rather than inheriting it.
         self.db.update_loop_status(
             &loop_id,
@@ -495,11 +514,11 @@ impl LoopEngine {
             None,
             Some(chrono::Utc::now()),
         )?;
-        let (done, total) = self.spec_progress(&loop_id, pool_id.as_deref())?;
+        let (done, total) = self.spec_progress(&loop_id, queue_id.as_deref())?;
         // (B17) This dispatch's own completed-spec count is what makes a
         // completion "real": a run that never actually executed a spec this
         // dispatch (every bound spec was already completed/skipped, or —
-        // resuming a pool — the last pending member got skipped out from
+        // resuming a queue — the last pending member got skipped out from
         // under it) still legitimately transitions to `Completed`, but must
         // never fire `on_completed` for work it didn't do.
         let executed_any_spec = !completed_specs.is_empty();
@@ -625,7 +644,7 @@ impl LoopEngine {
     }
 
     /// (B17) `Ok(Some(message))` if launching `loop_id` (optionally against
-    /// `pool_id`) would find no effective spec to run — `message` is the
+    /// `queue_id`) would find no effective spec to run — `message` is the
     /// actionable, human/LLM-readable error to surface. `Ok(None)` means the
     /// launch may proceed.
     ///
@@ -637,26 +656,26 @@ impl LoopEngine {
     /// check from `run_loop_dispatch` itself.
     ///
     /// Emptiness is defined per launch mode:
-    /// - Bound specs (`pool_id` is `None`): the loop has *zero* specs bound
+    /// - Bound specs (`queue_id` is `None`): the loop has *zero* specs bound
     ///   to it at all — mirrors the incident exactly (a loop whose specs all
-    ///   live in a pool has no bound specs). Deliberately not "every bound
+    ///   live in a queue has no bound specs). Deliberately not "every bound
     ///   spec is already completed/skipped" — a loop's own bound specs
     ///   belong to it 1:1, so if they're all done the loop genuinely is
     ///   finished (see the zero-execution completion path in
     ///   `run_loop_dispatch`, which still completes but never fires the
     ///   hook).
-    /// - A pool (`pool_id` is `Some`): the pool has no `pending` member *and*
+    /// - A queue (`queue_id` is `Some`): the queue has no `pending` member *and*
     ///   no other non-terminal (`running`/`failed`) member left either — i.e.
-    ///   [`Database::pool_has_incomplete_members`] is false. Unlike bound
-    ///   specs, a pool is a shared queue another loop or a stale relaunch can
+    ///   [`Database::queue_has_incomplete_members`] is false. Unlike bound
+    ///   specs, a queue is a shared queue another loop or a stale relaunch can
     ///   easily point at by mistake, so "every member already done" is
     ///   treated as an error here rather than a silent, do-nothing
-    ///   completion (regression (b): a pool run where every member is
+    ///   completion (regression (b): a queue run where every member is
     ///   already completed).
     pub fn empty_launch_check(
         &self,
         loop_id: &str,
-        pool_id: Option<&str>,
+        queue_id: Option<&str>,
     ) -> Result<Option<String>> {
         let Some(lp) = self.db.get_loop(loop_id)? else {
             // Not-found is handled by the caller (`run_loop_dispatch` bails
@@ -665,40 +684,40 @@ impl LoopEngine {
             return Ok(None);
         };
 
-        let is_empty = match pool_id {
-            Some(pool_id) => !self.db.pool_has_incomplete_members(pool_id)?,
+        let is_empty = match queue_id {
+            Some(queue_id) => !self.db.queue_has_incomplete_members(queue_id)?,
             None => self.db.list_loop_specs(loop_id)?.is_empty(),
         };
         if !is_empty {
             return Ok(None);
         }
 
-        Ok(Some(self.empty_spec_set_message(&lp, pool_id)?))
+        Ok(Some(self.empty_spec_set_message(&lp, queue_id)?))
     }
 
     /// Build the actionable error text for [`Self::empty_launch_check`].
     ///
-    /// Pool membership doesn't record which loop(s) normally draw from it
-    /// (pool specs stay standalone — see [`Self::run_loop`]'s doc), so the
-    /// one concrete, discoverable link back to "which pool should this loop
-    /// use?" is the loop's own [`crate::domain::loops::Loop::active_run_pool_id`]
-    /// — the pool its last real run drew from. This is exactly requirement 3's
-    /// guard rail: a pool-less relaunch of a loop that was last pool-driven
-    /// names that pool so a recovery agent can retry correctly instead of
-    /// the launch silently discarding the pool context.
+    /// Queue membership doesn't record which loop(s) normally draw from it
+    /// (queue specs stay standalone — see [`Self::run_loop`]'s doc), so the
+    /// one concrete, discoverable link back to "which queue should this loop
+    /// use?" is the loop's own [`crate::domain::loops::Loop::active_run_queue_id`]
+    /// — the queue its last real run drew from. This is exactly requirement 3's
+    /// guard rail: a queue-less relaunch of a loop that was last queue-driven
+    /// names that queue so a recovery agent can retry correctly instead of
+    /// the launch silently discarding the queue context.
     fn empty_spec_set_message(
         &self,
         lp: &crate::domain::loops::Loop,
-        pool_id: Option<&str>,
+        queue_id: Option<&str>,
     ) -> Result<String> {
-        match pool_id {
-            Some(pool_id) => {
-                let total = self.db.list_pool_member_spec_ids(pool_id)?.len();
+        match queue_id {
+            Some(queue_id) => {
+                let total = self.db.list_queue_member_spec_ids(queue_id)?.len();
                 Ok(format!(
                     "Loop '{}' has no specs to run: queue '{}' has {} member(s), none pending \
                      (all already completed/skipped, or the queue is empty). Add pending specs \
                      to the queue, or pass a different queue_id.",
-                    lp.name, pool_id, total
+                    lp.name, queue_id, total
                 ))
             }
             None => {
@@ -707,11 +726,11 @@ impl LoopEngine {
                      given.",
                     lp.name
                 );
-                match &lp.active_run_pool_id {
-                    Some(last_pool) => {
+                match &lp.active_run_queue_id {
+                    Some(last_queue) => {
                         message.push_str(&format!(
-                            " Its last run drew from queue '{last_pool}' — pass queue_id: \
-                             \"{last_pool}\" to relaunch against it."
+                            " Its last run drew from queue '{last_queue}' — pass queue_id: \
+                             \"{last_queue}\" to relaunch against it."
                         ));
                     }
                     None => {
@@ -723,11 +742,11 @@ impl LoopEngine {
         }
     }
 
-    /// Resume `loop_id` in the background using whatever run context (pool
-    /// or bound-spec) it last persisted via [`Database::set_loop_active_run_pool`].
+    /// Resume `loop_id` in the background using whatever run context (queue
+    /// or bound-spec) it last persisted via [`Database::set_loop_active_run_queue`].
     /// The one path every "continue where this loop left off" entry point —
     /// the scheduler's autorun auto-reset-and-resume, `loop_continue` — must
-    /// go through, so a pool run is never silently swapped for the loop's own
+    /// go through, so a queue run is never silently swapped for the loop's own
     /// (typically empty) bound specs.
     ///
     /// This is the *only* entry point allowed to carry `is_resume = true`
@@ -737,22 +756,22 @@ impl LoopEngine {
     /// [`Self::start_background_run`] instead and always gets a fresh
     /// baseline.
     pub fn resume_background(self: Arc<Self>, loop_id: String) {
-        let pool_id = self
+        let queue_id = self
             .db
             .get_loop(&loop_id)
             .ok()
             .flatten()
-            .and_then(|lp| lp.active_run_pool_id);
+            .and_then(|lp| lp.active_run_queue_id);
         tokio::spawn(async move {
             if let Err(error) = self
-                .run_loop_dispatch(loop_id.clone(), pool_id, None, true)
+                .run_loop_dispatch(loop_id.clone(), queue_id, None, true)
                 .await
             {
                 if error.downcast_ref::<EmptySpecSetError>().is_some() {
                     tracing::error!("Loop '{}' launch refused: {error:#}", loop_id);
                 } else {
                     tracing::error!("Loop '{}' failed to run: {error:#}", loop_id);
-                    let _ = self.fail_loop(&loop_id, None, &error.to_string());
+                    let _ = self.fail_loop(&loop_id, None, None, &error.to_string());
                 }
             }
         });
@@ -772,7 +791,7 @@ impl LoopEngine {
         spec: &LoopSpec,
         workdir: &str,
         is_resume: bool,
-        pool_id: Option<&str>,
+        queue_id: Option<&str>,
     ) -> Result<SpecExecutionOutcome> {
         let spec_details = self
             .db
@@ -837,7 +856,7 @@ impl LoopEngine {
         //   silently reused because status alone couldn't distinguish "same
         //   attempt, paused" from "different, abandoned attempt".
         // - `spec.status == Running` — this spec itself has already started
-        //   (as opposed to a pending/failed spec a resumed pool/loop run is
+        //   (as opposed to a pending/failed spec a resumed queue/loop run is
         //   only now reaching for the first time, which must capture fresh
         //   like any other new entry).
         //
@@ -877,15 +896,15 @@ impl LoopEngine {
         let mut resumable_sessions: HashMap<String, String> = HashMap::new();
 
         // RS3: the context group this spec belongs to within the running
-        // queue, if any. Only pool/queue runs carry a group (a loop's own
-        // bound specs never do — `pool_id` is `None` there), so ungrouped and
+        // queue, if any. Only queue/queue runs carry a group (a loop's own
+        // bound specs never do — `queue_id` is `None` there), so ungrouped and
         // non-queue specs never cross-resume. This is the ONE deliberate
         // exception to RS2's "first visit is cold" rule: the first visit of a
         // grouped spec to a node resumes the session captured by the previous
         // successfully-completed grouped sibling on that same node (see the
         // seed below and [`Database::group_session_for_node`]).
-        let spec_group = match pool_id {
-            Some(pid) => self.db.pool_member_group(pid, &spec.id)?,
+        let spec_group = match queue_id {
+            Some(pid) => self.db.queue_member_group(pid, &spec.id)?,
             None => None,
         };
 
@@ -956,6 +975,18 @@ impl LoopEngine {
                     // node's previous run in this dispatch → resume.
                     let mut resume_candidate = resumable_sessions.get(node_id.as_str()).cloned();
 
+                    // RS3/R1: whether `resume_candidate` (once populated below)
+                    // crosses a spec boundary — i.e. was captured by a DIFFERENT
+                    // spec, not this one. `group_session_for_node` only ever
+                    // returns a session belonging to an earlier-positioned
+                    // sibling (see its query), so any hit from it is a
+                    // cross-spec resume by construction; the RS2 in-dispatch map
+                    // above is always this spec's own session, so a hit there
+                    // never is. This is the ONE thing `render_resume_prompt`
+                    // needs to know to decide whether the new spec has ever
+                    // been shown to the resumed session.
+                    let mut resume_crosses_spec = false;
+
                     // RS3 group-session handoff: a grouped spec's FIRST visit to
                     // this node (nothing yet in `resumable_sessions` for it)
                     // resumes the group's live session for this node — the
@@ -968,13 +999,14 @@ impl LoopEngine {
                     // (map already populated) keep RS2's in-dispatch session and
                     // never re-consult the group.
                     if resume_candidate.is_none() {
-                        if let (Some(group), Some(pid)) = (spec_group.as_deref(), pool_id) {
+                        if let (Some(group), Some(pid)) = (spec_group.as_deref(), queue_id) {
                             resume_candidate = self.db.group_session_for_node(
                                 pid,
                                 group,
                                 &spec.id,
                                 node_id.as_str(),
                             )?;
+                            resume_crosses_spec = resume_candidate.is_some();
                         }
                     }
                     let mut run_id = uuid::Uuid::new_v4().to_string();
@@ -1036,6 +1068,7 @@ impl LoopEngine {
                                 &run_id,
                                 workdir,
                                 resume_candidate.as_deref(),
+                                resume_crosses_spec,
                             )
                             .await?;
                         let run = self.db.get_loop_run(&run_id)?.ok_or_else(|| {
@@ -1054,7 +1087,19 @@ impl LoopEngine {
                             // session if it managed to create one before dying;
                             // an infra crash at spawn usually created none, so
                             // this is normally `None` → the retry cold-starts.
-                            resume_candidate = run.session_id.clone();
+                            // If the crashed attempt was itself a cross-spec
+                            // (RS3) resume and it continued the SAME foreign
+                            // session before dying, the retry is still that
+                            // same cross-spec resume; any other outcome (a
+                            // fresh session captured on cold fallback, or none
+                            // at all) means the retry is not, and the next
+                            // `execute_node` call renders normally for
+                            // whichever case it's in.
+                            let new_candidate = run.session_id.clone();
+                            resume_crosses_spec = resume_crosses_spec
+                                && new_candidate.is_some()
+                                && new_candidate == resume_candidate;
+                            resume_candidate = new_candidate;
                             run_id = begin_infra_retry(
                                 &self.db,
                                 lp,
@@ -1082,16 +1127,21 @@ impl LoopEngine {
                         "node run completed"
                     );
 
-                    // B42: a newer attempt at this node terminated this run out
-                    // from under us (see `terminate_run`/`SUPERSEDE_REASON`).
-                    // That is engine bookkeeping — the run's `Fail` row is a
-                    // reclaim, not a node failure — so this dispatch stops here:
-                    // it evaluates NO edge (never the fail edge to a resilience
-                    // node), fails nothing, and leaves the loop to whichever
-                    // dispatch now owns it. Checked before any routing so the
-                    // supersede can never be routed as a fail (the runaway that
-                    // manufactured a resilience run per killed implementer).
-                    if run_was_superseded(&run) {
+                    // B42/2026-08-05: something terminated this run out from
+                    // under us — a newer attempt at this node, a concurrent
+                    // `loop_reset`, `loop_pause`, or budget/`fail_loop`
+                    // sweep (see `run_was_terminated_out_of_band`). That is
+                    // engine bookkeeping, not a node failure — so this
+                    // dispatch stops here: it evaluates NO edge (never the
+                    // fail edge to a resilience node), fails nothing, and
+                    // leaves the loop to whichever dispatch now owns it.
+                    // Checked before any routing so the termination can
+                    // never be routed as a fail (the runaway that
+                    // manufactured a resilience run per killed implementer,
+                    // and the incident where a stale dispatch's late
+                    // completion failed a loop out from under a healthy
+                    // sibling dispatch).
+                    if run_was_terminated_out_of_band(&run) {
                         return Ok(SpecExecutionOutcome::Superseded);
                     }
 
@@ -1165,7 +1215,7 @@ impl LoopEngine {
                             None,
                             Some(chrono::Utc::now()),
                         )?;
-                        self.notify_spec_completed(lp, spec, pool_id)?;
+                        self.notify_spec_completed(lp, spec, queue_id)?;
                         return Ok(SpecExecutionOutcome::Completed {
                             summary: final_execution.summary,
                         });
@@ -1199,8 +1249,26 @@ impl LoopEngine {
                 }
             };
 
-            let step_selection =
-                select_next_step(edges, &ensembles, &from_node_id, final_execution.status)?;
+            // A router that finished `Pass` routes by its chosen label
+            // (`select_router_step`), never by Pass/Fail/Always
+            // (`select_next_step`) — a router's verdict has no notion of
+            // success/failure. A failed router (spawn failure/timeout, per
+            // `execute_router_node`) falls through to `select_next_step`
+            // exactly like any other node's fail edge.
+            let is_routed_router = nodes_by_id
+                .get(from_node_id.as_str())
+                .is_some_and(|node| node.kind == LoopNodeKind::Router)
+                && final_execution.status == LoopRunStatus::Pass;
+            let step_selection = if is_routed_router {
+                let route_label = final_execution
+                    .output
+                    .get("route")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                select_router_step(edges, &from_node_id, route_label)?
+            } else {
+                select_next_step(edges, &ensembles, &from_node_id, final_execution.status)?
+            };
 
             let run_id_field = run_id.as_deref().unwrap_or("");
             match &step_selection {
@@ -1212,6 +1280,7 @@ impl LoopEngine {
                             to_node = %target,
                             status = ?final_execution.status,
                             edge_condition = sel.edge_condition.as_str(),
+                            route = sel.edge_condition.route_label().unwrap_or(""),
                             "edge traversed"
                         );
                     }
@@ -1233,6 +1302,18 @@ impl LoopEngine {
                         status = ?final_execution.status,
                         "no outgoing edge matched; spec terminating"
                     );
+                    if final_execution.status == LoopRunStatus::Fail {
+                        if let Some(terminal_run_id) = run_id.as_deref() {
+                            let node_name = nodes_by_id
+                                .get(from_node_id.as_str())
+                                .map_or(from_node_id.as_str(), |node| node.name.as_str());
+                            self.record_terminal_blocker(
+                                terminal_run_id,
+                                node_name,
+                                &final_execution,
+                            )?;
+                        }
+                    }
                 }
             }
 
@@ -1250,7 +1331,7 @@ impl LoopEngine {
                         None,
                         Some(chrono::Utc::now()),
                     )?;
-                    self.notify_spec_completed(lp, spec, pool_id)?;
+                    self.notify_spec_completed(lp, spec, queue_id)?;
                     return Ok(SpecExecutionOutcome::Completed {
                         summary: final_execution.summary,
                     });
@@ -1266,6 +1347,43 @@ impl LoopEngine {
                 }
             }
         }
+    }
+
+    /// A spec that terminates because a FAILING node had no outgoing edge
+    /// leaves no blocker anywhere a human can see unless something writes
+    /// one — see the module-level defect this closes. Writes a derived
+    /// blocker onto the terminating run's `output.blocker`, the exact key
+    /// `loop_run_blocker` (daemon/handler.rs) already reads for `loop_list`
+    /// and `loop_get`'s `blocked`/`blocker` fields, so no reader needs to
+    /// change. Never invoked for a PASSING termination (the normal, correct
+    /// end of a spec — see `Check committed`) and never overwrites a
+    /// blocker `loop_report_blocker` already recorded, since that text is
+    /// more specific than anything derived here.
+    fn record_terminal_blocker(
+        &self,
+        run_id: &str,
+        node_name: &str,
+        final_execution: &NodeExecution,
+    ) -> anyhow::Result<()> {
+        if final_execution.output.get("blocker").is_some() {
+            return Ok(());
+        }
+        let blocker = format!(
+            "Spec terminated: node '{}' ended '{}' with no outgoing edge for that status. {}",
+            node_name,
+            final_execution.status.as_str(),
+            final_execution.summary,
+        );
+        let mut output = final_execution.output.clone();
+        match output.as_object_mut() {
+            Some(map) => {
+                map.insert("blocker".to_string(), Value::String(blocker));
+            }
+            None => output = serde_json::json!({ "blocker": blocker }),
+        }
+        self.db
+            .update_loop_run_result(run_id, final_execution.status, Some(&output), None)?;
+        Ok(())
     }
 
     /// Run an ensemble's members concurrently (F1), wait for every one of
@@ -1390,6 +1508,12 @@ impl LoopEngine {
                                 &member_run_id,
                                 &workdir,
                                 resume_candidate.as_deref(),
+                                // RS3 group-session handoff is scoped to the
+                                // sequential bounce path only; an ensemble
+                                // member's own resume (B19 infra-retry) is
+                                // always its own crashed attempt's session,
+                                // never a different spec's.
+                                false,
                                 dynamic_skills.as_ref(),
                             )
                             .await?;
@@ -1618,6 +1742,7 @@ impl LoopEngine {
         run_id: &str,
         workdir: &str,
         resume_session_id: Option<&str>,
+        resume_crosses_spec: bool,
     ) -> Result<NodeExecution> {
         match node.kind {
             LoopNodeKind::Check => {
@@ -1634,6 +1759,7 @@ impl LoopEngine {
                     run_id,
                     workdir,
                     resume_session_id,
+                    resume_crosses_spec,
                     self.dynamic_skills.as_ref(),
                 )
                 .await
@@ -1646,6 +1772,9 @@ impl LoopEngine {
                 "Quorum node '{}' cannot execute directly; it only runs as part of ensemble fan-out.",
                 node.name
             ),
+            LoopNodeKind::Router => {
+                execute_router_node(&self.db, node, previous_output, run_id, workdir).await
+            }
         }
     }
 
@@ -1668,14 +1797,54 @@ impl LoopEngine {
             .is_some_and(|lp| lp.status == LoopStatus::Paused))
     }
 
-    fn fail_loop(&self, loop_id: &str, spec_name: Option<&str>, summary: &str) -> Result<()> {
+    /// Fail `loop_id`, sweeping every run still `running` under it — but
+    /// only when `dispatch_started_at` (this call's claimed generation, from
+    /// `run_loop_dispatch`'s own atomic claim) still matches the loop's
+    /// current `started_at`. A mismatch means a newer dispatch has since
+    /// claimed the loop (a reset + relaunch raced this one), so this call is
+    /// itself the stale one: it must not flip status out from under the
+    /// fresher dispatch, and — critically — must not sweep `list_running_loop_runs`,
+    /// which would otherwise terminate that fresher dispatch's entirely
+    /// healthy runs (the 2026-08-05 incident this guards against). `None`
+    /// skips the check (the two catch-all call sites in
+    /// `start_background_run`/`resume_background` have no captured
+    /// generation to compare, since the error they're reacting to already
+    /// unwound out of `run_loop_dispatch`'s scope) — decision-4's broadened
+    /// `run_was_terminated_out_of_band` check is what keeps a stale run's
+    /// completion from reaching either of those paths in the first place.
+    fn fail_loop(
+        &self,
+        loop_id: &str,
+        dispatch_started_at: Option<chrono::DateTime<chrono::Utc>>,
+        spec_name: Option<&str>,
+        summary: &str,
+    ) -> Result<()> {
+        if let Some(expected) = dispatch_started_at {
+            let current_started_at = self.db.get_loop(loop_id)?.and_then(|lp| lp.started_at);
+            let still_current =
+                current_started_at.is_some_and(|at| at.timestamp() == expected.timestamp());
+            if !still_current {
+                tracing::info!(
+                    "Loop '{}' failure from a stale dispatch (claimed at {}) ignored — a newer \
+                     dispatch has since taken over; this attempt's own run row already records \
+                     its own outcome.",
+                    loop_id,
+                    expected.to_rfc3339()
+                );
+                return Ok(());
+            }
+        }
+
         self.db
             .update_loop_status(loop_id, LoopStatus::Failed, None, Some(chrono::Utc::now()))?;
         // B12 catch-all: whatever hard-error path got us here (a node
         // timeout already kills its own process before bubbling up, but a
         // DB error or any other error class reaching this point wouldn't
         // have), make sure nothing is left running under this now-failed
-        // loop.
+        // loop. Safe to sweep every run still `running` under `loop_id`
+        // unscoped: the generation check above already established that no
+        // newer dispatch has claimed the loop since this one did, so
+        // anything still `running` here can only belong to this dispatch.
         for run in self.db.list_running_loop_runs(loop_id).unwrap_or_default() {
             self.terminate_run(&run, "loop run failed");
         }
@@ -1711,13 +1880,13 @@ impl LoopEngine {
     }
 
     /// `(done, total)` specs for `loop_id`'s current run — the loop's bound
-    /// specs, or `pool_id`'s members when this run is drawing from a pool.
+    /// specs, or `queue_id`'s members when this run is drawing from a queue.
     /// `done` counts specs already `completed`; skipped/pending/running/failed
     /// specs count toward `total` but not `done`.
-    fn spec_progress(&self, loop_id: &str, pool_id: Option<&str>) -> Result<(usize, usize)> {
-        match pool_id {
-            Some(pool_id) => {
-                let ids = self.db.list_pool_member_spec_ids(pool_id)?;
+    fn spec_progress(&self, loop_id: &str, queue_id: Option<&str>) -> Result<(usize, usize)> {
+        match queue_id {
+            Some(queue_id) => {
+                let ids = self.db.list_queue_member_spec_ids(queue_id)?;
                 let mut done = 0;
                 for id in &ids {
                     if let Some(spec) = self.db.get_loop_spec(id)? {
@@ -1747,10 +1916,10 @@ impl LoopEngine {
         &self,
         lp: &crate::domain::loops::Loop,
         spec: &LoopSpec,
-        pool_id: Option<&str>,
+        queue_id: Option<&str>,
     ) -> Result<()> {
-        let (done, total) = self.spec_progress(&lp.id, pool_id)?;
-        let next_pending = self.first_pending_spec_name(&lp.id, pool_id)?;
+        let (done, total) = self.spec_progress(&lp.id, queue_id)?;
+        let next_pending = self.first_pending_spec_name(&lp.id, queue_id)?;
         self.notification_service.notify_spec_completed(
             &lp.name,
             &spec.name,
@@ -1761,17 +1930,18 @@ impl LoopEngine {
         Ok(())
     }
 
-    /// Name of the next spec this run will work: the pool's next pending
-    /// member for a pool run, else the loop's first `running`-or-`pending`
-    /// bound spec in position order. `None` when nothing is left to do.
+    /// Name of the next spec this run will work: the queue's next pending
+    /// member for a queue run, else the loop's first
+    /// `running`-or-`pending`-or-`interrupted` bound spec in position order.
+    /// `None` when nothing is left to do.
     fn first_pending_spec_name(
         &self,
         loop_id: &str,
-        pool_id: Option<&str>,
+        queue_id: Option<&str>,
     ) -> Result<Option<String>> {
-        match pool_id {
-            Some(pool_id) => {
-                let Some(spec_id) = self.db.pool_next_pending_spec_id(pool_id)? else {
+        match queue_id {
+            Some(queue_id) => {
+                let Some(spec_id) = self.db.queue_next_pending_spec_id(queue_id)? else {
                     return Ok(None);
                 };
                 Ok(self.db.get_loop_spec(&spec_id)?.map(|spec| spec.name))
@@ -1782,9 +1952,12 @@ impl LoopEngine {
                     .iter()
                     .find(|spec| spec.status == LoopSpecStatus::Running)
                     .or_else(|| {
-                        specs
-                            .iter()
-                            .find(|spec| spec.status == LoopSpecStatus::Pending)
+                        specs.iter().find(|spec| {
+                            matches!(
+                                spec.status,
+                                LoopSpecStatus::Pending | LoopSpecStatus::Interrupted
+                            )
+                        })
                     });
                 Ok(next.map(|spec| spec.name.clone()))
             }
@@ -1826,10 +1999,33 @@ fn merge_attempt_marker(output: &Value, attempt: u32, is_crash: bool) -> Value {
 /// semantic pass, a failure past the crash window, or a permanent spawn
 /// failure (binary not found, permission denied) is never an infra crash.
 ///
+/// Also never an infra crash: an empty-stdout `Fail` from
+/// [`agent_finished_execution`] (marked `no_output`). That case is a process
+/// that ran to completion and exited cleanly — nothing "crashed" — so it's a
+/// different failure shape than a fast nonzero-exit death, and the two must
+/// not be conflated. A spawn/runtime crash is plausibly transient (a flaky
+/// fork, a momentarily-unavailable resource) and retrying it can land
+/// differently; an agent that starts fine, exits 0, and says nothing is far
+/// more often a deterministic misconfiguration (the `mimo-auto`/`mimocode`
+/// incident: an unsupported model name that fails identically every time).
+/// Retrying that would burn the infra-retry budget reproducing the same
+/// empty result before finally reaching the fail edge — delaying, not
+/// preventing, the exact ping-pong this fix exists to stop. So it fails
+/// plainly and routes down the fail edge on the first attempt, same as any
+/// other semantic fail, leaving the resilience/medic node downstream free to
+/// diagnose it immediately instead of after a few silent retries.
+///
 /// Shared by the sequential node path ([`LoopEngine::run_spec`]) and, since
 /// B26, by ensemble members ([`LoopEngine::execute_ensemble`]) — both use the
 /// identical rule so a crashed member is retried exactly like a lone node and
 /// only counts as failed for the join once its retries are exhausted.
+///
+/// Also never an infra crash: a `require_report` downgrade (marked
+/// `failure_kind: "no_report"` by [`agent_finished_execution`]). Same
+/// reasoning as `no_output` — the process ran to completion, exited 0, and
+/// simply never called `loop_complete_node`; retrying would reproduce the
+/// identical silent result up to the retry budget before finally reaching the
+/// fail edge the node opted into by setting the flag in the first place.
 fn is_infra_crash(
     node: &LoopNode,
     execution: &NodeExecution,
@@ -1844,8 +2040,17 @@ fn is_infra_crash(
         .get("spawn_permanent")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let no_output = execution
+        .output
+        .get("no_output")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let no_report =
+        execution.output.get("failure_kind").and_then(Value::as_str) == Some("no_report");
     !self_reported
         && !permanent
+        && !no_output
+        && !no_report
         && node.kind == LoopNodeKind::Agent
         && execution.status == LoopRunStatus::Fail
         && (chrono::Utc::now() - run.started_at).num_seconds() < crash_max_secs as i64
@@ -2161,6 +2366,13 @@ fn self_reported_execution(run: Option<&LoopNodeRun>, node: &LoopNode) -> Option
 /// capture skipped), and — if the resume flag is rejected / crashes at spawn —
 /// falls back to a byte-identical cold start whose verdict the node then uses.
 /// Every other case cold-starts exactly as before.
+///
+/// `resume_crosses_spec` (RS3) marks the one exception to "only feedback, no
+/// spec": when the session being resumed was captured by a DIFFERENT spec (a
+/// context-group handoff), the resumed session has never seen this spec's
+/// content, so the incremental prompt renders it — plus a boundary notice
+/// that the previous spec is done — instead of the bare feedback-only
+/// template. See [`render_resume_prompt`].
 #[allow(clippy::too_many_arguments)]
 async fn execute_agent_node(
     db: &Arc<Database>,
@@ -2171,6 +2383,7 @@ async fn execute_agent_node(
     run_id: &str,
     workdir: &str,
     resume_session_id: Option<&str>,
+    resume_crosses_spec: bool,
     dynamic_skills: Option<&Arc<crate::dynamic_skills::SkillStore>>,
 ) -> Result<NodeExecution> {
     let cli_name = node
@@ -2197,11 +2410,19 @@ async fn execute_agent_node(
     // ── RS2 resume attempt ──────────────────────────────────────────────
     if let Some(sid) = resume_session_id {
         if node_allows_resume && base_strategy.supports_resume_by_id() {
-            let resume_template = node
-                .config
-                .get("resume_prompt")
-                .and_then(Value::as_str)
-                .unwrap_or(RESUME_PROMPT_DEFAULT);
+            // RS3: a cross-spec resume always uses the engine's own boundary
+            // template, ignoring any node-level `resume_prompt` override —
+            // the choice depends on runtime state (which spec the resumed
+            // session was captured under) that a static per-node template
+            // cannot know, so it is not the node's to make.
+            let resume_template = if resume_crosses_spec {
+                RESUME_PROMPT_CROSS_SPEC_DEFAULT
+            } else {
+                node.config
+                    .get("resume_prompt")
+                    .and_then(Value::as_str)
+                    .unwrap_or(RESUME_PROMPT_DEFAULT)
+            };
             let resume_prompt = render_resume_prompt(
                 lp,
                 spec,
@@ -2236,13 +2457,20 @@ async fn execute_agent_node(
             // failure)? Fall back to a cold start whose result the node uses.
             // A resumed run that did real work and then failed (slow, or a
             // timeout) is a genuine fail and routes normally — never redone.
+            // A `require_report` downgrade (`failure_kind: "no_report"`) is
+            // excluded the same way `is_infra_crash` excludes it: the process
+            // ran to completion and exited 0, so it never "crashed at spawn"
+            // — it must route down the fail edge, not get silently redone.
             let (_, crash_max_secs, _) = read_infra_config(node);
             let elapsed = run
                 .as_ref()
                 .map(|r| (chrono::Utc::now() - r.started_at).num_seconds())
                 .unwrap_or(i64::MAX);
-            let resume_failed_at_spawn =
-                execution.status == LoopRunStatus::Fail && elapsed < crash_max_secs as i64;
+            let no_report =
+                execution.output.get("failure_kind").and_then(Value::as_str) == Some("no_report");
+            let resume_failed_at_spawn = execution.status == LoopRunStatus::Fail
+                && elapsed < crash_max_secs as i64
+                && !no_report;
             if !resume_failed_at_spawn {
                 return Ok(execution);
             }
@@ -2536,6 +2764,7 @@ async fn run_agent_process(
                 "model": model,
                 "error": "timed out",
                 "timeout_minutes": timeout_minutes,
+                "prompt_source": agent_prompt_source(&node.config),
             });
             let _ = db.update_loop_run_result(
                 run_id,
@@ -2556,23 +2785,150 @@ async fn run_agent_process(
             exit_code,
             stdout,
             stderr,
-        }) => Ok(NodeExecution {
-            status: if exit_code == 0 {
-                LoopRunStatus::Pass
-            } else {
-                LoopRunStatus::Fail
-            },
-            output: serde_json::json!({
-                "kind": "agent",
-                "node_id": node.id,
-                "cli": cli.as_str(),
-                "model": model,
-                "exit_code": exit_code,
-                "stdout": stdout,
-                "stderr": stderr,
-            }),
-            summary: format!("Agent node '{}' exited with code {}.", node.name, exit_code),
-        }),
+        }) => {
+            // The self-report tool call (if any) lands on the run row over
+            // MCP while the process is still alive, so by the time it has
+            // exited and `wait` has returned here, the row already carries
+            // its final word — reusing `self_reported_execution`'s own
+            // "did it self-report" check (`run.status != Running`) rather
+            // than re-deriving it.
+            let run = db.get_loop_run(run_id)?;
+            let self_reported = self_reported_execution(run.as_ref(), node).is_some();
+            Ok(agent_finished_execution(
+                node,
+                cli,
+                model,
+                exit_code,
+                &stdout,
+                &stderr,
+                self_reported,
+            ))
+        }
+    }
+}
+
+/// Turn a completed (non-timeout, non-spawn-failure) CLI run into its
+/// verdict. `exit_code == 0` is necessary but not sufficient for `Pass`: a
+/// CLI that fails to start its model, prints to stderr, and still exits 0
+/// produces empty stdout — no self-report, no route answer, nothing a
+/// downstream node can read as a result. Crediting that with `Pass` is
+/// exactly the defect from the 2026-08 `mimocode`/`mimo-auto` incident,
+/// where four such runs were routed down the `pass` edge and the resilience
+/// node whose entire job was to catch this never ran once.
+///
+/// So: empty stdout is `Fail` regardless of `exit_code`, marked `no_output`
+/// so [`is_infra_crash`] can tell it apart from a fast nonzero-exit crash
+/// (see that function's doc comment for why the two must not be treated the
+/// same), and — when stderr has text — carried into `error` so
+/// [`member_output_text`]'s existing `error` fallback surfaces it in an
+/// ensemble's consolidated doc, and a downstream node reading
+/// `{{previous_feedback}}` (the whole JSON blob, not just `stdout`) sees it
+/// too instead of a silent `(none)`.
+///
+/// An agent that exits 0 with real stdout keeps passing exactly as before —
+/// this only changes the empty-stdout case, which used to be an
+/// unconditional `Pass`.
+///
+/// `self_reported` — whether this run's row already carries a
+/// `loop_complete_node`/`loop_report_blocker` verdict — decides two more
+/// things unrelated to `zero_exit_no_output`:
+///
+/// - `unreported: true` is stamped on the output whenever it's `false`,
+///   whatever the verdict ends up being. This is unconditional (not gated on
+///   `require_report`) so a resilience node downstream can always tell "the
+///   harness ran and chose not to report" apart from "the harness never ran",
+///   without any config of its own.
+/// - When the node opts in with `require_report: true` in its config, an
+///   otherwise-passing run (exit 0, real stdout) that never self-reported is
+///   downgraded to `Fail` with `failure_kind: "no_report"`. This is the hole
+///   `zero_exit_no_output` doesn't cover: codex, copilot and antigravity have
+///   all been observed exiting 0 with non-empty stdout — including the
+///   model's own success sentinel — while every tool call they attempted was
+///   refused or unavailable and nothing was actually done. Self-reporting
+///   always wins regardless of this flag: this function only ever runs for
+///   the *unreported* branch (see the `self_reported_execution` check at
+///   this function's call sites), so there is no case here where an explicit
+///   `graph_complete_node` verdict could be overridden.
+fn agent_finished_execution(
+    node: &LoopNode,
+    cli: &Cli,
+    model: Option<&str>,
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+    self_reported: bool,
+) -> NodeExecution {
+    // Only the exit-0 + empty-stdout combination is the new failure shape
+    // (a process that ran to completion and said nothing). A nonzero exit
+    // with empty stdout is the ordinary fast-crash signature `is_infra_crash`
+    // already retries — most crashing CLIs print nothing before dying — so it
+    // must NOT pick up the `no_output` marker or this fix would silently
+    // stop retrying every plain crash that happens not to log to stdout.
+    let zero_exit_no_output = exit_code == 0 && stdout.is_empty();
+    let exit_says_pass = exit_code == 0 && !zero_exit_no_output;
+
+    let require_report = node
+        .config
+        .get("require_report")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let no_report_override = require_report && !self_reported && exit_says_pass;
+
+    let status = if exit_says_pass && !no_report_override {
+        LoopRunStatus::Pass
+    } else {
+        LoopRunStatus::Fail
+    };
+    let mut output = serde_json::json!({
+        "kind": "agent",
+        "node_id": node.id,
+        "cli": cli.as_str(),
+        "model": model,
+        "exit_code": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+        "prompt_source": agent_prompt_source(&node.config),
+    });
+    if zero_exit_no_output {
+        let reason = if stderr.is_empty() {
+            "agent produced no output".to_string()
+        } else {
+            format!("agent produced no output; stderr: {stderr}")
+        };
+        if let Value::Object(map) = &mut output {
+            map.insert("no_output".to_string(), Value::Bool(true));
+            map.insert("error".to_string(), Value::String(reason));
+        }
+    }
+    if !self_reported {
+        if let Value::Object(map) = &mut output {
+            map.insert("unreported".to_string(), Value::Bool(true));
+        }
+    }
+    if no_report_override {
+        if let Value::Object(map) = &mut output {
+            map.insert(
+                "failure_kind".to_string(),
+                Value::String("no_report".to_string()),
+            );
+        }
+    }
+    NodeExecution {
+        status,
+        summary: if no_report_override {
+            format!(
+                "Agent node '{}' exited 0 but never called loop_complete_node (require_report).",
+                node.name
+            )
+        } else if zero_exit_no_output {
+            format!(
+                "Agent node '{}' produced no output (exit code 0).",
+                node.name
+            )
+        } else {
+            format!("Agent node '{}' exited with code {}.", node.name, exit_code)
+        },
+        output,
     }
 }
 
@@ -2588,6 +2944,7 @@ fn agent_spawn_failure(
         "cli": cli.as_str(),
         "model": model,
         "error": error.message,
+        "prompt_source": agent_prompt_source(&node.config),
     });
     // A permanent failure is recorded with its reason so the run reads as
     // "failed fast on purpose" rather than "retried and gave up" — the two
@@ -2607,6 +2964,193 @@ fn agent_spawn_failure(
             node.name, error.message
         ),
     }
+}
+
+/// Read a router node's `routes` + `fallback` straight from its `config`.
+/// The shape (`2`-`8` unique-labeled routes, a fallback naming one of them)
+/// is already enforced at `loop_add_node`/`loop_update_node` time (see
+/// `daemon::handler::validate_node_config`'s `Router` arm) — this only
+/// defends against that guard somehow having been bypassed, so it bails with
+/// a generic engine error rather than re-deriving the MCP layer's messages.
+fn parse_router_config(node: &LoopNode) -> Result<(Vec<RouterRoute>, String)> {
+    let map = node
+        .config
+        .as_object()
+        .ok_or_else(|| anyhow!("Router node '{}' has a non-object config.", node.name))?;
+    let routes = map
+        .get("routes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            anyhow!(
+                "Router node '{}' config is missing a 'routes' array.",
+                node.name
+            )
+        })?
+        .iter()
+        .map(|entry| RouterRoute {
+            label: entry
+                .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            description: entry
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        })
+        .collect::<Vec<_>>();
+    let fallback = map
+        .get("fallback")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            anyhow!(
+                "Router node '{}' config is missing a 'fallback' label.",
+                node.name
+            )
+        })?
+        .to_string();
+    Ok((routes, fallback))
+}
+
+/// Compose a router node's one-shot prompt: its input (the previous node's
+/// output, bounded the same way [`render_agent_prompt`] bounds
+/// `{{previous_feedback}}`) plus its declared routes with descriptions and a
+/// hard instruction to answer with exactly one route label and nothing else.
+/// Deliberately carries none of `render_agent_prompt`'s
+/// `loop_complete_node`/`loop_report_blocker` reporting contract — a router
+/// never self-reports; its whole answer is read straight from process
+/// stdout by [`match_router_token`].
+fn render_router_prompt(previous_output: Option<&Value>, routes: &[RouterRoute]) -> String {
+    let input = previous_output
+        .map(|value| serde_json::to_string_pretty(value).unwrap_or_default())
+        .unwrap_or_else(|| "(none)".to_string());
+    let input = bound_previous_feedback(input);
+    let route_list = routes
+        .iter()
+        .map(|route| format!("- {}: {}", route.label, route.description))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "# [INPUT]\n{input}\n\n# [ROUTES]\nPick exactly one route below and answer with ONLY its label — no punctuation, no explanation, nothing before or after it.\n\n{route_list}\n"
+    )
+}
+
+/// Strict single-token match of a router's raw answer against its declared
+/// routes: trim the whole answer and compare it for exact equality against
+/// each label — never a substring/`contains` check (that's exactly what
+/// would let a bare route word inside narration silently trigger a route).
+/// `None` means the raw answer didn't cleanly name a declared route, so the
+/// caller falls back to the node's declared fallback route.
+fn match_router_token<'a>(raw_answer: &str, routes: &'a [RouterRoute]) -> Option<&'a str> {
+    let token = raw_answer.trim();
+    routes
+        .iter()
+        .find(|route| route.label == token)
+        .map(|route| route.label.as_str())
+}
+
+/// Execute a router node (M2): spawn the configured platform/model exactly
+/// like an agent node's cold start ([`execute_agent_node`]), then read its
+/// one-shot answer straight from stdout — a router never self-reports via
+/// `loop_complete_node`, so [`self_reported_execution`] never applies here,
+/// and it never resumes a prior session (there is nothing to continue: each
+/// visit is an independent classification).
+///
+/// A spawn failure or timeout is a node failure like any other node's —
+/// `run_agent_process`'s own `Fail` verdict is returned unchanged, and the
+/// caller in `run_spec` routes it through the graph's ordinary fail edge
+/// (see the `select_router_step` vs. `select_next_step` branch there). Any
+/// run that actually finished instead always resolves `Pass` with a chosen
+/// route: the raw answer matched against a declared label if it is exactly
+/// one, or the node's declared fallback — logged either way (chosen route +
+/// raw answer) so an operator can see what the model actually said, per
+/// B43's node-run lifecycle logging.
+async fn execute_router_node(
+    db: &Database,
+    node: &LoopNode,
+    previous_output: Option<&Value>,
+    run_id: &str,
+    workdir: &str,
+) -> Result<NodeExecution> {
+    let (routes, fallback) = parse_router_config(node)?;
+
+    let cli_name = node
+        .config
+        .get("platform")
+        .or_else(|| node.config.get("cli"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("Router node '{}' is missing a platform/cli.", node.name))?;
+    let cli = Cli::resolve(Some(cli_name)).map_err(anyhow::Error::msg)?;
+    let model = node.config.get("model").and_then(Value::as_str);
+    let timeout_minutes = node
+        .config
+        .get("timeout_minutes")
+        .and_then(Value::as_u64)
+        .unwrap_or(30);
+    let base_strategy = cli.strategy();
+
+    let prompt = render_router_prompt(previous_output, &routes);
+    let strategy = sized_strategy(&base_strategy, &prompt);
+
+    let execution = run_agent_process(
+        db,
+        run_id,
+        &cli,
+        &strategy,
+        node,
+        &prompt,
+        model,
+        workdir,
+        timeout_minutes,
+        None,
+    )
+    .await?;
+
+    if execution.status != LoopRunStatus::Pass {
+        return Ok(execution);
+    }
+
+    let raw_answer = execution
+        .output
+        .get("stdout")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let (chosen_route, used_fallback) = match match_router_token(&raw_answer, &routes) {
+        Some(label) => (label.to_string(), false),
+        None => (fallback.clone(), true),
+    };
+
+    tracing::info!(
+        run_id,
+        node = %node.name,
+        route = %chosen_route,
+        raw_answer = %raw_answer,
+        used_fallback,
+        "router node decided route"
+    );
+
+    Ok(NodeExecution {
+        status: LoopRunStatus::Pass,
+        output: serde_json::json!({
+            "kind": "router",
+            "node_id": node.id,
+            "cli": cli.as_str(),
+            "model": model,
+            "raw_answer": raw_answer,
+            "route": chosen_route,
+            "used_fallback": used_fallback,
+        }),
+        summary: format!(
+            "Router node '{}' selected route '{}'{}.",
+            node.name,
+            chosen_route,
+            if used_fallback { " (fallback)" } else { "" }
+        ),
+    })
 }
 
 /// Hard cap on how long a session-list invocation may run during
@@ -2853,7 +3397,11 @@ fn evaluate_success_condition(condition: &str, exit_code: i32, output: &str) -> 
     bail!("Unsupported success condition '{}'.", condition)
 }
 
-fn find_entry_node(nodes: &[LoopNode], edges: &[LoopEdge], spec_name: &str) -> Result<String> {
+pub(crate) fn find_entry_node(
+    nodes: &[LoopNode],
+    edges: &[LoopEdge],
+    spec_name: &str,
+) -> Result<String> {
     let incoming = edges
         .iter()
         .map(|edge| edge.to_node.as_str())
@@ -2917,7 +3465,7 @@ fn select_next_step(
         [] => Ok(None),
         [edge] => Ok(Some(StepSelection {
             cursor: SpecCursor::Node(edge.to_node.clone()),
-            edge_condition: edge.condition,
+            edge_condition: edge.condition.clone(),
         })),
         _ => {
             let distinct_targets = matching
@@ -2928,7 +3476,7 @@ fn select_next_step(
                 let to_node = *distinct_targets.iter().next().expect("len == 1");
                 return Ok(Some(StepSelection {
                     cursor: SpecCursor::Node(to_node.to_string()),
-                    edge_condition: matching[0].condition,
+                    edge_condition: matching[0].condition.clone(),
                 }));
             }
             for details in ensembles {
@@ -2940,11 +3488,58 @@ fn select_next_step(
                 if member_ids == distinct_targets {
                     return Ok(Some(StepSelection {
                         cursor: SpecCursor::Ensemble(details.ensemble.id.clone()),
-                        edge_condition: matching[0].condition,
+                        edge_condition: matching[0].condition.clone(),
                     }));
                 }
             }
             bail!("Node '{}' has ambiguous outgoing edges.", from_node)
+        }
+    }
+}
+
+/// Resolve a router node's next graph step: the edge out of `from_node`
+/// whose declared route matches `route_label` exactly (see
+/// [`LoopEdgeCondition::Route`]). Used instead of [`select_next_step`] only
+/// when the node just executed is a [`LoopNodeKind::Router`] that finished
+/// `Pass` — a router's own verdict carries no notion of success/failure, only
+/// a choice among its declared routes, so Pass/Fail/Always-conditioned edges
+/// never apply here. A failed router (spawn failure/timeout) instead falls
+/// through to `select_next_step` like any other node, per its fail-edge
+/// contract.
+fn select_router_step(
+    edges: &[LoopEdge],
+    from_node: &str,
+    route_label: &str,
+) -> Result<Option<StepSelection>> {
+    let matching = edges
+        .iter()
+        .filter(|edge| edge.from_node == from_node)
+        .filter(|edge| edge.condition.route_label() == Some(route_label))
+        .collect::<Vec<_>>();
+
+    match matching.as_slice() {
+        [] => Ok(None),
+        [edge] => Ok(Some(StepSelection {
+            cursor: SpecCursor::Node(edge.to_node.clone()),
+            edge_condition: edge.condition.clone(),
+        })),
+        _ => {
+            let distinct_targets = matching
+                .iter()
+                .map(|edge| edge.to_node.as_str())
+                .collect::<HashSet<_>>();
+            if distinct_targets.len() == 1 {
+                let to_node = *distinct_targets.iter().next().expect("len == 1");
+                return Ok(Some(StepSelection {
+                    cursor: SpecCursor::Node(to_node.to_string()),
+                    edge_condition: matching[0].condition.clone(),
+                }));
+            }
+            bail!(
+                "Router node '{}' has ambiguous outgoing edges for route '{}'.",
+                from_node,
+                route_label
+            )
         }
     }
 }
@@ -2984,24 +3579,35 @@ fn cursor_label(cursor: &SpecCursor, ensembles: &[EnsembleDetails]) -> String {
 }
 
 /// Reason recorded on a node run terminated because a newer attempt at the
-/// same node superseded it (B42). Unlike every other termination reason, a
-/// superseded run is pure engine bookkeeping rather than a node failure: the
-/// dispatch that owned it must recognise the marker and stop silently, routing
-/// it down no edge (see [`run_was_superseded`] and its use in
-/// [`LoopEngine::run_spec`]).
+/// same node superseded it (B42). One of several reasons
+/// [`run_was_terminated_out_of_band`] recognises — see that function's doc
+/// for why every one of them is treated identically.
 const SUPERSEDE_REASON: &str = "superseded by a new attempt at this node";
 
-/// Whether `run` was terminated by the supersede path ([`SUPERSEDE_REASON`]) —
-/// i.e. its `Fail` row is a newer attempt reclaiming the node, not a real node
-/// failure. Recognised by the exact `{ "terminated": true, "reason": … }`
-/// marker [`terminate_run_row`] writes, so a genuine agent output that merely
-/// mentions the phrase can never be mistaken for one.
-fn run_was_superseded(run: &LoopNodeRun) -> bool {
+/// Whether `run` was terminated by the engine out from under the dispatch
+/// that owned it — a same-node supersede ([`SUPERSEDE_REASON`], B42), a
+/// concurrent `loop_reset`, `loop_pause`, iteration-budget exhaustion, or
+/// `fail_loop`'s own sweep — rather than a genuine node outcome (a clean
+/// exit, or a self-report via `loop_complete_node`). Every one of those
+/// paths is pure engine bookkeeping, not a node failure: the dispatch that
+/// owned the run must recognise it and stop silently here, routing down no
+/// edge, failing nothing, and completing nothing (see its use in
+/// [`LoopEngine::run_spec`]) — exactly what let a stale dispatch's late
+/// completion route a fail edge and take down a healthy sibling dispatch on
+/// 2026-08-05.
+///
+/// Recognised by the `{ "terminated": true, "reason": … }` marker every one
+/// of those paths writes via [`terminate_run_row`] (or, for `loop_reset`,
+/// the identically-shaped write in [`crate::db::Database::reset_loop`]) —
+/// matched on the `terminated` key alone, not a specific reason string, so
+/// nothing that terminates a run out-of-band can be missed here. A genuine
+/// agent output can never be mistaken for one: self-reports never set this
+/// key.
+fn run_was_terminated_out_of_band(run: &LoopNodeRun) -> bool {
     let Some(output) = run.output.as_ref() else {
         return false;
     };
     output.get("terminated").and_then(Value::as_bool) == Some(true)
-        && output.get("reason").and_then(Value::as_str) == Some(SUPERSEDE_REASON)
 }
 
 /// Best-effort termination (B12) of `run`'s OS process, if it still has one
@@ -3026,14 +3632,20 @@ fn terminate_run_row(db: &Database, run: &LoopNodeRun, reason: &str) {
     );
 }
 
-/// `"platform"` or `"platform/model"` — the label used in an ensemble's
-/// consolidated `"## <label> [pass|fail]"` sections and in the TUI's
-/// collapsed ensemble view.
+/// `"platform #N"` or `"platform/model #N"` (1-based `N` from the member's
+/// position) — the label used in an ensemble's consolidated
+/// `"## <label> [pass|fail]"` sections and in the TUI's collapsed ensemble
+/// view. The position suffix is always included, not just when it would
+/// disambiguate: a multi-angle panel commonly runs several members on the
+/// same platform/model with only their `prompt_override` differing, so
+/// platform/model alone can name the same label for every section — the
+/// position is what actually attributes a section to one member.
 fn member_label(member: &EnsembleMember) -> String {
-    match member.model.as_deref().map(str::trim) {
+    let base = match member.model.as_deref().map(str::trim) {
         Some(model) if !model.is_empty() => format!("{}/{}", member.platform, model),
         _ => member.platform.clone(),
-    }
+    };
+    format!("{base} #{}", member.position + 1)
 }
 
 /// The human-readable text to carry into an ensemble's consolidated doc for
@@ -3149,6 +3761,31 @@ fn resolve_node_prompt_template(node: &LoopNode, prompts_dir: &std::path::Path) 
     "{{spec_content}}\n\n{{previous_feedback}}".to_string()
 }
 
+/// Classifies which branch of [`resolve_node_prompt_template`]'s precedence
+/// an agent node's config will actually take — `"explicit"` (`prompt_template`
+/// set), `"preset"` (`prompt_preset` set), or `"default_fallback"` (neither,
+/// so the node silently runs on the bare fallback template nobody chose).
+/// Read-only mirror of that function's own precedence check — never the
+/// other way around, so the two can't drift. Surfaced in `loop_get`'s node
+/// JSON (`daemon::handler::loop_node_json`) and recorded on every agent run's
+/// output, so a node running on the default is distinguishable from one
+/// running its author's prompt without having to inspect its raw config.
+pub(crate) fn agent_prompt_source(config: &Value) -> &'static str {
+    let has_non_empty_str = |field: &str| {
+        config
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+    };
+    if has_non_empty_str("prompt_template") {
+        "explicit"
+    } else if has_non_empty_str("prompt_preset") {
+        "preset"
+    } else {
+        "default_fallback"
+    }
+}
+
 fn render_agent_prompt(
     lp: &crate::domain::loops::Loop,
     spec: &LoopSpec,
@@ -3172,6 +3809,22 @@ fn render_agent_prompt(
         .replace("{{node_id}}", &node.id)
         .replace("{{previous_feedback}}", &previous_feedback);
 
+    // A spec picked up in `Interrupted` status has a previous attempt's
+    // partial work sitting in `workdir` — the engine no longer `git stash`es
+    // it away, so it's exactly where that attempt left it. This agent has no
+    // memory of that attempt (it's a cold start, a fresh process/session),
+    // so the prompt has to say so explicitly: the work was cut short by
+    // something external (a daemon restart, a crash), not set aside for
+    // being wrong, and the right move is to inspect what's there and
+    // continue it rather than redo it from scratch.
+    let continuation_notice = if spec.status == LoopSpecStatus::Interrupted {
+        format!(
+            "\n# [CONTINUATION]\nA previous attempt at this spec was interrupted by something external — a daemon restart, a machine crash, or an unrelated process — not by any problem with the work itself. The working tree at {workdir} may already hold that attempt's partial progress, left exactly as it was. Before doing anything else, run `git status` and `git diff` there to see what already exists, and continue from it rather than starting over. (If {workdir} is not a git repository, inspect it directly instead — the same partial work may still be present.)\n"
+        )
+    } else {
+        String::new()
+    };
+
     // `run_id` (not just `node_id`) must round-trip through the report tools
     // (B12): a node can be retried, so more than one run can exist for the
     // same `node_id` over a spec's lifetime. Without the exact run_id, a
@@ -3180,11 +3833,12 @@ fn render_agent_prompt(
     // otherwise be matched to "whatever's currently active for this node_id"
     // and silently corrupt a newer, unrelated run.
     format!(
-        "# [LOOP CONTEXT]\n<loop>\n  <name>{}</name>\n  <spec>{}</spec>\n  <node>{}</node>\n  <workdir>{}</workdir>\n</loop>\n\n# [SPEC]\n{}\n\n# [PREVIOUS FEEDBACK]\n{}\n\n# [REPORTING]\nWhen you finish this node, call loop_complete_node with run_id=\"{}\", node_id=\"{}\", status=\"pass\"|\"fail\", a concise summary, and your output.\nIf you are blocked and need human intervention, call loop_report_blocker with run_id=\"{}\", node_id=\"{}\" and the blocker description.\n",
+        "# [LOOP CONTEXT]\n<loop>\n  <name>{}</name>\n  <spec>{}</spec>\n  <node>{}</node>\n  <workdir>{}</workdir>\n</loop>\n{}\n# [SPEC]\n{}\n\n# [PREVIOUS FEEDBACK]\n{}\n\n# [REPORTING]\nWhen you finish this node, call loop_complete_node with run_id=\"{}\", node_id=\"{}\", status=\"pass\"|\"fail\", a concise summary, and your output.\nIf you are blocked and need human intervention, call loop_report_blocker with run_id=\"{}\", node_id=\"{}\" and the blocker description.\n",
         lp.name,
         spec.name,
         node.name,
         workdir,
+        continuation_notice,
         prompt,
         previous_feedback,
         run_id,
@@ -3194,19 +3848,43 @@ fn render_agent_prompt(
     )
 }
 
-/// Default incremental prompt for a RESUMED agent run (RS2). Deliberately
-/// omits the full `[LOOP CONTEXT]`/`[SPEC]` block that a cold start renders:
-/// the resumed session already holds all of that in its own history, so
+/// Default incremental prompt for a SAME-SPEC resumed agent run (RS2): a
+/// fail-edge bounce or B19 infra retry, where the resumed session was
+/// captured by THIS spec earlier in this same dispatch. Deliberately omits
+/// the full `[LOOP CONTEXT]`/`[SPEC]` block that a cold start renders: the
+/// resumed session already holds all of that in its own history, so
 /// re-sending it wastes tokens and can confuse the model into re-reading the
 /// whole task. Only the new feedback and a one-line reminder of the reporting
-/// contract are sent. Overridable per node via the `resume_prompt` config key.
+/// contract are sent. Overridable per node via the `resume_prompt` config
+/// key — but only for this same-spec case; see
+/// [`RESUME_PROMPT_CROSS_SPEC_DEFAULT`] for the other one.
 const RESUME_PROMPT_DEFAULT: &str = "# [CONTINUE]\nYou are resuming your existing session for this task. The full task context is already in your session history — only the new feedback is included below. Address it, then report.\n\n# [PREVIOUS FEEDBACK]\n{{previous_feedback}}\n\n# [REPORTING]\nWhen you finish, call loop_complete_node with run_id=\"{{run_id}}\", node_id=\"{{node_id}}\", status=\"pass\"|\"fail\", a concise summary, and your output.\nIf you are blocked and need human intervention, call loop_report_blocker with run_id=\"{{run_id}}\", node_id=\"{{node_id}}\" and the blocker description.\n";
 
-/// Render a resumed run's incremental prompt (RS2) from `template` (the node's
-/// `resume_prompt` or [`RESUME_PROMPT_DEFAULT`]). Same `{{previous_feedback}}`
-/// bounding as [`render_agent_prompt`], plus the run/node/spec placeholders the
-/// reporting contract needs — but never `{{spec_content}}`, since a resume must
-/// not re-render the spec block the session already has.
+/// Default incremental prompt for a CROSS-SPEC resumed agent run (RS3): a
+/// context-group handoff, where the session being resumed was captured by a
+/// DIFFERENT spec — the previous grouped sibling on this node. Unlike
+/// [`RESUME_PROMPT_DEFAULT`], the claim "the full task context is already in
+/// your session history" is false here (the session has never seen THIS
+/// spec), so it is never sent: this template renders `{{spec_content}}`
+/// instead, plus a short boundary notice that the previous spec is finished
+/// and already committed, so its conclusions are not to be restated as this
+/// spec's own work. Selected by the engine itself, from its own state (which
+/// spec captured the session being resumed) — never overridable via the
+/// node's `resume_prompt` config key, since that choice depends on runtime
+/// state a static per-node template cannot know.
+const RESUME_PROMPT_CROSS_SPEC_DEFAULT: &str = "# [CONTINUE: NEW SPEC]\nYou are resuming your existing session, but for a NEW spec. The previous spec you were working on is finished and already committed — do not restate its conclusions or describe its prior work as this spec's output. Only the spec below is outstanding; address it, then report.\n\n# [SPEC]\n{{spec_content}}\n\n# [PREVIOUS FEEDBACK]\n{{previous_feedback}}\n\n# [REPORTING]\nWhen you finish, call loop_complete_node with run_id=\"{{run_id}}\", node_id=\"{{node_id}}\", status=\"pass\"|\"fail\", a concise summary, and your output.\nIf you are blocked and need human intervention, call loop_report_blocker with run_id=\"{{run_id}}\", node_id=\"{{node_id}}\" and the blocker description.\n";
+
+/// Render a resumed run's incremental prompt (RS2/RS3) from `template` — the
+/// node's `resume_prompt` override or [`RESUME_PROMPT_DEFAULT`] for a
+/// same-spec bounce, [`RESUME_PROMPT_CROSS_SPEC_DEFAULT`] for a cross-spec
+/// (RS3) handoff. The caller picks which (see `execute_agent_node`); this
+/// function only renders whichever it's given. Same `{{previous_feedback}}`
+/// bounding as [`render_agent_prompt`], plus the run/node/spec placeholders
+/// the reporting contract needs. `{{spec_content}}` is substituted ONLY when
+/// `template` asks for it — the same-spec default never does (the session
+/// already has that spec in its history; re-rendering it wastes tokens and
+/// invites regurgitation), but the cross-spec default does (that session has
+/// never seen this spec).
 fn render_resume_prompt(
     lp: &crate::domain::loops::Loop,
     spec: &LoopSpec,
@@ -3220,11 +3898,13 @@ fn render_resume_prompt(
         .map(|value| serde_json::to_string_pretty(value).unwrap_or_default())
         .unwrap_or_else(|| "(none)".to_string());
     let previous_feedback = bound_previous_feedback(previous_feedback);
+    let spec_content = spec.description.as_deref().unwrap_or(&spec.name);
     template
         .replace("{{loop_name}}", &lp.name)
         .replace("{{workdir}}", workdir)
         .replace("{{spec_id}}", &spec.id)
         .replace("{{spec_name}}", &spec.name)
+        .replace("{{spec_content}}", spec_content)
         .replace("{{node}}", &node.name)
         .replace("{{node_id}}", &node.id)
         .replace("{{run_id}}", run_id)
@@ -3475,6 +4155,7 @@ mod tests {
         let dir = tempdir()?;
         let db = Arc::new(Database::new(&dir.path().join("test.db"))?);
         let lp = crate::domain::loops::Loop {
+            archived: false,
             id: "wf-test".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -3487,7 +4168,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         };
         let spec = crate::domain::loops::LoopSpec {
@@ -3665,6 +4346,7 @@ mod tests {
         let dir = tempdir()?;
         let db = Arc::new(Database::new(&dir.path().join("test.db"))?);
         let lp = crate::domain::loops::Loop {
+            archived: false,
             id: "wf-test".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -3677,7 +4359,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         };
         let spec = crate::domain::loops::LoopSpec {
@@ -4596,6 +5278,7 @@ mod tests {
     #[test]
     fn render_agent_prompt_includes_reporting_contract() {
         let lp = crate::domain::loops::Loop {
+            archived: false,
             id: "wf".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -4608,7 +5291,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         };
         let spec = LoopSpec {
@@ -4653,6 +5336,86 @@ mod tests {
         assert!(prompt.contains("run_id=\"run-1\""));
         assert!(prompt.contains("Do the thing"));
         assert!(prompt.contains("\"feedback\": \"ok\""));
+    }
+
+    /// A spec picked up `Interrupted` gets an explicit continuation notice
+    /// in its cold-start prompt — the agent has no memory of the previous
+    /// attempt, so the prompt is the only thing that can tell it partial
+    /// work exists in the workdir and should be continued, not redone. A
+    /// `Pending` spec (any other status reaching a cold start) gets no such
+    /// notice — nothing was interrupted, there is nothing to continue.
+    #[test]
+    fn render_agent_prompt_adds_continuation_notice_only_when_spec_interrupted() {
+        let lp = crate::domain::loops::Loop {
+            archived: false,
+            id: "wf".to_string(),
+            name: "Loop".to_string(),
+            description: None,
+            workdir: "/tmp/project".to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        };
+        let mut spec = LoopSpec {
+            id: "spec".to_string(),
+            loop_id: Some("wf".to_string()),
+            name: "Spec".to_string(),
+            description: Some("Do the thing".to_string()),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        let node = LoopNode {
+            id: "node-1".to_string(),
+            spec_id: Some("spec".to_string()),
+            loop_id: None,
+            name: "Agent".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+
+        let pending_prompt = render_agent_prompt(
+            &lp,
+            &spec,
+            &node,
+            "{{spec_content}}",
+            None,
+            &lp.workdir,
+            "run-1",
+        );
+        assert!(!pending_prompt.contains("[CONTINUATION]"));
+
+        spec.status = LoopSpecStatus::Interrupted;
+        let interrupted_prompt = render_agent_prompt(
+            &lp,
+            &spec,
+            &node,
+            "{{spec_content}}",
+            None,
+            &lp.workdir,
+            "run-1",
+        );
+        assert!(interrupted_prompt.contains("[CONTINUATION]"));
+        assert!(interrupted_prompt.contains("interrupted"));
+        assert!(interrupted_prompt.contains("git status"));
+        assert!(interrupted_prompt.contains("git diff"));
+        assert!(interrupted_prompt.contains(&lp.workdir));
     }
 
     fn agent_node_with_config(config: Value) -> LoopNode {
@@ -4722,7 +5485,7 @@ mod tests {
         let expected = crate::domain::prompts::builtin_prompt_preset_specs()
             .into_iter()
             .find(|(name, _)| *name == "reviewer")
-            .map(|(_, content)| content.to_string())
+            .map(|(_, content)| content)
             .unwrap();
 
         assert_eq!(resolve_node_prompt_template(&node, &prompts_dir), expected);
@@ -4765,6 +5528,7 @@ mod tests {
         // was a 65KB test log blowing up argv. The full text must never be
         // interpolated whole; the marker must show it was cut.
         let lp = crate::domain::loops::Loop {
+            archived: false,
             id: "wf".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -4777,7 +5541,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         };
         let spec = LoopSpec {
@@ -5079,6 +5843,7 @@ mod tests {
                 "run-pin",
                 dir.path().to_str().unwrap(),
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -5517,6 +6282,7 @@ echo done
     async fn run_resume_agent_node(
         node_extra: Value,
         resume_session_id: Option<&str>,
+        cross_spec: bool,
         set_flag: Option<&str>,
         list_cmd: Option<&str>,
         fail_resume: bool,
@@ -5556,6 +6322,7 @@ echo done
             "run-r",
             dir.path().to_str().unwrap(),
             resume_session_id,
+            cross_spec,
             None,
         )
         .await
@@ -5570,7 +6337,7 @@ echo done
     #[tokio::test]
     async fn resume_uses_resume_flag_and_incremental_prompt() {
         let (execution, run, argv) =
-            run_resume_agent_node(Value::Null, Some("ses_prev"), None, None, false).await;
+            run_resume_agent_node(Value::Null, Some("ses_prev"), false, None, None, false).await;
         assert_eq!(execution.status, LoopRunStatus::Pass);
         assert!(argv.contains("--resume"), "resume flag must be passed");
         assert!(argv.contains("ses_prev"), "the resumed id must be passed");
@@ -5579,7 +6346,11 @@ echo done
         assert!(argv.contains("[CONTINUE]"), "resume prompt must be sent");
         assert!(
             !argv.contains("# [SPEC]"),
-            "a resume must not re-render the full spec block"
+            "a same-spec resume must not re-render the full spec block"
+        );
+        assert!(
+            !argv.contains("finished and already committed"),
+            "a same-spec resume must not carry the cross-spec boundary notice"
         );
         // The resumed run records the SAME session id; capture is skipped.
         assert_eq!(run.session_id.as_deref(), Some("ses_prev"));
@@ -5590,6 +6361,7 @@ echo done
         let (execution, _run, argv) = run_resume_agent_node(
             serde_json::json!({ "resume": false }),
             Some("ses_prev"),
+            false,
             None,
             None,
             false,
@@ -5610,7 +6382,7 @@ echo done
     async fn first_visit_without_session_is_cold() {
         // No resume_session_id offered (first visit to the node) → cold.
         let (execution, _run, argv) =
-            run_resume_agent_node(Value::Null, None, None, None, false).await;
+            run_resume_agent_node(Value::Null, None, false, None, None, false).await;
         assert_eq!(execution.status, LoopRunStatus::Pass);
         assert!(!argv.contains("--resume"));
         assert!(argv.contains("# [SPEC]"));
@@ -5621,7 +6393,7 @@ echo done
         // The resume attempt is rejected at spawn (FAIL_RESUME); the engine
         // must fall back to a cold start whose (passing) verdict the node uses.
         let (execution, _run, argv) =
-            run_resume_agent_node(Value::Null, Some("ses_prev"), None, None, true).await;
+            run_resume_agent_node(Value::Null, Some("ses_prev"), false, None, None, true).await;
         assert_eq!(
             execution.status,
             LoopRunStatus::Pass,
@@ -5642,6 +6414,7 @@ echo done
         let (execution, run, argv) = run_resume_agent_node(
             Value::Null,
             Some("ses_prev"),
+            false,
             Some("--set"),
             Some("list"),
             false,
@@ -5656,6 +6429,61 @@ echo done
         assert!(
             !argv.contains("--set"),
             "set-at-spawn flag must not be injected on a resumed spawn"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_spec_resume_renders_new_spec_and_boundary_notice() {
+        // RS3: the session being resumed was captured by a DIFFERENT spec (a
+        // context-group handoff) — the resumed session has never seen THIS
+        // spec, so unlike a same-spec bounce it must get the full spec
+        // content plus a notice that the previous spec is done.
+        let (execution, run, argv) =
+            run_resume_agent_node(Value::Null, Some("ses_prev"), true, None, None, false).await;
+        assert_eq!(execution.status, LoopRunStatus::Pass);
+        assert!(argv.contains("--resume"), "still a genuine resume");
+        assert!(argv.contains("ses_prev"), "the resumed id must be passed");
+        assert!(
+            argv.contains("# [SPEC]"),
+            "a cross-spec resume must render the new spec's content"
+        );
+        assert!(
+            argv.contains("Functional Requirements:\n- A"),
+            "the rendered spec content must be THIS spec's own, not omitted"
+        );
+        assert!(
+            argv.contains("finished and already committed"),
+            "must state the previous spec is done"
+        );
+        assert!(
+            !argv.contains("The full task context is already in your session history"),
+            "the false same-session claim must never be sent on a cross-spec resume"
+        );
+        assert_eq!(run.session_id.as_deref(), Some("ses_prev"));
+    }
+
+    #[tokio::test]
+    async fn cross_spec_resume_ignores_node_level_resume_prompt_override() {
+        // The boundary choice depends on runtime state (which spec captured
+        // the resumed session) that a static per-node template cannot know,
+        // so a cross-spec resume must use the engine's own template
+        // regardless of any `resume_prompt` override configured on the node.
+        let (_execution, _run, argv) = run_resume_agent_node(
+            serde_json::json!({ "resume_prompt": "CUSTOM {{previous_feedback}}" }),
+            Some("ses_prev"),
+            true,
+            None,
+            None,
+            false,
+        )
+        .await;
+        assert!(
+            !argv.contains("CUSTOM"),
+            "a node-level resume_prompt override must be ignored on a cross-spec resume"
+        );
+        assert!(
+            argv.contains("# [SPEC]"),
+            "the engine's own cross-spec template must be used instead"
         );
     }
 
@@ -5763,11 +6591,11 @@ echo done
 
     /// Build a loop with a single loop-level agent node backed by the argv-echo
     /// `resume-cli` (set-at-spawn capture + resume-by-id), queue `member_specs`
-    /// into `pool-1`, run the pool, and hand back the argv log path plus the db.
+    /// into `queue-1`, run the queue, and hand back the argv log path plus the db.
     /// Each grouped member shares the one loop-level node id `node-impl`, which
     /// is exactly what a warm-context queue looks like: several small specs
     /// draining one loop graph.
-    async fn run_grouped_pool(
+    async fn run_grouped_queue(
         member_specs: &[(&str, Option<&str>)],
     ) -> (Arc<Database>, std::path::PathBuf) {
         let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
@@ -5787,9 +6615,9 @@ echo done
             db.insert_loop_spec(&standalone_spec(spec_id, (position as i64) + 1))
                 .unwrap();
         }
-        insert_pool_with_grouped_members(&db, "pool-1", member_specs);
+        insert_queue_with_grouped_members(&db, "queue-1", member_specs);
 
-        // Loop-level agent node: every pool member with no graph of its own
+        // Loop-level agent node: every queue member with no graph of its own
         // drains this shared node, so grouped siblings share the node id.
         db.insert_loop_node(&LoopNode {
             id: "node-impl".to_string(),
@@ -5805,7 +6633,7 @@ echo done
 
         let guard = HomeGuard::set(home.path());
         engine
-            .run_loop(loop_id.clone(), Some("pool-1".to_string()), None)
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
             .await
             .unwrap();
         drop(guard);
@@ -5830,7 +6658,7 @@ echo done
         // spec-b in the same group resumes it on its first node run and records
         // the SAME session id — the ONE exception to RS2's "first visit cold".
         let (db, argv_file) =
-            run_grouped_pool(&[("spec-a", Some("ctx")), ("spec-b", Some("ctx"))]).await;
+            run_grouped_queue(&[("spec-a", Some("ctx")), ("spec-b", Some("ctx"))]).await;
 
         assert_eq!(
             db.get_loop_spec("spec-a").unwrap().unwrap().status,
@@ -5859,7 +6687,7 @@ echo done
     async fn ungrouped_specs_never_cross_resume() {
         // RS7: with no group, each spec cold-starts — spec-b mints its OWN
         // set-at-spawn session and never touches spec-a's.
-        let (db, argv_file) = run_grouped_pool(&[("spec-a", None), ("spec-b", None)]).await;
+        let (db, argv_file) = run_grouped_queue(&[("spec-a", None), ("spec-b", None)]).await;
 
         let sid_a = impl_session(&db, "spec-a").expect("spec-a captures a session");
         let sid_b = impl_session(&db, "spec-b").expect("spec-b captures its own session");
@@ -5872,6 +6700,171 @@ echo done
         assert!(
             !argv.contains("--resume"),
             "no resume flag may appear for an ungrouped queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn grouped_spec_resume_across_boundary_shows_new_spec_not_old() {
+        // Reproduces the incident on loop 824de730-7fec-4031-800a-7933d2cf94c1,
+        // group `rag`: spec 2's implementer resumed spec 1's session and, with
+        // the old RESUME_PROMPT_DEFAULT claiming full context was already in
+        // history, was never shown ANY spec at all — it reported PASS after
+        // fourteen minutes describing spec 1's (already-committed) work,
+        // the only work it had ever seen. The fix must show the resumed
+        // session its OWN (spec 2's) content, plus a notice that spec 1 is
+        // done, so it neither regurgitates spec 1 nor works blind.
+        let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+        let argv_file = dir.path().join("argv.log");
+        let script = write_argv_echo_cli(dir.path());
+        let mut env = HashMap::new();
+        env.insert(
+            "ARGV_FILE".to_string(),
+            argv_file.to_string_lossy().into_owned(),
+        );
+        env.insert("RESUME_FLAG".to_string(), "--resume".to_string());
+        let cli = argv_cli_config(&script, env, Some("--resume"), Some("--set"), None);
+        let home = write_resume_cli_home(cli);
+
+        let mut spec_1 = standalone_spec("rag-1", 1);
+        spec_1.description = Some("SPEC-1-MARKER: bridge restart recovery".to_string());
+        let mut spec_2 = standalone_spec("rag-2", 2);
+        spec_2.description = Some("SPEC-2-MARKER: rag ingestion pipeline".to_string());
+        db.insert_loop_spec(&spec_1).unwrap();
+        db.insert_loop_spec(&spec_2).unwrap();
+        insert_queue_with_grouped_members(
+            &db,
+            "queue-1",
+            &[("rag-1", Some("rag")), ("rag-2", Some("rag"))],
+        );
+
+        // Loop-level agent node: both grouped members drain the same node id,
+        // exactly like the incident's implementer node.
+        db.insert_loop_node(&LoopNode {
+            id: "node-impl".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "impl".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({ "platform": "resume-cli" }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let guard = HomeGuard::set(home.path());
+        engine
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
+            .await
+            .unwrap();
+        drop(guard);
+
+        let argv = std::fs::read_to_string(&argv_file).unwrap();
+        let invocations: Vec<&str> = argv.split("===\n").collect();
+        assert_eq!(
+            invocations.len(),
+            3, // two real invocations + trailing empty split segment
+            "expected exactly one cold spawn (spec 1) and one resumed spawn (spec 2)"
+        );
+
+        // Invocation 1: spec 1 cold-starts and gets its own content.
+        assert!(invocations[0].contains("SPEC-1-MARKER"));
+
+        // Invocation 2: spec 2 resumes spec 1's session, but must be shown
+        // its OWN spec — never spec 1's — plus the boundary notice.
+        let spec_2_invocation = invocations[1];
+        assert!(
+            spec_2_invocation.contains("--resume"),
+            "spec 2 must resume spec 1's session"
+        );
+        assert!(
+            spec_2_invocation.contains("SPEC-2-MARKER"),
+            "the resumed session must be shown spec 2's OWN content — the bug \
+             this reproduces showed it no spec content at all"
+        );
+        assert!(
+            spec_2_invocation.contains("finished and already committed"),
+            "must state spec 1 is done so its conclusions aren't restated"
+        );
+        assert!(
+            !spec_2_invocation.contains("The full task context is already in your session history"),
+            "the false same-session claim is exactly what caused the incident's \
+             14-minute regurgitation and must never be sent on a cross-spec resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn grouped_reviewer_resume_across_boundary_gets_new_spec_not_stuck() {
+        // Reproduces the second incident, group `daemon`: the REVIEWER node
+        // resumed across a spec boundary and, with the old prompt, had only
+        // spec 1 ("bridge restart recovery", already complete) in context —
+        // it said so plainly: "I need the spec content to know what work to
+        // do next." Same fix, different node role — a `review` node instead
+        // of `impl`, proving the fix is node-role-agnostic.
+        let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+        let argv_file = dir.path().join("argv.log");
+        let script = write_argv_echo_cli(dir.path());
+        let mut env = HashMap::new();
+        env.insert(
+            "ARGV_FILE".to_string(),
+            argv_file.to_string_lossy().into_owned(),
+        );
+        env.insert("RESUME_FLAG".to_string(), "--resume".to_string());
+        let cli = argv_cli_config(&script, env, Some("--resume"), Some("--set"), None);
+        let home = write_resume_cli_home(cli);
+
+        let mut spec_1 = standalone_spec("daemon-1", 1);
+        spec_1.description = Some("DAEMON-SPEC-1: bridge restart recovery".to_string());
+        let mut spec_2 = standalone_spec("daemon-2", 2);
+        spec_2.description = Some("DAEMON-SPEC-2: watchdog heartbeat timeout".to_string());
+        db.insert_loop_spec(&spec_1).unwrap();
+        db.insert_loop_spec(&spec_2).unwrap();
+        insert_queue_with_grouped_members(
+            &db,
+            "queue-1",
+            &[("daemon-1", Some("daemon")), ("daemon-2", Some("daemon"))],
+        );
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-review".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "review".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({ "platform": "resume-cli" }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let guard = HomeGuard::set(home.path());
+        engine
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
+            .await
+            .unwrap();
+        drop(guard);
+
+        let argv = std::fs::read_to_string(&argv_file).unwrap();
+        let invocations: Vec<&str> = argv.split("===\n").collect();
+        assert_eq!(invocations.len(), 3, "one cold spawn, one resumed spawn");
+
+        let reviewer_invocation = invocations[1];
+        assert!(
+            reviewer_invocation.contains("--resume"),
+            "the reviewer must resume spec 1's session"
+        );
+        assert!(
+            reviewer_invocation.contains("DAEMON-SPEC-2"),
+            "the resumed reviewer must be shown spec 2's content — the incident's \
+             reviewer had none and had to ask for it"
+        );
+        assert!(
+            reviewer_invocation.contains("finished and already committed"),
+            "must state spec 1 is done"
+        );
+        assert!(
+            !reviewer_invocation
+                .contains("The full task context is already in your session history"),
+            "must not claim stale context is complete"
         );
     }
 
@@ -5895,6 +6888,345 @@ echo done
         assert_eq!(execution.status, LoopRunStatus::Fail);
         assert!(execution.summary.contains("failed to spawn"));
         assert!(execution.output.get("error").is_some());
+    }
+
+    /// The `mimocode`/`mimo-auto` incident, reproduced exactly: a CLI that
+    /// fails to start its model, prints its complaint to stderr, produces
+    /// empty stdout, and still exits 0. This must never be recorded as
+    /// `Pass` — a downstream `pass` edge must not fire for a run that never
+    /// actually did anything.
+    #[tokio::test]
+    async fn run_agent_process_empty_stdout_zero_exit_is_fail_not_pass() {
+        let (dir, db) = test_db();
+        let cli = Cli::new("test-cli");
+        let script = write_member_script(
+            dir.path(),
+            "mimocode.sh",
+            ">&2 printf 'Error: Unsupported model mimo-auto'\nexit 0",
+        );
+        let strategy = sample_strategy(&script);
+        let node = sample_agent_node();
+
+        let execution = run_agent_process(
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            execution.status,
+            LoopRunStatus::Fail,
+            "empty stdout must be a Fail even though the process exited 0"
+        );
+        assert_eq!(
+            execution.output.get("exit_code").and_then(Value::as_i64),
+            Some(0)
+        );
+        assert_eq!(
+            execution.output.get("no_output").and_then(Value::as_bool),
+            Some(true),
+            "the no-output reason must be distinguishable from a self-reported FAIL"
+        );
+        // The stderr text must be surfaced in a form a downstream node's
+        // `(none)` fallback can act on, not silently dropped.
+        let error_text = execution
+            .output
+            .get("error")
+            .and_then(Value::as_str)
+            .expect("no-output run must carry an error field");
+        assert!(error_text.contains("Unsupported model mimo-auto"));
+        assert_eq!(
+            execution.output.get("stderr").and_then(Value::as_str),
+            Some("Error: Unsupported model mimo-auto")
+        );
+        assert!(
+            !execution.summary.to_lowercase().contains("reported"),
+            "must not read as a self-report of any kind"
+        );
+
+        // Must not be eligible for infra-crash retry: this is a deterministic
+        // misconfiguration (wrong/unsupported model), not a transient crash —
+        // retrying would just reproduce the identical empty result up to the
+        // retry budget before finally reaching the fail edge.
+        let run = LoopNodeRun {
+            id: "run-test".to_string(),
+            loop_id: "loop1".to_string(),
+            spec_id: "spec1".to_string(),
+            node_id: node.id.clone(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        };
+        assert!(
+            !is_infra_crash(&node, &execution, &run, 0, 3, 60),
+            "an empty-output zero-exit run must not be retried as an infra crash"
+        );
+    }
+
+    /// The inverse of the no-output fix: an agent that exits 0 and produces
+    /// real stdout must keep passing exactly as before. Guards against the
+    /// no-output fix becoming an overly broad check that makes well-behaved
+    /// nodes flaky.
+    #[tokio::test]
+    async fn run_agent_process_normal_stdout_zero_exit_still_passes() {
+        let (dir, db) = test_db();
+        let cli = Cli::new("test-cli");
+        let script = write_member_script(dir.path(), "ok.sh", "printf 'all done'");
+        let strategy = sample_strategy(&script);
+        let node = sample_agent_node();
+
+        let execution = run_agent_process(
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(execution.status, LoopRunStatus::Pass);
+        assert_eq!(
+            execution.output.get("stdout").and_then(Value::as_str),
+            Some("all done")
+        );
+        assert!(execution.output.get("no_output").is_none());
+    }
+
+    /// A fast nonzero-exit crash that (like most real crashes) prints
+    /// nothing to stdout must still be retried as an infra crash exactly as
+    /// before — the no-output fix only targets the exit-0 shape, and must
+    /// not silently swallow the existing nonzero-exit crash-retry path by
+    /// tagging every empty-stdout failure alike.
+    #[tokio::test]
+    async fn run_agent_process_empty_stdout_nonzero_exit_stays_infra_crash_eligible() {
+        let (dir, db) = test_db();
+        let cli = Cli::new("test-cli");
+        let script = write_member_script(dir.path(), "dead.sh", "exit 1");
+        let strategy = sample_strategy(&script);
+        let node = sample_agent_node();
+
+        let execution = run_agent_process(
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(execution.status, LoopRunStatus::Fail);
+        assert!(
+            execution.output.get("no_output").is_none(),
+            "a nonzero-exit crash must not be conflated with the exit-0 no-output case"
+        );
+
+        let run = LoopNodeRun {
+            id: "run-test".to_string(),
+            loop_id: "loop1".to_string(),
+            spec_id: "spec1".to_string(),
+            node_id: node.id.clone(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        };
+        assert!(
+            is_infra_crash(&node, &execution, &run, 0, 3, 60),
+            "a fast nonzero-exit crash with empty stdout must remain infra-crash eligible"
+        );
+    }
+
+    /// A self-reported FAIL (the agent called `loop_complete_node` itself)
+    /// must route on its own reported verdict, never on the no-output rule —
+    /// even when the CLI process that follows the self-report happens to
+    /// exit 0 with no further stdout.
+    #[tokio::test]
+    async fn self_reported_fail_is_not_reclassified_as_no_output() {
+        let (_dir, db, _engine, loop_id) = bare_loop_fixture().unwrap();
+        let node = seed_agent_run(&db, &loop_id, "run-selfreport");
+        db.update_loop_run_result(
+            "run-selfreport",
+            LoopRunStatus::Fail,
+            Some(&serde_json::json!({ "summary": "agent reported it failed" })),
+            Some(chrono::Utc::now()),
+        )
+        .unwrap();
+
+        let run = db.get_loop_run("run-selfreport").unwrap();
+        let reported = self_reported_execution(run.as_ref(), &node)
+            .expect("a completed run row must be read as self-reported");
+        assert_eq!(reported.status, LoopRunStatus::Fail);
+        assert!(reported.output.get("no_output").is_none());
+
+        assert!(
+            !is_infra_crash(&node, &reported, &run.unwrap(), 0, 3, 60),
+            "a self-reported fail must never be classified as an infra crash"
+        );
+    }
+
+    // ── require_report: the four corners ─────────────────────────────────
+    //
+    // `require_report` crossed with "did it self-report" — unit-tested
+    // directly against `agent_finished_execution` (rather than through a
+    // live process) exactly like `self_reported_fail_is_not_reclassified_as_
+    // no_output` above: `self_reported` is a plain bool parameter here, so
+    // the corner is exercised precisely without needing a fake CLI that can
+    // actually call `loop_complete_node` mid-run.
+
+    /// Regression pin: `require_report` absent (defaults to `false`) must
+    /// leave today's verdict exactly as it is — an exit-0, real-stdout,
+    /// never-self-reported run still passes — while `unreported: true` is
+    /// still stamped so a resilience node can see the run never called
+    /// `loop_complete_node`, with no config of its own.
+    #[test]
+    fn agent_finished_execution_require_report_absent_unreported_stays_pass() {
+        let cli = Cli::new("test-cli");
+        let node = sample_agent_node();
+        let execution = agent_finished_execution(&node, &cli, None, 0, "all done", "", false);
+
+        assert_eq!(
+            execution.status,
+            LoopRunStatus::Pass,
+            "require_report absent must not change today's verdict"
+        );
+        assert_eq!(
+            execution.output.get("unreported").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(execution.output.get("failure_kind").is_none());
+    }
+
+    /// `require_report` absent + a self-reported run: unaffected, and no
+    /// `unreported` stamp — the run did report, after all.
+    #[test]
+    fn agent_finished_execution_require_report_absent_self_reported_no_stamp() {
+        let cli = Cli::new("test-cli");
+        let node = sample_agent_node();
+        let execution = agent_finished_execution(&node, &cli, None, 0, "all done", "", true);
+
+        assert_eq!(execution.status, LoopRunStatus::Pass);
+        assert!(
+            execution.output.get("unreported").is_none(),
+            "a self-reported run must not be marked unreported"
+        );
+        assert!(execution.output.get("failure_kind").is_none());
+    }
+
+    /// The exact hole this spec closes: `require_report: true`, exit 0, real
+    /// (non-empty) stdout — codex/copilot/antigravity have all been observed
+    /// exiting 0 with real stdout, including the model's own success
+    /// sentinel, while every tool call was refused/unavailable and nothing
+    /// was actually done. `zero_exit_no_output` doesn't catch this (stdout
+    /// isn't empty); `require_report` does, and must fail with the fixed
+    /// `failure_kind: "no_report"` string, not prose.
+    #[test]
+    fn agent_finished_execution_require_report_true_unreported_fails_as_no_report() {
+        let cli = Cli::new("test-cli");
+        let mut node = sample_agent_node();
+        node.config = serde_json::json!({ "require_report": true });
+        let execution = agent_finished_execution(&node, &cli, None, 0, "looks done", "", false);
+
+        assert_eq!(
+            execution.status,
+            LoopRunStatus::Fail,
+            "require_report must fail an exit-0 run that never self-reported"
+        );
+        assert_eq!(
+            execution.output.get("unreported").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            execution.output.get("failure_kind").and_then(Value::as_str),
+            Some("no_report")
+        );
+        assert_eq!(
+            execution.output.get("exit_code").and_then(Value::as_i64),
+            Some(0),
+            "the exit code itself is untouched — only the verdict is"
+        );
+    }
+
+    /// `require_report: true` with a self-report present: the self-report
+    /// wins exactly as today — `require_report` never overrides an explicit
+    /// `graph_complete_node` verdict, pass or fail.
+    #[test]
+    fn agent_finished_execution_require_report_true_self_reported_is_not_overridden() {
+        let cli = Cli::new("test-cli");
+        let mut node = sample_agent_node();
+        node.config = serde_json::json!({ "require_report": true });
+        let execution = agent_finished_execution(&node, &cli, None, 0, "looks done", "", true);
+
+        assert_eq!(
+            execution.status,
+            LoopRunStatus::Pass,
+            "require_report must never override a self-reported result"
+        );
+        assert!(execution.output.get("unreported").is_none());
+        assert!(execution.output.get("failure_kind").is_none());
+    }
+
+    /// End-to-end (real spawned process, not a fabricated `NodeExecution`):
+    /// a script that exits 0 and prints real stdout, on a node configured
+    /// with `require_report: true`, must fail — and must never be swept into
+    /// infra-crash retry, since the process ran to completion and exited 0;
+    /// nothing here "crashed".
+    #[tokio::test]
+    async fn run_agent_process_require_report_true_no_self_report_is_fail_not_pass() {
+        let (dir, db) = test_db();
+        let cli = Cli::new("test-cli");
+        let script = write_member_script(dir.path(), "silent.sh", "printf 'Done!'\nexit 0");
+        let strategy = sample_strategy(&script);
+        let mut node = sample_agent_node();
+        node.config = serde_json::json!({ "require_report": true });
+
+        let execution = run_agent_process(
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            execution.status,
+            LoopRunStatus::Fail,
+            "exit 0 with real stdout but no self-report must fail when require_report is set"
+        );
+        assert_eq!(
+            execution.output.get("stdout").and_then(Value::as_str),
+            Some("Done!")
+        );
+        assert_eq!(
+            execution.output.get("unreported").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            execution.output.get("failure_kind").and_then(Value::as_str),
+            Some("no_report")
+        );
+
+        let run = LoopNodeRun {
+            id: "run-test".to_string(),
+            loop_id: "loop1".to_string(),
+            spec_id: "spec1".to_string(),
+            node_id: node.id.clone(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        };
+        assert!(
+            !is_infra_crash(&node, &execution, &run, 0, 3, 60),
+            "a require_report no-report failure must not be retried as an infra crash"
+        );
     }
 
     /// B39: a permanent spawn failure (missing binary) must produce a
@@ -6301,6 +7633,7 @@ echo done
                     position: i as i64,
                     platform: "claude".to_string(),
                     model: None,
+                    prompt_override: None,
                 })
                 .collect(),
         }
@@ -6585,15 +7918,16 @@ echo done
         assert_eq!(spec.status, LoopSpecStatus::Failed);
     }
 
-    // ── R5: `loop_run` with a pool ──────────────────────────────────────
+    // ── R5: `loop_run` with a queue ──────────────────────────────────────
 
-    /// A loop with no bound specs — the pool's own standalone specs supply
+    /// A loop with no bound specs — the queue's own standalone specs supply
     /// the work instead. Distinct from [`loop_fixture`], which always seeds
     /// one bound spec.
     fn bare_loop_fixture() -> Result<(TempDir, Arc<Database>, LoopEngine, String)> {
         let dir = tempdir()?;
         let db = Arc::new(Database::new(&dir.path().join("test.db"))?);
         let lp = crate::domain::loops::Loop {
+            archived: false,
             id: "wf-test".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -6606,7 +7940,7 @@ echo done
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         };
         db.insert_loop(&lp)?;
@@ -6618,8 +7952,8 @@ echo done
         ))
     }
 
-    /// A standalone spec (`loop_id: None`), the shape pool members take —
-    /// pool membership never binds the spec to a loop.
+    /// A standalone spec (`loop_id: None`), the shape queue members take —
+    /// queue membership never binds the spec to a loop.
     fn standalone_spec(id: &str, position: i64) -> LoopSpec {
         LoopSpec {
             id: id.to_string(),
@@ -6641,41 +7975,41 @@ echo done
         }
     }
 
-    fn insert_pool_with_members(db: &Database, pool_id: &str, member_ids: &[&str]) {
-        db.insert_pool(&crate::domain::pools::Pool {
-            id: pool_id.to_string(),
-            name: pool_id.to_string(),
+    fn insert_queue_with_members(db: &Database, queue_id: &str, member_ids: &[&str]) {
+        db.insert_queue(&crate::domain::queues::Queue {
+            id: queue_id.to_string(),
+            name: queue_id.to_string(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
         for spec_id in member_ids {
-            db.append_pool_member(pool_id, spec_id, None).unwrap();
+            db.append_queue_member(queue_id, spec_id, None).unwrap();
         }
     }
 
-    /// RS3 variant of [`insert_pool_with_members`]: each member is `(spec_id,
+    /// RS3 variant of [`insert_queue_with_members`]: each member is `(spec_id,
     /// group_name)`, so a test can queue grouped and ungrouped members side by
     /// side.
-    fn insert_pool_with_grouped_members(
+    fn insert_queue_with_grouped_members(
         db: &Database,
-        pool_id: &str,
+        queue_id: &str,
         members: &[(&str, Option<&str>)],
     ) {
-        db.insert_pool(&crate::domain::pools::Pool {
-            id: pool_id.to_string(),
-            name: pool_id.to_string(),
+        db.insert_queue(&crate::domain::queues::Queue {
+            id: queue_id.to_string(),
+            name: queue_id.to_string(),
             created_at: chrono::Utc::now(),
         })
         .unwrap();
         for (spec_id, group) in members {
-            db.append_pool_member(pool_id, spec_id, *group).unwrap();
+            db.append_queue_member(queue_id, spec_id, *group).unwrap();
         }
     }
 
     #[tokio::test]
-    async fn loop_engine_pool_run_walks_loop_graph_across_pool_specs_in_queue_order() {
-        // Two standalone specs, queued into the pool in the *opposite* order
-        // of their `position` field — proving the pool's queue order drives
+    async fn loop_engine_queue_run_walks_loop_graph_across_queue_specs_in_queue_order() {
+        // Two standalone specs, queued into the queue in the *opposite* order
+        // of their `position` field — proving the queue's queue order drives
         // execution, not the spec's own position. Each pass through the
         // shared loop-level check node commits to the workdir's git repo, so
         // the spec that captures the pre-commit HEAD ran first.
@@ -6683,12 +8017,12 @@ echo done
         init_git_repo(dir.path());
         let initial_head = git_head(dir.path());
 
-        let spec_a = standalone_spec("pool-spec-a", 1);
-        let spec_b = standalone_spec("pool-spec-b", 2);
+        let spec_a = standalone_spec("queue-spec-a", 1);
+        let spec_b = standalone_spec("queue-spec-b", 2);
         db.insert_loop_spec(&spec_a).unwrap();
         db.insert_loop_spec(&spec_b).unwrap();
         // Queue order: b, then a — the reverse of position order.
-        insert_pool_with_members(&db, "pool-1", &[&spec_b.id, &spec_a.id]);
+        insert_queue_with_members(&db, "queue-1", &[&spec_b.id, &spec_a.id]);
 
         db.insert_loop_node(&LoopNode {
             id: "loop-check".to_string(),
@@ -6706,7 +8040,7 @@ echo done
         .unwrap();
 
         engine
-            .run_loop(loop_id.clone(), Some("pool-1".to_string()), None)
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
             .await
             .unwrap();
 
@@ -6732,29 +8066,31 @@ echo done
         );
     }
 
-    /// B18, end to end: the real incident. A pool-driven run's in-flight
+    /// B18, end to end: the real incident. A queue-driven run's in-flight
     /// member is left `running` by a daemon restart — a dangling node run
     /// with no live process behind it — while another member sits `pending`
-    /// right behind it in the queue. G2 boot reconcile must reset the
-    /// in-flight member back to `pending` in the same pass it interrupts the
-    /// dangling run, and the resumed dispatch (what `loop_continue`'s
-    /// `retry_current_node` triggers via `resume_background`, simulated here
-    /// by calling `run_loop_dispatch` directly with `is_resume: true`) must
-    /// pick the interrupted member up FIRST — never skip straight past it to
-    /// the next queued member, which is exactly how it got orphaned in the
-    /// 2026-07-14 incident.
+    /// right behind it in the queue. G2 boot reconcile must mark the
+    /// in-flight member `Interrupted` (not `Pending` — the run was cut short
+    /// by something external, not a failure of the work) in the same pass it
+    /// interrupts the dangling run, and the resumed dispatch (what
+    /// `loop_continue`'s `retry_current_node` triggers via
+    /// `resume_background`, simulated here by calling `run_loop_dispatch`
+    /// directly with `is_resume: true`) must pick the interrupted member up
+    /// FIRST — never skip straight past it to the next queued member, which
+    /// is exactly how it got orphaned in the 2026-07-14 incident.
     #[tokio::test]
-    async fn loop_engine_restart_recovery_runs_interrupted_pool_spec_first() {
+    async fn loop_engine_restart_recovery_runs_interrupted_queue_spec_first() {
         let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+        let data_dir = tempdir().unwrap();
         init_git_repo(dir.path());
         let initial_head = git_head(dir.path());
 
-        let mut interrupted = standalone_spec("pool-interrupted", 1);
+        let mut interrupted = standalone_spec("queue-interrupted", 1);
         interrupted.status = LoopSpecStatus::Running;
-        let next = standalone_spec("pool-next", 2);
+        let next = standalone_spec("queue-next", 2);
         db.insert_loop_spec(&interrupted).unwrap();
         db.insert_loop_spec(&next).unwrap();
-        insert_pool_with_members(&db, "pool-1", &[&interrupted.id, &next.id]);
+        insert_queue_with_members(&db, "queue-1", &[&interrupted.id, &next.id]);
 
         db.update_loop_status(
             &loop_id,
@@ -6763,7 +8099,7 @@ echo done
             None,
         )
         .unwrap();
-        db.set_loop_active_run_pool(&loop_id, Some("pool-1"))
+        db.set_loop_active_run_queue(&loop_id, Some("queue-1"))
             .unwrap();
 
         db.insert_loop_node(&LoopNode {
@@ -6802,22 +8138,22 @@ echo done
         .unwrap();
 
         // G2 boot reconcile.
-        assert_eq!(db.reconcile_orphaned_loops().unwrap(), 1);
+        assert_eq!(db.reconcile_orphaned_loops(data_dir.path()).unwrap(), 1);
         let lp_after_reconcile = db.get_loop(&loop_id).unwrap().unwrap();
         assert_eq!(lp_after_reconcile.status, LoopStatus::Paused);
         let interrupted_after_reconcile = db.get_loop_spec(&interrupted.id).unwrap().unwrap();
         assert_eq!(
             interrupted_after_reconcile.status,
-            LoopSpecStatus::Pending,
-            "reconcile must reset the in-flight member back to pending, not leave it running"
+            LoopSpecStatus::Interrupted,
+            "reconcile must mark the in-flight member interrupted, not leave it running"
         );
 
         // `loop_continue { retry_current_node }`: resume with the loop's
-        // persisted pool context, same as `resume_background`. The loop is left
+        // persisted queue context, same as `resume_background`. The loop is left
         // `Paused` (as reconcile set it) — the dispatch's own atomic claim (B42)
         // owns the flip to `Running`, so no caller pre-flips it anymore.
         engine
-            .run_loop_dispatch(loop_id.clone(), Some("pool-1".to_string()), None, true)
+            .run_loop_dispatch(loop_id.clone(), Some("queue-1".to_string()), None, true)
             .await
             .unwrap();
 
@@ -6853,6 +8189,7 @@ echo done
         let engine = LoopEngine::new(Arc::clone(&db), Arc::new(DefaultNotificationService));
 
         let lp = crate::domain::loops::Loop {
+            archived: false,
             id: "wf-workdir".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -6865,7 +8202,7 @@ echo done
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         };
         db.insert_loop(&lp).unwrap();
@@ -6907,10 +8244,10 @@ echo done
     }
 
     #[tokio::test]
-    async fn loop_engine_legacy_run_without_pool_id_only_touches_bound_specs() {
-        // A standalone spec exists in the DB (e.g. pool backlog) but isn't
-        // added to any pool and isn't bound to this loop. Calling run_loop
-        // without pool_id must behave exactly as before pools existed: only
+    async fn loop_engine_legacy_run_without_queue_id_only_touches_bound_specs() {
+        // A standalone spec exists in the DB (e.g. queue backlog) but isn't
+        // added to any queue and isn't bound to this loop. Calling run_loop
+        // without queue_id must behave exactly as before queues existed: only
         // the loop's own bound specs are touched.
         let (_dir, db, engine, loop_id, bound_spec_id) = loop_fixture().unwrap();
         let untouched = standalone_spec("untouched-standalone", 99);
@@ -6947,15 +8284,15 @@ echo done
     }
 
     #[tokio::test]
-    async fn loop_engine_pool_run_skips_already_completed_members() {
+    async fn loop_engine_queue_run_skips_already_completed_members() {
         let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
 
-        let mut done = standalone_spec("pool-done", 1);
+        let mut done = standalone_spec("queue-done", 1);
         done.status = LoopSpecStatus::Completed;
-        let pending = standalone_spec("pool-pending", 2);
+        let pending = standalone_spec("queue-pending", 2);
         db.insert_loop_spec(&done).unwrap();
         db.insert_loop_spec(&pending).unwrap();
-        insert_pool_with_members(&db, "pool-1", &[&done.id, &pending.id]);
+        insert_queue_with_members(&db, "queue-1", &[&done.id, &pending.id]);
 
         db.insert_loop_node(&LoopNode {
             id: "loop-check".to_string(),
@@ -6973,7 +8310,7 @@ echo done
         .unwrap();
 
         engine
-            .run_loop(loop_id.clone(), Some("pool-1".to_string()), None)
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
             .await
             .unwrap();
 
@@ -6990,12 +8327,12 @@ echo done
     }
 
     #[tokio::test]
-    async fn loop_engine_pool_run_retains_context_on_genuine_completion_for_progress() {
+    async fn loop_engine_queue_run_retains_context_on_genuine_completion_for_progress() {
         let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
 
-        let spec = standalone_spec("pool-spec", 1);
+        let spec = standalone_spec("queue-spec", 1);
         db.insert_loop_spec(&spec).unwrap();
-        insert_pool_with_members(&db, "pool-1", &[&spec.id]);
+        insert_queue_with_members(&db, "queue-1", &[&spec.id]);
 
         db.insert_loop_node(&LoopNode {
             id: "loop-check".to_string(),
@@ -7013,53 +8350,53 @@ echo done
         .unwrap();
 
         engine
-            .run_loop(loop_id.clone(), Some("pool-1".to_string()), None)
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
             .await
             .unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         assert_eq!(lp.status, LoopStatus::Completed);
-        // B31: a genuinely finished pool run keeps its `active_run_pool_id`
+        // B31: a genuinely finished queue run keeps its `active_run_queue_id`
         // as last-run context so `loop list` / `loop info` can still render
         // its real progress instead of a misleading `0/0`. B8's
         // anti-pollution guarantee is upheld elsewhere: every launch path
         // re-persists this field before the first spec runs, so a later
-        // fresh `loop_run` against a different pool overwrites it.
+        // fresh `loop_run` against a different queue overwrites it.
         assert_eq!(
-            lp.active_run_pool_id.as_deref(),
-            Some("pool-1"),
-            "a genuinely finished pool run must keep the run context so its queue progress \
+            lp.active_run_queue_id.as_deref(),
+            Some("queue-1"),
+            "a genuinely finished queue run must keep the run context so its queue progress \
              stays queryable"
         );
         // The progress the CLI/MCP surfaces (mirrored by `loop_progress` in
         // `daemon/loop_cli.rs`) is a real `1/1`, not `0/0`.
         assert_eq!(
             engine
-                .spec_progress(&loop_id, lp.active_run_pool_id.as_deref())
+                .spec_progress(&loop_id, lp.active_run_queue_id.as_deref())
                 .unwrap(),
             (1, 1),
-            "completed pool loop must report n/n progress, not 0/0"
+            "completed queue loop must report n/n progress, not 0/0"
         );
     }
 
-    /// If `pool_next_pending_spec_id` finds no `pending` member to pick, but a
+    /// If `queue_next_pending_spec_id` finds no `pending` member to pick, but a
     /// member is nonetheless left non-terminal (e.g. `running`, from a crash
-    /// mid-spec that never got reset), the pool isn't genuinely finished —
+    /// mid-spec that never got reset), the queue isn't genuinely finished —
     /// the loop must not be marked `completed` out from under it. This is
-    /// the guard that keeps a resumed pool run from repeating the incident's
-    /// false-completion (17 of 20 pool specs still pending, loop marked
+    /// the guard that keeps a resumed queue run from repeating the incident's
+    /// false-completion (17 of 20 queue specs still pending, loop marked
     /// completed anyway).
     #[tokio::test]
-    async fn loop_engine_pool_run_does_not_complete_loop_while_member_left_running() {
+    async fn loop_engine_queue_run_does_not_complete_loop_while_member_left_running() {
         let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
 
-        let mut stuck = standalone_spec("pool-stuck", 1);
+        let mut stuck = standalone_spec("queue-stuck", 1);
         stuck.status = LoopSpecStatus::Running;
         db.insert_loop_spec(&stuck).unwrap();
-        insert_pool_with_members(&db, "pool-1", &[&stuck.id]);
+        insert_queue_with_members(&db, "queue-1", &[&stuck.id]);
 
         engine
-            .run_loop(loop_id.clone(), Some("pool-1".to_string()), None)
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
             .await
             .unwrap();
 
@@ -7067,16 +8404,16 @@ echo done
         assert_eq!(
             lp.status,
             LoopStatus::Running,
-            "must not be marked completed while a pool member is still non-terminal"
+            "must not be marked completed while a queue member is still non-terminal"
         );
         assert_eq!(
-            lp.active_run_pool_id.as_deref(),
-            Some("pool-1"),
-            "the run context must survive so a later resume still knows the pool"
+            lp.active_run_queue_id.as_deref(),
+            Some("queue-1"),
+            "the run context must survive so a later resume still knows the queue"
         );
     }
 
-    // ── R6: live pools — append and reorder while running ────────────────
+    // ── R6: live queues — append and reorder while running ────────────────
 
     async fn wait_for_file(path: &std::path::Path) {
         for _ in 0..500 {
@@ -7133,9 +8470,9 @@ echo done
     }
 
     #[tokio::test]
-    async fn loop_engine_pool_run_picks_up_spec_appended_mid_run() {
-        // A spec appended to the pool while the run is in flight must still
-        // get executed before the run ends: the engine re-queries the pool
+    async fn loop_engine_queue_run_picks_up_spec_appended_mid_run() {
+        // A spec appended to the queue while the run is in flight must still
+        // get executed before the run ends: the engine re-queries the queue
         // for its next pending member at each spec boundary instead of
         // iterating a list frozen at launch.
         let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
@@ -7143,13 +8480,13 @@ echo done
         let go_marker = dir.path().join("go.marker");
         let order_log = dir.path().join("order.log");
 
-        let spec_a = standalone_spec("pool-spec-a", 1);
-        let spec_b = standalone_spec("pool-spec-b", 2);
+        let spec_a = standalone_spec("queue-spec-a", 1);
+        let spec_b = standalone_spec("queue-spec-b", 2);
         db.insert_loop_spec(&spec_a).unwrap();
         db.insert_loop_spec(&spec_b).unwrap();
-        // spec_b exists in the DB but is NOT yet in the pool — it's appended
+        // spec_b exists in the DB but is NOT yet in the queue — it's appended
         // below, while spec_a is mid-run.
-        insert_pool_with_members(&db, "pool-1", &[&spec_a.id]);
+        insert_queue_with_members(&db, "queue-1", &[&spec_a.id]);
 
         db.insert_loop_node(&touch_gate_node(
             "node-a",
@@ -7165,14 +8502,14 @@ echo done
         let run_loop_id = loop_id.clone();
         let handle = tokio::spawn(async move {
             run_engine
-                .run_loop(run_loop_id, Some("pool-1".to_string()), None)
+                .run_loop(run_loop_id, Some("queue-1".to_string()), None)
                 .await
         });
 
         wait_for_file(&started_marker).await;
-        // spec_a is mid-run (blocked on the gate). Append spec_b to the pool
+        // spec_a is mid-run (blocked on the gate). Append spec_b to the queue
         // now, while the run is in flight.
-        db.append_pool_member("pool-1", &spec_b.id, None).unwrap();
+        db.append_queue_member("queue-1", &spec_b.id, None).unwrap();
         std::fs::write(&go_marker, "").unwrap();
 
         handle.await.unwrap().unwrap();
@@ -7191,8 +8528,8 @@ echo done
     }
 
     #[tokio::test]
-    async fn loop_engine_pool_run_reorder_changes_pick_order_mid_run() {
-        // Reordering the pool's PENDING members while a run is in flight
+    async fn loop_engine_queue_run_reorder_changes_pick_order_mid_run() {
+        // Reordering the queue's PENDING members while a run is in flight
         // must change which one the engine picks next — proving the pick is
         // a live, fresh query, not a list captured at launch.
         let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
@@ -7200,14 +8537,14 @@ echo done
         let go_marker = dir.path().join("go.marker");
         let order_log = dir.path().join("order.log");
 
-        let spec_a = standalone_spec("pool-spec-a", 1);
-        let spec_b = standalone_spec("pool-spec-b", 2);
-        let spec_c = standalone_spec("pool-spec-c", 3);
+        let spec_a = standalone_spec("queue-spec-a", 1);
+        let spec_b = standalone_spec("queue-spec-b", 2);
+        let spec_c = standalone_spec("queue-spec-c", 3);
         db.insert_loop_spec(&spec_a).unwrap();
         db.insert_loop_spec(&spec_b).unwrap();
         db.insert_loop_spec(&spec_c).unwrap();
         // Queue order at launch: a, b, c.
-        insert_pool_with_members(&db, "pool-1", &[&spec_a.id, &spec_b.id, &spec_c.id]);
+        insert_queue_with_members(&db, "queue-1", &[&spec_a.id, &spec_b.id, &spec_c.id]);
 
         db.insert_loop_node(&touch_gate_node(
             "node-a",
@@ -7225,14 +8562,14 @@ echo done
         let run_loop_id = loop_id.clone();
         let handle = tokio::spawn(async move {
             run_engine
-                .run_loop(run_loop_id, Some("pool-1".to_string()), None)
+                .run_loop(run_loop_id, Some("queue-1".to_string()), None)
                 .await
         });
 
         wait_for_file(&started_marker).await;
         // spec_a is mid-run. Swap the two PENDING members' order: c before b.
-        db.reorder_pool_members(
-            "pool-1",
+        db.reorder_queue_members(
+            "queue-1",
             &[spec_a.id.clone(), spec_c.id.clone(), spec_b.id.clone()],
         )
         .unwrap();
@@ -7253,18 +8590,18 @@ echo done
     }
 
     #[tokio::test]
-    async fn loop_engine_pool_run_ends_when_no_pending_members_remain() {
+    async fn loop_engine_queue_run_ends_when_no_pending_members_remain() {
         // Sanity check underpinning both tests above: with no gating at all,
-        // a pool run with N pending members ends after exactly N specs run,
+        // a queue run with N pending members ends after exactly N specs run,
         // and picks up an appended spec before completing.
         let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
         let order_log = dir.path().join("order.log");
 
-        let spec_a = standalone_spec("pool-spec-a", 1);
-        let spec_b = standalone_spec("pool-spec-b", 2);
+        let spec_a = standalone_spec("queue-spec-a", 1);
+        let spec_b = standalone_spec("queue-spec-b", 2);
         db.insert_loop_spec(&spec_a).unwrap();
         db.insert_loop_spec(&spec_b).unwrap();
-        insert_pool_with_members(&db, "pool-1", &[&spec_a.id, &spec_b.id]);
+        insert_queue_with_members(&db, "queue-1", &[&spec_a.id, &spec_b.id]);
 
         db.insert_loop_node(&record_node("node-a", &spec_a.id, &order_log, "spec-a"))
             .unwrap();
@@ -7272,13 +8609,13 @@ echo done
             .unwrap();
 
         engine
-            .run_loop(loop_id.clone(), Some("pool-1".to_string()), None)
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
             .await
             .unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         assert_eq!(lp.status, LoopStatus::Completed);
-        assert!(db.pool_next_pending_spec_id("pool-1").unwrap().is_none());
+        assert!(db.queue_next_pending_spec_id("queue-1").unwrap().is_none());
 
         let order = std::fs::read_to_string(&order_log).unwrap();
         assert_eq!(order.lines().collect::<Vec<_>>(), vec!["spec-a", "spec-b"]);
@@ -7342,6 +8679,7 @@ echo done
 
         // 2. Render the full prompt — elision must survive composition.
         let lp = crate::domain::loops::Loop {
+            archived: false,
             id: "wf".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -7354,7 +8692,7 @@ echo done
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         };
         let spec = LoopSpec {
@@ -7609,7 +8947,7 @@ echo done
         let superseded = db.get_loop_run(&superseded_run_id).unwrap().unwrap();
         assert_eq!(superseded.status, LoopRunStatus::Fail);
         assert!(
-            run_was_superseded(&superseded),
+            run_was_terminated_out_of_band(&superseded),
             "the run must carry the supersede marker"
         );
 
@@ -7629,6 +8967,362 @@ echo done
         assert_eq!(lp.status, LoopStatus::Running);
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
         assert_eq!(spec.status, LoopSpecStatus::Running);
+    }
+
+    /// The same mechanism, generalized (2026-08-05): a run terminated
+    /// out-of-band for ANY reason — not just a same-node supersede — must be
+    /// recognized and traverse no edge. `loop_reset` marks a run it kills
+    /// with reason `"spec reset"`, not `SUPERSEDE_REASON`; before the fix
+    /// this reason mismatch meant a spec reset out from under an executing
+    /// node let its late completion route the fail edge anyway.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_terminated_for_any_out_of_band_reason_also_traverses_no_edge() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "implement".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "implement".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "sleep 30",
+                "success_condition": "exit_code_0",
+                "timeout_seconds": 60,
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "resilience".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "resilience".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf DIAGNOSED",
+                "success_condition": "exit_code_0",
+            }),
+            position: 2,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "edge-fail".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "implement".to_string(),
+            to_node: "resilience".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Fail,
+        })
+        .unwrap();
+
+        let engine = Arc::new(engine);
+        let dispatch = {
+            let engine = Arc::clone(&engine);
+            let loop_id = loop_id.clone();
+            tokio::spawn(async move { engine.run_loop(loop_id, None, None).await })
+        };
+
+        // Terminate the live run exactly as `Database::reset_loop` does when
+        // it finds an in-flight run for a spec being reset: same
+        // `{ "terminated": true, "reason": … }` shape, but a different
+        // reason than the same-node supersede path uses.
+        let terminated_run_id = loop {
+            if let Some(run) = db.get_active_loop_run_for_node("implement").unwrap() {
+                if run.pid.is_some() {
+                    terminate_run_row(&db, &run, "spec reset");
+                    break run.id;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+
+        dispatch.await.unwrap().unwrap();
+
+        let terminated = db.get_loop_run(&terminated_run_id).unwrap().unwrap();
+        assert_eq!(terminated.status, LoopRunStatus::Fail);
+        assert!(run_was_terminated_out_of_band(&terminated));
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        assert!(
+            runs.iter().all(|r| r.node_id != "resilience"),
+            "an out-of-band termination for any reason must not route down the fail edge"
+        );
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Running);
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(spec.status, LoopSpecStatus::Running);
+    }
+
+    // ── terminal blocker: dead-ending on a failing node must self-explain ──
+
+    /// The defect this closes (2026-08-06, loop 824de730): a spec that dies
+    /// because a FAILING node has no outgoing edge left NOTHING visible
+    /// beyond a log line — no blocker anywhere `loop_list`/the TUI could
+    /// show. The engine must now derive one, naming the node and what it
+    /// reported, onto the terminating run's `output.blocker` — the exact
+    /// key `loop_run_blocker` (daemon/handler.rs) already reads.
+    #[tokio::test]
+    async fn terminal_fail_node_with_no_outgoing_edge_records_a_derived_blocker() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "dead-end".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "dead-end".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "exit 1",
+                "success_condition": "exit_code_0",
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        // No outgoing edge from "dead-end" for either status: the spec
+        // dead-ends right here.
+
+        engine.run_loop(loop_id, None, None).await.unwrap();
+
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(spec.status, LoopSpecStatus::Failed);
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, LoopRunStatus::Fail);
+        let blocker = runs[0]
+            .output
+            .as_ref()
+            .and_then(|output| output.get("blocker"))
+            .and_then(Value::as_str)
+            .expect("a failing dead-end must record a blocker");
+        assert!(blocker.contains("dead-end"), "blocker: {blocker}");
+    }
+
+    /// The mirror image: a PASSING dead-end (no outgoing edge for `Pass`)
+    /// is the normal, correct end of a spec — exactly what `Check
+    /// committed` does on every successful spec — and must record no
+    /// blocker at all. Getting this wrong would mark every healthy spec as
+    /// blocked.
+    #[tokio::test]
+    async fn terminal_pass_node_with_no_outgoing_edge_records_no_blocker() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "check-committed".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "check-committed".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "exit 0",
+                "success_condition": "exit_code_0",
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id, None, None).await.unwrap();
+
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(spec.status, LoopSpecStatus::Completed);
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, LoopRunStatus::Pass);
+        assert!(
+            runs[0]
+                .output
+                .as_ref()
+                .is_none_or(|output| output.get("blocker").is_none()),
+            "a passing dead-end must never record a blocker"
+        );
+    }
+
+    /// A blocker already written by `loop_report_blocker` is more specific
+    /// than anything the engine can synthesise — `record_terminal_blocker`
+    /// must never overwrite it.
+    #[tokio::test]
+    async fn record_terminal_blocker_preserves_an_existing_blocker() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "node".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        let run_id = "run-with-existing-blocker".to_string();
+        let existing_output = serde_json::json!({ "blocker": "human already reported this" });
+        db.insert_loop_run(&LoopNodeRun {
+            id: run_id.clone(),
+            loop_id,
+            spec_id,
+            node_id: "node".to_string(),
+            status: LoopRunStatus::Fail,
+            input: None,
+            output: Some(existing_output.clone()),
+            started_at: chrono::Utc::now(),
+            completed_at: Some(chrono::Utc::now()),
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        })
+        .unwrap();
+
+        let final_execution = NodeExecution {
+            status: LoopRunStatus::Fail,
+            output: existing_output,
+            summary: "whatever the node reported".to_string(),
+        };
+        engine
+            .record_terminal_blocker(&run_id, "node", &final_execution)
+            .unwrap();
+
+        let run = db.get_loop_run(&run_id).unwrap().unwrap();
+        let blocker = run
+            .output
+            .as_ref()
+            .and_then(|output| output.get("blocker"))
+            .and_then(Value::as_str)
+            .unwrap();
+        assert_eq!(blocker, "human already reported this");
+    }
+
+    // ── fail_loop: scoped to the dispatch generation that failed ─────────
+
+    /// `fail_loop`'s sweep must never terminate a sibling dispatch's healthy
+    /// run — the exact way the 2026-08-05 incident took down a fresh,
+    /// correct dispatch that had claimed the loop 64 seconds after the one
+    /// that eventually failed. Simulates the race directly: dispatch A
+    /// claims, a reset + relaunch (dispatch B) claims again with a later
+    /// timestamp and starts its own run, and only then does dispatch A's
+    /// late failure arrive carrying its now-stale claim.
+    #[tokio::test]
+    async fn fail_loop_from_stale_dispatch_never_touches_a_newer_dispatchs_runs() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-a".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "node-a".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "true"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let claim_a = chrono::Utc::now();
+        assert!(db.claim_loop_for_run(&loop_id, claim_a).unwrap());
+
+        // A reset + relaunch out from under dispatch A: status drops out of
+        // `running` (what `Database::reset_loop` does), then dispatch B
+        // claims again with a strictly later timestamp.
+        db.update_loop_status(&loop_id, LoopStatus::Draft, None, None)
+            .unwrap();
+        let claim_b = claim_a + chrono::Duration::seconds(5);
+        assert!(db.claim_loop_for_run(&loop_id, claim_b).unwrap());
+
+        // Dispatch B's own healthy, in-flight run.
+        db.insert_loop_run(&LoopNodeRun {
+            id: "run-b".to_string(),
+            loop_id: loop_id.clone(),
+            spec_id,
+            node_id: "node-a".to_string(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        })
+        .unwrap();
+
+        // Dispatch A's late failure, carrying its now-stale claim.
+        engine
+            .fail_loop(
+                &loop_id,
+                Some(claim_a),
+                Some("spec"),
+                "dispatch A's late failure",
+            )
+            .unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(
+            lp.status,
+            LoopStatus::Running,
+            "a stale dispatch's failure must not flip status out from under the current dispatch"
+        );
+        let run_b = db.get_loop_run("run-b").unwrap().unwrap();
+        assert_eq!(
+            run_b.status,
+            LoopRunStatus::Running,
+            "a stale dispatch's fail_loop sweep must never touch a newer dispatch's run"
+        );
+    }
+
+    /// The ordinary, single-dispatch case is unchanged: when
+    /// `dispatch_started_at` still matches the loop's current claim,
+    /// `fail_loop` flips status and sweeps exactly as before.
+    #[tokio::test]
+    async fn fail_loop_from_current_dispatch_still_flips_status_and_sweeps() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-a".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "node-a".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "true"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let claim = chrono::Utc::now();
+        assert!(db.claim_loop_for_run(&loop_id, claim).unwrap());
+        db.insert_loop_run(&LoopNodeRun {
+            id: "run-a".to_string(),
+            loop_id: loop_id.clone(),
+            spec_id,
+            node_id: "node-a".to_string(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        })
+        .unwrap();
+
+        engine
+            .fail_loop(&loop_id, Some(claim), Some("spec"), "genuine failure")
+            .unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Failed);
+        let run = db.get_loop_run("run-a").unwrap().unwrap();
+        assert_eq!(run.status, LoopRunStatus::Fail);
     }
 
     /// A second launch against a loop that already has an in-flight run must be
@@ -8189,7 +9883,7 @@ echo done
             ),
             (
                 "member-ok",
-                &write_member_script(dir.path(), "ok.sh", "exit 0"),
+                &write_member_script(dir.path(), "ok.sh", "printf ok"),
             ),
         ]);
 
@@ -8634,11 +10328,11 @@ echo done
 
     // ── B17: empty effective spec set is a launch error, not a completion ──
 
-    /// The core incident: a loop with zero bound specs and no `pool_id`
+    /// The core incident: a loop with zero bound specs and no `queue_id`
     /// given must refuse to launch — not silently transition to
     /// `Completed`. Status must stay untouched and no run recorded.
     #[tokio::test]
-    async fn loop_engine_zero_bound_specs_and_no_pool_is_a_launch_error() {
+    async fn loop_engine_zero_bound_specs_and_no_queue_is_a_launch_error() {
         let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
 
         let error = engine
@@ -8662,64 +10356,64 @@ echo done
         );
     }
 
-    /// (Requirement 3) When the loop's last run was pool-driven and a fresh
-    /// `loop_run` arrives without `pool_id` and finds zero bound specs, the
-    /// error must name the last pool so a recovery agent can retry
-    /// correctly instead of silently discarding the pool context.
+    /// (Requirement 3) When the loop's last run was queue-driven and a fresh
+    /// `loop_run` arrives without `queue_id` and finds zero bound specs, the
+    /// error must name the last queue so a recovery agent can retry
+    /// correctly instead of silently discarding the queue context.
     #[tokio::test]
-    async fn loop_engine_pool_less_relaunch_after_pool_run_names_last_pool() {
+    async fn loop_engine_queue_less_relaunch_after_queue_run_names_last_queue() {
         let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
 
-        // Simulate the incident: a pool-driven run left interrupted (daemon
-        // crash, quota failure) — `active_run_pool_id` stays persisted
+        // Simulate the incident: a queue-driven run left interrupted (daemon
+        // crash, quota failure) — `active_run_queue_id` stays persisted
         // (it's only ever cleared on a *genuine* completion) with pending
-        // pool members still queued behind it.
-        let pending = standalone_spec("pool-pending", 1);
+        // queue members still queued behind it.
+        let pending = standalone_spec("queue-pending", 1);
         db.insert_loop_spec(&pending).unwrap();
-        insert_pool_with_members(&db, "pool-1", &[&pending.id]);
-        db.set_loop_active_run_pool(&loop_id, Some("pool-1"))
+        insert_queue_with_members(&db, "queue-1", &[&pending.id]);
+        db.set_loop_active_run_queue(&loop_id, Some("queue-1"))
             .unwrap();
 
         // The recovery agent's mistake: relaunch directly (the loop's own
-        // bound specs are still empty — every spec lives in the pool)
-        // without passing `pool_id` back.
+        // bound specs are still empty — every spec lives in the queue)
+        // without passing `queue_id` back.
         let error = engine
             .run_loop(loop_id.clone(), None, None)
             .await
             .unwrap_err();
         assert!(
-            error.to_string().contains("pool-1"),
-            "error must name the last pool so a recovery agent can retry correctly: {error}"
+            error.to_string().contains("queue-1"),
+            "error must name the last queue so a recovery agent can retry correctly: {error}"
         );
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         assert_eq!(
             lp.status,
             LoopStatus::Draft,
-            "the failed pool-less relaunch must not touch the loop's status"
+            "the failed queue-less relaunch must not touch the loop's status"
         );
         assert_eq!(
-            lp.active_run_pool_id.as_deref(),
-            Some("pool-1"),
-            "the pool context must not be silently discarded by the failed relaunch"
+            lp.active_run_queue_id.as_deref(),
+            Some("queue-1"),
+            "the queue context must not be silently discarded by the failed relaunch"
         );
     }
 
-    /// (Requirement 4b) A pool run where every member is already completed
+    /// (Requirement 4b) A queue run where every member is already completed
     /// must be treated as the same empty-set error, not a fresh completed
-    /// run — a pool is shared/reusable, so "nothing pending" is far more
-    /// likely a stale/incorrect pool_id than a genuine finish.
+    /// run — a queue is shared/reusable, so "nothing pending" is far more
+    /// likely a stale/incorrect queue_id than a genuine finish.
     #[tokio::test]
-    async fn loop_engine_pool_run_with_all_members_completed_is_a_launch_error() {
+    async fn loop_engine_queue_run_with_all_members_completed_is_a_launch_error() {
         let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
 
-        let mut done = standalone_spec("pool-done", 1);
+        let mut done = standalone_spec("queue-done", 1);
         done.status = LoopSpecStatus::Completed;
         db.insert_loop_spec(&done).unwrap();
-        insert_pool_with_members(&db, "pool-1", &[&done.id]);
+        insert_queue_with_members(&db, "queue-1", &[&done.id]);
 
         let error = engine
-            .run_loop(loop_id.clone(), Some("pool-1".to_string()), None)
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
             .await
             .unwrap_err();
         assert!(
@@ -8731,22 +10425,22 @@ echo done
         assert_eq!(
             lp.status,
             LoopStatus::Draft,
-            "an empty pool launch must leave the loop's status untouched"
+            "an empty queue launch must leave the loop's status untouched"
         );
     }
 
-    /// (Requirement 4c) A normal pool run — real pending members — still
+    /// (Requirement 4c) A normal queue run — real pending members — still
     /// completes and fires the `on_completed` hook exactly once; the B17
     /// guard must not interfere with a genuine completion.
     #[tokio::test]
-    async fn loop_engine_normal_pool_run_still_completes_and_fires_hook_once() {
+    async fn loop_engine_normal_queue_run_still_completes_and_fires_hook_once() {
         let fake_home = setup_test_cli_home();
         let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
         let marker = dir.path().join("hook_fired.marker");
 
-        let spec = standalone_spec("pool-spec", 1);
+        let spec = standalone_spec("queue-spec", 1);
         db.insert_loop_spec(&spec).unwrap();
-        insert_pool_with_members(&db, "pool-1", &[&spec.id]);
+        insert_queue_with_members(&db, "queue-1", &[&spec.id]);
 
         db.insert_loop_node(&LoopNode {
             id: "loop-check".to_string(),
@@ -8775,7 +10469,7 @@ echo done
 
         let _home = HomeGuard::set(fake_home.path());
         let result = engine
-            .run_loop(loop_id.clone(), Some("pool-1".to_string()), None)
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
             .await;
         drop(_home);
         drop(fake_home);
@@ -8845,6 +10539,7 @@ echo done
     #[tokio::test]
     async fn render_completion_hook_prompt_substitutes_all_placeholders() {
         let lp = crate::domain::loops::Loop {
+            archived: false,
             id: "wf".to_string(),
             name: "MyLoop".to_string(),
             description: None,
@@ -8857,7 +10552,7 @@ echo done
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         };
         let completed_specs = vec![
@@ -8882,6 +10577,7 @@ echo done
     #[tokio::test]
     async fn render_completion_hook_prompt_empty_specs_shows_none() {
         let lp = crate::domain::loops::Loop {
+            archived: false,
             id: "wf".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -8894,7 +10590,7 @@ echo done
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         };
 
@@ -9188,6 +10884,7 @@ echo done
                 position: i as i64,
                 platform: platform.to_string(),
                 model: None,
+                prompt_override: None,
             })
             .collect();
 
@@ -9373,11 +11070,11 @@ echo done
         let fake_home = setup_multi_cli_home(&[
             (
                 "member-ok-a",
-                &write_member_script(dir.path(), "a.sh", "exit 0"),
+                &write_member_script(dir.path(), "a.sh", "printf ok"),
             ),
             (
                 "member-ok-b",
-                &write_member_script(dir.path(), "b.sh", "exit 0"),
+                &write_member_script(dir.path(), "b.sh", "printf ok"),
             ),
             (
                 "member-bad",
@@ -9428,7 +11125,7 @@ echo done
         let fake_home = setup_multi_cli_home(&[
             (
                 "member-ok",
-                &write_member_script(dir.path(), "a.sh", "exit 0"),
+                &write_member_script(dir.path(), "a.sh", "printf ok"),
             ),
             (
                 "member-bad-a",
@@ -9531,6 +11228,174 @@ echo done
             pos_a < pos_b,
             "consolidated doc must list members in position order, not completion order"
         );
+    }
+
+    /// A multi-angle panel (the point of per-member `prompt_override`): three
+    /// members sharing the SAME platform/model — so `member_label`'s old
+    /// "platform/model" text alone would produce three identical, unlabeled
+    /// "## shared-cli [pass]" headings — each renders its own override
+    /// instead of the (unused here) shared prompt. The quorum must still
+    /// attribute each section to its own member (by position, since
+    /// platform/model can no longer do it) and each section's content must
+    /// be that member's own rendered prompt, not another member's or the
+    /// shared template.
+    #[tokio::test]
+    async fn ensemble_execute_attributes_members_sharing_platform_by_prompt_override() {
+        let (dir, db, engine, _loop_id, spec_id) = loop_fixture().unwrap();
+        // A single registered CLI, `cat`, echoes its composed prompt back on
+        // stdout verbatim — letting the consolidated doc prove which prompt
+        // text each member actually rendered.
+        let fake_home = setup_multi_cli_home(&[(
+            "shared-cli",
+            &write_member_script(dir.path(), "echo.sh", "cat"),
+        )]);
+
+        db.insert_loop_node(&LoopNode {
+            id: "kickoff".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "kickoff".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "printf ok", "success_condition": "exit_code_0"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        let pass_marker = dir.path().join("pass.marker");
+        db.insert_loop_node(&touch_marker_node("on-pass", &spec_id, &pass_marker, 100))
+            .unwrap();
+
+        let overrides = [
+            ("m-context", "OVERRIDE-CONTEXT-ANGLE"),
+            ("m-security", "OVERRIDE-SECURITY-ANGLE"),
+            ("m-conventions", "OVERRIDE-CONVENTIONS-ANGLE"),
+        ];
+        let now = chrono::Utc::now();
+        let member_nodes: Vec<LoopNode> = overrides
+            .iter()
+            .enumerate()
+            .map(|(i, (node_id, prompt))| LoopNode {
+                id: node_id.to_string(),
+                spec_id: Some(spec_id.clone()),
+                loop_id: None,
+                name: format!("Panel [{}]", i + 1),
+                kind: LoopNodeKind::Agent,
+                config: serde_json::json!({
+                    "platform": "shared-cli",
+                    "prompt_template": prompt,
+                    "timeout_minutes": 5,
+                }),
+                position: 2 + i as i64,
+                created_at: now,
+            })
+            .collect();
+        let join_node = LoopNode {
+            id: "join1".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "quorum".to_string(),
+            kind: LoopNodeKind::Join,
+            config: serde_json::json!({ "ensemble_id": "ens1" }),
+            position: 2 + overrides.len() as i64,
+            created_at: now,
+        };
+        let mut edges = Vec::new();
+        for (node_id, _) in &overrides {
+            edges.push(LoopEdge {
+                id: format!("kickoff->{node_id}"),
+                spec_id: Some(spec_id.clone()),
+                loop_id: None,
+                from_node: "kickoff".to_string(),
+                to_node: node_id.to_string(),
+                condition: LoopEdgeCondition::Always,
+            });
+            edges.push(LoopEdge {
+                id: format!("{node_id}->join1"),
+                spec_id: Some(spec_id.clone()),
+                loop_id: None,
+                from_node: node_id.to_string(),
+                to_node: "join1".to_string(),
+                condition: LoopEdgeCondition::Always,
+            });
+        }
+        edges.push(LoopEdge {
+            id: "join1->on-pass".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "join1".to_string(),
+            to_node: "on-pass".to_string(),
+            condition: LoopEdgeCondition::Pass,
+        });
+        let ensemble = crate::domain::loops::Ensemble {
+            id: "ens1".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "Panel".to_string(),
+            prompt_template: "shared prompt (unused — every member overrides it)".to_string(),
+            join_node_id: "join1".to_string(),
+            entry_from_node: "kickoff".to_string(),
+            entry_condition: LoopEdgeCondition::Always,
+            min_pass: 3,
+            straggler_timeout_minutes: None,
+            timeout_minutes: 5,
+            on_pass_to: "on-pass".to_string(),
+            on_fail_to: None,
+            created_at: now,
+        };
+        let ensemble_members: Vec<EnsembleMember> = overrides
+            .iter()
+            .enumerate()
+            .map(|(i, (node_id, prompt))| EnsembleMember {
+                ensemble_id: "ens1".to_string(),
+                node_id: node_id.to_string(),
+                position: i as i64,
+                platform: "shared-cli".to_string(),
+                model: None,
+                prompt_override: Some(prompt.to_string()),
+            })
+            .collect();
+        db.insert_ensemble_unit(
+            &ensemble,
+            &ensemble_members,
+            &member_nodes,
+            &join_node,
+            &edges,
+        )
+        .unwrap();
+
+        let _home = HomeGuard::set(fake_home.path());
+        engine
+            .run_loop("wf-test".to_string(), None, None)
+            .await
+            .unwrap();
+        drop(_home);
+
+        let join = join_run(&db, &spec_id, "join1");
+        assert_eq!(join.status, LoopRunStatus::Pass);
+        assert!(pass_marker.exists());
+        let doc = join.output.unwrap()["consolidated_doc"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Every member shares "shared-cli" with no model, so the label alone
+        // no longer disambiguates — three distinct, position-numbered
+        // headings must still exist.
+        assert!(doc.contains("## shared-cli #1 [pass]"), "{doc}");
+        assert!(doc.contains("## shared-cli #2 [pass]"), "{doc}");
+        assert!(doc.contains("## shared-cli #3 [pass]"), "{doc}");
+
+        // Each section carries that member's own rendered prompt, not the
+        // (unused) shared template and not another member's override.
+        let pos1 = doc.find("## shared-cli #1").unwrap();
+        let pos2 = doc.find("## shared-cli #2").unwrap();
+        let pos3 = doc.find("## shared-cli #3").unwrap();
+        assert!(doc[pos1..pos2].contains("OVERRIDE-CONTEXT-ANGLE"));
+        assert!(!doc[pos1..pos2].contains("OVERRIDE-SECURITY-ANGLE"));
+        assert!(doc[pos2..pos3].contains("OVERRIDE-SECURITY-ANGLE"));
+        assert!(!doc[pos2..pos3].contains("OVERRIDE-CONVENTIONS-ANGLE"));
+        assert!(doc[pos3..].contains("OVERRIDE-CONVENTIONS-ANGLE"));
+        assert!(!doc.contains("shared prompt (unused"));
     }
 
     /// Straggler kill + fail counting (B12): a member that hangs past the
@@ -9746,6 +11611,7 @@ echo done
                 position: i as i64,
                 platform: platform.to_string(),
                 model: None,
+                prompt_override: None,
             })
             .collect();
 
@@ -9783,7 +11649,7 @@ echo done
             dir.path(),
             "flap.sh",
             &format!(
-                "n=$(cat \"{c}\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"{c}\"; [ \"$n\" -ge 2 ] && exit 0 || exit 1",
+                "n=$(cat \"{c}\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"{c}\"; [ \"$n\" -ge 2 ] && (printf ok; exit 0) || exit 1",
                 c = counter.display(),
             ),
         );
@@ -9791,7 +11657,7 @@ echo done
             ("member-flap", &flap),
             (
                 "member-ok",
-                &write_member_script(dir.path(), "ok.sh", "exit 0"),
+                &write_member_script(dir.path(), "ok.sh", "printf ok"),
             ),
         ]);
         insert_infra_ensemble(
@@ -9843,7 +11709,7 @@ echo done
             ),
             (
                 "member-ok",
-                &write_member_script(dir.path(), "ok.sh", "exit 0"),
+                &write_member_script(dir.path(), "ok.sh", "printf ok"),
             ),
         ]);
         insert_infra_ensemble(
@@ -9889,6 +11755,140 @@ echo done
         );
         assert_eq!(dead[0].output.as_ref().unwrap()["infra_attempt"], 0);
         assert_eq!(dead[1].output.as_ref().unwrap()["infra_attempt"], 1);
+    }
+
+    /// The `mimocode`/`mimo-auto` incident inside an ensemble: a member that
+    /// exits 0 with empty stdout (and stderr complaining about its model)
+    /// must count as a member FAIL, not a pass — a crashed member must never
+    /// count toward the join's pass quorum. With min_pass=2 and only one
+    /// genuinely healthy member, 1/2 must fail the join. It must also
+    /// resolve on the FIRST attempt (one run row), never retried as an infra
+    /// crash, since this is a deterministic misconfiguration that would just
+    /// reproduce the identical empty result.
+    #[tokio::test]
+    async fn ensemble_member_empty_output_zero_exit_counts_as_fail_not_pass() {
+        let (dir, db, engine, _loop_id, spec_id) = loop_fixture().unwrap();
+        let fake_home = setup_multi_cli_home(&[
+            (
+                "member-no-output",
+                &write_member_script(
+                    dir.path(),
+                    "no-output.sh",
+                    ">&2 printf 'Error: Unsupported model mimo-auto'\nexit 0",
+                ),
+            ),
+            (
+                "member-ok",
+                &write_member_script(dir.path(), "ok.sh", "printf ok"),
+            ),
+        ]);
+        insert_infra_ensemble(
+            &db,
+            &spec_id,
+            &[("m-no-output", "member-no-output"), ("m-ok", "member-ok")],
+            2,
+            Some(1),
+            &serde_json::json!({ "infra_backoff_seconds": 0 }),
+        );
+
+        let _home = HomeGuard::set(fake_home.path());
+        engine
+            .run_loop("wf-test".to_string(), None, None)
+            .await
+            .unwrap();
+        drop(_home);
+
+        let join = join_run(&db, &spec_id, "join1");
+        assert_eq!(
+            join.status,
+            LoopRunStatus::Fail,
+            "an empty-output member exiting 0 must not count toward the pass quorum -> 1/2 -> join fails"
+        );
+        assert_eq!(join.output.as_ref().unwrap()["passed"], 1);
+
+        let runs = member_runs(&db, &spec_id, "m-no-output");
+        assert_eq!(
+            runs.len(),
+            1,
+            "an exit-0 no-output member must resolve on the first attempt, never infra-retried"
+        );
+        assert_eq!(runs[0].status, LoopRunStatus::Fail);
+        assert_eq!(
+            runs[0].output.as_ref().unwrap()["no_output"],
+            serde_json::Value::Bool(true)
+        );
+        assert!(
+            runs[0].output.as_ref().unwrap()["error"]
+                .as_str()
+                .unwrap()
+                .contains("Unsupported model mimo-auto"),
+            "the member's stderr must be surfaced in the stored output"
+        );
+    }
+
+    /// The ensemble-member corner: `require_report` is judged per member,
+    /// exactly like the sequential path, so a quorum counts a silent member
+    /// the same way a lone node's fail edge would. Both members exit 0 with
+    /// REAL stdout (unlike the no-output member above) — the shape
+    /// `zero_exit_no_output` cannot catch — and neither self-reports, so with
+    /// `require_report: true` on the ensemble's shared member config, both
+    /// must still fail the quorum, deterministically on the first attempt
+    /// (never infra-retried).
+    #[tokio::test]
+    async fn ensemble_member_require_report_true_without_self_report_counts_as_fail() {
+        let (dir, db, engine, _loop_id, spec_id) = loop_fixture().unwrap();
+        let fake_home = setup_multi_cli_home(&[
+            (
+                "member-silent-1",
+                &write_member_script(dir.path(), "silent1.sh", "printf 'looks done'\nexit 0"),
+            ),
+            (
+                "member-silent-2",
+                &write_member_script(dir.path(), "silent2.sh", "printf 'also done'\nexit 0"),
+            ),
+        ]);
+        insert_infra_ensemble(
+            &db,
+            &spec_id,
+            &[
+                ("m-silent-1", "member-silent-1"),
+                ("m-silent-2", "member-silent-2"),
+            ],
+            1,
+            Some(1),
+            &serde_json::json!({ "infra_backoff_seconds": 0, "require_report": true }),
+        );
+
+        let _home = HomeGuard::set(fake_home.path());
+        engine
+            .run_loop("wf-test".to_string(), None, None)
+            .await
+            .unwrap();
+        drop(_home);
+
+        let join = join_run(&db, &spec_id, "join1");
+        assert_eq!(
+            join.status,
+            LoopRunStatus::Fail,
+            "require_report members that exit 0 with real stdout but never self-report must fail the join"
+        );
+        assert_eq!(join.output.as_ref().unwrap()["passed"], 0);
+
+        let runs = member_runs(&db, &spec_id, "m-silent-1");
+        assert_eq!(
+            runs.len(),
+            1,
+            "a require_report no-report member must resolve on the first attempt, never infra-retried"
+        );
+        assert_eq!(runs[0].status, LoopRunStatus::Fail);
+        assert_eq!(
+            runs[0].output.as_ref().unwrap()["unreported"],
+            serde_json::Value::Bool(true)
+        );
+        assert_eq!(
+            runs[0].output.as_ref().unwrap()["failure_kind"],
+            serde_json::Value::String("no_report".to_string())
+        );
     }
 
     /// Straggler-window interaction (documented behavior): the ensemble's
@@ -9965,16 +11965,17 @@ echo done
         );
     }
 
-    /// Pool-run compatibility: a pool member spec whose own graph contains
-    /// an ensemble must run end to end through a pool dispatch exactly like
+    /// Queue-run compatibility: a queue member spec whose own graph contains
+    /// an ensemble must run end to end through a queue dispatch exactly like
     /// any other spec — the ensemble's join routing onward is what lets the
-    /// spec (and therefore the pool) reach completion.
+    /// spec (and therefore the queue) reach completion.
     #[tokio::test]
-    async fn ensemble_runs_end_to_end_through_a_pool_dispatch() {
+    async fn ensemble_runs_end_to_end_through_a_queue_dispatch() {
         let dir = tempdir().unwrap();
         let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
         let lp = crate::domain::loops::Loop {
-            id: "wf-pool-ensemble".to_string(),
+            archived: false,
+            id: "wf-queue-ensemble".to_string(),
             name: "Loop".to_string(),
             description: None,
             workdir: dir.path().to_string_lossy().to_string(),
@@ -9986,24 +11987,24 @@ echo done
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         };
         db.insert_loop(&lp).unwrap();
         let engine = LoopEngine::new(Arc::clone(&db), Arc::new(DefaultNotificationService));
 
-        let spec = standalone_spec("pool-ensemble-spec", 1);
+        let spec = standalone_spec("queue-ensemble-spec", 1);
         db.insert_loop_spec(&spec).unwrap();
-        insert_pool_with_members(&db, "pool-1", &[&spec.id]);
+        insert_queue_with_members(&db, "queue-1", &[&spec.id]);
 
         let fake_home = setup_multi_cli_home(&[
             (
                 "member-ok-a",
-                &write_member_script(dir.path(), "a.sh", "exit 0"),
+                &write_member_script(dir.path(), "a.sh", "printf ok"),
             ),
             (
                 "member-ok-b",
-                &write_member_script(dir.path(), "b.sh", "exit 0"),
+                &write_member_script(dir.path(), "b.sh", "printf ok"),
             ),
         ]);
         db.insert_loop_node(&touch_marker_node(
@@ -10028,7 +12029,7 @@ echo done
 
         let _home = HomeGuard::set(fake_home.path());
         engine
-            .run_loop(lp.id.clone(), Some("pool-1".to_string()), None)
+            .run_loop(lp.id.clone(), Some("queue-1".to_string()), None)
             .await
             .unwrap();
         drop(_home);
@@ -10036,9 +12037,9 @@ echo done
         let lp = db.get_loop(&lp.id).unwrap().unwrap();
         assert_eq!(lp.status, LoopStatus::Completed);
         assert_eq!(
-            db.pool_next_pending_spec_id("pool-1").unwrap(),
+            db.queue_next_pending_spec_id("queue-1").unwrap(),
             None,
-            "the ensemble-bearing spec must have been fully consumed by the pool run"
+            "the ensemble-bearing spec must have been fully consumed by the queue run"
         );
     }
 
@@ -10355,7 +12356,7 @@ echo done
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\nif [ -f \"{m}\" ]; then exit 0; else touch \"{m}\"; exit 1; fi\n",
+                "#!/bin/sh\nif [ -f \"{m}\" ]; then printf ok; exit 0; else touch \"{m}\"; exit 1; fi\n",
                 m = marker.to_string_lossy()
             ),
         )
@@ -10447,6 +12448,779 @@ echo done
         assert!(
             flaky_runs.iter().any(|r| r.status == LoopRunStatus::Pass),
             "the retry should pass"
+        );
+    }
+
+    // ── M2: router node execution ────────────────────────────────────────
+
+    fn router_node(
+        id: &str,
+        spec_id: &str,
+        platform: &str,
+        routes: &[(&str, &str)],
+        fallback: &str,
+        position: i64,
+    ) -> LoopNode {
+        let routes_json: Vec<Value> = routes
+            .iter()
+            .map(|(label, description)| {
+                serde_json::json!({ "label": label, "description": description })
+            })
+            .collect();
+        LoopNode {
+            id: id.to_string(),
+            spec_id: Some(spec_id.to_string()),
+            loop_id: None,
+            name: id.to_string(),
+            kind: LoopNodeKind::Router,
+            config: serde_json::json!({
+                "platform": platform,
+                "routes": routes_json,
+                "fallback": fallback,
+                "timeout_minutes": 1,
+            }),
+            position,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn route_edge(
+        id: &str,
+        spec_id: &str,
+        from_node: &str,
+        to_node: &str,
+        label: &str,
+    ) -> LoopEdge {
+        LoopEdge {
+            id: id.to_string(),
+            spec_id: Some(spec_id.to_string()),
+            loop_id: None,
+            from_node: from_node.to_string(),
+            to_node: to_node.to_string(),
+            condition: LoopEdgeCondition::Route(label.to_string()),
+        }
+    }
+
+    fn sample_routes() -> Vec<RouterRoute> {
+        vec![
+            RouterRoute {
+                label: "billing".to_string(),
+                description: "Billing questions".to_string(),
+            },
+            RouterRoute {
+                label: "technical".to_string(),
+                description: "Technical issues".to_string(),
+            },
+            RouterRoute {
+                label: "other".to_string(),
+                description: "Everything else".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn parse_router_config_reads_routes_and_fallback() {
+        let node = router_node(
+            "r1",
+            "spec-1",
+            "test-cli",
+            &[("billing", "b"), ("technical", "t")],
+            "technical",
+            1,
+        );
+        let (routes, fallback) = parse_router_config(&node).unwrap();
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].label, "billing");
+        assert_eq!(routes[0].description, "b");
+        assert_eq!(fallback, "technical");
+    }
+
+    #[test]
+    fn parse_router_config_rejects_missing_routes_array() {
+        let mut node = router_node(
+            "r1",
+            "spec-1",
+            "test-cli",
+            &[("billing", "b")],
+            "billing",
+            1,
+        );
+        node.config.as_object_mut().unwrap().remove("routes");
+        let err = parse_router_config(&node).unwrap_err();
+        assert!(err.to_string().contains("routes"));
+    }
+
+    #[test]
+    fn parse_router_config_rejects_missing_fallback() {
+        let mut node = router_node(
+            "r1",
+            "spec-1",
+            "test-cli",
+            &[("billing", "b")],
+            "billing",
+            1,
+        );
+        node.config.as_object_mut().unwrap().remove("fallback");
+        let err = parse_router_config(&node).unwrap_err();
+        assert!(err.to_string().contains("fallback"));
+    }
+
+    #[test]
+    fn match_router_token_matches_exact_trimmed_label() {
+        let routes = sample_routes();
+        assert_eq!(match_router_token("billing\n", &routes), Some("billing"));
+        assert_eq!(
+            match_router_token("  technical  ", &routes),
+            Some("technical")
+        );
+    }
+
+    #[test]
+    fn match_router_token_rejects_bare_word_inside_narration() {
+        let routes = sample_routes();
+        assert_eq!(
+            match_router_token("I think billing is the right route here.", &routes),
+            None,
+            "a route label appearing inside narration must never match"
+        );
+    }
+
+    #[test]
+    fn match_router_token_returns_none_for_unknown_answer() {
+        let routes = sample_routes();
+        assert_eq!(match_router_token("nonsense", &routes), None);
+    }
+
+    #[test]
+    fn select_router_step_resolves_matching_route_edge() {
+        let edges = vec![
+            route_edge("e1", "s", "r", "n-billing", "billing"),
+            route_edge("e2", "s", "r", "n-technical", "technical"),
+        ];
+        let sel = select_router_step(&edges, "r", "technical")
+            .unwrap()
+            .unwrap();
+        assert_eq!(sel.cursor, SpecCursor::Node("n-technical".to_string()));
+    }
+
+    #[test]
+    fn select_router_step_returns_none_when_route_unwired() {
+        let edges = vec![route_edge("e1", "s", "r", "n-billing", "billing")];
+        assert!(select_router_step(&edges, "r", "technical")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn select_router_step_ambiguous_distinct_targets_errors() {
+        let edges = vec![
+            route_edge("e1", "s", "r", "n-a", "billing"),
+            route_edge("e2", "s", "r", "n-b", "billing"),
+        ];
+        let err = select_router_step(&edges, "r", "billing").unwrap_err();
+        assert!(err.to_string().contains("ambiguous"));
+    }
+
+    #[tokio::test]
+    async fn execute_router_node_spawn_failure_is_a_node_failure() {
+        let (_dir, db) = test_db();
+        let fake_home = setup_multi_cli_home(&[("broken-cli", "/nonexistent/nowhere/binary-xyz")]);
+        let node = router_node(
+            "r1",
+            "spec-1",
+            "broken-cli",
+            &[("billing", "Billing"), ("technical", "Technical")],
+            "technical",
+            1,
+        );
+
+        let _home = HomeGuard::set(fake_home.path());
+        let execution = execute_router_node(&db, &node, None, "run-router-spawn-fail", "/tmp")
+            .await
+            .unwrap();
+        drop(_home);
+
+        assert_eq!(execution.status, LoopRunStatus::Fail);
+        assert!(
+            execution.output.get("route").is_none(),
+            "a spawn failure must not carry a chosen route"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_router_node_matches_declared_route_from_stdout() {
+        let (dir, db) = test_db();
+        let script = write_member_script(dir.path(), "router-billing.sh", "printf 'billing\\n'");
+        let fake_home = setup_multi_cli_home(&[("router-billing-cli", &script)]);
+        let node = router_node(
+            "r1",
+            "spec-1",
+            "router-billing-cli",
+            &[("billing", "Billing"), ("technical", "Technical")],
+            "technical",
+            1,
+        );
+
+        let _home = HomeGuard::set(fake_home.path());
+        let execution = execute_router_node(&db, &node, None, "run-router-billing", "/tmp")
+            .await
+            .unwrap();
+        drop(_home);
+
+        assert_eq!(execution.status, LoopRunStatus::Pass);
+        assert_eq!(
+            execution.output.get("route").and_then(Value::as_str),
+            Some("billing")
+        );
+        assert_eq!(
+            execution
+                .output
+                .get("used_fallback")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            execution.output.get("raw_answer").and_then(Value::as_str),
+            Some("billing")
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_router_node_falls_back_and_records_raw_answer_when_unparseable() {
+        let (dir, db) = test_db();
+        let script = write_member_script(
+            dir.path(),
+            "router-narration.sh",
+            "printf 'I think billing fits best.\\n'",
+        );
+        let fake_home = setup_multi_cli_home(&[("router-narration-cli", &script)]);
+        let node = router_node(
+            "r1",
+            "spec-1",
+            "router-narration-cli",
+            &[("billing", "Billing"), ("technical", "Technical")],
+            "technical",
+            1,
+        );
+
+        let _home = HomeGuard::set(fake_home.path());
+        let execution = execute_router_node(&db, &node, None, "run-router-narration", "/tmp")
+            .await
+            .unwrap();
+        drop(_home);
+
+        assert_eq!(execution.status, LoopRunStatus::Pass);
+        assert_eq!(
+            execution.output.get("route").and_then(Value::as_str),
+            Some("technical"),
+            "an unparseable answer must take the declared fallback"
+        );
+        assert_eq!(
+            execution
+                .output
+                .get("used_fallback")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            execution.output.get("raw_answer").and_then(Value::as_str),
+            Some("I think billing fits best.")
+        );
+    }
+
+    /// Acceptance: a three-route router loop takes a different path per
+    /// input, and each decision — chosen route, raw answer — is persisted on
+    /// the router node's own run row: the same JSON blob `execute_router_node`
+    /// logs via `tracing::info!` (B43's node-run lifecycle logging) is what
+    /// `update_loop_run_result` writes, so the run row is the queryable
+    /// record of what the daemon log carries.
+    #[tokio::test]
+    async fn three_route_router_loop_takes_a_different_path_per_input() {
+        for (answer, expected_marker) in [
+            ("billing", "billing.marker"),
+            ("technical", "technical.marker"),
+            ("other", "other.marker"),
+        ] {
+            let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+            let script =
+                write_member_script(dir.path(), "router.sh", &format!("printf '{answer}\\n'"));
+            let fake_home = setup_multi_cli_home(&[("router-cli", &script)]);
+
+            db.insert_loop_node(&router_node(
+                "router",
+                &spec_id,
+                "router-cli",
+                &[
+                    ("billing", "Billing questions"),
+                    ("technical", "Technical issues"),
+                    ("other", "Everything else"),
+                ],
+                "other",
+                1,
+            ))
+            .unwrap();
+
+            for (position, (route_label, marker_name, node_id)) in [
+                ("billing", "billing.marker", "path-billing"),
+                ("technical", "technical.marker", "path-technical"),
+                ("other", "other.marker", "path-other"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                db.insert_loop_node(&LoopNode {
+                    id: node_id.to_string(),
+                    spec_id: Some(spec_id.clone()),
+                    loop_id: None,
+                    name: node_id.to_string(),
+                    kind: LoopNodeKind::Check,
+                    config: serde_json::json!({
+                        "command": format!("touch \"{}\"", dir.path().join(marker_name).display()),
+                        "success_condition": "exit_code_0"
+                    }),
+                    position: 2 + position as i64,
+                    created_at: chrono::Utc::now(),
+                })
+                .unwrap();
+                db.insert_loop_edge(&route_edge(
+                    &format!("edge-{route_label}"),
+                    &spec_id,
+                    "router",
+                    node_id,
+                    route_label,
+                ))
+                .unwrap();
+            }
+
+            let _home = HomeGuard::set(fake_home.path());
+            let result = engine.run_loop(loop_id.clone(), None, None).await;
+            drop(_home);
+            result.unwrap();
+
+            let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+            assert_eq!(
+                spec.status,
+                LoopSpecStatus::Completed,
+                "route '{answer}' must complete the spec"
+            );
+
+            for marker in ["billing.marker", "technical.marker", "other.marker"] {
+                let exists = dir.path().join(marker).exists();
+                if marker == expected_marker {
+                    assert!(exists, "expected marker '{marker}' for answer '{answer}'");
+                } else {
+                    assert!(
+                        !exists,
+                        "unexpected marker '{marker}' for answer '{answer}'"
+                    );
+                }
+            }
+
+            let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+            let router_run = runs.iter().find(|r| r.node_id == "router").unwrap();
+            assert_eq!(router_run.status, LoopRunStatus::Pass);
+            let output = router_run.output.as_ref().unwrap();
+            assert_eq!(output.get("route").and_then(Value::as_str), Some(answer));
+            assert_eq!(
+                output.get("raw_answer").and_then(Value::as_str),
+                Some(answer)
+            );
+            assert_eq!(
+                output.get("used_fallback").and_then(Value::as_bool),
+                Some(false)
+            );
+        }
+    }
+
+    /// Concurrency invariant: starting, pausing, resuming, and finishing one
+    /// graph must never change any observable state of another graph in a
+    /// different workdir sharing the same database. Graph A is seeded
+    /// mid-run and never driven again — its persisted rows are the baseline.
+    /// Graph B is driven through a full, real start → pause → resume →
+    /// finish cycle via the same `LoopEngine` a shared daemon would use, and
+    /// graph A's loop/spec/run rows must be byte-identical (via their
+    /// serialized JSON) before and after.
+    #[tokio::test]
+    async fn graph_b_full_lifecycle_never_touches_graph_a_in_a_different_workdir() {
+        let db_dir = tempdir().unwrap();
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let db = Arc::new(Database::new(&db_dir.path().join("shared.db")).unwrap());
+
+        // Graph A: seeded as mid-run and left alone for the rest of the test.
+        let loop_a = crate::domain::loops::Loop {
+            archived: false,
+            id: "wf-graph-a".to_string(),
+            name: "Graph A".to_string(),
+            description: None,
+            workdir: dir_a.path().to_string_lossy().to_string(),
+            status: LoopStatus::Running,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: Some(chrono::Utc::now()),
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        };
+        let spec_a = LoopSpec {
+            id: "spec-graph-a".to_string(),
+            loop_id: Some(loop_a.id.clone()),
+            name: "Spec A".to_string(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Running,
+            started_at: Some(chrono::Utc::now()),
+            completed_at: None,
+            spec_start_head: Some("deadbeef".to_string()),
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        let node_a = LoopNode {
+            id: "node-graph-a".to_string(),
+            spec_id: Some(spec_a.id.clone()),
+            loop_id: None,
+            name: "Node A".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "true", "success_condition": "exit_code_0"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+        let run_a = LoopNodeRun {
+            id: "run-graph-a".to_string(),
+            loop_id: loop_a.id.clone(),
+            spec_id: spec_a.id.clone(),
+            node_id: node_a.id.clone(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        };
+        db.insert_loop(&loop_a).unwrap();
+        db.insert_loop_spec(&spec_a).unwrap();
+        db.insert_loop_node(&node_a).unwrap();
+        db.insert_loop_run(&run_a).unwrap();
+
+        let snapshot = |db: &Database| {
+            (
+                serde_json::to_value(db.get_loop(&loop_a.id).unwrap().unwrap()).unwrap(),
+                serde_json::to_value(db.get_loop_spec(&spec_a.id).unwrap().unwrap()).unwrap(),
+                serde_json::to_value(db.get_loop_run(&run_a.id).unwrap().unwrap()).unwrap(),
+            )
+        };
+        let snapshot_before = snapshot(&db);
+
+        // Graph B: a real loop in a different workdir, driven through its
+        // full lifecycle by the engine.
+        let loop_b = crate::domain::loops::Loop {
+            archived: false,
+            id: "wf-graph-b".to_string(),
+            name: "Graph B".to_string(),
+            description: None,
+            workdir: dir_b.path().to_string_lossy().to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        };
+        let spec_b = LoopSpec {
+            id: "spec-graph-b".to_string(),
+            loop_id: Some(loop_b.id.clone()),
+            name: "Spec B".to_string(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        db.insert_loop(&loop_b).unwrap();
+        db.insert_loop_spec(&spec_b).unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-graph-b".to_string(),
+            spec_id: Some(spec_b.id.clone()),
+            loop_id: None,
+            name: "Node B".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "sleep 0.3 && true",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let engine = Arc::new(LoopEngine::new(
+            Arc::clone(&db),
+            Arc::new(DefaultNotificationService),
+        ));
+
+        // Start graph B in the background.
+        let dispatch_engine = Arc::clone(&engine);
+        let loop_b_id = loop_b.id.clone();
+        let dispatch =
+            tokio::spawn(async move { dispatch_engine.run_loop(loop_b_id, None, None).await });
+
+        // Poll (never a fixed sleep) until graph B's node run is actually
+        // recorded `Running` before pausing it, to avoid a flaky race
+        // against process spawn.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if !db
+                .list_running_loop_runs(&loop_b.id)
+                .unwrap_or_default()
+                .is_empty()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "graph B's node run never started"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // A snapshot mid-run of graph B confirms graph A is unaffected by
+        // graph B's mere presence as `Running`, not just by its start/end.
+        assert_eq!(
+            snapshot(&db),
+            snapshot_before,
+            "graph A must be untouched while graph B is starting"
+        );
+
+        // Pause graph B.
+        assert!(engine.request_pause(&loop_b.id).unwrap());
+        dispatch.await.unwrap().unwrap();
+        assert_eq!(
+            db.get_loop(&loop_b.id).unwrap().unwrap().status,
+            LoopStatus::Paused,
+            "graph B must actually have paused for this test to be meaningful"
+        );
+        assert_eq!(
+            snapshot(&db),
+            snapshot_before,
+            "graph A must be untouched by graph B pausing"
+        );
+
+        // Resume graph B — relaunching a paused loop directly is a
+        // supported, documented entry point of `run_loop`.
+        engine
+            .run_loop(loop_b.id.clone(), None, None)
+            .await
+            .unwrap();
+
+        let loop_b_after = db.get_loop(&loop_b.id).unwrap().unwrap();
+        assert_eq!(
+            loop_b_after.status,
+            LoopStatus::Completed,
+            "graph B must have finished its lifecycle for this test to be meaningful"
+        );
+
+        assert_eq!(
+            snapshot(&db),
+            snapshot_before,
+            "graph A's persisted state must be byte-identical after graph B's full \
+             start/pause/resume/finish lifecycle"
+        );
+    }
+
+    /// A graph's node run must never be signalled by a process that did not
+    /// launch it (no pid, no boot id recorded here — the shape a crashed
+    /// prior boot leaves behind). Pausing graph B — whose own running node
+    /// carries a real pid — must leave graph A's running node run row
+    /// completely untouched, even though both rows describe a `Running`
+    /// node run at the same instant. Asserted on the persisted run row
+    /// (not the daemon log), per the invariant that the 2026-08-03 incident
+    /// was invisible in the daemon's own log.
+    #[tokio::test]
+    async fn pausing_graph_b_never_signals_or_mutates_graph_a_run() {
+        let db_dir = tempdir().unwrap();
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let db = Arc::new(Database::new(&db_dir.path().join("shared.db")).unwrap());
+
+        let loop_a = crate::domain::loops::Loop {
+            archived: false,
+            id: "wf-signal-a".to_string(),
+            name: "Graph A".to_string(),
+            description: None,
+            workdir: dir_a.path().to_string_lossy().to_string(),
+            status: LoopStatus::Running,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: Some(chrono::Utc::now()),
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        };
+        let spec_a = LoopSpec {
+            id: "spec-signal-a".to_string(),
+            loop_id: Some(loop_a.id.clone()),
+            name: "Spec A".to_string(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Running,
+            started_at: Some(chrono::Utc::now()),
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        let node_a = LoopNode {
+            id: "node-signal-a".to_string(),
+            spec_id: Some(spec_a.id.clone()),
+            loop_id: None,
+            name: "Node A".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "true", "success_condition": "exit_code_0"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+        // A "running" node run with no pid of its own — never a process this
+        // test spawns, so any attempt to signal it would be a no-op at best
+        // and a wrong-process kill at worst; the assertion below is on the
+        // row, not on process survival.
+        let run_a = LoopNodeRun {
+            id: "run-signal-a".to_string(),
+            loop_id: loop_a.id.clone(),
+            spec_id: spec_a.id.clone(),
+            node_id: node_a.id.clone(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        };
+        db.insert_loop(&loop_a).unwrap();
+        db.insert_loop_spec(&spec_a).unwrap();
+        db.insert_loop_node(&node_a).unwrap();
+        db.insert_loop_run(&run_a).unwrap();
+        let run_a_before =
+            serde_json::to_value(db.get_loop_run(&run_a.id).unwrap().unwrap()).unwrap();
+
+        let loop_b = crate::domain::loops::Loop {
+            archived: false,
+            id: "wf-signal-b".to_string(),
+            name: "Graph B".to_string(),
+            description: None,
+            workdir: dir_b.path().to_string_lossy().to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        };
+        let spec_b = LoopSpec {
+            id: "spec-signal-b".to_string(),
+            loop_id: Some(loop_b.id.clone()),
+            name: "Spec B".to_string(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        db.insert_loop(&loop_b).unwrap();
+        db.insert_loop_spec(&spec_b).unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-signal-b".to_string(),
+            spec_id: Some(spec_b.id.clone()),
+            loop_id: None,
+            name: "Node B".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "sleep 0.3 && true",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let engine = Arc::new(LoopEngine::new(
+            Arc::clone(&db),
+            Arc::new(DefaultNotificationService),
+        ));
+        let dispatch_engine = Arc::clone(&engine);
+        let loop_b_id = loop_b.id.clone();
+        let dispatch =
+            tokio::spawn(async move { dispatch_engine.run_loop(loop_b_id, None, None).await });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if !db
+                .list_running_loop_runs(&loop_b.id)
+                .unwrap_or_default()
+                .is_empty()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "graph B's node run never started"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert!(engine.request_pause(&loop_b.id).unwrap());
+        dispatch.await.unwrap().unwrap();
+
+        let b_runs = db.list_loop_runs_for_spec(&spec_b.id).unwrap();
+        assert_eq!(
+            b_runs.len(),
+            1,
+            "graph B's node must have been signalled and finalized"
+        );
+        assert_eq!(b_runs[0].status, LoopRunStatus::Fail);
+
+        let run_a_after =
+            serde_json::to_value(db.get_loop_run(&run_a.id).unwrap().unwrap()).unwrap();
+        assert_eq!(
+            run_a_after, run_a_before,
+            "graph A's node run must never be signalled or mutated by graph B's pause"
         );
     }
 }

@@ -435,10 +435,10 @@ impl CronScheduler {
             }
 
             tracing::info!("Loop '{}' reached its autorun_at time; launching", lp.id);
-            // Resume with the loop's persisted run context (its pool, if any)
+            // Resume with the loop's persisted run context (its queue, if any)
             // rather than a fresh `start_background`, which would fall back
-            // to the loop's own bound specs — empty for a pool run, and
-            // exactly how a resumed pool run used to be mistaken for
+            // to the loop's own bound specs — empty for a queue run, and
+            // exactly how a resumed queue run used to be mistaken for
             // "nothing to do" and marked completed with members still
             // pending.
             Arc::clone(loop_engine).resume_background(lp.id.clone());
@@ -911,6 +911,7 @@ mod tests {
         status: crate::domain::loops::LoopStatus,
     ) -> crate::domain::loops::Loop {
         crate::domain::loops::Loop {
+            archived: false,
             id: id.to_string(),
             name: "Autorun test loop".to_string(),
             description: None,
@@ -923,7 +924,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         }
     }
@@ -1051,6 +1052,7 @@ mod tests {
         let workdir = tempfile::tempdir().unwrap();
         let loop_id = "failed-autorun".to_string();
         db.insert_loop(&Loop {
+            archived: false,
             id: loop_id.clone(),
             name: "Autorun test loop".to_string(),
             description: None,
@@ -1063,7 +1065,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         })
         .unwrap();
@@ -1138,25 +1140,26 @@ mod tests {
     }
 
     /// The exact incident this spec fixes: a loop was launched with
-    /// `loop_run { pool_id }`, failed mid-pool (e.g. a quota error), and its
+    /// `loop_run { queue_id }`, failed mid-queue (e.g. a quota error), and its
     /// `loop_schedule_autorun` fired to revive it. Before this fix, autorun
-    /// resumed the loop with its own bound specs — empty for a pool run — so
+    /// resumed the loop with its own bound specs — empty for a queue run — so
     /// the engine found nothing to do and marked the loop `completed` with
-    /// pool members still pending. Firing autorun now must reset and resume
-    /// against the *same pool*, in queue order, until it's genuinely done.
+    /// queue members still pending. Firing autorun now must reset and resume
+    /// against the *same queue*, in queue order, until it's genuinely done.
     #[tokio::test]
-    async fn fire_due_autorun_loops_resumes_same_pool_after_failed_run() {
+    async fn fire_due_autorun_loops_resumes_same_queue_after_failed_run() {
         use crate::domain::loops::{
             Loop, LoopNode, LoopNodeKind, LoopSpec, LoopSpecStatus, LoopStatus,
         };
-        use crate::domain::pools::Pool;
+        use crate::domain::queues::Queue;
 
         let (db, scheduler) = test_scheduler_with_loops();
         let workdir = tempfile::tempdir().unwrap();
-        let loop_id = "failed-pool-autorun".to_string();
+        let loop_id = "failed-queue-autorun".to_string();
         db.insert_loop(&Loop {
+            archived: false,
             id: loop_id.clone(),
-            name: "Autorun pool test loop".to_string(),
+            name: "Autorun queue test loop".to_string(),
             description: None,
             workdir: workdir.path().to_string_lossy().to_string(),
             status: LoopStatus::Failed,
@@ -1167,7 +1170,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: Some("pool-1".to_string()),
+            active_run_queue_id: Some("queue-1".to_string()),
             on_completed: None,
         })
         .unwrap();
@@ -1188,25 +1191,25 @@ mod tests {
             completed_via_reason: None,
             completed_via_at: None,
         };
-        db.insert_loop_spec(&standalone("pool-done", 1, LoopSpecStatus::Completed))
+        db.insert_loop_spec(&standalone("queue-done", 1, LoopSpecStatus::Completed))
             .unwrap();
-        // Left `failed` by the run that hit quota mid-pool — never explicitly
+        // Left `failed` by the run that hit quota mid-queue — never explicitly
         // reset, unlike the loop's own status.
-        db.insert_loop_spec(&standalone("pool-failed", 2, LoopSpecStatus::Failed))
+        db.insert_loop_spec(&standalone("queue-failed", 2, LoopSpecStatus::Failed))
             .unwrap();
-        db.insert_loop_spec(&standalone("pool-pending", 3, LoopSpecStatus::Pending))
+        db.insert_loop_spec(&standalone("queue-pending", 3, LoopSpecStatus::Pending))
             .unwrap();
-        db.insert_pool(&Pool {
-            id: "pool-1".to_string(),
-            name: "pool-1".to_string(),
+        db.insert_queue(&Queue {
+            id: "queue-1".to_string(),
+            name: "queue-1".to_string(),
             created_at: Utc::now(),
         })
         .unwrap();
-        for spec_id in ["pool-done", "pool-failed", "pool-pending"] {
-            db.append_pool_member("pool-1", spec_id, None).unwrap();
+        for spec_id in ["queue-done", "queue-failed", "queue-pending"] {
+            db.append_queue_member("queue-1", spec_id, None).unwrap();
         }
         // No bound specs on the loop itself — this is what the real incident
-        // hit: a `loop_run { pool_id }` launch never binds specs to the loop.
+        // hit: a `loop_run { queue_id }` launch never binds specs to the loop.
         db.insert_loop_node(&LoopNode {
             id: "node-check".to_string(),
             spec_id: None,
@@ -1242,27 +1245,27 @@ mod tests {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "resumed pool run did not complete in time; loop status is {:?}",
+                "resumed queue run did not complete in time; loop status is {:?}",
                 lp.status
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
-        // All three pool members ran to completion via the *same* pool — not
+        // All three queue members ran to completion via the *same* queue — not
         // a false completion with them left pending.
-        for spec_id in ["pool-done", "pool-failed", "pool-pending"] {
+        for spec_id in ["queue-done", "queue-failed", "queue-pending"] {
             let spec = db.get_loop_spec(spec_id).unwrap().unwrap();
             assert_eq!(
                 spec.status,
                 LoopSpecStatus::Completed,
-                "spec '{spec_id}' should have completed via the resumed pool run"
+                "spec '{spec_id}' should have completed via the resumed queue run"
             );
         }
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         assert_eq!(
             lp.status,
             LoopStatus::Completed,
-            "the resumed pool run must reach genuine completion"
+            "the resumed queue run must reach genuine completion"
         );
         // B31: the run context survives genuine completion as last-run data
         // so `loop list` / `loop info` keep rendering the finished loop's
@@ -1270,9 +1273,9 @@ mod tests {
         // launch time (every path re-persists this before the first spec),
         // not by clearing it on completion.
         assert_eq!(
-            lp.active_run_pool_id.as_deref(),
-            Some("pool-1"),
-            "a genuinely finished pool run keeps the persisted run context for progress display"
+            lp.active_run_queue_id.as_deref(),
+            Some("queue-1"),
+            "a genuinely finished queue run keeps the persisted run context for progress display"
         );
     }
 
@@ -1413,6 +1416,7 @@ mod tests {
         let workdir = tempfile::tempdir().unwrap();
         let loop_id = "paused-auto-continue".to_string();
         db.insert_loop(&Loop {
+            archived: false,
             id: loop_id.clone(),
             name: "Auto-continue test loop".to_string(),
             description: None,
@@ -1425,7 +1429,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         })
         .unwrap();
@@ -1522,6 +1526,7 @@ mod tests {
         let workdir = tempfile::tempdir().unwrap();
         let loop_id = "paused-auto-continue-skip".to_string();
         db.insert_loop(&Loop {
+            archived: false,
             id: loop_id.clone(),
             name: "Auto-continue skip test loop".to_string(),
             description: None,
@@ -1534,7 +1539,7 @@ mod tests {
             autorun_at: None,
             auto_continue_at: None,
             auto_continue_action: None,
-            active_run_pool_id: None,
+            active_run_queue_id: None,
             on_completed: None,
         })
         .unwrap();
