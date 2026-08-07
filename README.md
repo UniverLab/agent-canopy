@@ -42,7 +42,7 @@ See [`docs/installation.md`](docs/installation.md) for all methods and first-tim
 
 Full documentation lives in [`docs/`](docs/): installation, quick start, the
 TUI, agents and seed identities, intelligence & sync, loops, the RAG
-pipeline, all 64 MCP tools, and the complete CLI reference.
+pipeline, all 83 MCP tools, and the complete CLI reference.
 
 ---
 
@@ -62,6 +62,7 @@ pipeline, all 64 MCP tools, and the complete CLI reference.
 - **Interactive PTY Agents** — Each agent runs in a dedicated pseudo-terminal with full vt100 emulation, 24-bit color support, cursor positioning, and interactive applications.
 - **Terminal Sessions** — Raw shell sessions with per-session command history (TOML-backed), cross-session autocomplete search, and Warp-like input mode for efficient command entry.
 - **Background Agents** — Cron-scheduled and file-watcher-triggered agents with configurable timeouts, automatic retries, execution logging (5 MB rotation), and per-run status tracking.
+- **Platform Liveness Probe** — `agent_probe` tests whether a platform+model pair can actually respond before loop_run spends real quota on it. Probes the exact pair a node would use, not just the platform default.
 - **Seed Identity System** — Persistent, evolvable agent identities stored as structured TOML at `~/.canopy/seeds/<id>/identity.toml`. Each seed has a unique name, family, behavioral directives, and personality traits. Binded sessions receive the seed's prompt injection automatically. The `evolve_identity` MCP tool lets agents refine themselves over time. 4 KB size cap, case-insensitive name uniqueness, and mandatory field validation.
 - **Seed Nursery** — Collaborative workspace for creating new seed identities. Creates a temporary directory with a draft `identity.toml` and CLI-specific instruction files (e.g. `CLAUDE.md`, `AGENTS.md`) that guide the agent to interview the user and define the seed's personality. Validates and registers the seed on completion.
 - **Context Transfer** — Seamlessly transfer conversation context, prompts, and output between agents while preserving session state and scrollback history.
@@ -88,10 +89,10 @@ pipeline, all 64 MCP tools, and the complete CLI reference.
 - **Ordered Specs** — Loops contain sequenced `Spec`s, each with `Node`s connected by `Edge`s with routing conditions (`pass`/`fail`/`always`).
 - **Standalone Spec Backlog** — Specs exist independently from loops; tag them to a workdir for filtering. Managed via `spec_create`, `spec_list`, `spec_update`, `spec_delete`.
 - **Spec Queues** — Ordered queues of existing specs that a loop drains one by one. Append and reorder while a loop is running via `queue_create`, `queue_add_spec`, `queue_list`, `queue_remove_spec`, `queue_reorder`.
-- **Node Kinds** — `agent` nodes invoke CLI tools with prompt templates; `check` nodes execute shell commands; `gate` nodes validate previous output (e.g., `output_contains`); `quorum` is the engine-managed node that closes an ensemble.
-- **Ensembles** — `loop_add_ensemble` creates a parallel group of 2-8 agent-node members sharing one prompt, plus a wait-all quorum that consolidates their outputs and routes onward, in a single MCP call. `loop_update_ensemble` edits the shared prompt, member list, and quorum/exit config as one unit. See [docs/loops.md](docs/loops.md#ensembles).
+- **Node Kinds** — `agent` nodes invoke CLI tools with prompt templates; `check` nodes execute shell commands; `gate` nodes validate previous output (e.g., `output_contains`); `router` nodes classify and route by token matching with fallback; `quorum` is the engine-managed node that closes an ensemble.
+- **Ensembles** — `loop_add_ensemble` creates a parallel group of 2-8 agent-node members sharing one prompt (or per-member prompt overrides for specialist panels), plus a wait-all quorum that consolidates their outputs and routes onward, in a single MCP call. `loop_update_ensemble` edits the shared prompt, member list, and quorum/exit config as one unit. See [docs/loops.md](docs/loops.md#ensembles).
 - **Node Blueprints** — Reusable `{name, kind, config}` templates referenced by name in `loop_add_node`. Five builtins seeded at startup; custom blueprints via `blueprint_create`/`blueprint_delete`/`blueprint_list`.
-- **Full Lifecycle** — Create, update, run, pause, continue (retry or skip), reset, complete nodes, and report blockers for human intervention. `loop_schedule_autorun` resumes failed/completed loops at a future time.
+- **Full Lifecycle** — Create, update, run, pause, continue (retry or skip), reset, complete nodes, and report blockers for human intervention. `loop_schedule_autorun` resumes failed/completed loops at a future time. Archive and restore loops without losing history. Export and import loop designs as shareable JSON documents. Copy nodes and ensembles within or across loops. View node run history for failure diagnosis.
 - **`on_completed` Hook** — Post-completion agent execution (e.g. documentation maintenance) that fires once per completion.
 - **Template Variables** — Loop prompts support `{{loop_name}}`, `{{workdir}}`, `{{spec_id}}`, `{{spec_name}}`, `{{spec_content}}`, `{{node_id}}`, `{{previous_feedback}}`, and `{{spec_start_head}}` (git HEAD at spec start, for check nodes).
 - **24 MCP Tools** — Complete authoring, inspection, runtime, spec, queue, and blueprint management.
@@ -134,19 +135,19 @@ pipeline, all 64 MCP tools, and the complete CLI reference.
 
 ---
 
-## MCP Tools (66)
+## MCP Tools (83)
 
 | Category | Tools |
 |----------|-------|
-| **Agent Management** (13) | `agent_add`, `agent_watch`, `agent_list`, `agent_remove`, `agent_enable`, `agent_disable`, `agent_schedule_enable`, `agent_run`, `agent_status`, `agent_models`, `agent_logs`, `agent_update`, `agent_report` |
+| **Agent Management** (14) | `agent_add`, `agent_watch`, `agent_list`, `agent_remove`, `agent_enable`, `agent_disable`, `agent_schedule_enable`, `agent_run`, `agent_status`, `agent_models`, `agent_logs`, `agent_update`, `agent_report`, `agent_probe` |
 | **Multi-Agent Sync** (4) | `sync_declare_intent`, `sync_report_status`, `sync_broadcast`, `sync_get_context` |
-| **Intelligence V2** (6) | `intelligence_get_context`, `intelligence_upsert`, `intelligence_search`, `intelligence_graph_walk`, `intelligence_list_projects`, `intelligence_link_projects` |
+| **Intelligence V2** (8) | `intelligence_get_context`, `intelligence_upsert`, `intelligence_search`, `intelligence_graph_walk`, `intelligence_list_projects`, `intelligence_link_projects`, `intelligence_delete_node`, `intelligence_delete_relation` |
 | **Seed Identity** (5) | `get_identity`, `evolve_identity`, `create_seed`, `list_seeds`, `remove_seed` |
-| **Loop Engine** (21) | `loop_create`, `loop_update`, `loop_add_spec`, `loop_update_spec`, `loop_add_node`, `loop_update_node`, `loop_add_edge`, `loop_update_edge`, `loop_delete_edge`, `loop_delete_node`, `loop_add_ensemble`, `loop_update_ensemble`, `loop_get`, `loop_list`, `loop_run`, `loop_reset`, `loop_schedule_autorun`, `loop_pause`, `loop_continue`, `loop_complete_node`, `loop_report_blocker` |
+| **Loop Engine** (32) | `loop_create`, `loop_update`, `loop_add_spec`, `loop_update_spec`, `loop_add_node`, `loop_update_node`, `loop_add_edge`, `loop_update_edge`, `loop_delete_edge`, `loop_delete_node`, `loop_add_ensemble`, `loop_update_ensemble`, `loop_get`, `loop_list`, `loop_run`, `loop_reset`, `loop_schedule_autorun`, `loop_pause`, `loop_continue`, `loop_complete_node`, `loop_report_blocker`, `loop_export`, `loop_import`, `loop_archive`, `loop_restore`, `loop_node_runs_list`, `loop_node_run_get`, `loop_copy_node`, `loop_copy_ensemble`, `loop_audit_node_configs`, `loop_schedule_continue`, `loop_preflight` |
 | **Spec Backlog** (5) | `spec_create`, `spec_list`, `spec_update`, `spec_delete`, `spec_set_status` |
 | **Spec Queues** (5) | `queue_create`, `queue_add_spec`, `queue_list`, `queue_remove_spec`, `queue_reorder` |
 | **Node Blueprints** (3) | `blueprint_list`, `blueprint_create`, `blueprint_delete` |
-| **Project** (2) | `project_search`, `project_update` |
+| **Project** (3) | `project_search`, `project_update`, `project_remap` |
 | **RAG** (1) | `rag_search` |
 | **Protocol** (1) | `get_tools` |
 
@@ -154,13 +155,13 @@ pipeline, all 64 MCP tools, and the complete CLI reference.
 
 ## Architecture Overview
 
-- **Daemon** — Owns the MCP server (Streamable HTTP on port 7755 + stdio), scheduler, watcher engine, and database. Exposes all 66 MCP tools.
+- **Daemon** — Owns the MCP server (Streamable HTTP on port 7755 + stdio), scheduler, watcher engine, and database. Exposes all 83 MCP tools.
 - **Scheduler** — Computes next fire times for all active tasks, sleeping until needed. Wakes instantly on changes.
 - **Watcher Engine** — Reacts to file system events, triggering tasks as defined.
 - **Executor** — Runs tasks and agents, manages locking, logs, and status.
-- **Intelligence V2** — Project-scoped knowledge graph with node/edge CRUD, graph walk, project relationships.
+- **Intelligence V2** — Project-scoped knowledge graph with node/edge CRUD, deletion tools, graph walk, project relationships.
 - **Sync Manager** — Per-workdir in-memory broadcast channels (64 capacity), DB persistence, and intelligence node auto-upsert.
-- **Loop Engine** — DAG execution engine: check/gate/agent node runners, iteration limits, pause/continue, blocker reporting, spec queues, node blueprints, scheduled autorun.
+- **Loop Engine** — DAG execution engine: agent/check/gate/router node runners, iteration limits, pause/continue, blocker reporting, spec queues, node blueprints, scheduled autorun, archive/restore, export/import, node run history, and copy tools.
 - **RAG Pipeline** — Background ingestion, language-aware chunking, embedding client, vector store, and rate-limited search.
 - **TUI** — Full-screen ratatui terminal UI for managing agents, viewing output, loops, and system metrics in real time.
 - **Gamification** — Mission tracker with 28 achievements across 6 categories, persisted in the database.

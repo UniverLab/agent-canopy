@@ -18,10 +18,11 @@ Loop
 ```
 
 - **Specs** — ordered units of work inside a loop.
-- **Nodes** — four kinds:
+- **Nodes** — five kinds:
   - `agent` — invokes a CLI tool with a prompt template.
   - `check` — executes a shell command.
   - `gate` — validates previous output (e.g. `output_contains`).
+  - `router` — classifies and routes by token matching with fallback.
   - `quorum` — engine-managed node that closes an
     [ensemble](#ensembles), never created directly.
 - **Edges** — connect nodes with routing conditions: `pass`, `fail`,
@@ -75,12 +76,12 @@ implementer itself) receives all of them and implements the consensus
 reviewer models review the same diff in parallel and the quorum
 consolidates their findings into one verdict.
 
-Members are homogeneous by design in v1 — they differ only by
-`platform`/`model`, share the one prompt, and can't be edited
-individually. `loop_update_ensemble` changes the shared prompt
-(propagated to every member), the member list, quorum config
-(`min_pass`, `straggler_timeout_minutes`), and exit wiring, all
-without touching member nodes directly. `loop_get` returns the
+Members differ by `platform`/`model`, and each may set its own
+`prompt_override` to review the same input from a different angle instead
+of sharing the template. `loop_update_ensemble` changes the shared prompt
+(propagated to every member without its own override), the member list,
+quorum config (`min_pass`, `straggler_timeout_minutes`), and exit wiring,
+all without touching member nodes directly. `loop_get` returns the
 ensemble as one unit (`ensemble_id`, members, quorum config) alongside
 its expanded nodes.
 
@@ -270,14 +271,14 @@ Queue membership is unaffected by `loop_run` — specs stay standalone.
 The `loop info` CLI and `loop_get` MCP tool show queue-driven progress
 by reconstructing what ran from the run history.
 
-## The 26 MCP tools
+## The 32 MCP tools
 
 | Stage | Tools |
 |---|---|
-| Authoring | `loop_create`, `loop_update`, `loop_add_spec`, `loop_update_spec`, `loop_add_node`, `loop_update_node`, `loop_add_edge`, `loop_update_edge`, `loop_delete_edge`, `loop_delete_node`, `loop_add_ensemble`, `loop_update_ensemble` |
-| Sharing | `loop_export`, `loop_import` |
-| Inspection | `loop_get`, `loop_list` |
-| Runtime | `loop_run`, `loop_reset`, `loop_schedule_autorun`, `loop_pause`, `loop_continue`, `loop_complete_node`, `loop_report_blocker` |
+| Authoring | `loop_create`, `loop_update`, `loop_add_spec`, `loop_update_spec`, `loop_add_node`, `loop_update_node`, `loop_add_edge`, `loop_update_edge`, `loop_delete_edge`, `loop_delete_node`, `loop_add_ensemble`, `loop_update_ensemble`, `loop_copy_node`, `loop_copy_ensemble`, `loop_audit_node_configs` |
+| Sharing | `loop_export`, `loop_import`, `loop_archive`, `loop_restore` |
+| Inspection | `loop_get`, `loop_list`, `loop_node_runs_list`, `loop_node_run_get` |
+| Runtime | `loop_run`, `loop_reset`, `loop_schedule_autorun`, `loop_schedule_continue`, `loop_pause`, `loop_continue`, `loop_complete_node`, `loop_report_blocker`, `loop_preflight` |
 
 Loops can be authored programmatically by agents through these tools,
 or edited in the [TUI loop editor](tui.md) with inline JSON config
@@ -389,6 +390,43 @@ exported without `--with-models` — `import` will report all three as
 `nodes_missing_platform`), and the ensemble's own member/quorum nodes
 never appear in `nodes` — only its `entry_from_node`/`on_pass_to`
 (both plain node names) and its `members` array do.
+
+## Archive and restore
+
+Loops can be archived instead of deleted — they leave the main
+`loop_list`/sidebar view but their row, specs, and full run history
+are untouched and can be restored at any time:
+
+```
+canopy loop archive <loop_id>
+canopy loop restore <loop_id>
+```
+
+Over MCP: `loop_archive { loop_id }` and `loop_restore { loop_id }`.
+Archiving refuses a `running` loop — pause it first. The archived loop
+is still reachable directly by id via `loop_get` regardless of
+archived state. Restoring is a plain flag flip — no data is lost or
+moved.
+
+## Node run history
+
+When a loop fails, the node run history lets you diagnose exactly what
+happened:
+
+```
+canopy loop runs <loop_id> [--node <node_id>] [--limit <n>]
+```
+
+Over MCP: `loop_node_runs_list { loop_id, node_id?, spec_id?, limit? }`
+returns the most recent runs first (default 20, capped at 200).
+`loop_node_run_get { run_id }` fetches one run's full stored input and
+output, including `infra_attempt`/`infra_crash` markers when present.
+Secret-shaped substrings are redacted before the output crosses the
+boundary.
+
+This is the second step of failure diagnosis: list to find the
+offending run, then fetch its output here — the exact stderr/stdout/
+reported_output the engine recorded.
 
 ## Node blueprints
 

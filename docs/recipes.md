@@ -328,13 +328,12 @@ value, and wait for per-harness availability before wiring all four.
 
 **Shape:** specialist panel (pattern 7).
 **Status:** the version below is what works *today*; the ensemble version
-waits on per-member prompts.
+with per-member prompt overrides is also available.
 
 ### Today: four plain nodes in series
 
-Until ensemble members can carry different prompts, a specialist panel is
-four ordinary agent nodes chained one after another. Slower than parallel,
-identical in coverage:
+A specialist panel can be four ordinary agent nodes chained one after another.
+Slower than parallel, identical in coverage:
 
 | from | condition | to |
 |---|---|---|
@@ -378,11 +377,12 @@ That last rule is not politeness. A model that believes an empty report
 reflects badly on it will produce findings, and a panel of four such models
 will bounce every change forever.
 
-### When per-member prompts land
+### With per-member prompt overrides
 
 The same panel collapses into one ensemble that runs the four in parallel
 with `min_pass` equal to the member count, cutting wall-clock to the slowest
-reviewer instead of the sum.
+reviewer instead of the sum. Each member carries its own `prompt_override`
+specialized to its axis.
 
 ---
 

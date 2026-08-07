@@ -1,15 +1,15 @@
 ---
 title: MCP Tools
-description: All 65 MCP tools exposed by the canopy daemon, by category.
+description: All 83 MCP tools exposed by the canopy daemon, by category.
 order: 11
 ---
 
 # MCP Tools
 
-The daemon exposes **66 MCP tools** over Streamable HTTP (port 7755) and
+The daemon exposes **83 MCP tools** over Streamable HTTP (port 7755) and
 stdio. Connect any MCP-capable AI CLI with `canopy mcp`.
 
-## Agent management (13)
+## Agent management (14)
 
 | Tool | Description |
 |---|---|
@@ -25,6 +25,7 @@ stdio. Connect any MCP-capable AI CLI with `canopy mcp`.
 | `agent_logs` | Read execution logs |
 | `agent_update` | Update an agent's definition |
 | `agent_report` | Report execution status for scheduled tasks |
+| `agent_probe` | Test platform+model liveness before loop_run |
 
 ## Multi-agent sync (4)
 
@@ -35,7 +36,7 @@ stdio. Connect any MCP-capable AI CLI with `canopy mcp`.
 | `sync_broadcast` | Send info/query/answer messages |
 | `sync_get_context` | Active missions, chatter, workspace vibe |
 
-## Intelligence (6)
+## Intelligence (8)
 
 | Tool | Description |
 |---|---|
@@ -45,6 +46,8 @@ stdio. Connect any MCP-capable AI CLI with `canopy mcp`.
 | `intelligence_graph_walk` | Traverse the knowledge graph |
 | `intelligence_list_projects` | List known projects |
 | `intelligence_link_projects` | Link projects with typed relations |
+| `intelligence_delete_node` | Delete an intelligence node and its relations |
+| `intelligence_delete_relation` | Delete a single relation by ID |
 
 ## Seed identity (5)
 
@@ -54,7 +57,7 @@ stdio. Connect any MCP-capable AI CLI with `canopy mcp`.
 | `evolve_identity` | Refine the identity over time |
 | `create_seed` / `list_seeds` / `remove_seed` | Manage the seed nursery |
 
-## Loop engine (21)
+## Loop engine (32)
 
 `loop_create`, `loop_update`, `loop_add_spec`,
 `loop_update_spec`, `loop_add_node`, `loop_update_node`,
@@ -63,8 +66,12 @@ stdio. Connect any MCP-capable AI CLI with `canopy mcp`.
 `loop_update_ensemble`, `loop_get`,
 `loop_list`, `loop_run`, `loop_reset`, `loop_schedule_autorun`,
 `loop_pause`, `loop_continue`,
-`loop_complete_node`, `loop_report_blocker` — see
-[Loops](loops.md).
+`loop_complete_node`, `loop_report_blocker`,
+`loop_export`, `loop_import`, `loop_archive`, `loop_restore`,
+`loop_node_runs_list`, `loop_node_run_get`,
+`loop_copy_node`, `loop_copy_ensemble`,
+`loop_audit_node_configs`, `loop_schedule_continue`,
+`loop_preflight` — see [Loops](loops.md).
 
 ## Spec backlog (5)
 
@@ -94,12 +101,13 @@ stdio. Connect any MCP-capable AI CLI with `canopy mcp`.
 | `blueprint_create` | Create a reusable node config template |
 | `blueprint_delete` | Delete a custom blueprint (builtins protected) |
 
-## Project (2)
+## Project (3)
 
 | Tool | Description |
 |---|---|
 | `project_search` | Search the automatic project registry |
 | `project_update` | Update a project's registry entry |
+| `project_remap` | Remap a moved/renamed workdir instead of orphaning history |
 
 ## RAG (1)
 

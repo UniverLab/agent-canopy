@@ -156,7 +156,7 @@ not.
 
 ---
 
-## 5. Router by complexity — Designed
+## 5. Router by complexity — Proven
 
 The first shape that needs the router node. Two implementers on different
 harnesses and price points; a cheap classifier reads the spec and decides
@@ -188,9 +188,6 @@ falsified by evidence.
 **The router must be cheap.** A router as expensive as the expensive
 implementer means you paid the high price on every task, including the ones
 you routed away from it.
-
-Status note: the router node is in flight as three specs — domain model,
-engine execution, and TUI. Nothing here is buildable until they land.
 
 ---
 
@@ -244,7 +241,7 @@ router could read does not exist yet.
 
 ---
 
-## 7. Specialist review panel — Blocked
+## 7. Specialist review panel — Designed
 
 An ensemble where each member reviews a different axis: one reads for
 security, one for performance, one for maintainability, one for the
@@ -265,12 +262,9 @@ graph LR
     Q -->|fail| I
 ```
 
-Blocked on two things, one being built and one not yet designed.
-
-**Members cannot have different prompts.** Ensemble members are homogeneous
-by design in v1 — they differ only by platform and model and share one
-prompt. A specialist panel is exactly the opposite. Per-member prompt
-overrides are a pending spec.
+Per-member prompt overrides are available — each member can carry its own
+`prompt_override` in `loop_add_ensemble`, so a specialist panel runs all
+four axes in parallel with one call instead of four sequential nodes.
 
 **`min_pass` means the wrong thing here.** With homogeneous members,
 `min_pass: 2 of 3` reads as "a majority agrees" and that is sensible. With
@@ -366,7 +360,7 @@ it lands.
 | A fix that is right but fragile | 9 — adversarial pair |
 
 Shapes compose. The graph that drains this project's own backlog is 1 + 3,
-and grows a 5 the day the router lands.
+and grows a 5 with the router.
 
 ---
 
@@ -375,8 +369,6 @@ and grows a 5 the day the router lands.
 Collected from the patterns above, because a limitation stated once in
 context is worth more than a roadmap:
 
-- **Routing on why a node failed.** The router node — in flight. Patterns 5
-  and 6 both wait on it.
 - **Memory of a spent harness.** Nothing survives a spec boundary to say
   "cursor is exhausted until 4pm", so a cascade rediscovers it every time.
 - **Severity in a quorum.** Members vote pass/fail; there is no way to say
