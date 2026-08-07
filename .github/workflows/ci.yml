@@ -26,4 +26,12 @@ jobs:
       # runner paths.
       coverage-ignore-regex: "src/tui/ui/"
       coverage-threshold: 80
+      # The local gate (install-canopy.sh) runs `cargo nextest run`, and parts
+      # of the suite depend on that: the handler's endpoint tests set the real
+      # CANOPY_AGENT_ID env var, because resolve_sync_agent_id falls back to it
+      # when a direct call carries no request headers. Under `cargo test` those
+      # tests are threads in one process, so one test's teardown unsets the var
+      # underneath another — a race that surfaced as a coverage failure with a
+      # green check job on the same commit. Same runner here as locally.
+      use-nextest: true
     secrets: inherit
