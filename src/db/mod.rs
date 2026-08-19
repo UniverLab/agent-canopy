@@ -98,6 +98,7 @@ impl Database {
     /// TABLE IF NOT EXISTS` batch below, which would otherwise create empty
     /// `queues`/`queue_members` tables first and make the rename fail with
     /// "table already exists".
+    // RETIRED-SCHEMA-NAME-BEGIN (see `no_retired_schema_name_identifiers_remain_outside_its_migration`)
     fn migrate_legacy_queue_schema(conn: &Connection) -> Result<()> {
         let legacy_schema_present: bool = conn
             .query_row(
@@ -162,6 +163,7 @@ impl Database {
 
         Ok(())
     }
+    // RETIRED-SCHEMA-NAME-END
 
     fn init(&self) -> Result<()> {
         let conn = self

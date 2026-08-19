@@ -300,7 +300,7 @@ pub(crate) struct LoopEditorDialog {
     pub edge_rows: Vec<crate::domain::loops::LoopEdge>,
     pub edge_row_index: usize,
     /// Candidate `(node_id, node_name)` retarget destinations: every other
-    /// node in the edge's graph — same pool as `router_targets`.
+    /// node in the edge's graph — same set as `router_targets`.
     pub edge_targets: Vec<(String, String)>,
 }
 

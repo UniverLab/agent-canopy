@@ -2257,6 +2257,7 @@ fn active_run_queue_id_migration_is_idempotent_and_a_pre_b8_database_opens_clean
     assert_eq!(lp.active_run_queue_id.as_deref(), Some("queue-1"));
 }
 
+// RETIRED-SCHEMA-NAME-BEGIN (see `no_retired_schema_name_identifiers_remain_outside_its_migration`)
 #[test]
 fn legacy_queue_table_names_migrate_preserving_member_order_and_context_groups() {
     // Simulate a database still on the previous-generation queue schema (the
@@ -2455,6 +2456,7 @@ fn legacy_queue_table_rename_is_a_noop_on_an_already_migrated_database() {
         "the migration must not resurrect the legacy table"
     );
 }
+// RETIRED-SCHEMA-NAME-END
 
 #[test]
 fn a_schema_version_newer_than_this_binary_supports_fails_loudly_instead_of_starting_empty() {
@@ -5220,3 +5222,75 @@ fn archived_migration_defaults_existing_rows_and_is_idempotent() {
     let lp = db.get_loop("legacy-loop").unwrap().unwrap();
     assert!(lp.archived);
 }
+
+// RETIRED-SCHEMA-NAME-BEGIN
+/// Guards the pool-to-queue rename from regressing a third time: the public
+/// surface and the schema were already renamed once each, in two separate
+/// passes, which is exactly how this codebase ended up with a schema still
+/// naming the retired concept. Every `.rs` file under `src/` is scanned for
+/// the retired name as a whole word or a `snake_case` suffix; a hit is
+/// exempt only between a `RETIRED-SCHEMA-NAME-BEGIN` / `-END` marker pair,
+/// which brackets the legacy migration, its tests, and this guard itself —
+/// all three must name the retired schema literally to do their job.
+#[test]
+fn no_retired_schema_name_identifiers_remain_outside_its_migration() {
+    // `\b` treats `_` as a word char, so it won't fire between `_` and
+    // `pool` (e.g. `test_pool_marker`). Normalizing `_` to a space first
+    // turns every snake_case segment boundary into a real `\b`, so one
+    // simple pattern catches prefix (`PoolMember`), suffix (`spec_pool`),
+    // and mid-identifier (`test_pool_marker`) forms alike.
+    let retired_name = regex::Regex::new(r"(?i)\bpool[a-zA-Z]*").unwrap();
+    let begin_marker = "RETIRED-SCHEMA-NAME-BEGIN";
+    let end_marker = "RETIRED-SCHEMA-NAME-END";
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let src_dir = std::path::Path::new(manifest_dir).join("src");
+
+    let mut violations = Vec::new();
+    for entry in walkdir::WalkDir::new(&src_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
+    {
+        let rel_path = entry
+            .path()
+            .strip_prefix(manifest_dir)
+            .unwrap_or(entry.path())
+            .to_path_buf();
+        let source = std::fs::read_to_string(entry.path())
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", rel_path.display()));
+
+        let mut exempt = false;
+        for (i, line) in source.lines().enumerate() {
+            if line.contains(end_marker) {
+                exempt = false;
+                continue;
+            }
+            if line.contains(begin_marker) {
+                exempt = true;
+                continue;
+            }
+            if exempt {
+                continue;
+            }
+            let normalized = line.replace('_', " ");
+            if let Some(m) = retired_name.find(&normalized) {
+                violations.push(format!("{}:{} — {}", rel_path.display(), i + 1, m.as_str()));
+            }
+        }
+        assert!(
+            !exempt,
+            "{} has an unclosed {begin_marker} region",
+            rel_path.display()
+        );
+    }
+
+    assert!(
+        violations.is_empty(),
+        "retired schema name found outside a RETIRED-SCHEMA-NAME-BEGIN/-END \
+         region (queue is the decided term — see migrate_legacy_queue_schema \
+         for the one place the retired name may still appear):\n{}",
+        violations.join("\n")
+    );
+}
+// RETIRED-SCHEMA-NAME-END
