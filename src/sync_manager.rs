@@ -265,6 +265,59 @@ mod tests {
         assert_ne!(message.agent_name, "standalone");
     }
 
+    /// A bridge call for a NAMED session — through either write path — must
+    /// reproduce the exact same display shape the TUI sidebar shows for that
+    /// session ("boletus · claude"), the shape `daemon::bridge::forward_request`
+    /// now preserves by no longer sending its own `x-canopy-client-name:
+    /// bridge` header (see `forward_request_omits_client_name_header` in
+    /// `daemon::bridge`, which guards the actual injection site). A stray
+    /// non-empty `client_name` here would still get appended — this only
+    /// pins the None case that real bridge traffic exercises today.
+    #[tokio::test]
+    async fn report_status_and_broadcast_from_named_session_match_tui_display_name() {
+        let (manager, _dir) = test_manager();
+        let workdir = "/tmp/named-bridge-workdir";
+        let agent_id = "sess-boletus-2";
+
+        manager
+            .db
+            .insert_interactive_session(
+                agent_id,
+                "boletus",
+                "claude",
+                workdir,
+                None,
+                Some(4242),
+                "interactive",
+                None,
+            )
+            .expect("seed known session");
+
+        let tui_display_name = manager
+            .db
+            .resolve_sync_actor_display_name(workdir, agent_id)
+            .expect("resolve display name");
+        assert_eq!(tui_display_name, "boletus · claude");
+
+        let status_message = manager
+            .report_status(
+                workdir,
+                agent_id,
+                None,
+                WorkspaceStatus::Stable,
+                "all green",
+            )
+            .await
+            .expect("report_status");
+        assert_eq!(status_message.agent_name, tui_display_name);
+
+        let broadcast_message = manager
+            .broadcast(workdir, agent_id, None, MessageKind::Info, "hello", None)
+            .await
+            .expect("broadcast");
+        assert_eq!(broadcast_message.agent_name, tui_display_name);
+    }
+
     /// A bridge with no resolvable identity (mirrors
     /// `daemon::bridge::register_standalone_session` after the fix) must
     /// still be distinguishable from a real session and must not collapse
