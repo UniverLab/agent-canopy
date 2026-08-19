@@ -1113,6 +1113,7 @@ mod tests {
     fn make_loop(id: &str, name: &str, status: LoopStatus) -> Loop {
         Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: id.to_string(),
             name: name.to_string(),
             description: None,

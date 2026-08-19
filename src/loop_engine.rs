@@ -4156,6 +4156,7 @@ mod tests {
         let db = Arc::new(Database::new(&dir.path().join("test.db"))?);
         let lp = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf-test".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -4347,6 +4348,7 @@ mod tests {
         let db = Arc::new(Database::new(&dir.path().join("test.db"))?);
         let lp = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf-test".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -5279,6 +5281,7 @@ mod tests {
     fn render_agent_prompt_includes_reporting_contract() {
         let lp = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -5348,6 +5351,7 @@ mod tests {
     fn render_agent_prompt_adds_continuation_notice_only_when_spec_interrupted() {
         let lp = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -5529,6 +5533,7 @@ mod tests {
         // interpolated whole; the marker must show it was cut.
         let lp = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -7928,6 +7933,7 @@ echo done
         let db = Arc::new(Database::new(&dir.path().join("test.db"))?);
         let lp = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf-test".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -8190,6 +8196,7 @@ echo done
 
         let lp = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf-workdir".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -8680,6 +8687,7 @@ echo done
         // 2. Render the full prompt — elision must survive composition.
         let lp = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -10540,6 +10548,7 @@ echo done
     async fn render_completion_hook_prompt_substitutes_all_placeholders() {
         let lp = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf".to_string(),
             name: "MyLoop".to_string(),
             description: None,
@@ -10578,6 +10587,7 @@ echo done
     async fn render_completion_hook_prompt_empty_specs_shows_none() {
         let lp = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -11975,6 +11985,7 @@ echo done
         let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
         let lp = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf-queue-ensemble".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -12850,6 +12861,7 @@ echo done
         // Graph A: seeded as mid-run and left alone for the rest of the test.
         let loop_a = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf-graph-a".to_string(),
             name: "Graph A".to_string(),
             description: None,
@@ -12924,6 +12936,7 @@ echo done
         // full lifecycle by the engine.
         let loop_b = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf-graph-b".to_string(),
             name: "Graph B".to_string(),
             description: None,
@@ -13063,6 +13076,7 @@ echo done
 
         let loop_a = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf-signal-a".to_string(),
             name: "Graph A".to_string(),
             description: None,
@@ -13132,6 +13146,7 @@ echo done
 
         let loop_b = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf-signal-b".to_string(),
             name: "Graph B".to_string(),
             description: None,

@@ -4028,6 +4028,7 @@ mod tests {
     ) -> crate::domain::loops::Loop {
         crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: id.to_string(),
             name: name.to_string(),
             description: None,
@@ -5795,6 +5796,7 @@ mod tests {
 
         db.insert_loop(&Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "plp1".to_string(),
             name: "plain loop".to_string(),
             description: None,
@@ -5959,6 +5961,7 @@ mod tests {
 
         db.insert_loop(&Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "rlp1".to_string(),
             name: "router loop".to_string(),
             description: None,
@@ -6247,6 +6250,7 @@ mod tests {
         let db = test_db();
         db.insert_loop(&Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "clp1".to_string(),
             name: "check loop".to_string(),
             description: None,

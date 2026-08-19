@@ -1439,6 +1439,7 @@ mod tests {
     ) -> crate::domain::loops::Loop {
         crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: id.to_string(),
             name: format!("loop-{id}"),
             description: None,

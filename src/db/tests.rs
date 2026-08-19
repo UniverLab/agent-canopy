@@ -93,6 +93,7 @@ fn sample_manual_agent(id: &str) -> Agent {
 fn sample_loop(id: &str) -> Loop {
     Loop {
         archived: false,
+        paused_by_reconciliation: false,
         id: id.to_string(),
         name: "Auth loop".to_string(),
         description: Some("Implements auth in ordered specs".to_string()),

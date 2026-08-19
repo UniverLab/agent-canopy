@@ -565,6 +565,7 @@ mod tests {
     ) -> crate::domain::loops::Loop {
         crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "loop-1".to_string(),
             name: "sample".to_string(),
             description: None,

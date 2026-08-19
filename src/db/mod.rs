@@ -1090,6 +1090,29 @@ impl Database {
             .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
         }
 
+        // C1: distinguishes a loop `reconcile_orphaned_loops` paused after an
+        // unclean daemon exit from one an operator paused on purpose, so a
+        // pending `autorun_at` schedule can survive the former but still be
+        // blocked by the latter — see
+        // [`crate::domain::loops::Loop::is_autorun_due`]. `DEFAULT 0` means
+        // every pre-existing `Paused` loop reads as operator-paused, which is
+        // the safe assumption for a row this migration has no way to
+        // distinguish retroactively.
+        let has_paused_by_reconciliation: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loops') WHERE name = 'paused_by_reconciliation'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_paused_by_reconciliation {
+            conn.execute(
+                "ALTER TABLE loops ADD COLUMN paused_by_reconciliation INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
         Self::set_schema_version(&conn)?;
 
         Ok(())

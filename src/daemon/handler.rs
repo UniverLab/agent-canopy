@@ -3705,6 +3705,7 @@ impl TaskTriggerHandler {
 
         let lp = Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: uuid::Uuid::new_v4().to_string(),
             name: name.to_string(),
             description: params.description.filter(|value| !value.trim().is_empty()),
@@ -5546,6 +5547,7 @@ impl TaskTriggerHandler {
 
         let lp = Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: loop_id.clone(),
             name: final_name.clone(),
             description: document
@@ -7856,6 +7858,7 @@ mod tests {
         let loop_id = "loop-reset-test".to_string();
         db.insert_loop(&Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: loop_id.clone(),
             name: "Loop".to_string(),
             description: None,
@@ -7966,6 +7969,7 @@ mod tests {
         let loop_id = "loop-queue-reset-test".to_string();
         db.insert_loop(&Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: loop_id.clone(),
             name: "Loop".to_string(),
             description: None,
@@ -8810,6 +8814,7 @@ mod tests {
     fn insert_test_loop(db: &Database, id: &str) {
         db.insert_loop(&Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: id.to_string(),
             name: id.to_string(),
             description: None,
@@ -9256,6 +9261,7 @@ mod tests {
         let loop_id = "loop-with-graph".to_string();
         db.insert_loop(&Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: loop_id.clone(),
             name: "Loop".to_string(),
             description: None,
@@ -9303,6 +9309,7 @@ mod tests {
         let loop_id = "loop-with-pinned-skills".to_string();
         db.insert_loop(&Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: loop_id.clone(),
             name: "Loop".to_string(),
             description: None,
@@ -9354,6 +9361,7 @@ mod tests {
         let loop_id = "loop-with-autorun".to_string();
         db.insert_loop(&Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: loop_id.clone(),
             name: "Loop".to_string(),
             description: None,
@@ -9395,6 +9403,7 @@ mod tests {
     fn autorun_test_loop(loop_id: &str, workdir: &str, status: LoopStatus) -> Loop {
         Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: loop_id.to_string(),
             name: loop_id.to_string(),
             description: None,
@@ -10972,6 +10981,7 @@ mod tests {
     fn make_loop_with_trigger(trigger: Option<Trigger>) -> Loop {
         Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "loop-1".to_string(),
             name: "Test Loop".to_string(),
             description: None,
@@ -11329,6 +11339,7 @@ mod additional_tests {
     fn insert_test_loop(db: &Database, id: &str) {
         db.insert_loop(&Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: id.to_string(),
             name: id.to_string(),
             description: None,
@@ -12540,6 +12551,7 @@ mod additional_tests {
     fn loop_trigger_json_manual() {
         let lp = Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "l1".to_string(),
             name: "l1".to_string(),
             description: None,
@@ -12564,6 +12576,7 @@ mod additional_tests {
     fn loop_trigger_json_cron() {
         let lp = Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "l1".to_string(),
             name: "l1".to_string(),
             description: None,
@@ -12717,6 +12730,7 @@ mod coverage_tests {
     fn make_loop(loop_id: &str, status: LoopStatus) -> Loop {
         Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: loop_id.to_string(),
             name: loop_id.to_string(),
             description: None,
@@ -15421,6 +15435,7 @@ mod endpoint_tests {
     fn insert_test_loop(db: &Database, workdir: &std::path::Path) -> Loop {
         let lp = Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: uuid::Uuid::new_v4().to_string(),
             name: "Test Loop".to_string(),
             description: None,

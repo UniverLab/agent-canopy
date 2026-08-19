@@ -1247,6 +1247,7 @@ mod preview_key_tests {
     fn loop_with_status(status: crate::domain::loops::LoopStatus) -> crate::domain::loops::Loop {
         crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "lp1".to_string(),
             name: "Nightly review".to_string(),
             description: None,

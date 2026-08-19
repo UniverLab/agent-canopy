@@ -1793,6 +1793,7 @@ mod tests {
         }
         db.insert_loop(&Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf-probe".to_string(),
             name: "Probe Loop".to_string(),
             description: None,
@@ -1922,6 +1923,7 @@ mod tests {
     fn bare_loop(id: &str, status: LoopStatus) -> Loop {
         Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: id.to_string(),
             name: format!("Loop {id}"),
             description: None,
