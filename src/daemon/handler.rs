@@ -5735,7 +5735,7 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "agent_probe",
-        description = "Actually invoke a configured platform headlessly with a trivial prompt and report whether a real, usable response comes back — the verdict is based on the response content, not the exit code, so a harness that prints its own error and exits 0 is reported broken rather than healthy. Omit `platform` to probe every platform configured in canopy (each with its own default model); pass `platform` alone to probe its default model, or `platform`+`model` together to validate the exact pair a loop node would use. On failure, reports the harness's own error text (redacted of secrets) so you learn *why* (missing API key vs. wrong model name vs. it never answered), not just that it failed. Spends real tokens/quota per platform probed — call this explicitly, never automatically or on a schedule."
+        description = "Actually invoke a configured platform headlessly with a trivial prompt and report whether a real, usable response comes back — the verdict is based on the response content, not the exit code, so a harness that prints its own error and exits 0 is reported broken rather than healthy, and a harness that silently answers with a different model than the one requested (its own \"falling back\" warning) is reported substituted rather than reachable. Omit `platform` to probe every platform configured in canopy (each with its own default model); pass `platform` alone to probe its default model, or `platform`+`model` together to validate the exact pair a loop node would use. If the platform's CLI has no way to select a model explicitly, the specific pair can't be validated end to end and is reported unknown, never reachable. On failure, reports the harness's own error text (redacted of secrets) so you learn *why* (missing API key vs. wrong model name vs. it never answered), not just that it failed. Spends real tokens/quota per platform probed — call this explicitly, never automatically or on a schedule."
     )]
     async fn agent_probe(
         &self,
@@ -5786,7 +5786,8 @@ impl TaskTriggerHandler {
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&serde_json::json!({
                 "timeout_seconds": timeout_secs,
-                "would_fail": reports.iter().filter(|r| !r.outcome.reachable()).count(),
+                "would_fail": crate::daemon::probe::would_fail_count(&reports),
+                "unknown": crate::daemon::probe::unknown_count(&reports),
                 "probes": reports.iter().map(|r| r.to_json()).collect::<Vec<_>>(),
             }))
             .unwrap_or_default(),
@@ -5795,7 +5796,7 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "loop_preflight",
-        description = "Probe every distinct platform+model pair a loop's agent nodes, ensemble members, and on_completed hook reference — before spending a real loop_run on a harness that's installed and configured but can't actually produce a response. A platform used by several nodes is probed once, not once per node; the result names every node/hook that references a failing pair. Verdict is based on response content, not exit code (see agent_probe). Spends real tokens/quota per distinct pair — call this explicitly before loop_run, never automatically."
+        description = "Probe every distinct platform+model pair a loop's agent nodes, ensemble members, and on_completed hook reference — before spending a real loop_run on a harness that's installed and configured but can't actually produce a response. A platform used by several nodes is probed once, not once per node; the result names every node/hook that references a failing pair. Verdict is based on response content, not exit code (see agent_probe): a pair the harness silently answers with a substituted model, or one whose CLI has no way to select a model explicitly, is never reported reachable — `would_fail` counts confirmed failures and `unknown` counts pairs that couldn't be validated, kept separate so an unvalidated pair is never mistaken for a passing one. Spends real tokens/quota per distinct pair — call this explicitly before loop_run, never automatically."
     )]
     async fn loop_preflight(
         &self,
@@ -5856,7 +5857,8 @@ impl TaskTriggerHandler {
                 "loop_id": params.loop_id,
                 "timeout_seconds": timeout_secs,
                 "pairs_checked": reports.len(),
-                "would_fail": reports.iter().filter(|r| !r.outcome.reachable()).count(),
+                "would_fail": crate::daemon::probe::would_fail_count(&reports),
+                "unknown": crate::daemon::probe::unknown_count(&reports),
                 "probes": probes,
             }))
             .unwrap_or_default(),

@@ -76,6 +76,24 @@ pub(crate) enum ProbeOutcome {
     /// from `Broken` because the harness's own error-reporting was never
     /// reached.
     SpawnFailed,
+    /// A `model` was requested but this platform's CLI has no way to select
+    /// one explicitly (no `model_flag` configured) — the 2026-08-13
+    /// `mistral` case, whose CLI addresses named agents, not models, so
+    /// `agent_models` output is never valid input for it. No process was
+    /// spawned: probing "whatever the bare CLI defaults to" would validate
+    /// a different pair than the one asked about and silently pass, which
+    /// is the exact defect this variant exists to prevent. Never
+    /// `reachable` — a caller that treated this as passing would repeat
+    /// the 2026-08-13 incident.
+    Unknown,
+    /// The harness accepted the request and answered, but its own response
+    /// carries a "requested model not recognized, using a different one"
+    /// warning (see [`detect_model_substitution`]) — the `gpt-5.6` case:
+    /// the probe token can still show up because the *substituted* model
+    /// answered it, not the one that was actually requested. Reporting
+    /// this `Reachable` would validate a pair a real node never actually
+    /// runs.
+    Substituted,
 }
 
 impl ProbeOutcome {
@@ -86,6 +104,8 @@ impl ProbeOutcome {
             Self::TimedOut => "timed_out",
             Self::NotConfigured => "not_configured",
             Self::SpawnFailed => "spawn_failed",
+            Self::Unknown => "unknown",
+            Self::Substituted => "substituted",
         }
     }
 
@@ -135,6 +155,33 @@ fn probe_prompt(token: &str) -> String {
     format!("Reply with exactly this text and nothing else: {token}")
 }
 
+/// Marker substring of the harness's own "requested model not recognized,
+/// substituting a different one" warning — the 2026-08-13 incident's
+/// `Model metadata for 'gpt-5.6' not found. Defaulting to fallback
+/// metadata`. Matched case-insensitively and on the "defaulting to
+/// fallback metadata" half only, since that half is the actual signal (the
+/// model name/quoting around "not found" is free-form harness text not
+/// worth pinning exactly).
+const MODEL_SUBSTITUTION_MARKER: &str = "defaulting to fallback metadata";
+
+/// Find the line (if any) in the captured response that shows the harness
+/// silently answered with a different model than the one requested. Checked
+/// against the *raw* stdout/stderr, independent of whether the probe token
+/// is present — the whole defect this catches is a response that both
+/// contains the token (a real, usable-looking answer) and this warning (the
+/// answer came from a model nobody asked for).
+fn detect_model_substitution(stdout: &str, stderr: &str) -> Option<String> {
+    for text in [stderr, stdout] {
+        if let Some(line) = text
+            .lines()
+            .find(|line| line.to_lowercase().contains(MODEL_SUBSTITUTION_MARKER))
+        {
+            return Some(line.to_string());
+        }
+    }
+    None
+}
+
 /// Probe one platform+model pair by actually invoking it: build the
 /// platform's real headless command from its registry config
 /// (`headless_mode`/`model_flag`/etc, via [`CliStrategy::from_cli_config`] —
@@ -166,6 +213,31 @@ pub(crate) async fn probe_target(
     };
 
     let strategy = CliStrategy::from_cli_config(cli_config);
+
+    // A model was requested but this platform's CLI has no flag to select
+    // one — `CliStrategy::build_command` would silently drop it and probe
+    // the bare default instead, which is exactly how the 2026-08-13
+    // `mistral` pair was wrongly reported `reachable`: the probe validated
+    // a different pair than the one a real node run would use. Report
+    // `Unknown` without spawning rather than pretend the specific model was
+    // exercised.
+    if let Some(model) = target.model.as_deref() {
+        if strategy.model_flag.is_none() {
+            return ProbeReport {
+                platform: target.platform.clone(),
+                model: target.model.clone(),
+                outcome: ProbeOutcome::Unknown,
+                duration_ms: start.elapsed().as_millis(),
+                error: Some(format!(
+                    "Platform '{}' has no configured way to select a model explicitly \
+                     (no model_flag) — cannot validate model '{}' end-to-end. Omit `model` \
+                     to probe the platform's own default instead.",
+                    target.platform, model
+                )),
+            };
+        }
+    }
+
     let token = probe_token();
     let prompt = probe_prompt(&token);
 
@@ -227,6 +299,23 @@ pub(crate) async fn probe_target(
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             let duration_ms = start.elapsed().as_millis();
 
+            // Checked before the token match: a substituted-model response
+            // can still contain the probe token (the fallback model
+            // answered it), which would otherwise be reported `Reachable`
+            // for a model nobody actually validated — the 2026-08-13
+            // `gpt-5.6` case.
+            if target.model.is_some() {
+                if let Some(warning) = detect_model_substitution(&stdout, &stderr) {
+                    return ProbeReport {
+                        platform: target.platform.clone(),
+                        model: target.model.clone(),
+                        outcome: ProbeOutcome::Substituted,
+                        duration_ms,
+                        error: Some(redact_secrets(&warning)),
+                    };
+                }
+            }
+
             if stdout.contains(&token) || stderr.contains(&token) {
                 ProbeReport {
                     platform: target.platform.clone(),
@@ -259,6 +348,32 @@ pub(crate) async fn probe_target(
             }
         }
     }
+}
+
+/// Count of reports that are *known* to fail a real run — every outcome
+/// except `Reachable` and `Unknown`. Deliberately excludes `Unknown`: a pair
+/// whose validity could not be determined is not a confirmed failure, and
+/// folding it in here would make `would_fail` claim more certainty than the
+/// probe actually has. Shared by `agent_probe` and `loop_preflight` so the
+/// two tools can never disagree about what counts as "would fail".
+pub(crate) fn would_fail_count(reports: &[ProbeReport]) -> usize {
+    reports
+        .iter()
+        .filter(|r| !r.outcome.reachable() && r.outcome != ProbeOutcome::Unknown)
+        .count()
+}
+
+/// Count of reports whose validity could not be determined at all (see
+/// [`ProbeOutcome::Unknown`]). Reported alongside `would_fail` rather than
+/// folded into it — an unknown pair is not a confirmed pass (excluded from
+/// `would_fail`'s complement) and not a confirmed failure (excluded from
+/// `would_fail` itself), so it needs its own count to stay honest about
+/// which pairs were actually validated.
+pub(crate) fn unknown_count(reports: &[ProbeReport]) -> usize {
+    reports
+        .iter()
+        .filter(|r| r.outcome == ProbeOutcome::Unknown)
+        .count()
 }
 
 /// Probe every target concurrently — a single slow/hanging harness must not
@@ -361,6 +476,22 @@ mod tests {
         }
     }
 
+    /// Same as [`config_with_cli`] but with `--model` configured as the
+    /// model flag — for exercising the `platform`+`model` path the way a
+    /// real loop node (e.g. codex) does, as opposed to platforms like
+    /// `mistral` that have no model flag at all.
+    fn config_with_cli_and_model_flag(name: &str, script_path: &std::path::Path) -> CanopyConfig {
+        CanopyConfig {
+            clis: vec![CliConfig {
+                name: name.to_string(),
+                binary: script_path.to_string_lossy().to_string(),
+                model_flag: Some("--model".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
     fn write_script(dir: &tempfile::TempDir, name: &str, body: &str) -> std::path::PathBuf {
         let path = dir.path().join(name);
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -454,6 +585,135 @@ mod tests {
         assert_eq!(report.outcome, ProbeOutcome::Reachable);
         assert!(report.outcome.reachable());
         assert!(report.error.is_none());
+    }
+
+    /// No-regression check for the healthy path with a *specific* model
+    /// requested against a platform that actually has a model flag
+    /// configured (unlike the `mistral` case below): a clean answer
+    /// containing the probe token must still be `Reachable`.
+    #[tokio::test]
+    async fn probe_target_reports_reachable_for_healthy_response_with_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_script(&dir, "healthy-model-cli", "echo \"ok: $1\"\n");
+        let config = config_with_cli_and_model_flag("healthy-model", &script);
+        let target = ProbeTarget {
+            platform: "healthy-model".to_string(),
+            model: Some("some-model".to_string()),
+        };
+        let report = probe_target(&config, &target, None, Duration::from_secs(5)).await;
+        assert_eq!(report.outcome, ProbeOutcome::Reachable);
+        assert!(report.outcome.reachable());
+        assert!(report.error.is_none());
+    }
+
+    /// The 2026-08-13 incident, reproduced as a fixture: the real 400 body
+    /// Codex returned for `gpt-5.6` on a ChatGPT account. It never echoes
+    /// the probe token, so it must be reported `Broken` (not `Reachable`) —
+    /// this was already true before this fix; this test pins it against
+    /// regressions now that the substitution check runs in the same branch.
+    #[tokio::test]
+    async fn probe_target_reports_broken_for_real_unsupported_model_400_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-5.6' model is not supported when using Codex with a ChatGPT account."}}"#;
+        let script = write_script(&dir, "codex-400-cli", &format!("echo '{body}'\nexit 0\n"));
+        let config = config_with_cli_and_model_flag("codex-400", &script);
+        let target = ProbeTarget {
+            platform: "codex-400".to_string(),
+            model: Some("gpt-5.6".to_string()),
+        };
+        let report = probe_target(&config, &target, None, Duration::from_secs(5)).await;
+        assert_eq!(report.outcome, ProbeOutcome::Broken);
+        assert!(!report.outcome.reachable());
+        assert!(report.error.unwrap().contains("not supported"));
+    }
+
+    /// The other half of the 2026-08-13 incident: the harness answers with
+    /// the probe token present (so a naive check would call it healthy) but
+    /// its own output also carries the "requested model not recognized,
+    /// substituting a different one" warning. Must be `Substituted`, never
+    /// `Reachable` — the answer did not come from the model that was
+    /// actually requested.
+    #[tokio::test]
+    async fn probe_target_reports_substituted_for_model_metadata_fallback_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_script(
+            &dir,
+            "fallback-cli",
+            "echo \"warning: Model metadata for 'gpt-5.6' not found. Defaulting to fallback metadata\" 1>&2\necho \"$1\"\n",
+        );
+        let config = config_with_cli_and_model_flag("fallback", &script);
+        let target = ProbeTarget {
+            platform: "fallback".to_string(),
+            model: Some("gpt-5.6".to_string()),
+        };
+        let report = probe_target(&config, &target, None, Duration::from_secs(5)).await;
+        assert_eq!(report.outcome, ProbeOutcome::Substituted);
+        assert!(!report.outcome.reachable());
+        assert!(report
+            .error
+            .unwrap()
+            .to_lowercase()
+            .contains("fallback metadata"));
+    }
+
+    /// A response with no substitution warning and no probe token at all
+    /// must stay `Broken`, not `Substituted` — the substitution check must
+    /// not fire on unrelated broken output.
+    #[tokio::test]
+    async fn probe_target_does_not_report_substituted_without_the_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_script(
+            &dir,
+            "plain-broken-cli",
+            "echo 'Error: something else went wrong' 1>&2\nexit 0\n",
+        );
+        let config = config_with_cli_and_model_flag("plain-broken", &script);
+        let target = ProbeTarget {
+            platform: "plain-broken".to_string(),
+            model: Some("some-model".to_string()),
+        };
+        let report = probe_target(&config, &target, None, Duration::from_secs(5)).await;
+        assert_eq!(report.outcome, ProbeOutcome::Broken);
+    }
+
+    /// The `mistral` case: a `model` is requested but this platform's CLI
+    /// has no `model_flag` configured at all — it addresses named agents,
+    /// not models, so the pair can never be exercised end to end. Must be
+    /// `Unknown` without ever spawning the (misleading) bare-default
+    /// process, and never `Reachable`.
+    #[tokio::test]
+    async fn probe_target_reports_unknown_when_platform_has_no_model_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        // If this script ran and its output were consulted, the probe would
+        // wrongly look healthy — proving the `Unknown` verdict came from
+        // the pre-spawn check, not from judging a response.
+        let script = write_script(&dir, "no-model-flag-cli", "echo \"$1\"\n");
+        let config = config_with_cli("no-model-flag", &script);
+        let target = ProbeTarget {
+            platform: "no-model-flag".to_string(),
+            model: Some("mistral-medium-latest".to_string()),
+        };
+        let report = probe_target(&config, &target, None, Duration::from_secs(5)).await;
+        assert_eq!(report.outcome, ProbeOutcome::Unknown);
+        assert!(!report.outcome.reachable());
+        assert!(report.error.unwrap().contains("no configured way"));
+    }
+
+    /// Omitting `model` must keep today's behaviour exactly: even on a
+    /// platform with no `model_flag`, probing the bare default is fine and
+    /// must not trip the `Unknown` check (that check only applies when a
+    /// *specific* model was requested and can't be honored).
+    #[tokio::test]
+    async fn probe_target_without_model_ignores_missing_model_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_script(&dir, "no-model-flag-default-cli", "echo \"$1\"\n");
+        let config = config_with_cli("no-model-flag-default", &script);
+        let target = ProbeTarget {
+            platform: "no-model-flag-default".to_string(),
+            model: None,
+        };
+        let report = probe_target(&config, &target, None, Duration::from_secs(5)).await;
+        assert_eq!(report.outcome, ProbeOutcome::Reachable);
     }
 
     /// A harness that hangs past the timeout must report `TimedOut`,
@@ -658,5 +918,88 @@ mod tests {
         };
 
         assert!(distinct_targets_for_loop(&details).is_empty());
+    }
+
+    fn report(outcome: ProbeOutcome) -> ProbeReport {
+        ProbeReport {
+            platform: "p".to_string(),
+            model: None,
+            outcome,
+            duration_ms: 0,
+            error: None,
+        }
+    }
+
+    /// `would_fail` must count every confirmed-failure outcome — not just
+    /// `Broken` — and must never count `Reachable`.
+    #[test]
+    fn would_fail_count_counts_every_confirmed_failure_outcome() {
+        let reports = vec![
+            report(ProbeOutcome::Reachable),
+            report(ProbeOutcome::Broken),
+            report(ProbeOutcome::TimedOut),
+            report(ProbeOutcome::NotConfigured),
+            report(ProbeOutcome::SpawnFailed),
+            report(ProbeOutcome::Substituted),
+        ];
+        assert_eq!(would_fail_count(&reports), 5);
+    }
+
+    /// The core honesty requirement: a pair whose validity is `Unknown`
+    /// must not be counted as a confirmed failure by `would_fail`, and must
+    /// not vanish into a `would_fail` of zero as if it had passed either —
+    /// it has its own count via `unknown_count`.
+    #[test]
+    fn would_fail_count_does_not_count_unknown_as_a_failure_or_a_pass() {
+        let reports = vec![report(ProbeOutcome::Unknown), report(ProbeOutcome::Unknown)];
+        assert_eq!(would_fail_count(&reports), 0);
+        assert_eq!(unknown_count(&reports), 2);
+    }
+
+    #[test]
+    fn unknown_count_ignores_every_other_outcome() {
+        let reports = vec![
+            report(ProbeOutcome::Reachable),
+            report(ProbeOutcome::Broken),
+            report(ProbeOutcome::TimedOut),
+            report(ProbeOutcome::NotConfigured),
+            report(ProbeOutcome::SpawnFailed),
+            report(ProbeOutcome::Substituted),
+        ];
+        assert_eq!(unknown_count(&reports), 0);
+    }
+
+    /// `agent_probe` and `loop_preflight` (handler.rs) both build their JSON
+    /// response exclusively from `ProbeReport::to_json()` and this module's
+    /// `would_fail_count`/`unknown_count` — there is no second copy of the
+    /// outcome vocabulary for either tool to drift from. This test pins the
+    /// vocabulary itself so a future new variant can't silently ship a word
+    /// one caller knows about and the other doesn't.
+    #[test]
+    fn probe_outcome_vocabulary_is_stable_and_shared() {
+        let all = [
+            ProbeOutcome::Reachable,
+            ProbeOutcome::Broken,
+            ProbeOutcome::TimedOut,
+            ProbeOutcome::NotConfigured,
+            ProbeOutcome::SpawnFailed,
+            ProbeOutcome::Unknown,
+            ProbeOutcome::Substituted,
+        ];
+        let words: Vec<&str> = all.iter().map(ProbeOutcome::as_str).collect();
+        assert_eq!(
+            words,
+            vec![
+                "reachable",
+                "broken",
+                "timed_out",
+                "not_configured",
+                "spawn_failed",
+                "unknown",
+                "substituted",
+            ]
+        );
+        // Only `Reachable` is ever a pass.
+        assert_eq!(all.iter().filter(|o| o.reachable()).count(), 1);
     }
 }
