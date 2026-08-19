@@ -223,14 +223,12 @@ fn handle_section_picker_key(
             handle_add_custom_section_key(dialog, input.clone(), code);
             Ok(true)
         }
-        SectionPickerMode::RemoveSection { selected } => {
+        SectionPickerMode::RemoveSection { selected, .. } => {
             handle_remove_section_picker_key(dialog, *selected, code);
             Ok(true)
         }
-        SectionPickerMode::SkillsPicker {
-            selected, entries, ..
-        } => {
-            handle_skills_picker_key(dialog, *selected, entries.len(), code);
+        SectionPickerMode::SkillsPicker { .. } => {
+            handle_skills_picker_key(dialog, code);
             Ok(true)
         }
         SectionPickerMode::ProjectPicker { .. } => {
@@ -253,12 +251,8 @@ fn handle_add_section_picker_key(
 ) -> Result<()> {
     match code {
         KeyCode::Esc => dialog.picker_mode = SectionPickerMode::None,
-        KeyCode::Up if selected > 0 => {
-            dialog.picker_mode = SectionPickerMode::AddSection {
-                selected: selected - 1,
-            };
-        }
-        KeyCode::Down => move_add_section_picker_down(dialog, selected),
+        KeyCode::Up => move_add_section_picker(dialog, selected, false),
+        KeyCode::Down => move_add_section_picker(dialog, selected, true),
         KeyCode::Enter => select_addable_section(dialog, selected, db, workdir)?,
         KeyCode::Char('c') => {
             dialog.picker_mode = SectionPickerMode::AddCustom {
@@ -271,15 +265,14 @@ fn handle_add_section_picker_key(
     Ok(())
 }
 
-fn move_add_section_picker_down(dialog: &mut SimplePromptDialog, selected: usize) {
-    let addable = dialog.get_addable_sections();
-    if selected + 1 >= addable.len() {
-        return;
-    }
-
-    dialog.picker_mode = SectionPickerMode::AddSection {
-        selected: selected + 1,
-    };
+/// Moves the highlighted row, wrapping at both ends via the shared
+/// [`crate::tui::selection`] model — up from the first entry lands on the
+/// last, down from the last lands on the first. The menu is always short
+/// enough to fit its box in full, so there is no scroll offset to track.
+fn move_add_section_picker(dialog: &mut SimplePromptDialog, selected: usize, forward: bool) {
+    let len = dialog.get_addable_sections().len();
+    let selected = crate::tui::selection::move_index(selected, len, forward);
+    dialog.picker_mode = SectionPickerMode::AddSection { selected };
 }
 
 fn select_addable_section(
@@ -324,6 +317,7 @@ fn open_skills_picker(dialog: &mut SimplePromptDialog, workdir: &Path) {
     let entries = SimplePromptDialog::collect_skills_for_picker(workdir);
     dialog.picker_mode = SectionPickerMode::SkillsPicker {
         selected: 0,
+        scroll: 0,
         entries,
         replace_id: None,
     };
@@ -374,26 +368,25 @@ fn handle_remove_section_picker_key(
 ) {
     match code {
         KeyCode::Esc => dialog.picker_mode = SectionPickerMode::None,
-        KeyCode::Up if selected > 0 => {
-            dialog.picker_mode = SectionPickerMode::RemoveSection {
-                selected: selected - 1,
-            };
-        }
-        KeyCode::Down => move_remove_section_picker_down(dialog, selected),
+        KeyCode::Up => move_remove_section_picker(dialog, selected, false),
+        KeyCode::Down => move_remove_section_picker(dialog, selected, true),
         KeyCode::Enter => select_removable_section(dialog, selected),
         _ => {}
     }
 }
 
-fn move_remove_section_picker_down(dialog: &mut SimplePromptDialog, selected: usize) {
-    let removable = dialog.get_removable_sections();
-    if selected + 1 >= removable.len() {
+/// Moves the highlighted row, wrapping at both ends and rescrolling so it
+/// stays visible — this list grows with `enabled_sections` and can exceed
+/// the viewport, unlike the fixed, short `AddSection` menu.
+fn move_remove_section_picker(dialog: &mut SimplePromptDialog, selected: usize, forward: bool) {
+    let len = dialog.get_removable_sections().len();
+    let SectionPickerMode::RemoveSection { scroll, .. } = &dialog.picker_mode else {
         return;
-    }
-
-    dialog.picker_mode = SectionPickerMode::RemoveSection {
-        selected: selected + 1,
     };
+    let visible_rows = SimplePromptDialog::remove_section_visible_rows(len);
+    let (selected, scroll) =
+        crate::tui::selection::move_selection(selected, *scroll, len, visible_rows, forward);
+    dialog.picker_mode = SectionPickerMode::RemoveSection { selected, scroll };
 }
 
 fn select_removable_section(dialog: &mut SimplePromptDialog, selected: usize) {
@@ -406,28 +399,35 @@ fn select_removable_section(dialog: &mut SimplePromptDialog, selected: usize) {
     dialog.picker_mode = SectionPickerMode::None;
 }
 
-fn handle_skills_picker_key(
-    dialog: &mut SimplePromptDialog,
-    selected: usize,
-    count: usize,
-    code: KeyCode,
-) {
+fn handle_skills_picker_key(dialog: &mut SimplePromptDialog, code: KeyCode) {
     match code {
         KeyCode::Esc => dialog.picker_mode = SectionPickerMode::None,
-        KeyCode::Up if selected > 0 => set_skills_picker_selection(dialog, selected - 1),
-        KeyCode::Down if selected + 1 < count => set_skills_picker_selection(dialog, selected + 1),
+        KeyCode::Up => move_skills_picker(dialog, false),
+        KeyCode::Down => move_skills_picker(dialog, true),
         KeyCode::Enter | KeyCode::Tab => confirm_skills_picker_selection(dialog),
         _ => {}
     }
 }
 
-fn set_skills_picker_selection(dialog: &mut SimplePromptDialog, selected: usize) {
-    if let SectionPickerMode::SkillsPicker {
-        selected: current, ..
+/// Moves the highlighted row, wrapping at both ends and rescrolling so it
+/// stays visible — this is the tools menu that used to walk its selection
+/// off screen once the skill count exceeded the viewport.
+fn move_skills_picker(dialog: &mut SimplePromptDialog, forward: bool) {
+    let SectionPickerMode::SkillsPicker {
+        selected,
+        scroll,
+        entries,
+        ..
     } = &mut dialog.picker_mode
-    {
-        *current = selected;
-    }
+    else {
+        return;
+    };
+    let len = entries.len();
+    let visible_rows = SimplePromptDialog::skills_picker_visible_rows(len);
+    let (new_selected, new_scroll) =
+        crate::tui::selection::move_selection(*selected, *scroll, len, visible_rows, forward);
+    *selected = new_selected;
+    *scroll = new_scroll;
 }
 
 fn confirm_skills_picker_selection(dialog: &mut SimplePromptDialog) {
@@ -435,6 +435,7 @@ fn confirm_skills_picker_selection(dialog: &mut SimplePromptDialog) {
         entries,
         selected,
         replace_id,
+        ..
     } = std::mem::replace(&mut dialog.picker_mode, SectionPickerMode::None)
     else {
         return;
@@ -559,8 +560,9 @@ fn handle_project_picker_key(dialog: &mut SimplePromptDialog, code: KeyCode) {
 }
 
 /// Move the highlighted row up/down within the filtered list, wrapping at
-/// both ends, then slides `scroll` (via `clamp_scroll`) so the new selection
-/// is always drawn — including right after a wraparound jump.
+/// both ends, then slides `scroll` (via the shared [`crate::tui::selection`]
+/// model) so the new selection is always drawn — including right after a
+/// wraparound jump.
 fn move_project_picker(dialog: &mut SimplePromptDialog, forward: bool) {
     let filtered_len = project_filtered_indices(dialog).len();
     if filtered_len == 0 {
@@ -572,13 +574,16 @@ fn move_project_picker(dialog: &mut SimplePromptDialog, forward: bool) {
     else {
         return;
     };
-    *selected = if forward {
-        (*selected + 1) % filtered_len
-    } else {
-        selected.checked_sub(1).unwrap_or(filtered_len - 1)
-    };
     let visible_rows = SimplePromptDialog::project_picker_visible_rows(filtered_len);
-    *scroll = SimplePromptDialog::clamp_scroll(*selected, *scroll, visible_rows);
+    let (new_selected, new_scroll) = crate::tui::selection::move_selection(
+        *selected,
+        *scroll,
+        filtered_len,
+        visible_rows,
+        forward,
+    );
+    *selected = new_selected;
+    *scroll = new_scroll;
 }
 
 fn push_project_picker_filter(dialog: &mut SimplePromptDialog, c: char) {
@@ -1205,7 +1210,10 @@ fn open_remove_section_picker_if_available(dialog: &mut SimplePromptDialog) {
         return;
     }
 
-    dialog.picker_mode = SectionPickerMode::RemoveSection { selected: 0 };
+    dialog.picker_mode = SectionPickerMode::RemoveSection {
+        selected: 0,
+        scroll: 0,
+    };
 }
 
 fn handle_section_char_input(
@@ -2322,38 +2330,40 @@ mod picker_navigation_tests {
     use tempfile::NamedTempFile;
 
     #[test]
-    fn skills_picker_up_at_zero_wraps() {
+    fn skills_picker_up_at_zero_wraps_to_last() {
         let mut dialog = SimplePromptDialog::new();
         dialog.picker_mode = SectionPickerMode::SkillsPicker {
             selected: 0,
+            scroll: 0,
             entries: vec![
                 ("s1".into(), "r1".into(), "skill".into()),
                 ("s2".into(), "r2".into(), "skill".into()),
             ],
             replace_id: None,
         };
-        handle_skills_picker_key(&mut dialog, 0, 2, KeyCode::Up);
+        handle_skills_picker_key(&mut dialog, KeyCode::Up);
         if let SectionPickerMode::SkillsPicker { selected, .. } = &dialog.picker_mode {
-            assert_eq!(*selected, 0, "stays at zero, no wrap");
+            assert_eq!(*selected, 1, "up from the first entry wraps to the last");
         } else {
             panic!("expected SkillsPicker");
         }
     }
 
     #[test]
-    fn skills_picker_down_at_end_wraps() {
+    fn skills_picker_down_at_end_wraps_to_first() {
         let mut dialog = SimplePromptDialog::new();
         dialog.picker_mode = SectionPickerMode::SkillsPicker {
             selected: 1,
+            scroll: 0,
             entries: vec![
                 ("s1".into(), "r1".into(), "skill".into()),
                 ("s2".into(), "r2".into(), "skill".into()),
             ],
             replace_id: None,
         };
-        handle_skills_picker_key(&mut dialog, 1, 2, KeyCode::Down);
+        handle_skills_picker_key(&mut dialog, KeyCode::Down);
         if let SectionPickerMode::SkillsPicker { selected, .. } = &dialog.picker_mode {
-            assert_eq!(*selected, 1, "stays at end, no wrap");
+            assert_eq!(*selected, 0, "down from the last entry wraps to the first");
         } else {
             panic!("expected SkillsPicker");
         }
@@ -2364,11 +2374,44 @@ mod picker_navigation_tests {
         let mut dialog = SimplePromptDialog::new();
         dialog.picker_mode = SectionPickerMode::SkillsPicker {
             selected: 0,
+            scroll: 0,
             entries: vec![("s1".into(), "r1".into(), "skill".into())],
             replace_id: None,
         };
-        handle_skills_picker_key(&mut dialog, 0, 1, KeyCode::Esc);
+        handle_skills_picker_key(&mut dialog, KeyCode::Esc);
         assert_eq!(dialog.picker_mode, SectionPickerMode::None);
+    }
+
+    /// Regression test for the reported bug: with more skills than fit the
+    /// picker's viewport, moving down past the last visible row must slide
+    /// the scroll offset so the selection stays on screen instead of
+    /// walking off the bottom.
+    #[test]
+    fn skills_picker_scrolls_past_visible_rows() {
+        let entries: Vec<_> = (0..20)
+            .map(|i| (format!("s{i}"), format!("r{i}"), "skill".to_string()))
+            .collect();
+        let visible_rows = SimplePromptDialog::skills_picker_visible_rows(20);
+        let mut dialog = SimplePromptDialog::new();
+        dialog.picker_mode = SectionPickerMode::SkillsPicker {
+            selected: visible_rows - 1,
+            scroll: 0,
+            entries,
+            replace_id: None,
+        };
+        handle_skills_picker_key(&mut dialog, KeyCode::Down);
+        if let SectionPickerMode::SkillsPicker {
+            selected, scroll, ..
+        } = &dialog.picker_mode
+        {
+            assert_eq!(*selected, visible_rows);
+            assert_eq!(
+                *scroll, 1,
+                "offset must advance to keep the selection visible"
+            );
+        } else {
+            panic!("expected SkillsPicker");
+        }
     }
 
     fn make_project_entries(names: &[&str]) -> Vec<ProjectPickerEntry> {
@@ -2589,10 +2632,33 @@ mod picker_navigation_tests {
     #[test]
     fn remove_section_picker_navigation() {
         let mut dialog = SimplePromptDialog::new();
-        dialog.picker_mode = SectionPickerMode::RemoveSection { selected: 1 };
+        dialog.add_section("context");
+        dialog.add_section("context");
+        dialog.picker_mode = SectionPickerMode::RemoveSection {
+            selected: 1,
+            scroll: 0,
+        };
         handle_remove_section_picker_key(&mut dialog, 1, KeyCode::Up);
-        if let SectionPickerMode::RemoveSection { selected } = &dialog.picker_mode {
+        if let SectionPickerMode::RemoveSection { selected, .. } = &dialog.picker_mode {
             assert_eq!(*selected, 0);
+        } else {
+            panic!("expected RemoveSection");
+        }
+    }
+
+    #[test]
+    fn remove_section_picker_up_at_zero_wraps_to_last() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.add_section("context");
+        dialog.add_section("context");
+        let last = dialog.get_removable_sections().len() - 1;
+        dialog.picker_mode = SectionPickerMode::RemoveSection {
+            selected: 0,
+            scroll: 0,
+        };
+        handle_remove_section_picker_key(&mut dialog, 0, KeyCode::Up);
+        if let SectionPickerMode::RemoveSection { selected, .. } = &dialog.picker_mode {
+            assert_eq!(*selected, last, "up from the first entry wraps to the last");
         } else {
             panic!("expected RemoveSection");
         }
@@ -2601,7 +2667,10 @@ mod picker_navigation_tests {
     #[test]
     fn remove_section_picker_esc_closes() {
         let mut dialog = SimplePromptDialog::new();
-        dialog.picker_mode = SectionPickerMode::RemoveSection { selected: 0 };
+        dialog.picker_mode = SectionPickerMode::RemoveSection {
+            selected: 0,
+            scroll: 0,
+        };
         handle_remove_section_picker_key(&mut dialog, 0, KeyCode::Esc);
         assert_eq!(dialog.picker_mode, SectionPickerMode::None);
     }
@@ -2614,14 +2683,30 @@ mod picker_navigation_tests {
     }
 
     #[test]
-    fn add_section_picker_up_at_zero_is_noop() {
+    fn add_section_picker_up_at_zero_wraps_to_last() {
         let mut dialog = SimplePromptDialog::new();
+        let last = dialog.get_addable_sections().len() - 1;
         dialog.picker_mode = SectionPickerMode::AddSection { selected: 0 };
         let db = test_db();
         let workdir = Path::new("/tmp");
         handle_add_section_picker_key(&mut dialog, 0, &db, workdir, KeyCode::Up).unwrap();
         if let SectionPickerMode::AddSection { selected } = &dialog.picker_mode {
-            assert_eq!(*selected, 0, "should stay at 0");
+            assert_eq!(*selected, last, "up from the first entry wraps to the last");
+        } else {
+            panic!("expected AddSection");
+        }
+    }
+
+    #[test]
+    fn add_section_picker_down_at_last_wraps_to_zero() {
+        let mut dialog = SimplePromptDialog::new();
+        let last = dialog.get_addable_sections().len() - 1;
+        dialog.picker_mode = SectionPickerMode::AddSection { selected: last };
+        let db = test_db();
+        let workdir = Path::new("/tmp");
+        handle_add_section_picker_key(&mut dialog, last, &db, workdir, KeyCode::Down).unwrap();
+        if let SectionPickerMode::AddSection { selected } = &dialog.picker_mode {
+            assert_eq!(*selected, 0, "down from the last entry wraps to the first");
         } else {
             panic!("expected AddSection");
         }

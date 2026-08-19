@@ -40,6 +40,9 @@ pub(crate) fn draw_section_picker_modal(
             frame.render_widget(block, area);
 
             for (y_pos, (i, (_, label))) in (inner.y..).zip(addable.iter().enumerate()) {
+                if y_pos >= inner.y + inner.height.saturating_sub(1) {
+                    break;
+                }
                 let is_selected = i == *selected;
                 let style = if is_selected {
                     Style::default()
@@ -130,9 +133,15 @@ pub(crate) fn draw_section_picker_modal(
             };
             frame.render_widget(Paragraph::new(hint), hint_area);
         }
-        SectionPickerMode::RemoveSection { selected } => {
+        SectionPickerMode::RemoveSection { selected, scroll } => {
             let removable = dialog.get_removable_sections();
-            let height = (removable.len() as u16 + 4).min(15);
+            let height = crate::tui::app::dialog::SimplePromptDialog::remove_section_box_height(
+                removable.len(),
+            );
+            let visible_rows =
+                crate::tui::app::dialog::SimplePromptDialog::remove_section_visible_rows(
+                    removable.len(),
+                );
             let area = centered_rect(50, height, frame.area());
             frame.render_widget(Clear, area);
 
@@ -146,7 +155,15 @@ pub(crate) fn draw_section_picker_modal(
             let inner = block.inner(area);
             frame.render_widget(block, area);
 
-            for (y_pos, (i, (_, display_label))) in (inner.y..).zip(removable.iter().enumerate()) {
+            let visible = removable
+                .iter()
+                .enumerate()
+                .skip(*scroll)
+                .take(visible_rows);
+            for (y_pos, (i, (_, display_label))) in (inner.y..).zip(visible) {
+                if y_pos >= inner.y + inner.height.saturating_sub(1) {
+                    break;
+                }
                 let is_selected = i == *selected;
 
                 let style = if is_selected {
@@ -184,9 +201,18 @@ pub(crate) fn draw_section_picker_modal(
             frame.render_widget(Paragraph::new(hint), hint_area);
         }
         SectionPickerMode::SkillsPicker {
-            selected, entries, ..
+            selected,
+            scroll,
+            entries,
+            ..
         } => {
-            let height = (entries.len() as u16 + 5).min(16);
+            let height = crate::tui::app::dialog::SimplePromptDialog::skills_picker_box_height(
+                entries.len(),
+            );
+            let visible_rows =
+                crate::tui::app::dialog::SimplePromptDialog::skills_picker_visible_rows(
+                    entries.len(),
+                );
             let area = centered_rect(55, height, frame.area());
             frame.render_widget(Clear, area);
 
@@ -214,9 +240,8 @@ pub(crate) fn draw_section_picker_modal(
                     },
                 );
             } else {
-                for (y_pos, (i, (_label, raw_name, prefix))) in
-                    (inner.y..).zip(entries.iter().enumerate())
-                {
+                let visible = entries.iter().enumerate().skip(*scroll).take(visible_rows);
+                for (y_pos, (i, (_label, raw_name, prefix))) in (inner.y..).zip(visible) {
                     if y_pos >= inner.y + inner.height.saturating_sub(1) {
                         break;
                     }
@@ -667,7 +692,10 @@ mod tests {
                 frame,
                 &app,
                 Color::Cyan,
-                &SectionPickerMode::RemoveSection { selected: 0 },
+                &SectionPickerMode::RemoveSection {
+                    selected: 0,
+                    scroll: 0,
+                },
                 &theme,
             );
         });
@@ -701,6 +729,7 @@ mod tests {
                 Color::Cyan,
                 &SectionPickerMode::SkillsPicker {
                     selected: 0,
+                    scroll: 0,
                     entries,
                     replace_id: None,
                 },
@@ -722,6 +751,7 @@ mod tests {
                 Color::Cyan,
                 &SectionPickerMode::SkillsPicker {
                     selected: 0,
+                    scroll: 0,
                     entries: vec![],
                     replace_id: None,
                 },
@@ -731,6 +761,48 @@ mod tests {
         assert!(
             text.contains("No skills found"),
             "Should show empty message: {text}"
+        );
+    }
+
+    /// Regression test for the reported bug: a scrolled-down selection must
+    /// stay on screen instead of walking off the bottom of the tools menu.
+    #[test]
+    fn draw_skills_picker_scrolled_selection_stays_visible() {
+        let app = make_app_with_prompt_dialog();
+        let theme = Theme::classic();
+        let entries: Vec<_> = (0..20)
+            .map(|i| {
+                (
+                    format!("Skill {i}"),
+                    format!("skill_{i}"),
+                    "skill".to_string(),
+                )
+            })
+            .collect();
+        let visible_rows =
+            crate::tui::app::dialog::SimplePromptDialog::skills_picker_visible_rows(20);
+        let scroll = 20 - visible_rows;
+        let text = render_to_text(80, 24, |frame, _area| {
+            draw_section_picker_modal(
+                frame,
+                &app,
+                Color::Cyan,
+                &SectionPickerMode::SkillsPicker {
+                    selected: 19,
+                    scroll,
+                    entries: entries.clone(),
+                    replace_id: None,
+                },
+                &theme,
+            );
+        });
+        assert!(
+            text.contains("skill_19"),
+            "Last entry must stay visible when scrolled: {text}"
+        );
+        assert!(
+            !text.contains("skill_0 "),
+            "First entry should have scrolled out of view: {text}"
         );
     }
 

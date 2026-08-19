@@ -20,6 +20,11 @@ pub enum SectionPickerMode {
     },
     RemoveSection {
         selected: usize,
+        /// Scroll offset into `enabled_sections`' removable subset — unlike
+        /// `AddSection`'s fixed, short menu this list grows with however
+        /// many sections the user has enabled, so it can exceed the
+        /// viewport in practice.
+        scroll: usize,
     },
     AddCustom {
         input: String,
@@ -27,6 +32,7 @@ pub enum SectionPickerMode {
     /// Skills picker for the Tools section — entries are `(label, raw_name, prefix)`
     SkillsPicker {
         selected: usize,
+        scroll: usize,
         /// `(display_label, raw_name, prefix)` — `prefix` is "skill" or "global"
         entries: Vec<(String, String, String)>,
         /// `None` → create a new tools section on confirm; `Some(id)` → replace content of that section
@@ -577,22 +583,28 @@ impl SimplePromptDialog {
         Self::project_picker_box_height(count).saturating_sub(4) as usize
     }
 
-    /// Recompute the scroll offset so `selected` (an index into the current
-    /// filtered list) stays inside the `visible_rows`-tall window, sliding by
-    /// exactly enough to bring it back into view. Pure and Frame-free so
-    /// scrolling logic is unit-testable on its own; also what makes the view
-    /// follow selection wraparound at either end of the list for free.
-    pub fn clamp_scroll(selected: usize, scroll: usize, visible_rows: usize) -> usize {
-        if visible_rows == 0 {
-            return 0;
-        }
-        if selected < scroll {
-            selected
-        } else if selected >= scroll + visible_rows {
-            selected + 1 - visible_rows
-        } else {
-            scroll
-        }
+    /// Box height for the Skills picker (Tools section), mirroring
+    /// `project_picker_box_height`: grows to fit small lists, caps so long
+    /// lists scroll instead of overflowing the screen.
+    pub fn skills_picker_box_height(count: usize) -> u16 {
+        (count as u16 + 5).min(16)
+    }
+
+    /// Entry rows visible inside the Skills picker box — the box height
+    /// minus its 2 border rows and 1 hint row.
+    pub fn skills_picker_visible_rows(count: usize) -> usize {
+        Self::skills_picker_box_height(count).saturating_sub(3) as usize
+    }
+
+    /// Box height for the Remove Section picker.
+    pub fn remove_section_box_height(count: usize) -> u16 {
+        (count as u16 + 4).min(15)
+    }
+
+    /// Entry rows visible inside the Remove Section picker box — the box
+    /// height minus its 2 border rows and 1 hint row.
+    pub fn remove_section_visible_rows(count: usize) -> usize {
+        Self::remove_section_box_height(count).saturating_sub(3) as usize
     }
 
     /// Set the content of a specific tools section to a single skill label.
@@ -2049,31 +2061,17 @@ mod tests {
     }
 
     #[test]
-    fn clamp_scroll_stays_put_when_selection_already_visible() {
-        assert_eq!(SimplePromptDialog::clamp_scroll(2, 0, 5), 0);
+    fn skills_picker_visible_rows_caps_at_thirteen() {
+        assert_eq!(SimplePromptDialog::skills_picker_visible_rows(1), 3);
+        assert_eq!(SimplePromptDialog::skills_picker_visible_rows(11), 13);
+        assert_eq!(SimplePromptDialog::skills_picker_visible_rows(100), 13);
     }
 
     #[test]
-    fn clamp_scroll_follows_selection_past_bottom_edge() {
-        // visible_rows=5 shows rows [0,5); selecting row 5 must slide by one.
-        assert_eq!(SimplePromptDialog::clamp_scroll(5, 0, 5), 1);
-    }
-
-    #[test]
-    fn clamp_scroll_follows_selection_past_top_edge() {
-        assert_eq!(SimplePromptDialog::clamp_scroll(2, 3, 5), 2);
-    }
-
-    #[test]
-    fn clamp_scroll_shows_last_page_when_selection_wraps_to_end() {
-        // 20 entries, 13 visible rows: wrapping to the last entry (idx 19)
-        // must scroll so the final page (rows 7..20) is shown.
-        assert_eq!(SimplePromptDialog::clamp_scroll(19, 0, 13), 7);
-    }
-
-    #[test]
-    fn clamp_scroll_resets_to_top_when_selection_wraps_to_start() {
-        assert_eq!(SimplePromptDialog::clamp_scroll(0, 7, 13), 0);
+    fn remove_section_visible_rows_caps_at_twelve() {
+        assert_eq!(SimplePromptDialog::remove_section_visible_rows(1), 2);
+        assert_eq!(SimplePromptDialog::remove_section_visible_rows(11), 12);
+        assert_eq!(SimplePromptDialog::remove_section_visible_rows(100), 12);
     }
 
     #[test]
