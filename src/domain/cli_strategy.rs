@@ -54,6 +54,14 @@ pub struct CliStrategy {
     ///
     /// [`CliConfig::session_resume_cmd`]: super::cli_config::CliConfig::session_resume_cmd
     pub session_resume_cmd: Option<String>,
+    /// Flag that non-interactively trusts the run's working directory for
+    /// this invocation, e.g. mistral's `--trust`. See
+    /// [`CliConfig::trust_flag`]. Only applied by a caller that has opted in
+    /// (the loop engine, per `node.config["trust_workdir"]`) — never appended
+    /// unconditionally by this struct's own command builders.
+    ///
+    /// [`CliConfig::trust_flag`]: super::cli_config::CliConfig::trust_flag
+    pub trust_flag: Option<String>,
 }
 
 /// A CLI's configured `binary` could not be resolved to an executable.
@@ -188,6 +196,7 @@ impl CliStrategy {
             session_list_format_args: cli_config.session_list_format_args.clone(),
             session_id_pattern: cli_config.session_id_pattern.clone(),
             session_resume_cmd: cli_config.session_resume_cmd.clone(),
+            trust_flag: cli_config.trust_flag.clone(),
         }
     }
 
@@ -436,6 +445,7 @@ mod tests {
             session_list_format_args: None,
             session_id_pattern: None,
             session_resume_cmd: None,
+            trust_flag: None,
         }
     }
 

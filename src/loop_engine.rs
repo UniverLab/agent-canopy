@@ -2614,6 +2614,7 @@ async fn spawn_and_wait_cli_process(
     timeout_minutes: u64,
     session_id: Option<&str>,
     resume_session_id: Option<&str>,
+    trust_workdir: bool,
     on_pid: impl FnOnce(u32),
 ) -> Result<CliProcessOutcome, SpawnError> {
     // A resume (RS2) uses the by-id resume flag and continues an existing
@@ -2627,6 +2628,14 @@ async fn spawn_and_wait_cli_process(
             .build_command_with_session(prompt, model, Some(workdir), session_id)
             .map_err(|error| SpawnError::from_build(&error))?,
     };
+    // Only appended when the caller opted in (per node.config["trust_workdir"])
+    // AND the harness has a registered trust flag — never a silent default
+    // (see [`CliConfig::trust_flag`]).
+    if trust_workdir {
+        if let Some(flag) = strategy.trust_flag.as_deref() {
+            command.arg(flag);
+        }
+    }
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
 
@@ -2729,6 +2738,12 @@ async fn run_agent_process(
         None
     };
 
+    // Opt-in only (per node config), never a default — see [`CliConfig::trust_flag`].
+    let trust_workdir = node
+        .config
+        .get("trust_workdir")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let outcome = spawn_and_wait_cli_process(
         strategy,
         prompt,
@@ -2737,6 +2752,7 @@ async fn run_agent_process(
         timeout_minutes,
         session_id.as_deref(),
         resume_session_id,
+        trust_workdir,
         |pid| {
             let _ = db.set_loop_run_pid(run_id, pid as i64, crate::system::boot_id().as_deref());
         },
@@ -2807,6 +2823,29 @@ async fn run_agent_process(
     }
 }
 
+/// Shape-matches a harness's stderr against an "untrusted working directory"
+/// refusal — the class of failure that produced exit 0, empty stdout, and
+/// this stderr in the 2026-08-13 `gitkit-composition` incident:
+///
+/// ```text
+/// Warning: /home/.../gitkit is not trusted; project configuration (.agents/)
+///          will be ignored. Re-run with --trust to trust this folder temporarily.
+/// ```
+///
+/// `.agents/` is where MCP server configuration lives, so a harness hitting
+/// this silently loses every tool it needed — including the two calls
+/// (`loop_complete_node`/`loop_report_blocker`) it would need to report that
+/// loss. Matches on the *shape* of the refusal (an explicit "not trusted"
+/// verdict alongside project configuration being ignored) rather than this
+/// one CLI's exact sentence, since a different harness or a future wording
+/// change must still be caught — see [`agent_finished_execution`], which
+/// keeps the stderr verbatim in the report so a wording drift is visible
+/// there rather than silently swallowed by ever-looser matching here.
+fn is_untrusted_workdir_signal(stderr: &str) -> bool {
+    let lower = stderr.to_lowercase();
+    lower.contains("not trusted") && lower.contains("ignored")
+}
+
 /// Turn a completed (non-timeout, non-spawn-failure) CLI run into its
 /// verdict. `exit_code == 0` is necessary but not sufficient for `Pass`: a
 /// CLI that fails to start its model, prints to stderr, and still exits 0
@@ -2849,6 +2888,10 @@ async fn run_agent_process(
 ///   the *unreported* branch (see the `self_reported_execution` check at
 ///   this function's call sites), so there is no case here where an explicit
 ///   `graph_complete_node` verdict could be overridden.
+///
+/// A fourth, more specific `failure_kind` — `"untrusted_workdir"` — joins
+/// `"no_report"` in this vocabulary when [`is_untrusted_workdir_signal`]
+/// matches stderr on a `zero_exit_no_output` run (C3).
 fn agent_finished_execution(
     node: &LoopNode,
     cli: &Cli,
@@ -2866,6 +2909,11 @@ fn agent_finished_execution(
     // stop retrying every plain crash that happens not to log to stdout.
     let zero_exit_no_output = exit_code == 0 && stdout.is_empty();
     let exit_says_pass = exit_code == 0 && !zero_exit_no_output;
+    // Only meaningful within the `zero_exit_no_output` shape: a harness that
+    // produced real output warned about many things, and an untrusted-workdir
+    // mention alongside a successful result must never downgrade it (harnesses
+    // warn about all kinds of things and still finish the job).
+    let untrusted_workdir = zero_exit_no_output && is_untrusted_workdir_signal(stderr);
 
     let require_report = node
         .config
@@ -2890,7 +2938,13 @@ fn agent_finished_execution(
         "prompt_source": agent_prompt_source(&node.config),
     });
     if zero_exit_no_output {
-        let reason = if stderr.is_empty() {
+        let reason = if untrusted_workdir {
+            format!(
+                "agent produced no output because its working directory was not trusted \
+                 by the harness, so project configuration (including MCP tools) was \
+                 ignored; stderr: {stderr}"
+            )
+        } else if stderr.is_empty() {
             "agent produced no output".to_string()
         } else {
             format!("agent produced no output; stderr: {stderr}")
@@ -2898,6 +2952,12 @@ fn agent_finished_execution(
         if let Value::Object(map) = &mut output {
             map.insert("no_output".to_string(), Value::Bool(true));
             map.insert("error".to_string(), Value::String(reason));
+            if untrusted_workdir {
+                map.insert(
+                    "failure_kind".to_string(),
+                    Value::String("untrusted_workdir".to_string()),
+                );
+            }
         }
     }
     if !self_reported {
@@ -2918,6 +2978,12 @@ fn agent_finished_execution(
         summary: if no_report_override {
             format!(
                 "Agent node '{}' exited 0 but never called loop_complete_node (require_report).",
+                node.name
+            )
+        } else if untrusted_workdir {
+            format!(
+                "Agent node '{}' produced no output: the harness reported its working \
+                 directory as untrusted and ignored project configuration (exit code 0).",
                 node.name
             )
         } else if zero_exit_no_output {
@@ -3288,6 +3354,7 @@ async fn run_completion_hook_process(
         timeout_minutes,
         None,
         None,
+        false,
         |pid| {
             let _ = db.set_loop_completion_hook_run_pid(
                 hook_run_id,
@@ -5899,6 +5966,7 @@ mod tests {
             session_list_format_args: None,
             session_id_pattern: None,
             session_resume_cmd: None,
+            trust_flag: None,
         }
     }
 
@@ -6040,6 +6108,7 @@ esac
             session_list_format_args: None,
             session_id_pattern: Some(r#""id"\s*:\s*"([^"]+)""#.to_string()),
             session_resume_cmd: None,
+            trust_flag: None,
         }
     }
 
@@ -6971,6 +7040,217 @@ echo done
         assert!(
             !is_infra_crash(&node, &execution, &run, 0, 3, 60),
             "an empty-output zero-exit run must not be retried as an infra crash"
+        );
+    }
+
+    /// C3: the 2026-08-13 `gitkit-composition` incident, reproduced with the
+    /// stderr the harness actually printed — exit 0, empty stdout, and a
+    /// warning that the workdir was untrusted so `.agents/` (MCP config) was
+    /// ignored. Must be classified as the specific `untrusted_workdir` cause,
+    /// not just the generic no-output case, so a human (or the resilience
+    /// node's own summary) can tell "the harness lost its tools" apart from
+    /// "the harness said nothing for some other reason".
+    #[tokio::test]
+    async fn run_agent_process_untrusted_workdir_stderr_is_classified_specifically() {
+        let (dir, db) = test_db();
+        let cli = Cli::new("test-cli");
+        let stderr_text =
+            "Warning: /home/jheisonmblivecom/Projects/UniverLab/gitkit is not trusted; \
+                            project configuration (.agents/) will be ignored. \
+                            Re-run with --trust to trust this folder temporarily.";
+        let script = write_member_script(
+            dir.path(),
+            "untrusted.sh",
+            &format!(">&2 printf '%s' '{stderr_text}'\nexit 0"),
+        );
+        let strategy = sample_strategy(&script);
+        let node = sample_agent_node();
+
+        let execution = run_agent_process(
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(execution.status, LoopRunStatus::Fail);
+        assert_eq!(
+            execution.output.get("no_output").and_then(Value::as_bool),
+            Some(true),
+            "existing no_output mechanism must still fire (this sharpens it, not replaces it)"
+        );
+        assert_eq!(
+            execution.output.get("failure_kind").and_then(Value::as_str),
+            Some("untrusted_workdir"),
+            "must join the failure_kind vocabulary alongside no_report"
+        );
+        let error_text = execution
+            .output
+            .get("error")
+            .and_then(Value::as_str)
+            .expect("must carry an error field");
+        assert!(
+            error_text.contains("not trusted"),
+            "the matched stderr text must be visible in the report: {error_text}"
+        );
+        assert!(
+            execution.summary.to_lowercase().contains("untrusted"),
+            "summary must state the cause, not read as a generic empty response: {}",
+            execution.summary
+        );
+    }
+
+    /// Guard against over-matching: an unrelated stderr on an empty-stdout,
+    /// zero-exit run must stay the generic no-output case, never picking up
+    /// the `untrusted_workdir` cause just because stdout happened to be
+    /// empty.
+    #[tokio::test]
+    async fn run_agent_process_unrelated_stderr_stays_generic_no_output() {
+        let (dir, db) = test_db();
+        let cli = Cli::new("test-cli");
+        let script = write_member_script(
+            dir.path(),
+            "unrelated.sh",
+            ">&2 printf 'Error: rate limited, try again later'\nexit 0",
+        );
+        let strategy = sample_strategy(&script);
+        let node = sample_agent_node();
+
+        let execution = run_agent_process(
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(execution.status, LoopRunStatus::Fail);
+        assert_eq!(
+            execution.output.get("no_output").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            execution.output.get("failure_kind").is_none(),
+            "unrelated stderr must not be classified as untrusted_workdir"
+        );
+    }
+
+    /// Harnesses warn about many things; an untrusted-workdir mention in
+    /// stderr alongside REAL stdout must never downgrade an otherwise
+    /// successful run — only the empty-stdout shape is diagnostic here.
+    #[tokio::test]
+    async fn run_agent_process_untrusted_warning_with_real_output_still_passes() {
+        let (dir, db) = test_db();
+        let cli = Cli::new("test-cli");
+        let stderr_text = "Warning: workdir is not trusted; project configuration will be ignored.";
+        let script = write_member_script(
+            dir.path(),
+            "warned-but-worked.sh",
+            &format!(">&2 printf '%s' '{stderr_text}'\nprintf 'all done'\nexit 0"),
+        );
+        let strategy = sample_strategy(&script);
+        let node = sample_agent_node();
+
+        let execution = run_agent_process(
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            execution.status,
+            LoopRunStatus::Pass,
+            "real stdout must pass regardless of an unrelated warning in stderr"
+        );
+        assert!(execution.output.get("no_output").is_none());
+        assert!(execution.output.get("failure_kind").is_none());
+    }
+
+    /// A harness with a registered `trust_flag` AND a node that opts in via
+    /// `trust_workdir: true` must actually receive the flag — otherwise
+    /// nothing in the registry is wired to anything a run can use.
+    #[tokio::test]
+    async fn run_agent_process_trust_flag_appended_when_configured_and_opted_in() {
+        let (dir, db) = test_db();
+        let cli = Cli::new("test-cli");
+        let capture = dir.path().join("argv.txt");
+        let script = write_member_script(
+            dir.path(),
+            "capture-argv.sh",
+            &format!("printf '%s' \"$*\" > \"{}\"\nexit 0", capture.display()),
+        );
+        let mut strategy = sample_strategy(&script);
+        strategy.trust_flag = Some("--trust".to_string());
+        let mut node = sample_agent_node();
+        node.config = serde_json::json!({"trust_workdir": true});
+
+        run_agent_process(
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+        )
+        .await
+        .unwrap();
+
+        let captured_argv = std::fs::read_to_string(&capture).unwrap();
+        assert!(
+            captured_argv.contains("--trust"),
+            "trust flag must be in argv: {captured_argv}"
+        );
+    }
+
+    /// A harness with no `trust_flag` registered must never receive one,
+    /// even when a node opts in — there is nothing to pass, and the opt-in
+    /// must be a no-op rather than an error.
+    #[tokio::test]
+    async fn run_agent_process_trust_flag_absent_when_not_configured() {
+        let (dir, db) = test_db();
+        let cli = Cli::new("test-cli");
+        let capture = dir.path().join("argv.txt");
+        let script = write_member_script(
+            dir.path(),
+            "capture-argv.sh",
+            &format!("printf '%s' \"$*\" > \"{}\"\nexit 0", capture.display()),
+        );
+        let strategy = sample_strategy(&script); // trust_flag: None
+        let mut node = sample_agent_node();
+        node.config = serde_json::json!({"trust_workdir": true});
+
+        run_agent_process(
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+        )
+        .await
+        .unwrap();
+
+        let captured_argv = std::fs::read_to_string(&capture).unwrap();
+        assert!(
+            !captured_argv.contains("--trust"),
+            "no trust flag is registered, so none must be passed: {captured_argv}"
+        );
+    }
+
+    /// Trusting a directory is opt-in per node, never a default — a harness
+    /// configured with a trust flag must NOT receive it unless the node's
+    /// own config asks for it.
+    #[tokio::test]
+    async fn run_agent_process_trust_flag_absent_when_configured_but_not_opted_in() {
+        let (dir, db) = test_db();
+        let cli = Cli::new("test-cli");
+        let capture = dir.path().join("argv.txt");
+        let script = write_member_script(
+            dir.path(),
+            "capture-argv.sh",
+            &format!("printf '%s' \"$*\" > \"{}\"\nexit 0", capture.display()),
+        );
+        let mut strategy = sample_strategy(&script);
+        strategy.trust_flag = Some("--trust".to_string());
+        let node = sample_agent_node(); // config: {} — no trust_workdir opt-in
+
+        run_agent_process(
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+        )
+        .await
+        .unwrap();
+
+        let captured_argv = std::fs::read_to_string(&capture).unwrap();
+        assert!(
+            !captured_argv.contains("--trust"),
+            "must never pass a trust flag by default without the node's opt-in: {captured_argv}"
         );
     }
 
