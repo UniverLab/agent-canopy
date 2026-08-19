@@ -1976,6 +1976,7 @@ mod tests {
             started_at: Some(started_at),
             completed_at: Some(started_at),
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,

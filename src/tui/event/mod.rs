@@ -1541,6 +1541,7 @@ mod project_panel_mouse_tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,

@@ -712,6 +712,20 @@ pub struct LoopSpec {
     /// isn't a git repo or the spec hasn't started yet.
     #[serde(default)]
     pub spec_start_head: Option<String>,
+    /// The workdir's git HEAD immediately after a `commit_rights: true`
+    /// node's own execution actually moved it during this attempt (C15).
+    /// Unlike `spec_start_head` — which only proves *some* commit landed
+    /// since the spec began, and is satisfied just as well by a concurrent
+    /// commit from outside this run sharing the same worktree — this is set
+    /// only when a node the graph explicitly trusts to commit is the one
+    /// whose execution moved HEAD, so `check` nodes can verify "did *this
+    /// run's own committer* land a commit" via `{{spec_committed_head}}`.
+    /// `None` until such a node commits; overwritten (not accumulated) each
+    /// time one does, so it always reflects the latest commit this attempt
+    /// itself produced. Requires the graph to name a committer
+    /// (`commit_rights: true`) — a graph that never does never populates it.
+    #[serde(default)]
+    pub spec_committed_head: Option<String>,
     /// Optional workdir tag for backlog filtering only (`spec_list`). It does
     /// not drive execution — the run that eventually assigns this spec to a
     /// loop decides the actual workdir.

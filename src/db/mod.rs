@@ -370,7 +370,8 @@ impl Database {
                 workdir TEXT,
                 completed_via TEXT,
                 completed_via_reason TEXT,
-                completed_via_at INTEGER
+                completed_via_at INTEGER,
+                spec_committed_head TEXT
             );
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_loop_specs_position
@@ -1108,6 +1109,29 @@ impl Database {
         if !has_paused_by_reconciliation {
             conn.execute(
                 "ALTER TABLE loops ADD COLUMN paused_by_reconciliation INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // `spec_committed_head` (C15): the workdir's git HEAD immediately
+        // after a `commit_rights: true` node's own execution actually moved
+        // it — as opposed to `spec_start_head`, which only proves *some*
+        // commit landed since the spec began and is satisfied just as well
+        // by a concurrent commit from outside this run sharing the same
+        // worktree. `NULL` on every pre-existing row (no historical spec's
+        // committing node was ever tracked this way) and on any row where
+        // the graph never named a committer. Additive.
+        let has_spec_committed_head: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loop_specs') WHERE name = 'spec_committed_head'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_spec_committed_head {
+            conn.execute(
+                "ALTER TABLE loop_specs ADD COLUMN spec_committed_head TEXT",
                 [],
             )
             .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;

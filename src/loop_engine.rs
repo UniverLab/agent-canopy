@@ -927,6 +927,27 @@ impl LoopEngine {
             head
         };
 
+        // C15: `spec_committed_head` follows the exact same same-attempt-vs-
+        // fresh-attempt rule as `spec_start_head` above — a genuine resume of
+        // this same in-flight attempt keeps whatever this attempt already
+        // recorded (a commit the committer made before a daemon restart must
+        // still count), while every other case (including a spec stuck
+        // `running` from an abandoned prior attempt) starts fresh so a stale
+        // committed-head from an unrelated earlier attempt can never pass a
+        // check for an attempt that hasn't committed anything itself yet.
+        //
+        // Unlike `spec_start_head`, this is *not* frozen for the whole
+        // attempt: it is updated in place (both here and in the DB, kept in
+        // sync) every time a `commit_rights: true` node's own execution
+        // moves HEAD, so a check node placed anywhere after the committer
+        // sees the latest value.
+        let mut spec_committed_head = if is_resume && spec.status == LoopSpecStatus::Running {
+            spec_details.spec.spec_committed_head.clone()
+        } else {
+            self.db.set_loop_spec_committed_head(&spec.id, None)?;
+            None
+        };
+
         self.db.update_loop_spec_status(
             &spec.id,
             LoopSpecStatus::Running,
@@ -1105,6 +1126,18 @@ impl LoopEngine {
                     )
                     .await;
 
+                    // C15: mirror of the watch above, but for the node the
+                    // graph actually trusts to commit rather than every node
+                    // that must not. Captured only when this node carries
+                    // `commit_rights: true` — otherwise there is nothing to
+                    // attribute a HEAD move to, so `spec_committed_head`
+                    // stays whatever it already was.
+                    let committer_head_before = if node_has_commit_rights(node) {
+                        capture_workdir_head(workdir).await
+                    } else {
+                        None
+                    };
+
                     let (final_execution, run) = loop {
                         let execution = self
                             .execute_node(
@@ -1113,6 +1146,7 @@ impl LoopEngine {
                                 node,
                                 previous_output.as_ref(),
                                 spec_start_head.as_deref(),
+                                spec_committed_head.as_deref(),
                                 &run_id,
                                 workdir,
                                 resume_candidate.as_deref(),
@@ -1251,6 +1285,26 @@ impl LoopEngine {
                         },
                         None => final_execution,
                     };
+
+                    // C15: if this node carries commit rights and its own
+                    // execution moved HEAD, that new HEAD is evidence this
+                    // *run* itself committed — record it regardless of the
+                    // node's own pass/fail verdict (an infra crash right
+                    // after a successful commit still leaves the commit
+                    // behind, and it must still count). Persisted eagerly so
+                    // a daemon restart before the next node dispatches never
+                    // loses it, and kept in sync with the in-memory value
+                    // handed to every check node from here on in this
+                    // dispatch.
+                    if let Some(head_before) = committer_head_before.as_deref() {
+                        if let Some(head_after) = capture_workdir_head(workdir).await {
+                            if head_after != head_before {
+                                self.db
+                                    .set_loop_spec_committed_head(&spec.id, Some(&head_after))?;
+                                spec_committed_head = Some(head_after);
+                            }
+                        }
+                    }
 
                     if self.is_paused(&lp.id)? {
                         return Ok(SpecExecutionOutcome::Paused);
@@ -1779,7 +1833,6 @@ impl LoopEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     async fn execute_node(
         &self,
         lp: &crate::domain::loops::Loop,
@@ -1787,6 +1840,7 @@ impl LoopEngine {
         node: &LoopNode,
         previous_output: Option<&Value>,
         spec_start_head: Option<&str>,
+        spec_committed_head: Option<&str>,
         run_id: &str,
         workdir: &str,
         resume_session_id: Option<&str>,
@@ -1794,7 +1848,17 @@ impl LoopEngine {
     ) -> Result<NodeExecution> {
         match node.kind {
             LoopNodeKind::Check => {
-                execute_check_node(&self.db, run_id, lp, spec, node, spec_start_head, workdir).await
+                execute_check_node(
+                    &self.db,
+                    run_id,
+                    lp,
+                    spec,
+                    node,
+                    spec_start_head,
+                    spec_committed_head,
+                    workdir,
+                )
+                .await
             }
             LoopNodeKind::Gate => execute_gate_node(node, previous_output),
             LoopNodeKind::Agent => {
@@ -2153,6 +2217,7 @@ async fn begin_infra_retry(
     Ok(run_id)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_check_node(
     db: &Database,
     run_id: &str,
@@ -2160,6 +2225,7 @@ async fn execute_check_node(
     spec: &LoopSpec,
     node: &LoopNode,
     spec_start_head: Option<&str>,
+    spec_committed_head: Option<&str>,
     workdir: &str,
 ) -> Result<NodeExecution> {
     let raw_command = node
@@ -2169,7 +2235,9 @@ async fn execute_check_node(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("Check node '{}' is missing a command.", node.name))?;
-    let command = raw_command.replace("{{spec_start_head}}", spec_start_head.unwrap_or(""));
+    let command = raw_command
+        .replace("{{spec_start_head}}", spec_start_head.unwrap_or(""))
+        .replace("{{spec_committed_head}}", spec_committed_head.unwrap_or(""));
     let success_condition = node
         .config
         .get("success_condition")
@@ -4219,6 +4287,7 @@ fn no_spec_placeholder(loop_id: &str) -> LoopSpec {
         started_at: None,
         completed_at: None,
         spec_start_head: None,
+        spec_committed_head: None,
         workdir: None,
         completed_via: None,
         completed_via_reason: None,
@@ -4340,6 +4409,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -4530,6 +4600,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -5166,6 +5237,332 @@ mod tests {
         assert_eq!(check_run.status, LoopRunStatus::Pass);
     }
 
+    // ── C15: spec_committed_head — tied to *this run's* committer, not to
+    // "any commit since spec_start_head" ──────────────────────────────────
+
+    /// The canonical stronger check template: clean tree, *and* this run's
+    /// own committer actually produced a commit, *and* HEAD still is that
+    /// exact commit (nothing landed on top of it unaccounted for).
+    const COMMITTED_CHECK_CMD: &str = "test -z \"$(git status --porcelain -- src/)\" \
+         && test -n \"{{spec_committed_head}}\" \
+         && test \"$(git rev-parse HEAD)\" = \"{{spec_committed_head}}\"";
+
+    #[tokio::test]
+    async fn loop_engine_committed_check_passes_when_this_runs_committer_commits() {
+        // Test 1 (spec TESTS REQUIRED): a spec that commits — the check
+        // passes.
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        init_git_repo(dir.path());
+
+        db.insert_loop_node(&rights_node(
+            &spec_id,
+            "committer",
+            COMMIT_CMD,
+            Some(true),
+            1,
+        ))
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": COMMITTED_CHECK_CMD,
+                "success_condition": "exit_code_0"
+            }),
+            position: 2,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "e-committer-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "committer".to_string(),
+            to_node: "node-check".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Always,
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(spec.status, LoopSpecStatus::Completed);
+        assert_eq!(
+            spec.spec_committed_head.as_deref(),
+            Some(git_head(dir.path()).as_str()),
+            "the committer's own resulting HEAD must be recorded"
+        );
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        let check_run = runs.iter().find(|r| r.node_id == "node-check").unwrap();
+        assert_eq!(check_run.status, LoopRunStatus::Pass);
+    }
+
+    #[tokio::test]
+    async fn loop_engine_committed_check_fails_when_nothing_committed_and_tree_clean() {
+        // Test 2 (spec TESTS REQUIRED): a spec that commits nothing, clean
+        // tree — the check fails.
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        init_git_repo(dir.path());
+
+        // Carries commit rights but never actually commits — the exact
+        // shape of the bug this gate exists to catch: an approval with no
+        // commit behind it.
+        db.insert_loop_node(&rights_node(&spec_id, "committer", "true", Some(true), 1))
+            .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": COMMITTED_CHECK_CMD,
+                "success_condition": "exit_code_0"
+            }),
+            position: 2,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "e-committer-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "committer".to_string(),
+            to_node: "node-check".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Always,
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(
+            spec.spec_committed_head, None,
+            "no commit landed, so there is nothing to record"
+        );
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        let check_run = runs.iter().find(|r| r.node_id == "node-check").unwrap();
+        assert_eq!(check_run.status, LoopRunStatus::Fail);
+    }
+
+    #[tokio::test]
+    async fn loop_engine_regression_concurrent_commit_from_outside_this_run_fails_committed_check()
+    {
+        // Test 3 (spec TESTS REQUIRED) — the regression test for the
+        // concurrent-worktree case: a commit made by something other than
+        // this spec's run, with the spec having committed nothing, must
+        // fail. This is the 2026-08-19 incident shape: a human (or another
+        // agent) commits into the same worktree while a loop is running on
+        // it. The superseded `HEAD != spec_start_head` comparison is
+        // satisfied by exactly this, which is the bug this test guards
+        // against.
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        init_git_repo(dir.path());
+        let baseline = git_head(dir.path());
+
+        // Simulate a spec already mid-attempt with its baseline already
+        // captured and persisted — same setup the B10 resume tests use, so
+        // a genuine resume (daemon restart mid-run) reuses it rather than
+        // recapturing.
+        db.update_loop_spec_status(&spec_id, LoopSpecStatus::Running, None, None)
+            .unwrap();
+        db.set_loop_spec_start_head(&spec_id, Some(&baseline))
+            .unwrap();
+
+        // The concurrent-worktree case itself: something other than this
+        // run's own committer lands a commit while the spec is in flight.
+        std::fs::write(dir.path().join("unrelated.txt"), "external change").unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Someone Else",
+                "-c",
+                "user.email=someone@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "concurrent, unrelated commit"
+            ])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        let concurrent_head = git_head(dir.path());
+        assert_ne!(
+            concurrent_head, baseline,
+            "the concurrent commit must actually have moved HEAD for this test to mean anything"
+        );
+
+        // This spec's own graph never commits anything — just the check.
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": COMMITTED_CHECK_CMD,
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        // A resumed dispatch — same path a daemon restart mid-run takes.
+        engine
+            .run_loop_dispatch(loop_id.clone(), None, None, true)
+            .await
+            .unwrap();
+
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(
+            spec.spec_committed_head, None,
+            "no node this run trusts to commit ever ran, so `spec_committed_head` \
+             must stay unset even though HEAD moved"
+        );
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        let check_run = runs.iter().find(|r| r.node_id == "node-check").unwrap();
+        assert_eq!(
+            check_run.status,
+            LoopRunStatus::Fail,
+            "the superseded `HEAD != spec_start_head` comparison alone would have passed \
+             here (HEAD moved to the concurrent commit) — the strengthened check must not"
+        );
+
+        // Proof this is a real regression test, not a vacuous one: the old
+        // comparison really would have been satisfied.
+        assert_ne!(git_head(dir.path()), baseline);
+    }
+
+    #[tokio::test]
+    async fn loop_engine_spec_committed_head_scoped_per_spec_not_shared() {
+        // Test 4 (spec TESTS REQUIRED): the marker's value is scoped to the
+        // run — two specs in one loop do not share it. A loop with two bound
+        // specs runs both, in position order, within one `run_loop` call.
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        init_git_repo(dir.path());
+
+        db.insert_loop_node(&rights_node(
+            &spec_id,
+            "committer",
+            COMMIT_CMD,
+            Some(true),
+            1,
+        ))
+        .unwrap();
+
+        // A second spec in the same loop, with its own committer that also
+        // commits.
+        let spec_b = crate::domain::loops::LoopSpec {
+            id: "spec-b".to_string(),
+            loop_id: Some(loop_id.clone()),
+            name: "Spec B".to_string(),
+            description: Some("second spec".to_string()),
+            position: 2,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+            spec_committed_head: None,
+        };
+        db.insert_loop_spec(&spec_b).unwrap();
+        db.insert_loop_node(&rights_node(
+            &spec_b.id,
+            "committer-b",
+            COMMIT_CMD,
+            Some(true),
+            1,
+        ))
+        .unwrap();
+
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+
+        let spec_a_after = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        let spec_b_after = db.get_loop_spec(&spec_b.id).unwrap().unwrap();
+        assert_eq!(spec_a_after.status, LoopSpecStatus::Completed);
+        assert_eq!(spec_b_after.status, LoopSpecStatus::Completed);
+        assert!(
+            spec_a_after.spec_committed_head.is_some(),
+            "spec A must have recorded its own commit"
+        );
+        assert!(
+            spec_b_after.spec_committed_head.is_some(),
+            "spec B must have recorded its own commit"
+        );
+        assert_ne!(
+            spec_b_after.spec_committed_head, spec_a_after.spec_committed_head,
+            "each spec must record its own commit, not share the other's"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_engine_restart_mid_run_does_not_turn_committed_check_fail_into_pass() {
+        // Test 5 (spec TESTS REQUIRED): if a restart path is reachable in a
+        // test, a restart mid-run does not turn a fail into a pass. Mirrors
+        // B10's `loop_engine_resume_dispatch_reuses_persisted_spec_start_head_even_if_stale`:
+        // a spec left `running` (as a daemon restart would leave it) with no
+        // `spec_committed_head` recorded yet must resume still lacking one —
+        // a resume must never manufacture evidence of a commit that never
+        // happened.
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        init_git_repo(dir.path());
+        let baseline = git_head(dir.path());
+
+        db.update_loop_spec_status(&spec_id, LoopSpecStatus::Running, None, None)
+            .unwrap();
+        db.set_loop_spec_start_head(&spec_id, Some(&baseline))
+            .unwrap();
+        // Deliberately left unset, as an interrupted attempt that hadn't
+        // committed yet would leave it.
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": COMMITTED_CHECK_CMD,
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        engine
+            .run_loop_dispatch(loop_id.clone(), None, None, true)
+            .await
+            .unwrap();
+
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(spec.spec_committed_head, None);
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        let check_run = runs.iter().find(|r| r.node_id == "node-check").unwrap();
+        assert_eq!(
+            check_run.status,
+            LoopRunStatus::Fail,
+            "resuming an attempt that never committed must never read as a pass"
+        );
+    }
+
     #[tokio::test]
     async fn loop_engine_completes_check_and_gate_spec() {
         let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
@@ -5260,6 +5657,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -5319,6 +5717,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -5382,6 +5781,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -5463,6 +5863,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -5533,6 +5934,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -5715,6 +6117,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -5998,6 +6401,7 @@ mod tests {
                 &lp,
                 &spec,
                 &node,
+                None,
                 None,
                 None,
                 "run-pin",
@@ -8026,6 +8430,7 @@ echo done
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -8342,6 +8747,7 @@ echo done
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -9082,6 +9488,7 @@ echo done
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -13421,6 +13828,7 @@ echo done
             completed_via: None,
             completed_via_reason: None,
             completed_via_at: None,
+            spec_committed_head: None,
         };
         let node_a = LoopNode {
             id: "node-graph-a".to_string(),
@@ -13492,6 +13900,7 @@ echo done
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -13632,6 +14041,7 @@ echo done
             started_at: Some(chrono::Utc::now()),
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -13702,6 +14112,7 @@ echo done
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,

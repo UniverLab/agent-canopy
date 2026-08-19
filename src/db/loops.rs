@@ -471,7 +471,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let rows = conn.execute(
-            "UPDATE loop_specs SET status = ?1, started_at = NULL, completed_at = NULL, spec_start_head = NULL WHERE id = ?2",
+            "UPDATE loop_specs SET status = ?1, started_at = NULL, completed_at = NULL, spec_start_head = NULL, spec_committed_head = NULL WHERE id = ?2",
             params![LoopSpecStatus::Pending.as_str(), spec_id],
         )?;
         Ok(rows > 0)
@@ -626,8 +626,8 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         conn.execute(
-            "INSERT INTO loop_specs (id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head, workdir)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO loop_specs (id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head, workdir, spec_committed_head)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 &spec.id,
                 &spec.loop_id,
@@ -640,6 +640,7 @@ impl Database {
                 spec.completed_at.map(|value| value.timestamp()),
                 &spec.spec_start_head,
                 &spec.workdir,
+                &spec.spec_committed_head,
             ],
         )?;
         Ok(())
@@ -651,7 +652,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head, workdir, completed_via, completed_via_reason, completed_via_at
+            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head, workdir, completed_via, completed_via_reason, completed_via_at, spec_committed_head
              FROM loop_specs WHERE loop_id = ?1 ORDER BY position ASC",
         )?;
         let rows = stmt.query_map(params![loop_id], map_loop_spec_row)?;
@@ -666,7 +667,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head, workdir, completed_via, completed_via_reason, completed_via_at
+            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head, workdir, completed_via, completed_via_reason, completed_via_at, spec_committed_head
              FROM loop_specs WHERE id = ?1",
         )?;
 
@@ -703,7 +704,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head, workdir, completed_via, completed_via_reason, completed_via_at
+            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head, workdir, completed_via, completed_via_reason, completed_via_at, spec_committed_head
              FROM loop_specs
              WHERE (?1 IS NULL OR workdir = ?1)
                AND (?2 IS NULL OR status = ?2)
@@ -774,6 +775,29 @@ impl Database {
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let rows = conn.execute(
             "UPDATE loop_specs SET spec_start_head = ?1 WHERE id = ?2",
+            params![head, spec_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Record the workdir's git HEAD immediately after a `commit_rights:
+    /// true` node's own execution actually moved it (C15) — see
+    /// [`crate::loop_engine`]'s `{{spec_committed_head}}` placeholder.
+    /// Unlike `spec_start_head`, which is captured once and answers "has
+    /// anything been committed since this spec began", this answers "did
+    /// *this run's own committer* land a commit" — the distinction a
+    /// concurrent commit from outside this run (another agent, a human
+    /// sharing the worktree) would otherwise slip past. Overwritten every
+    /// time the committer node visits and moves HEAD again (e.g. a
+    /// review/retry cycle that re-commits), so it always reflects the
+    /// latest commit this run itself produced.
+    pub fn set_loop_spec_committed_head(&self, spec_id: &str, head: Option<&str>) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE loop_specs SET spec_committed_head = ?1 WHERE id = ?2",
             params![head, spec_id],
         )?;
         Ok(rows > 0)
@@ -1625,14 +1649,18 @@ impl Database {
                 // reset to `Pending`) is what used to be the stash's job —
                 // it's what tells the next pickup's rendered prompt to say
                 // "a previous attempt exists, continue it" instead of
-                // silently starting fresh. `spec_start_head` is still
-                // cleared: the next attempt captures its own fresh baseline
-                // (`run_spec` only reuses a persisted baseline for a
-                // same-attempt resume of a `Running` spec, which an
-                // `Interrupted` pickup is not).
+                // silently starting fresh. `spec_start_head` and
+                // `spec_committed_head` (C15) are still cleared: the next
+                // attempt captures its own fresh baseline and starts with no
+                // committed-head evidence of its own (`run_spec` only reuses
+                // a persisted baseline for a same-attempt resume of a
+                // `Running` spec, which an `Interrupted` pickup is not) — a
+                // restart must never let a *stale* `spec_committed_head` from
+                // the interrupted attempt pass a check for an attempt that
+                // hasn't committed anything itself yet.
                 tx.execute(
                     "UPDATE loop_specs
-                     SET status = ?1, started_at = NULL, completed_at = NULL, spec_start_head = NULL
+                     SET status = ?1, started_at = NULL, completed_at = NULL, spec_start_head = NULL, spec_committed_head = NULL
                      WHERE id = ?2",
                     params![LoopSpecStatus::Interrupted.as_str(), run.spec_id],
                 )?;
@@ -1776,7 +1804,7 @@ impl Database {
                 tx.execute(
                     "UPDATE loop_specs
                      SET status = ?1, started_at = NULL, completed_at = NULL,
-                         spec_start_head = NULL
+                         spec_start_head = NULL, spec_committed_head = NULL
                      WHERE id = ?2",
                     params![new_status.as_str(), spec_id],
                 )?;
@@ -1935,6 +1963,7 @@ fn map_loop_spec_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoopSpec> {
             .get::<_, Option<i64>>(13)?
             .map(from_timestamp)
             .transpose()?,
+        spec_committed_head: row.get(14)?,
     })
 }
 
@@ -2453,6 +2482,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
