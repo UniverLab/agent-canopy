@@ -50,7 +50,7 @@ fn draw_ctx_preview(frame: &mut Frame, app: &App, theme: &Theme) {
         .title(format!(" Context Transfer — from: {src_id} "))
         .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(accent))
-        .style(Style::default().bg(Color::Rgb(15, 25, 15)));
+        .style(Style::default().bg(theme.dialog_bg));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -134,7 +134,7 @@ fn draw_ctx_picker(frame: &mut Frame, app: &App, theme: &Theme) {
         .title(" Select Destination Agent ")
         .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(src_accent))
-        .style(Style::default().bg(Color::Rgb(15, 25, 15)));
+        .style(Style::default().bg(theme.dialog_bg));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -178,7 +178,7 @@ fn draw_ctx_picker(frame: &mut Frame, app: &App, theme: &Theme) {
             let bg = if is_sel {
                 theme.selected_bg
             } else {
-                Color::Rgb(15, 25, 15)
+                theme.dialog_bg
             };
 
             let cursor = if is_sel { "›" } else { " " };

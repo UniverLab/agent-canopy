@@ -102,7 +102,7 @@ pub fn draw_new_agent_dialog(frame: &mut Frame, app: &App, theme: &Theme) {
         .title(dialog_title(dialog))
         .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(accent))
-        .style(Style::default().bg(Color::Rgb(15, 25, 15)));
+        .style(Style::default().bg(theme.dialog_bg));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);

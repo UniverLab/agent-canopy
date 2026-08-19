@@ -34,7 +34,7 @@ pub(crate) fn draw_section_picker_modal(
                 .title(title)
                 .borders(crate::tui::ui::borders_for(theme))
                 .border_style(Style::default().fg(accent))
-                .style(Style::default().bg(Color::Rgb(15, 25, 15)));
+                .style(Style::default().bg(theme.dialog_bg));
 
             let inner = block.inner(area);
             frame.render_widget(block, area);
@@ -86,7 +86,7 @@ pub(crate) fn draw_section_picker_modal(
                 .title(title)
                 .borders(crate::tui::ui::borders_for(theme))
                 .border_style(Style::default().fg(accent))
-                .style(Style::default().bg(Color::Rgb(15, 25, 15)));
+                .style(Style::default().bg(theme.dialog_bg));
 
             let inner = block.inner(area);
             frame.render_widget(block, area);
@@ -141,7 +141,7 @@ pub(crate) fn draw_section_picker_modal(
                 .title(title)
                 .borders(crate::tui::ui::borders_for(theme))
                 .border_style(Style::default().fg(accent))
-                .style(Style::default().bg(Color::Rgb(15, 25, 15)));
+                .style(Style::default().bg(theme.dialog_bg));
 
             let inner = block.inner(area);
             frame.render_widget(block, area);

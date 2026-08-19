@@ -29,7 +29,7 @@ pub fn draw_loop_autorun_dialog(frame: &mut Frame, app: &App, theme: &Theme) {
         .title(title)
         .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(theme.header_color))
-        .style(Style::default().bg(Color::Rgb(15, 25, 15)));
+        .style(Style::default().bg(theme.dialog_bg));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -94,7 +94,7 @@ pub fn draw_loop_action_message(frame: &mut Frame, app: &App, theme: &Theme) {
         .title(title)
         .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(color))
-        .style(Style::default().bg(Color::Rgb(15, 25, 15)));
+        .style(Style::default().bg(theme.dialog_bg));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 

@@ -229,7 +229,7 @@ fn render_brain_or_graph(frame: &mut Frame, area: Rect, app: &App, theme: &Theme
             Style::default().fg(theme.dim_text),
             Style::default().fg(theme.dim_text),
             theme,
-            |frame, inner| draw_project_graph(frame, inner, app),
+            |frame, inner| draw_project_graph(frame, inner, app, theme),
         );
         return;
     }
@@ -494,7 +494,7 @@ fn draw_live_body(
             " terminal ",
             terminal_indices,
             app,
-            Color::Green,
+            theme.success,
             border_style,
             theme,
         );
@@ -692,7 +692,7 @@ fn draw_projects_list(frame: &mut Frame, area: Rect, app: &mut App, theme: &Them
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "No registered projects",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.muted_text),
             ))),
             area,
         );
@@ -810,7 +810,7 @@ fn loop_status_icon(lp: &Loop, meta: &LoopSidebarMeta, theme: &Theme) -> (&'stat
     match lp.status {
         LoopStatus::Running => ("▶", STATUS_RUNNING),
         LoopStatus::Paused if meta.blocked => ("⛔", STATUS_FAIL),
-        LoopStatus::Paused => ("⏸", Color::Yellow),
+        LoopStatus::Paused => ("⏸", theme.warning),
         LoopStatus::Draft => ("○", theme.dim_text),
         LoopStatus::Completed => ("✓", STATUS_OK),
         LoopStatus::Failed => ("✗", STATUS_FAIL),
@@ -881,7 +881,7 @@ fn draw_automation_loops_list(frame: &mut Frame, area: Rect, app: &mut App, them
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "No loops",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.muted_text),
             ))),
             area,
         );
@@ -934,13 +934,13 @@ fn draw_automation_loops_list(frame: &mut Frame, area: Rect, app: &mut App, them
 fn project_title_style(selected: bool, panel_focused: bool, theme: &Theme) -> Style {
     if selected && panel_focused {
         return Style::default()
-            .fg(Color::Black)
+            .fg(theme.accent_fg)
             .bg(theme.header_color)
             .add_modifier(Modifier::BOLD);
     }
     if selected {
         return Style::default()
-            .fg(Color::White)
+            .fg(theme.text_primary)
             .bg(theme.selected_bg)
             .add_modifier(Modifier::BOLD);
     }
@@ -951,7 +951,9 @@ fn project_title_style(selected: bool, panel_focused: bool, theme: &Theme) -> St
 
 fn project_meta_style(selected: bool, theme: &Theme) -> Style {
     if selected {
-        Style::default().fg(Color::White).bg(theme.selected_bg)
+        Style::default()
+            .fg(theme.text_primary)
+            .bg(theme.selected_bg)
     } else {
         Style::default().fg(theme.dim_text)
     }
@@ -972,7 +974,7 @@ fn draw_rag_queue(
             break;
         }
         let (icon, icon_color) = if item.status == "processing" {
-            ("◉", Color::Yellow)
+            ("◉", theme.warning)
         } else {
             ("·", theme.header_color)
         };
@@ -985,7 +987,7 @@ fn draw_rag_queue(
                 Span::raw(" "),
                 Span::styled(
                     truncate_str(&item.source_path, area.width.saturating_sub(3) as usize),
-                    Style::default().fg(Color::White),
+                    Style::default().fg(theme.text_primary),
                 ),
             ])),
             Rect::new(area.x, y, area.width, 1),
@@ -1049,7 +1051,7 @@ fn labeled_kv_line(label: &'static str, value: &str, theme: &Theme) -> Line<'sta
         Span::styled(
             value.to_string(),
             Style::default()
-                .fg(Color::White)
+                .fg(theme.text_primary)
                 .add_modifier(Modifier::BOLD),
         ),
     ])
@@ -1067,27 +1069,27 @@ fn rag_status_line(app: &App, theme: &Theme) -> Line<'static> {
     ) {
         RagModelStatus::Unavailable(_) => Line::from(Span::styled(
             " ✗ unavailable ",
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme.error),
         )),
         RagModelStatus::DownloadFailed(_) => Line::from(Span::styled(
             " ✗ download failed ",
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme.error),
         )),
         RagModelStatus::Downloading { .. } => Line::from(Span::styled(
             " ⬇ downloading ",
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme.warning),
         )),
         RagModelStatus::Preparing { .. } => Line::from(Span::styled(
             " ⚙ preparing ",
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme.warning),
         )),
         RagModelStatus::Paused => Line::from(Span::styled(
             " ⏸ paused ",
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme.warning),
         )),
         RagModelStatus::Ready if app.rag_info.processing_items > 0 => Line::from(Span::styled(
             " ◉ indexing ",
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme.warning),
         )),
         RagModelStatus::Ready => Line::from(Span::styled(
             " ● ready ",
@@ -1225,7 +1227,11 @@ fn draw_sidebar_card(
         name,
         Style::default()
             .add_modifier(Modifier::BOLD)
-            .fg(if selected { meta.accent } else { Color::White }),
+            .fg(if selected {
+                meta.accent
+            } else {
+                theme.text_primary
+            }),
     )];
     if is_agent_in_group(name, app) {
         name_spans.push(Span::styled(" [▣]", Style::default().fg(theme.dim_text)));
@@ -1322,7 +1328,7 @@ fn agent_card_meta<'a>(agent: &'a AgentEntry, app: &'a App, theme: &Theme) -> Ag
         AgentEntry::Orphaned(index) => {
             let session = &app.orphaned_sessions[*index];
             AgentCardMeta {
-                accent: ratatui::style::Color::DarkGray,
+                accent: theme.muted_text,
                 status_color: STATUS_FAIL,
                 agent_type: "orphan",
                 type_detail: session.cli.as_str(),
@@ -1337,7 +1343,7 @@ fn agent_card_meta<'a>(agent: &'a AgentEntry, app: &'a App, theme: &Theme) -> Ag
             work_dir: None,
         },
         AgentEntry::Corrupt(_) => AgentCardMeta {
-            accent: ratatui::style::Color::Red,
+            accent: theme.error,
             status_color: STATUS_FAIL,
             agent_type: "corrupt config",
             type_detail: "",
@@ -1496,9 +1502,9 @@ fn group_row_style(is_selected: bool, is_active: bool, theme: &Theme) -> GroupRo
         fg: if is_selected {
             theme.header_color
         } else if is_active {
-            Color::Green
+            theme.success
         } else {
-            Color::White
+            theme.text_primary
         },
         modifier: if is_active || is_selected {
             Modifier::BOLD
@@ -1506,7 +1512,7 @@ fn group_row_style(is_selected: bool, is_active: bool, theme: &Theme) -> GroupRo
             Modifier::empty()
         },
         prefix_color: if is_active {
-            Color::Green
+            theme.success
         } else {
             theme.dim_text
         },
@@ -1562,7 +1568,7 @@ fn draw_groups_list(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme)
 
 // ── Project Graph ────────────────────────────────────────────────
 
-fn draw_project_graph(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_project_graph(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     if app.project_graph_trees.is_empty() || app.project_graph_edges.is_empty() {
         let msg = if app.projects.len() <= 1 {
             "No relationships yet. Press Enter on a project to link."
@@ -1572,7 +1578,7 @@ fn draw_project_graph(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 msg,
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.muted_text),
             ))),
             area,
         );
@@ -1603,6 +1609,7 @@ fn draw_project_graph(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 truncate_str(&label, area.width.saturating_sub(2) as usize),
+                // THEME-EXEMPT: single-use graph-edge cyan — not a recurring role.
                 Style::default().fg(Color::Cyan),
             ))),
             Rect::new(area.x, y, area.width, 1),
@@ -1658,7 +1665,7 @@ fn draw_project_relation_dialog(
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 truncate_str(error, inner.width as usize),
-                Style::default().fg(Color::Red),
+                Style::default().fg(theme.error),
             ))),
             Rect::new(inner.x, inner.y + 1, inner.width, 1),
         );
@@ -1673,7 +1680,7 @@ fn draw_project_relation_dialog(
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             format!("{}|", filter_label),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme.warning),
         ))),
         Rect::new(inner.x, inner.y + 2, inner.width, 1),
     );
@@ -1699,10 +1706,10 @@ fn draw_project_relation_dialog(
         );
         let style = if i as usize == dialog.selected_idx {
             Style::default()
-                .fg(Color::White)
+                .fg(theme.text_primary)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.muted_text)
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(name, style))),
@@ -1714,7 +1721,7 @@ fn draw_project_relation_dialog(
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "No other projects indexed.",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.muted_text),
             ))),
             Rect::new(inner.x, list_start_y, inner.width, 1),
         );
