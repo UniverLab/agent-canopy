@@ -91,6 +91,19 @@ pub struct NewAgentDialog {
     pub session_picker_idx: usize,
     /// The session the user confirmed, if any.
     pub selected_session: Option<(String, String)>,
+    // ── Canopy-native session-resume picker (C12) ──
+    // Distinct from the session picker above: that one lists a single
+    // already-chosen CLI's own sessions via `session_list_cmd`. This one
+    // lists canopy's own resumable sessions across harnesses, and the
+    // harness follows from whichever one is picked.
+    /// Open when `NewTaskMode::Resume` was chosen with more than one
+    /// resumable session.
+    pub session_resume_picker: Option<crate::tui::app::session_resume::SessionResumePicker>,
+    /// The canopy session resolved via the picker, or set directly when
+    /// exactly one resumable session existed. Its `cli` is the harness.
+    pub selected_resume_session: Option<crate::tui::app::session_resume::ResumableSession>,
+    /// Set when `Resume` was chosen but no resumable sessions exist.
+    pub resume_sessions_empty: bool,
     /// Whether to launch the agent in yolo (autonomous) mode.
     pub yolo_mode: bool,
     /// Index into `seed_options` for the selected seed identity.
@@ -160,6 +173,9 @@ impl NewAgentDialog {
             session_entries: Vec::new(),
             session_picker_idx: 0,
             selected_session: None,
+            session_resume_picker: None,
+            selected_resume_session: None,
+            resume_sessions_empty: false,
             yolo_mode: false,
             seed_index: 0,
             seed_options,
@@ -411,6 +427,31 @@ impl NewAgentDialog {
         if self.selected_yolo_flag().is_none() {
             self.yolo_mode = false;
         }
+    }
+
+    /// Apply a session chosen via the canopy-native resume picker (or the
+    /// sole candidate when there was only one): its harness becomes the
+    /// dialog's CLI, without the user picking the CLI separately.
+    pub fn apply_resume_choice(
+        &mut self,
+        session: crate::tui::app::session_resume::ResumableSession,
+    ) {
+        if let Some(idx) = self
+            .available_clis
+            .iter()
+            .position(|cli| cli.as_str() == session.cli)
+        {
+            self.set_cli_index(idx);
+        }
+        self.selected_resume_session = Some(session);
+    }
+
+    /// Clear all canopy-native resume-picker state (mode toggled away from
+    /// `Resume`, or the picker cancelled).
+    pub fn reset_resume_choice(&mut self) {
+        self.session_resume_picker = None;
+        self.selected_resume_session = None;
+        self.resume_sessions_empty = false;
     }
 
     pub fn open_cli_picker(&mut self) {
