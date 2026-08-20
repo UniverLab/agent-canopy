@@ -1,5 +1,6 @@
 use anyhow::Result;
 use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::db::Database;
@@ -516,6 +517,14 @@ fn pop_preset_picker_filter(dialog: &mut SimplePromptDialog) {
 /// (mirrors the Skills picker's un-replace_id path: `add_section_with_content`)
 /// so the preset becomes a normal, freely-editable field — never a locked
 /// reference — and closes the picker either way.
+///
+/// Presets under `~/.canopy/prompts/` also serve the loop engine's own role
+/// templates (implementer/reviewer/resilience), which carry `{{spec_content}}`/
+/// `{{previous_feedback}}` placeholders meant to be filled at agent-spawn
+/// time. This TUI composes ad hoc prompts with no such bindings to offer, so
+/// a preset that still carries an unfilled placeholder is refused — never
+/// inserted with the literal `{{...}}` left in — rather than silently
+/// dumping a foreign template into the user's message (spec C11).
 fn confirm_preset_picker_selection(dialog: &mut SimplePromptDialog) {
     let filtered = preset_filtered_indices(dialog);
     let SectionPickerMode::PresetPicker {
@@ -524,14 +533,27 @@ fn confirm_preset_picker_selection(dialog: &mut SimplePromptDialog) {
     else {
         return;
     };
-    let content = filtered
+    let preset = filtered
         .get(*selected)
         .and_then(|&idx| entries.get(idx))
-        .map(|(_, _, content)| content.clone());
+        .map(|(name, _, content)| (name.clone(), content.clone()));
 
     dialog.picker_mode = SectionPickerMode::None;
-    if let Some(content) = content {
-        dialog.add_section_with_content("instruction", content);
+    let Some((name, content)) = preset else {
+        return;
+    };
+
+    match crate::domain::prompts::render_preset(&name, &content, &HashMap::new()) {
+        Ok(rendered) => {
+            dialog.add_section_with_content("instruction", rendered);
+        }
+        Err(err) => {
+            crate::domain::notification::send_notification(
+                "Preset not inserted",
+                &err.to_string(),
+                crate::domain::notification::NotificationLevel::Warning,
+            );
+        }
     }
 }
 
@@ -1720,6 +1742,71 @@ mod preset_picker_tests {
         assert_eq!(dialog.picker_mode, SectionPickerMode::None);
         assert_eq!(dialog.enabled_sections, original_sections);
     }
+
+    #[test]
+    fn enter_refuses_a_preset_with_an_unfilled_placeholder_and_inserts_nothing() {
+        // Mirrors the observed C11 incident: picking a loop-engine role
+        // preset (carrying {{spec_content}}) from the TUI's ad hoc composer,
+        // which has no such binding to offer.
+        let mut dialog = dialog_with_presets(vec![(
+            "implementer",
+            "role a",
+            "Do this:\n\n{{spec_content}}",
+        )]);
+        let original_sections = dialog.enabled_sections.clone();
+
+        handle_preset_picker_key(&mut dialog, KeyCode::Enter);
+
+        assert_eq!(dialog.picker_mode, SectionPickerMode::None);
+        // Nothing was inserted — not a new section, and definitely not the
+        // literal unfilled placeholder.
+        assert_eq!(dialog.enabled_sections, original_sections);
+        for id in &dialog.enabled_sections {
+            assert!(!dialog.get_section_content(id).contains("{{"));
+        }
+    }
+
+    #[test]
+    fn two_presets_confirmed_in_one_session_stay_in_separate_isolated_sections() {
+        let mut dialog = dialog_with_presets(vec![
+            ("alpha", "role a", "alpha body, nothing else"),
+            ("beta", "role b", "beta body, nothing else"),
+        ]);
+
+        // Confirm "alpha" first.
+        handle_preset_picker_key(&mut dialog, KeyCode::Enter);
+        assert_eq!(
+            dialog.get_section_content("instruction_2"),
+            "alpha body, nothing else"
+        );
+
+        // Reopen the picker and confirm "beta" second.
+        dialog.picker_mode = SectionPickerMode::PresetPicker {
+            selected: 1,
+            entries: vec![
+                (
+                    "alpha".to_string(),
+                    "role a".to_string(),
+                    "alpha body, nothing else".to_string(),
+                ),
+                (
+                    "beta".to_string(),
+                    "role b".to_string(),
+                    "beta body, nothing else".to_string(),
+                ),
+            ],
+            filter: String::new(),
+        };
+        handle_preset_picker_key(&mut dialog, KeyCode::Enter);
+
+        // Each preset landed in its own section, containing only its own body.
+        let alpha_content = dialog.get_section_content("instruction_2");
+        let beta_content = dialog.get_section_content("instruction_3");
+        assert_eq!(alpha_content, "alpha body, nothing else");
+        assert_eq!(beta_content, "beta body, nothing else");
+        assert!(!alpha_content.contains("beta"));
+        assert!(!beta_content.contains("alpha"));
+    }
 }
 
 #[cfg(test)]
@@ -1905,6 +1992,93 @@ mod recall_last_prompt_tests {
             dialog.get_section_content("instruction_1"),
             "recovered prompt"
         );
+    }
+
+    /// Full round trip through the DB: compose a structured prompt (multiple
+    /// section types, not just one instruction), persist it the way
+    /// `submit_prompt`/`schedule_send_prompt` do (rendered text +
+    /// `PersistedBuilderState` JSON), then recall it into a fresh builder and
+    /// assert the structure — not a flattened blob — comes back.
+    #[test]
+    fn ctrl_l_restores_the_full_structured_view_not_just_flat_text() {
+        use crate::tui::app::dialog::PersistedBuilderState;
+
+        let (mut app, _dir) = test_app();
+        let workdir = app.current_workdir().to_string_lossy().to_string();
+
+        app.open_simple_prompt_dialog(None);
+        {
+            let dialog = app.simple_prompt_dialog.as_mut().unwrap();
+            dialog.set_section_content("instruction_1", "primary task".to_string());
+            dialog.add_section_with_content("goal", "ship the feature".to_string());
+            dialog.add_section_with_content("resources", "@src/main.rs".to_string());
+        }
+        let dialog = app.simple_prompt_dialog.as_ref().unwrap();
+        let snapshot = PersistedBuilderState::from_dialog(dialog);
+        let json = serde_json::to_string(&snapshot).unwrap();
+
+        app.db
+            .insert_last_prompt(
+                "lp-1",
+                &workdir,
+                "flattened rendered text",
+                Some(&json),
+                chrono::Utc::now(),
+            )
+            .expect("persist structured last prompt");
+
+        // Close and reopen fresh, as if the builder had been closed and the
+        // user came back later to edit it again.
+        app.discard_simple_prompt_dialog();
+        app.open_simple_prompt_dialog(None);
+        assert!(app.simple_prompt_dialog.as_ref().unwrap().is_empty());
+
+        ctrl_l(&mut app);
+
+        let dialog = app.simple_prompt_dialog.as_ref().unwrap();
+        assert!(dialog.pending_recall.is_none());
+        // The structure survived: three distinct sections, not one
+        // instruction section holding the flattened rendered text.
+        assert_eq!(dialog.get_section_content("instruction_1"), "primary task");
+        assert_eq!(dialog.get_section_content("goal_1"), "ship the feature");
+        assert_eq!(dialog.get_section_content("resources_1"), "@src/main.rs");
+        assert!(dialog.enabled_sections.contains(&"goal_1".to_string()));
+        assert!(dialog.enabled_sections.contains(&"resources_1".to_string()));
+        // None of the sections regressed to the flattened text.
+        for id in &dialog.enabled_sections {
+            assert_ne!(dialog.get_section_content(id), "flattened rendered text");
+        }
+    }
+
+    /// A row written before structured persistence existed (`builder_state`
+    /// is `NULL`) must still open — in raw, as a single instruction section
+    /// — never error or panic.
+    #[test]
+    fn ctrl_l_on_a_pre_migration_row_with_no_builder_state_opens_in_raw_without_error() {
+        let (mut app, _dir) = test_app();
+        let workdir = app.current_workdir().to_string_lossy().to_string();
+
+        app.db
+            .insert_last_prompt(
+                "lp-legacy",
+                &workdir,
+                "an old prompt saved before structure was tracked",
+                None,
+                chrono::Utc::now(),
+            )
+            .expect("seed legacy last prompt");
+
+        app.open_simple_prompt_dialog(None);
+        ctrl_l(&mut app);
+
+        let dialog = app.simple_prompt_dialog.as_ref().unwrap();
+        assert!(dialog.pending_recall.is_none());
+        assert_eq!(
+            dialog.get_section_content("instruction_1"),
+            "an old prompt saved before structure was tracked"
+        );
+        // Raw fallback is a single section — no structure to have restored.
+        assert_eq!(dialog.enabled_sections, vec!["instruction_1".to_string()]);
     }
 }
 
