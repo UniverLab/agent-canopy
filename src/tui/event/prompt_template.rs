@@ -1254,12 +1254,11 @@ fn handle_section_backspace(
 }
 
 fn submit_prompt(app: &mut App, prompt: &str) {
-    // Capture whether system content was included before discarding
-    let had_system = app
+    // Capture whether the session-start protocol block was included before discarding
+    let had_protocol = app
         .simple_prompt_dialog
         .as_ref()
-        .and_then(|d| d.system_content.as_ref())
-        .is_some();
+        .is_some_and(|d| d.protocol_included);
     let is_solo = !app.sync_available();
     let workdir = app.current_workdir();
     let session_key = app.current_prompt_session_key();
@@ -1269,10 +1268,11 @@ fn submit_prompt(app: &mut App, prompt: &str) {
     app.prompt_builder_sessions.remove(&session_key);
     app.discard_simple_prompt_dialog();
 
-    // Record that system block was sent for this workdir
-    if had_system {
-        let state = app.workdir_system_state.entry(workdir).or_default();
-        state.sent = true;
+    // Record that the protocol block was sent for this session, so later
+    // turns of the same session omit it while still getting per-turn context.
+    if had_protocol {
+        let state = app.session_protocol_state.entry(session_key).or_default();
+        state.protocol_sent = true;
         state.sent_as_solo = is_solo;
     }
 }
@@ -1904,6 +1904,148 @@ mod recall_last_prompt_tests {
         assert_eq!(
             dialog.get_section_content("instruction_1"),
             "recovered prompt"
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_protocol_tests {
+    use super::submit_prompt;
+    use crate::db::Database;
+    use crate::tui::app::types::App;
+    use std::sync::Arc;
+    use tempfile::{tempdir, NamedTempFile};
+
+    const FIRST_ACTION: &str = "FIRST action";
+
+    fn test_app() -> (App, tempfile::TempDir) {
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).expect("create test db"));
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(db, data_dir.path()).expect("create app");
+        (app, data_dir)
+    }
+
+    fn system_content(app: &App) -> String {
+        app.simple_prompt_dialog
+            .as_ref()
+            .and_then(|d| d.system_content.clone())
+            .unwrap_or_default()
+    }
+
+    /// Opens the dialog, submits `prompt`, and returns the system content
+    /// that was assembled for that turn (i.e. what the agent actually saw).
+    fn send_turn(app: &mut App, prompt: &str) -> String {
+        app.open_simple_prompt_dialog(None);
+        let content = system_content(app);
+        submit_prompt(app, prompt);
+        content
+    }
+
+    #[test]
+    fn turn_one_of_a_session_contains_the_session_start_block() {
+        let (mut app, _dir) = test_app();
+
+        let turn_1 = send_turn(&mut app, "do the first thing");
+
+        assert!(turn_1.contains("[START HERE — required]"));
+        assert!(turn_1.contains(FIRST_ACTION));
+    }
+
+    #[test]
+    fn turn_two_of_the_same_session_omits_the_session_start_block() {
+        let (mut app, _dir) = test_app();
+
+        send_turn(&mut app, "do the first thing");
+        let turn_2 = send_turn(&mut app, "do the second thing");
+
+        assert!(!turn_2.contains("[START HERE — required]"));
+        assert!(!turn_2.contains(FIRST_ACTION));
+    }
+
+    #[test]
+    fn per_turn_workspace_context_is_present_on_every_turn() {
+        let (mut app, _dir) = test_app();
+
+        let turn_1 = send_turn(&mut app, "do the first thing");
+        let turn_2 = send_turn(&mut app, "do the second thing");
+        let turn_3 = send_turn(&mut app, "do the third thing");
+
+        assert!(turn_1.contains("workspace:"));
+        assert!(turn_2.contains("workspace:"));
+        assert!(turn_3.contains("workspace:"));
+    }
+
+    #[test]
+    fn a_new_session_after_the_previous_one_ended_gets_the_block_again() {
+        let (mut app, _dir) = test_app();
+        send_turn(&mut app, "do the first thing");
+
+        // The previous session's process ends; a brand new one starts with
+        // no shared in-memory state (a fresh `App`, per the documented
+        // decision that a session's protocol-delivery state does not
+        // outlive the process it was tracked in).
+        let (mut new_session_app, _dir2) = test_app();
+        let new_turn_1 = send_turn(&mut new_session_app, "do the first thing, again");
+
+        assert!(new_turn_1.contains("[START HERE — required]"));
+        assert!(new_turn_1.contains(FIRST_ACTION));
+    }
+
+    #[test]
+    fn first_action_phrase_appears_at_most_once_across_a_ten_turn_session() {
+        let (mut app, _dir) = test_app();
+
+        let turns: Vec<String> = (0..10)
+            .map(|i| send_turn(&mut app, &format!("turn {i}")))
+            .collect();
+
+        let occurrences = turns
+            .iter()
+            .filter(|content| content.contains(FIRST_ACTION))
+            .count();
+        assert_eq!(
+            occurrences, 1,
+            "expected exactly one turn to carry the session-start block"
+        );
+    }
+
+    /// FR5: measures the assembled system-block size for a ten-turn session
+    /// before this fix (protocol block repeated every turn) against after
+    /// (protocol block sent once, per-turn context sent every turn).
+    #[test]
+    fn ten_turn_session_sends_far_fewer_protocol_tokens_than_resending_every_turn() {
+        let (mut app, _dir) = test_app();
+
+        let turns: Vec<String> = (0..10)
+            .map(|i| send_turn(&mut app, &format!("turn {i}")))
+            .collect();
+
+        let turn_1_chars = turns[0].chars().count();
+        let turn_2_chars = turns[1].chars().count();
+        let after_chars: usize = turns.iter().map(|t| t.chars().count()).sum();
+        // Baseline this replaces: the full block (protocol + per-turn
+        // context) repeated on all ten turns, as observed in the bug report.
+        let before_chars = turn_1_chars * 10;
+
+        assert!(
+            turn_1_chars > turn_2_chars,
+            "turn 1 must carry more than later turns"
+        );
+        assert!(
+            after_chars < before_chars,
+            "after ({after_chars} chars) should be well below before ({before_chars} chars)"
+        );
+        // ~4 chars/token is a standard rough estimator; exact tokenization is
+        // beside the point here — the ratio is what the fix targets.
+        let before_tokens = before_chars / 4;
+        let after_tokens = after_chars / 4;
+        assert!(
+            after_tokens * 2 < before_tokens,
+            "expected at least a 2x reduction in estimated tokens over ten turns: \
+             before={before_tokens} after={after_tokens}"
         );
     }
 }

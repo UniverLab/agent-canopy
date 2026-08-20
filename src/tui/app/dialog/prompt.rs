@@ -218,9 +218,14 @@ pub struct SimplePromptDialog {
     /// Section IDs that are read-only (auto-filled, cannot be edited).
     pub locked_sections: HashSet<String>,
     /// Invisible system block rendered at the top of the final prompt so its
-    /// protocol is read before the task. None = omit. Set once per workdir
-    /// session (idempotent).
+    /// protocol is read before the task. None = omit.
     pub system_content: Option<String>,
+    /// Whether `system_content` (if any) carries the one-time session-start
+    /// protocol block, as opposed to only the per-turn workspace/intents/
+    /// chatter context. Read by `submit_prompt` to decide whether to mark
+    /// the session's protocol as delivered; never persisted across
+    /// openings.
+    pub protocol_included: bool,
     /// Send-timing selector (U11): `now` sends immediately, `date`
     /// schedules the delivery at `send_at`.
     pub send_choice: SendChoice,
@@ -287,6 +292,7 @@ impl SimplePromptDialog {
             collapsed_pastes: HashMap::new(),
             locked_sections: HashSet::new(),
             system_content: None,
+            protocol_included: false,
             send_choice: SendChoice::Now,
             send_at: None,
             send_edit: None,
@@ -4470,6 +4476,7 @@ impl PromptBuilderSession {
         dialog.picker_mode = SectionPickerMode::None;
         dialog.at_picker = None;
         dialog.system_content = None; // re-evaluated on each open
+        dialog.protocol_included = false; // re-evaluated on each open
         dialog.send_edit = None;
         dialog.send_error = None;
         dialog.raw_preview = None; // recomputed when the Raw tab is shown
@@ -4484,8 +4491,9 @@ impl PromptBuilderSession {
 ///
 /// Deliberately excludes `send_at`: recalling a prompt should not silently
 /// re-arm a delivery schedule from a previous session. `picker_mode`,
-/// `at_picker`, and `system_content` are transient UI/idempotency state that
-/// `PromptBuilderSession::restore_into` also never persists.
+/// `at_picker`, `system_content`, and `protocol_included` are transient
+/// UI/idempotency state that `PromptBuilderSession::restore_into` also
+/// never persists.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PersistedBuilderState {
     pub sections: HashMap<String, String>,

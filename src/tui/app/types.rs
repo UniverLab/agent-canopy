@@ -958,8 +958,12 @@ pub struct App {
     pub(crate) playground_scroll: u16,
     /// Optional project hash to filter search results. None = Global.
     pub(crate) playground_project_hash: Option<String>,
-    /// Tracks whether the system block has been sent per workdir.
-    pub(crate) workdir_system_state: HashMap<PathBuf, WorkdirSystemState>,
+    /// Tracks whether the session-start protocol block has been sent per
+    /// session. Keyed by `App::current_prompt_session_key` (agent/session
+    /// ID when one exists, workdir as a fallback) rather than by workdir
+    /// alone, so two different agent sessions sharing a workdir don't share
+    /// delivery state.
+    pub(crate) session_protocol_state: HashMap<String, SessionProtocolState>,
 
     // Project relation graph
     pub(crate) project_relation_dialog: Option<ProjectRelationDialog>,
@@ -1012,10 +1016,13 @@ pub(crate) struct ProjectRelationDialog {
     pub error: Option<String>,
 }
 
-/// Tracks system block delivery per workdir for idempotency.
+/// Tracks session-start protocol block delivery per session for idempotency.
+/// The block is the static "[START HERE — required]" contract, not the
+/// per-turn workspace/intents/chatter context, which is sent every turn
+/// regardless of this state.
 #[derive(Clone, Default)]
-pub(crate) struct WorkdirSystemState {
-    pub sent: bool,
+pub(crate) struct SessionProtocolState {
+    pub protocol_sent: bool,
     pub sent_as_solo: bool,
 }
 
