@@ -49,7 +49,8 @@ async fn main() -> anyhow::Result<()> {
     println!("✅ Query embedded: {} dims\n", query_vec.len());
 
     // Open vector store and search
-    let store: vector_store::VectorStore = vector_store::VectorStore::new(dimensions).await?;
+    let store: vector_store::VectorStore =
+        vector_store::VectorStore::new(dimensions, Some(config.rag_vector_cache_entries)).await?;
     let results: Vec<vector_store::SearchResult> = store.search_similar(&query_vec, 5).await?;
 
     println!("📊 Top 5 results:\n");

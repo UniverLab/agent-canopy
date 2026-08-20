@@ -1429,7 +1429,7 @@ async fn open_vector_store(
         }
     };
 
-    match VectorStore::new(dimensions).await {
+    match VectorStore::new(dimensions, Some(config.rag_vector_cache_entries)).await {
         Ok(store) => {
             tracing::info!("RAG open_vector_store: store opened OK");
             Some(store)
@@ -1447,7 +1447,7 @@ async fn open_vector_store(
                 if let Err(e) = wipe_lancedb(db, "corrupt store recovery").await {
                     tracing::warn!("RAG: failed to purge corrupt store: {e:#}");
                 }
-                match VectorStore::new(dimensions).await {
+                match VectorStore::new(dimensions, Some(config.rag_vector_cache_entries)).await {
                     Ok(store) => {
                         tracing::warn!("RAG open_vector_store: recovered after purge");
                         return Some(store);

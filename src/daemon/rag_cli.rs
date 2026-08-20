@@ -151,6 +151,7 @@ async fn handle_rag_report(data_dir: &std::path::Path, db: &Database) -> Result<
         match crate::rag::vector_store::VectorStore::open_at(
             &crate::rag::vector_store::VectorStore::default_lancedb_path()?,
             dims,
+            Some(config.rag_vector_cache_entries),
         )
         .await
         {

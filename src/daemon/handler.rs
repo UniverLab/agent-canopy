@@ -6591,9 +6591,12 @@ impl TaskTriggerHandler {
             .map_err(|e| internal_error(e.to_string()))?
             .map_err(|e| internal_error(e.to_string()))?;
 
-        let store = crate::rag::vector_store::VectorStore::new(dimensions)
-            .await
-            .map_err(|e| internal_error(e.to_string()))?;
+        let store = crate::rag::vector_store::VectorStore::new(
+            dimensions,
+            Some(config.rag_vector_cache_entries),
+        )
+        .await
+        .map_err(|e| internal_error(e.to_string()))?;
 
         let results = store
             .search_similar(&query_vec, limit)

@@ -3568,7 +3568,11 @@ fn playground_vector_search(
         .enable_all()
         .build()?;
     rt.block_on(async {
-        let store = crate::rag::vector_store::VectorStore::new(dimensions).await?;
+        let store = crate::rag::vector_store::VectorStore::new(
+            dimensions,
+            Some(config.rag_vector_cache_entries),
+        )
+        .await?;
         let embedder = crate::rag::embedding_client::client_from_config(&config)?;
         let query_vec = embedder.embed(query)?;
         store.search_similar(&query_vec, top_k).await

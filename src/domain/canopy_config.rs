@@ -97,6 +97,16 @@ pub struct CanopyConfig {
     /// choosing to index bigger files, not a regression in chunking itself.
     #[serde(default = "default_rag_max_file_mb")]
     pub rag_max_file_mb: u32,
+
+    /// Ceiling on LanceDB's index cache, in entries (see
+    /// `lancedb::OpenTableBuilder::index_cache_size` — roughly 20 MiB per
+    /// entry). With this unset, LanceDB's own default lets the index cache
+    /// grow to 6 GiB, which is the second identified contributor to daemon
+    /// RSS on a workspace with a large on-disk index. Configurable per
+    /// workspace since a small index and a tens-of-gigabytes one want
+    /// different ceilings.
+    #[serde(default = "default_rag_vector_cache_entries")]
+    pub rag_vector_cache_entries: u32,
 }
 
 /// Highest per-file indexing cap a user may configure, in MB. Text/PDF
@@ -107,6 +117,15 @@ pub const RAG_MAX_FILE_MB_CEILING: u32 = 100;
 
 fn default_rag_max_file_mb() -> u32 {
     10
+}
+
+/// Kept equal to `rag::vector_store::DEFAULT_INDEX_CACHE_ENTRIES` (see that
+/// constant for the measurement behind the value). Not referenced directly
+/// across the module boundary because `examples/rag_search.rs` mounts
+/// `vector_store` at its own crate root via `#[path]`, without a `rag`
+/// module wrapping it — `crate::rag::vector_store` doesn't resolve there.
+fn default_rag_vector_cache_entries() -> u32 {
+    64
 }
 
 /// Validates a configured (or user-entered) per-file indexing size cap.
@@ -374,6 +393,7 @@ impl Default for CanopyConfig {
             models: ModelsConfig::default(),
             theme: default_theme(),
             rag_max_file_mb: default_rag_max_file_mb(),
+            rag_vector_cache_entries: default_rag_vector_cache_entries(),
         }
     }
 }
@@ -393,6 +413,10 @@ mod tests {
         assert_eq!(config.similarity_threshold, 0.25);
         assert_eq!(config.theme, "classic");
         assert_eq!(config.rag_max_file_mb, 10);
+        assert_eq!(
+            config.rag_vector_cache_entries,
+            crate::rag::vector_store::DEFAULT_INDEX_CACHE_ENTRIES
+        );
     }
 
     #[test]

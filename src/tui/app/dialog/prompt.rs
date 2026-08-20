@@ -843,7 +843,12 @@ impl SimplePromptDialog {
         };
 
         rt.block_on(async {
-            let Ok(store) = crate::rag::vector_store::VectorStore::new(dimensions).await else {
+            let Ok(store) = crate::rag::vector_store::VectorStore::new(
+                dimensions,
+                Some(config.rag_vector_cache_entries),
+            )
+            .await
+            else {
                 return Vec::new();
             };
             let Ok(embedder) = crate::rag::embedding_client::client_from_config(&config) else {

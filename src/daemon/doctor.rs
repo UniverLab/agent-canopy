@@ -562,7 +562,12 @@ pub(crate) async fn run_doctor() -> Result<()> {
                 );
             }
         }
-        Some(dimensions) => match crate::rag::vector_store::VectorStore::new(dimensions).await {
+        Some(dimensions) => match crate::rag::vector_store::VectorStore::new(
+            dimensions,
+            Some(config.rag_vector_cache_entries),
+        )
+        .await
+        {
             Err(e) => {
                 println!(" \x1b[31m✗\x1b[0m Could not open LanceDB: {e}");
                 issues.push(
@@ -1329,7 +1334,9 @@ mod tests {
         // the vector store already "exists" when doctor checks for it.
         // 1536 dims matches text-embedding-3-small.
         let lancedb_path = canopy_dir.join("rag").join("vectors.lancedb");
-        let store = VectorStore::open_at(&lancedb_path, 1536).await.unwrap();
+        let store = VectorStore::open_at(&lancedb_path, 1536, None)
+            .await
+            .unwrap();
         store
             .insert_chunk(&VectorChunk {
                 id: "chunk-1".to_string(),
