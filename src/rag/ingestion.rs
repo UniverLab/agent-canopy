@@ -325,7 +325,16 @@ impl IngestionManager {
     /// downloading/preparing/failed, acquires it — reusing
     /// `get_embedding_client` so the resulting client is cached for the
     /// next query or indexing pass instead of being built twice.
+    ///
+    /// Only runs when the indexing queue is non-empty: a daemon with
+    /// nothing queued has no imminent need for the model, and eagerly
+    /// acquiring it here would silently reintroduce the startup load this
+    /// loop's own scope excludes (C8) — the model is loaded lazily, from
+    /// whichever of a query or an indexing pass asks for it first.
     async fn ensure_configured_model_acquired(&self) {
+        if self.queue_len().await == 0 {
+            return;
+        }
         let config = crate::domain::canopy_config::CanopyConfig::load(&self.data_dir);
         let model_id = config.embeddings_model.trim();
         if model_id.is_empty() {
@@ -1593,6 +1602,26 @@ mod tests {
         assert!(mgr.cached_client.lock().await.is_none());
     }
 
+    /// (1b) A local model being *configured* isn't enough to load it: the
+    /// proactive acquisition path (`ensure_configured_model_acquired`, run
+    /// by `model_acquisition_loop` right after `start()`) must also see an
+    /// empty queue and skip, or a daemon that never indexes anything would
+    /// still eagerly load the model — reintroducing the exact startup load
+    /// this spec removes, just from a different call site than
+    /// `startup_personal_rag`.
+    #[tokio::test]
+    async fn configured_local_model_not_acquired_with_empty_queue() {
+        let (mgr, dir) = test_manager();
+        let mut config = crate::domain::canopy_config::CanopyConfig::load(dir.path());
+        config.embeddings_model = "baai/bge-small-en-v1.5".to_string();
+        config.save(dir.path()).unwrap();
+
+        assert_eq!(mgr.queue_len().await, 0);
+        mgr.ensure_configured_model_acquired().await;
+
+        assert!(mgr.cached_client.lock().await.is_none());
+    }
+
     /// (2) A query (via `get_or_load_client`, the shared core behind
     /// `get_embedding_client`) loads and caches the client on first use.
     #[tokio::test]
@@ -1647,6 +1676,38 @@ mod tests {
         assert!(!crate::rag::status::is_model_loaded(&mgr.db));
     }
 
+    /// (3b) A request arriving after an idle release reloads transparently
+    /// and produces the same results as before the release (decision 5:
+    /// "reloading must be correct").
+    #[tokio::test]
+    async fn request_after_idle_unload_reloads_with_identical_results() {
+        let (mgr, _dir) = test_manager();
+        let before = mgr
+            .get_or_load_client("mock-model".to_string(), || async { Ok(mock_client()) })
+            .await
+            .unwrap()
+            .embed("hello world")
+            .unwrap();
+
+        let idle_timeout = Duration::from_secs(600);
+        let long_after = Instant::now() + Duration::from_secs(700);
+        assert!(mgr
+            .maybe_unload_idle_client_at(idle_timeout, long_after)
+            .await
+            .is_some());
+        assert!(mgr.cached_client.lock().await.is_none());
+
+        let after = mgr
+            .get_or_load_client("mock-model".to_string(), || async { Ok(mock_client()) })
+            .await
+            .unwrap()
+            .embed("hello world")
+            .unwrap();
+
+        assert_eq!(before, after);
+        assert!(mgr.cached_client.lock().await.is_some());
+    }
+
     /// (4) The client is not released while an in-progress use still holds the Arc,
     /// even past the idle timeout — checked via the strong count, not a busy flag.
     #[tokio::test]
@@ -1681,6 +1742,50 @@ mod tests {
             "should unload once the in-flight use ends"
         );
         assert!(mgr.cached_client.lock().await.is_none());
+    }
+
+    /// (5) Concurrent first-requests for the same model must not each start
+    /// their own load: `get_or_load_client` holds `cached_client`'s lock
+    /// across the whole check-then-load, so a second caller arriving while
+    /// the first is still loading simply blocks on the mutex and then finds
+    /// the cache already populated, instead of racing its own loader.
+    #[tokio::test]
+    async fn concurrent_first_requests_produce_one_load() {
+        let (mgr, _dir) = test_manager();
+        let mgr = Arc::new(mgr);
+        let load_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let handles: Vec<_> = (0..5)
+            .map(|_| {
+                let mgr = Arc::clone(&mgr);
+                let load_count = Arc::clone(&load_count);
+                tokio::spawn(async move {
+                    mgr.get_or_load_client("mock-model".to_string(), || async move {
+                        load_count.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        Ok(mock_client())
+                    })
+                    .await
+                })
+            })
+            .collect();
+
+        let mut clients = Vec::new();
+        for h in handles {
+            clients.push(h.await.unwrap().expect("load should succeed"));
+        }
+
+        assert_eq!(
+            load_count.load(Ordering::SeqCst),
+            1,
+            "loader must run exactly once across concurrent first-requests"
+        );
+        for client in &clients[1..] {
+            assert!(
+                Arc::ptr_eq(&clients[0], client),
+                "every caller should receive the same cached client"
+            );
+        }
     }
 
     #[test]
