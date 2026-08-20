@@ -206,13 +206,18 @@ impl InteractiveAgent {
     /// Returns `true` if the event was forwarded, `false` if no mouse
     /// protocol is active (caller should handle the event internally).
     ///
-    /// Scroll ticks are special-cased: a full-screen child (alternate
-    /// screen) that has no mouse protocol still needs *something*, since
-    /// canopy has no scrollback of its own to fall back on for it (see
-    /// `agents.rs`'s close-time capture comment for why). So scroll ticks
-    /// forward through even under `MouseProtocolMode::None` once the child
-    /// owns the screen, via the same [`encode_scroll_sequence`] that
-    /// [`Self::forward_scroll`] uses — see [`should_forward_scroll_to_child`].
+    /// Scroll ticks are forwarded (and consumed) here only when the child
+    /// has an active mouse protocol — see [`should_forward_scroll_to_child`].
+    /// Under `MouseProtocolMode::None` this always declines and writes
+    /// nothing, even inside a full-screen child's alternate screen: this
+    /// method has no way to know the guessed fallback keystroke actually
+    /// meant anything to the child, so consuming the event here would risk
+    /// silently eating a scroll gesture the child never understood (see the
+    /// C6b writeup — this exact bug shipped once already). The alternate
+    /// screen without a mouse protocol case is instead handled by
+    /// [`Self::forward_scroll`] via `scroll_terminal_like_agent` in
+    /// `event/mod.rs`, which always runs as a fallback after this method
+    /// declines, so the tick is never silently dropped either way.
     pub fn forward_mouse(
         &self,
         kind: ratatui::crossterm::event::MouseEventKind,
@@ -234,7 +239,7 @@ impl InteractiveAgent {
         use vt100::MouseProtocolMode as MPM;
 
         if let Some(scroll_up) = scroll_direction(kind) {
-            if !should_forward_scroll_to_child(mode, self.in_alternate_screen()) {
+            if !should_forward_scroll_to_child(mode) {
                 return Ok(false);
             }
             let seq = encode_scroll_sequence(mode, encoding, scroll_up, col, row);
@@ -344,23 +349,24 @@ fn scroll_direction(kind: ratatui::crossterm::event::MouseEventKind) -> Option<b
     }
 }
 
-/// Whether a scroll tick should be forwarded to the child at all, versus
-/// left for the caller to apply to canopy's own scrollback.
+/// Whether [`InteractiveAgent::forward_mouse`] should forward a scroll tick
+/// to the child *and treat it as consumed*.
 ///
-/// A child with an active mouse protocol always gets it (functional
-/// requirement 2). A child with none only gets it once it owns the screen
-/// (alternate screen) — that's the one case where canopy has no buffer of
-/// its own to scroll instead (vt100's alternate grid has no scrollback; see
-/// the close-time capture comment in `app/agents.rs`). Outside alternate
-/// screen with no protocol, declining lets the caller scroll canopy's own
-/// buffer, unchanged from today (functional requirement 3) — and that
-/// caller-side scrolling is itself a real action, so a scroll tick is never
-/// silently dropped either way (functional requirement 1).
-fn should_forward_scroll_to_child(
-    mode: vt100::MouseProtocolMode,
-    in_alternate_screen: bool,
-) -> bool {
-    mode != vt100::MouseProtocolMode::None || in_alternate_screen
+/// True only when the child has an active mouse protocol — it explicitly
+/// asked for wheel events, so canopy knows the bytes mean something to it.
+/// Under `MouseProtocolMode::None` this is always false, even inside a
+/// full-screen child's alternate screen: `forward_mouse` has no
+/// confirmation the child understands the PgUp/PgDn fallback, so it must
+/// not consume the event on that guess (that guess shipped once already —
+/// see the C6b writeup — and made scrolling over Codex a dead gesture,
+/// since forwarding *and* consuming meant canopy's own fallback scroll
+/// never got a turn). The alternate-screen-without-a-protocol case is
+/// handled separately by [`InteractiveAgent::forward_scroll`], invoked
+/// unconditionally by `scroll_terminal_like_agent` in `event/mod.rs`
+/// whenever `forward_mouse` declines — so the tick still reaches the child
+/// there, just never at the cost of silently eating canopy's own fallback.
+fn should_forward_scroll_to_child(mode: vt100::MouseProtocolMode) -> bool {
+    mode != vt100::MouseProtocolMode::None
 }
 
 /// Encode a single scroll-wheel tick as PTY bytes for the child's current
@@ -379,7 +385,19 @@ fn encode_scroll_sequence(
 
     match mode {
         MPM::None => {
-            // No mouse protocol — PgUp/PgDn works in most full-screen TUIs.
+            // No mouse protocol — legacy PgUp/PgDn (CSI 5~ / CSI 6~) works
+            // in most full-screen TUIs, *including* ones that have pushed
+            // Kitty keyboard protocol flags: verified live against Codex
+            // (which negotiates Kitty flags `>7u` — disambiguate + report
+            // event types + report alternate keys, notably *not* bit 8
+            // "report all keys as escape codes") by driving its Transcript
+            // pager over a real PTY. `\x1b[5~` moved its scroll position
+            // from 100% to 0%; the Kitty `CSI u` form of the same key
+            // (`\x1b[5;1u`) was a no-op. Per the Kitty keyboard protocol
+            // spec, named/functional keys like Page Up keep their legacy
+            // final byte unless bit 8 is set — so this fallback already
+            // matches what a Kitty-flag child expects and needs no
+            // per-protocol branching.
             if scroll_up {
                 b"\x1b[5~".to_vec()
             } else {
@@ -591,53 +609,31 @@ mod scroll_tests {
     use super::{encode_scroll_sequence, should_forward_scroll_to_child};
     use vt100::{MouseProtocolEncoding as MPE, MouseProtocolMode as MPM};
 
-    // C6: `forward_mouse` and `forward_scroll` used to decide independently
-    // what a scroll tick under a given `MouseProtocolMode` should do, and
-    // could disagree. Both now delegate to `encode_scroll_sequence` for the
-    // bytes and `should_forward_scroll_to_child` for whether to send them at
-    // all — these tests pin that shared decision directly, since it's the
-    // one thing both call sites must never drift apart on.
+    // C6b: `should_forward_scroll_to_child` used to also forward (and let
+    // `forward_mouse` consume) a scroll tick under `MouseProtocolMode::None`
+    // whenever the child owned the alternate screen, on the theory that the
+    // PgUp/PgDn fallback was better than nothing. In practice `forward_mouse`
+    // had no way to confirm the child understood that fallback, so a child
+    // that didn't (or one where the guess was simply wrong) silently ate the
+    // gesture — canopy's own fallback scroll in `scroll_terminal_like_agent`
+    // never got a turn, because the event was already marked consumed. That
+    // shipped and made scrolling over a real Codex session a dead gesture.
+    // The predicate is now protocol-only; the alternate-screen fallback is
+    // handled exclusively by `forward_scroll`/`scroll_terminal_like_agent`,
+    // which never consumes anything since it isn't gated by a return value.
 
     #[test]
-    fn no_protocol_and_no_alternate_screen_defers_to_canopy_scrollback() {
-        // A plain shell with no mouse protocol: canopy has its own
-        // scrollback here, so the child should not receive anything.
-        assert!(!should_forward_scroll_to_child(MPM::None, false));
+    fn no_protocol_declines_regardless_of_screen_mode() {
+        // forward_mouse must never consume a scroll tick on a guess — see
+        // the module doc above. This is the regression test for C6b.
+        assert!(!should_forward_scroll_to_child(MPM::None));
     }
 
     #[test]
-    fn no_protocol_but_alternate_screen_forwards_to_child() {
-        // A full-screen child (e.g. Codex) with no mouse protocol: canopy
-        // has no scrollback of its own for the alternate grid, so the tick
-        // must still go somewhere rather than vanish.
-        assert!(should_forward_scroll_to_child(MPM::None, true));
-    }
-
-    #[test]
-    fn active_protocol_always_forwards_regardless_of_alternate_screen() {
-        assert!(should_forward_scroll_to_child(MPM::PressRelease, false));
-        assert!(should_forward_scroll_to_child(MPM::PressRelease, true));
-    }
-
-    #[test]
-    fn every_decision_results_in_some_action_not_nothing() {
-        // Whatever the (mode, alternate_screen) combination, there is
-        // always a concrete, observable outcome: forward to the child
-        // (checked here) or defer to canopy's own buffer (the `false`
-        // cases above, which the caller always honors — see
-        // `scroll_terminal_like_agent` in event/mod.rs). No combination
-        // produces a silent no-op.
-        for mode in [MPM::None, MPM::PressRelease] {
-            for alt_screen in [false, true] {
-                let forwards = should_forward_scroll_to_child(mode, alt_screen);
-                if forwards {
-                    let seq = encode_scroll_sequence(mode, MPE::Sgr, true, 0, 0);
-                    assert!(!seq.is_empty());
-                }
-                // else: the caller scrolls canopy's own buffer instead —
-                // also a real action, just not a PTY write.
-            }
-        }
+    fn active_protocol_forwards() {
+        assert!(should_forward_scroll_to_child(MPM::Press));
+        assert!(should_forward_scroll_to_child(MPM::PressRelease));
+        assert!(should_forward_scroll_to_child(MPM::AnyMotion));
     }
 
     #[test]
@@ -669,5 +665,85 @@ mod scroll_tests {
     fn sgr_encoding_reports_button_65_for_scroll_down() {
         let seq = encode_scroll_sequence(MPM::PressRelease, MPE::Sgr, false, 9, 4);
         assert_eq!(seq, b"\x1b[<65;10;5M".to_vec());
+    }
+}
+
+// C6b: end-to-end coverage of `InteractiveAgent::forward_mouse`'s scroll
+// branch against a real spawned child, so the regression is pinned at the
+// method boundary the router (`try_forward_mouse_to_pty` in event/mod.rs)
+// actually calls — not just at the pure predicate.
+#[cfg(test)]
+mod forward_mouse_scroll_tests {
+    use crate::domain::models::Cli;
+    use crate::tui::agent::InteractiveAgent;
+    use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+    use ratatui::style::Color;
+
+    fn spawn_cat_agent() -> InteractiveAgent {
+        InteractiveAgent::spawn(
+            Cli::new("cat"),
+            ".",
+            80,
+            24,
+            None,
+            None,
+            Color::Reset,
+            Some("forward-mouse-scroll-test-agent"),
+            &[],
+            None,
+            None,
+            None,
+        )
+        .expect("spawn cat as a stand-in interactive child")
+    }
+
+    #[test]
+    fn no_protocol_in_alternate_screen_does_not_consume() {
+        // This is the regression test for the whole C6b spec: a full-screen
+        // child with no mouse protocol (Codex, in practice) must not have
+        // its scroll ticks swallowed here on the PgUp/PgDn guess — the
+        // caller (`scroll_terminal_like_agent`) is the one that forwards
+        // that fallback, and only it may claim credit for handling it.
+        let mut agent = spawn_cat_agent();
+        agent.vt.lock().expect("vt lock").process(b"\x1b[?1049h");
+        assert!(agent.in_alternate_screen());
+
+        let consumed = agent
+            .forward_mouse(MouseEventKind::ScrollUp, MouseButton::Left, 5, 5)
+            .expect("forward_mouse should not error");
+
+        assert!(!consumed);
+        agent.kill();
+    }
+
+    #[test]
+    fn no_protocol_outside_alternate_screen_does_not_consume() {
+        let mut agent = spawn_cat_agent();
+        assert!(!agent.in_alternate_screen());
+
+        let consumed = agent
+            .forward_mouse(MouseEventKind::ScrollDown, MouseButton::Left, 5, 5)
+            .expect("forward_mouse should not error");
+
+        assert!(!consumed);
+        agent.kill();
+    }
+
+    #[test]
+    fn active_protocol_consumes_scroll_ticks() {
+        let mut agent = spawn_cat_agent();
+        // DECSET 1000 (press/release mouse mode) + 1006 (SGR encoding).
+        agent
+            .vt
+            .lock()
+            .expect("vt lock")
+            .process(b"\x1b[?1000h\x1b[?1006h");
+
+        let consumed = agent
+            .forward_mouse(MouseEventKind::ScrollUp, MouseButton::Left, 5, 5)
+            .expect("forward_mouse should not error");
+
+        assert!(consumed);
+        agent.kill();
     }
 }
