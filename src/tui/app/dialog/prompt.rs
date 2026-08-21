@@ -97,93 +97,18 @@ pub const TAB_NORMAL_LABEL: &str = " Normal ";
 pub const TAB_RAW_LABEL: &str = " Raw ";
 
 /// Inline date-time picker state for the send control (U11). Opened with
-/// Enter on `send: date`, preseeded with the current local time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SendAtEdit {
-    pub value: chrono::NaiveDateTime,
-    /// Focused field: 0=year, 1=month, 2=day, 3=hour, 4=minute.
-    pub field: usize,
-    /// In-progress numeric accumulator for the focused field while the user is
-    /// typing digits (U11): the running value and how many digits have been
-    /// entered since the field was (re)started. Reset on field change and on
-    /// arrow adjust so a fresh digit always starts a new number.
-    pub typed: u32,
-    pub typed_len: u8,
-}
+/// Enter on `send: date`, preseeded with the current local time. An alias
+/// for the shared picker ([`crate::tui::app::dialog::datetime_picker::DateTimeEdit`])
+/// also used by the loop autorun dialog (C18), so the two never diverge into
+/// separate widgets.
+pub type SendAtEdit = crate::tui::app::dialog::datetime_picker::DateTimeEdit;
 
-/// Digits a field accepts before it is "full" and auto-advances: the year is
-/// 4 digits wide, every other field is 2.
-fn field_digit_width(field: usize) -> u8 {
-    if field == 0 {
-        4
-    } else {
-        2
-    }
-}
-
-/// Month arithmetic for the send picker: ±N months with day clamping
-/// (chrono's checked add/sub semantics — Jan 31 + 1 month = Feb 28/29).
-fn add_months(value: chrono::NaiveDateTime, delta: i64) -> Option<chrono::NaiveDateTime> {
-    if delta >= 0 {
-        value.checked_add_months(chrono::Months::new(delta as u32))
-    } else {
-        value.checked_sub_months(chrono::Months::new(delta.unsigned_abs() as u32))
-    }
-}
-
-/// Number of days in a given month (handles leap years).
-fn days_in_month(year: i32, month: u32) -> u32 {
-    let (next_year, next_month) = if month == 12 {
-        (year + 1, 1)
-    } else {
-        (year, month + 1)
-    };
-    match (
-        chrono::NaiveDate::from_ymd_opt(year, month, 1),
-        chrono::NaiveDate::from_ymd_opt(next_year, next_month, 1),
-    ) {
-        (Some(first), Some(next)) => (next - first).num_days() as u32,
-        _ => 28,
-    }
-}
-
-/// Set one component (year/month/day/hour/minute) of `value` to `num`, clamping
-/// it into that component's valid range and clamping the day to the resulting
-/// month length. Returns `None` only if chrono still rejects the date, in which
-/// case the caller keeps the previous value.
-fn with_field(
-    value: chrono::NaiveDateTime,
-    field: usize,
-    num: u32,
-) -> Option<chrono::NaiveDateTime> {
-    use chrono::{Datelike, NaiveDate, Timelike};
-    let date = value.date();
-    let time = value.time();
-    match field {
-        0 => {
-            let year = num.clamp(1, 9999) as i32;
-            let day = date.day().min(days_in_month(year, date.month()));
-            NaiveDate::from_ymd_opt(year, date.month(), day).map(|d| d.and_time(time))
-        }
-        1 => {
-            let month = num.clamp(1, 12);
-            let day = date.day().min(days_in_month(date.year(), month));
-            NaiveDate::from_ymd_opt(date.year(), month, day).map(|d| d.and_time(time))
-        }
-        2 => {
-            let day = num.clamp(1, days_in_month(date.year(), date.month()));
-            NaiveDate::from_ymd_opt(date.year(), date.month(), day).map(|d| d.and_time(time))
-        }
-        3 => {
-            let hour = num.min(23);
-            date.and_hms_opt(hour, time.minute(), time.second())
-        }
-        _ => {
-            let minute = num.min(59);
-            date.and_hms_opt(time.hour(), minute, time.second())
-        }
-    }
-}
+use crate::tui::app::dialog::datetime_picker::{add_months, field_digit_width, with_field};
+// `days_in_month` isn't called directly outside `datetime_picker` (only
+// through `with_field`) — this crate's own tests below are the sole direct
+// caller, so the import is test-only.
+#[cfg(test)]
+use crate::tui::app::dialog::datetime_picker::days_in_month;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RagScope<'a> {

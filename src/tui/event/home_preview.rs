@@ -122,17 +122,71 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
         return Ok(());
     }
     if app.loop_autorun_dialog.is_some() {
+        use crate::tui::app::dialog::LoopAutorunMode;
         match code {
             KeyCode::Esc => app.close_loop_autorun_dialog(),
             KeyCode::Enter => app.submit_loop_autorun_dialog(),
+            // Tab switches between picking a time and typing a raw
+            // quota-reset message — the two mutually exclusive submit paths.
+            KeyCode::Tab | KeyCode::BackTab => {
+                if let Some(dialog) = app.loop_autorun_dialog.as_mut() {
+                    dialog.toggle_mode();
+                }
+            }
+            KeyCode::Up
+                if app.loop_autorun_dialog.as_ref().map(|d| d.mode)
+                    == Some(LoopAutorunMode::Picker) =>
+            {
+                if let Some(dialog) = app.loop_autorun_dialog.as_mut() {
+                    dialog.picker.adjust(1);
+                    dialog.error = None;
+                }
+            }
+            KeyCode::Down
+                if app.loop_autorun_dialog.as_ref().map(|d| d.mode)
+                    == Some(LoopAutorunMode::Picker) =>
+            {
+                if let Some(dialog) = app.loop_autorun_dialog.as_mut() {
+                    dialog.picker.adjust(-1);
+                    dialog.error = None;
+                }
+            }
+            KeyCode::Left
+                if app.loop_autorun_dialog.as_ref().map(|d| d.mode)
+                    == Some(LoopAutorunMode::Picker) =>
+            {
+                if let Some(dialog) = app.loop_autorun_dialog.as_mut() {
+                    dialog.picker.move_field(-1);
+                }
+            }
+            KeyCode::Right
+                if app.loop_autorun_dialog.as_ref().map(|d| d.mode)
+                    == Some(LoopAutorunMode::Picker) =>
+            {
+                if let Some(dialog) = app.loop_autorun_dialog.as_mut() {
+                    dialog.picker.move_field(1);
+                }
+            }
             KeyCode::Backspace => {
                 if let Some(dialog) = app.loop_autorun_dialog.as_mut() {
-                    dialog.input.pop();
+                    if dialog.mode == LoopAutorunMode::QuotaMessage {
+                        dialog.quota_input.pop();
+                    }
                 }
             }
             KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(dialog) = app.loop_autorun_dialog.as_mut() {
-                    dialog.input.push(c);
+                    match dialog.mode {
+                        LoopAutorunMode::Picker => {
+                            if let Some(digit) = c.to_digit(10) {
+                                dialog.picker.type_digit(digit);
+                                dialog.error = None;
+                            }
+                        }
+                        LoopAutorunMode::QuotaMessage => {
+                            dialog.quota_input.push(c);
+                        }
+                    }
                 }
             }
             _ => {}
@@ -1375,15 +1429,44 @@ mod preview_key_tests {
     }
 
     #[test]
-    fn loop_autorun_dialog_typing_backspace_and_submit() {
+    fn loop_autorun_dialog_quota_message_typing_backspace_and_submit() {
         let mut app = app_on_loop(crate::domain::loops::LoopStatus::Failed);
         handle_preview_key(&mut app, KeyCode::Char('a'), KeyModifiers::NONE).unwrap();
+        // Tab switches into the free-text quota-message mode (the picker is
+        // the default mode on open).
+        handle_preview_key(&mut app, KeyCode::Tab, KeyModifiers::NONE).unwrap();
 
         handle_preview_key(&mut app, KeyCode::Char('1'), KeyModifiers::NONE).unwrap();
         handle_preview_key(&mut app, KeyCode::Char('2'), KeyModifiers::NONE).unwrap();
         handle_preview_key(&mut app, KeyCode::Backspace, KeyModifiers::NONE).unwrap();
-        assert_eq!(app.loop_autorun_dialog.as_ref().unwrap().input, "1");
+        assert_eq!(app.loop_autorun_dialog.as_ref().unwrap().quota_input, "1");
 
+        handle_preview_key(&mut app, KeyCode::Enter, KeyModifiers::NONE).unwrap();
+        assert!(app.loop_autorun_dialog.is_none());
+        assert!(app.loop_action_pending);
+    }
+
+    #[test]
+    fn loop_autorun_dialog_picker_mode_default_seed_is_rejected_on_submit() {
+        // The picker seeds to "now" absent a pending autorun (see
+        // `LoopAutorunDialog::new`), which is already past by the time
+        // submit runs a moment later — the dialog must stay open with an
+        // inline error rather than dispatch (requirement 7).
+        let mut app = app_on_loop(crate::domain::loops::LoopStatus::Failed);
+        handle_preview_key(&mut app, KeyCode::Char('a'), KeyModifiers::NONE).unwrap();
+        handle_preview_key(&mut app, KeyCode::Enter, KeyModifiers::NONE).unwrap();
+        assert!(app.loop_autorun_dialog.is_some());
+        assert!(!app.loop_action_pending);
+        assert!(app.loop_autorun_dialog.as_ref().unwrap().error.is_some());
+    }
+
+    #[test]
+    fn loop_autorun_dialog_picker_mode_future_time_submits() {
+        let mut app = app_on_loop(crate::domain::loops::LoopStatus::Failed);
+        handle_preview_key(&mut app, KeyCode::Char('a'), KeyModifiers::NONE).unwrap();
+        // Field 0 (year) is focused on open; bump it a year forward so the
+        // picked time is unambiguously in the future.
+        handle_preview_key(&mut app, KeyCode::Up, KeyModifiers::NONE).unwrap();
         handle_preview_key(&mut app, KeyCode::Enter, KeyModifiers::NONE).unwrap();
         assert!(app.loop_autorun_dialog.is_none());
         assert!(app.loop_action_pending);
