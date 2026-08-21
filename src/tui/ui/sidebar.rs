@@ -215,25 +215,83 @@ fn render_dashboard_if_present(frame: &mut Frame, area: Option<Rect>, app: &App,
     );
 }
 
-/// Leftover space below the three layers: the project relation graph when
-/// there's something to show, else Brian's Brain.
-fn render_brain_or_graph(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+/// The project graph's minimum height: border rows plus at least one edge line.
+const GRAPH_MIN_HEIGHT: u16 = 4;
+
+/// How the leftover space below the three layers is carved up between the
+/// project relation graph and Brian's Brain. When the graph has nothing to
+/// show, the brain takes the whole area, as before. When it does, the graph
+/// gets its minimum first (it carries information; the brain is atmosphere),
+/// then the brain takes whatever remains, if that remainder still meets its
+/// own minimum — otherwise the graph draws alone rather than splitting into
+/// two broken panels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrainOrGraphLayout {
+    Neither,
+    GraphOnly(Rect),
+    BrainOnly(Rect),
+    Both { graph: Rect, brain: Rect },
+}
+
+fn split_brain_or_graph(area: Rect, graph_has_content: bool) -> BrainOrGraphLayout {
     if area.height == 0 {
-        return;
+        return BrainOrGraphLayout::Neither;
     }
-    if !app.project_graph_trees.is_empty() && area.height >= 4 {
-        render_titled_panel(
-            frame,
-            area,
-            " project graph ",
-            Style::default().fg(theme.dim_text),
-            Style::default().fg(theme.dim_text),
-            theme,
-            |frame, inner| draw_project_graph(frame, inner, app, theme),
-        );
-        return;
+
+    if !graph_has_content {
+        return if area.height >= 3 && area.width >= 6 {
+            BrainOrGraphLayout::BrainOnly(area)
+        } else {
+            BrainOrGraphLayout::Neither
+        };
     }
-    render_brain_if_visible(frame, area, app);
+
+    if area.height < GRAPH_MIN_HEIGHT {
+        return BrainOrGraphLayout::Neither;
+    }
+
+    let brain_fits = area.width >= 6 && area.height >= GRAPH_MIN_HEIGHT + 3;
+    if !brain_fits {
+        return BrainOrGraphLayout::GraphOnly(area);
+    }
+
+    let graph = Rect::new(area.x, area.y, area.width, GRAPH_MIN_HEIGHT);
+    let brain = Rect::new(
+        area.x,
+        area.y + GRAPH_MIN_HEIGHT,
+        area.width,
+        area.height - GRAPH_MIN_HEIGHT,
+    );
+    BrainOrGraphLayout::Both { graph, brain }
+}
+
+fn render_graph_panel(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    render_titled_panel(
+        frame,
+        area,
+        " project graph ",
+        Style::default().fg(theme.dim_text),
+        Style::default().fg(theme.dim_text),
+        theme,
+        |frame, inner| draw_project_graph(frame, inner, app, theme),
+    );
+}
+
+fn render_brain_or_graph(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let graph_has_content = !app.project_graph_trees.is_empty();
+    match split_brain_or_graph(area, graph_has_content) {
+        BrainOrGraphLayout::Neither => {}
+        BrainOrGraphLayout::GraphOnly(graph_area) => {
+            render_graph_panel(frame, graph_area, app, theme);
+        }
+        BrainOrGraphLayout::BrainOnly(brain_area) => {
+            render_brain_if_visible(frame, brain_area, app);
+        }
+        BrainOrGraphLayout::Both { graph, brain } => {
+            render_graph_panel(frame, graph, app, theme);
+            render_brain_if_visible(frame, brain, app);
+        }
+    }
 }
 
 // ── Layer headers ─────────────────────────────────────────────────
@@ -3108,5 +3166,69 @@ mod tests {
         let line = rag_status_line(&app, &theme);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("download failed"), "got: {text:?}");
+    }
+
+    #[test]
+    fn split_shares_space_when_both_fit() {
+        let area = Rect::new(0, 0, 30, 20);
+        match split_brain_or_graph(area, true) {
+            BrainOrGraphLayout::Both { graph, brain } => {
+                assert!(graph.height >= GRAPH_MIN_HEIGHT, "graph below its minimum");
+                assert!(brain.height >= 3, "brain below its minimum");
+                assert_eq!(
+                    graph.height + brain.height,
+                    area.height,
+                    "the two sub-areas should cover the whole leftover area"
+                );
+                assert_eq!(
+                    brain.y,
+                    graph.y + graph.height,
+                    "brain should sit below the graph"
+                );
+            }
+            other => panic!("expected Both, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_gives_graph_alone_when_only_it_fits() {
+        // Tall enough for the graph (>=4) but not for graph + brain (>=7).
+        let area = Rect::new(0, 0, 30, 5);
+        match split_brain_or_graph(area, true) {
+            BrainOrGraphLayout::GraphOnly(graph) => assert_eq!(graph, area),
+            other => panic!("expected GraphOnly, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_gives_brain_alone_when_graph_is_empty() {
+        // Below the graph's own minimum, but that's moot since it has nothing to show.
+        let area = Rect::new(0, 0, 30, 3);
+        match split_brain_or_graph(area, false) {
+            BrainOrGraphLayout::BrainOnly(brain) => assert_eq!(brain, area),
+            other => panic!("expected BrainOnly, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_yields_neither_below_both_minimums() {
+        let area = Rect::new(0, 0, 30, 2);
+        assert_eq!(
+            split_brain_or_graph(area, true),
+            BrainOrGraphLayout::Neither
+        );
+    }
+
+    #[test]
+    fn split_yields_neither_on_zero_height() {
+        let area = Rect::new(0, 0, 30, 0);
+        assert_eq!(
+            split_brain_or_graph(area, true),
+            BrainOrGraphLayout::Neither
+        );
+        assert_eq!(
+            split_brain_or_graph(area, false),
+            BrainOrGraphLayout::Neither
+        );
     }
 }
