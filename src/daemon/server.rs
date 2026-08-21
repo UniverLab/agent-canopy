@@ -45,6 +45,7 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
     let loop_engine = Arc::new(
         LoopEngine::new(Arc::clone(&db), Arc::clone(&notification_service))
             .with_ensemble_concurrency_cap(canopy_config.ensemble_concurrency_cap)
+            .with_spec_attempt_limit(canopy_config.spec_attempt_limit)
             .with_dynamic_skills(Arc::clone(&dynamic_skills)),
     );
     let watcher_engine = Arc::new(WatcherEngine::new(
@@ -335,6 +336,7 @@ async fn stdio_server_startup(db: Arc<Database>, data_dir: &std::path::Path) -> 
     let loop_engine = Arc::new(
         LoopEngine::new(Arc::clone(&db), Arc::clone(&notification_service))
             .with_ensemble_concurrency_cap(canopy_config.ensemble_concurrency_cap)
+            .with_spec_attempt_limit(canopy_config.spec_attempt_limit)
             .with_dynamic_skills(Arc::clone(&dynamic_skills)),
     );
     let watcher_engine = Arc::new(WatcherEngine::new(

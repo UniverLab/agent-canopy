@@ -373,7 +373,8 @@ impl Database {
                 completed_via TEXT,
                 completed_via_reason TEXT,
                 completed_via_at INTEGER,
-                spec_committed_head TEXT
+                spec_committed_head TEXT,
+                cross_run_attempts INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_loop_specs_position
@@ -1134,6 +1135,33 @@ impl Database {
         if !has_spec_committed_head {
             conn.execute(
                 "ALTER TABLE loop_specs ADD COLUMN spec_committed_head TEXT",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // `cross_run_attempts` (C19): how many separate loop executions this
+        // spec has failed with a genuine (non-infrastructure) verdict.
+        // Unlike the per-node iteration budget `run_spec` tracks in memory
+        // for the duration of one execution, this is persisted so it
+        // survives `loop_reset`, a relaunch, and a daemon restart — the
+        // whole point being that an unsatisfiable spec doesn't get a fresh
+        // budget every time an operator resets and relaunches after a quota
+        // failure. `DEFAULT 0` means every pre-existing spec reads as never
+        // having failed under this counter, which is correct: it didn't
+        // exist to count anything before now. See
+        // `Database::increment_loop_spec_cross_run_attempts` and
+        // `LoopEngine::record_spec_attempt`.
+        let has_cross_run_attempts: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loop_specs') WHERE name = 'cross_run_attempts'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_cross_run_attempts {
+            conn.execute(
+                "ALTER TABLE loop_specs ADD COLUMN cross_run_attempts INTEGER NOT NULL DEFAULT 0",
                 [],
             )
             .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;

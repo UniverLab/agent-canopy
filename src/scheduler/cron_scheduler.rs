@@ -927,6 +927,27 @@ mod tests {
         (db, scheduler)
     }
 
+    /// Like [`test_scheduler_with_loops`], but also hands back the
+    /// [`LoopEngine`] itself, with the cross-run attempt budget floored to a
+    /// single attempt, so a test can drive a spec to a genuine C19 `Blocked`
+    /// loop through real execution and then check the scheduler's autorun
+    /// behavior against that exact state.
+    fn test_scheduler_and_engine() -> (Arc<Database>, CronScheduler, Arc<LoopEngine>) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
+        std::mem::forget(dir);
+        let executor = Arc::new(Executor::new(
+            db.clone(),
+            Arc::new(DefaultNotificationService),
+        ));
+        let loop_engine = Arc::new(
+            LoopEngine::new(db.clone(), Arc::new(DefaultNotificationService))
+                .with_spec_attempt_limit(1),
+        );
+        let scheduler = CronScheduler::with_loops(db.clone(), executor, Arc::clone(&loop_engine));
+        (db, scheduler, loop_engine)
+    }
+
     fn sample_loop(
         id: &str,
         status: crate::domain::loops::LoopStatus,
@@ -1332,6 +1353,107 @@ mod tests {
         assert!(
             lp_after.autorun_at.is_some(),
             "operator pause must not be silently discarded either — the schedule stays pending"
+        );
+    }
+
+    /// C19: a loop the engine itself paused because a spec exceeded its
+    /// persisted cross-run attempt budget must not be silently relaunched by
+    /// a pending autorun schedule either — it needs a human, exactly like
+    /// any other blocker. `LoopEngine::block_loop` reaches this state
+    /// through the exact same `update_loop_status(..., Paused, ...)` path
+    /// as an operator pause (clearing `paused_by_reconciliation` on every
+    /// call), so `is_autorun_due` already refuses it — this exercises that
+    /// through real execution rather than a hand-built `Loop` row.
+    #[tokio::test]
+    async fn fire_due_autorun_loops_never_fires_a_c19_blocked_loop() {
+        use crate::domain::loops::{Loop, LoopNode, LoopNodeKind, LoopSpec, LoopSpecStatus};
+
+        let (db, scheduler, loop_engine) = test_scheduler_and_engine();
+        let workdir = tempfile::tempdir().unwrap();
+        let loop_id = "c19-blocked-autorun".to_string();
+        db.insert_loop(&Loop {
+            archived: false,
+            paused_by_reconciliation: false,
+            id: loop_id.clone(),
+            name: "C19 blocked autorun test".to_string(),
+            description: None,
+            workdir: workdir.path().to_string_lossy().to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        })
+        .unwrap();
+
+        let spec_id = "c19-blocked-spec".to_string();
+        db.insert_loop_spec(&LoopSpec {
+            id: spec_id.clone(),
+            loop_id: Some(loop_id.clone()),
+            name: "Spec".to_string(),
+            description: Some(
+                "Functional Requirements:\n- A\n\nNon-Functional Requirements:\n- B\n\n\
+                 Objective:\n- C\n\nConstraints:\n- D\n\nGuidelines:\n- E\n\nIn Scope:\n- F\n\n\
+                 Out of Scope:\n- G"
+                    .to_string(),
+            ),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "dead-end".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "dead-end".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "exit 1",
+                "success_condition": "exit_code_0",
+            }),
+            position: 1,
+            created_at: Utc::now(),
+        })
+        .unwrap();
+        // No outgoing edge from "dead-end": one genuine Fail is enough to
+        // exceed the attempt limit of 1 this fixture set up.
+
+        loop_engine
+            .run_loop(loop_id.clone(), None, None)
+            .await
+            .unwrap();
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Paused, "must be blocked, not failed");
+        assert!(!lp.paused_by_reconciliation);
+
+        db.schedule_loop_autorun(&loop_id, Utc::now() - chrono::Duration::minutes(1))
+            .unwrap();
+
+        scheduler.fire_due_autorun_loops(Utc::now()).unwrap();
+
+        let lp_after = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(
+            lp_after.status,
+            LoopStatus::Paused,
+            "a C19-blocked loop must not autorun"
+        );
+        assert!(
+            lp_after.autorun_at.is_some(),
+            "the pending schedule stays pending until the blocker is cleared"
         );
     }
 

@@ -5223,6 +5223,65 @@ fn archived_migration_defaults_existing_rows_and_is_idempotent() {
     assert!(lp.archived);
 }
 
+#[test]
+fn cross_run_attempts_migration_defaults_existing_rows_and_is_idempotent() {
+    // Simulate a pre-C19 database: `loop_specs` without `cross_run_attempts`.
+    let tmp = NamedTempFile::new().expect("create temp file");
+    let path = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+
+    {
+        let conn = rusqlite::Connection::open(&path).expect("open raw legacy db");
+        conn.execute_batch(
+            "CREATE TABLE loop_specs (
+                id TEXT PRIMARY KEY,
+                loop_id TEXT,
+                name TEXT NOT NULL,
+                description TEXT,
+                position INTEGER NOT NULL,
+                parallelizable INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER,
+                spec_start_head TEXT,
+                workdir TEXT,
+                completed_via TEXT,
+                completed_via_reason TEXT,
+                completed_via_at INTEGER,
+                spec_committed_head TEXT
+             );
+             INSERT INTO loop_specs (id, loop_id, name, position, status)
+                 VALUES ('legacy-spec', NULL, 'Spec', 1, 'failed');",
+        )
+        .expect("seed legacy schema");
+    }
+
+    // Opening the DB (Database::new runs the migration) must add the column
+    // without erroring, defaulting the pre-existing row to zero attempts.
+    let db = Database::new(&path).expect("open pre-cross_run_attempts db, running migration");
+    assert_eq!(
+        db.get_loop_spec_cross_run_attempts("legacy-spec").unwrap(),
+        0,
+        "pre-existing rows must default to zero attempts"
+    );
+
+    // The new column is actually usable after migration.
+    assert_eq!(
+        db.increment_loop_spec_cross_run_attempts("legacy-spec")
+            .unwrap(),
+        1
+    );
+    drop(db);
+
+    // Reopening after the migration already ran must be a no-op: same data,
+    // no error (idempotent), the incremented count preserved.
+    let db = Database::new(&path).expect("reopen db after migration already applied");
+    assert_eq!(
+        db.get_loop_spec_cross_run_attempts("legacy-spec").unwrap(),
+        1
+    );
+}
+
 // RETIRED-SCHEMA-NAME-BEGIN
 /// Guards the pool-to-queue rename from regressing a third time: the public
 /// surface and the schema were already renamed once each, in two separate

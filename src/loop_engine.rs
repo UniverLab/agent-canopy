@@ -18,6 +18,13 @@ use crate::domain::models::Cli;
 // Five bounces of the same (spec,node) pair is enough signal that a spec
 // needs a human or a redesign; ten burned entire quota windows ping-ponging.
 const DEFAULT_MAX_ITERATIONS_PER_NODE: usize = 5;
+/// Default cross-run attempt budget (C19): how many separate loop executions
+/// a spec may fail with a genuine verdict before the loop is marked blocked
+/// instead of quietly costing another quota window on relaunch. Deliberately
+/// lower than [`DEFAULT_MAX_ITERATIONS_PER_NODE`] — these are whole attempts
+/// (one per relaunch), not node cycles within a single one. Overridable via
+/// [`LoopEngine::with_spec_attempt_limit`] (`CanopyConfig::spec_attempt_limit`).
+const DEFAULT_MAX_SPEC_ATTEMPTS: usize = 3;
 const DEFAULT_INFRA_RETRY_LIMIT: u32 = 2;
 const DEFAULT_INFRA_CRASH_MAX_SECONDS: u64 = 60;
 const DEFAULT_INFRA_BACKOFF_SECONDS: u64 = 30;
@@ -45,6 +52,8 @@ pub struct LoopEngine {
     /// degrades to a WARN + note per skill, exactly like a store that's
     /// there but can't reach its sources.
     dynamic_skills: Option<Arc<crate::dynamic_skills::SkillStore>>,
+    /// Cross-run attempt budget (C19) — see [`DEFAULT_MAX_SPEC_ATTEMPTS`].
+    spec_attempt_limit: usize,
 }
 
 /// Where a spec's sequential graph cursor currently is: at a single ordinary
@@ -80,6 +89,16 @@ enum SpecExecutionOutcome {
     /// terminated it (a newer attempt, or the dispatch that won the loop
     /// claim after a reset) is what now drives the loop.
     Superseded,
+    /// C19: this spec has now failed with a genuine verdict often enough,
+    /// across separate loop executions, to exceed its persisted cross-run
+    /// attempt budget ([`LoopEngine::spec_attempt_limit`]). Unlike `Failed`,
+    /// which invites another relaunch, this converts the dispatch's outcome
+    /// into a paused, human-visible blocker — see
+    /// [`LoopEngine::block_loop`] — so an unsatisfiable spec stops quietly
+    /// costing another quota window on every reset. The `String` is the
+    /// blocker text, naming the spec, the attempt count, and the last
+    /// failure.
+    Blocked(String),
 }
 
 struct NodeExecution {
@@ -113,6 +132,7 @@ impl LoopEngine {
             notification_service,
             ensemble_concurrency: Arc::new(Semaphore::new(DEFAULT_ENSEMBLE_CONCURRENCY_CAP)),
             dynamic_skills: None,
+            spec_attempt_limit: DEFAULT_MAX_SPEC_ATTEMPTS,
         }
     }
 
@@ -122,6 +142,15 @@ impl LoopEngine {
     /// forever.
     pub fn with_ensemble_concurrency_cap(mut self, cap: usize) -> Self {
         self.ensemble_concurrency = Arc::new(Semaphore::new(cap.max(1)));
+        self
+    }
+
+    /// Override the default cross-run attempt budget (C19) — e.g. from
+    /// `CanopyConfig::spec_attempt_limit` at daemon startup. `limit` is
+    /// floored at 1 so a misconfigured `0` can't block every spec on its
+    /// very first genuine failure.
+    pub fn with_spec_attempt_limit(mut self, limit: usize) -> Self {
+        self.spec_attempt_limit = limit.max(1);
         self
     }
 
@@ -408,6 +437,10 @@ impl LoopEngine {
                                     )?;
                                     return Ok(());
                                 }
+                                SpecExecutionOutcome::Blocked(blocker) => {
+                                    self.block_loop(&loop_id, Some(claimed_at), &blocker)?;
+                                    return Ok(());
+                                }
                             }
                         }
                     }
@@ -442,6 +475,10 @@ impl LoopEngine {
                         }
                         SpecExecutionOutcome::Failed(summary) => {
                             self.fail_loop(&loop_id, Some(claimed_at), Some(&spec.name), &summary)?;
+                            return Ok(());
+                        }
+                        SpecExecutionOutcome::Blocked(blocker) => {
+                            self.block_loop(&loop_id, Some(claimed_at), &blocker)?;
                             return Ok(());
                         }
                     }
@@ -512,6 +549,10 @@ impl LoopEngine {
                         }
                         SpecExecutionOutcome::Failed(summary) => {
                             self.fail_loop(&loop_id, Some(claimed_at), Some(&spec.name), &summary)?;
+                            return Ok(());
+                        }
+                        SpecExecutionOutcome::Blocked(blocker) => {
+                            self.block_loop(&loop_id, Some(claimed_at), &blocker)?;
                             return Ok(());
                         }
                     }
@@ -1021,6 +1062,28 @@ impl LoopEngine {
                     spec.name,
                     cursor_label(&cursor, &ensembles)
                 );
+                // C19: every bounce that grew this counter was a genuine
+                // fail-edge routing decision, not an in-flight infra retry
+                // (those never touch `iterations` — see its increment
+                // above) — so reaching the per-node budget always reflects
+                // repeated real verdicts, never pure infrastructure noise.
+                if let Some(blocker) = self.record_spec_attempt(spec, &summary, false)? {
+                    if let Some(run) = self.db.list_loop_runs_for_spec(&spec.id)?.last() {
+                        self.set_run_blocker(
+                            &run.id,
+                            run.status,
+                            run.output.as_ref().unwrap_or(&serde_json::json!({})),
+                            &blocker,
+                        )?;
+                    }
+                    self.db.update_loop_spec_status(
+                        &spec.id,
+                        LoopSpecStatus::Failed,
+                        None,
+                        Some(chrono::Utc::now()),
+                    )?;
+                    return Ok(SpecExecutionOutcome::Blocked(blocker));
+                }
                 self.db.update_loop_spec_status(
                     &spec.id,
                     LoopSpecStatus::Failed,
@@ -1439,6 +1502,31 @@ impl LoopEngine {
                     });
                 }
                 None => {
+                    // C19: this dead-end Fail is what just ended the
+                    // attempt — check it directly for the infra markers
+                    // `is_infra_crash`/`agent_finished_execution` already
+                    // write, rather than re-deriving "did an agent actually
+                    // produce a verdict".
+                    let is_infra = execution_is_infra_failure(&final_execution.output);
+                    if let Some(blocker) =
+                        self.record_spec_attempt(spec, &final_execution.summary, is_infra)?
+                    {
+                        if let Some(terminal_run_id) = run_id.as_deref() {
+                            self.set_run_blocker(
+                                terminal_run_id,
+                                final_execution.status,
+                                &final_execution.output,
+                                &blocker,
+                            )?;
+                        }
+                        self.db.update_loop_spec_status(
+                            &spec.id,
+                            LoopSpecStatus::Failed,
+                            None,
+                            Some(chrono::Utc::now()),
+                        )?;
+                        return Ok(SpecExecutionOutcome::Blocked(blocker));
+                    }
                     self.db.update_loop_spec_status(
                         &spec.id,
                         LoopSpecStatus::Failed,
@@ -1486,6 +1574,70 @@ impl LoopEngine {
         self.db
             .update_loop_run_result(run_id, final_execution.status, Some(&output), None)?;
         Ok(())
+    }
+
+    /// Overwrite (not merge-and-preserve, unlike [`Self::record_terminal_blocker`])
+    /// `run_id`'s `output.blocker` with C19's cross-run budget text. Called
+    /// only once [`Self::record_spec_attempt`] has confirmed the budget is
+    /// actually exceeded, at which point this attempt's blocker is strictly
+    /// more informative than whatever dead-end text (if any) is already
+    /// there — naming the spec, the attempt count, and the last failure
+    /// rather than just this one node.
+    fn set_run_blocker(
+        &self,
+        run_id: &str,
+        status: LoopRunStatus,
+        output: &Value,
+        blocker: &str,
+    ) -> Result<()> {
+        let mut merged = output.clone();
+        match merged.as_object_mut() {
+            Some(map) => {
+                map.insert("blocker".to_string(), Value::String(blocker.to_string()));
+            }
+            None => merged = serde_json::json!({ "blocker": blocker }),
+        }
+        self.db
+            .update_loop_run_result(run_id, status, Some(&merged), None)?;
+        Ok(())
+    }
+
+    /// C19: called from [`Self::run_spec`] every time a spec is about to end
+    /// this attempt as `Failed`, with `is_infra_failure` (from
+    /// [`execution_is_infra_failure`]) telling it whether the terminating
+    /// execution reflects a genuine verdict or an infrastructure failure
+    /// that never produced one — an infra failure touches nothing and
+    /// returns `None` immediately.
+    ///
+    /// A genuine failure increments the spec's own persisted
+    /// `cross_run_attempts` counter (`loop_specs.cross_run_attempts`) —
+    /// unlike the per-node `iterations` map `run_spec` builds fresh on every
+    /// call, this survives `loop_reset`, a relaunch, and a daemon restart,
+    /// which is the entire point: an unsatisfiable spec must not get a
+    /// fresh budget every time an operator resets and relaunches after a
+    /// quota failure. Once the count reaches `self.spec_attempt_limit`,
+    /// returns `Some(blocker text)` naming the spec, the attempt count, and
+    /// `summary` (the last failure) — the caller is responsible for
+    /// recording it and converting this attempt's outcome to `Blocked`
+    /// instead of `Failed`.
+    fn record_spec_attempt(
+        &self,
+        spec: &LoopSpec,
+        summary: &str,
+        is_infra_failure: bool,
+    ) -> Result<Option<String>> {
+        if is_infra_failure {
+            return Ok(None);
+        }
+        let attempts = self.db.increment_loop_spec_cross_run_attempts(&spec.id)?;
+        if (attempts as usize) < self.spec_attempt_limit {
+            return Ok(None);
+        }
+        Ok(Some(format!(
+            "Spec '{}' failed {} time(s) across separate loop executions (limit {}); last \
+             failure: {}",
+            spec.name, attempts, self.spec_attempt_limit, summary
+        )))
     }
 
     /// Run an ensemble's members concurrently (F1), wait for every one of
@@ -1975,11 +2127,11 @@ impl LoopEngine {
     }
 
     /// Notify that `loop_id` has become blocked on a node needing human
-    /// intervention (`loop_report_blocker`). This is the only "loop
-    /// finished" case not driven from within [`Self::run_loop_dispatch`] —
-    /// the daemon's `loop_report_blocker` tool owns the actual state
-    /// transition (pausing the loop, recording the blocker on the run) and
-    /// calls this to fire the matching notification.
+    /// intervention. Called both by the daemon's `loop_report_blocker` tool
+    /// (which owns that state transition itself — pausing the loop,
+    /// recording the blocker on the run) and by [`Self::block_loop`] (C19),
+    /// so there is one notification path for every way a loop can end up
+    /// blocked.
     pub fn notify_blocked(&self, loop_id: &str, summary: &str) -> Result<()> {
         let loop_name = self
             .db
@@ -1989,6 +2141,50 @@ impl LoopEngine {
         self.notification_service
             .notify_loop_finished(&loop_name, LoopFinishOutcome::Blocked { summary });
         Ok(())
+    }
+
+    /// C19: the `Blocked` counterpart to [`Self::fail_loop`] — same
+    /// stale-dispatch guard (a reset + relaunch that's already claimed the
+    /// loop must not be paused out from under it) and the same B12 sweep of
+    /// any run still `running` under `loop_id`, but pauses the loop instead
+    /// of failing it and fires [`Self::notify_blocked`] instead of the
+    /// ordinary failed-loop notification. This is what a spec that exceeded
+    /// its persisted cross-run attempt budget routes through: unlike
+    /// `Failed`, `Paused` is not accepted by a pending autorun
+    /// ([`crate::domain::loops::Loop::is_autorun_due`] already excludes it
+    /// unless `paused_by_reconciliation`, which `update_loop_status` always
+    /// clears) and is refused by `loop_run` once it carries a blocker (see
+    /// the daemon's `loop_run` tool) — exactly the "not started again until
+    /// a human clears it" FR4 asks for, reusing the loop_report_blocker
+    /// mechanism wholesale rather than inventing a parallel one.
+    fn block_loop(
+        &self,
+        loop_id: &str,
+        dispatch_started_at: Option<chrono::DateTime<chrono::Utc>>,
+        blocker: &str,
+    ) -> Result<()> {
+        if let Some(expected) = dispatch_started_at {
+            let current_started_at = self.db.get_loop(loop_id)?.and_then(|lp| lp.started_at);
+            let still_current =
+                current_started_at.is_some_and(|at| at.timestamp() == expected.timestamp());
+            if !still_current {
+                tracing::info!(
+                    "Loop '{}' block from a stale dispatch (claimed at {}) ignored — a newer \
+                     dispatch has since taken over; this attempt's own run row already records \
+                     its own outcome.",
+                    loop_id,
+                    expected.to_rfc3339()
+                );
+                return Ok(());
+            }
+        }
+
+        self.db
+            .update_loop_status(loop_id, LoopStatus::Paused, None, None)?;
+        for run in self.db.list_running_loop_runs(loop_id).unwrap_or_default() {
+            self.terminate_run(&run, "spec exceeded cross-run attempt budget");
+        }
+        self.notify_blocked(loop_id, blocker)
     }
 
     /// `(done, total)` specs for `loop_id`'s current run — the loop's bound
@@ -2167,6 +2363,26 @@ fn is_infra_crash(
         && execution.status == LoopRunStatus::Fail
         && (chrono::Utc::now() - run.started_at).num_seconds() < crash_max_secs as i64
         && attempt < retry_limit
+}
+
+/// C19: whether `output` reflects an infrastructure failure — a crash,
+/// empty response, or dropped/never-filed report — rather than a genuine
+/// verdict an agent (or check/gate) actually produced. Reuses the exact
+/// markers [`is_infra_crash`]/`agent_finished_execution` already write
+/// (`infra_crash`, `no_output`, `failure_kind: "no_report"`) instead of
+/// re-deriving the distinction — see [`LoopEngine::record_spec_attempt`],
+/// the only caller: an infra failure never consumes the persisted cross-run
+/// attempt budget.
+fn execution_is_infra_failure(output: &Value) -> bool {
+    output
+        .get("infra_crash")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || output
+            .get("no_output")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        || output.get("failure_kind").and_then(Value::as_str) == Some("no_report")
 }
 
 /// Persist a crashed agent attempt with B19 `infra_attempt`/`infra_crash`
@@ -9925,6 +10141,203 @@ echo done
                 .as_ref()
                 .is_none_or(|output| output.get("blocker").is_none()),
             "a passing dead-end must never record a blocker"
+        );
+    }
+
+    // ── C19: cross-run attempt budget ─────────────────────────────────
+
+    /// The regression test for the whole spec: a spec that keeps failing
+    /// with a genuine verdict — never an infra crash — across three
+    /// SEPARATE `run_loop` dispatches (not three bounces within one, which
+    /// is the pre-existing per-node `DEFAULT_MAX_ITERATIONS_PER_NODE`
+    /// budget) must end up `Blocked`, not `Failed`: the loop pauses, and the
+    /// terminating run's blocker names the spec and the attempt count.
+    #[tokio::test]
+    async fn cross_run_attempt_budget_blocks_loop_after_three_failed_executions() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "dead-end".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "dead-end".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "exit 1",
+                "success_condition": "exit_code_0",
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        // No outgoing edge from "dead-end": every execution dead-ends
+        // there as a genuine (Check-node, never infra-classified) Fail.
+
+        // Executions 1 and 2: ordinary Failed, not yet blocked.
+        for expected_attempts in 1..=2 {
+            engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+            let lp = db.get_loop(&loop_id).unwrap().unwrap();
+            assert_eq!(lp.status, LoopStatus::Failed, "attempt {expected_attempts}");
+            assert_eq!(
+                db.get_loop_spec_cross_run_attempts(&spec_id).unwrap(),
+                expected_attempts,
+                "attempt count must persist across separate executions"
+            );
+        }
+
+        // Execution 3: the budget (default 3) is now exceeded — blocked.
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        assert_eq!(db.get_loop_spec_cross_run_attempts(&spec_id).unwrap(), 3);
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(
+            lp.status,
+            LoopStatus::Paused,
+            "the third genuine failure must block the loop, not just fail it"
+        );
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        let blocker = runs
+            .last()
+            .unwrap()
+            .output
+            .as_ref()
+            .and_then(|output| output.get("blocker"))
+            .and_then(Value::as_str)
+            .expect("the terminating run must carry the C19 blocker");
+        assert!(
+            blocker.contains(&spec_id) || blocker.contains("Spec"),
+            "{blocker}"
+        );
+        assert!(
+            blocker.contains('3'),
+            "blocker must name the attempt count: {blocker}"
+        );
+    }
+
+    /// Decision 2: an infrastructure failure (here, `no_output` — an agent
+    /// that exits 0 with nothing to say) never consumes the cross-run
+    /// budget. Verified directly against `execution_is_infra_failure` /
+    /// `record_spec_attempt` — the exact pair `run_spec` consults — rather
+    /// than fighting the test-cli harness into reproducing a raw process
+    /// crash end-to-end.
+    #[tokio::test]
+    async fn infra_marked_output_does_not_consume_the_cross_run_budget() {
+        let (_dir, db, engine, _loop_id, spec_id) = loop_fixture().unwrap();
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+
+        for infra_output in [
+            serde_json::json!({"infra_crash": true, "infra_attempt": 0}),
+            serde_json::json!({"no_output": true}),
+            serde_json::json!({"failure_kind": "no_report"}),
+        ] {
+            assert!(execution_is_infra_failure(&infra_output), "{infra_output}");
+            let blocked = engine
+                .record_spec_attempt(&spec, "infra blip", true)
+                .unwrap();
+            assert!(blocked.is_none(), "an infra failure must never block");
+        }
+        assert_eq!(
+            db.get_loop_spec_cross_run_attempts(&spec_id).unwrap(),
+            0,
+            "none of the infra-flavoured failures above may have touched the counter"
+        );
+
+        // A genuine failure, by contrast, does.
+        assert!(!execution_is_infra_failure(&serde_json::json!({})));
+        engine
+            .record_spec_attempt(&spec, "a real fail", false)
+            .unwrap();
+        assert_eq!(db.get_loop_spec_cross_run_attempts(&spec_id).unwrap(), 1);
+    }
+
+    /// Decision 6: an EXPLICIT `loop_reset` of the specific spec that hit
+    /// the budget clears its count, so the next execution starts fresh
+    /// rather than being blocked on its very first fail. The counter must
+    /// still be shared across executions otherwise — this is the one
+    /// deliberate escape hatch, not a general amnesty.
+    #[tokio::test]
+    async fn explicit_spec_reset_clears_the_cross_run_attempt_count() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "dead-end".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "dead-end".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "exit 1",
+                "success_condition": "exit_code_0",
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        // Two genuine failures — one short of the default budget of 3.
+        for _ in 0..2 {
+            engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        }
+        assert_eq!(db.get_loop_spec_cross_run_attempts(&spec_id).unwrap(), 2);
+
+        // The operator names this spec explicitly — the "I fixed it" signal.
+        let outcome = db
+            .reset_loop(&loop_id, Some(std::slice::from_ref(&spec_id)))
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            crate::domain::loops::LoopResetOutcome::Reset { spec_count: 1 }
+        ));
+        assert_eq!(
+            db.get_loop_spec_cross_run_attempts(&spec_id).unwrap(),
+            0,
+            "an explicit reset of this exact spec must clear its count"
+        );
+
+        // The next execution starts fresh: one more genuine failure lands
+        // at count 1, not 3 — still an ordinary Failed, not Blocked.
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        assert_eq!(db.get_loop_spec_cross_run_attempts(&spec_id).unwrap(), 1);
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(
+            lp.status,
+            LoopStatus::Failed,
+            "must not be blocked so soon after reset"
+        );
+    }
+
+    /// The mirror image, and decision 6's other half: a BLANKET
+    /// `loop_reset` (no `specs` named) resets the spec's status like any
+    /// other, but must NOT clear its attempt count — that's exactly the
+    /// "operator resets and relaunches without fixing anything" recovery
+    /// this whole spec exists to stop from silently resetting the budget.
+    #[tokio::test]
+    async fn blanket_loop_reset_does_not_clear_the_cross_run_attempt_count() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "dead-end".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "dead-end".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "exit 1",
+                "success_condition": "exit_code_0",
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        assert_eq!(db.get_loop_spec_cross_run_attempts(&spec_id).unwrap(), 1);
+
+        db.reset_loop(&loop_id, None).unwrap();
+        assert_eq!(
+            db.get_loop_spec_cross_run_attempts(&spec_id).unwrap(),
+            1,
+            "a blanket reset must leave the persisted count untouched"
         );
     }
 

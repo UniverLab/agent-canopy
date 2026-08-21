@@ -1970,6 +1970,11 @@ struct SpecRunInfo {
     name: String,
     current_node: Option<String>,
     blocker: Option<String>,
+    /// C19: how many separate loop executions this spec has failed with a
+    /// genuine verdict — the persisted counter behind the cross-run attempt
+    /// budget. Surfaced so an operator can see a spec approaching the limit
+    /// before it actually blocks the loop, not just after.
+    cross_run_attempts: i64,
 }
 
 fn build_spec_run_info(db: &Database, spec: &LoopSpec) -> Result<SpecRunInfo, McpError> {
@@ -1983,10 +1988,14 @@ fn build_spec_run_info(db: &Database, spec: &LoopSpec) -> Result<SpecRunInfo, Mc
         .or_else(|| runs.last())
         .map(|run| run.node_id.clone());
     let blocker = runs.last().and_then(loop_run_blocker);
+    let cross_run_attempts = db
+        .get_loop_spec_cross_run_attempts(&spec.id)
+        .map_err(internal_error)?;
     Ok(SpecRunInfo {
         name: spec.name.clone(),
         current_node,
         blocker,
+        cross_run_attempts,
     })
 }
 
@@ -2019,7 +2028,8 @@ fn build_loop_summary_json(db: &Database, lp: &Loop) -> Result<serde_json::Value
         "current_spec": current_spec.as_ref().map(|v| &v.name),
         "current_node": current_spec.as_ref().and_then(|v| v.current_node.as_ref()),
         "blocked": current_spec.as_ref().is_some_and(|v| v.blocker.is_some()),
-        "blocker": current_spec.and_then(|v| v.blocker),
+        "blocker": current_spec.as_ref().and_then(|v| v.blocker.clone()),
+        "spec_attempts": current_spec.as_ref().map(|v| v.cross_run_attempts),
         "created_at": lp.created_at.to_rfc3339(),
         "workdir": lp.workdir,
         "archived": lp.archived,
@@ -5888,6 +5898,27 @@ impl TaskTriggerHandler {
 
         if let Err(message) = loop_run_status_guard(&params.loop_id, lp.status) {
             return Ok(error_result(&message));
+        }
+
+        // C19: a loop paused with an active blocker (whether from
+        // `loop_report_blocker` or from a spec exceeding its cross-run
+        // attempt budget) needs a human, not another relaunch —
+        // `loop_run_status_guard` alone still accepts `Paused` (that's the
+        // normal resume-after-`loop_pause` path), so this is a second,
+        // narrower check on top of it. `loop_reset` always clears the
+        // loop's own status back to `draft` regardless of which specs it
+        // targeted, so this only ever refuses the exact window FR4 asks
+        // for: still-`paused`-and-blocked, not yet reset.
+        if lp.status == LoopStatus::Paused {
+            let summary = build_loop_summary_json(&self.db, &lp)?;
+            if let Some(blocker) = summary.get("blocker").and_then(|v| v.as_str()) {
+                return Ok(error_result(&format!(
+                    "Loop '{}' is blocked and cannot be relaunched via loop_run: {blocker}. \
+                     Resolve it, then loop_reset the affected spec (naming it explicitly \
+                     clears its cross-run attempt count) before relaunching.",
+                    params.loop_id
+                )));
+            }
         }
 
         // A dispatch is refused while any run of this loop is still
@@ -17364,6 +17395,46 @@ mod endpoint_tests {
         assert_eq!(
             db.get_loop(&lp.id).unwrap().unwrap().status,
             LoopStatus::Paused
+        );
+    }
+
+    /// C19 FR4 (reusing the same blocker mechanism `loop_report_blocker`
+    /// uses): a loop paused with an active blocker must not be silently
+    /// relaunched via `loop_run` — that's the whole "not started again
+    /// until a human clears it" the budget exists for. A plain
+    /// `loop_pause` (`Paused`, no blocker) is unaffected — `loop_run`
+    /// resuming that is the normal, sanctioned path and must keep working.
+    #[tokio::test]
+    async fn loop_run_refuses_a_paused_loop_with_an_active_blocker() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let run = insert_running_node_run(&db, &lp.id);
+        let node_id = run.node_id.clone();
+
+        let blocked = handler
+            .loop_report_blocker(Parameters(LoopReportBlockerParams {
+                run_id: run.id,
+                node_id,
+                description: "waiting on human input".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&blocked), "{}", text(&blocked));
+
+        let result = handler
+            .loop_run(Parameters(LoopRunParams {
+                loop_id: lp.id.clone(),
+                queue_id: None,
+                workdir: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&result), "a blocked loop must refuse loop_run");
+        assert!(text(&result).contains("blocked"), "{}", text(&result));
+        assert_eq!(
+            db.get_loop(&lp.id).unwrap().unwrap().status,
+            LoopStatus::Paused,
+            "the refusal must not itself change the loop's status"
         );
     }
 

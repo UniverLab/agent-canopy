@@ -62,6 +62,17 @@ pub struct CanopyConfig {
     #[serde(default = "default_ensemble_concurrency_cap")]
     pub ensemble_concurrency_cap: usize,
 
+    /// Cross-run attempt budget (C19): how many separate loop executions a
+    /// single spec may fail with a genuine verdict before the loop is marked
+    /// blocked instead of being left to burn another quota window on a
+    /// relaunch. Persisted per spec (`loop_specs.cross_run_attempts`) so it
+    /// survives `loop_reset`, a relaunch, and a daemon restart — unlike the
+    /// per-node in-run iteration budget, which resets with every execution.
+    /// Lower than that per-node budget by design: these are whole attempts,
+    /// not node cycles.
+    #[serde(default = "default_spec_attempt_limit")]
+    pub spec_attempt_limit: usize,
+
     /// `[clean]` settings for the `canopy clean` CLI command.
     #[serde(default)]
     pub clean: CleanConfig,
@@ -296,6 +307,10 @@ fn default_ensemble_concurrency_cap() -> usize {
     4
 }
 
+fn default_spec_attempt_limit() -> usize {
+    3
+}
+
 fn default_theme() -> String {
     "classic".to_string()
 }
@@ -388,6 +403,7 @@ impl Default for CanopyConfig {
             projects_root: default_projects_root(),
             embeddings_idle_unload_secs: default_embeddings_idle_unload_secs(),
             ensemble_concurrency_cap: default_ensemble_concurrency_cap(),
+            spec_attempt_limit: default_spec_attempt_limit(),
             clean: CleanConfig::default(),
             skills: SkillsConfig::default(),
             models: ModelsConfig::default(),
@@ -733,6 +749,26 @@ mod tests {
 
         let loaded = CanopyConfig::load(&canopy_dir);
         assert_eq!(loaded.ensemble_concurrency_cap, 8);
+    }
+
+    #[test]
+    fn test_spec_attempt_limit_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let canopy_dir = dir.path().join(".canopy");
+
+        let config = CanopyConfig {
+            spec_attempt_limit: 5,
+            ..CanopyConfig::default()
+        };
+        config.save(&canopy_dir).unwrap();
+
+        let loaded = CanopyConfig::load(&canopy_dir);
+        assert_eq!(loaded.spec_attempt_limit, 5);
+    }
+
+    #[test]
+    fn test_spec_attempt_limit_defaults_to_three() {
+        assert_eq!(CanopyConfig::default().spec_attempt_limit, 3);
     }
 
     #[test]

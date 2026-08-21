@@ -465,16 +465,75 @@ impl Database {
     /// Reset a loop spec back to `Pending`, clearing `started_at` and
     /// `completed_at` unconditionally (unlike [`Self::update_loop_spec_status`],
     /// which only overwrites when a new value is given). Used by `loop_reset`.
-    pub fn reset_loop_spec_status(&self, spec_id: &str) -> Result<bool> {
+    ///
+    /// `clear_cross_run_attempts` (C19) additionally zeroes the spec's
+    /// persisted cross-run attempt counter — but only when the caller passed
+    /// this exact spec explicitly. [`Self::reset_loop`] wires that in: an
+    /// operator naming a spec by id is the deliberate "I fixed this" signal
+    /// decision 6 asks for; a blanket reset of every non-completed spec is
+    /// not, so the counter must survive it — otherwise the very relaunch
+    /// this budget exists to guard against would silently get a fresh one
+    /// every time.
+    pub fn reset_loop_spec_status(
+        &self,
+        spec_id: &str,
+        clear_cross_run_attempts: bool,
+    ) -> Result<bool> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let rows = conn.execute(
-            "UPDATE loop_specs SET status = ?1, started_at = NULL, completed_at = NULL, spec_start_head = NULL, spec_committed_head = NULL WHERE id = ?2",
-            params![LoopSpecStatus::Pending.as_str(), spec_id],
+            "UPDATE loop_specs SET status = ?1, started_at = NULL, completed_at = NULL, spec_start_head = NULL, spec_committed_head = NULL,
+                 cross_run_attempts = CASE WHEN ?3 THEN 0 ELSE cross_run_attempts END
+             WHERE id = ?2",
+            params![
+                LoopSpecStatus::Pending.as_str(),
+                spec_id,
+                clear_cross_run_attempts,
+            ],
         )?;
         Ok(rows > 0)
+    }
+
+    /// C19: the spec's persisted cross-run attempt count — how many separate
+    /// loop executions it has failed with a genuine (non-infrastructure)
+    /// verdict. `0` for a spec that has never failed this way (including
+    /// every pre-migration row). See [`Self::increment_loop_spec_cross_run_attempts`].
+    pub fn get_loop_spec_cross_run_attempts(&self, spec_id: &str) -> Result<i64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        conn.query_row(
+            "SELECT cross_run_attempts FROM loop_specs WHERE id = ?1",
+            params![spec_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    }
+
+    /// Increment `spec_id`'s persisted cross-run attempt count and return the
+    /// new value, atomically under the single connection lock so a
+    /// concurrent read never observes a torn increment. Called by
+    /// `LoopEngine::record_spec_attempt` exactly once per spec-execution
+    /// that ends in a genuine (non-infrastructure) `Failed` — never for an
+    /// infra failure, and never more than once per attempt.
+    pub fn increment_loop_spec_cross_run_attempts(&self, spec_id: &str) -> Result<i64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        conn.execute(
+            "UPDATE loop_specs SET cross_run_attempts = cross_run_attempts + 1 WHERE id = ?1",
+            params![spec_id],
+        )?;
+        conn.query_row(
+            "SELECT cross_run_attempts FROM loop_specs WHERE id = ?1",
+            params![spec_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
     }
 
     /// Administratively transition a standalone spec's status. The transition
@@ -610,8 +669,15 @@ impl Database {
         // recorded under this same `loop_id` (bound or drawn live from a
         // queue — see `list_loop_runs_for_loop`), so there is nothing left
         // to terminate here.
+        //
+        // C19: only an explicitly-named `specs` list clears the target
+        // spec(s)' cross-run attempt count — see `reset_loop_spec_status`'s
+        // doc. A blanket reset (`specs: None`) resets every non-completed
+        // spec's status the same as always, but leaves each one's count
+        // exactly where it was.
+        let clear_cross_run_attempts = specs.is_some();
         for spec_id in &target_ids {
-            self.reset_loop_spec_status(spec_id)?;
+            self.reset_loop_spec_status(spec_id, clear_cross_run_attempts)?;
         }
         self.reset_loop_status(loop_id)?;
 
