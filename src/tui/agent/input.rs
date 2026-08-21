@@ -199,6 +199,20 @@ impl InteractiveAgent {
             .unwrap_or(false)
     }
 
+    /// Whether the child has pushed Kitty keyboard protocol flags (`CSI >
+    /// flags u`) at any point in the session. Tracked from a raw scan of
+    /// PTY output — see [`parse_kitty_keyboard_push`] — independent of the
+    /// vt100 parser, which has no support of its own for this protocol
+    /// (vt100 0.16.2's `perform.rs` has no `u`-terminated CSI dispatch at
+    /// all).
+    #[allow(dead_code)]
+    pub fn kitty_keyboard_negotiated(&self) -> bool {
+        self.kitty_keyboard_flags
+            .try_lock()
+            .map(|f| f.is_some())
+            .unwrap_or(false)
+    }
+
     /// Forward a mouse event to the PTY.
     ///
     /// Checks the child's mouse protocol mode. If mouse reporting is
@@ -385,19 +399,40 @@ fn encode_scroll_sequence(
 
     match mode {
         MPM::None => {
-            // No mouse protocol — legacy PgUp/PgDn (CSI 5~ / CSI 6~) works
-            // in most full-screen TUIs, *including* ones that have pushed
-            // Kitty keyboard protocol flags: verified live against Codex
-            // (which negotiates Kitty flags `>7u` — disambiguate + report
-            // event types + report alternate keys, notably *not* bit 8
-            // "report all keys as escape codes") by driving its Transcript
-            // pager over a real PTY. `\x1b[5~` moved its scroll position
-            // from 100% to 0%; the Kitty `CSI u` form of the same key
-            // (`\x1b[5;1u`) was a no-op. Per the Kitty keyboard protocol
-            // spec, named/functional keys like Page Up keep their legacy
-            // final byte unless bit 8 is set — so this fallback already
-            // matches what a Kitty-flag child expects and needs no
-            // per-protocol branching.
+            // No mouse protocol — legacy PgUp/PgDn (`CSI 5 ~` / `CSI 6 ~`)
+            // is sent unconditionally, whether or not the child pushed
+            // Kitty keyboard protocol flags (see `kitty_keyboard_negotiated`
+            // above). This is not a fallback we chose over a "real" Kitty
+            // encoding — for an unmodified Page Up/Page Down keypress there
+            // is no other encoding to send. The Kitty keyboard protocol's
+            // own "Functional key codes" table (kovidgoyal/kitty
+            // docs/keyboard-protocol.rst) lists PAGE_UP as `5 ~` and
+            // PAGE_DOWN as `6 ~` — identical to the legacy table — because
+            // these keys only gain a distinct `CSI number u` / PUA-codepoint
+            // form under the "report all keys as escape codes" enhancement
+            // bit (0x8), and even then the codepoints listed (57421/57422)
+            // are for the *keypad* variants (KP_PAGE_UP/KP_PAGE_DOWN), not
+            // the plain keys a scroll-wheel tick maps to. So `\x1b[5~` /
+            // `\x1b[6~` already *is* "the Kitty encoding" here.
+            //
+            // A prior version of this comment claimed to have verified this
+            // live against Codex by driving a "Transcript pager" over a
+            // real PTY and observing `\x1b[5~` move its scroll position
+            // from 100% to 0%. That claim could not be reproduced: driving
+            // Codex 0.147.0 over a real PTY (TERM=xterm-256color, matching
+            // how canopy spawns children — see `apply_canopy_session_env`
+            // callers in `agent/mod.rs`) through startup, the update-skip
+            // prompt, MCP server loading, a large composer paste, and an
+            // async rate-limit/model-switch picker never produced a single
+            // `\x1b[?1049h` (enter alternate screen), and neither `\x1b[5~`
+            // nor a hand-built `\x1b[5;1u` produced any output distinguishable
+            // from Codex's own idle spinner repaint. No "Transcript pager"
+            // was reachable (Ctrl+T was a no-op). Since `forward_scroll` is
+            // only ever invoked from `in_alternate_screen()` callers, and
+            // Codex was never observed to enter that mode, this fallback
+            // path does not appear to be exercised by Codex at all in the
+            // states reachable without quota (restored 2026-09-12) — see
+            // the C20 writeup.
             if scroll_up {
                 b"\x1b[5~".to_vec()
             } else {
@@ -421,6 +456,45 @@ fn encode_scroll_sequence(
             }
         }
     }
+}
+
+/// Scan raw PTY output for a Kitty keyboard protocol "push flags" sequence
+/// (`CSI > flags u`, e.g. `\x1b[>7u`) and return the flags value from the
+/// last one found, if any. vt100 0.16.2 has no support of its own for this
+/// protocol (no `u`-terminated CSI dispatch in its `perform.rs`), so this
+/// scan runs independently over the same bytes handed to `vt100::Parser`,
+/// in the reader thread in `agent/mod.rs`.
+///
+/// Only recognises a push sequence that lands whole inside `data`. In
+/// practice a child emits this once, in its very first burst of output —
+/// the 91-byte ground-truth capture this module's tests are built from is
+/// exactly that burst arriving in a single PTY `read()` — so a parser that
+/// tolerates the sequence splitting across reads was not worth the added
+/// complexity.
+pub(crate) fn parse_kitty_keyboard_push(data: &[u8]) -> Option<u8> {
+    let mut found = None;
+    let mut i = 0;
+    while i + 3 < data.len() {
+        if data[i] == 0x1b && data[i + 1] == b'[' && data[i + 2] == b'>' {
+            let start = i + 3;
+            let mut j = start;
+            while j < data.len() && data[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > start && j < data.len() && data[j] == b'u' {
+                if let Ok(flags) = std::str::from_utf8(&data[start..j])
+                    .unwrap_or_default()
+                    .parse::<u32>()
+                {
+                    found = Some(flags.min(u8::MAX as u32) as u8);
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    found
 }
 
 /// Pure predicate behind [`InteractiveAgent::has_recent_activity`]: was
@@ -744,6 +818,121 @@ mod forward_mouse_scroll_tests {
             .expect("forward_mouse should not error");
 
         assert!(consumed);
+        agent.kill();
+    }
+}
+
+// C20: pure-function coverage for `parse_kitty_keyboard_push`, the raw-byte
+// scan that stands in for vt100's lack of Kitty keyboard protocol support.
+#[cfg(test)]
+mod kitty_keyboard_push_tests {
+    use super::parse_kitty_keyboard_push;
+
+    // Ground truth: Codex 0.147.0's real negotiation burst, captured over a
+    // real PTY (see the C20 writeup) — 91 bytes, arriving in one PTY read.
+    const CODEX_NEGOTIATION: &[u8] = b"\x1b[?2004h\x1b[>4;0m\x1b[>7u\x1b[?1004h\x1b[6n\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b[?u\x1b[c\x1b[?2026h\x1b[39m\x1b[49m\x1b[0m\x1b[?25l\x1b[?2026l";
+
+    #[test]
+    fn recognises_the_codex_negotiation_burst() {
+        assert_eq!(parse_kitty_keyboard_push(CODEX_NEGOTIATION), Some(7));
+    }
+
+    #[test]
+    fn absence_leaves_it_unset() {
+        // The same burst minus the `\x1b[>7u` push — everything else here
+        // (modifyOtherKeys, focus reporting, cursor position report) must
+        // not be mistaken for a keyboard-protocol push.
+        assert_eq!(
+            parse_kitty_keyboard_push(b"\x1b[?2004h\x1b[>4;0m\x1b[?1004h\x1b[6n"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_later_push_overrides_an_earlier_one() {
+        assert_eq!(parse_kitty_keyboard_push(b"\x1b[>1u\x1b[>31u"), Some(31));
+    }
+
+    #[test]
+    fn a_push_with_no_flags_digits_is_not_mistaken_for_one() {
+        assert_eq!(parse_kitty_keyboard_push(b"\x1b[>u"), None);
+    }
+}
+
+// C20: end-to-end coverage of `InteractiveAgent::kitty_keyboard_negotiated`
+// against a real spawned child, mirroring the `forward_mouse_scroll_tests`
+// pattern above — the state must come from genuine PTY output, not a mock.
+#[cfg(test)]
+mod kitty_keyboard_negotiation_tests {
+    use crate::domain::models::Cli;
+    use crate::tui::agent::InteractiveAgent;
+    use ratatui::style::Color;
+    use std::time::{Duration, Instant};
+
+    fn spawn_cat_agent() -> InteractiveAgent {
+        InteractiveAgent::spawn(
+            Cli::new("cat"),
+            ".",
+            80,
+            24,
+            None,
+            None,
+            Color::Reset,
+            Some("kitty-keyboard-test-agent"),
+            &[],
+            None,
+            None,
+            None,
+        )
+        .expect("spawn cat as a stand-in interactive child")
+    }
+
+    fn wait_for(mut check: impl FnMut() -> bool, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if check() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn negotiated_state_is_set_once_the_child_pushes_kitty_flags() {
+        let mut agent = spawn_cat_agent();
+        assert!(!agent.kitty_keyboard_negotiated());
+
+        // `cat` echoes stdin straight back out to its own stdout, so
+        // writing the push sequence to its stdin round-trips it through the
+        // real reader thread in `agent/mod.rs` exactly as a genuine child's
+        // own output would. The PTY is in canonical mode, so a trailing
+        // newline is needed to flush the line through to `cat` — it ends up
+        // in the echoed bytes too, but the scanner only cares about the
+        // `CSI > 7 u` part.
+        agent
+            .write_to_pty(b"\x1b[>7u\n")
+            .expect("write to cat's stdin");
+
+        assert!(wait_for(
+            || agent.kitty_keyboard_negotiated(),
+            Duration::from_secs(2)
+        ));
+        agent.kill();
+    }
+
+    #[test]
+    fn negotiated_state_stays_unset_without_a_push() {
+        let mut agent = spawn_cat_agent();
+        agent
+            .write_to_pty(b"hello, no kitty push here\n")
+            .expect("write to cat's stdin");
+        // Give the reader thread a beat to process ordinary output too, so
+        // this isn't just "we didn't wait long enough".
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!agent.kitty_keyboard_negotiated());
         agent.kill();
     }
 }
