@@ -922,10 +922,31 @@ fn report_service_unit(home: &Path, issues: &mut Vec<String>) {
 /// doesn't exist or can't be read is skipped rather than failing the whole
 /// search, and a file named `canopy` without the execute bit (or, on
 /// Windows, without a recognized `PATHEXT` extension) is not a match.
+///
+/// `which_in_all` yields one candidate per matching `PATH` entry, not one
+/// per distinct file — a directory repeated in `PATH` (ordinary when a
+/// shell profile is sourced more than once), or a symlink alongside its
+/// own target, would otherwise be counted as separate binaries. Dedupe by
+/// canonical path, keeping the first `PATH` entry that reaches each file so
+/// resolution order — and which one is "the one that runs" — is preserved.
+/// A candidate whose canonical path can't be determined (broken symlink,
+/// permission error) is kept as its own distinct entry rather than dropped:
+/// a check that can silently lose a candidate on failure is worse than one
+/// that occasionally over-reports.
 fn find_canopy_copies(path_var: &str, cwd: &Path) -> Vec<PathBuf> {
-    which::which_in_all("canopy", Some(path_var), cwd)
+    let candidates: Vec<PathBuf> = which::which_in_all("canopy", Some(path_var), cwd)
         .map(Iterator::collect)
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    let mut seen = HashSet::new();
+    let mut copies = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let key = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+        if seen.insert(key) {
+            copies.push(candidate);
+        }
+    }
+    copies
 }
 
 /// How long to wait on one copy's `--version` before giving up on it. This
@@ -1981,6 +2002,92 @@ mod tests {
         assert!(
             copies.is_empty(),
             "a non-executable file must not be reported as a copy that would run"
+        );
+    }
+
+    /// C21 regression test: the bug this spec fixes. A shell profile
+    /// sourced more than once leaves the same directory repeated in `PATH`
+    /// — one file, several `PATH` entries — and the check must still report
+    /// it as one copy, not one per repetition.
+    #[test]
+    fn find_canopy_copies_dedupes_directory_repeated_on_path() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let path_a = write_fake_canopy(dir_a.path(), "canopy 1.0.0");
+        let path_var = synthetic_path_var(&[dir_a.path(), dir_a.path(), dir_a.path()]);
+
+        let copies = find_canopy_copies(&path_var, dir_a.path());
+        assert_eq!(
+            copies,
+            vec![path_a],
+            "one file reachable through three PATH entries must be reported once"
+        );
+    }
+
+    #[tokio::test]
+    async fn gather_path_copies_report_directory_repeated_on_path_is_single_and_silent() {
+        let dir_a = tempfile::tempdir().unwrap();
+        write_fake_canopy(dir_a.path(), "canopy 1.0.0");
+        let path_var = synthetic_path_var(&[dir_a.path(), dir_a.path(), dir_a.path()]);
+
+        let report = gather_path_copies_report(&path_var, dir_a.path()).await;
+        match &report {
+            PathCopiesReport::Single { .. } => {}
+            other => panic!("expected Single from a directory repeated on PATH, got {other:?}"),
+        }
+
+        let mut issues = Vec::new();
+        print_path_copies_report(report, &mut issues);
+        assert!(
+            issues.is_empty(),
+            "a duplicated PATH entry pointing at one file must not raise a warning"
+        );
+    }
+
+    /// A symlink and its target are one binary, not two — someone who
+    /// symlinks `~/bin/canopy` to `~/.local/bin/canopy` has one install.
+    #[cfg(unix)]
+    #[test]
+    fn find_canopy_copies_dedupes_symlink_to_binary_in_another_dir() {
+        let real_dir = tempfile::tempdir().unwrap();
+        let link_dir = tempfile::tempdir().unwrap();
+        let real_path = write_fake_canopy(real_dir.path(), "canopy 1.0.0");
+        let link_path = link_dir.path().join("canopy");
+        std::os::unix::fs::symlink(&real_path, &link_path).unwrap();
+        let path_var = synthetic_path_var(&[link_dir.path(), real_dir.path()]);
+
+        let copies = find_canopy_copies(&path_var, link_dir.path());
+        assert_eq!(
+            copies.len(),
+            1,
+            "a symlink and its target must be counted as one binary, got {copies:?}"
+        );
+        assert_eq!(
+            copies[0], link_path,
+            "PATH order must be preserved: the symlink resolves first"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gather_path_copies_report_symlink_to_binary_in_another_dir_is_single_and_silent() {
+        let real_dir = tempfile::tempdir().unwrap();
+        let link_dir = tempfile::tempdir().unwrap();
+        let real_path = write_fake_canopy(real_dir.path(), "canopy 1.0.0");
+        let link_path = link_dir.path().join("canopy");
+        std::os::unix::fs::symlink(&real_path, &link_path).unwrap();
+        let path_var = synthetic_path_var(&[link_dir.path(), real_dir.path()]);
+
+        let report = gather_path_copies_report(&path_var, link_dir.path()).await;
+        match &report {
+            PathCopiesReport::Single { .. } => {}
+            other => panic!("expected Single from a symlink and its target, got {other:?}"),
+        }
+
+        let mut issues = Vec::new();
+        print_path_copies_report(report, &mut issues);
+        assert!(
+            issues.is_empty(),
+            "a symlink alongside its target must not raise a warning"
         );
     }
 
