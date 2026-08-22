@@ -486,9 +486,11 @@ fn groups_list_demand(count: usize) -> u16 {
 /// remaining height — exactly one tab is visible at a time, so there's no
 /// more space-sharing between layers (`fair_section_heights` is still used
 /// *within* a tab's own sub-sections, e.g. Live's interactive/terminal/
-/// groups panels). Returns the leftover area for the project graph / Brian's
-/// Brain — now always empty, since the active tab claims the full height,
-/// but `render_brain_or_graph` already no-ops on a zero-height area.
+/// groups panels). Returns the rows the active tab did not claim, which the
+/// project graph and Brian's Brain share. `fair_section_heights` caps each
+/// sub-section at its own demand, so a tab with few agents genuinely leaves
+/// rows over; handing back a hardcoded empty rect here is what made the brain
+/// unreachable no matter how that leftover was later divided.
 fn draw_sidebar_tabs(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) -> Rect {
     let (background_indices, interactive_indices, terminal_indices) = agent_indices_by_kind(app);
 
@@ -507,12 +509,10 @@ fn draw_sidebar_tabs(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme
             theme,
         ),
         SidebarLayer::Automation => {
-            draw_automation_body(frame, remaining, app, &background_indices, theme);
+            draw_automation_body(frame, remaining, app, &background_indices, theme)
         }
         SidebarLayer::Knowledge => draw_knowledge_body(frame, remaining, app, theme),
     }
-
-    Rect::new(area.x, area.y + area.height, area.width, 0)
 }
 
 fn draw_live_body(
@@ -522,7 +522,7 @@ fn draw_live_body(
     interactive_indices: &[usize],
     terminal_indices: &[usize],
     theme: &Theme,
-) {
+) -> Rect {
     let demands = [
         card_list_demand(interactive_indices.len()),
         card_list_demand(terminal_indices.len()),
@@ -560,6 +560,8 @@ fn draw_live_body(
     if let Some(sub) = take_top(&mut remaining, alloc[2]) {
         render_groups_panel(frame, Some(sub), app, AgentSectionFocus::Groups, theme);
     }
+
+    remaining
 }
 
 fn draw_automation_body(
@@ -568,7 +570,7 @@ fn draw_automation_body(
     app: &mut App,
     background_indices: &[usize],
     theme: &Theme,
-) {
+) -> Rect {
     let loop_count = app.sidebar_loops().len();
     let demands = [
         card_list_demand(background_indices.len()),
@@ -611,9 +613,13 @@ fn draw_automation_body(
             |frame, inner| draw_automation_loops_list(frame, inner, app, theme),
         );
     }
+
+    remaining
 }
 
-fn draw_knowledge_body(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
+/// Knowledge has a single panel that always fills its whole area, so it never
+/// leaves anything over: return an empty rect at the bottom edge.
+fn draw_knowledge_body(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) -> Rect {
     render_titled_panel(
         frame,
         area,
@@ -623,6 +629,8 @@ fn draw_knowledge_body(frame: &mut Frame, area: Rect, app: &mut App, theme: &The
         theme,
         |frame, inner| draw_projects_list(frame, inner, app, theme),
     );
+
+    Rect::new(area.x, area.y + area.height, area.width, 0)
 }
 
 // ── Focus/border styling ────────────────────────────────────────────
@@ -1832,6 +1840,20 @@ mod tests {
         theme: &Theme,
         active_layer: SidebarLayer,
     ) -> String {
+        render_sidebar_text_with(project_count, width, height, theme, active_layer, |_| {})
+    }
+
+    /// Like [`render_sidebar_text_on_tab`], but runs `prepare` on the App after
+    /// it is built and before the sidebar is drawn — for state the constructor
+    /// does not set up, such as an installed Brian's Brain.
+    fn render_sidebar_text_with(
+        project_count: usize,
+        width: u16,
+        height: u16,
+        theme: &Theme,
+        active_layer: SidebarLayer,
+        prepare: impl FnOnce(&mut App),
+    ) -> String {
         use crate::db::Database;
         use crate::domain::loops::{Loop, LoopStatus};
         use crate::domain::project::Project;
@@ -1883,6 +1905,7 @@ mod tests {
             !app.sidebar_loops().is_empty(),
             "loop should be loaded from db"
         );
+        prepare(&mut app);
 
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1907,6 +1930,46 @@ mod tests {
             text.push('\n');
         }
         text
+    }
+
+    /// A brain whose every cell is On, so its glyphs are deterministic instead
+    /// of depending on the automaton's random seed.
+    fn solid_brain(rows: usize, cols: usize) -> crate::tui::brians_brain::BriansBrain {
+        use crate::tui::brians_brain::CellState;
+        let mut brain = crate::tui::brians_brain::BriansBrain::new(rows, cols, 60);
+        for row in brain.grid.iter_mut() {
+            for cell in row.iter_mut() {
+                *cell = CellState::On;
+            }
+        }
+        for row in brain.green_grid.iter_mut() {
+            for green in row.iter_mut() {
+                *green = 255;
+            }
+        }
+        brain
+    }
+
+    /// The active tab's sub-sections are each capped at their own demand, so a
+    /// tall sidebar holding one loop and no sessions leaves rows unclaimed.
+    /// Those rows belong to the brain. `draw_sidebar_tabs` used to hand back a
+    /// hardcoded zero-height rect instead, which made the brain unreachable no
+    /// matter how `split_brain_or_graph` later divided it.
+    #[test]
+    fn unclaimed_tab_rows_are_handed_to_the_brain() {
+        let text = render_sidebar_text_with(
+            0,
+            30,
+            60,
+            &Theme::classic(),
+            SidebarLayer::Automation,
+            |app| app.sidebar_brain = Some(solid_brain(40, 28)),
+        );
+
+        assert!(
+            text.contains('\u{2588}') || text.contains('\u{28ff}'),
+            "expected Brian's Brain glyphs in the sidebar's unclaimed rows, got:\n{text}"
+        );
     }
 
     #[test]
@@ -2394,7 +2457,8 @@ mod tests {
         assert_eq!(alloc[2], demands[2]);
         // Interactive absorbs all the surplus and scrolls internally.
         assert_eq!(alloc[1], 30 - demands[0] - demands[2]);
-        // The whole budget is used — no leftover rows leaking to a brain gap.
+        // Demand exceeds the budget here, so every row is spoken for and
+        // nothing is left over for the brain.
         assert_eq!(alloc.iter().sum::<u16>(), 30);
     }
 
