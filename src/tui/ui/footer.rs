@@ -137,6 +137,10 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Them
                 let child_claimed = focused_child_claimed_keyboard(app);
                 let mut h = vec![("F10", "preview"), ("Esc", "home")];
                 if child_claimed {
+                    // Frame navigation stays with canopy even then, so it is
+                    // still worth showing: only the content shortcuts yield.
+                    h.push(("Shift+↑↓", "agents/rag"));
+                    h.push(("Shift+←→", if in_split { "split focus" } else { "tab" }));
                     h.push(("*", "other keys → child"));
                 } else {
                     h.push(("Shift+↑↓", "agents/rag"));

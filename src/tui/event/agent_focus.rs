@@ -203,15 +203,38 @@ fn is_focus_cycle_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
 /// keyboard (see [`focused_child_claimed_keyboard`]). The single source of
 /// truth for the reserved set (spec C23) — nothing below `handle_focus_shortcuts`
 /// gets to opt out of it on its own.
-const RESERVED_FOCUS_KEYS: &[KeyCode] = &[
+///
+/// The rule for earning a place here is **frame navigation**: a key that moves
+/// between canopy's own panes rather than acting on the session's content. A
+/// multiplexer that hands the inner program its application shortcuts still has
+/// to keep the keys that get you out of, and between, its frames — otherwise
+/// entering a session is a one-way door. Everything else yields.
+///
+/// Each entry is a key plus the modifiers that must be present; a match is
+/// `modifiers.contains(required)`, not equality, so a terminal that reports
+/// extra modifiers alongside them still resolves.
+const RESERVED_FOCUS_KEYS: &[(KeyCode, KeyModifiers)] = &[
     // Leaves focus back to the sidebar. With focus left, every other canopy
     // shortcut is reachable again from there, so it's the one key that must
     // survive a child claiming everything else.
-    KeyCode::F(10),
+    (KeyCode::F(10), KeyModifiers::NONE),
+    // Cross-section focus navigation (`handle_agent_cycle_shortcut`): moves the
+    // selection between agents and sections without leaving focus. Reserved
+    // after C23 shipped without it and made stepping between sessions
+    // impossible from inside one.
+    (KeyCode::Up, KeyModifiers::SHIFT),
+    (KeyCode::Down, KeyModifiers::SHIFT),
+    // Split-pane focus and the sidebar tab strip (`handle_split_panel_focus_shortcut`
+    // and the global handler behind it) — the horizontal half of the same
+    // frame navigation.
+    (KeyCode::Left, KeyModifiers::SHIFT),
+    (KeyCode::Right, KeyModifiers::SHIFT),
 ];
 
-fn is_reserved_focus_key(code: KeyCode) -> bool {
-    RESERVED_FOCUS_KEYS.contains(&code)
+fn is_reserved_focus_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    RESERVED_FOCUS_KEYS
+        .iter()
+        .any(|(reserved, required)| *reserved == code && modifiers.contains(*required))
 }
 
 /// The agent a focus shortcut would currently apply to: the focused split
@@ -249,7 +272,7 @@ pub(crate) fn focused_child_claimed_keyboard(app: &App) -> bool {
 }
 
 fn handle_focus_shortcuts(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> bool {
-    if !is_reserved_focus_key(code) && focused_child_claimed_keyboard(app) {
+    if !is_reserved_focus_key(code, modifiers) && focused_child_claimed_keyboard(app) {
         return false;
     }
 
@@ -1331,10 +1354,42 @@ mod focus_shortcuts_keyboard_claim_tests {
     }
 
     #[test]
-    fn reserved_focus_keys_is_exactly_f10() {
-        assert_eq!(RESERVED_FOCUS_KEYS, [KeyCode::F(10)]);
-        assert!(is_reserved_focus_key(KeyCode::F(10)));
-        assert!(!is_reserved_focus_key(KeyCode::Char('t')));
+    fn reserved_focus_keys_are_leave_focus_and_frame_navigation() {
+        // The list is frame navigation only: leave focus, and step between
+        // canopy's own panes. Anything that acts on the session's content is
+        // the child's.
+        assert_eq!(
+            RESERVED_FOCUS_KEYS,
+            [
+                (KeyCode::F(10), KeyModifiers::NONE),
+                (KeyCode::Up, KeyModifiers::SHIFT),
+                (KeyCode::Down, KeyModifiers::SHIFT),
+                (KeyCode::Left, KeyModifiers::SHIFT),
+                (KeyCode::Right, KeyModifiers::SHIFT),
+            ]
+        );
+        assert!(is_reserved_focus_key(KeyCode::F(10), KeyModifiers::NONE));
+        assert!(!is_reserved_focus_key(
+            KeyCode::Char('t'),
+            KeyModifiers::CONTROL
+        ));
+    }
+
+    #[test]
+    fn shift_arrows_stay_with_canopy_while_a_child_claims_the_keyboard() {
+        // Regression: C23 shipped with F10 as the only reserved key, which
+        // made Shift+arrows dead from inside a focused session — there was no
+        // way to step to another agent without leaving focus first.
+        for code in [KeyCode::Up, KeyCode::Down, KeyCode::Left, KeyCode::Right] {
+            assert!(
+                is_reserved_focus_key(code, KeyModifiers::SHIFT),
+                "Shift+{code:?} is frame navigation and must stay with canopy"
+            );
+            assert!(
+                !is_reserved_focus_key(code, KeyModifiers::NONE),
+                "a bare arrow is the child's"
+            );
+        }
     }
 
     #[test]
