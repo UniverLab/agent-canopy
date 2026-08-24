@@ -52,7 +52,8 @@ pub(super) fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App, theme: 
     }
 
     let brain_area = draw_sidebar_tabs(frame, content_below, app, theme);
-    render_brain_or_graph(frame, brain_area, app, theme);
+    let is_knowledge_tab = app.sidebar_layer == SidebarLayer::Knowledge;
+    render_brain_or_graph(frame, brain_area, app, theme, is_knowledge_tab);
 
     render_dashboard_if_present(frame, areas.dashboard, app, theme);
 
@@ -215,7 +216,12 @@ fn render_dashboard_if_present(frame: &mut Frame, area: Option<Rect>, app: &App,
     );
 }
 
-/// The project graph's minimum height: border rows plus at least one edge line.
+/// The project graph's minimum *outer* height — what the split hands out,
+/// not what `draw_project_graph` gets to draw into. `render_titled_panel`
+/// strips the border before calling in, so with `Borders::ALL` this leaves
+/// an inner budget of 2 edge lines; with a borderless theme, all 4.
+/// `draw_project_graph` must budget the inner height it receives directly
+/// rather than subtracting border rows a second time.
 const GRAPH_MIN_HEIGHT: u16 = 4;
 
 /// How the leftover space below the three layers is carved up between the
@@ -277,8 +283,24 @@ fn render_graph_panel(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     );
 }
 
-fn render_brain_or_graph(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
-    let graph_has_content = !app.project_graph_trees.is_empty();
+/// Whether the shared strip should reserve rows for the project graph
+/// instead of handing them all to Brian's Brain: only on the Knowledge tab
+/// (C26 decision 1 — projects aren't the subject on Live/Automation), and
+/// only when there's an edge to draw (C26 decision 2 — a workspace of
+/// unrelated projects still fills `project_graph_trees` with one singleton
+/// per project, which is not "content").
+fn graph_has_content(edge_count: usize, is_knowledge_tab: bool) -> bool {
+    is_knowledge_tab && edge_count > 0
+}
+
+fn render_brain_or_graph(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    theme: &Theme,
+    is_knowledge_tab: bool,
+) {
+    let graph_has_content = graph_has_content(app.project_graph_edges.len(), is_knowledge_tab);
     match split_brain_or_graph(area, graph_has_content) {
         BrainOrGraphLayout::Neither => {}
         BrainOrGraphLayout::GraphOnly(graph_area) => {
@@ -617,20 +639,37 @@ fn draw_automation_body(
     remaining
 }
 
-/// Knowledge has a single panel that always fills its whole area, so it never
-/// leaves anything over: return an empty rect at the bottom edge.
-fn draw_knowledge_body(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) -> Rect {
-    render_titled_panel(
-        frame,
-        area,
-        " projects ",
-        Style::default().fg(theme.dim_text),
-        knowledge_border_style(app, theme),
-        theme,
-        |frame, inner| draw_projects_list(frame, inner, app, theme),
-    );
+/// Rows needed for the projects panel: 3-row cards + 1-row gap + 2-row
+/// border (see `draw_projects_list`), with a 3-row floor so the panel (and
+/// its "No registered projects" message) still shows when the list is
+/// empty. Like `card_list_demand`, a workspace with few projects leaves
+/// rows over for the project graph and Brian's Brain below it (C26) —
+/// unlike Knowledge's old behavior of always claiming the whole area,
+/// which made the graph panel unreachable no matter how many relations
+/// existed.
+fn project_list_demand(count: usize) -> u16 {
+    if count == 0 {
+        3
+    } else {
+        count as u16 * 4 + 2
+    }
+}
 
-    Rect::new(area.x, area.y + area.height, area.width, 0)
+fn draw_knowledge_body(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) -> Rect {
+    let mut remaining = area;
+    if let Some(sub) = take_top(&mut remaining, project_list_demand(app.projects.len())) {
+        render_titled_panel(
+            frame,
+            sub,
+            " projects ",
+            Style::default().fg(theme.dim_text),
+            knowledge_border_style(app, theme),
+            theme,
+            |frame, inner| draw_projects_list(frame, inner, app, theme),
+        );
+    }
+
+    remaining
 }
 
 // ── Focus/border styling ────────────────────────────────────────────
@@ -1634,6 +1673,14 @@ fn draw_groups_list(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme)
 
 // ── Project Graph ────────────────────────────────────────────────
 
+/// How many edge lines fit in the panel's inner area. `inner_height` is
+/// already the post-border rect `render_titled_panel` hands to its
+/// callback — budget it directly rather than subtracting border rows a
+/// second time, which used to compute 0 at the panel's minimum height.
+fn graph_edge_row_budget(inner_height: u16, edge_count: usize) -> usize {
+    edge_count.min(inner_height as usize)
+}
+
 fn draw_project_graph(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     if app.project_graph_trees.is_empty() || app.project_graph_edges.is_empty() {
         let msg = if app.projects.len() <= 1 {
@@ -1651,10 +1698,7 @@ fn draw_project_graph(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         return;
     }
 
-    let edge_count = app
-        .project_graph_edges
-        .len()
-        .min(area.height.saturating_sub(2) as usize);
+    let edge_count = graph_edge_row_budget(area.height, app.project_graph_edges.len());
 
     for (i, edge) in app.project_graph_edges.iter().take(edge_count).enumerate() {
         let y = area.y + i as u16;
@@ -3293,6 +3337,111 @@ mod tests {
         assert_eq!(
             split_brain_or_graph(area, false),
             BrainOrGraphLayout::Neither
+        );
+    }
+
+    // ── C26: graph_has_content / graph_edge_row_budget ────────────────
+
+    #[test]
+    fn graph_has_content_regression_defect_1_trees_but_no_edges() {
+        // 39 singleton trees, 0 edges: `project_graph_trees` is never empty
+        // (defect 1's false-positive signal), but with no edges there's
+        // nothing to draw, so content must read false and the split must
+        // hand the whole area to the brain.
+        assert!(!graph_has_content(0, true));
+
+        let area = Rect::new(0, 0, 30, 20);
+        match split_brain_or_graph(area, graph_has_content(0, true)) {
+            BrainOrGraphLayout::BrainOnly(brain) => assert_eq!(brain, area),
+            other => panic!("expected BrainOnly, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn graph_has_content_true_with_at_least_one_edge_on_knowledge_tab() {
+        assert!(graph_has_content(1, true));
+    }
+
+    #[test]
+    fn graph_has_content_gated_to_knowledge_layer() {
+        // Same edge count, same area — only the tab differs.
+        let edge_count = 3;
+        assert!(
+            graph_has_content(edge_count, true),
+            "Knowledge should show it"
+        );
+        assert!(
+            !graph_has_content(edge_count, false),
+            "Live/Automation should not show it"
+        );
+    }
+
+    #[test]
+    fn graph_edge_row_budget_regression_defect_2() {
+        // GRAPH_MIN_HEIGHT is the *outer* height the split hands the panel;
+        // render_titled_panel strips Borders::ALL's 2 border rows before
+        // draw_project_graph ever sees the area. The old code subtracted
+        // another 2 from that already-inner height, computing 0 for a
+        // panel that has exactly one edge to show.
+        let inner_height = GRAPH_MIN_HEIGHT - 2;
+        assert_eq!(graph_edge_row_budget(inner_height, 1), 1);
+    }
+
+    #[test]
+    fn graph_edge_row_budget_truncates_to_available_rows() {
+        assert_eq!(graph_edge_row_budget(2, 5), 2);
+    }
+
+    #[test]
+    fn graph_edge_row_budget_draws_all_edges_when_rows_have_slack() {
+        assert_eq!(graph_edge_row_budget(10, 3), 3);
+    }
+
+    #[test]
+    fn knowledge_tab_with_an_edge_draws_the_graph_panel() {
+        let text = render_sidebar_text_with(
+            2,
+            34,
+            40,
+            &Theme::classic(),
+            SidebarLayer::Knowledge,
+            |app| {
+                app.project_graph_edges
+                    .push(crate::tui::app::types::ProjectGraphEdge {
+                        from_name: "project0".to_string(),
+                        to_name: "project1".to_string(),
+                        from_hash: "hash0".to_string(),
+                        to_hash: "hash1".to_string(),
+                        relation: "depends_on".to_string(),
+                    });
+            },
+        );
+        assert!(
+            text.contains("project graph"),
+            "graph panel title missing: {text}"
+        );
+        assert!(
+            text.contains("project0") && text.contains("project1"),
+            "edge label missing: {text}"
+        );
+    }
+
+    #[test]
+    fn live_tab_never_shows_the_graph_panel_even_with_edges() {
+        let text =
+            render_sidebar_text_with(2, 34, 40, &Theme::classic(), SidebarLayer::Live, |app| {
+                app.project_graph_edges
+                    .push(crate::tui::app::types::ProjectGraphEdge {
+                        from_name: "project0".to_string(),
+                        to_name: "project1".to_string(),
+                        from_hash: "hash0".to_string(),
+                        to_hash: "hash1".to_string(),
+                        relation: "depends_on".to_string(),
+                    });
+            });
+        assert!(
+            !text.contains("project graph"),
+            "graph panel must not render on Live: {text}"
         );
     }
 }
