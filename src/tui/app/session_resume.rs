@@ -40,17 +40,26 @@ fn args_contain_sequence(args: &str, sequence: &str) -> bool {
             .any(|window| window == sequence_tokens.as_slice())
 }
 
+use std::collections::HashSet;
+
 use crate::db::session::InteractiveSession;
 
+/// Cap on the resume picker's candidate list, applied after deduplication
+/// (decision 6): the table holds well over a thousand rows and the picker is
+/// a recency tool, not an archive browser.
+pub(crate) const RESUME_CANDIDATE_CAP: usize = 20;
+
 /// Metadata-only view of a resumable session for the picker: enough to tell
-/// rows apart (name, harness, recency) without reading a session's full
-/// history.
+/// rows apart (name, harness, recency) and enough to actually relaunch it
+/// (working_dir, original args) without reading a session's full history.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ResumableSession {
     pub id: String,
     pub name: String,
     pub cli: String,
     pub last_active: String,
+    pub working_dir: String,
+    pub args: Option<String>,
 }
 
 impl From<&InteractiveSession> for ResumableSession {
@@ -60,8 +69,27 @@ impl From<&InteractiveSession> for ResumableSession {
             name: session.name.clone(),
             cli: session.cli.clone(),
             last_active: session.started_at.clone(),
+            working_dir: session.working_dir.clone(),
+            args: session.args.clone(),
         }
     }
+}
+
+/// Collapse resumable-session candidates to at most one per (cli,
+/// working_dir) — the most recent — then cap the result (decisions 5, 6).
+/// `sessions` must already be ordered most-recent-first (as returned by
+/// `Database::get_resumable_sessions`), since the first occurrence of each
+/// key is the one kept.
+pub(crate) fn dedupe_resumable_sessions(
+    sessions: Vec<InteractiveSession>,
+    cap: usize,
+) -> Vec<InteractiveSession> {
+    let mut seen = HashSet::new();
+    sessions
+        .into_iter()
+        .filter(|session| seen.insert((session.cli.clone(), session.working_dir.clone())))
+        .take(cap)
+        .collect()
 }
 
 /// What choosing "Resume" should do for the current set of resumable
@@ -128,17 +156,13 @@ impl SessionResumePicker {
 }
 
 pub(crate) fn build_resumed_session_args(
-    session: &crate::db::session::InteractiveSession,
+    original_args: Option<&str>,
     interactive_args: Option<&str>,
     resume_args: Option<&str>,
     session_resume_cmd: Option<&str>,
     yolo_flag: Option<&str>,
 ) -> Option<String> {
-    let original_args = session
-        .args
-        .as_deref()
-        .map(str::trim)
-        .filter(|args| !args.is_empty());
+    let original_args = original_args.map(str::trim).filter(|args| !args.is_empty());
     let inter_args = interactive_args
         .map(str::trim)
         .filter(|args| !args.is_empty());
@@ -244,12 +268,16 @@ mod resume_picker_tests {
                 name: "alpha".into(),
                 cli: "claude".into(),
                 last_active: "2026-08-19T12:00:00Z".into(),
+                working_dir: "/tmp".into(),
+                args: None,
             },
             ResumableSession {
                 id: "s2".into(),
                 name: "beta".into(),
                 cli: "codex".into(),
                 last_active: "2026-08-19T11:00:00Z".into(),
+                working_dir: "/tmp".into(),
+                args: None,
             },
         ];
         let mut picker = SessionResumePicker::new(rows);
@@ -259,5 +287,84 @@ mod resume_picker_tests {
 
         picker.move_selection(true, 6);
         assert_eq!(picker.selected().map(|s| s.id.as_str()), Some("s1"));
+    }
+
+    // ── dedupe_resumable_sessions ───────────────────────────────
+
+    fn session_in(id: &str, cli: &str, started_at: &str, working_dir: &str) -> InteractiveSession {
+        InteractiveSession {
+            id: id.to_string(),
+            name: id.to_string(),
+            cli: cli.to_string(),
+            working_dir: working_dir.to_string(),
+            args: None,
+            started_at: started_at.to_string(),
+            status: "completed".to_string(),
+            session_type: "interactive".to_string(),
+            pid: None,
+            boot_id: None,
+        }
+    }
+
+    #[test]
+    fn dedupe_collapses_same_cli_and_dir_to_most_recent() {
+        // Already most-recent-first, as the DB query returns it.
+        let sessions = vec![
+            session_in("s3", "claude", "2026-08-19T12:00:00Z", "/proj"),
+            session_in("s2", "claude", "2026-08-19T11:00:00Z", "/proj"),
+            session_in("s1", "claude", "2026-08-19T10:00:00Z", "/proj"),
+        ];
+
+        let deduped = dedupe_resumable_sessions(sessions, 20);
+
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].id, "s3", "must keep the most recent row");
+    }
+
+    #[test]
+    fn dedupe_keeps_same_cli_different_dirs() {
+        let sessions = vec![
+            session_in("s1", "claude", "2026-08-19T10:00:00Z", "/proj-a"),
+            session_in("s2", "claude", "2026-08-19T09:00:00Z", "/proj-b"),
+        ];
+
+        let deduped = dedupe_resumable_sessions(sessions, 20);
+
+        assert_eq!(deduped.len(), 2);
+    }
+
+    #[test]
+    fn dedupe_keeps_different_clis_same_dir() {
+        let sessions = vec![
+            session_in("s1", "claude", "2026-08-19T10:00:00Z", "/proj"),
+            session_in("s2", "codex", "2026-08-19T09:00:00Z", "/proj"),
+        ];
+
+        let deduped = dedupe_resumable_sessions(sessions, 20);
+
+        assert_eq!(deduped.len(), 2);
+    }
+
+    #[test]
+    fn dedupe_truncates_to_cap_keeping_most_recent() {
+        let sessions: Vec<InteractiveSession> = (0..25)
+            .map(|i| {
+                session_in(
+                    &format!("s{i}"),
+                    "claude",
+                    &format!("2026-08-19T10:{:02}:00Z", 59 - i),
+                    &format!("/proj-{i}"),
+                )
+            })
+            .collect();
+
+        let deduped = dedupe_resumable_sessions(sessions, RESUME_CANDIDATE_CAP);
+
+        assert_eq!(deduped.len(), RESUME_CANDIDATE_CAP);
+        assert_eq!(
+            deduped[0].id, "s0",
+            "most recent row must survive truncation"
+        );
+        assert_eq!(deduped[19].id, "s19");
     }
 }

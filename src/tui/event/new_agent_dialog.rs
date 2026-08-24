@@ -3,7 +3,9 @@ use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::db::session::InteractiveSession;
 use crate::tui::app::dialog::{BackgroundTrigger, NewAgentDialog, NewTaskMode, NewTaskType};
-use crate::tui::app::session_resume::{plan_resume, ResumeChoice, SessionResumePicker};
+use crate::tui::app::session_resume::{
+    dedupe_resumable_sessions, plan_resume, ResumeChoice, SessionResumePicker, RESUME_CANDIDATE_CAP,
+};
 use crate::tui::app::types::App;
 use crate::tui::ui::dialogs::new_agent_dialog::{
     prompt_visual_line_count, PROMPT_VISIBLE_ROWS, SESSION_RESUME_PICKER_VISIBLE,
@@ -13,6 +15,11 @@ use crate::tui::ui::dialogs::new_agent_dialog::{
 //
 // Flow: ↑↓ switch fields, ←→ choose CLI/type/mode, ↑↓ in dir browser,
 //       Space enter directory, Enter launch, Esc cancel.
+
+/// Raw row count fetched from the DB before dedup collapses repeat (cli,
+/// working_dir) rows into one candidate each — comfortably more than
+/// `RESUME_CANDIDATE_CAP` so a busy directory doesn't starve the final list.
+const RESUME_CANDIDATE_FETCH_LIMIT: usize = 200;
 
 pub fn handle_dialog_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
     {
@@ -39,7 +46,14 @@ pub fn handle_dialog_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) 
                     && matches!(code, KeyCode::Left | KeyCode::Right)
             });
             let resumable_sessions = if toggling_to_resume {
-                app.db.get_orphaned_sessions().unwrap_or_default()
+                // Fetch generously beyond the picker's final cap: several
+                // rows can collapse into one candidate per (cli, working_dir)
+                // (decision 5), so the raw fetch needs headroom for dedup to
+                // still surface `RESUME_CANDIDATE_CAP` distinct candidates.
+                app.db
+                    .get_resumable_sessions(RESUME_CANDIDATE_FETCH_LIMIT)
+                    .map(|sessions| dedupe_resumable_sessions(sessions, RESUME_CANDIDATE_CAP))
+                    .unwrap_or_default()
             } else {
                 Vec::new()
             };

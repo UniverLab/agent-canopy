@@ -287,6 +287,8 @@ impl NewAgentDialog {
         }
 
         // Session-specific resume: interactive_args + session_resume_cmd + id.
+        // Takes precedence over the canopy-native picker below (decision 10):
+        // it's a different, unrelated feature that keeps working as today.
         if let Some((ref id, _)) = self.selected_session {
             if let Some(ref cmd) = config.session_resume_cmd {
                 return Some(match inter {
@@ -294,6 +296,19 @@ impl NewAgentDialog {
                     None => format!("{cmd} {id}"),
                 });
             }
+        }
+
+        // Canopy-native resume picker: rebuild the chosen session's original
+        // command line the same way auto-resume does (decision 8), so its
+        // original flags survive and resume args are never duplicated.
+        if let Some(session) = self.selected_resume_session.as_ref() {
+            return crate::tui::app::session_resume::build_resumed_session_args(
+                session.args.as_deref(),
+                inter.as_deref(),
+                config.resume_args.as_deref(),
+                config.session_resume_cmd.as_deref(),
+                config.yolo_flag.as_deref(),
+            );
         }
 
         // Generic resume: interactive_args + resume_args (each optional).
@@ -431,7 +446,11 @@ impl NewAgentDialog {
 
     /// Apply a session chosen via the canopy-native resume picker (or the
     /// sole candidate when there was only one): its harness becomes the
-    /// dialog's CLI, without the user picking the CLI separately.
+    /// dialog's CLI, without the user picking the CLI separately, and its
+    /// working directory becomes the dialog's — a generic resume is
+    /// `--continue`-shaped (resumes the most recent conversation of that CLI
+    /// in that directory), so landing on the chosen conversation requires
+    /// launching from the directory it was recorded in.
     pub fn apply_resume_choice(
         &mut self,
         session: crate::tui::app::session_resume::ResumableSession,
@@ -443,6 +462,7 @@ impl NewAgentDialog {
         {
             self.set_cli_index(idx);
         }
+        self.working_dir = session.working_dir.clone();
         self.selected_resume_session = Some(session);
     }
 
@@ -791,6 +811,7 @@ fn load_seed_options() -> Vec<SeedOption> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::app::session_resume::ResumableSession;
     use tempfile::tempdir;
 
     #[test]
@@ -1757,6 +1778,116 @@ mod tests {
         // With session but no resume_cmd, falls back to generic resume
         let result = dialog.build_resume_args(&config, Some("--tui".to_string()));
         assert_eq!(result.as_deref(), Some("--tui"));
+    }
+
+    // ── canopy-native resume picker: apply_resume_choice / args (C25) ──
+
+    fn resumable_session(cli: &str, working_dir: &str, args: Option<&str>) -> ResumableSession {
+        ResumableSession {
+            id: "s1".to_string(),
+            name: "picked-session".to_string(),
+            cli: cli.to_string(),
+            last_active: "2026-08-19T10:00:00Z".to_string(),
+            working_dir: working_dir.to_string(),
+            args: args.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn apply_resume_choice_sets_cli_and_working_dir() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.available_clis = vec![Cli::new("claude"), Cli::new("codex")];
+        dialog.cli_configs = vec![None, None];
+        dialog.working_dir = "/wherever/the/dialog/opened".to_string();
+
+        dialog.apply_resume_choice(resumable_session("codex", "/recorded/session/dir", None));
+
+        assert_eq!(dialog.selected_cli().as_str(), "codex");
+        assert_eq!(
+            dialog.working_dir, "/recorded/session/dir",
+            "a generic resume is --continue-shaped: it must land in the session's own dir"
+        );
+    }
+
+    #[test]
+    fn selected_args_for_resume_choice_routes_through_build_resumed_session_args_preserves_yolo() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.task_mode = NewTaskMode::Resume;
+        dialog.available_clis = vec![Cli::new("opencode")];
+        dialog.cli_configs = vec![Some(crate::domain::cli_config::CliConfig {
+            name: "opencode".into(),
+            binary: "opencode".into(),
+            headless_mode: String::new(),
+            model_flag: None,
+            supports_working_dir: false,
+            working_dir_flag: None,
+            env_vars: std::collections::HashMap::new(),
+            interactive_args: None,
+            fallback_interactive_args: None,
+            resume_args: Some("--continue".to_string()),
+            session_list_cmd: None,
+            session_resume_cmd: None,
+            session_id_set_flag: None,
+            session_list_format_args: None,
+            session_id_pattern: None,
+            models_list_cmd: None,
+            accent_color: None,
+            yolo_flag: Some("--yolo".to_string()),
+            trust_flag: None,
+            instruction_file: None,
+            prompt_via_stdin: false,
+            paste_submit_delay_ms: None,
+            paste_submit_key: None,
+            paste_submit_presses: 1,
+        })];
+        dialog.cli_index = 0;
+        dialog.apply_resume_choice(resumable_session("opencode", "/proj", Some("--tui --yolo")));
+
+        let args = dialog.selected_args().expect("resume args");
+        assert_eq!(
+            args.matches("--yolo").count(),
+            1,
+            "the original session's yolo flag must survive, not be dropped or duplicated"
+        );
+    }
+
+    #[test]
+    fn selected_args_for_resume_choice_does_not_duplicate_resume_flag() {
+        let mut dialog = NewAgentDialog::new(None);
+        dialog.task_mode = NewTaskMode::Resume;
+        dialog.available_clis = vec![Cli::new("opencode")];
+        dialog.cli_configs = vec![Some(crate::domain::cli_config::CliConfig {
+            name: "opencode".into(),
+            binary: "opencode".into(),
+            headless_mode: String::new(),
+            model_flag: None,
+            supports_working_dir: false,
+            working_dir_flag: None,
+            env_vars: std::collections::HashMap::new(),
+            interactive_args: None,
+            fallback_interactive_args: None,
+            resume_args: Some("--continue".to_string()),
+            session_list_cmd: None,
+            session_resume_cmd: None,
+            session_id_set_flag: None,
+            session_list_format_args: None,
+            session_id_pattern: None,
+            models_list_cmd: None,
+            accent_color: None,
+            yolo_flag: None,
+            trust_flag: None,
+            instruction_file: None,
+            prompt_via_stdin: false,
+            paste_submit_delay_ms: None,
+            paste_submit_key: None,
+            paste_submit_presses: 1,
+        })];
+        dialog.cli_index = 0;
+        // The recorded session's own args already carry the resume flag.
+        dialog.apply_resume_choice(resumable_session("opencode", "/proj", Some("--continue")));
+
+        let args = dialog.selected_args().expect("resume args");
+        assert_eq!(args.matches("--continue").count(), 1);
     }
 
     // ── move_cli_picker_prev empty ──────────────────────────────

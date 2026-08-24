@@ -3043,7 +3043,7 @@ impl App {
         let cli = crate::domain::models::Cli::from_str(&session.cli);
         let cli_config = canopy_config.get_cli(cli.as_str());
         let resume_args = build_resumed_session_args(
-            session,
+            session.args.as_deref(),
             cli_config.and_then(|config| config.interactive_args.as_deref()),
             cli_config.and_then(|config| config.resume_args.as_deref()),
             cli_config.and_then(|config| config.session_resume_cmd.as_deref()),
@@ -3792,11 +3792,15 @@ mod tests {
             boot_id: None,
         };
 
-        assert!(
-            build_resumed_session_args(&session, None, None, None, Some("--yolo"))
-                .as_deref()
-                .is_some_and(|args| args.contains("--yolo"))
-        );
+        assert!(build_resumed_session_args(
+            session.args.as_deref(),
+            None,
+            None,
+            None,
+            Some("--yolo")
+        )
+        .as_deref()
+        .is_some_and(|args| args.contains("--yolo")));
     }
 
     #[test]
@@ -3814,7 +3818,9 @@ mod tests {
             boot_id: None,
         };
 
-        let args = build_resumed_session_args(&session, None, None, None, Some("--yolo")).unwrap();
+        let args =
+            build_resumed_session_args(session.args.as_deref(), None, None, None, Some("--yolo"))
+                .unwrap();
         assert_eq!(args.matches("--yolo").count(), 1);
     }
 
@@ -3834,7 +3840,7 @@ mod tests {
         };
 
         let args = build_resumed_session_args(
-            &session,
+            session.args.as_deref(),
             Some("--chat"),
             Some("-c"),
             Some("--session"),
@@ -3861,9 +3867,14 @@ mod tests {
             boot_id: None,
         };
 
-        let args =
-            build_resumed_session_args(&session, None, Some("--continue"), None, Some("--yolo"))
-                .unwrap();
+        let args = build_resumed_session_args(
+            session.args.as_deref(),
+            None,
+            Some("--continue"),
+            None,
+            Some("--yolo"),
+        )
+        .unwrap();
         assert!(args.contains("--continue"));
         assert!(!args.contains("--yolo"));
     }
@@ -3884,7 +3895,7 @@ mod tests {
         };
 
         let args = build_resumed_session_args(
-            &session,
+            session.args.as_deref(),
             Some("chat"),
             Some("--resume-picker"),
             None,
