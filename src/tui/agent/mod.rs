@@ -171,11 +171,12 @@ pub struct InteractiveAgent {
     /// 0.16 has no Kitty-protocol support of its own — see
     /// `input::parse_kitty_keyboard_push`), independent of the vt100
     /// parser's own state. Exposed via
-    /// [`crate::tui::agent::InteractiveAgent::kitty_keyboard_negotiated`];
-    /// not yet consulted by any encoder (see the `MPM::None` arm of
+    /// [`crate::tui::agent::InteractiveAgent::kitty_keyboard_negotiated`],
+    /// consulted by `event::agent_focus::focused_child_claimed_keyboard` to
+    /// decide whether a focus shortcut should yield to the child; not
+    /// consulted by any scroll encoder (see the `MPM::None` arm of
     /// `encode_scroll_sequence` in `input.rs` for why Page Up/Page Down
     /// specifically have no distinct Kitty encoding to switch to).
-    #[allow(dead_code)]
     pub(crate) kitty_keyboard_flags: Arc<Mutex<Option<u8>>>,
 }
 

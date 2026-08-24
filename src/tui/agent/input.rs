@@ -205,7 +205,6 @@ impl InteractiveAgent {
     /// vt100 parser, which has no support of its own for this protocol
     /// (vt100 0.16.2's `perform.rs` has no `u`-terminated CSI dispatch at
     /// all).
-    #[allow(dead_code)]
     pub fn kitty_keyboard_negotiated(&self) -> bool {
         self.kitty_keyboard_flags
             .try_lock()

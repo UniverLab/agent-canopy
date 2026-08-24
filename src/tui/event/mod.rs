@@ -112,6 +112,7 @@ fn dispatch_event(app: &mut App, event: Event) -> Result<()> {
 // ── Prompt Template Dialog ──────────────────────────────────────
 
 mod agent_focus;
+pub(crate) use agent_focus::focused_child_claimed_keyboard;
 mod context_transfer;
 mod home_preview;
 pub(crate) mod knowledge_dialog;
