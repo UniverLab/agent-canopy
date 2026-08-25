@@ -41,6 +41,11 @@ pub fn run_event_loop(terminal: &mut Terminal, app: &mut App) -> Result<()> {
             drain_pending_events(app)?;
         }
 
+        #[cfg(unix)]
+        if crate::tui::agent::pty::SIGHUP_RECEIVED.load(std::sync::atomic::Ordering::Relaxed) {
+            app.running = false;
+        }
+
         app.refresh()?;
     }
 
