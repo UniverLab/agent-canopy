@@ -21,7 +21,7 @@ use crate::shared::sync_identity::{
 };
 
 #[cfg(unix)]
-use crate::tui::agent::pty::{ignore_signals, send_sighup_to_group};
+use crate::tui::agent::pty::{install_signal_handlers, send_sighup_to_group};
 
 pub mod input;
 pub mod naming;
@@ -205,7 +205,7 @@ impl InteractiveAgent {
         seed_id: Option<&str>,
     ) -> Result<Self> {
         #[cfg(unix)]
-        ignore_signals();
+        install_signal_handlers();
 
         let id = uuid::Uuid::new_v4().to_string();
         let name = name
@@ -366,7 +366,7 @@ impl InteractiveAgent {
         accent_color: Color,
     ) -> Result<Self> {
         #[cfg(unix)]
-        ignore_signals();
+        install_signal_handlers();
 
         let id = uuid::Uuid::new_v4().to_string();
         let session_name = name

@@ -3265,7 +3265,10 @@ impl App {
                 // Only a live process that actually IS this CLI, and that
                 // survives a short grace period, is a genuine conflict.
                 let pid = session.pid.unwrap_or(0);
-                if !process_outlives_grace(pid, &session.cli) {
+                if matches!(
+                    resume_decision(true, process_outlives_grace(pid, &session.cli)),
+                    ResumeDecision::Resume
+                ) {
                     tracing::info!(
                         "Auto-resuming session '{}': stored pid {pid} was recycled or exited during grace",
                         session.name
@@ -3280,19 +3283,18 @@ impl App {
                     continue;
                 }
                 tracing::warn!(
-                    "Skipping auto-resume of session '{}': old process (pid {:?}) is still alive (same boot); closing session",
-                    session.name,
-                    session.pid
+                    "Skipping auto-resume of session '{}' for this start: pid {pid} is still alive and holds it; will retry on the next start",
+                    session.name
                 );
                 // A genuine session-lock conflict: the old CLI is still alive
-                // and holding the lock, so this instance can never take the
-                // session over. With no session-admin surface to hand it back,
-                // it's dead to us — mark it closed (B32) so it drops from the
-                // sidebar rather than lingering as a red orphan. Per-session,
-                // so a crash right here strands at most this one row. The row
-                // is kept for history; `restore_scheduled_sends` drops any
-                // schedules that targeted it.
-                let _ = self.db.mark_session_closed(&session.id);
+                // and holding the session, which makes it unreachable right
+                // now, not dead. Leave the row exactly as it is — still
+                // `active`, still holding its pid and boot_id — so it's
+                // retried on every subsequent start and comes back on its own
+                // once the holder exits. There's nothing to clean up in the
+                // meantime either: only resumed sessions join
+                // `interactive_agents`, so a skipped row is simply absent
+                // from this run's sidebar.
                 continue;
             }
             self.resume_interactive_session(
@@ -3413,6 +3415,25 @@ fn should_resume_session(
     match pid {
         Some(pid) => !process_is_alive(pid),
         None => true,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeDecision {
+    Resume,
+    SkipHeldByLiveProcess,
+}
+
+/// Pure decision for a session whose stored PID is alive on the current boot
+/// (i.e. `should_resume_session` returned `false`). A PID that doesn't
+/// outlive the grace window in `process_outlives_grace` was mid-death or
+/// recycled, so resuming is safe. A PID that survives the full window is a
+/// genuine session-lock conflict and must be skipped for this start.
+fn resume_decision(pid_alive_same_boot: bool, outlives_grace: bool) -> ResumeDecision {
+    if pid_alive_same_boot && outlives_grace {
+        ResumeDecision::SkipHeldByLiveProcess
+    } else {
+        ResumeDecision::Resume
     }
 }
 
@@ -3722,7 +3743,8 @@ mod tests {
         adaptive_change_score, adaptive_poll_interval_ms, blend_optional_f32, blend_optional_f64,
         build_resumed_session_args, calculate_log_hash, lerp_f32, lerp_u64, log_contains_error,
         log_contains_spawn, log_contains_success, process_is_alive, process_outlives_grace,
-        sample_from, scroll_into_view, should_resume_session, step_ring_index, SystemSample,
+        resume_decision, sample_from, scroll_into_view, should_resume_session, step_ring_index,
+        ResumeDecision, SystemSample,
     };
     use crate::db::session::InteractiveSession;
     use crate::db::Database;
@@ -3977,6 +3999,35 @@ mod tests {
             Some("some-stored-boot-id"),
             None,
         ));
+    }
+
+    #[test]
+    fn test_resume_decision_skips_when_pid_alive_same_boot_and_outlives_grace() {
+        // The only genuine conflict: a live PID on this boot that survives
+        // the full grace window — some other process still holds the lock.
+        assert_eq!(
+            resume_decision(true, true),
+            ResumeDecision::SkipHeldByLiveProcess
+        );
+    }
+
+    #[test]
+    fn test_resume_decision_resumes_when_pid_alive_same_boot_but_grace_expires() {
+        // Live PID, same boot, but it didn't survive the grace window: mid-death
+        // or recycled, not a real holder.
+        assert_eq!(resume_decision(true, false), ResumeDecision::Resume);
+    }
+
+    #[test]
+    fn test_resume_decision_resumes_when_pid_not_alive_same_boot() {
+        assert_eq!(resume_decision(false, false), ResumeDecision::Resume);
+    }
+
+    #[test]
+    fn test_resume_decision_resumes_when_pid_not_alive_same_boot_even_if_grace_flag_set() {
+        // outlives_grace is meaningless when the PID isn't the live-same-boot
+        // case in the first place; pid_alive_same_boot alone must gate it.
+        assert_eq!(resume_decision(false, true), ResumeDecision::Resume);
     }
 
     #[cfg(target_os = "linux")]

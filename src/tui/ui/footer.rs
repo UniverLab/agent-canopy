@@ -130,7 +130,8 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Them
             if is_pty {
                 // While the focused child has claimed the keyboard (alternate
                 // screen or Kitty keyboard protocol), every canopy shortcut
-                // below yields to it except F10 — see
+                // below yields to it except F10, the Shift+arrow frame
+                // navigation, and Ctrl+T — see
                 // `agent_focus::RESERVED_FOCUS_KEYS`. Reflect that here so a
                 // shortcut that "did nothing" is explainable instead of
                 // looking broken.
@@ -141,7 +142,7 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Them
                     // still worth showing: only the content shortcuts yield.
                     h.push(("Shift+↑↓", "agents/rag"));
                     h.push(("Shift+←→", if in_split { "split focus" } else { "tab" }));
-                    h.push(("*", "other keys → child"));
+                    h.push(("Ctrl+T", "context"));
                 } else {
                     h.push(("Shift+↑↓", "agents/rag"));
                     h.push(("Ctrl+T", "context"));
@@ -720,6 +721,51 @@ mod tests {
             !text.contains("split focus"),
             "no split is active, so 'split focus' must not be advertised: {text}"
         );
+    }
+
+    #[test]
+    fn footer_in_agent_focus_with_claimed_keyboard_shows_ctrl_t_not_star() {
+        // Functional requirements 4 and 5: with the keyboard claimed, Ctrl+T
+        // now works again and must be advertised — the old "* other keys →
+        // child" hint must be gone, from this branch and everywhere else.
+        let agent = crate::tui::agent::InteractiveAgent::spawn(
+            crate::domain::models::Cli::new("cat"),
+            ".",
+            80,
+            24,
+            None,
+            None,
+            Color::Reset,
+            Some("claimed-agent"),
+            &[],
+            None,
+            None,
+            None,
+        )
+        .expect("spawn cat as a stand-in interactive child");
+        *agent.kitty_keyboard_flags.lock().expect("lock") = Some(7);
+
+        let mut app = make_app();
+        app.interactive_agents = vec![agent];
+        app.agents = vec![crate::tui::app::types::AgentEntry::Interactive(0)];
+        app.selected = 0;
+        app.focus = Focus::Agent;
+
+        let theme = Theme::classic();
+        let text = render_footer_to_text(200, 1, |frame, area| {
+            draw_footer(frame, area, &app, &theme);
+        });
+
+        assert!(
+            text.contains("Ctrl+T"),
+            "claimed-keyboard footer must advertise Ctrl+T: {text}"
+        );
+        assert!(
+            !text.contains('*'),
+            "the '* other keys \u{2192} child' hint must be gone: {text}"
+        );
+
+        app.interactive_agents[0].kill();
     }
 
     #[test]
