@@ -229,6 +229,12 @@ const RESERVED_FOCUS_KEYS: &[(KeyCode, KeyModifiers)] = &[
     // frame navigation.
     (KeyCode::Left, KeyModifiers::SHIFT),
     (KeyCode::Right, KeyModifiers::SHIFT),
+    // Context transfer (`handle_context_transfer_shortcut`). Deliberately not
+    // frame navigation — a one-off exception the owner made with eyes open:
+    // Codex also binds Ctrl+T, and losing that collision was judged worth it
+    // to make the transfer reachable again from inside a claimed session. The
+    // owner doesn't use Codex's binding and will rebind it on Codex's side.
+    (KeyCode::Char('t'), KeyModifiers::CONTROL),
 ];
 
 fn is_reserved_focus_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
@@ -1355,8 +1361,9 @@ mod focus_shortcuts_keyboard_claim_tests {
 
     #[test]
     fn reserved_focus_keys_are_leave_focus_and_frame_navigation() {
-        // The list is frame navigation only: leave focus, and step between
-        // canopy's own panes. Anything that acts on the session's content is
+        // The list is frame navigation, plus one deliberate exception: leave
+        // focus, step between canopy's own panes, and Ctrl+T for context
+        // transfer. Everything else that acts on the session's content is
         // the child's.
         assert_eq!(
             RESERVED_FOCUS_KEYS,
@@ -1366,10 +1373,14 @@ mod focus_shortcuts_keyboard_claim_tests {
                 (KeyCode::Down, KeyModifiers::SHIFT),
                 (KeyCode::Left, KeyModifiers::SHIFT),
                 (KeyCode::Right, KeyModifiers::SHIFT),
+                (KeyCode::Char('t'), KeyModifiers::CONTROL),
             ]
         );
         assert!(is_reserved_focus_key(KeyCode::F(10), KeyModifiers::NONE));
-        assert!(!is_reserved_focus_key(
+        // Ownership of this key was reversed on purpose: the owner decided
+        // context transfer is worth more than Codex's own Ctrl+T and will
+        // rebind it on Codex's side.
+        assert!(is_reserved_focus_key(
             KeyCode::Char('t'),
             KeyModifiers::CONTROL
         ));
@@ -1393,9 +1404,11 @@ mod focus_shortcuts_keyboard_claim_tests {
     }
 
     #[test]
-    fn kitty_negotiated_child_does_not_have_ctrl_t_consumed() {
-        // The regression test for the whole spec: Codex's real shape is
-        // Kitty-negotiated without ever entering the alternate screen.
+    fn kitty_negotiated_child_has_ctrl_t_reserved_for_context_transfer() {
+        // Ownership of Ctrl+T was reversed on purpose (see
+        // `RESERVED_FOCUS_KEYS`): Codex's real shape is Kitty-negotiated
+        // without ever entering the alternate screen, and without this
+        // reservation the transfer had no working entry point at all.
         let agent = spawn_cat_agent("codex-like");
         *agent.kitty_keyboard_flags.lock().expect("lock") = Some(7);
         assert!(agent.kitty_keyboard_negotiated());
@@ -1404,7 +1417,11 @@ mod focus_shortcuts_keyboard_claim_tests {
 
         let handled = handle_focus_shortcuts(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
 
-        assert!(!handled, "Ctrl+T must reach the Kitty-negotiated child");
+        assert!(
+            handled,
+            "Ctrl+T must open context transfer even with a claimed keyboard"
+        );
+        assert!(matches!(app.focus, Focus::ContextTransfer));
         app.interactive_agents[0].kill();
     }
 
@@ -1444,11 +1461,11 @@ mod focus_shortcuts_keyboard_claim_tests {
         assert!(!agent.kitty_keyboard_negotiated());
         let mut app = app_with_interactive_agent(agent);
 
-        assert!(!handle_focus_shortcuts(
-            &mut app,
-            KeyCode::Char('t'),
-            KeyModifiers::CONTROL
-        ));
+        assert!(
+            handle_focus_shortcuts(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL),
+            "Ctrl+T is reserved for context transfer regardless of which \
+             signal claimed the keyboard"
+        );
         assert!(!handle_focus_shortcuts(
             &mut app,
             KeyCode::F(4),
@@ -1514,20 +1531,22 @@ mod focus_shortcuts_keyboard_claim_tests {
         app.active_split_id = Some("split-1".to_string());
         app.focus = Focus::Agent;
 
-        // Right panel focused: the claimed child owns the keyboard.
+        // Right panel focused: the claimed child owns the keyboard. Ctrl+S
+        // (split picker) is unreserved content, unlike Ctrl+T, so it still
+        // probes the claim.
         app.split_right_focused = true;
         assert!(!handle_focus_shortcuts(
             &mut app,
-            KeyCode::Char('t'),
+            KeyCode::Char('s'),
             KeyModifiers::CONTROL
         ));
 
-        // Left panel focused: its unclaimed child leaves Ctrl+T with canopy —
+        // Left panel focused: its unclaimed child leaves Ctrl+S with canopy —
         // the other pane's claim must not leak across.
         app.split_right_focused = false;
         assert!(handle_focus_shortcuts(
             &mut app,
-            KeyCode::Char('t'),
+            KeyCode::Char('s'),
             KeyModifiers::CONTROL
         ));
 
